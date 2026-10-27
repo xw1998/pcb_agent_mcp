@@ -85,6 +85,9 @@
 - 文档边界用 `{"type":"DOCHEAD"}||{"docType":"PCB","uuid":...}` 分隔，`docType` 有 `PROJECT_CONFIG/BOARD/SCH/SCH_PAGE/PCB/PANEL/SYMBOL/FOOTPRINT/DEVICE/BLOB/INSTANCE`。
 - 约定：坐标长度单位 **0.01 英寸**；角度逆时针为正、单位度；颜色 `#RRGGBB`；布尔用 1/0。
 
+> **⚠ 已修正（0.5.0，实测）**：本段关于 `.epro` 是 append-only 日志的判断**不成立**，
+> 实测为普通快照记录流（见 `13-立创实测-真实存储与记录格式.md`）。下文保留作历史。
+
 ⇒ **这是一个 append-only 的设计状态机。** 同一块板子的历史全部在文件里，最终状态要"回放"出来。这意味着：
 - 它能表达"版本/撤销"（KiCad 不能）；
 - 但**直接读文件 = 读日志**，不做 ticket 归并就会读到中间态。

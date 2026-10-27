@@ -327,9 +327,10 @@ IPC-2221 的正确形式是 `A = (I / (k·ΔT^0.44))^(1/0.725)`。实算对照�
 | `clearance_required` | 同上（+ 过电压类别） | mm + 表号 | 同上 |
 | `creepage_actual` | netA, netB | mm | 表面寻路；先用间隙做充分条件 |
 | `lambda_over_20` | f, εr | 过孔最大间距 | λ = c/(f·√εr) |
-| `unit_convert` | value, from, to | value | mil↔mm↔inch（含 0.01in，立创内部单位） |
+| `unit_convert` | value, from, to | value | mil↔mm↔inch（立创实测存 **mil**，`0.01in` 仅作兼容别名） |
 
-**`unit_convert` 看着琐碎，但它防的是最贵的一类静默错**：立创内部 0.01 英寸、KiCad mm。25.4 倍的错误不会让任何 DRC 报错。
+**`unit_convert` 看着琐碎，但它防的是最贵的一类静默错**：立创存 mil（`9.8425` 读作 0.25 mm，而标签写着 "mm"）、
+KiCad 存 mm。25.4 倍的错误不会让任何 DRC 报错。口径证据见 [`13`](13-立创实测-真实存储与记录格式.md) §2。
 
 ### 6.5 实现顺序：Calc 应该最先做
 

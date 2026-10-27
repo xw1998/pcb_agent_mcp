@@ -12,7 +12,9 @@ Modules:
 
     sexpr      lossless S-expression reader/writer (atom spelling, quoting kept)
     kicad_doc  a whole `.kicad_pcb` as a tree + round-trip proof + coverage report
-    epro_doc   a whole `.epro` (ZIP + append-only JSON log, ticket resolution)
+    lceda      one record stream (`.epcb`/`.efoo`/`.esch`) as lines that keep bytes
+    epro_doc   a whole `.epro`: the ZIP, member by member, byte-repacking exactly
+    eproj_doc  a whole `.eprj`/`.eprj2`: the SQLite project (documents/coppers)
     views      read facts out of the tree; every record keeps its `raw` node
     engine     ask kicad-cli (DRC / stats / Gerbers / positions) - the referee
 
@@ -22,10 +24,10 @@ Proofs, because "lossless" is a claim that needs payment:
     EproDocument.verify()    byte identity per member + resolved-state idempotence
     engine.verify(doc)       KiCad plots both files; copper, stats and positions equal
 """
-from . import engine, epro_doc, kicad_doc, sexpr, views
+from . import engine, epro_doc, eproj_doc, kicad_doc, lceda, sexpr, views
 
-__all__ = ["engine", "epro_doc", "kicad_doc", "sexpr", "views",
-           "sniff", "load", "FidelityError"]
+__all__ = ["engine", "epro_doc", "eproj_doc", "kicad_doc", "lceda", "sexpr",
+           "views", "sniff", "load", "FidelityError"]
 
 
 class FidelityError(ValueError):

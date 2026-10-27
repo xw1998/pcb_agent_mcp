@@ -3,6 +3,60 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)；`0.x` 期间 tool 的入参与返回结构仍可能变动，
 但**信封契约（`status` / `basis` / `precision` / `reason_code`）从 0.1.0 起冻结**。
 
+## [0.5.0] - 2026-10-28
+
+**立创侧从「按格式文档推」改成「在 194 个真实 `.epro` 上测」**。核心是三条被真板子推翻的假设：
+一次保存不是"新增成员 + 改写 `project.json`"而是**原地重写一个成员**；`RULE` 标签写着 `"mm"`
+而数字**恒为 mil**；`PAD_NET` 第 5 字段不是序号而是**封装内 PAD 对象的 id**。
+详见 [docs/13](docs/13-立创实测-真实存储与记录格式.md)。
+
+### Changed
+
+- **`.epro` 写路径整体换形状**：由「append-only 日志 + ticket 递增 + 追加成员」改为
+  **「只重写点名的那一个 ZIP 成员」**，另用六道闸门证明其余 129 个成员与未点名的行字节未变。
+  `plan.py` 里那句「立创按 ticket 解析追加日志」的注释已改为实测结论并指向 docs/13。
+- **`edit/epro_edit.py` 六个 op 全部落地并端到端跑通**（propose 不写盘 → 六门禁全绿 → apply →
+  重新解析后事实成立）：`move_component`（连带平移落在锚点上的 `ATTR`）、`set_track`、`set_via`、
+  `set_text`、`set_pad_net`、`delete_record`。
+- **层表不再预置**：`_context()` 的 `layer_by_code` / `layer_by_name` 全部来自本文件自己的
+  `LAYER` 记录，不再带一张编造的默认层表。
+- **`board_ops` 的 `.epro` op 目录 3 → 6 个**；`tools.py` 的 `not_implemented_yet` /
+  `verified_against` / `epro_inspect` 描述、`board_ops` 的 mm 入参 / mil 存储说明全部改成实测口径。
+- **`edit/__init__.py`**：`detect_format` 认 `SQLite format 3`（`.eprj`/`.eprj2`）并按只读工程处理；
+  `propose` 的格式判定改写为两行判断，去掉优先级歧义。
+
+### Added
+
+- **`fidelity/lceda.py`**（新增）：立创记录流。`MM_PER_COORD=0.0254`（mil→mm）、
+  `Line(body, term, record, parsed)`、`Document`、`Member`（`to_text` / `to_bytes` /
+  `is_verbatim` / `set_record` / `remove_line` / `roundtrip` / `tag_layout` / `stats` /
+  本轮新增 `dominant_term` / `append_record`）。
+- **`fidelity/eproj_doc.py`**（新增）：SQLite 工程只读打开（`documents` / `coppers` / `projects` /
+  `branches` …），明确**拒写**。
+- **`tests/_lceda_fixtures.py`、`tests/test_lceda_records.py`（18 例）、
+  `tests/test_epro_edit.py`（重写，37 例）**。
+- **`docs/13-立创实测-真实存储与记录格式.md`**：保存行为逐成员比对、单位证明表、各 tag 的字段
+  布局与 arity、`POUR[5]`/`FILL[5]`/`REGION[4]` 是标志位、板级自由 `PAD`、`PAD_NET` 8159/8149
+  统计、SQLite schema 与拒写理由、逐字节重打包、几何口径强弱表（旋转 54.1%、底面镜像 35.1%）。
+- **`tracks[]` / `vias[]` / `source["texts"][]` 补 `id`**：否则后置条件无法从适配器侧回查该记录。
+- **`free_pads`**：板级 `PAD`（271 条、无任何字段指向 `COMPONENT`）单列，不再混进封装焊盘。
+- `run_server.py --selftest` 新增 2 项（`board_ops` 广告 6 个 epro op；非归档文件被
+  `FORMAT_NOT_SUPPORTED` 拒绝），共 **25/25 PASS**。
+
+### Fixed
+
+- **`epro_doc.to_bytes` 的 central directory 偏移**：读的是 index 19（`char_encoding_flag`），
+  应为 16（`disk_number_start`）——错读会让追加成员后整包 CRC 计算位置偏掉。
+- **`_contours` 重复顶点**、**`REGION` 的 layer/flag 下标**、**`Board.mark("free_pads")` 未注册**。
+- **`set_pad_net` 的追加回调是死代码**（`ctx["appended"]` 从未被执行，`allow_new_record=True`
+  实际什么也没写）→ 改为 op 内直接 `member.append_record(...)`；封装焊盘 id 由
+  `FOOTPRINT/<uuid>.efoo` 读出，读不到抛 `PAD_OBJECT_UNKNOWN` / `PAD_NOT_FOUND`，不猜。
+- **`rows_untouched` 按下标逐行比对**会被"被改的行当然不同"和"删一行导致后面全部平移"误判
+  → 换成内容级 `_line_diff`（多重集 + 保序校验）与 plan 自报的 `touches` 集合。
+- **`set_text` / `delete_record` 缺后置条件**（`ok=None` → `reparsed` 门禁恒红）→ 补两分支 +
+  `_record_present`；`_designator` 从空桩改成真实现（读 `ATTR` 的 `Designator`）。
+- **`lines_deleted` 用 set 去重**（删 6 行报 5）→ 新增未去重的 `_planned_counts`。
+
 ## [0.4.0] - 2026-10-27
 
 **写路径**：从“只能读”变成“能改，且改得可证”。两种格式两条实现，一套协议：

@@ -52,8 +52,9 @@ def _tool(name, description, schema, handler):
 # ---------------------------------------------------------------- units
 _tool(
     "unit_convert",
-    "Convert a length between PCB units. Needed because EasyEDA Pro stores 0.01 inch "
-    "internally while KiCad uses mm: a silent 25.4x error passes every DRC.",
+    "Convert a length between PCB units. EasyEDA Pro stores numbers in mil (measured on "
+    "194 real archives - the unit label in the file is display-only) while KiCad uses mm: "
+    "a silent 25.4x error passes every DRC.",
     {
         "type": "object",
         "properties": {
@@ -555,11 +556,12 @@ _tool(
 
 _tool(
     "epro_inspect",
-    "Inspect an EasyEDA Pro .epro WITHOUT interpreting it: members, per-document object "
-    "type counts, and the raw key names of the first payloads of each type. Use it to "
-    "close an unmapped field instead of guessing a key name.",
+    "Inspect an EasyEDA Pro project WITHOUT interpreting it: the container (.epro ZIP "
+    "or .eprj/.eprj2 SQLite project), every member, and per document the measured tag "
+    "arity and a few real records. This is the tool that keeps the record map honest - "
+    "layout claims can be checked against a file instead of believed.",
     {"type": "object",
-     "properties": {"path": _str("absolute path to the .epro"),
+     "properties": {"path": _str("absolute path to the .epro / .eprj / .eprj2"),
                     "sample": _num("payloads to show per type", 3)},
      "required": ["path"]},
     lambda a: _guarded(lambda: _epro_inspect(a)),
@@ -660,11 +662,13 @@ def _capabilities(_args):
                               "carries authoritative=false and names board_drc",
         },
         "not_implemented_yet": [
-            "LCEDA Pro write path: .epro record editing exists only against synthetic "
-            "archives in the test suite - no real .epro was on disk when it was "
-            "written, so key names and the 0.01-inch unit stay unverified and every "
-            "apply answers unit_verified=false. A real file closes that with "
-            "board_fidelity(key_inventory)",
+            "LCEDA Pro write path: the record layout, the mil unit and the "
+            "'a save rewrites one member' shape are measured against the 194 .epro "
+            "archives in LCEDA-Pro/projects-recovery, and the gates prove the bytes. "
+            "What is NOT claimed: that the application accepts a written file - no "
+            "written archive was re-opened in LCEDA Pro, so every apply says so in "
+            "not_verified. Appending a record the vendor was never seen writing is "
+            "reported as verified_by_app=false",
             "Schematic editing in either EDA (this server writes boards, not sheets)",
             "EasyEDA Pro live API drive (websocket gateway on 49620-49629): the port is "
             "only opened after the user enables 外部交互权限, and no client is implemented",
@@ -681,10 +685,12 @@ def _capabilities(_args):
                         "identical plotted Gerbers, identical positions after a round "
                         "trip; the sample board itself is now validated by KiCad (an "
                         "invalid sample was the first thing this check caught)",
-            "adapters": "SYNTHETIC boards only - no real .epro/.kicad_pcb was available "
-                        "when this was written, so payload key names and the 0.01-inch "
-                        "unit are unverified (board_summary.source says so); "
-                        "board_fidelity(key_inventory) on a real .epro closes that",
+            "adapters": "the LCEDA Pro record map, arities and the mil unit are "
+                        "measured: 194 real .epro archives re-read, a byte-identical "
+                        "repack of every one of them, unit proof from RULE viaSize "
+                        "(9.8425 mil = 0.25 mm) and from 9874 pads whose copper "
+                        "endpoints land on the predicted positions (54.1% exact, the "
+                        "rest unrouted). KiCad side is proven against kicad-cli 10.0.7",
             "desktop": "real install: LCEDA Pro 4.1.60 and KiCad 10.0.7 both detected by "
                        "drive scan; window-title parsing unit-tested, live open confirmed "
                        "only for KiCad's argv form",
@@ -952,16 +958,27 @@ def _board_ops(_args):
                                           "reports); written as a KiCad tree and then "
                                           "re-judged by kicad-cli"},
                 "epro": {"operations": _edit.describe_epro_ops(),
-                         "coordinates": "the file's own payload values are passed "
-                                        "through untouched - no unit is converted, so "
-                                        "unit_verified stays false until a real .epro "
-                                        "confirms it",
-                         "write_shape": "append-only: a change is a new line with a "
-                                         "higher ticket, never an edited line"},
+                         "coordinates": "arguments are millimetres; the file stores mil "
+                                        "(0.0254 mm, measured - the RULE labels say mm "
+                                        "but the numbers are mil). One conversion "
+                                        "point, in the writer",
+                         "write_shape": "a real save rewrites ONE member in place (the "
+                                        "PCB/<uuid>.epcb record stream) and leaves the "
+                                        "other 129 members byte-identical; measured by "
+                                        "comparing two consecutive saves. So a plan "
+                                        "rewrites one member, and six gates prove "
+                                        "nothing else moved",
+                         "read_only_here": ".eprj/.eprj2 (SQLite) is refused with "
+                                           "WRITE_UNSUPPORTED_FORMAT: the board row sits "
+                                           "beside projects.ticket / g_ticket and "
+                                           "encrypted history_data, and an UPDATE that "
+                                           "does not advance them is exactly the change "
+                                           "the application can treat as stale"},
             },
             "protocol": "board_propose -> read the digest -> board_apply(confirm=true)",
-            "format_detection": "by content: 'PK' = .epro, '(kicad_pcb' = KiCad. The "
-                                "file name is never trusted",
+            "format_detection": "by content: 'PK' = .epro container, 'SQLite format 3' "
+                                "= .eprj/.eprj2 project, '(kicad_pcb' = KiCad. The file "
+                                "name is never trusted",
             "note": "every operation is all-or-nothing inside one proposal"}
 
 def _board_propose(args):

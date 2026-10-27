@@ -284,6 +284,28 @@ def selftest():
         check("board_restore returns the exact bytes",
               back.get("status") == "ok" and restored == untouched,
               str(back.get("status")))
+
+        r = handle({"jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                    "params": {"name": "board_ops", "arguments": {}}})
+        catalogue = json.loads(r["result"]["content"][0]["text"])
+        epro_ops = ((catalogue.get("by_format") or {}).get("epro") or {}).get(
+            "operations") or []
+        check("board_ops advertises the 6 .epro operations",
+              len(epro_ops) == 6, ",".join(o["op"] for o in epro_ops))
+
+        junk = os.path.join(tmp, "not-a-project.epcb")
+        with open(junk, "wb") as fh:
+            fh.write(b"neither a zip nor kicad\n")
+        r = handle({"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                    "params": {"name": "board_propose", "arguments": {
+                        "path": junk,
+                        "operations": [{"op": "set_text", "id": "s1",
+                                        "text": "SELFTEST"}]}}})
+        refused = json.loads(r["result"]["content"][0]["text"])
+        check("an unreadable file is refused, not guessed",
+              refused.get("status") == "error"
+              and refused.get("reason_code") == "FORMAT_NOT_SUPPORTED",
+              str(refused.get("reason_code")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

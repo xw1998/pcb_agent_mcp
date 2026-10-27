@@ -8,8 +8,10 @@ Two very different file formats, one protocol:
     list_checkpoints / restore_checkpoint / find_checkpoint
 
 The format is decided by *content*, never by the file name: `PK` is an `.epro`
-(ZIP container, append-only log inside) and `(kicad_pcb` / `(kicad_sch` is KiCad.
-A `.epro` rename to `.kicad_pcb` therefore cannot smuggle itself in as KiCad.
+(a ZIP container whose member ``PCB/<uuid>.epcb`` holds the board's record
+stream), `SQLite format 3`` is an `.eprj`/`.eprj2` project (read-only here) and
+`(kicad_pcb` / `(kicad_sch` is KiCad. A rename therefore cannot smuggle one
+format in as another.
 
 Nothing in here ever deletes a file, and nothing ever writes beside a project
 except the same-volume temp file inside `fsutil.atomic_write`, which lives for
@@ -52,12 +54,18 @@ def describe_ops():
 
 
 def describe_epro_ops():
-    """The `.epro` operation catalogue (append-only log operations)."""
+    """The `.epro` operation catalogue (record-stream operations)."""
     return epro_edit.describe()
 
 
 def detect_format(path):
-    """'kicad' | 'epro' | None, decided by the bytes at the head of the file."""
+    """'kicad' | 'epro' | None, decided by the bytes at the head of the file.
+
+    ``epro`` covers both LCEDA Pro containers: the ZIP (``.epro``) and the
+    SQLite project (``.eprj``/``.eprj2``). The SQLite one is readable but the
+    write path refuses it (``WRITE_UNSUPPORTED_FORMAT``) - see
+    ``epro_edit.SQLITE_REFUSED`` for why.
+    """
     try:
         with open(path, "rb") as fh:
             head = fh.read(4096)
@@ -68,13 +76,17 @@ def detect_format(path):
     stripped = head.lstrip(b"\xef\xbb\xbf \t\r\n")
     if stripped.startswith(b"(kicad_pcb") or stripped.startswith(b"(kicad_sch"):
         return "kicad"
+    if head.startswith(b"SQLite format 3"):
+        return "epro"
     return None
 
 
 def propose(path, operations, options=None):
     """Plan a change to either format. Writes nothing, in either branch."""
     options = options or {}
-    fmt = options.get("format") or detect_format(path) if path else None
+    fmt = options.get("format")
+    if fmt is None and path:
+        fmt = detect_format(path)
     if fmt == "epro":
         return epro_edit.propose(path, operations, options)
     if fmt is None and path and os.path.isfile(path):

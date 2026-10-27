@@ -6,6 +6,7 @@ project exported with the wrong suffix must not silently parse as the wrong kind
 import zipfile
 
 from . import canonical, epro, kicad_pcb
+from ..fidelity import eproj_doc
 
 FORMATS = {
     "kicad_pcb": {
@@ -19,15 +20,20 @@ FORMATS = {
                                   "custom DRC rules (in .kicad_dru, text only)"],
     },
     "easyeda_epro": {
-        "extensions": [".epro"],
-        "kind": "zip container",
+        "extensions": [".epro", ".eprj", ".eprj2"],
+        "kind": "zip container (.epro) or sqlite project (.eprj/.eprj2)",
         "writable": False,
-        "facts": ["footprints", "pads", "tracks", "vias", "nets", "pour regions",
-                  "rules (ruleType 1/3)"],
-        "not_carried_in_format": ["stackup thickness/er unless filled in the layer manager",
-                                  "pour fill result (separate *.ecop member)"],
-        "caveats": ["append-only log: highest ticket wins, empty payload = delete",
-                    "unit is 0.01 inch", "Y axis grows down"],
+        "facts": ["footprints", "pads (shape, hole, corner radius, polygon)",
+                  "tracks", "vias", "nets", "pours and fills",
+                  "keepout regions", "rules", "stackup", "texts",
+                  "library footprint definitions"],
+        "not_carried_in_format": ["per-pad mask/paste expansion (mapping unverified)",
+                                  "3D bodies (SHELL/BOSS records, not evaluated)"],
+        "caveats": ["record stream: one JSON array per line, documents split by DOCTYPE",
+                    "coordinates and sizes are mil (0.0254 mm); CANVAS/RULE unit "
+                    "labels are display units only",
+                    "y is not inverted in the file",
+                    "a hand-drawn board edge may not close: reported as open chains"],
     },
 }
 
@@ -49,6 +55,8 @@ def detect_format(path):
         return "unknown"
     if head.startswith(b"(kicad_pcb"):
         return "kicad_pcb"
+    if eproj_doc.looks_like_eproj(path):
+        return "easyeda_epro"      # same format, sqlite container
     return "unknown"
 
 

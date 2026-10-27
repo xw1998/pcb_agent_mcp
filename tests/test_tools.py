@@ -117,20 +117,19 @@ class TestBoardToolsAreReadOnly(unittest.TestCase):
         self.assertEqual(os.stat(SAMPLE).st_mtime_ns, mtime)
 
     def test_epro_inspect_leaves_the_archive_untouched(self):
-        tmp = tempfile.mkdtemp()
-        path = os.path.join(tmp, "demo.epro")
-        with zipfile.ZipFile(path, "w") as zf:
-            zf.writestr("project.json", "{}")
-            zf.writestr("demo.epcb", json.dumps(
-                {"type": "NET", "id": "n1", "ticket": 1}) + "||" + '{"name":"GND"}\n')
+        # 归档必须是实测出来的真实形状（JSONL 记录流 + project.json），
+        # 旧版自造的 "||" + ticket 格式现在会被 LcedaError 拒收 —— 这是有意的。
+        import _lceda_fixtures as fx
+        path = fx.write_epro()
         before = _sha256(path)
         try:
             r = tools.call_tool("epro_inspect", {"path": path})
             self.assertEqual(r["status"], "ok")
             self.assertEqual(_sha256(path), before)
+            self.assertIn("members", r)
         finally:
             import shutil
-            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
     def test_board_tools_never_create_a_missing_file(self):
         missing = os.path.join(tempfile.gettempdir(), "definitely_missing_%d.kicad_pcb"

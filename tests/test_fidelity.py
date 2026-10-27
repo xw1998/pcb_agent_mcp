@@ -12,20 +12,27 @@ pad sizes, net classes), and - the real proof - KiCad itself plots the original
 and the re-emitted board to the same Gerbers. The last test is the anti-false-
 green check: drop one node on purpose and the engine comparison must fail.
 """
+import hashlib
 import io
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 import zipfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))
+sys.path.insert(0, _HERE)
 
 from pcb_agent_mcp import fidelity                          # noqa: E402
-from pcb_agent_mcp.fidelity import engine, sexpr as S        # noqa: E402
+from pcb_agent_mcp.fidelity import engine, epro_doc, sexpr as S  # noqa: E402
 from pcb_agent_mcp.fidelity.epro_doc import EproDocument      # noqa: E402
 from pcb_agent_mcp.fidelity.kicad_doc import KiCadDocument    # noqa: E402
 from pcb_agent_mcp.fidelity.views import INTERPRETED_HEADS, BoardView  # noqa: E402
+
+import _lceda_fixtures as _fx                              # noqa: E402
 
 SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
                       "sample.kicad_pcb")
@@ -178,74 +185,98 @@ class TestViewsReadStoredValues(unittest.TestCase):
 
 
 # --------------------------------------------------------------- epro
-def _epro_bytes():
-    """A tiny but realistic .epro: append-only log with a delete and a re-ticket."""
-    lines_pcb = [
-        '{"type":"NET","id":"n1","ticket":1}||{"netName":"GND"}',
-        '{"type":"NET","id":"n1","ticket":2}||{"netName":"GND","color":"#ff0000"}',
-        '{"type":"COMPONENT","id":"c1","ticket":1}||{"designator":"R1","x":100,"y":200}',
-        '{"type":"COMPONENT","id":"c1","ticket":2}||{"designator":"R1","x":120,"y":200}',
-        '{"type":"PAD","id":"p1","ticket":1}||{"parentId":"c1","number":"1","x":110,"y":200}',
-        '{"type":"VIA","id":"v1","ticket":1}||{"x":300,"y":400}',
-        '{"type":"VIA","id":"v1","ticket":2}||{}',
-        '{"type":"ZZZ_FUTURE","id":"z1","ticket":1}||{"whatever":1}',
-        'not a json line at all',
-    ]
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("project.json", json.dumps({"name": "demo"}))
-        zf.writestr("demo.epcb", "\n".join(lines_pcb) + "\n")
-        zf.writestr("demo.eblob", b"\x00\x01\x02binary")
-    return buf.getvalue()
+# The sample is `tests/_lceda_fixtures.py`, built from the format that was
+# measured on disk (docs/13): a ZIP of record-stream members, mil units,
+# `project.json` holding the only human-readable names.
+def _epro_path(tag="closed"):
+    return _fx.write_epro(name="t_%s.epro" % tag, outline=tag)
 
 
 class TestEproDocument(unittest.TestCase):
+    """`.epro` is a revision container: every member carried, byte for byte."""
 
     def setUp(self):
-        self.doc = EproDocument.from_bytes(_epro_bytes(), path="<memory>")
+        self.dir = tempfile.mkdtemp(prefix="epro_t_")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = _fx.write_epro(directory=self.dir)
+        self.doc = EproDocument.from_path(self.path)
 
     def test_every_member_is_kept(self):
-        self.assertEqual(sorted(self.doc.names()),
-                         ["demo.eblob", "demo.epcb", "project.json"])
-        self.assertEqual(self.doc.entry_bytes("demo.eblob"), b"\x00\x01\x02binary")
+        names = self.doc.names()
+        self.assertIn("project.json", names)
+        self.assertIn("PCB/%s.epcb" % _fx.PCB_UUID, names)
+        self.assertIn("FOOTPRINT/%s.efoo" % _fx.FP_UUID, names)
+        self.assertEqual(self.doc.entry_bytes("PCB/"), b"")
+        self.assertEqual(json.loads(self.doc.entry_bytes("project.json"))["pcbs"],
+                         {_fx.PCB_UUID: "PCB1_1"})
+
+    def test_stream_members_are_the_ones_with_a_stream_extension(self):
+        self.assertEqual(self.doc.stream_names(),
+                         ["PCB/%s.epcb" % _fx.PCB_UUID,
+                          "FOOTPRINT/%s.efoo" % _fx.FP_UUID,
+                          "SHEET/%s/1.esch" % _fx.SCH_UUID])
 
     def test_roundtrip_is_byte_identical(self):
-        r = self.doc.verify()
-        self.assertTrue(r["byte_identity"], r)
-        self.assertTrue(all(m["byte_identity"] and m["state_idempotent"]
-                            for m in r["members"].values()))
+        report = self.doc.verify()
+        self.assertTrue(report["ok"], report)
+        for member in report["members"]:
+            self.assertTrue(member["verbatim"], member)
+            self.assertEqual(member["n_other"], 0, member)
+        with open(self.path, "rb") as fh:
+            original = fh.read()
+        self.assertEqual(hashlib.sha256(self.doc.to_bytes()).hexdigest(),
+                         hashlib.sha256(original).hexdigest())
 
-    def test_highest_ticket_wins(self):
-        live = {r["id"]: r for r in self.doc.live("demo.epcb")}
-        self.assertEqual(live["n1"]["payload"]["color"], "#ff0000")
-        self.assertEqual(live["c1"]["payload"]["x"], 120)
+    def test_one_member_holds_two_documents(self):
+        kinds = [(name, d.kind) for name, d in self.doc.documents()]
+        self.assertEqual(kinds, [
+            ("PCB/%s.epcb" % _fx.PCB_UUID, "FOOTPRINT"),
+            ("PCB/%s.epcb" % _fx.PCB_UUID, "PCB"),
+            ("FOOTPRINT/%s.efoo" % _fx.FP_UUID, "FOOTPRINT"),
+            ("SHEET/%s/1.esch" % _fx.SCH_UUID, "SCH"),
+        ])
 
-    def test_empty_payload_means_deleted_and_is_recorded(self):
-        live = {r["id"]: r for r in self.doc.live("demo.epcb")}
-        self.assertNotIn("v1", live)
-        gone = {r["id"]: r for r in self.doc.deleted("demo.epcb")}
-        self.assertIn("v1", gone)
-        self.assertTrue(gone["v1"]["deleted"])
+    def test_project_index_joins_boards_to_pcbs(self):
+        project = self.doc.project()
+        self.assertEqual(sorted(project), ["boards", "config", "devices",
+                                           "footprints", "panels", "pcbs",
+                                           "schematics", "symbols"])
+        board = self.doc.boards()[0]
+        self.assertEqual(board["name"], "Board1_1")
+        self.assertEqual(board["pcb_uuid"], _fx.PCB_UUID)
+        self.assertEqual(board["schematic_uuid"], _fx.SCH_UUID)
+        self.assertEqual(board["member"], "PCB/%s.epcb" % _fx.PCB_UUID)
+        self.assertTrue(board["in_project_index"])
 
-    def test_unknown_type_is_carried_not_dropped(self):
-        seen = self.doc.known_types_seen()
-        self.assertEqual(seen["not_in_known_types"], {"ZZZ_FUTURE": 1})
+    def test_adding_a_revision_keeps_the_old_members_untouched(self):
+        """What the editor does on save: a new member plus a project.json edit."""
+        new_name = "PCB/%s.epcb" % ("f" * 32)
+        text = _fx.pcb_member_text()
+        project = json.loads(self.doc.entry_bytes("project.json"))
+        project["pcbs"]["f" * 32] = "PCB1_1"
+        blob = self.doc.to_bytes({new_name: text,
+                                  "project.json": json.dumps(project)})
+        out = os.path.join(self.dir, "new.epro")
+        with open(out, "wb") as fh:
+            fh.write(blob)
+        after = EproDocument.from_path(out)
+        for name in self.doc.names():
+            if name == "project.json":
+                continue
+            self.assertEqual(after.entry_bytes(name), self.doc.entry_bytes(name),
+                             name)
+        self.assertEqual(after.entry_bytes(new_name).decode("utf-8"), text)
+        self.assertIn("f" * 32, after.project()["pcbs"])
 
-    def test_unparsable_line_is_reported(self):
-        bad = self.doc.unparsed("demo.epcb")
-        self.assertEqual(len(bad), 1)
-        self.assertIn("not a json line", bad[0][3])
-
-    def test_key_inventory_turns_guessing_into_reading(self):
-        inv = self.doc.key_inventory("demo.epcb")
-        self.assertEqual(sorted(inv["COMPONENT"]["keys"].keys()), ["designator", "x", "y"])
-        self.assertEqual(inv["COMPONENT"]["keys"]["x"]["sample"], 100)
-        self.assertEqual(inv["COMPONENT"]["objects"], 2)
-
-    def test_stats_accounts_for_every_line(self):
-        st = self.doc.stats()
-        self.assertEqual(st["lines_total"], 10)   # 9 log lines + project.json
-        self.assertEqual(st["lines_unparsed"], 1)
+    def test_sniff_reads_content_not_extension(self):
+        self.assertTrue(epro_doc.sniff(self.path))
+        plain = os.path.join(self.dir, "not_a_zip.epro")
+        with open(plain, "w", encoding="utf-8") as fh:
+            fh.write("this is not a zip\n")
+        self.assertFalse(epro_doc.sniff(plain))
+        self.assertFalse(epro_doc.looks_like_epro(plain))
+        with self.assertRaises(epro_doc.EproError):
+            EproDocument.from_path(plain)
 
 
 # --------------------------------------------------------------- engine

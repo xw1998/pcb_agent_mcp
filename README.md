@@ -2,25 +2,27 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.4.0` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.5.0` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（见 [docs/13](docs/13-立创实测-真实存储与记录格式.md)），不再有「按格式文档推的假设」。
 
 | 层 | 做什么 | 状态 |
 |---|---|---|
 | **Calc** | 无板子的工程计算（载流/阻抗/差分阻抗/λ/20/爬电） | 已实现 |
 | **Fidelity** | 把整份板文件**转换**成 AI 可读的表达：每个节点都进树，事实从树里读，往返由 KiCad 自己验证 | 已实现（KiCad 侧已被 kicad-cli 判决） |
-| **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（**仅用合成样本验证过**，见下） |
+| **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（KiCad 侧合成样本；立创侧在 194 个真实归档上实测） |
 | **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积） | 已实现 |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
-| **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 五道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 仅合成样本） |
+| **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 六道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 实测口径＝原地重写一个成员） |
 
 写路径的三条硬规则：**提案不落盘**（plan 单次使用、1 小时过期）；**落盘要 `confirm=true`**；
-**闸门不信任写代码本身**——盘上字节、重新解析的树的 token 双射、每条 op 的后置条件、
-`kicad-cli` 的 stats/Gerber/贴片坐标比对、以及 **DRC 差集**（新增违规就拦下并回滚）。
-这套闸门在自造示例板上真拦下过三次错（丝印压板边、悬空走线、悬空过孔）。
+**闸门不信任写代码本身**——KiCad 侧是盘上字节、token 双射、每条 op 的后置条件、`kicad-cli` 的
+stats/Gerber/贴片坐标比对、以及 **DRC 差集**（新增违规就拦下并回滚）；立创侧是写盘字节、其他成员
+逐字节不变、未点名行不变、流仍可解析、改动恰好等于计划、重新解析后事实成立。
+KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板边、悬空走线、悬空过孔）。
 
 > 设计文档在 [`docs/`](docs/)，按编号顺序读：
 > `00` 调研与架构 → `05` 无损转化架构总纲 → `06` 存储形式与信息传递 → `07` 自研定位与风险分期
-> → `08` PCB 设计流程与工具映射 → `09` 布局方法论补强与标准冲突。
+> → `10` 桌面控制与双栈读路径 → `11` 保真层 → `12` 写路径 → `13` 立创实测（真实存储与记录格式）。
 
 ## 为什么不是"又一个图元 MCP"
 
@@ -84,7 +86,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | tool | 作用 | 关键约束 |
 |---|---|---|
 | `calc_capabilities` | 自述：能算什么 / 拒算什么及原因 / 还没做什么 | 建议先调它 |
-| `unit_convert` | 单位换算，含立创内部单位 `0.01inch` | 未知单位 `UNIT_UNKNOWN` |
+| `unit_convert` | 单位换算（立创实测存 **mil**，标签只是显示单位） | 未知单位 `UNIT_UNKNOWN` |
 | `width_for_current` | 电流 → 线宽（IPC-2221 反解） | 必须传 `standard`；ΔT≤0 拒绝 |
 | `current_capacity` | 线宽 → 载流 | 开窗时只取下界，不计锡层 |
 | `via_current_allowed` | 过孔载流（桶壁侧面积折算） | 标注 `not_standard_defined`，±30% |
@@ -108,7 +110,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_drc` | **判决**：跑 KiCad 自己的 DRC 引擎，回违规项（按严重级/类型）+ 未连接项 | 立创无命令行 → 明确拒绝给判决，不近似 |
 | `board_stats` | **判决**：KiCad 自己的板统计（尺寸/面积/正反铜面积含铺铜/板厚/最小线宽与孔径） | 只读 |
 | `epro_inspect` | 不解译地列出 `.epro` 成员/类型计数/原始 key 名 | 用来"关掉未知字段"，而不是猜字段名 |
-| `board_ops` | 写路径的操作目录（KiCad 24 个 / `.epro` 3 个）+ 参数 + 它影响板子的哪一部分 | 调 `board_propose` 前先看它 |
+| `board_ops` | 写路径的操作目录（KiCad 24 个 / `.epro` 6 个）+ 参数 + 它影响板子的哪一部分 | 调 `board_propose` 前先看它 |
 | `board_create` | 造一块新的空板（叠层/规则/闭合板框），写完再问 KiCad：板框闭合吗、DRC 干净吗 | 任一为否就删掉文件而不是留个“看着像板”的东西 |
 | `board_propose` | 只算不写：plan_id、改前/改后 digest、每条 op 将被检查的后置条件、blocking | 按**内容**判格式（`PK` = `.epro`） |
 | `board_apply` | 落盘：checkpoint → 原子写 → 五道闸门 → 不过就回滚回原字节 | 必须 `confirm=true`；plan 单次使用 |
@@ -128,7 +130,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.4.0
+python run_server.py --version       # 0.5.0
 python run_server.py --selftest      # 协议级自检，23/23（含写路径端到端）
 python -m unittest discover -s tests # 202 个用例（约 11 分钟：kicad-cli 单次 DRC ≈ 90 s）
 python run_server.py                 # 起 stdio MCP 服务
@@ -161,28 +163,29 @@ MCP 客户端配置（stdio）：
 - **V2** ✅ KiCad 写路径：`propose → apply`，五道闸门（字节 / token 双射 / 后置条件 /
   kicad-cli 比对 / DRC 差集），checkpoint 与回滚；`examples/build_demo_board.py` 自造一块
   60×40 四层板并用 kicad-cli 判决。
-- **V3** ✅ 立创写路径：追加式日志（ticket 递增、旧字节必须是新字节的前缀、其它 ZIP 成员
-  逐字节不变）、`key_inventory` 先验键名（`KEY_NOT_IN_FILE`）、`unit_verified` 如实报 false。
-  仅用合成 `.epro` 验证——真实文件待用户环境接入。
+- **V3** ✅ 立创写路径：**原地重写一个成员**（实测：同一工程两次保存只改一个 `.epcb`，129 个成员
+  字节全同）、六道闸门（写盘字节 / 其他成员 / 未点名行 / 流可解析 / 改动是计划的 / 重新解析后的
+  事实）。单位实测为 **恒 mil**（标签只是显示单位），不做任何换算；SQLite 格式的 `.eprj2` 只读拒写。
+  六条 op：`move_component` / `set_track` / `set_via` / `set_text` / `set_pad_net` / `delete_record`。
 
 双栈必须同时在场：**单端开发永远发现不了适配层设计错了。**
 
 ## 已知未实现 / 已打折扣的地方（诚实清单）
 
-- **没有一个真实工程被解析过。** 这台机器上没有 `.epro` 也没有真实 `.kicad_pcb`，所以两个
-  Adapter 全部用**合成样本**测试。具体后果：`.epro` 的 payload key 名（候选表 `CANDIDATES`）和
-  "内部单位 0.01 inch" 都还只是按格式文档写下的假设，`board_summary` 的 `source` 里会如实写
-  `unit_verified: false`。拿到真实工程后先跑 `board_fidelity`（`key_inventory` 会把真实键名读出来），
-  再按实际键名补候选表——这样"猜"变成"读"。
+- **立创侧已实测，KiCad 侧仍是合成样本。** 立创的存储形式、单位、记录布局、保存行为、焊盘网络行
+  都在 194 个真实 `.epro` 归档上核过（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；KiCad 侧
+  只有 `tests/data/sample.kicad_pcb`，因此 `.kicad_pcb` 的少见语法仍可能没被覆盖到。
 - **合成样本曾经连 KiCad 都不认。** 保真层的第一个产出就是抓到这件事（`(dnp)` 裸写等三处非法语法）。
   现在 `tests/data/sample.kicad_pcb` 是 v7 合法文件，且每轮被 `kicad-cli` 验证。
 - **推导仍然存在，但已被点名。** `board_clearance` / `free_space` / `pour_connectivity` /
   `cross_split` / `loop_area` 是本服务自己算的几何量，答案里带 `authoritative: false` 和
   `verdict_available_from: board_drc`——测量不是判决。
-- **立创写路径只用合成样本验证过。** 真实 `.epro` 落到这台机器之前，键名与“0.01 inch 单位”
-  仍是未证假设，所以每次 `board_apply` 都回 `unit_verified: false`，且写路径**不做任何坐标换算**。
-  拿到真实文件后跑 `board_fidelity` 的 `key_inventory` 就能把假设变成事实。
-- **不写原理图。** 两个 EDA 的原理图都不在写路径上（只写了板）。
+- **立创侧还剩两处非实测。** ① 元件焊盘位置＝库封装 + 旋转/镜像变换推导（54.1% 铜端点命中率，
+  见 docs/13 §6，底面镜像只有弱证据 35.1%）；② `set_pad_net` 追加一行 `PAD_NET` 时，第 5 字段
+  按「封装文档里该焊盘号的每个 PAD 对象各写一行」——8159/8159 指向同号对象是实测量，但**从未观察到
+  应用自己写这一行**，所以结果标 `verified_by_app: false`。
+- **SQLite 格式（`.eprj2`）只读。** 能打开、能算度量，但写路径直接拒绝（`WRITE_UNSUPPORTED_FORMAT`）：
+  `history_data` 加密、`ticket` 单调，任何手改都可能让工程打不开。- **不写原理图。** 两个 EDA 的原理图都不在写路径上（只写了板）。
 - 立创 Pro 的实时 API（websocket 网关 49620-49629）只做端口探测，**没有实现客户端**；而且它只有
   用户手动打开「外部交互权限」后才会监听。
 - `app_open_project` 的立创命令行形式 `lceda-pro.exe <工程.epro>` **未在真机确认**（返回里
@@ -205,7 +208,7 @@ pcb_agent_mcp/
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
 │   │   ├── checks.py             # 板框闭合/越界/铜间距/digest
 │   │   ├── plan.py               # propose / apply / create_board / checkpoint
-│   │   ├── epro_edit.py          # .epro 追加式日志写（ticket 递增、只 appending）
+│   │   ├── epro_edit.py          # .epro 写：6 op、原地重写一个成员、六道闸门、行级 diff
 │   │   └── fsutil.py             # 原子写（同卷临时文件 + fsync + os.replace）
 │   ├── desktop.py                # Desktop 层：ctypes 探测/启动/关闭/开工程（不碰文件）
 │   ├── oracle.py                 # Oracle 层：只读度量，缺事实就拒绝回答
@@ -213,17 +216,19 @@ pcb_agent_mcp/
 │   ├── fidelity/                 # 保真层：整份文档进树，事实从树里读
 │   │   ├── sexpr.py              # 无损 S 表达式（保留原子拼写/引号/转义）
 │   │   ├── kicad_doc.py          # 整棵 (kicad_pcb ...) + token 双射自证 + 覆盖报告
-│   │   ├── epro_doc.py           # 整个 ZIP：每个成员/每行日志/ticket/删除都保留
+│   │   ├── epro_doc.py           # 整个 ZIP：每个成员、每行记录、成员顺序都保留，可逐字节重打包
+│   │   ├── lceda.py              # 立创记录流：行/终止符/标签表/单位（恒 mil）、append_record
+│   │   ├── eproj_doc.py          # SQLite 工程（.eprj/.eprj2）：只读打开，写一律拒绝
 │   │   ├── views.py              # 事实投影，每条记录带 raw
 │   │   └── engine.py             # 裁判：kicad-cli 的 DRC / stats / Gerbers / pos
 │   ├── adapters/                 # Adapter 层：两份格式 → 一个 Canonical
 │   │   ├── canonical.py          # 唯一真值容器 + present/absent 记账
 │   │   ├── kicad_pcb.py          # S-expr 解析、Edge.Cuts 轮廓、叠层、工程规则
-│   │   ├── epro.py               # ZIP + append-only JSONL、ticket 覆盖、0.01in→mm
+│   │   ├── epro.py               # ZIP 内记录流；单位恒 mil→mm；自由焊盘与封装焊盘分开报
 │   │   └── __init__.py           # 按内容嗅探格式并分发
 │   └── calc/                     # Calc 层（纯算术，不读文件、不联网）
 │       ├── result.py             # 统一信封：basis/precision 强制
-│       ├── units.py              # 含立创内部单位 0.01inch
+│       ├── units.py              # mil/mm/inch；立创实测存 mil，0.01in 仅兼容别名
 │       ├── current.py            # IPC-2221 载流正/反解 + 过孔
 │       ├── impedance.py          # 微带/带状线正/反解 + 有效区间护栏
 │       ├── diffpair.py           # 边耦合差分阻抗正/反解
@@ -231,9 +236,9 @@ pcb_agent_mcp/
 │       └── creepage.py           # 爬电/间隙，fail-closed
 ├── data/
 │   └── creepage_tables.json      # 空表 + verified:false（故意不填）
-├── tests/                        # 143 个用例（含"解析前后 sha256 不变"与"裁判有牙"）
+├── tests/                        # 251 个用例（含"解析前后 sha256 不变"、"闸门有牙"与真实归档形状）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~11，建议按编号顺序读
+└── docs/                         # 设计文档 00~13，建议按编号顺序读
 ```
 
 ## 免责声明

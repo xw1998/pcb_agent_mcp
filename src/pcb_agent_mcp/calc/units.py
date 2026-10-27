@@ -1,6 +1,9 @@
 """Length unit conversion.
 
-EasyEDA Pro uses 0.01 inch internally; KiCad uses mm (nm internally).
+EasyEDA Pro stores numbers in **mil** (measured on 194 real `.epro` archives: `viaSize`
+reads 9.8425 mil for "0.25 mm" - the unit label in the file is display-only). The
+`0.01inch` alias is kept because it is the value EasyEDA's docs and older builds
+assumed; it is *not* what current files contain. KiCad uses mm (nm internally).
 A silent 25.4x error passes every DRC, so this must be an explicit tool.
 """
 
@@ -13,7 +16,7 @@ TO_MM = {
     "thou": 0.0254,
     "inch": 25.4,
     "in": 25.4,
-    "0.01inch": 0.254,   # EasyEDA Pro internal unit
+    "0.01inch": 0.254,   # legacy assumption - real files store mil (see docs/13)
     "0.01in": 0.254,
 }
 

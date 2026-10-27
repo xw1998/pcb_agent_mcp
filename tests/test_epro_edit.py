@@ -1,243 +1,414 @@
 """Tests for the LCEDA Pro (`.epro`) write path.
 
-These run against a SYNTHETIC archive on purpose: no real `.epro` was on disk
-when the writer was written, and pretending otherwise would be the exact kind of
-false green this project exists to avoid. What can be tested without a real file
-is tested hard:
+The fixtures are built by `_lceda_fixtures`, which synthesises the **measured**
+member layout and record arities (docs/13): a ZIP with ``PCB/<uuid>.epcb``,
+``FOOTPRINT/<uuid>.efoo`` and a ``project.json``, records in mil with the real
+field order. The tests never touch a real project - the reviewer's boards are
+only ever read.
 
-* the log is only ever **appended** to (the old bytes are a prefix of the new);
-* the **ticket** rises above every ticket already in the member (a smaller one is
-  ignored by the application in silence - no error, no change);
-* **every other ZIP member** stays byte-identical (a rebuilt `.ecop` would change
-  the copper-pour fill while still looking valid);
-* a **key name the file never showed** is refused, because EasyEDA Pro ignores an
-  unknown key silently;
-* `unit_verified` is reported as false, never as a pass.
+What is asserted here is the shape of the promise, not just "it returned ok":
+
+* proposing writes **nothing** (the archive's sha256 is unchanged);
+* applying changes **one member** and leaves every other member byte-identical;
+* every line whose bytes changed is a line the operation **named**, and every
+  other line kept its bytes (the `rows_untouched` / `diff_is_intended` gates);
+* each operation's promise is **re-read out of the written file** by the
+  adapter (`reparsed`), not taken from the in-memory plan;
+* what cannot be derived from the file is **refused** (`NET_NOT_FOUND`,
+  `LAYER_NOT_FOUND`, `PAD_OBJECT_UNKNOWN`, `WRITE_UNSUPPORTED_FORMAT`).
 """
-import io
+import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 import zipfile
 
+import _lceda_fixtures as _fx
+
 from pcb_agent_mcp.edit import epro_edit as X
-from pcb_agent_mcp.edit import plan as P
-from pcb_agent_mcp.fidelity.epro_doc import EproDocument
+from pcb_agent_mcp.fidelity import epro_doc
+from pcb_agent_mcp.fidelity import lceda
 
-def epro_bytes():
-    """Same shape as the fidelity sample: NET, COMPONENT, PAD, a deleted VIA."""
-    lines_pcb = [
-        '{"type":"NET","id":"n1","ticket":1}||{"netName":"GND"}',
-        '{"type":"NET","id":"n1","ticket":2}||{"netName":"GND","color":"#ff0000"}',
-        '{"type":"COMPONENT","id":"c1","ticket":1}||{"designator":"R1","x":100,"y":200}',
-        '{"type":"COMPONENT","id":"c1","ticket":2}||{"designator":"R1","x":120,"y":200}',
-        '{"type":"PAD","id":"p1","ticket":1}||{"parentId":"c1","number":"1","x":110,"y":200}',
-        '{"type":"VIA","id":"v1","ticket":2}||{}',
-        'not a json line at all',
-    ]
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("project.json", json.dumps({"name": "demo"}))
-        zf.writestr("demo.epcb", "\n".join(lines_pcb) + "\n")
-        zf.writestr("demo.eblob", b"\x00\x01\x02binary")
-    return buf.getvalue()
 
-class EproTestBase(unittest.TestCase):
+def _sha(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def _members(path):
+    with zipfile.ZipFile(path) as zf:
+        return {name: hashlib.sha256(zf.read(name)).hexdigest()
+                for name in zf.namelist()}
+
+
+def _records(path, tag):
+    """The records of one tag, read straight out of the file (not via the plan)."""
+    with zipfile.ZipFile(path) as zf:
+        name = [n for n in zf.namelist() if n.lower().endswith(".epcb")][0]
+        text = zf.read(name).decode("utf-8")
+    out = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith('["%s"' % tag):
+            out.append(json.loads(line))
+    return out
+
+
+class _Case(unittest.TestCase):
+    """One synthetic archive per test, in a temp dir (never beside a project)."""
+
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="pcbepro-")
-        self._home = os.environ.get("PCB_AGENT_HOME")
-        os.environ["PCB_AGENT_HOME"] = os.path.join(self.tmp, "home")
-        self.path = os.path.join(self.tmp, "demo.epro")
-        self.original = epro_bytes()
-        with open(self.path, "wb") as fh:
-            fh.write(self.original)
+        self.dir = tempfile.mkdtemp(prefix="epro_edit_")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = _fx.write_epro(self.dir, "board.epro")
 
-    def tearDown(self):
-        if self._home is None:
-            os.environ.pop("PCB_AGENT_HOME", None)
-        else:
-            os.environ["PCB_AGENT_HOME"] = self._home
-        P.PLANS.clear()
-        shutil.rmtree(self.tmp, ignore_errors=True)
+    def propose(self, ops, **options):
+        return X.propose(self.path, ops, options or None)
 
-    def read(self):
-        with open(self.path, "rb") as fh:
-            return fh.read()
+    def apply(self, ops, **options):
+        plan = self.propose(ops, **options)
+        self.assertEqual(plan["status"], "ok", plan["blocking"])
+        result = X.apply_plan(plan["plan_id"], confirm=True)
+        self.assertEqual(result["status"], "ok")
+        return result
 
-    def doc(self):
-        return EproDocument.from_bytes(self.read(), self.path)
+    def assertGatesGreen(self, result):
+        for gate, value in result["gates"].items():
+            if isinstance(value, dict):
+                self.assertTrue(value.get("ok"), "%s: %r" % (gate, value))
 
-class TestEproPropose(EproTestBase):
-    def test_propose_writes_nothing(self):
-        prop = X.propose(self.path, [
-            {"op": "set_fields", "target": {"type": "COMPONENT", "id": "c1"},
-             "fields": {"x": 140}}])
-        self.assertEqual(self.read(), self.original)
-        self.assertEqual(prop["format"], "epro")
-        self.assertEqual(prop["member"], "demo.epcb")
-        self.assertEqual(prop["blocking"], [])
 
-    def test_ticket_rises_above_every_ticket_in_the_member(self):
-        prop = X.propose(self.path, [
-            {"op": "set_fields", "target": {"type": "COMPONENT", "id": "c1"},
-             "fields": {"x": 140}},
-            {"op": "add_object", "type": "NET", "id": "n2",
-             "fields": {"netName": "VCC"}}])
-        # the member's highest ticket is 2, so the two new lines take 3 and 4
-        self.assertEqual(prop["ticket"]["from"], 2)
-        self.assertEqual([r["ticket"] for r in prop["operations"]], [3, 4])
+class TestCatalogue(unittest.TestCase):
+    def test_describe_lists_every_registered_op(self):
+        ops = X.describe()
+        names = [o["op"] for o in ops]
+        self.assertEqual(names, sorted(X.OPS))
+        self.assertEqual(len(set(names)), len(names))
+        for entry in ops:
+            self.assertTrue(entry["summary"])
+            self.assertIsInstance(entry["params"], dict)
 
-    def test_unknown_key_is_refused_with_the_keys_that_do_exist(self):
+    def test_no_op_is_registered_twice_under_two_spellings(self):
+        self.assertEqual(sorted(X.OPS), sorted({k for k in X.OPS}))
+
+    def test_unknown_operation_is_named_with_the_known_ones(self):
+        plan_dir = tempfile.mkdtemp(prefix="epro_edit_")
+        self.addCleanup(shutil.rmtree, plan_dir, True)
+        path = _fx.write_epro(plan_dir, "board.epro")
         with self.assertRaises(X.EditError) as ctx:
-            X.propose(self.path, [
-                {"op": "set_fields", "target": {"type": "COMPONENT", "id": "c1"},
-                 "fields": {"xPos": 140}}])
-        self.assertEqual(ctx.exception.code, "KEY_NOT_IN_FILE")
-        self.assertIn("designator", ctx.exception.extra["known"])
+            X.propose(path, [{"op": "teleport_component"}])
+        self.assertEqual(ctx.exception.code, "OP_UNKNOWN")
+        for name in X.OPS:
+            self.assertIn(name, str(ctx.exception))
 
-    def test_unknown_type_is_refused(self):
-        with self.assertRaises(X.EditError) as ctx:
-            X.propose(self.path, [
-                {"op": "add_object", "type": "NO_SUCH_TYPE", "fields": {"a": 1}}])
-        self.assertEqual(ctx.exception.code, "UNKNOWN_OBJECT_TYPE")
 
-    def test_allow_new_keys_turns_the_refusal_into_a_warning(self):
-        prop = X.propose(self.path, [
-            {"op": "set_fields", "target": {"type": "COMPONENT", "id": "c1"},
-             "fields": {"xPos": 140}, "allow_new_keys": True}])
-        self.assertTrue(prop["warnings"])
-        self.assertEqual(prop["blocking"], [])
+class TestProposeWritesNothing(_Case):
+    def test_proposing_leaves_the_archive_untouched(self):
+        before_sha, before_members = _sha(self.path), _members(self.path)
+        mtime = os.path.getmtime(self.path)
+        plan = self.propose([{"op": "move_component", "component": "e1",
+                              "x_mm": 25.0, "y_mm": 25.0}])
+        self.assertEqual(plan["status"], "ok")
+        self.assertEqual(_sha(self.path), before_sha)
+        self.assertEqual(_members(self.path), before_members)
+        self.assertEqual(os.path.getmtime(self.path), mtime)
 
-    def test_missing_object_and_deleted_object_are_refused(self):
+    def test_an_empty_plan_is_refused(self):
         with self.assertRaises(X.EditError) as ctx:
-            X.propose(self.path, [
-                {"op": "set_fields", "target": {"type": "COMPONENT", "id": "nope"},
-                 "fields": {"x": 1}}])
-        self.assertEqual(ctx.exception.code, "OBJECT_NOT_FOUND")
-        with self.assertRaises(X.EditError) as ctx:
-            X.propose(self.path, [
-                {"op": "set_fields", "target": {"type": "VIA", "id": "v1"},
-                 "fields": {"x": 1}}])
-        self.assertEqual(ctx.exception.code, "OBJECT_DELETED")
-
-    def test_add_existing_object_is_refused(self):
-        with self.assertRaises(X.EditError) as ctx:
-            X.propose(self.path, [
-                {"op": "add_object", "type": "COMPONENT", "id": "c1",
-                 "fields": {"designator": "R2"}}])
-        self.assertEqual(ctx.exception.code, "OBJECT_EXISTS")
-
-    def test_empty_plan_and_wrong_format_are_refused(self):
-        with self.assertRaises(X.EditError) as ctx:
-            X.propose(self.path, [])
+            self.propose([])
         self.assertEqual(ctx.exception.code, "ARG_MISSING")
-        plain = os.path.join(self.tmp, "b.kicad_pcb")
-        with open(plain, "w", encoding="utf-8") as fh:
-            fh.write("(kicad_pcb (version 20221018))")
+
+    def test_a_missing_file_is_refused(self):
         with self.assertRaises(X.EditError) as ctx:
-            X.propose(plain, [{"op": "add_object", "type": "NET",
-                               "fields": {"netName": "GND"}}])
-        self.assertEqual(ctx.exception.code, "FORMAT_NOT_SUPPORTED")
+            X.propose(os.path.join(self.dir, "nope.epro"),
+                      [{"op": "set_text", "id": "s1", "text": "x"}])
+        self.assertEqual(ctx.exception.code, "FILE_NOT_FOUND")
 
-class TestEproApply(EproTestBase):
-    def test_apply_appends_and_never_rewrites(self):
-        prop = X.propose(self.path, [
-            {"op": "set_fields", "target": {"type": "COMPONENT", "id": "c1"},
-             "fields": {"x": 140}},
-            {"op": "add_object", "type": "PAD", "id": "p2",
-             "fields": {"parentId": "c1", "number": "2", "x": 130, "y": 200}},
-            {"op": "delete_object", "type": "NET", "id": "n1"}])
-        applied = X.apply_plan(prop["plan_id"], confirm=True)
-        self.assertEqual(applied["status"], "ok")
-        self.assertEqual(applied["gates_passed"],
-                         ["append_only", "bytes_written", "log_idempotent",
-                          "members_untouched", "postconditions"])
-        self.assertFalse(applied["unit_verified"])
 
-        doc = self.doc()
-        # the old bytes are a prefix: nothing was rewritten, only appended
-        before = EproDocument.from_bytes(self.original)
-        self.assertTrue(doc.entry_bytes("demo.epcb").startswith(
-            before.entry_bytes("demo.epcb")))
-        state = doc.resolved("demo.epcb")
-        self.assertEqual(state[("COMPONENT", "c1")]["payload"]["x"], 140)
-        self.assertEqual(state[("COMPONENT", "c1")]["payload"]["designator"], "R1")
-        self.assertEqual(state[("COMPONENT", "c1")]["ticket"], 3)
-        self.assertEqual(state[("PAD", "p2")]["payload"],
-                         {"parentId": "c1", "number": "2", "x": 130, "y": 200})
-        self.assertTrue(state[("NET", "n1")]["deleted"])
+class TestMoveComponent(_Case):
+    def test_it_changes_the_component_and_the_attr_that_sits_on_its_anchor(self):
+        before = _records(self.path, "COMPONENT")
+        plan = self.propose([{"op": "move_component", "component": "e1",
+                              "x_mm": 25.0, "y_mm": 25.0}])
+        self.assertEqual(plan["lines_changed"], 2)          # COMPONENT + ATTR
+        self.assertEqual([r["attrs_moved"] for r in plan["operations"]],
+                         [[{"attr": "e1d", "key": "Designator"}]])
+        after = _records(self.path, "COMPONENT")
+        self.assertEqual(after, before, "proposing must not write")
 
-    def test_other_members_stay_byte_identical(self):
-        prop = X.propose(self.path, [
-            {"op": "add_object", "type": "NET", "id": "n2",
-             "fields": {"netName": "VCC"}}])
-        X.apply_plan(prop["plan_id"], confirm=True)
-        before = EproDocument.from_bytes(self.original)
-        after = self.doc()
-        for name in ("project.json", "demo.eblob"):
-            self.assertEqual(before.entry_bytes(name), after.entry_bytes(name), name)
-        self.assertEqual(after.names(), before.names())
+        result = self.apply([{"op": "move_component", "component": "e1",
+                              "x_mm": 25.0, "y_mm": 25.0}])
+        self.assertGatesGreen(result)
+        moved = _records(self.path, "COMPONENT")[0]
+        self.assertAlmostEqual(moved[4] * _fx.MIL, 25.0, places=4)
+        self.assertAlmostEqual(moved[5] * _fx.MIL, 25.0, places=4)
+        # the designator label that sat exactly on the anchor travelled with it
+        attr = [a for a in _records(self.path, "ATTR") if a[1] == "e1d"][0]
+        self.assertAlmostEqual(attr[5] * _fx.MIL, 25.0, places=4)
+        self.assertAlmostEqual(attr[6] * _fx.MIL, 25.0, places=4)
+        self.assertTrue(result["gates"]["reparsed"]["operations"][0]["verified"])
 
-    def test_confirm_is_required_and_the_plan_is_single_use(self):
-        prop = X.propose(self.path, [
-            {"op": "add_object", "type": "NET", "id": "n2",
-             "fields": {"netName": "VCC"}}])
+    def test_other_members_and_unnamed_lines_keep_their_bytes(self):
+        before = _members(self.path)
+        result = self.apply([{"op": "move_component", "component": "e1",
+                              "x_mm": 12.5, "y_mm": 8.0}])
+        after = _members(self.path)
+        self.assertEqual(sorted(before), sorted(after))
+        changed = [n for n in before if before[n] != after[n]]
+        self.assertEqual(len(changed), 1, changed)
+        self.assertTrue(changed[0].lower().endswith(".epcb"))
+        self.assertEqual(result["gates"]["members_untouched"]["ok"], True)
+        self.assertEqual(result["gates"]["rows_untouched"]["ok"], True)
+
+    def test_an_unknown_component_is_refused(self):
         with self.assertRaises(X.EditError) as ctx:
-            X.apply_plan(prop["plan_id"])
+            self.propose([{"op": "move_component", "component": "e99",
+                           "x_mm": 1.0, "y_mm": 1.0}])
+        self.assertEqual(ctx.exception.code, "RECORD_NOT_FOUND")
+        self.assertEqual(ctx.exception.extra["tag"], "COMPONENT")
+
+    def test_the_attr_that_is_not_on_the_anchor_is_left_alone_and_said_so(self):
+        # designator sits at (400, 400) = the anchor; move the record's own
+        # coordinates out from under it first, then move again: nothing follows.
+        self.apply([{"op": "move_component", "component": "e1",
+                     "x_mm": 10.16, "y_mm": 10.16}])
+        plan = self.propose([{"op": "move_component", "component": "e1",
+                              "x_mm": 30.0, "y_mm": 30.0}])
+        self.assertTrue(plan["operations"][0]["warning"])
+
+
+class TestSetTrack(_Case):
+    def test_a_line_width_is_written_in_mil(self):
+        self.apply([{"op": "set_track", "id": "l1", "width_mm": 1.0}])
+        line = _records(self.path, "LINE")[0]
+        self.assertAlmostEqual(line[9] * _fx.MIL, 1.0, places=4)
+
+    def test_an_arc_endpoint_and_its_net_can_both_change(self):
+        self.apply([{"op": "set_track", "id": "a1", "x1_mm": 5.0, "net": "GND"}])
+        arc = _records(self.path, "ARC")[0]
+        self.assertAlmostEqual(arc[5] * _fx.MIL, 5.0, places=4)
+        self.assertEqual(arc[3], "GND")
+
+    def test_a_net_that_is_not_in_the_table_is_refused(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_track", "id": "l1", "net": "GNDD"}])
+        self.assertEqual(ctx.exception.code, "NET_NOT_FOUND")
+        self.assertIn("GND", ctx.exception.extra["nets"])
+
+    def test_an_unknown_track_id_is_refused(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_track", "id": "l404", "width_mm": 1.0}])
+        self.assertEqual(ctx.exception.code, "RECORD_NOT_FOUND")
+
+
+class TestSetVia(_Case):
+    def test_drill_and_pad_are_written_and_keep_their_ratio(self):
+        self.apply([{"op": "set_via", "id": "v1", "drill_mm": 0.3,
+                     "diameter_mm": 0.6, "x_mm": 12.0, "y_mm": 13.0}])
+        via = _records(self.path, "VIA")[0]
+        self.assertAlmostEqual(via[7] * _fx.MIL, 0.3, places=4)
+        self.assertAlmostEqual(via[8] * _fx.MIL, 0.6, places=4)
+        self.assertAlmostEqual(via[5] * _fx.MIL, 12.0, places=4)
+
+    def test_a_drill_that_is_not_smaller_than_the_pad_is_refused(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_via", "id": "v1", "drill_mm": 0.7}])
+        self.assertEqual(ctx.exception.code, "ARG_INVALID")
+
+    def test_a_net_that_does_not_exist_is_refused_before_anything_is_written(self):
+        before = _sha(self.path)
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_via", "id": "v1", "net": "nope"}])
+        self.assertEqual(ctx.exception.code, "NET_NOT_FOUND")
+        self.assertEqual(_sha(self.path), before)
+
+
+class TestSetText(_Case):
+    def test_text_position_and_layer(self):
+        self.apply([{"op": "set_text", "id": "s1", "text": "REV B",
+                     "x_mm": 3.0, "layer": "TOP_SILK"}])
+        rec = _records(self.path, "STRING")[0]
+        self.assertEqual(rec[6], "REV B")
+        self.assertAlmostEqual(rec[4] * _fx.MIL, 3.0, places=4)
+        self.assertEqual(rec[3], 3)                      # TOP_SILK's code, from LAYER
+
+    def test_a_layer_name_the_file_does_not_have_is_refused(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_text", "id": "s1", "layer": "SILK_TOP"}])
+        self.assertEqual(ctx.exception.code, "LAYER_NOT_FOUND")
+        self.assertIn("TOP_SILK", str(ctx.exception))
+
+
+class TestSetPadNet(_Case):
+    def test_an_existing_pad_net_row_is_rewritten(self):
+        plan = self.propose([{"op": "set_pad_net", "component": "e1",
+                              "pad": "1", "net": "VCC"}])
+        self.assertFalse(plan["operations"][0]["appended"])
+        self.apply([{"op": "set_pad_net", "component": "e1",
+                     "pad": "1", "net": "VCC"}])
+        row = [r for r in _records(self.path, "PAD_NET") if r[2] == "1"][0]
+        self.assertEqual(row[3], "VCC")
+
+    def test_a_pad_without_a_row_is_refused_unless_appending_is_allowed(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_pad_net", "component": "e1",
+                           "pad": "3", "net": "VCC"}])
+        self.assertEqual(ctx.exception.code, "RECORD_NOT_FOUND")
+        self.assertEqual(ctx.exception.extra["pad"], "3")
+
+    def test_appending_copies_the_rows_the_footprint_needs(self):
+        plan = self.propose([{"op": "set_pad_net", "component": "e1", "pad": "3",
+                              "net": "VCC", "allow_new_record": True}])
+        self.assertEqual(plan["lines_added"], 1)
+        self.assertFalse(plan["verified_by_app"])
+        self.assertEqual(plan["operations"][0]["appended_rows"],
+                         [{"pad_object": "ie3", "net": "VCC"}])
+
+        result = self.apply([{"op": "set_pad_net", "component": "e1", "pad": "3",
+                              "net": "VCC", "allow_new_record": True}])
+        self.assertGatesGreen(result)
+        rows = [r for r in _records(self.path, "PAD_NET") if r[2] == "3"]
+        self.assertEqual(len(rows), 1)
+        # the fifth field is the footprint-local pad object, read from the file
+        self.assertEqual(rows[0][4], "ie3")
+        self.assertEqual(rows[0][3], "VCC")
+
+    def test_a_pad_number_the_footprint_does_not_have_is_refused(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_pad_net", "component": "e1", "pad": "77",
+                           "net": "VCC", "allow_new_record": True}])
+        self.assertEqual(ctx.exception.code, "PAD_NOT_FOUND")
+        self.assertEqual(ctx.exception.extra["footprint"], _fx.FP_UUID)
+
+
+class TestDeleteRecord(_Case):
+    def test_deleting_needs_allow_delete(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "delete_record", "tag": "STRING", "id": "s1"}])
         self.assertEqual(ctx.exception.code, "CONFIRMATION_REQUIRED")
-        self.assertEqual(self.read(), self.original)
-        X.apply_plan(prop["plan_id"], confirm=True)
+
+    def test_deleting_a_component_needs_cascade_and_then_takes_its_children(self):
         with self.assertRaises(X.EditError) as ctx:
-            X.apply_plan(prop["plan_id"], confirm=True)
+            self.propose([{"op": "delete_record", "tag": "COMPONENT", "id": "e1",
+                           "allow_delete": True}])
+        self.assertEqual(ctx.exception.code, "CASCADE_REQUIRED")
+        self.assertEqual(ctx.exception.extra["children"], 5)   # 3 ATTR + 2 PAD_NET
+
+        result = self.apply([{"op": "delete_record", "tag": "COMPONENT",
+                              "id": "e1", "allow_delete": True, "cascade": True}])
+        self.assertGatesGreen(result)
+        self.assertEqual(_records(self.path, "COMPONENT"), [])
+        self.assertEqual([a for a in _records(self.path, "ATTR") if a[3] == "e1"], [])
+        self.assertEqual([p for p in _records(self.path, "PAD_NET") if p[1] == "e1"], [])
+
+    def test_deleting_one_text_leaves_the_rest_of_the_stream_where_it_was(self):
+        before = _records(self.path, "LINE")
+        self.apply([{"op": "delete_record", "tag": "STRING", "id": "s1",
+                     "allow_delete": True}])
+        self.assertEqual(_records(self.path, "STRING"), [])
+        self.assertEqual(_records(self.path, "LINE"), before)
+
+
+class TestApplyGates(_Case):
+    def test_confirm_is_required(self):
+        plan = self.propose([{"op": "set_track", "id": "l1", "width_mm": 1.0}])
+        before = _sha(self.path)
+        with self.assertRaises(X.EditError) as ctx:
+            X.apply_plan(plan["plan_id"])
+        self.assertEqual(ctx.exception.code, "CONFIRMATION_REQUIRED")
+        self.assertEqual(_sha(self.path), before)
+
+    def test_a_plan_is_single_use(self):
+        plan = self.propose([{"op": "set_track", "id": "l1", "width_mm": 1.0}])
+        X.apply_plan(plan["plan_id"], confirm=True)
+        with self.assertRaises(X.EditError) as ctx:
+            X.apply_plan(plan["plan_id"], confirm=True)
         self.assertEqual(ctx.exception.code, "PLAN_NOT_FOUND")
 
-    def test_archive_changed_since_plan_is_refused(self):
-        prop = X.propose(self.path, [
-            {"op": "add_object", "type": "NET", "id": "n2",
-             "fields": {"netName": "VCC"}}])
-        with open(self.path, "ab") as fh:
-            fh.write(b"\n")
+    def test_an_unknown_plan_id_is_refused(self):
         with self.assertRaises(X.EditError) as ctx:
-            X.apply_plan(prop["plan_id"], confirm=True)
+            X.apply_plan("plan-doesnotexist", confirm=True)
+        self.assertEqual(ctx.exception.code, "PLAN_NOT_FOUND")
+
+    def test_a_plan_made_against_other_bytes_is_refused(self):
+        plan = self.propose([{"op": "set_track", "id": "l1", "width_mm": 1.0}])
+        other = _fx.write_epro(self.dir, "other.epro", outline="rect")
+        with open(other, "rb") as fh:
+            blob = fh.read()
+        with open(self.path, "wb") as fh:            # the editor saved meanwhile
+            fh.write(blob)
+        with self.assertRaises(X.EditError) as ctx:
+            X.apply_plan(plan["plan_id"], confirm=True)
         self.assertEqual(ctx.exception.code, "BOARD_CHANGED_SINCE_PLAN")
 
-    def test_new_file_mode_leaves_the_source_alone(self):
-        out = os.path.join(self.tmp, "copy.epro")
-        prop = X.propose(self.path, [
-            {"op": "add_object", "type": "NET", "id": "n2",
-             "fields": {"netName": "VCC"}}])
-        X.apply_plan(prop["plan_id"], confirm=True,
-                     options={"mode": "new_file", "out_path": out})
-        self.assertEqual(self.read(), self.original)
-        self.assertTrue(os.path.isfile(out))
-        self.assertEqual(EproDocument.from_path(out).resolved("demo.epcb")[
-            ("NET", "n2")]["payload"], {"netName": "VCC"})
+    def test_the_result_names_how_to_undo_it(self):
+        result = self.apply([{"op": "set_track", "id": "l1", "width_mm": 1.0}])
+        self.assertIn("board_restore", result["how_to_undo"])
+        self.assertTrue(result["checkpoint"]["checkpoint_id"])
+        self.assertIn("never opened in LCEDA Pro", result["not_verified"])
 
-    def test_rollback_restores_the_exact_bytes(self):
-        prop = X.propose(self.path, [
-            {"op": "add_object", "type": "NET", "id": "n2",
-             "fields": {"netName": "VCC"}}])
-        applied = X.apply_plan(prop["plan_id"], confirm=True)
-        P.restore_checkpoint(applied["checkpoint"]["checkpoint_id"], confirm=True)
-        self.assertEqual(self.read(), self.original)
+    def test_every_gate_the_module_promises_is_reported(self):
+        result = self.apply([{"op": "set_text", "id": "s1", "text": "REV C"}])
+        for gate in ("bytes_written", "members_untouched", "rows_untouched",
+                     "stream_parses", "diff_is_intended", "reparsed"):
+            self.assertIn(gate, result["gates"])
+            self.assertTrue(result["gates"][gate]["ok"], gate)
 
-class TestFormatDetection(unittest.TestCase):
-    def test_detected_by_content_not_by_name(self):
-        from pcb_agent_mcp import edit as E
-        tmp = tempfile.mkdtemp(prefix="pcbfmt-")
-        try:
-            epro_with_pcb_name = os.path.join(tmp, "looks_like.kicad_pcb")
-            with open(epro_with_pcb_name, "wb") as fh:
-                fh.write(epro_bytes())
-            self.assertEqual(E.detect_format(epro_with_pcb_name), "epro")
-            kicad_with_epro_name = os.path.join(tmp, "looks_like.epro")
-            with open(kicad_with_epro_name, "w", encoding="utf-8") as fh:
-                fh.write("(kicad_pcb (version 20221018))\n")
-            self.assertEqual(E.detect_format(kicad_with_epro_name), "kicad")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+
+class TestRefusals(_Case):
+    def test_a_sqlite_project_is_refused_with_a_reason(self):
+        path = os.path.join(self.dir, "project.eprj2")
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE documents (uuid TEXT, title TEXT, docType TEXT,"
+                    " dataStr TEXT)")
+        con.commit()
+        con.close()
+        self.assertTrue(path.startswith(self.dir))
+        with self.assertRaises(X.EditError) as ctx:
+            X.propose(path, [{"op": "set_text", "id": "s1", "text": "x"}])
+        self.assertEqual(ctx.exception.code, "WRITE_UNSUPPORTED_FORMAT")
+        self.assertIn("ticket", str(ctx.exception))
+
+    def test_a_file_that_is_neither_container_nor_kicad_is_refused(self):
+        path = os.path.join(self.dir, "junk.bin")
+        with open(path, "wb") as fh:
+            fh.write(b"not an archive")
+        with self.assertRaises(X.EditError) as ctx:
+            X.propose(path, [{"op": "set_text", "id": "s1", "text": "x"}])
+        self.assertEqual(ctx.exception.code, "FORMAT_NOT_SUPPORTED")
+
+    def test_a_named_member_that_is_not_in_the_archive_is_refused(self):
+        with self.assertRaises(X.EditError) as ctx:
+            self.propose([{"op": "set_text", "id": "s1", "text": "x"}],
+                         member="PCB/nope.epcb")
+        self.assertEqual(ctx.exception.code, "MEMBER_NOT_FOUND")
+
+
+class TestArchiveShape(_Case):
+    def test_the_untouched_lines_are_byte_identical_after_a_write(self):
+        with zipfile.ZipFile(self.path) as zf:
+            name = [n for n in zf.namelist() if n.lower().endswith(".epcb")][0]
+            before = zf.read(name).decode("utf-8").split("\n")
+        self.apply([{"op": "set_track", "id": "l1", "width_mm": 1.0}])
+        with zipfile.ZipFile(self.path) as zf:
+            after = zf.read(name).decode("utf-8").split("\n")
+        self.assertEqual(len(before), len(after))
+        differing = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
+        self.assertEqual(len(differing), 1)
+        self.assertTrue(after[differing[0]].startswith('["LINE","l1"'))
+
+    def test_the_member_still_round_trips_after_a_write(self):
+        self.apply([{"op": "set_via", "id": "v1", "drill_mm": 0.3,
+                     "diameter_mm": 0.6}])
+        container = epro_doc.EproDocument.from_path(self.path)
+        name = [n for n in container.names() if n.lower().endswith(".epcb")][0]
+        member = lceda.Member(name, container.entry_bytes(name).decode("utf-8"))
+        self.assertTrue(member.is_verbatim())
+        self.assertEqual([d.kind for d in member.documents], ["FOOTPRINT", "PCB"])
+
 
 if __name__ == "__main__":
     unittest.main()

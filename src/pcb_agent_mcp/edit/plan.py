@@ -13,8 +13,10 @@ Why so much ceremony for "move a footprint":
 * a written board is used by a real EDA and eventually by a board house - a
   broken write is not a bug, it is a scrapped panel;
 * both write paths are *silent* on failure. KiCad ignores a field it does not
-  understand; EasyEDA Pro resolves an append-only log by ticket, so a ticket that
-  is too small loses the change and leaves the file valid. Neither tells you.
+  understand; EasyEDA Pro ignores a record whose field count or unit is wrong and
+  still opens the file. Neither tells you. (The ticket/append-only model this
+  comment used to describe was a guess; the measured save rewrites one member -
+  see `epro_edit` and docs/13.)
 
 So every apply has to pass four gates that do not trust the code that did the
 writing:

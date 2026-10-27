@@ -30,6 +30,7 @@ FACT_KEYS = (
     "cutouts",            # internal slots / holes in the outline
     "footprints",         # placed components
     "pads",               # pad geometry + net assignment
+    "free_pads",          # pads placed as board objects (not part of a footprint)
     "tracks",             # routed copper as line segments
     "vias",               # layer transitions
     "zones",              # pours / keepouts
@@ -55,6 +56,11 @@ class Board(object):
         }
         self.outline = []          # [ [(x,y), ...] ] one polygon per contour, outer first
         self.cutouts = []          # [ [(x,y), ...] ]
+        # Edge chains that do NOT close into a contour. A board edge drawn by
+        # hand can be a few tenths of a mil off; fitting it into a polygon would
+        # report an outline the file does not contain, so the segments are kept
+        # as they are and the fact is declared (see `source.outline_note`).
+        self.outline_open = []
         self.footprints = []       # [{ref, value, lib_id, x, y, rotation, layer, bbox, pads}]
         self.tracks = []           # [{net, layer, width, start, end}]
         self.vias = []             # [{net, x, y, drill, diameter, from, to, kind}]
@@ -122,6 +128,7 @@ class Board(object):
             "zones": len(self.zones),
             "nets": len(self.nets),
             "outline_contours": len(self.outline),
+            "outline_open_chains": len(self.outline_open),
             "cutouts": len(self.cutouts),
             "stackup_layers": len(self.stackup),
         }
@@ -135,11 +142,15 @@ class Board(object):
             "absent": self.absent,
             "stackup": self.stackup,
             "rules": self.rules,
-            "outline_bbox": _bbox(self.outline),
+            # Extents of every measured edge, open chains included: this is a
+            # measurement of the geometry that exists, not a fitted outline.
+            "outline_bbox": _bbox(self.outline + self.outline_open),
+            "outline_closed": bool(self.outline) and not self.outline_open,
         }
         if items:
             out.update({
                 "outline": self.outline,
+                "outline_open": self.outline_open,
                 "cutouts": self.cutouts,
                 "footprints": self.footprints,
                 "tracks": self.tracks,
