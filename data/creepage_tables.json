@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "verified": false,
+  "edition": "NOT LOADED",
+  "note": "Intentionally empty and unverified. Fill from the actual standard text (table number + edition) and set verified=true. The tool refuses to answer until then, because a guessed safety distance is worse than no answer.",
+  "expected_row_format": {
+    "voltage_v": 250,
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "basic",
+    "distance_mm": null,
+    "table": "table id from the standard"
+  },
+  "tables": {}
+}
