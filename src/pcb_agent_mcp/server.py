@@ -143,6 +143,44 @@ def selftest():
     check("creepage fails closed", payload["status"] == "error"
           and payload["reason_code"] == "SAFETY_TABLE_MISSING")
 
+    r = handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "diff_impedance",
+                           "arguments": {"width_mm": 0.2, "spacing_mm": 0.2,
+                                         "dielectric_mm": 0.2}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    check("diff_impedance 0.2/0.2/0.2 ~ 107.8 ohm", abs(payload["value"] - 107.8) < 0.2,
+          str(payload.get("value")))
+
+    r = handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": "diff_width",
+                           "arguments": {"target_ohm": 100, "spacing_mm": 0.2,
+                                         "dielectric_mm": 0.2}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    check("diff_width round-trips 100 ohm",
+          abs(payload.get("zdiff_recomputed", 0) - 100.0) < 0.2,
+          str(payload.get("value")))
+
+    r = handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                "params": {"name": "board_summary",
+                           "arguments": {"path": "__NO_SUCH_BOARD__.kicad_pcb"}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    check("missing board refused, not created",
+          payload["status"] == "error" and payload["reason_code"] == "FILE_NOT_FOUND")
+
+    r = handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": "app_status",
+                           "arguments": {"app": "lceda-pro", "probe_ports": False}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    check("app_status well formed",
+          payload.get("status") == "ok" and "running" in payload
+          and "instances" in payload)
+
+    r = handle({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": {"name": "calc_capabilities", "arguments": {}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    check("capabilities lists the board tools",
+          "board_summary" in payload["available"] and "app_open_project" in payload["available"])
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

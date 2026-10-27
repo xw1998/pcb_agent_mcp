@@ -6,12 +6,18 @@ must say what the tool will NOT do as clearly as what it does.
 """
 import json
 
+from . import desktop as _desktop
+from . import oracle as _oracle
 from .calc import current as _current
 from .calc import creepage as _creepage
+from .calc import diffpair as _diffpair
 from .calc import impedance as _impedance
 from .calc import rf as _rf
 from .calc import units as _units
 from .calc.result import err
+from .adapters import FORMATS as _FORMATS
+from .adapters import detect_format as _detect_format
+from .adapters import open_board as _open_board
 
 
 def _num(desc, default=None):
@@ -248,34 +254,392 @@ _tool(
 )
 
 
+# ------------------------------------------------------------- diff pair
+_tool(
+    "diff_impedance",
+    "Differential impedance of an edge-coupled pair (microstrip or stripline) plus the "
+    "single-ended value and the coupling factor. Use this instead of trace_impedance for "
+    "USB 90 ohm / Ethernet 100 ohm / HDMI targets: the single-ended closed form cannot "
+    "express the coupling between the two traces.",
+    {"type": "object",
+     "properties": {
+         "width_mm": _num("single trace width"),
+         "spacing_mm": _num("edge-to-edge gap between the two traces"),
+         "dielectric_mm": _num("dielectric height from trace to its reference plane "
+                               "(stripline: half the plane-to-plane separation)"),
+         "copper_um": _num("copper thickness in um", 35),
+         "er": _num("relative permittivity", 4.3),
+         "kind": _str("trace geometry", ["microstrip", "stripline"], "microstrip"),
+     },
+     "required": ["width_mm", "spacing_mm", "dielectric_mm"]},
+    lambda a: _diffpair.diff_impedance(
+        a["width_mm"], a["spacing_mm"], a["dielectric_mm"],
+        copper_um=a.get("copper_um", 35.0), er=a.get("er", 4.3),
+        kind=a.get("kind", "microstrip")),
+)
+
+_tool(
+    "diff_width",
+    "Reverse solve: the trace width that gives a target differential impedance at a fixed "
+    "spacing. Reports the reachable band when the target cannot be met, instead of "
+    "returning a width that silently misses.",
+    {"type": "object",
+     "properties": {
+         "target_ohm": _num("target differential impedance, e.g. 90 or 100"),
+         "spacing_mm": _num("edge-to-edge gap held fixed (set by the connector or the "
+                            "fabricator's minimum gap)"),
+         "dielectric_mm": _num("dielectric height"),
+         "copper_um": _num("copper thickness in um", 35),
+         "er": _num("relative permittivity", 4.3),
+         "kind": _str("trace geometry", ["microstrip", "stripline"], "microstrip"),
+     },
+     "required": ["target_ohm", "spacing_mm", "dielectric_mm"]},
+    lambda a: _diffpair.width_for_diff_impedance(
+        a["target_ohm"], a["spacing_mm"], a["dielectric_mm"],
+        copper_um=a.get("copper_um", 35.0), er=a.get("er", 4.3),
+        kind=a.get("kind", "microstrip")),
+)
+
+# --------------------------------------------------------------- desktop
+_APP = _str("which application", ["lceda-pro", "kicad", "pcbnew", "kicad-cli"])
+
+def _desktop_error(exc):
+    return err(str(exc), "APP_UNKNOWN",
+               hint="known apps: " + ", ".join(sorted(_desktop.APPS)))
+
+_tool(
+    "app_detect",
+    "Where is the EDA installed? Explicit path, else the running process image, else a "
+    "drive scan, else the registry - and always returns what was tried. Never launches "
+    "anything and never touches a project file.",
+    {"type": "object",
+     "properties": {
+         "app": _APP,
+         "explicit_path": _str("override: an exact exe path, used as-is"),
+     }},
+    lambda a: _guarded(lambda: _app_detect(a)),
+)
+
+_tool(
+    "app_status",
+    "Is the EDA running, which instances exist, which project is loaded, and is the "
+    "EasyEDA Pro API gateway listening (49620-49629)? The project name is taken from a "
+    "window title, so an empty list means 'no window shows a project', not 'no project'.",
+    {"type": "object",
+     "properties": {
+         "app": _APP,
+         "probe_ports": _bool("also probe the API gateway ports (0.02 s each)", True),
+     },
+     "required": ["app"]},
+    lambda a: _guarded(lambda: _desktop.status(a["app"], a.get("probe_ports", True))),
+)
+
+_tool(
+    "app_launch",
+    "Start the EDA detached (no project). Prefer app_open_project when a project exists: "
+    "starting a process is not the same as having the board loaded.",
+    {"type": "object",
+     "properties": {"app": _APP},
+     "required": ["app"]},
+    lambda a: _guarded(lambda: _launch_app(a["app"])),
+)
+
+_tool(
+    "app_close",
+    "Close the EDA by sending WM_CLOSE to its windows (same as clicking X, so the app may "
+    "show a save dialog and stay open). force=true terminates the process and can lose "
+    "unsaved work. Project files are never touched.",
+    {"type": "object",
+     "properties": {
+         "app": _APP,
+         "force": _bool("TerminateProcess instead of asking to close", False),
+         "timeout_s": _num("how long to wait for a graceful exit", 15),
+     },
+     "required": ["app"]},
+    lambda a: _guarded(lambda: _desktop.close(a["app"], force=a.get("force", False),
+                                              timeout=a.get("timeout_s", 15.0))),
+)
+
+_tool(
+    "app_open_project",
+    "Open a .epro / .kicad_pro / .kicad_pcb in the right application, then CONFIRM by "
+    "window title. `opened` is 'confirmed' only when a title contains the file stem; "
+    "otherwise 'unconfirmed' with what was seen. Refuses to create a missing file.",
+    {"type": "object",
+     "properties": {
+         "app": _APP,
+         "path": _str("absolute path to the project/board file (must already exist)"),
+         "reuse": _bool("focus an instance that already has this project instead of "
+                        "starting a second window", True),
+         "wait_s": _num("how long to wait for the window title to confirm", 25),
+     },
+     "required": ["app", "path"]},
+    lambda a: _guarded(lambda: _desktop.open_project(
+        a["app"], a["path"], reuse=a.get("reuse", True), wait=a.get("wait_s", 25.0))),
+)
+
+# ----------------------------------------------------------------- board
+def _guarded(fn):
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return err("%s: %s" % (type(exc).__name__, exc), "APP_UNKNOWN"
+                   if isinstance(exc, _desktop.DesktopError) else "TOOL_RAISED")
+
+
+_BOARD_CACHE = {}
+_BOARD_CACHE_MAX = 4
+
+def _load_board(args):
+    """Parse a board file, cached by (path, size, mtime). Read-only, always."""
+    import os
+    path = args.get("path")
+    if not path:
+        return None, err("path is required", "ARG_MISSING")
+    if not os.path.isfile(path):
+        return None, err("board file does not exist: %r (this server never creates "
+                         "files)" % path, "FILE_NOT_FOUND")
+    fmt_present = _detect_format(path)
+    if fmt_present == "unknown":
+        return None, err("unrecognised board format: %r" % path, "FORMAT_UNKNOWN",
+                         hint="supported: KiCad .kicad_pcb (S-expression), EasyEDA Pro "
+                              ".epro (ZIP). Supported set: " + ", ".join(sorted(_FORMATS)))
+    stat = os.stat(path)
+    key = (os.path.abspath(path), stat.st_size, int(stat.st_mtime))
+    cached = _BOARD_CACHE.get(key)
+    if cached is not None:
+        return cached, None
+    try:
+        board = _open_board(path, member=args.get("member"),
+                            project=args.get("project"))
+    except Exception as exc:  # noqa: BLE001
+        return None, err("%s: %s" % (type(exc).__name__, exc), "PARSE_FAILED")
+    if len(_BOARD_CACHE) >= _BOARD_CACHE_MAX:
+        _BOARD_CACHE.pop(next(iter(_BOARD_CACHE)))
+    _BOARD_CACHE[key] = board
+    return board, None
+
+_NOT_WRITTEN = ("this tool parses a file and measures it; it never writes, moves or "
+                "deletes anything in the project")
+
+_COMMON = {
+    "path": _str("absolute path to the board file"),
+    "member": _str("for .epro: which .epcb member to read (default: the largest)"),
+    "project": _str("optional side file: .kicad_pro next to a .kicad_pcb"),
+}
+
+def _board_tool(fn):
+    def handler(args):
+        board, e = _load_board(args)
+        if e:
+            return e
+        return fn(board, args)
+    return handler
+
+_tool(
+    "board_summary",
+    "Open a board and report what the file actually carries: counts, board outline bbox, "
+    "stackup, design rules, and - equally important - which facts are ABSENT. Read-only.",
+    {"type": "object", "properties": dict(_COMMON), "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.summary(b)),
+)
+
+_tool(
+    "board_components",
+    "Every placed component with reference, value, library id, position (mm, Y up), "
+    "rotation and pad count, plus a bbox the model can reason about.",
+    {"type": "object",
+     "properties": dict({"layer": _str("only components on this copper layer")}, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.components(b, layer=a.get("layer"))),
+)
+
+_tool(
+    "board_nets",
+    "Per net: pad/track/via/zone counts and total routed length. Use it to spot a net "
+    "that exists in the netlist but has no copper.",
+    {"type": "object", "properties": dict(_COMMON), "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.nets(b)),
+)
+
+_tool(
+    "board_clearance",
+    "Minimum edge-to-edge distance between copper of different nets, with the offending "
+    "pairs named. Track width is subtracted from the centre-line distance. This is the "
+    "measured number, not a DRC verdict. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "net_a": _str("restrict to this net (pair with net_b)"),
+         "net_b": _str("the other net"),
+         "threshold_mm": _num("report pairs closer than this", 0.2),
+         "layer": _str("restrict to one copper layer"),
+         "worst": _num("how many offending pairs to list", 20),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.clearance(
+        b, net_a=a.get("net_a"), net_b=a.get("net_b"),
+        threshold_mm=a.get("threshold_mm", 0.2), layer=a.get("layer"),
+        worst=a.get("worst", 20))),
+)
+
+_tool(
+    "board_free_space",
+    "Largest rectangles on a layer where a new component could sit, from an occupancy "
+    "grid with a clearance margin. Answers 'where can this part go', not 'how dense is "
+    "the board'.",
+    {"type": "object",
+     "properties": dict({
+         "layer": _str("copper layer to inspect, e.g. F.Cu / B.Cu"),
+         "grid_mm": _num("grid step", 1.0),
+         "clearance_mm": _num("keep-out margin around existing copper", 0.2),
+         "top": _num("how many rectangles to return", 8),
+     }, **_COMMON),
+     "required": ["path", "layer"]},
+    _board_tool(lambda b, a: _oracle.free_space(
+        b, a["layer"], grid_mm=a.get("grid_mm", 1.0),
+        clearance_mm=a.get("clearance_mm", 0.2), top=a.get("top", 8))),
+)
+
+_tool(
+    "board_pour_connectivity",
+    "Do the pads of the pour's net actually land inside the filled copper? A pour that "
+    "looks connected in the file can be isolated in fact.",
+    {"type": "object",
+     "properties": dict({"zone_index": _num("which zone (0-based)", 0)}, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.pour_connectivity(b, a.get("zone_index", 0))),
+)
+
+_tool(
+    "board_cross_split",
+    "Does any signal run over a break in its reference plane? REFUSES when the board "
+    "carries no plane zones: the split is then not observable, and 'no split found' "
+    "would be the answer that keeps a broken stackup green in DRC.",
+    {"type": "object",
+     "properties": dict({
+         "layer": _str("signal layer to check"),
+         "signal_nets": _str("comma separated nets (default: every track)"),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.cross_split(
+        b, layer=a.get("layer"),
+        signal_nets=[x.strip() for x in (a.get("signal_nets") or "").split(",")
+                     if x.strip()] or None)),
+)
+
+_tool(
+    "board_loop_area",
+    "Estimated signal/return loop area for one net (routed length x height to the nearest "
+    "copper below). REFUSES without a stackup, because a guessed dielectric height "
+    "produces a guessed EMC answer.",
+    {"type": "object",
+     "properties": dict({"net": _str("net name")}, **_COMMON),
+     "required": ["path", "net"]},
+    _board_tool(lambda b, a: _oracle.loop_area(b, a["net"])),
+)
+
+_tool(
+    "epro_inspect",
+    "Inspect an EasyEDA Pro .epro WITHOUT interpreting it: members, per-document object "
+    "type counts, and the raw key names of the first payloads of each type. Use it to "
+    "close an unmapped field instead of guessing a key name.",
+    {"type": "object",
+     "properties": {"path": _str("absolute path to the .epro"),
+                    "sample": _num("payloads to show per type", 3)},
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _epro_inspect(a)),
+)
+
+def _app_detect(args):
+    """detect() returns evidence, not an envelope: wrap it so `status` is always present."""
+    app = args.get("app")
+    if not app:
+        return {"status": "ok", "apps": _desktop.detect_all(),
+                "trust": "drive scan and registry reads are evidence of installation; a "
+                         "running process's image path is stronger but only exists while "
+                         "the app is open"}
+    found = dict(_desktop.detect(app, args.get("explicit_path")))
+    found["status"] = "ok" if found.get("found") else "error"
+    if not found.get("found"):
+        found["reason_code"] = "APP_NOT_INSTALLED"
+        found["message"] = "%s was not found on any drive or in the registry" % (
+            _desktop.APPS[app]["display"])
+    return found
+
+def _launch_app(app):
+    found = _desktop.detect(app)
+    if not found.get("found"):
+        return err("%s is not installed (or not found)" % _desktop.APPS[app]["display"],
+                   "APP_NOT_INSTALLED", extra={"tried": found.get("tried")})
+    return _desktop.launch(found["exe"], [])
+
+def _epro_inspect(args):
+    import os
+    from .adapters import epro as _epro
+    path = args.get("path")
+    if not path or not os.path.isfile(path):
+        return err("file does not exist: %r" % path, "FILE_NOT_FOUND")
+    return _epro.inspect(path, sample=int(args.get("sample", 3)))
+
 # ------------------------------------------------------- capabilities
 def _capabilities(_args):
     return {
         "status": "ok",
         "server": "pcb-agent-mcp",
-        "layer": "Calc (stateless engineering calculation, no board handle needed)",
+        "layers": {
+            "calc": "stateless engineering calculation (no board needed)",
+            "adapters": "read-only parsers: KiCad .kicad_pcb / EasyEDA Pro .epro -> "
+                        "one canonical model (mm, Y up, nets by NAME)",
+            "oracle": "measurements on one parsed board (clearance, free space, pour, "
+                      "reference-plane continuity, loop area)",
+            "desktop": "find / start / stop the EDA and open a project, verified by "
+                       "window title - never touches a project file",
+        },
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
             "via_current_allowed", "trace_impedance", "width_for_impedance",
-            "lambda_over_20",
+            "diff_impedance", "diff_width", "lambda_over_20",
+            "board_summary", "board_components", "board_nets", "board_clearance",
+            "board_free_space", "board_pour_connectivity", "board_cross_split",
+            "board_loop_area", "epro_inspect",
+            "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
         ],
         "fail_closed_pending_data": {
-            "creepage_required": "needs verified IEC table in data/creepage_tables.json",
-            "clearance_required": "needs verified IEC table in data/creepage_tables.json",
-            "standard=ipc2152": "needs verified IPC-2152 data table",
+            "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
+            "clearance_required": "needs a verified IEC table in data/creepage_tables.json",
+            "standard=ipc2152": "needs a verified IPC-2152 data table",
+        },
+        "answers_only_when_the_file_carries_the_fact": {
+            "board_cross_split": "needs plane zones; without them reference-plane "
+                                 "continuity is not observable",
+            "board_loop_area": "needs a stackup; a guessed dielectric height is a "
+                               "guessed EMC answer",
+            "board_pour_connectivity": "reports outline_only when the fill result was "
+                                       "not stored",
+            "app_open_project": "reports opened=confirmed only when a window title "
+                                "contains the file stem",
         },
         "not_implemented_yet": [
-            "Oracle layer (measure THIS board: fits_where / min_clearance / loop_area / "
-            "cross_split / pour_connectivity)",
-            "Adapters (KiCad .kicad_pcb, EasyEDA Pro .epro)",
-            "Differential impedance (coupled microstrip/stripline - needs edge coupling, "
-            "not derivable from the single-ended closed form; USB 90 ohm / Ethernet 100 ohm "
-            "targets are NOT solved by width_for_impedance)",
-            "BGA/thermal via array temperature rise, fuse behaviour, and any electrothermal "
+            "WRITE path: nothing here edits, creates or deletes a board. Writing goes "
+            "through propose_plan -> digest -> approve in a later phase",
+            "EasyEDA Pro live API drive (websocket gateway on 49620-49629): the port is "
+            "only opened after the user enables 外部交互权限, and no client is implemented",
+            "DRC/DFM verdicts (use kicad-cli for KiCad; there is no equivalent CLI for Pro)",
+            "BGA/thermal via array temperature rise, fuse behaviour, electrothermal "
             "coupling (IPC-2152 tables not loaded)",
+            "Impedance/creepage tables for standards other than IPC-2221 / IPC-2141A",
         ],
-        "contract": "every value carries model + basis + precision + assumptions; "
-                    "missing basis is treated as invalid",
+        "contract": "every value carries model + basis + precision + assumptions; a "
+                    "missing fact is refused or declared absent, never defaulted",
+        "verified_against": {
+            "calc": "hand-computed golden values (tests/test_calc.py, tests/test_diffpair.py)",
+            "adapters": "SYNTHETIC boards only - no real .epro/.kicad_pcb was available "
+                        "when this was written, so payload key names and the 0.01-inch "
+                        "unit are unverified (board_summary.source says so)",
+            "desktop": "real install: LCEDA Pro 4.1.60 and KiCad 10.0.7 both detected by "
+                       "drive scan; window-title parsing unit-tested, live open confirmed "
+                       "only for KiCad's argv form",
+        },
     }
 
 

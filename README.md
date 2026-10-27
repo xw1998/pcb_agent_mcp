@@ -2,8 +2,17 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.1.0` 只实现四件套里的 **Calc 层**（无板子的工程计算）。Adapter 与 Oracle 尚未实现，
-但工具信封、错误码与 `calc_capabilities` 自述已经按最终形态定好了，后续只往里填内容，不改契约。
+当前版本 `0.2.0` 已实现四件套里的三层只读能力：
+
+| 层 | 做什么 | 状态 |
+|---|---|---|
+| **Calc** | 无板子的工程计算（载流/阻抗/差分阻抗/λ/20/爬电） | 已实现 |
+| **Adapter** | 把 KiCad `.kicad_pcb` 与立创 `.epro` 解析成同一个 Canonical 模型 | 已实现（**仅用合成样本验证过**，见下） |
+| **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积） | 已实现 |
+| **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
+
+**没有写路径**：本服务不创建、不修改、不移动、不删除任何板文件——`tests/test_tools.py` 用
+sha256 前后比对把这条钉成可执行断言。
 
 > 设计文档在 [`docs/`](docs/)，按编号顺序读：
 > `00` 调研与架构 → `05` 无损转化架构总纲 → `06` 存储形式与信息传递 → `07` 自研定位与风险分期
@@ -66,7 +75,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（10 个）
+## 工具（26 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -80,6 +89,22 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `lambda_over_20` | λ/20 布线间距 | 与频率/εr 绑定，不给记忆值 |
 | `creepage_required` | 爬电距离查表 | 无表 fail-closed |
 | `clearance_required` | 电气间隙查表 | 无表 fail-closed |
+| `diff_impedance` | 差分对几何 → Zdiff（边耦合微带/带状线） | s/h 超出 0.1..3.0 标 `validity_note` |
+| `diff_width` | Zdiff → 线宽（间距固定，二分） | 不可达 → `UNREACHABLE` + 可达带宽 |
+| `board_summary` | 开板：计数/板框 bbox/叠层/规则 + **哪些事实缺失** | 只读；格式按内容嗅探 |
+| `board_components` | 元件位置（mm、Y 向上）、角度、pad 数、bbox | — |
+| `board_nets` | 每网络 pad/线/过孔/铺铜数与总走线长 | 暴露"网络表里有、板上没铜" |
+| `board_clearance` | 不同网络铜的边到边最小间距 + 肇事对 | 减线宽（保守）；给出测量值不是 DRC 判决 |
+| `board_free_space` | 某层可放元件的大矩形（占用栅格 + 余量） | 回答"能放哪"而不是"多密" |
+| `board_pour_connectivity` | 铺铜网络 pad 是否真落在填充铜里 | 只有轮廓时标 `outline_only` |
+| `board_cross_split` | 信号是否跨参考平面断口 | **无平面 zone 直接拒绝**（看不见就不答） |
+| `board_loop_area` | 环路面积（走线长 × 到下层铜的距离） | **无叠层直接拒绝**（猜介质高度 = 猜 EMC 答案） |
+| `epro_inspect` | 不解译地列出 `.epro` 成员/类型计数/原始 key 名 | 用来"关掉未知字段"，而不是猜字段名 |
+| `app_detect` | EDA 装在哪（显式路径→运行中镜像→盘符→注册表） | 永远回带 `tried` 证据 |
+| `app_status` | 是否在跑/几个实例/哪个工程/API 网关端口 | 工程名来自窗口标题，空 = 没窗口显示工程 |
+| `app_launch` | 分离启动 EDA（不带工程） | 启动进程 ≠ 打开工程 |
+| `app_close` | WM_CLOSE 关窗（等同点 X，可能弹保存框） | `force` 才 TerminateProcess；不碰文件 |
+| `app_open_project` | 打开 `.epro`/`.kicad_pro`/`.kicad_pcb` 并按标题确认 | 三态 `confirmed/unconfirmed`；缺文件拒绝且不创建 |
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
@@ -89,9 +114,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.1.0
-python run_server.py --selftest      # 协议级自检，8/8
-python -m unittest discover -s tests # 25 个用例
+python run_server.py --version       # 0.2.0
+python run_server.py --selftest      # 协议级自检，13/13
+python -m unittest discover -s tests # 110 个用例
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -113,19 +138,27 @@ MCP 客户端配置（stdio）：
 
 ## 路线图
 
-- **V0（当前）** Calc 层 + `calc_capabilities` 自述。
-- **V0.5** 双 Adapter 只读：KiCad `.kicad_pcb` 与立创 `.epro` 都解析到同一 Canonical，
+- **V0** ✅ Calc 层 + `calc_capabilities` 自述。
+- **V0.5** ✅ 双 Adapter 只读：KiCad `.kicad_pcb` 与立创 `.epro` 都解析到同一 Canonical，
   单位与轴向只在 adapter 边界归一化一次（Canonical 内只有 mm + Y 向上）。
-- **V1** Oracle 只读投影：`fits_where` / `min_clearance` / `loop_area` / `cross_split` / `pour_connectivity`。
-- **V2** 立创写路径（含 ticket 语义、写后回读校验）。
-- **V3** KiCad 写路径。
+- **V1** ✅ Oracle 只读投影 + Desktop 层（探测/启动/关闭/开工程，按窗口标题确认）。
+- **V2** 立创写路径（含 ticket 语义、写后回读校验）——**未开始**。
+- **V3** KiCad 写路径——**未开始**。
 
 双栈必须同时在场：**单端开发永远发现不了适配层设计错了。**
 
-## 已知未实现
+## 已知未实现 / 已打折扣的地方（诚实清单）
 
-- 差分阻抗（coupled line）——USB 90Ω / 以太网 100Ω 目标**不能**用单端 `width_for_impedance` 解。
-- 铺铜连通性、回流路径、温度场（属 Oracle，需板子）。
+- **没有一个真实工程被解析过。** 写这份代码时这台机器上没有 `.epro` 也没有 `.kicad_pcb`，所以两个
+  Adapter 全部用**合成样本**测试。具体后果：`.epro` 的 payload key 名（候选表 `CANDIDATES`）和
+  "内部单位 0.01 inch" 都还只是按格式文档写下的假设，`board_summary` 的 `source` 里会如实写
+  `unit_verified: false`。拿到真实工程后应先跑 `epro_inspect`，再按实际 key 名补候选表。
+- 写路径完全没有（不创建、不修改、不删除；见 `tests/test_tools.py`）。
+- 立创 Pro 的实时 API（websocket 网关 49620-49629）只做端口探测，**没有实现客户端**；而且它只有
+  用户手动打开「外部交互权限」后才会监听。
+- `app_open_project` 的立创命令行形式 `lceda-pro.exe <工程.epro>` **未在真机确认**（返回里
+  `open_argv_verified: false`）；KiCad 的命令行形式是确认过的。
+- 差分阻抗为边耦合闭式近似（±15%），不建模阻焊、蚀刻梯形与铜厚对耦合的影响。
 - IPC-2152 表（现行载流标准，与 IPC-2221 差可 >3×）、IEC 60664-1 爬电/间隙表 —— 需人工核验后填入
   `data/creepage_tables.json` 并置 `verified: true`。
 
@@ -137,18 +170,28 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 10 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 26 个 tool 的 schema 与 handler 注册
+│   ├── desktop.py                # Desktop 层：ctypes 探测/启动/关闭/开工程（不碰文件）
+│   ├── oracle.py                 # Oracle 层：只读度量，缺事实就拒绝回答
+│   ├── geometry.py               # 纯 stdlib 2D 几何（mm、Y 向上）
+│   ├── adapters/                 # Adapter 层：两份格式 → 一个 Canonical
+│   │   ├── canonical.py          # 唯一真值容器 + present/absent 记账
+│   │   ├── kicad_pcb.py          # S-expr 解析、Edge.Cuts 轮廓、叠层、工程规则
+│   │   ├── epro.py               # ZIP + append-only JSONL、ticket 覆盖、0.01in→mm
+│   │   └── __init__.py           # 按内容嗅探格式并分发
 │   └── calc/                     # Calc 层（纯算术，不读文件、不联网）
 │       ├── result.py             # 统一信封：basis/precision 强制
 │       ├── units.py              # 含立创内部单位 0.01inch
 │       ├── current.py            # IPC-2221 载流正/反解 + 过孔
 │       ├── impedance.py          # 微带/带状线正/反解 + 有效区间护栏
+│       ├── diffpair.py           # 边耦合差分阻抗正/反解
 │       ├── rf.py                 # λ/20
 │       └── creepage.py           # 爬电/间隙，fail-closed
 ├── data/
 │   └── creepage_tables.json      # 空表 + verified:false（故意不填）
-├── tests/test_calc.py            # 25 个用例
-└── docs/                         # 设计文档 00~09，建议按编号顺序读
+├── tests/                        # 110 个用例（含"解析前后文件 sha256 不变"）
+│   └── data/sample.kicad_pcb     # 合成样本（不是真实工程）
+└── docs/                         # 设计文档 00~10，建议按编号顺序读
 ```
 
 ## 免责声明
@@ -169,6 +212,8 @@ pcb_agent_mcp/
    就来自“能跑、但差了 2 倍”的现成代码。
 3. **测试要覆盖拒绝路径**：每个 fail-closed 分支至少一个用例，断言 `reason_code` 而不是断言异常。
 4. 跑 `python run_server.py --selftest` 与 `python -m unittest discover -s tests`，两者全绿再提交。
+5. **不许写用户的工程**。任何新增能力若需要写文件，先走 propose→digest→approve；只读路径要补一条
+   "解析前后 sha256 不变" 的用例。
 
 ## License
 
