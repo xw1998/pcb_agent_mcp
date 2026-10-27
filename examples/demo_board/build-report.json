@@ -1,0 +1,607 @@
+{
+ "board": "D:\\工作\\git_project\\pcb_agent_mcp\\examples\\demo_board\\demo60x40.kicad_pcb",
+ "create": {
+  "bytes": 1775,
+  "gates": {
+   "token_identity": {
+    "ok": true
+   },
+   "outline": {
+    "ok": true,
+    "detail": "closed"
+   },
+   "engine_stats": {
+    "ok": true,
+    "has_outline": true,
+    "width": "60.0000 mm",
+    "height": "40.0000 mm",
+    "engine": {
+     "name": "kicad-cli",
+     "version": "10.0.7"
+    }
+   },
+   "engine_drc": {
+    "ok": true,
+    "violations_total": 0,
+    "by_type": {},
+    "engine": {
+     "name": "kicad-cli",
+     "exe": "D:\\KiCad\\10.0\\bin\\kicad-cli.exe",
+     "version": "10.0.7"
+    }
+   }
+  }
+ },
+ "stages": [
+  {
+   "stage": "mechanical",
+   "ops": [
+    "add_mech_rect",
+    "add_board_text",
+    "add_board_text"
+   ],
+   "blocking": [],
+   "warnings": [],
+   "gates": {
+    "bytes_written": {
+     "ok": true,
+     "sha256": "f06bb056f062d19f5703fce664f6b45b74ceec2d591142e2ca77421d9ecea5c4",
+     "expected_sha256": "f06bb056f062d19f5703fce664f6b45b74ceec2d591142e2ca77421d9ecea5c4",
+     "bytes": 2535
+    },
+    "token_identity": {
+     "ok": true,
+     "note": "re-parsing the file that is now on disk reproduces exactly the tree that was planned (every atom, every quoting)"
+    },
+    "postconditions": {
+     "all_verified": true,
+     "operations": [
+      {
+       "index": 0,
+       "op": "add_mech_rect",
+       "verified": true,
+       "detail": {
+        "ok": true
+       }
+      },
+      {
+       "index": 1,
+       "op": "add_board_text",
+       "verified": true,
+       "detail": {
+        "ok": true
+       }
+      },
+      {
+       "index": 2,
+       "op": "add_board_text",
+       "verified": true,
+       "detail": {
+        "ok": true
+       }
+      }
+     ],
+     "ok": true
+    },
+    "engine": {
+     "status": "ok",
+     "engine": {
+      "name": "kicad-cli",
+      "exe": "D:\\KiCad\\10.0\\bin\\kicad-cli.exe",
+      "version": "10.0.7"
+     },
+     "identical": false,
+     "checks": {
+      "stats": {
+       "comparable": true,
+       "identical": true,
+       "diff": {}
+      },
+      "gerbers": {
+       "comparable": true,
+       "identical": false,
+       "layers_compared": [
+        "%TF.FileFunction,Copper,L1,Top*%",
+        "%TF.FileFunction,Copper,L4,Bot*%",
+        "%TF.FileFunction,Legend,Bot*%",
+        "%TF.FileFunction,Legend,Top*%",
+        "%TF.FileFunction,Profile,NP*%",
+        "%TF.FileFunction,Soldermask,Bot*%",
+        "%TF.FileFunction,Soldermask,Top*%"
+       ],
+       "layers_different": [
+        "%TF.FileFunction,Legend,Top*%"
+       ],
+       "note": "creation date / project id lines are normalised away"
+      }
+     },
+     "meaning": "KiCad read both files; if the statistics, the plotted artwork and the positions all match, nothing KiCad cares about differs between them",
+     "not_written": "reports and plots were made in a temp directory",
+     "comparable_checks": 2,
+     "ok": true
+    },
+    "drc": {
+     "comparable": true,
+     "new": [],
+     "new_total": 0,
+     "resolved": [],
+     "resolved_total": 0,
+     "before_total": 0,
+     "after_total": 0,
+     "ok": true
+    },
+    "outline_after": {
+     "present": true,
+     "closed": true,
+     "loops": 1,
+     "open_components": 0,
+     "primitives": 4,
+     "lines_and_arcs": 4,
+     "closed_shapes": 0,
+     "open_ends": [],
+     "gaps_mm": [],
+     "largest_gap_mm": 0.0,
+     "bbox_mm": {
+      "x0": 0.0,
+      "y0": -0.0,
+      "x1": 60.0,
+      "y1": 40.0
+     },
+     "size_mm": {
+      "width": 60.0,
+      "height": 40.0
+     },
+     "perimeter_mm": 200.0,
+     "authoritative": false,
+     "message": "closed"
+    }
+   },
+   "gates_passed": [
+    "bytes_written",
+    "drc",
+    "engine",
+    "postconditions",
+    "token_identity"
+   ],
+   "decision": "every gate passed: the bytes on disk are the planned bytes, re-parsing reproduces the planned tree, each operation's postcondition was re-read from the file, KiCad re-read both files, and its DRC reports no new violation",
+   "seconds": 93.72,
+   "written": "D:\\工作\\git_project\\pcb_agent_mcp\\examples\\demo_board\\demo60x40.kicad_pcb",
+   "bytes": 2535,
+   "sha256_after": "f06bb056f062d19f5703fce664f6b45b74ceec2d591142e2ca77421d9ecea5c4"
+  },
+  {
+   "stage": "holes",
+   "ops": [
+    "add_slot",
+    "add_cutout_circle"
+   ],
+   "blocking": [],
+   "warnings": [],
+   "gates": {
+    "bytes_written": {
+     "ok": true,
+     "sha256": "d9f5dd8a3c996ef9e9445f404c312874241f2bd5636282dd8af4a75b7e05bade",
+     "expected_sha256": "d9f5dd8a3c996ef9e9445f404c312874241f2bd5636282dd8af4a75b7e05bade",
+     "bytes": 3159
+    },
+    "token_identity": {
+     "ok": true,
+     "note": "re-parsing the file that is now on disk reproduces exactly the tree that was planned (every atom, every quoting)"
+    },
+    "postconditions": {
+     "all_verified": true,
+     "operations": [
+      {
+       "index": 0,
+       "op": "add_slot",
+       "verified": true,
+       "detail": {
+        "ok": true,
+        "arcs": 2,
+        "lines": 6,
+        "expected_arc_chord": 3.2
+       }
+      },
+      {
+       "index": 1,
+       "op": "add_cutout_circle",
+       "verified": true,
+       "detail": {
+        "ok": true
+       }
+      }
+     ],
+     "ok": true
+    },
+    "engine": {
+     "status": "ok",
+     "engine": {
+      "name": "kicad-cli",
+      "exe": "D:\\KiCad\\10.0\\bin\\kicad-cli.exe",
+      "version": "10.0.7"
+     },
+     "identical": false,
+     "checks": {
+      "stats": {
+       "comparable": true,
+       "identical": true,
+       "diff": {}
+      },
+      "gerbers": {
+       "comparable": true,
+       "identical": false,
+       "layers_compared": [
+        "%TF.FileFunction,Copper,L1,Top*%",
+        "%TF.FileFunction,Copper,L4,Bot*%",
+        "%TF.FileFunction,Legend,Bot*%",
+        "%TF.FileFunction,Legend,Top*%",
+        "%TF.FileFunction,Profile,NP*%",
+        "%TF.FileFunction,Soldermask,Bot*%",
+        "%TF.FileFunction,Soldermask,Top*%"
+       ],
+       "layers_different": [
+        "%TF.FileFunction,Profile,NP*%"
+       ],
+       "note": "creation date / project id lines are normalised away"
+      },
+      "position": {
+       "comparable": true,
+       "identical": true,
+       "components": 0
+      }
+     },
+     "meaning": "KiCad read both files; if the statistics, the plotted artwork and the positions all match, nothing KiCad cares about differs between them",
+     "not_written": "reports and plots were made in a temp directory",
+     "comparable_checks": 3,
+     "ok": true
+    },
+    "drc": {
+     "comparable": true,
+     "new": [],
+     "new_total": 0,
+     "resolved": [],
+     "resolved_total": 0,
+     "before_total": 0,
+     "after_total": 0,
+     "ok": true
+    },
+    "outline_after": {
+     "present": true,
+     "closed": true,
+     "loops": 3,
+     "open_components": 0,
+     "primitives": 9,
+     "lines_and_arcs": 8,
+     "closed_shapes": 1,
+     "open_ends": [],
+     "gaps_mm": [],
+     "largest_gap_mm": 0.0,
+     "bbox_mm": {
+      "x0": 0.0,
+      "y0": -0.0,
+      "x1": 60.0,
+      "y1": 40.0
+     },
+     "size_mm": {
+      "width": 60.0,
+      "height": 40.0
+     },
+     "perimeter_mm": 258.108,
+     "authoritative": false,
+     "message": "closed"
+    }
+   },
+   "gates_passed": [
+    "bytes_written",
+    "drc",
+    "engine",
+    "postconditions",
+    "token_identity"
+   ],
+   "decision": "every gate passed: the bytes on disk are the planned bytes, re-parsing reproduces the planned tree, each operation's postcondition was re-read from the file, KiCad re-read both files, and its DRC reports no new violation",
+   "seconds": 74.25,
+   "written": "D:\\工作\\git_project\\pcb_agent_mcp\\examples\\demo_board\\demo60x40.kicad_pcb",
+   "bytes": 3159,
+   "sha256_after": "d9f5dd8a3c996ef9e9445f404c312874241f2bd5636282dd8af4a75b7e05bade"
+  },
+  {
+   "stage": "copper",
+   "ops": [
+    "add_net",
+    "add_via",
+    "add_via",
+    "add_track",
+    "add_track",
+    "add_keepout",
+    "add_zone"
+   ],
+   "blocking": [],
+   "warnings": [],
+   "gates": {
+    "bytes_written": {
+     "ok": true,
+     "sha256": "e5954d91ff2cad56f34d3fc563896afa8590e1645d083ff48ae6142e7fe9e52b",
+     "expected_sha256": "e5954d91ff2cad56f34d3fc563896afa8590e1645d083ff48ae6142e7fe9e52b",
+     "bytes": 4098
+    },
+    "token_identity": {
+     "ok": true,
+     "note": "re-parsing the file that is now on disk reproduces exactly the tree that was planned (every atom, every quoting)"
+    },
+    "postconditions": {
+     "all_verified": true,
+     "operations": [
+      {
+       "index": 0,
+       "op": "add_net",
+       "verified": true,
+       "detail": {
+        "ok": true,
+        "net_code": "1"
+       }
+      },
+      {
+       "index": 1,
+       "op": "add_via",
+       "verified": true,
+       "detail": {
+        "ok": true
+       }
+      },
+      {
+       "index": 2,
+       "op": "add_via",
+       "verified": true,
+       "detail": {
+        "ok": true
+       }
+      },
+      {
+       "index": 3,
+       "op": "add_track",
+       "verified": true,
+       "detail": {
+        "ok": true,
+        "net_code": "1"
+       }
+      },
+      {
+       "index": 4,
+       "op": "add_track",
+       "verified": true,
+       "detail": {
+        "ok": true,
+        "net_code": "1"
+       }
+      },
+      {
+       "index": 5,
+       "op": "add_keepout",
+       "verified": true,
+       "detail": {
+        "ok": true,
+        "keepout_zones_with_those_rules": 1
+       }
+      },
+      {
+       "index": 6,
+       "op": "add_zone",
+       "verified": true,
+       "detail": {
+        "ok": true,
+        "filled_polygon_present": false
+       }
+      }
+     ],
+     "ok": true
+    },
+    "engine": {
+     "status": "ok",
+     "engine": {
+      "name": "kicad-cli",
+      "exe": "D:\\KiCad\\10.0\\bin\\kicad-cli.exe",
+      "version": "10.0.7"
+     },
+     "identical": false,
+     "checks": {
+      "stats": {
+       "comparable": true,
+       "identical": false,
+       "diff": {
+        "board": {
+         "original": {
+          "has_outline": true,
+          "width": "60.0000 mm",
+          "height": "40.0000 mm",
+          "area": "2400.00 mm²",
+          "front_component_density": "0.00",
+          "back_component_density": "0.00",
+          "front_copper_area": "0.00 mm²",
+          "back_copper_area": "0.00 mm²",
+          "min_track_clearance": "2147.4836 mm",
+          "min_track_width": "2147.4836 mm",
+          "min_drill_diameter": "2147.4836 mm",
+          "board_thickness": "1.1800 mm",
+          "front_footprint_area": "0.00 mm²",
+          "back_footprint_area": "0.00 mm²",
+          "front_footprint_density": "0.00",
+          "back_footprint_density": "0.00"
+         },
+         "reemitted": {
+          "has_outline": true,
+          "width": "60.0000 mm",
+          "height": "40.0000 mm",
+          "area": "2400.00 mm²",
+          "front_component_density": "0.00",
+          "back_component_density": "0.00",
+          "front_copper_area": "8.667 mm²",
+          "back_copper_area": "8.667 mm²",
+          "min_track_clearance": "2147.4836 mm",
+          "min_track_width": "0.4000 mm",
+          "min_drill_diameter": "0.3000 mm",
+          "board_thickness": "1.1800 mm",
+          "front_footprint_area": "0.00 mm²",
+          "back_footprint_area": "0.00 mm²",
+          "front_footprint_density": "0.00",
+          "back_footprint_density": "0.00"
+         }
+        },
+        "drill_holes": {
+         "original": [],
+         "reemitted": [
+          {
+           "count": 2,
+           "shape": "圆形",
+           "x_size": "0.3000 mm",
+           "y_size": "0.3000 mm",
+           "plated": true,
+           "source": "过孔",
+           "start_layer": "F.Cu",
+           "stop_layer": "B.Cu"
+          }
+         ]
+        }
+       }
+      },
+      "gerbers": {
+       "comparable": true,
+       "identical": false,
+       "layers_compared": [
+        "%TF.FileFunction,Copper,L1,Top*%",
+        "%TF.FileFunction,Copper,L4,Bot*%",
+        "%TF.FileFunction,Legend,Bot*%",
+        "%TF.FileFunction,Legend,Top*%",
+        "%TF.FileFunction,Profile,NP*%",
+        "%TF.FileFunction,Soldermask,Bot*%",
+        "%TF.FileFunction,Soldermask,Top*%"
+       ],
+       "layers_different": [
+        "%TF.FileFunction,Copper,L1,Top*%",
+        "%TF.FileFunction,Copper,L4,Bot*%"
+       ],
+       "note": "creation date / project id lines are normalised away"
+      },
+      "position": {
+       "comparable": true,
+       "identical": true,
+       "components": 0
+      }
+     },
+     "meaning": "KiCad read both files; if the statistics, the plotted artwork and the positions all match, nothing KiCad cares about differs between them",
+     "not_written": "reports and plots were made in a temp directory",
+     "comparable_checks": 3,
+     "ok": true
+    },
+    "drc": {
+     "comparable": true,
+     "new": [],
+     "new_total": 0,
+     "resolved": [],
+     "resolved_total": 0,
+     "before_total": 0,
+     "after_total": 0,
+     "ok": true
+    },
+    "outline_after": {
+     "present": true,
+     "closed": true,
+     "loops": 3,
+     "open_components": 0,
+     "primitives": 9,
+     "lines_and_arcs": 8,
+     "closed_shapes": 1,
+     "open_ends": [],
+     "gaps_mm": [],
+     "largest_gap_mm": 0.0,
+     "bbox_mm": {
+      "x0": 0.0,
+      "y0": -0.0,
+      "x1": 60.0,
+      "y1": 40.0
+     },
+     "size_mm": {
+      "width": 60.0,
+      "height": 40.0
+     },
+     "perimeter_mm": 258.108,
+     "authoritative": false,
+     "message": "closed"
+    }
+   },
+   "gates_passed": [
+    "bytes_written",
+    "drc",
+    "engine",
+    "postconditions",
+    "token_identity"
+   ],
+   "decision": "every gate passed: the bytes on disk are the planned bytes, re-parsing reproduces the planned tree, each operation's postcondition was re-read from the file, KiCad re-read both files, and its DRC reports no new violation",
+   "seconds": 26.35,
+   "written": "D:\\工作\\git_project\\pcb_agent_mcp\\examples\\demo_board\\demo60x40.kicad_pcb",
+   "bytes": 4098,
+   "sha256_after": "e5954d91ff2cad56f34d3fc563896afa8590e1645d083ff48ae6142e7fe9e52b"
+  }
+ ],
+ "final": {
+  "stats": {
+   "path": "D:\\工作\\git_project\\pcb_agent_mcp\\examples\\demo_board\\demo60x40.kicad_pcb",
+   "format": "kicad_pcb",
+   "bytes": 4098,
+   "atoms": 492,
+   "seqs": 229,
+   "distinct_heads": 72,
+   "version": "20221018",
+   "generator": "pcb_agent_mcp"
+  },
+  "digest": {
+   "outline": {
+    "present": true,
+    "closed": true,
+    "loops": 3,
+    "open_components": 0,
+    "primitives": 9,
+    "lines_and_arcs": 8,
+    "closed_shapes": 1,
+    "open_ends": [],
+    "gaps_mm": [],
+    "largest_gap_mm": 0.0,
+    "bbox_mm": {
+     "x0": 0.0,
+     "y0": -0.0,
+     "x1": 60.0,
+     "y1": 40.0
+    },
+    "size_mm": {
+     "width": 60.0,
+     "height": 40.0
+    },
+    "perimeter_mm": 258.108,
+    "authoritative": false,
+    "message": "closed"
+   },
+   "counts": {
+    "footprints": 0,
+    "tracks": 2,
+    "vias": 2,
+    "zones": 2,
+    "nets": 1,
+    "edge_cuts_primitives": 9
+   }
+  },
+  "coverage": {
+   "heads_total": 72,
+   "nodes_total": 228,
+   "nodes_with_a_reading_rule": 228,
+   "share_with_a_reading_rule": 1.0,
+   "carried_but_not_yet_interpreted": {},
+   "meaning": "carried_but_not_yet_interpreted nodes are in the tree and are returned verbatim by board_view(kind='raw'); they are not silently dropped and not guessed at"
+  },
+  "verify": {
+   "token_identity": true,
+   "canonical_text_equal": true,
+   "method": "signature(parse(dumps(tree))) == signature(tree)",
+   "meaning": "every atom, in order, with its original spelling and quoting - no field can be dropped without this failing",
+   "note": "canonical_text_equal compares whitespace-squashed text; it is False whenever the source was pretty-printed differently, which is formatting, not information"
+  }
+ }
+}

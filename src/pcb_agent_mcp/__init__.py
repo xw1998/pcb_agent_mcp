@@ -3,4 +3,4 @@
 Design rule: every computed number MUST carry basis/model/precision/assumptions.
 If the standard data is not loaded, refuse to answer (fail-closed).
 """
-__version__ = "0.3.0"
+__version__ = "0.4.0"

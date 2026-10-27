@@ -230,6 +230,45 @@ def verify(doc, timeout=300):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def compare_paths(a, b, which=("stats", "gerbers", "position"), timeout=300):
+    """Ask KiCad whether two board FILES say the same thing.
+
+    Used by the write path: the file before the edit and the file after it are
+    handed to the same engine, so "the edit did what I said" is not decided by
+    the code that made the edit.
+    """
+    exe = find_kicad_cli()
+    if not exe:
+        return {"status": "skipped", "reason_code": "KICAD_CLI_NOT_FOUND",
+                "message": "install KiCad (or set one) to run the independent check"}
+    for path in (a, b):
+        if not os.path.isfile(path):
+            return {"status": "error", "reason_code": "FILE_NOT_FOUND",
+                    "message": "missing board file: %s" % path}
+    tmp = tempfile.mkdtemp(prefix="pcb_agent_compare_")
+    try:
+        checks = {}
+        if "stats" in which:
+            checks["stats"] = _cmp_stats(tmp, a, b, timeout)
+        if "gerbers" in which:
+            checks["gerbers"] = _cmp_gerbers(tmp, a, b, timeout)
+        if "position" in which:
+            checks["position"] = _cmp_pos(tmp, a, b, timeout)
+        tested = [c for c in checks.values() if c.get("comparable")]
+        identical = bool(tested) and all(c.get("identical") for c in tested)
+        return {
+            "status": "ok",
+            "engine": {"name": "kicad-cli", "exe": exe, "version": version()},
+            "identical": identical,
+            "checks": checks,
+            "meaning": ("KiCad read both files; if the statistics, the plotted "
+                        "artwork and the positions all match, nothing KiCad cares "
+                        "about differs between them"),
+            "not_written": "reports and plots were made in a temp directory",
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def _cmp_stats(tmp, a, b, timeout):
     out = {}
     for tag, path in (("a", a), ("b", b)):

@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.3.0` 已实现四件套里的四层只读能力：
+当前版本 `0.4.0` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 
 | 层 | 做什么 | 状态 |
 |---|---|---|
@@ -11,9 +11,12 @@
 | **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（**仅用合成样本验证过**，见下） |
 | **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积） | 已实现 |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
+| **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 五道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 仅合成样本） |
 
-**没有写路径**：本服务不创建、不修改、不移动、不删除任何板文件——`tests/test_tools.py` 用
-sha256 前后比对把这条钉成可执行断言。
+写路径的三条硬规则：**提案不落盘**（plan 单次使用、1 小时过期）；**落盘要 `confirm=true`**；
+**闸门不信任写代码本身**——盘上字节、重新解析的树的 token 双射、每条 op 的后置条件、
+`kicad-cli` 的 stats/Gerber/贴片坐标比对、以及 **DRC 差集**（新增违规就拦下并回滚）。
+这套闸门在自造示例板上真拦下过三次错（丝印压板边、悬空走线、悬空过孔）。
 
 > 设计文档在 [`docs/`](docs/)，按编号顺序读：
 > `00` 调研与架构 → `05` 无损转化架构总纲 → `06` 存储形式与信息传递 → `07` 自研定位与风险分期
@@ -76,7 +79,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（30 个）
+## 工具（36 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -105,6 +108,12 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_drc` | **判决**：跑 KiCad 自己的 DRC 引擎，回违规项（按严重级/类型）+ 未连接项 | 立创无命令行 → 明确拒绝给判决，不近似 |
 | `board_stats` | **判决**：KiCad 自己的板统计（尺寸/面积/正反铜面积含铺铜/板厚/最小线宽与孔径） | 只读 |
 | `epro_inspect` | 不解译地列出 `.epro` 成员/类型计数/原始 key 名 | 用来"关掉未知字段"，而不是猜字段名 |
+| `board_ops` | 写路径的操作目录（KiCad 24 个 / `.epro` 3 个）+ 参数 + 它影响板子的哪一部分 | 调 `board_propose` 前先看它 |
+| `board_create` | 造一块新的空板（叠层/规则/闭合板框），写完再问 KiCad：板框闭合吗、DRC 干净吗 | 任一为否就删掉文件而不是留个“看着像板”的东西 |
+| `board_propose` | 只算不写：plan_id、改前/改后 digest、每条 op 将被检查的后置条件、blocking | 按**内容**判格式（`PK` = `.epro`） |
+| `board_apply` | 落盘：checkpoint → 原子写 → 五道闸门 → 不过就回滚回原字节 | 必须 `confirm=true`；plan 单次使用 |
+| `board_checkpoints` | 某个文件的所有检查点（时间、sha256、原因） | — |
+| `board_restore` | 回到某个检查点（默认把当前态先再存一份） | 必须 `confirm=true` |
 | `app_detect` | EDA 装在哪（显式路径→运行中镜像→盘符→注册表） | 永远回带 `tried` 证据 |
 | `app_status` | 是否在跑/几个实例/哪个工程/API 网关端口 | 工程名来自窗口标题，空 = 没窗口显示工程 |
 | `app_launch` | 分离启动 EDA（不带工程） | 启动进程 ≠ 打开工程 |
@@ -119,9 +128,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.3.0
-python run_server.py --selftest      # 协议级自检，13/13
-python -m unittest discover -s tests # 110 个用例
+python run_server.py --version       # 0.4.0
+python run_server.py --selftest      # 协议级自检，23/23（含写路径端到端）
+python -m unittest discover -s tests # 202 个用例（约 11 分钟：kicad-cli 单次 DRC ≈ 90 s）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -149,8 +158,12 @@ MCP 客户端配置（stdio）：
 - **V1** ✅ Oracle 只读投影 + Desktop 层（探测/启动/关闭/开工程，按窗口标题确认）。
 - **V1.5** ✅ 保真层：整份文档进树（token 双射可证）、事实从树里读（每条带 `raw`）、
   厂商裁判（`kicad-cli` 的 DRC/stats/Gerbers/pos）。几何派生答案统一标 `authoritative: false`。
-- **V2** 立创写路径（含 ticket 语义、写后回读校验）——**未开始**。
-- **V3** KiCad 写路径——**未开始**。
+- **V2** ✅ KiCad 写路径：`propose → apply`，五道闸门（字节 / token 双射 / 后置条件 /
+  kicad-cli 比对 / DRC 差集），checkpoint 与回滚；`examples/build_demo_board.py` 自造一块
+  60×40 四层板并用 kicad-cli 判决。
+- **V3** ✅ 立创写路径：追加式日志（ticket 递增、旧字节必须是新字节的前缀、其它 ZIP 成员
+  逐字节不变）、`key_inventory` 先验键名（`KEY_NOT_IN_FILE`）、`unit_verified` 如实报 false。
+  仅用合成 `.epro` 验证——真实文件待用户环境接入。
 
 双栈必须同时在场：**单端开发永远发现不了适配层设计错了。**
 
@@ -166,7 +179,10 @@ MCP 客户端配置（stdio）：
 - **推导仍然存在，但已被点名。** `board_clearance` / `free_space` / `pour_connectivity` /
   `cross_split` / `loop_area` 是本服务自己算的几何量，答案里带 `authoritative: false` 和
   `verdict_available_from: board_drc`——测量不是判决。
-- 写路径完全没有（不创建、不修改、不删除；见 `tests/test_tools.py`）。
+- **立创写路径只用合成样本验证过。** 真实 `.epro` 落到这台机器之前，键名与“0.01 inch 单位”
+  仍是未证假设，所以每次 `board_apply` 都回 `unit_verified: false`，且写路径**不做任何坐标换算**。
+  拿到真实文件后跑 `board_fidelity` 的 `key_inventory` 就能把假设变成事实。
+- **不写原理图。** 两个 EDA 的原理图都不在写路径上（只写了板）。
 - 立创 Pro 的实时 API（websocket 网关 49620-49629）只做端口探测，**没有实现客户端**；而且它只有
   用户手动打开「外部交互权限」后才会监听。
 - `app_open_project` 的立创命令行形式 `lceda-pro.exe <工程.epro>` **未在真机确认**（返回里
@@ -183,7 +199,14 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 30 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 36 个 tool 的 schema 与 handler 注册
+│   ├── edit/                     # 写路径：propose -> apply（两种格式）
+│   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
+│   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
+│   │   ├── checks.py             # 板框闭合/越界/铜间距/digest
+│   │   ├── plan.py               # propose / apply / create_board / checkpoint
+│   │   ├── epro_edit.py          # .epro 追加式日志写（ticket 递增、只 appending）
+│   │   └── fsutil.py             # 原子写（同卷临时文件 + fsync + os.replace）
 │   ├── desktop.py                # Desktop 层：ctypes 探测/启动/关闭/开工程（不碰文件）
 │   ├── oracle.py                 # Oracle 层：只读度量，缺事实就拒绝回答
 │   ├── geometry.py               # 纯 stdlib 2D 几何（mm、Y 向上）

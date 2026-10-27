@@ -212,6 +212,81 @@ def selftest():
     else:
         check("sample board present for the fidelity check", False, sample)
 
+    r = handle({"jsonrpc": "2.0", "id": 14, "method": "tools/call",
+                "params": {"name": "board_ops", "arguments": {}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    by_format = payload.get("by_format") or {}
+    check("write catalogue covers both formats",
+          len(by_format.get("kicad", {}).get("operations") or []) >= 20
+          and len(by_format.get("epro", {}).get("operations") or []) >= 3,
+          "kicad=%s epro=%s" % (len(by_format.get("kicad", {}).get("operations") or []),
+                                 len(by_format.get("epro", {}).get("operations") or [])))
+
+    # write path, end to end, without the engine (kicad-cli costs ~90 s per DRC):
+    # create -> propose -> apply -> restore, in a temp dir that is removed again.
+    import shutil as _shutil
+    import tempfile as _tempfile
+    tmp = _tempfile.mkdtemp(prefix="pcbagent-selftest-")
+    try:
+        board = os.path.join(tmp, "selftest.kicad_pcb")
+        r = handle({"jsonrpc": "2.0", "id": 15, "method": "tools/call",
+                    "params": {"name": "board_create", "arguments": {
+                        "path": board,
+                        "spec": {"width_mm": 30, "height_mm": 20, "engine": False}}}})
+        created = json.loads(r["result"]["content"][0]["text"])
+        check("board_create writes a board with a closed outline",
+              created.get("status") == "ok"
+              and (created.get("digest") or {}).get("outline", {}).get("closed") is True,
+              str(created.get("status")))
+
+        r = handle({"jsonrpc": "2.0", "id": 16, "method": "tools/call",
+                    "params": {"name": "board_propose", "arguments": {
+                        "path": board,
+                        "operations": [{"op": "add_board_text", "text": "SELFTEST",
+                                        "x": 15, "y": 10, "layer": "F.SilkS",
+                                        "height": 1.2, "thickness": 0.15}]}}})
+        prop = json.loads(r["result"]["content"][0]["text"])
+        with open(board, "rb") as fh:
+            untouched = fh.read()
+        check("board_propose writes nothing",
+              prop.get("status") == "ok" and bool(prop.get("plan_id"))
+              and len(untouched) == (created.get("bytes") or -1),
+              str(prop.get("status")))
+
+        r = handle({"jsonrpc": "2.0", "id": 17, "method": "tools/call",
+                    "params": {"name": "board_apply", "arguments": {
+                        "plan_id": prop.get("plan_id"), "confirm": True,
+                        "options": {"engine": False}}}})
+        applied = json.loads(r["result"]["content"][0]["text"])
+        passed = applied.get("gates_passed") or []
+        check("board_apply passes bytes/token/postcondition gates",
+              applied.get("status") == "ok"
+              and {"bytes_written", "token_identity", "postconditions"} <= set(passed),
+              ",".join(passed))
+
+        r = handle({"jsonrpc": "2.0", "id": 18, "method": "tools/call",
+                    "params": {"name": "board_apply", "arguments": {
+                        "plan_id": prop.get("plan_id"), "confirm": True,
+                        "options": {"engine": False}}}})
+        replay = json.loads(r["result"]["content"][0]["text"])
+        check("a plan is single use",
+              replay.get("status") == "error"
+              and replay.get("reason_code") == "PLAN_NOT_FOUND",
+              str(replay.get("reason_code")))
+
+        cid = (applied.get("checkpoint") or {}).get("checkpoint_id")
+        r = handle({"jsonrpc": "2.0", "id": 19, "method": "tools/call",
+                    "params": {"name": "board_restore", "arguments": {
+                        "checkpoint_id": cid, "confirm": True}}})
+        back = json.loads(r["result"]["content"][0]["text"])
+        with open(board, "rb") as fh:
+            restored = fh.read()
+        check("board_restore returns the exact bytes",
+              back.get("status") == "ok" and restored == untouched,
+              str(back.get("status")))
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

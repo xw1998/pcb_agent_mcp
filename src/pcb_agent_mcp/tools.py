@@ -612,6 +612,10 @@ def _capabilities(_args):
                       "reference-plane continuity, loop area)",
             "desktop": "find / start / stop the EDA and open a project, verified by "
                        "window title - never touches a project file",
+            "write": "propose (compute only, no byte is written) -> apply (confirm=true, "
+                     "checkpoint, atomic write, five independent gates, rollback on any "
+                     "failure). KiCad edits are re-judged by kicad-cli; a new DRC "
+                     "violation blocks the write",
         },
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
@@ -621,6 +625,8 @@ def _capabilities(_args):
             "board_free_space", "board_pour_connectivity", "board_cross_split",
             "board_loop_area", "board_fidelity", "board_view", "board_drc",
             "board_stats", "epro_inspect",
+            "board_ops", "board_create", "board_propose", "board_apply",
+            "board_checkpoints", "board_restore",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
         ],
         "fail_closed_pending_data": {
@@ -654,8 +660,12 @@ def _capabilities(_args):
                               "carries authoritative=false and names board_drc",
         },
         "not_implemented_yet": [
-            "WRITE path: nothing here edits, creates or deletes a board. Writing goes "
-            "through propose_plan -> digest -> approve in a later phase",
+            "LCEDA Pro write path: .epro record editing exists only against synthetic "
+            "archives in the test suite - no real .epro was on disk when it was "
+            "written, so key names and the 0.01-inch unit stay unverified and every "
+            "apply answers unit_verified=false. A real file closes that with "
+            "board_fidelity(key_inventory)",
+            "Schematic editing in either EDA (this server writes boards, not sheets)",
             "EasyEDA Pro live API drive (websocket gateway on 49620-49629): the port is "
             "only opened after the user enables 外部交互权限, and no client is implemented",
             "DFM checks (fabricator capability rules)",
@@ -678,6 +688,12 @@ def _capabilities(_args):
             "desktop": "real install: LCEDA Pro 4.1.60 and KiCad 10.0.7 both detected by "
                        "drive scan; window-title parsing unit-tested, live open confirmed "
                        "only for KiCad's argv form",
+            "write": "every apply is gated on re-reading the bytes just written "
+                     "(bytes_written), a token-identity round trip, each op's own "
+                     "postcondition, a kicad-cli stats/gerber/position comparison and a "
+                     "DRC before/after diff; kicad-cli caught three real mistakes in the "
+                     "demo build (silk text over the edge, a dangling track, a dangling "
+                     "via) and rolled them back",
         },
     }
 
@@ -904,6 +920,184 @@ def _board_stats(args):
         return err("path is required", "ARG_MISSING")
     return _engine.stats(path)
 
+
+# ------------------------------------------------------------ write path
+def _edit_error(exc):
+    """Edit/Op errors carry a code and extra evidence; keep both, never flatten."""
+    import json as _json
+    out = err(str(exc), getattr(exc, "code", "EDIT_FAILED"))
+    extra = getattr(exc, "extra", None) or {}
+    for key, value in extra.items():
+        try:
+            _json.dumps(value)
+            out[key] = value
+        except TypeError:
+            out[key] = str(value)
+    return out
+
+def _board_create(args):
+    from . import edit as _edit
+    try:
+        return _edit.create_board(args.get("path"), args.get("spec") or {})
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+
+def _board_ops(_args):
+    from . import edit as _edit
+    return {"status": "ok",
+            "operations": _edit.describe_ops(),
+            "by_format": {
+                "kicad": {"operations": _edit.describe_ops(),
+                          "coordinates": "millimetres, Y UP (the same frame board_view "
+                                          "reports); written as a KiCad tree and then "
+                                          "re-judged by kicad-cli"},
+                "epro": {"operations": _edit.describe_epro_ops(),
+                         "coordinates": "the file's own payload values are passed "
+                                        "through untouched - no unit is converted, so "
+                                        "unit_verified stays false until a real .epro "
+                                        "confirms it",
+                         "write_shape": "append-only: a change is a new line with a "
+                                         "higher ticket, never an edited line"},
+            },
+            "protocol": "board_propose -> read the digest -> board_apply(confirm=true)",
+            "format_detection": "by content: 'PK' = .epro, '(kicad_pcb' = KiCad. The "
+                                "file name is never trusted",
+            "note": "every operation is all-or-nothing inside one proposal"}
+
+def _board_propose(args):
+    from . import edit as _edit
+    try:
+        return _edit.propose(args.get("path"), args.get("operations") or [],
+                             args.get("options") or {})
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+    except _edit.OpError as exc:
+        return _edit_error(exc)
+
+def _board_apply(args):
+    from . import edit as _edit
+    try:
+        return _edit.apply_plan(args.get("plan_id"), args.get("confirm") is True,
+                                args.get("options") or {})
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+
+def _board_checkpoints(args):
+    from . import edit as _edit
+    return _edit.list_checkpoints(args.get("path"), limit=int(args.get("limit") or 20))
+
+def _board_restore(args):
+    from . import edit as _edit
+    try:
+        return _edit.restore_checkpoint(args.get("checkpoint_id"),
+                                       args.get("confirm") is True,
+                                       keep_current=args.get("keep_current", True))
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+
+_tool(
+    "board_ops",
+    "The operation catalogue of the write path: every op this server can apply to a "
+    "KiCad board, its parameters, and which part of the board it affects. Call it "
+    "before board_propose.",
+    {"type": "object", "properties": {}},
+    _board_ops,
+)
+
+_tool(
+    "board_create",
+    "Create a NEW empty KiCad board (stackup, design rules, closed outline) that KiCad "
+    "itself accepts. The file is written, then KiCad is asked whether the outline is "
+    "really closed and its DRC really clean; if either says no, the file is removed "
+    "again rather than left as something that merely looks like a board. Refuses to "
+    "overwrite an existing file unless overwrite=true.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path for the new .kicad_pcb (parent dirs are created)"),
+        "spec": {
+            "type": "object",
+            "description": "width_mm, height_mm, x0_mm, y0_mm, thickness_mm, "
+                           "copper_layers (2/4/6...), edge_width_mm, clearance_mm, "
+                           "trace_width_mm, via_dia_mm, via_drill_mm, title, overwrite",
+            "properties": {
+                "width_mm": _num("board width", 60), "height_mm": _num("board height", 40),
+                "x0_mm": _num("outline origin x", 0), "y0_mm": _num("outline origin y", 0),
+                "thickness_mm": _num("board thickness", 1.6),
+                "copper_layers": _num("2, 4, 6 ...", 2),
+                "title": _str("title_block title"),
+                "overwrite": _bool("replace an existing file"),
+            }},
+    }, "required": ["path"]},
+    _board_create,
+)
+
+_tool(
+    "board_propose",
+    "Plan a change to a KiCad board WITHOUT writing anything: returns a plan_id, the "
+    "board digest before/after, per-operation postconditions that WILL be checked, and "
+    "the blocking reasons (open outline, new DRC violations, tracks outside the frame). "
+    "Nothing on disk changes; read the digest, then call board_apply with confirm=true.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_pcb"),
+        "operations": {"type": "array", "description":
+            "list of {op, ...params}; call board_ops for the catalogue",
+            "items": {"type": "object"}},
+        "options": {"type": "object", "description":
+            "allow_new_violations / allow_open_outline / engine (default true)",
+            "properties": {
+                "allow_new_violations": _bool("accept newly introduced DRC violations"),
+                "allow_open_outline": _bool("accept an outline that does not close"),
+                "engine": _bool("run the kicad-cli comparison (default true)", True),
+                "mode": _str("in_place or new_file", enum=["in_place", "new_file"]),
+                "out_path": _str("target when mode=new_file"),
+            }},
+    }, "required": ["path", "operations"]},
+    _board_propose,
+)
+
+_tool(
+    "board_apply",
+    "Apply a proposal and prove it. Takes a checkpoint first, writes atomically, then "
+    "runs four gates that do not trust the writing code: bytes-on-disk == planned bytes, "
+    "re-parse reproduces the planned tree, every operation's postcondition is re-read "
+    "from the file, and KiCad re-reads both files (stats/plots/positions) with its DRC "
+    "diffed. Any blocking failure restores the checkpoint and says so. A plan is "
+    "single-use and expires after an hour.",
+    {"type": "object", "properties": {
+        "plan_id": _str("the plan_id that board_propose returned"),
+        "confirm": _bool("must be true - writing a board is not Ctrl+Z"),
+        "options": {"type": "object", "properties": {
+            "allow_new_violations": _bool("accept newly introduced DRC violations"),
+            "allow_open_outline": _bool("accept an outline that does not close"),
+            "engine": _bool("run the kicad-cli comparison (default true)", True),
+            "mode": _str("in_place or new_file", enum=["in_place", "new_file"]),
+            "out_path": _str("target when mode=new_file"),
+        }},
+    }, "required": ["plan_id"]},
+    _board_apply,
+)
+
+_tool(
+    "board_checkpoints",
+    "List the checkpoints this server took before writing. They live under "
+    "PCB_AGENT_HOME (default ~/.pcb_agent_mcp), never beside the project.",
+    {"type": "object", "properties": {
+        "path": _str("only checkpoints for this board"),
+        "limit": _num("how many to return", 20),
+    }},
+    _board_checkpoints,
+)
+
+_tool(
+    "board_restore",
+    "Put a checkpoint back on disk. The file currently on disk is checkpointed first, "
+    "so a restore is itself undoable. Refuses without confirm=true.",
+    {"type": "object", "properties": {
+        "checkpoint_id": _str("checkpoint_id from board_checkpoints"),
+        "confirm": _bool("must be true - this overwrites the board"),
+        "keep_current": _bool("checkpoint the file being replaced (default true)", True),
+    }, "required": ["checkpoint_id"]},
+    _board_restore,
+)
 
 _tool(
     "calc_capabilities",

@@ -3,6 +3,49 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)；`0.x` 期间 tool 的入参与返回结构仍可能变动，
 但**信封契约（`status` / `basis` / `precision` / `reason_code`）从 0.1.0 起冻结**。
 
+## [0.4.0] - 2026-10-27
+
+**写路径**：从“只能读”变成“能改，且改得可证”。两种格式两条实现，一套协议：
+
+```
+board_propose(path, operations)  →  只算，一个字节都不写；plan 单次使用，1h 过期
+board_apply(plan_id, confirm=true) →  checkpoint → 原子写 → 闸门 → 任一不过就回滚
+```
+
+### Added
+
+- **KiCad 写路径 `edit/`**（新增）
+  - `build.py`：S 表达式构造器（按文件版本写层号：v7 的 `B.Cu=31`、`Edge.Cuts=44`，
+    不是 v10 的 2/25——这份表是用 `kicad-cli pcb upgrade` 对读出来的）。
+  - `ops.py`：**24 个 op**——板框（矩形/多边形/圆/线/弧）、**开槽**、**挖空**（矩形/圆/多边形）、
+    机械层图形、板上文字、移动元件、DNP、走线/删线/改宽、过孔、keepout、zone、网络、netclass、
+    板厚。每个 op 自带 `verify()`（后置条件从盘上文件读回来）。
+  - `checks.py`：板框闭合测量（开口端点/缺口宽度/连通分量）、越界报告、铜间距、改前改后 digest。
+  - `plan.py`：`propose` / `apply_plan` / `create_board` / checkpoint（`~/.pcb_agent_mcp/checkpoints`）
+    / `list` / `find` / `restore`。
+  - `fsutil.py`：同卷临时文件 + fsync + `os.replace` 的原子写；sha256；home 目录。
+- **五道闸门**（每一道都不信任写代码本身）：`bytes_written`、`token_identity`（重新解析盘上文件 →
+  逐原子重现计划的树）、`postconditions`（每条 op 自己的承诺）、`engine`（kicad-cli 比对
+  stats/Gerber/贴片坐标）、`drc`（**差集**：新增违规就拦）。防假绿两条：“没比较成”不算通过；
+  “只改了元信息却动了铜”判静默损坏。
+- **立创 `.epro` 写路径 `edit/epro_edit.py`**（新增）：追加式日志——改 = 追加一行（旧字节必须是新字节的
+  前缀）、ticket 必须高于成员内所有 ticket（过小会被应用静默忽略）、其它 ZIP 成员逐字节不变、
+  `key_inventory` 先验键名（`KEY_NOT_IN_FILE` 并列出真实存在的键）、`unit_verified: false` 如实报。
+  三个 op：`set_fields` / `add_object` / `delete_object`。
+- **6 个新 tool**：`board_ops`、`board_create`、`board_propose`、`board_apply`、`board_checkpoints`、
+  `board_restore`（共 36）。格式按**内容**判（`PK` = `.epro`），文件名从不被信任。
+- `examples/build_demo_board.py`：自造一块 60×40 四层板（机械层文字 → 槽+圆孔 → 网络/过孔/闭合走线环/
+  keepout/铺铜），每段 `propose → apply`，产物 + `build-report.json` 落盘。
+- `docs/12-写路径-提案到落盘.md`：协议、五道闸门、以及本轮拿真机学到的 DRC 事实。
+
+### 本轮被闸门拦下的真实错误（都是设计生效，不是 bug）
+
+- 丝印文字压板边：`gr_text` 以 `at` 点为中心、宽度≈字符数×高度×1.1，12 字符×1.6 mm 放在 x=4 就越过 x=0。
+- `track_dangling` ×2 与 `via_dangling`：**铺铜的填充在 DRC 里不算连通性**，端点落在 zone 内的过孔照样算悬空。
+  改成 F/B 两条同网走线成环（2 过孔）后 0 违规。
+- engine gate 假绿：checkpoint 存成 `.board` 让 kicad-cli 报 `Unknown file type`，三个比较全 skipped 而
+  `identical=None` 被当成绿灯→ 现在“没比较成”不算通过。
+
 ## [0.3.0] - 2026-10-27
 
 **方向纠正**：中间层改成"等于那张板"，不再"推导出那张板"。新增保真层（`fidelity/`），
