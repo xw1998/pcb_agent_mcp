@@ -10,10 +10,15 @@ C2  A fact that one format does not carry is declared, never filled with the
     other backend's default. Every board carries `present` (facts that were
     actually read) and `absent` (facts the format does not store, with why).
 
-The canonical model deliberately keeps discrete facts only (nets, pads, tracks,
-vias, zones, outline vertices, stackup rows). Continuous quantities - clearance,
-loop area, occupancy, thermal resistance - are computed by the Oracle on demand,
-because a stored number would be a stale answer to a question nobody asked yet.
+The canonical model keeps a *convenience view*: a hand-picked, normalised subset
+that is easy to measure on. It is NOT the truth about the board - `fidelity/`
+holds the whole document and is the layer that may claim losslessness. Anything
+this view leaves out is still in the fidelity tree and reachable through
+`board_view`, so the view may be incomplete without the system being lossy.
+
+Continuous quantities (clearance, loop area, occupancy) are computed by the
+Oracle on demand and are marked `authoritative: false`: they are this server's
+measurement, not a verdict. KiCad's own engine has the verdict (`board_drc`).
 """
 
 SCHEMA = 1

@@ -6,6 +6,7 @@ what the MCP stdio transport is. Handlers live in tools.py, so swapping in the
 official SDK later is a thin adapter, not a rewrite.
 """
 import json
+import os
 import sys
 
 from . import __version__
@@ -180,6 +181,36 @@ def selftest():
     payload = json.loads(r["result"]["content"][0]["text"])
     check("capabilities lists the board tools",
           "board_summary" in payload["available"] and "app_open_project" in payload["available"])
+
+    sample = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "tests", "data", "sample.kicad_pcb")
+    if os.path.isfile(sample):
+        r = handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                    "params": {"name": "board_fidelity",
+                               "arguments": {"path": sample, "engine": False}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("fidelity round trip is a token bijection",
+              bool((payload.get("roundtrip") or {}).get("token_identity")),
+              str((payload.get("roundtrip") or {}).get("token_identity")))
+        check("fidelity coverage is complete",
+              (payload.get("coverage") or {}).get("share_with_a_reading_rule") == 1.0,
+              str((payload.get("coverage") or {}).get("share_with_a_reading_rule")))
+
+        r = handle({"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                    "params": {"name": "board_view",
+                               "arguments": {"path": sample, "kind": "zones"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        filled = [z for z in payload.get("items", []) if z.get("filled_polygon_count")]
+        check("zone fill is read from the file, not recomputed", bool(filled))
+
+        r = handle({"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                    "params": {"name": "board_drc", "arguments": {"path": sample}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("drc returns a vendor verdict or a refusal",
+              payload.get("status") in ("ok", "error"),
+              payload.get("reason_code") or ("violations=%s" % payload.get("violations_total")))
+    else:
+        check("sample board present for the fidelity check", False, sample)
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

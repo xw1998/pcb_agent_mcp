@@ -3,6 +3,67 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)；`0.x` 期间 tool 的入参与返回结构仍可能变动，
 但**信封契约（`status` / `basis` / `precision` / `reason_code`）从 0.1.0 起冻结**。
 
+## [0.3.0] - 2026-10-27
+
+**方向纠正**：中间层改成"等于那张板"，不再"推导出那张板"。新增保真层（`fidelity/`），
+并把"厂商引擎说了算"变成可执行事实（`kicad-cli` 当裁判）。
+
+起因是一句纠正：*"如果只是推导那还是猜还是会犯错，我要的是 pcb 的信息转换成 AI 擅长处理的"*。
+旧设计（`docs/01` 的"解析 5%、推事实 95%"、`canonical.py` 的"只存离散事实、连续量按需算"）
+正是在做推导，本次推翻。
+
+### Added
+
+- **保真层 `fidelity/`**（新增）
+  - `sexpr.py`：无损 S 表达式读写。原子保留**原始拼写**（`1.0000` 不会变成 `1.0`），
+    引号/裸词区分，转义表可逆，表外转义保留反斜杠（不静默吃掉）。
+  - `kicad_doc.py`：整份 `.kicad_pcb` 进树；`verify()` 做 **token 双射**自证
+    （`signature(parse(dumps(tree))) == signature(tree)`）；`coverage()` 报告
+    "已带但没有读取规则"的节点清单（携带 ≠ 丢弃 ≠ 猜）。
+  - `epro_doc.py`：整个 `.epro` 携带——每个 ZIP 成员（含二进制 blob）、每一行日志、
+    `(type,id)` 最高 ticket、空 payload = 删除（**删除本身作为事实保留**）、
+    不可解析的行单独点名；`verify()` 做**字节一致 + 状态幂等**双证；
+    `key_inventory()` 把"猜键名"变成"读键名"（按 type 列出真实出现的键、类型与样例值）。
+  - `views.py`：从树上读事实（nets / net_class / layers / stackup / setup / footprints /
+    pads（精确尺寸·钻孔·旋转·网络·rratio·primitives）/ tracks / vias / zones（含**文件里存的
+    填充多边形**）/ Edge.Cuts / 板上文字与图形 / 未解释节点）。**每条记录都带 `raw`**
+    ——完整原始 S 表达式，视图漏掉的不会丢。
+  - `engine.py`：**裁判**。`verify(doc)` 把原件与写回件都交给 `kicad-cli`，
+    比对 stats（尺寸/铜面积/板厚/焊盘数）、Gerbers（逐层铜箔/丝印/板框，归一化创建时间）、
+    position CSV（每个元件的位置与旋转）。`drc(path)` 跑 KiCad 自己的 DRC 并回判决。
+    `stats(path)` 回 KiCad 自己的统计。全部只在临时目录工作且从不传 `--save-board`。
+- **新工具 4 个**（26 → 30）：`board_fidelity`、`board_view`、`board_drc`、`board_stats`。
+- `capabilities` 增 `derived_vs_authoritative` 段：哪几个是"本服务算的"、哪几个是"厂商引擎说的"、
+  以及不一致时该信谁。
+
+### Changed
+
+- 五个几何测量工具（`board_clearance` / `board_free_space` / `board_pour_connectivity` /
+  `board_cross_split` / `board_loop_area`）的每条 `ok` 信封现在都带
+  `answer_source`、`authoritative: false`、`verdict_available_from: board_drc`。
+- `adapters/canonical.py` 的定位改为"保真树之上的便利视图"，不再是"唯一真值"。
+- `--selftest` 13 → 17 项（新增 token 双射、覆盖完整、铺铜填充是读来的不是算的、DRC 判决或明确拒绝）。
+- 测试 110 → 143 个。
+
+### Fixed
+
+- **合成样本根本不是合法 KiCad 文件**（保真层的第一个产出）。`(dnp)` 裸写、v7 格式里用
+  `property`、`gr_rect` 混用 v8 的 `stroke` 写法——`kicad-cli` 直接拒绝加载，
+  意味着此前所有"Adapter 通过"都建立在一份 KiCad 不认的文件上。样本已重写为 v7 合法文件
+  （含 DNP、keepout、铺铜填充、net_class、丝印文字），并被 `kicad-cli` 每轮验证。
+- `dnp` 只认 `(dnp)` 裸节点，漏掉真实的 `(attr smd dnp)` 写法。
+- `net_class` 只认 `track_width`，漏掉 KiCad 7 的 `trace_width`（反之亦然）；
+  现在两种拼法都读，并回报**实际命中的键名**（`trace_width_key`），让"读到"与"猜到"可区分。
+- `pad` 的 `roundrect_rratio` / `layers` 等属性取到了表头而不是值（返回 `None`）。
+
+### Verified
+
+- KiCad 侧往返裁判通过（`kicad-cli 10.0.7`）：原始板与写回板的 stats JSON 相同、
+  4 层 Gerber 逐字节相同（归一化创建日期/工程 id）、位置 CSV 相同。
+- **裁判有牙**（`tests/test_fidelity.py::test_engine_check_has_teeth`）：故意删掉铺铜 zone 节点，
+  `back_copper_area` 与 `Copper,L2,Bot` 立刻不同 → `identical: false`。闸门不会假绿。
+- `python -m unittest discover -s tests` → 143/143；`--selftest` → 17/17。
+
 ## [0.2.0] - 2026-10-27
 
 三层只读能力落地：**Adapter（双栈解析）+ Oracle（板级度量）+ Desktop（EDA 探测与开关）**，

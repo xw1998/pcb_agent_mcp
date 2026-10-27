@@ -361,10 +361,17 @@ def _footprint(node):
             xs.extend([pad["x"] - half, pad["x"] + half])
             ys.extend([pad["y"] - half, pad["y"] + half])
         bbox = (min(xs), min(ys), max(xs), max(ys))
+    # DNP lives inside the attribute list in both KiCad 7 and 8:
+    #   (attr smd dnp)  /  (attr through_hole)
+    attr = child(node, "attr")
+    flags = [atom(attr, i, "") for i in range(1, len(attr or []))] if attr else []
+    if isinstance(flags, list) and any(not isinstance(f, str) for f in flags):
+        flags = [f for f in flags if isinstance(f, str)]
+    dnp = ("dnp" in flags) or (child(node, "dnp") is not None)
     return {"ref": ref, "value": value, "lib_id": lib_id, "x": round(x, 4),
             "y": round(y, 4), "rotation": rot, "layer": layer,
             "bbox": _bbox_dict(bbox), "pads": pads,
-            "dnp": child(node, "dnp") is not None}
+            "attr": flags, "dnp": dnp}
 
 
 def _bbox_dict(b):

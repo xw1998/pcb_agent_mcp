@@ -7,7 +7,9 @@ must say what the tool will NOT do as clearly as what it does.
 import json
 
 from . import desktop as _desktop
+from . import fidelity as _fidelity
 from . import oracle as _oracle
+from .fidelity import views as _fviews
 from .calc import current as _current
 from .calc import creepage as _creepage
 from .calc import diffpair as _diffpair
@@ -428,12 +430,24 @@ _COMMON = {
     "project": _str("optional side file: .kicad_pro next to a .kicad_pcb"),
 }
 
-def _board_tool(fn):
+def _board_tool(fn, derived=False):
+    """Wrap a board handler. `derived` marks answers this server COMPUTED.
+
+    A computed number is not a verdict. The envelope says so and points at the
+    tool that returns the vendor engine's own answer (board_drc), because the
+    difference between "I measured it" and "KiCad says so" is the whole reason
+    the fidelity layer exists.
+    """
     def handler(args):
         board, e = _load_board(args)
         if e:
             return e
-        return fn(board, args)
+        out = fn(board, args)
+        if derived and isinstance(out, dict) and out.get("status") == "ok":
+            out.setdefault("answer_source", "computed by this server from geometry")
+            out.setdefault("authoritative", False)
+            out.setdefault("verdict_available_from", "board_drc (KiCad's own engine)")
+        return out
     return handler
 
 _tool(
@@ -479,7 +493,7 @@ _tool(
     _board_tool(lambda b, a: _oracle.clearance(
         b, net_a=a.get("net_a"), net_b=a.get("net_b"),
         threshold_mm=a.get("threshold_mm", 0.2), layer=a.get("layer"),
-        worst=a.get("worst", 20))),
+        worst=a.get("worst", 20)), derived=True),
 )
 
 _tool(
@@ -497,7 +511,7 @@ _tool(
      "required": ["path", "layer"]},
     _board_tool(lambda b, a: _oracle.free_space(
         b, a["layer"], grid_mm=a.get("grid_mm", 1.0),
-        clearance_mm=a.get("clearance_mm", 0.2), top=a.get("top", 8))),
+        clearance_mm=a.get("clearance_mm", 0.2), top=a.get("top", 8)), derived=True),
 )
 
 _tool(
@@ -507,7 +521,8 @@ _tool(
     {"type": "object",
      "properties": dict({"zone_index": _num("which zone (0-based)", 0)}, **_COMMON),
      "required": ["path"]},
-    _board_tool(lambda b, a: _oracle.pour_connectivity(b, a.get("zone_index", 0))),
+    _board_tool(lambda b, a: _oracle.pour_connectivity(b, a.get("zone_index", 0)),
+                derived=True),
 )
 
 _tool(
@@ -524,7 +539,7 @@ _tool(
     _board_tool(lambda b, a: _oracle.cross_split(
         b, layer=a.get("layer"),
         signal_nets=[x.strip() for x in (a.get("signal_nets") or "").split(",")
-                     if x.strip()] or None)),
+                     if x.strip()] or None), derived=True),
 )
 
 _tool(
@@ -535,7 +550,7 @@ _tool(
     {"type": "object",
      "properties": dict({"net": _str("net name")}, **_COMMON),
      "required": ["path", "net"]},
-    _board_tool(lambda b, a: _oracle.loop_area(b, a["net"])),
+    _board_tool(lambda b, a: _oracle.loop_area(b, a["net"]), derived=True),
 )
 
 _tool(
@@ -588,8 +603,11 @@ def _capabilities(_args):
         "server": "pcb-agent-mcp",
         "layers": {
             "calc": "stateless engineering calculation (no board needed)",
-            "adapters": "read-only parsers: KiCad .kicad_pcb / EasyEDA Pro .epro -> "
-                        "one canonical model (mm, Y up, nets by NAME)",
+            "fidelity": "the board CONVERTED, not summarised: the whole document is "
+                        "carried (every node, every atom), facts are read out of it, "
+                        "and the round trip is proven by KiCad itself",
+            "adapters": "a hand-picked canonical view (mm, Y up, nets by NAME) built "
+                        "on top of the fidelity tree - a convenience, not the truth",
             "oracle": "measurements on one parsed board (clearance, free space, pour, "
                       "reference-plane continuity, loop area)",
             "desktop": "find / start / stop the EDA and open a project, verified by "
@@ -601,7 +619,8 @@ def _capabilities(_args):
             "diff_impedance", "diff_width", "lambda_over_20",
             "board_summary", "board_components", "board_nets", "board_clearance",
             "board_free_space", "board_pour_connectivity", "board_cross_split",
-            "board_loop_area", "epro_inspect",
+            "board_loop_area", "board_fidelity", "board_view", "board_drc",
+            "board_stats", "epro_inspect",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
         ],
         "fail_closed_pending_data": {
@@ -618,13 +637,28 @@ def _capabilities(_args):
                                        "not stored",
             "app_open_project": "reports opened=confirmed only when a window title "
                                 "contains the file stem",
+            "board_drc": "KiCad only - LCEDA Pro ships no command line, so its DRC "
+                         "verdict is refused rather than approximated",
+            "board_fidelity(engine=true)": "KiCad only; without kicad-cli the token / "
+                                           "byte proofs still run, the plot comparison "
+                                           "is reported as skipped",
+        },
+        "derived_vs_authoritative": {
+            "derived (this server computed it)": [
+                "board_clearance", "board_free_space", "board_pour_connectivity",
+                "board_cross_split", "board_loop_area"],
+            "authoritative (vendor engine said it)": ["board_drc", "board_stats"],
+            "why_it_matters": "a computed clearance is a measurement with a model and a "
+                              "precision; a DRC verdict is the tool's own ruling. When "
+                              "they disagree, the verdict wins - so every derived answer "
+                              "carries authoritative=false and names board_drc",
         },
         "not_implemented_yet": [
             "WRITE path: nothing here edits, creates or deletes a board. Writing goes "
             "through propose_plan -> digest -> approve in a later phase",
             "EasyEDA Pro live API drive (websocket gateway on 49620-49629): the port is "
             "only opened after the user enables 外部交互权限, and no client is implemented",
-            "DRC/DFM verdicts (use kicad-cli for KiCad; there is no equivalent CLI for Pro)",
+            "DFM checks (fabricator capability rules)",
             "BGA/thermal via array temperature rise, fuse behaviour, electrothermal "
             "coupling (IPC-2152 tables not loaded)",
             "Impedance/creepage tables for standards other than IPC-2221 / IPC-2141A",
@@ -633,14 +667,242 @@ def _capabilities(_args):
                     "missing fact is refused or declared absent, never defaulted",
         "verified_against": {
             "calc": "hand-computed golden values (tests/test_calc.py, tests/test_diffpair.py)",
+            "fidelity": "KiCad side proven against kicad-cli 10.0.7: identical stats, "
+                        "identical plotted Gerbers, identical positions after a round "
+                        "trip; the sample board itself is now validated by KiCad (an "
+                        "invalid sample was the first thing this check caught)",
             "adapters": "SYNTHETIC boards only - no real .epro/.kicad_pcb was available "
                         "when this was written, so payload key names and the 0.01-inch "
-                        "unit are unverified (board_summary.source says so)",
+                        "unit are unverified (board_summary.source says so); "
+                        "board_fidelity(key_inventory) on a real .epro closes that",
             "desktop": "real install: LCEDA Pro 4.1.60 and KiCad 10.0.7 both detected by "
                        "drive scan; window-title parsing unit-tested, live open confirmed "
                        "only for KiCad's argv form",
         },
     }
+
+
+# ------------------------------------------------------------- fidelity
+_FID_CACHE = {}
+_FID_CACHE_MAX = 4
+
+def _load_fidelity(args):
+    """Open a board as a fidelity document (whole tree, zero loss). Read-only."""
+    import os
+    path = args.get("path")
+    if not path:
+        return None, err("path is required", "ARG_MISSING")
+    if not os.path.isfile(path):
+        return None, err("board file does not exist: %r (this server never creates "
+                         "files)" % path, "FILE_NOT_FOUND")
+    stat = os.stat(path)
+    key = (os.path.abspath(path), stat.st_size, int(stat.st_mtime))
+    doc = _FID_CACHE.get(key)
+    if doc is not None:
+        return doc, None
+    try:
+        doc = _fidelity.load(path, fmt=args.get("format"))
+    except Exception as exc:  # noqa: BLE001
+        return None, err("%s: %s" % (type(exc).__name__, exc), "PARSE_FAILED",
+                         hint="supported: KiCad .kicad_pcb, EasyEDA Pro .epro")
+    if len(_FID_CACHE) >= _FID_CACHE_MAX:
+        _FID_CACHE.pop(next(iter(_FID_CACHE)))
+    _FID_CACHE[key] = doc
+    return doc, None
+
+
+def _board_fidelity(args):
+    doc, e = _load_fidelity(args)
+    if e:
+        return e
+    from .fidelity import kicad_doc as _kdoc
+    out = {"status": "ok", "path": doc.path, "not_written": _NOT_WRITTEN}
+    if isinstance(doc, _kdoc.KiCadDocument):
+        out["format"] = "kicad_pcb"
+        out["document"] = doc.stats()
+        out["roundtrip"] = doc.verify()
+        out["coverage"] = doc.coverage(_fviews.INTERPRETED_HEADS)
+        if args.get("engine", True):
+            out["engine_check"] = _fidelity.engine.verify(doc)
+        else:
+            out["engine_check"] = {"status": "skipped", "reason_code": "NOT_REQUESTED"}
+    else:
+        out["format"] = "epro"
+        out["document"] = doc.stats()
+        out["roundtrip"] = doc.verify()
+        out["object_types"] = doc.known_types_seen()
+        inv = {}
+        for name in doc.text_members():
+            per_type = doc.key_inventory(name)
+            inv[name] = {t: {"objects": v["objects"],
+                             "keys": list(v["keys"].keys())}
+                         for t, v in per_type.items()}
+        out["key_inventory"] = inv
+        out["engine_check"] = {
+            "status": "unavailable", "reason_code": "NO_VENDOR_CLI",
+            "message": "LCEDA Pro has no command line; its own DRC arrives with the "
+                       "API-gateway client, and until then no verdict is offered"}
+    out["meaning"] = (
+        "this is a CONVERSION report, not a measurement: it proves the whole document "
+        "is carried (token identity / byte identity), counts the nodes that no reading "
+        "rule covers yet (they are kept, not guessed), and - for KiCad - has the vendor "
+        "engine plot both the original and the re-emitted board and compare")
+    out["read_facts_with"] = "board_view"
+    return out
+
+
+_VIEW_KINDS = ("nets", "net_classes", "layers", "stackup", "setup", "footprints",
+               "pads", "tracks", "vias", "zones", "outline", "graphics",
+               "uninterpreted", "all")
+
+
+def _board_view(args):
+    doc, e = _load_fidelity(args)
+    if e:
+        return e
+    kind = args.get("kind") or "all"
+    limit = int(args.get("limit") or 200)
+    from .fidelity import kicad_doc as _kdoc
+    if isinstance(doc, _kdoc.KiCadDocument):
+        view = _fviews.BoardView(doc)
+        if kind == "all":
+            data = view.facts()
+            return {"status": "ok", "format": "kicad_pcb", "facts": data,
+                    "not_written": _NOT_WRITTEN,
+                    "note": "every record carries `raw`, the complete S-expression "
+                            "it was read from"}
+        if kind not in _VIEW_KINDS:
+            return err("unknown kind %r" % kind, "ARG_INVALID",
+                       hint="one of: " + ", ".join(_VIEW_KINDS))
+        items = getattr(view, kind)()
+        if isinstance(items, list):
+            total = len(items)
+            return {"status": "ok", "kind": kind, "total": total,
+                    "returned": min(total, limit), "truncated": total > limit,
+                    "items": items[:limit], "not_written": _NOT_WRITTEN}
+        return {"status": "ok", "kind": kind, "value": items,
+                "not_written": _NOT_WRITTEN}
+    # .epro
+    member = args.get("member") or (doc.text_members() or [None])[0]
+    if member is None or member not in doc.names():
+        return err("member not found in this .epro: %r" % member, "MEMBER_NOT_FOUND",
+                   hint="members: " + ", ".join(doc.names()[:20]))
+    if kind in ("all", "objects"):
+        live = doc.live(member)
+        return {"status": "ok", "format": "epro", "member": member,
+                "total": len(live), "returned": min(len(live), limit),
+                "truncated": len(live) > limit,
+                "items": [_epro_record(r) for r in live[:limit]]}
+    if kind == "deleted":
+        gone = doc.deleted(member)
+        return {"status": "ok", "format": "epro", "member": member,
+                "total": len(gone), "items": [_epro_record(r) for r in gone[:limit]]}
+    if kind == "key_inventory":
+        return {"status": "ok", "format": "epro", "member": member,
+                "inventory": doc.key_inventory(member)}
+    if kind == "unparsed":
+        bad = doc.unparsed(member)
+        return {"status": "ok", "format": "epro", "member": member,
+                "total": len(bad),
+                "items": [{"line": r[0], "raw": r[3][:400]} for r in bad[:limit]]}
+    return err("unknown kind %r for .epro" % kind, "ARG_INVALID",
+               hint="objects, deleted, key_inventory, unparsed")
+
+
+def _epro_record(rec):
+    return {"type": rec["type"], "id": rec["id"], "ticket": rec["ticket"],
+            "line": rec["line"], "payload": rec["payload"]}
+
+
+_tool(
+    "board_fidelity",
+    "PROOF tool: does this server carry the WHOLE board? Reports node/byte counts, a "
+    "token-identity round trip, the nodes that have no reading rule yet (kept, not "
+    "guessed), and - for KiCad - runs KiCad itself on the original and on the re-emitted "
+    "file and compares the plotted copper, the statistics and the positions. "
+    "Read-only; nothing is written beside the project.",
+    {"type": "object",
+     "properties": {
+         "path": _str("absolute path to the board file"),
+         "engine": _bool("also run the vendor engine check (KiCad only, ~2 s)", True),
+         "format": _str("force the container type", ["kicad_pcb", "epro"]),
+     },
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_fidelity(a)),
+)
+
+_tool(
+    "board_view",
+    "Read FACTS out of the converted board: nets, net classes, layers, stackup, setup, "
+    "footprints, pads (exact size/drill/rotation/net), tracks, vias, zones (including "
+    "the stored fill polygons), Edge.Cuts geometry, board graphics/texts, and the nodes "
+    "with no reading rule yet. Every record carries `raw` - the complete original "
+    "S-expression - so nothing is lost between the file and the answer.",
+    {"type": "object",
+     "properties": {
+         "path": _str("absolute path to the board file"),
+         "kind": _str("what to read", ["all", "nets", "net_classes", "layers",
+                                       "stackup", "setup", "footprints", "pads",
+                                       "tracks", "vias", "zones", "outline",
+                                       "graphics", "uninterpreted", "objects",
+                                       "deleted", "key_inventory", "unparsed"],
+                      "all"),
+         "member": _str("for .epro: which member to read (default: first text member)"),
+         "limit": _num("max items returned", 200),
+     },
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_view(a)),
+)
+
+_tool(
+    "board_drc",
+    "AUTHORITATIVE design-rule check: runs KiCad's own DRC engine (kicad-cli) and returns "
+    "its verdict - violations by severity and type, and unconnected items. This is not "
+    "this server's geometry opinion; when it disagrees with board_clearance, believe this "
+    "one. Read-only: the report goes to a temp directory, never beside your project.",
+    {"type": "object",
+     "properties": {
+         "path": _str("absolute path to a .kicad_pcb"),
+         "severity": _str("which violations to include", ["all", "error"], "all"),
+     },
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_drc(a)),
+)
+
+_tool(
+    "board_stats",
+    "AUTHORITATIVE board statistics from KiCad's own calculator: size, area, copper area "
+    "per side (so a poured zone counts as the copper it really is), board thickness, pad "
+    "and track counts, minimum track width and drill. Read-only.",
+    {"type": "object",
+     "properties": {"path": _str("absolute path to a .kicad_pcb")},
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_stats(a)),
+)
+
+
+def _board_drc(args):
+    from .fidelity import engine as _engine
+    path = args.get("path")
+    if not path:
+        return err("path is required", "ARG_MISSING")
+    if not _engine.find_kicad_cli():
+        return err("kicad-cli was not found, so no authoritative verdict is available "
+                   "(this tool refuses rather than guessing)", "KICAD_CLI_NOT_FOUND")
+    if _fidelity.sniff(path) == "epro":
+        return err("LCEDA Pro has no command line, so this server cannot obtain its DRC "
+                   "verdict; use the app's own DRC or board_fidelity for a conversion "
+                   "report", "VERDICT_SOURCE_UNAVAILABLE")
+    out = _engine.drc(path, severity=args.get("severity") or "all")
+    return out
+
+
+def _board_stats(args):
+    from .fidelity import engine as _engine
+    path = args.get("path")
+    if not path:
+        return err("path is required", "ARG_MISSING")
+    return _engine.stats(path)
 
 
 _tool(

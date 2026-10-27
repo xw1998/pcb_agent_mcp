@@ -2,12 +2,13 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.2.0` 已实现四件套里的三层只读能力：
+当前版本 `0.3.0` 已实现四件套里的四层只读能力：
 
 | 层 | 做什么 | 状态 |
 |---|---|---|
 | **Calc** | 无板子的工程计算（载流/阻抗/差分阻抗/λ/20/爬电） | 已实现 |
-| **Adapter** | 把 KiCad `.kicad_pcb` 与立创 `.epro` 解析成同一个 Canonical 模型 | 已实现（**仅用合成样本验证过**，见下） |
+| **Fidelity** | 把整份板文件**转换**成 AI 可读的表达：每个节点都进树，事实从树里读，往返由 KiCad 自己验证 | 已实现（KiCad 侧已被 kicad-cli 判决） |
+| **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（**仅用合成样本验证过**，见下） |
 | **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积） | 已实现 |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
 
@@ -75,7 +76,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（26 个）
+## 工具（30 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -99,6 +100,10 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_pour_connectivity` | 铺铜网络 pad 是否真落在填充铜里 | 只有轮廓时标 `outline_only` |
 | `board_cross_split` | 信号是否跨参考平面断口 | **无平面 zone 直接拒绝**（看不见就不答） |
 | `board_loop_area` | 环路面积（走线长 × 到下层铜的距离） | **无叠层直接拒绝**（猜介质高度 = 猜 EMC 答案） |
+| `board_fidelity` | **自证**：节点/字节计数、token 双射往返、还没读取规则的节点清单，KiCad 侧再让 kicad-cli 把原件与写回件各画一次并比对铜箔/统计/位号 | 只读；临时目录工作，绝不写在工程旁边 |
+| `board_view` | 从保真树读事实：nets/规则类/层/叠层/setup/元件/pad（精确尺寸·钻孔·旋转·网络）/走线/过孔/zone（含**文件里存的填充多边形**）/板框图元/板上文字/尚无规则的节点 | 每条记录都带 `raw`（原始 S 表达式），视图漏掉的不会丢 |
+| `board_drc` | **判决**：跑 KiCad 自己的 DRC 引擎，回违规项（按严重级/类型）+ 未连接项 | 立创无命令行 → 明确拒绝给判决，不近似 |
+| `board_stats` | **判决**：KiCad 自己的板统计（尺寸/面积/正反铜面积含铺铜/板厚/最小线宽与孔径） | 只读 |
 | `epro_inspect` | 不解译地列出 `.epro` 成员/类型计数/原始 key 名 | 用来"关掉未知字段"，而不是猜字段名 |
 | `app_detect` | EDA 装在哪（显式路径→运行中镜像→盘符→注册表） | 永远回带 `tried` 证据 |
 | `app_status` | 是否在跑/几个实例/哪个工程/API 网关端口 | 工程名来自窗口标题，空 = 没窗口显示工程 |
@@ -114,7 +119,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.2.0
+python run_server.py --version       # 0.3.0
 python run_server.py --selftest      # 协议级自检，13/13
 python -m unittest discover -s tests # 110 个用例
 python run_server.py                 # 起 stdio MCP 服务
@@ -142,6 +147,8 @@ MCP 客户端配置（stdio）：
 - **V0.5** ✅ 双 Adapter 只读：KiCad `.kicad_pcb` 与立创 `.epro` 都解析到同一 Canonical，
   单位与轴向只在 adapter 边界归一化一次（Canonical 内只有 mm + Y 向上）。
 - **V1** ✅ Oracle 只读投影 + Desktop 层（探测/启动/关闭/开工程，按窗口标题确认）。
+- **V1.5** ✅ 保真层：整份文档进树（token 双射可证）、事实从树里读（每条带 `raw`）、
+  厂商裁判（`kicad-cli` 的 DRC/stats/Gerbers/pos）。几何派生答案统一标 `authoritative: false`。
 - **V2** 立创写路径（含 ticket 语义、写后回读校验）——**未开始**。
 - **V3** KiCad 写路径——**未开始**。
 
@@ -149,10 +156,16 @@ MCP 客户端配置（stdio）：
 
 ## 已知未实现 / 已打折扣的地方（诚实清单）
 
-- **没有一个真实工程被解析过。** 写这份代码时这台机器上没有 `.epro` 也没有 `.kicad_pcb`，所以两个
+- **没有一个真实工程被解析过。** 这台机器上没有 `.epro` 也没有真实 `.kicad_pcb`，所以两个
   Adapter 全部用**合成样本**测试。具体后果：`.epro` 的 payload key 名（候选表 `CANDIDATES`）和
   "内部单位 0.01 inch" 都还只是按格式文档写下的假设，`board_summary` 的 `source` 里会如实写
-  `unit_verified: false`。拿到真实工程后应先跑 `epro_inspect`，再按实际 key 名补候选表。
+  `unit_verified: false`。拿到真实工程后先跑 `board_fidelity`（`key_inventory` 会把真实键名读出来），
+  再按实际键名补候选表——这样"猜"变成"读"。
+- **合成样本曾经连 KiCad 都不认。** 保真层的第一个产出就是抓到这件事（`(dnp)` 裸写等三处非法语法）。
+  现在 `tests/data/sample.kicad_pcb` 是 v7 合法文件，且每轮被 `kicad-cli` 验证。
+- **推导仍然存在，但已被点名。** `board_clearance` / `free_space` / `pour_connectivity` /
+  `cross_split` / `loop_area` 是本服务自己算的几何量，答案里带 `authoritative: false` 和
+  `verdict_available_from: board_drc`——测量不是判决。
 - 写路径完全没有（不创建、不修改、不删除；见 `tests/test_tools.py`）。
 - 立创 Pro 的实时 API（websocket 网关 49620-49629）只做端口探测，**没有实现客户端**；而且它只有
   用户手动打开「外部交互权限」后才会监听。
@@ -170,10 +183,16 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 26 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 30 个 tool 的 schema 与 handler 注册
 │   ├── desktop.py                # Desktop 层：ctypes 探测/启动/关闭/开工程（不碰文件）
 │   ├── oracle.py                 # Oracle 层：只读度量，缺事实就拒绝回答
 │   ├── geometry.py               # 纯 stdlib 2D 几何（mm、Y 向上）
+│   ├── fidelity/                 # 保真层：整份文档进树，事实从树里读
+│   │   ├── sexpr.py              # 无损 S 表达式（保留原子拼写/引号/转义）
+│   │   ├── kicad_doc.py          # 整棵 (kicad_pcb ...) + token 双射自证 + 覆盖报告
+│   │   ├── epro_doc.py           # 整个 ZIP：每个成员/每行日志/ticket/删除都保留
+│   │   ├── views.py              # 事实投影，每条记录带 raw
+│   │   └── engine.py             # 裁判：kicad-cli 的 DRC / stats / Gerbers / pos
 │   ├── adapters/                 # Adapter 层：两份格式 → 一个 Canonical
 │   │   ├── canonical.py          # 唯一真值容器 + present/absent 记账
 │   │   ├── kicad_pcb.py          # S-expr 解析、Edge.Cuts 轮廓、叠层、工程规则
@@ -189,9 +208,9 @@ pcb_agent_mcp/
 │       └── creepage.py           # 爬电/间隙，fail-closed
 ├── data/
 │   └── creepage_tables.json      # 空表 + verified:false（故意不填）
-├── tests/                        # 110 个用例（含"解析前后文件 sha256 不变"）
-│   └── data/sample.kicad_pcb     # 合成样本（不是真实工程）
-└── docs/                         # 设计文档 00~10，建议按编号顺序读
+├── tests/                        # 143 个用例（含"解析前后 sha256 不变"与"裁判有牙"）
+│   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
+└── docs/                         # 设计文档 00~11，建议按编号顺序读
 ```
 
 ## 免责声明

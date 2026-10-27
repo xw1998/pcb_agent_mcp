@@ -67,7 +67,7 @@ class TestParseSampleBoard(unittest.TestCase):
         self.assertEqual(c["pads"], 4)
         self.assertEqual(c["tracks"], 2)
         self.assertEqual(c["vias"], 1)
-        self.assertEqual(c["zones"], 1)
+        self.assertEqual(c["zones"], 2)   # one GND pour + one keepout
         self.assertEqual(c["outline_contours"], 1)
 
     def test_y_axis_is_flipped(self):
@@ -87,7 +87,9 @@ class TestParseSampleBoard(unittest.TestCase):
         # a track stores net 2; the model must expose "VCC", not "2"
         self.assertEqual(self.board.tracks[0]["net"], "VCC")
         self.assertEqual(self.board.vias[0]["net"], "VCC")
-        self.assertEqual(self.board.zones[0]["net"], "GND")
+        gnd = [z for z in self.board.zones if z["net"] == "GND"][0]
+        self.assertEqual(gnd["net"], "GND")
+        self.assertEqual(len([z for z in self.board.zones if z.get("keepout")]), 1)
 
     def test_properties_read_as_reference_and_value(self):
         c1 = [f for f in self.board.footprints if f["ref"] == "C1"][0]
@@ -110,7 +112,7 @@ class TestParseSampleBoard(unittest.TestCase):
         self.assertAlmostEqual(self.board.thickness_mm, 1.6, places=6)
 
     def test_zone_fill_polygon_read(self):
-        zone = self.board.zones[0]
+        zone = [z for z in self.board.zones if z["filled_polygons"]][0]
         self.assertEqual(len(zone["filled_polygons"]), 1)
         self.assertEqual(len(zone["filled_polygons"][0]), 4)
 

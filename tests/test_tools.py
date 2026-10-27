@@ -25,12 +25,62 @@ SAMPLE = os.path.join(HERE, "data", "sample.kicad_pcb")
 
 BOARD_TOOLS = ["board_summary", "board_components", "board_nets", "board_clearance",
                "board_free_space", "board_pour_connectivity", "board_cross_split",
-               "board_loop_area"]
+               "board_loop_area", "board_fidelity", "board_view", "board_drc",
+               "board_stats"]
 
 
 def _sha256(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+class TestDerivedAnswersAreLabelled(unittest.TestCase):
+    """A computed number must say so, and name the tool that has the real verdict."""
+
+    def test_measurement_tools_are_marked_derived(self):
+        for name in ("board_clearance", "board_free_space", "board_pour_connectivity",
+                     "board_cross_split", "board_loop_area"):
+            args = {"path": SAMPLE}
+            if name == "board_free_space":
+                args["layer"] = "F.Cu"
+            if name == "board_loop_area":
+                args["net"] = "VCC"
+            out = tools.call_tool(name, args)
+            self.assertEqual(out.get("status"), "ok", (name, out))
+            self.assertIs(out.get("authoritative"), False, name)
+            self.assertIn("board_drc", out.get("verdict_available_from", ""), name)
+
+
+class TestFidelityTools(unittest.TestCase):
+
+    def test_fidelity_proves_the_document_is_carried(self):
+        out = tools.call_tool("board_fidelity", {"path": SAMPLE, "engine": False})
+        self.assertEqual(out["status"], "ok")
+        self.assertTrue(out["roundtrip"]["token_identity"])
+        self.assertEqual(out["coverage"]["share_with_a_reading_rule"], 1.0)
+        self.assertEqual(out["engine_check"]["status"], "skipped")
+
+    def test_view_returns_raw_when_asked_for_setup(self):
+        out = tools.call_tool("board_view", {"path": SAMPLE, "kind": "setup"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["value"]["board_thickness_mm"], 1.6)
+
+    def test_view_unknown_kind_is_refused(self):
+        out = tools.call_tool("board_view", {"path": SAMPLE, "kind": "nonsense"})
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "ARG_INVALID")
+
+    def test_view_limit_truncates_but_reports_total(self):
+        out = tools.call_tool("board_view", {"path": SAMPLE, "kind": "pads", "limit": 1})
+        self.assertEqual(out["total"], 4)
+        self.assertEqual(out["returned"], 1)
+        self.assertTrue(out["truncated"])
+
+    def test_view_keeps_raw_on_every_record(self):
+        out = tools.call_tool("board_view", {"path": SAMPLE, "kind": "zones"})
+        for item in out["items"]:
+            self.assertIn("filled_polygons", item)
+            self.assertTrue(item["raw"].startswith("(zone"))
 
 
 class TestRegistryShape(unittest.TestCase):
