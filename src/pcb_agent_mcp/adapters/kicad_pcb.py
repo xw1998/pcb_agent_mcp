@@ -858,8 +858,13 @@ def parse_board_text(text, path="<memory>", project_path=None):
 
     polys, contours = _edge_polygons(tree)
     if polys:
-        # gr_rect / gr_circle / gr_poly: first is the outer contour by convention
-        board.outline = [polys[0]] + polys[1:]
+        # gr_rect / gr_circle / gr_poly: the FIRST is the outer contour, and every
+        # later one is a cut-out. Putting them all in `outline` (what this did
+        # before) made an internal slot look like board edge: the outline bbox
+        # then spanned every contour and `cutouts` stayed empty, so a 1 mm routed
+        # slot was silently indistinguishable from the board's own boundary.
+        board.outline = [polys[0]]
+        board.cutouts = list(polys[1:])
     if contours:
         if not board.outline:
             outer = max(contours, key=lambda p: abs(G.polygon_area(p)))

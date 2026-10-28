@@ -473,6 +473,58 @@ def selftest():
               refused.get("status") == "error"
               and refused.get("reason_code") == "FORMAT_NOT_SUPPORTED",
               str(refused.get("reason_code")))
+
+        # DFM: a capability document is the fab's promise, never this server's
+        # default. Both directions are checked - a typo'd rule key is refused,
+        # and the same board passes one limit and fails the next.
+        dfm_board = os.path.join(tmp, "dfm.kicad_pcb")
+        with open(dfm_board, "wb") as fh:
+            fh.write(b'(kicad_pcb (version 20221018) (generator pcbnew)\n'
+                     b'  (layers (0 "F.Cu" signal) (31 "B.Cu" signal)'
+                     b' (44 "Edge.Cuts" user))\n'
+                     b'  (net 0 "") (net 1 "VCC")\n'
+                     b'  (gr_rect (start 0 0) (end 50 30) (layer "Edge.Cuts")'
+                     b' (width 0.1))\n'
+                     b'  (footprint "T:A" (layer "F.Cu") (at 5 5)\n'
+                     b'    (fp_text reference "U1" (at 0 -2) (layer "F.SilkS"))\n'
+                     b'    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")'
+                     b' (net 1 "VCC")))\n'
+                     b'  (segment (start 5 5) (end 40 5) (width 0.2) (layer "F.Cu")'
+                     b' (net 1))\n'
+                     b'  (via (at 20 5) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu")'
+                     b' (net 1))\n)\n')
+
+        r = handle({"jsonrpc": "2.0", "id": 78, "method": "tools/call",
+                    "params": {"name": "dfm_capability", "arguments": {
+                        "capability": {"source": "selftest",
+                                       "rules": {"min_track_wdith_mm": 0.2}}}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("dfm refuses a misspelled rule key instead of reading it as unstated",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "CAPABILITY_KEY_UNKNOWN",
+              str(payload.get("reason_code")))
+
+        _dfm_cap = {"fab": "selftest", "source": "selftest fixture",
+                    "rules": {"min_track_width_mm": 0.15, "min_via_drill_mm": 0.3}}
+        r = handle({"jsonrpc": "2.0", "id": 79, "method": "tools/call",
+                    "params": {"name": "dfm_check", "arguments": {
+                        "path": dfm_board, "capability": _dfm_cap}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("dfm passes 0.2 mm track / 0.3 mm drill against a 0.15 / 0.3 limit",
+              payload.get("status") == "ok"
+              and (payload.get("value") or {}).get("overall") == "pass"
+              and abs(((payload["value"].get("facts") or {})
+                       .get("narrowest_track") or {}).get("measured", 0) - 0.2) < 1e-9,
+              str((payload.get("value") or {}).get("overall")))
+
+        _dfm_cap["rules"] = dict(_dfm_cap["rules"], min_track_width_mm=0.25)
+        r = handle({"jsonrpc": "2.0", "id": 80, "method": "tools/call",
+                    "params": {"name": "dfm_check", "arguments": {
+                        "path": dfm_board, "capability": _dfm_cap}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("dfm fails the same board against a 0.25 mm limit and names the rule",
+              (payload.get("value") or {}).get("failed_rules") == ["min_track_width_mm"],
+              str((payload.get("value") or {}).get("failed_rules")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

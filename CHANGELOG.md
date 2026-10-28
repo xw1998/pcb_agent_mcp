@@ -9,6 +9,37 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.4] - 2026-10-28
+
+DFM 层：把"这块板能不能交给这家板厂做"变成可判的事实。**没有内置表**——限值只来自用户给的
+工艺能力文档，服务器负责规则目录、文档体检与板上实测。
+
+- 新增 `calc/dfm.py`：11 条规则键（`min_track_width_mm` / `min_clearance_mm` / `min_via_drill_mm` /
+  `min_via_annular_ring_mm` / `min_pth_annular_ring_mm` / `min_hole_to_hole_mm` /
+  `min_copper_to_edge_mm` / `min_slot_width_mm` / `max_board_width_mm` / `max_board_height_mm` /
+  `max_copper_layers`），每条带单位与方向；`NOT_CHECKED_BY_DESIGN` 逐条点名 8 类静态文件里
+  没有可比事实的项目。
+- 新增 `oracle.dfm_check` 与 `oracle._dfm_facts`：11 个板侧事实（窄线宽 / 铜间距 / 过孔钻孔与
+  环宽 / PTH 环宽 / 孔到孔 / 铜到板边 / 槽宽 / 板宽 / 板高 / 铜层数），每个都带 `where`；
+  孔到孔与铜到板边用有界桶网格搜索（默认 5 mm），窗外只回 `lower_bound`。
+- 新增 2 个工具（80 → **82**）：`dfm_capability`（只体检文档）、`dfm_check`（板上实测 + 五态判定）。
+- 判定五态 `pass` / `fail` / `not_checked` / `not_applicable`，文档里没声明的规则进
+  `missing_known_rules` 而不是算通过；未知键 / 缺 `source` / 空文档三处整份拒收
+  （`CAPABILITY_KEY_UNKNOWN` / `SOURCE_REQUIRED` / `CAPABILITY_EMPTY`）。
+- 新增 28 个用例（`tests/test_dfm.py`，手算金标：窄线 0.2 / 过孔环 0.15 / PTH 环 0.3 /
+  孔到孔 0.7 / 铜到边 0.875 / 槽宽 1.0 / 板 50×30），全量 **559 passed**；`--selftest` 加 3 条
+  指纹（错键被拒、同一块板对 0.15 mm 限值 pass、对 0.25 mm 限值 fail 且只报 `min_track_width_mm`），
+  **41/41**。
+- 文档：`docs/18-DFM-工艺能力校验.md`（十九篇），索引与 README 工具表同步。
+
+### 一个真缺陷：挖空被当成板框
+
+- **`adapters/kicad_pcb.py` 把 `Edge.Cuts` 的第二个轮廓也算进 `board.outline`**，于是显式画出来的
+  挖空（1 mm 铣槽）与板边分不开、`board.cutouts` 永远为空——DFM 的槽宽这一条根本量不出来
+  （测试直接 `KeyError: 'measured'`）。改为按面积挑外轮廓、其余进 `cutouts`。用 18 块 KiCad
+  官方 demo 板核过影响面：只有 `vme-wren` 多轮廓，但它走 `contours` 分支（本来就按面积挑），
+  所以只影响显式 `gr_rect` / `gr_circle` / `gr_poly` 画挖空的文件。
+
 ## [0.0.3] - 2026-10-28
 
 仿真层：把"算得出来的答案"从单点公式扩到电路 / 电流 / 热三个域。**仍是子集**，

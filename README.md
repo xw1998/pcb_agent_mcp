@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.3` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.4` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -96,7 +96,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（80 个）
+## 工具（82 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -187,6 +187,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `thermal_heatsink` | 反解需要多少 Rth(j-a) | **不提供散热片表**（那会是唯一一个不是推导出来的数） |
 | `thermal_convection` | 由风速/尺寸给 h | 工程关联式 ±25%，只用于比两种假设 |
 | `board_ir_drop` | 按**板上真实铜**算单网压降（节点带层号，两层只在 via/镀通孔相连） | 铜厚/镀铜未知或汇点不通即拒绝；`authoritative:false` |
+| `dfm_capability` | 只校验一份**工艺能力文档**：11 条规则键、单位、方向、出处 | 未知键 / 没有 `source` / 空文档**整份拒收**；不内置任何板厂表 |
+| `dfm_check` | 拿能力文档去量板上真实几何，逐条给 `pass/fail/not_checked/not_applicable` + 余量 + `where` | 文档里没写的规则列进 `missing_known_rules`（不是 pass）；有界搜索窗外只给 `lower_bound` |
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
@@ -196,9 +198,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.3
-python run_server.py --selftest      # 协议级自检，38/38（含板与原理图写路径端到端、天线四问、仿真四问）
-python -m unittest discover -s tests # 531 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
+python run_server.py --version       # 0.0.4
+python run_server.py --selftest      # 协议级自检，41/41（含板与原理图写路径端到端、天线四问、仿真四问、DFM 三问）
+python -m unittest discover -s tests # 559 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -327,6 +329,24 @@ MCP 客户端配置（stdio）：
 - **板级 IR drop 用板上真实铜，不用长度乘方阻。** 节点是 `(x, y, layer)`，两层只在 via 或
   镀通孔焊盘处相连；铜厚取自叠层（`1 oz`、`0.5 oz`），没写就拒绝，不默认 35 µm。
 
+### DFM 层：没有表，只有规则（[docs/18](docs/18-DFM-工艺能力校验.md)）
+
+- **不内置任何板厂工艺能力表。** 规则限值来自用户给的**能力文档**，服务器只提供目录（11 条规则键：
+  最小线宽 / 最小间距 / 最小过孔钻孔与环宽 / 最小 PTH 环宽 / 孔到孔 / 铜到板边 / 最小槽宽 /
+  最大板宽 / 最大板高 / 最大铜层数）与体检。填一个猜的线宽限值比拒答更糟——那会让人以为板厂
+  已经答应了。
+- **三处整份拒收，而不是逐条忽略。** 未知键（拼错的键会被读成「没这条要求」）、缺 `source`
+  （说不出出处的限值不可追责）、空文档，一律 `CAPABILITY_*` 报错并回可用的键清单。
+- **没写的规则不是 pass。** 文档里没声明的规则进 `missing_known_rules`；不适用（例如板上没有
+  PTH 孔时的环宽）才 `not_applicable`；量不出来的进 `not_checked_by_design`——那 8 项
+  （阻焊桥、丝印、阻抗签核、工艺公差、拼板/V-cut/基准点、镀通与非镀通槽、铜到成品孔壁、
+  圆弧折线化）在静态文件里根本没有可比事实。
+- **量不到就给下界，不冒充最小值。** 孔与孔、铜到板边用有界搜索窗口（默认 5 mm）内的桶网格取最小值；
+  窗口里找不到时回 `lower_bound` 而不是 `measured`，两者在输出上分得开。
+- **这一层抓出一个真缺陷。** `adapters/kicad_pcb.py` 曾把 `Edge.Cuts` 的第二个轮廓也当成板框，
+  于是显式画出来的挖空（1 mm 铣槽）与板边分不开、`cutouts` 永远为空——槽宽这一条根本量不出来。
+  改后按面积挑外轮廓、其余进 `cutouts`，28 个用例里有手算金标守护。
+
 ## 项目结构
 
 ```
@@ -335,7 +355,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 80 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 82 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -378,14 +398,15 @@ pcb_agent_mcp/
 │       ├── link.py               # FSPL/Friis/最大距离/有效面积/远场/菲涅耳
 │       ├── spice.py              # SPICE 子集：MNA + 牛顿 + pnjlim + gmin 步进
 │       ├── power.py              # 铜阻/过孔/自感/电阻网络/IR drop/电容组/PDN
-│       └── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
+│       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
+│       └── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
 ├── data/
 │   ├── creepage_tables.json      # 空表 + verified:false + why_empty（故意不填）
 │   └── ipc2152_tables.json       # 同上；表本身由 calc/safety_table.py 可执行地体检
-├── tests/                        # 531 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 559 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~17，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~18，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
@@ -398,6 +419,9 @@ pcb_agent_mcp/
 - 仿真层是**子集**：SPICE 只有 R C L V I E G D Q M 与后向欧拉瞬态，没有自热、没有噪声/失真、
   没有器件电容随温度；热学是 1-D/2-D 稳态与单级或多级 RC，不含 TIM 压缩、辐照与空气流场；
   板级 IR drop 只算直流、只用叠层铜厚。逐条写在每次返回的 `not_computed` / `warnings` 里。
+- DFM 校验是**工艺能力核对**，不是板厂签核。它只回答「给定这份能力文档，板上哪几条越界了」；
+  蚀刻公差、阻焊桥、丝印可读性、拼板与基准点、铜到成品孔壁这 8 类静态文件里没有可比事实，
+  一律 `not_checked_by_design`，不要把它读成「通过」。
 - 爬电/间隙**故意不给默认值**。安规间距须按适用标准与电压等级查表，本项目只做查表与一致性检查；
   涉及市电、医疗、车载等场景请由有资质的工程师评审。
 - MIT 许可证，作者不对任何设计后果承担责任。

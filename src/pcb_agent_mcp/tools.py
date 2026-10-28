@@ -22,6 +22,7 @@ from .calc import units as _units
 from .calc import antenna as _antenna
 from .calc import feedline as _feedline
 from .calc import link as _link
+from .calc import dfm as _dfm
 from .calc import matching as _matching
 from .calc import power as _power
 from .calc import spice as _spice
@@ -1186,6 +1187,12 @@ def _capabilities(_args):
                           "budget). Every model is lumped or closed-form: no "
                           "full-wave, no electrothermal coupling, no thermal "
                           "radiation",
+            "dfm": "manufacturability against a capability document YOU supply: narrowest "
+                   "track, copper gap, via drill and rings, hole-to-hole web, "
+                   "copper-to-edge, narrowest cut-out, board size, layer count. This "
+                   "server ships NO fab table on purpose - the limits are the "
+                   "document's and it must name its source; rules the document does "
+                   "not state come back as unanswered, not as passes",
             "desktop": "find / start / stop the EDA and open a project, verified by "
                        "window title - never touches a project file",
             "write": "propose (compute only, no byte is written) -> apply (confirm=true, "
@@ -1226,6 +1233,7 @@ def _capabilities(_args):
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_convection",
             "board_ir_drop",
+            "dfm_capability", "dfm_check",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
@@ -1297,7 +1305,16 @@ def _capabilities(_args):
             "answer carries that list as not_computed so it cannot be mistaken for a "
             "full answer. The hand-off is deliberate: design here, then simulate or "
             "measure",
-            "DFM checks (fabricator capability rules)",
+            "DFM rules the fab states that this layer cannot measure: solder-mask "
+            "slivers and mask-defined pitch, silkscreen line width / text height, "
+            "impedance-controlled stackup sign-off (the fab's coupon is the verdict), "
+            "process tolerances (hole position, plating and copper weight, board "
+            "thickness), panelisation / tooling rails / V-cut / fiducials, and "
+            "copper-to-finished-hole-wall spacing with plating build-up. They are "
+            "listed in every dfm_check answer as not_checked_by_design. Also NOT "
+            "here: any built-in fab capability table - "
+            "dfm_capability REJECTS a document without a source and does not fill "
+            "the gaps with typical values",
             "BGA/thermal via array temperature rise, fuse behaviour, electrothermal "
             "coupling: data/ipc2152_tables.json ships with ZERO rows on purpose - the "
             "table validator (calc/safety_table.py) is in place, but the standard is "
@@ -1382,6 +1399,13 @@ def _capabilities(_args):
                          "one field2d already scores against the 2-D solver (-0.35 % .. "
                          "-2.83 %); CPW/GCPW are NOT solver-validated, only limit-checked, "
                          "and say so",
+            "dfm": "the rule catalogue is this server's, the limits are never: tests "
+                   "cover both failure directions (an unknown key and a missing source "
+                   "are refused, not defaulted), a measured value exactly on the limit "
+                   "passes and 1 um short fails, and a rule with no measurement comes "
+                   "back not_checked rather than pass. Board-side measurements are "
+                   "checked on real .kicad_pcb fixtures (track 0.2 mm, via 0.3/0.6, "
+                   "hole web, copper-to-edge, a 1 mm slot in a 50x30 outline)",
             "simulation": "golden values computed by hand, not by the code being "
                           "tested: a 10 V 1k/2k divider gives 6.666666662 V (3e-9 "
                           "from gmin), an RC step on 1k/1u matches the BACKWARD-EULER "
@@ -2268,6 +2292,47 @@ _tool(
         plating_um=a.get("plating_um"),
         quantize_mm=(a["quantize_mm"] if a.get("quantize_mm") is not None else 0.01),
         temp_c=(a["temp_c"] if a.get("temp_c") is not None else 20.0)), derived=True),
+)
+
+_tool(
+    "dfm_capability",
+    "Validate a process capability document on its own, before any board is opened: which "
+    "known rules it states, which it leaves unanswered, and whether it is usable at all. "
+    "An unknown rule key is REJECTED (a typo would otherwise read as 'not stated'), and a "
+    "document with no `source` is REJECTED - an unattributed limit cannot be told apart "
+    "from an invented one. This server ships NO fab table on purpose.",
+    {"type": "object", "properties": {
+        "capability": {"type": "object", "description":
+                       '{"fab": "...", "source": "where the numbers came from", '
+                       '"verified": false, "rules": {"min_track_width_mm": 0.127, ...}}. '
+                       "Rule keys: %s" % ", ".join(sorted(_dfm.RULES))},
+    }, "required": ["capability"]},
+    lambda a: _dfm.validate(a.get("capability")),
+)
+
+_tool(
+    "dfm_check",
+    "Compare THIS board against a supplied fab capability document: narrowest track, "
+    "copper-to-copper gap, via drill and annular rings, plated-pad rings, hole-to-hole web, "
+    "copper-to-edge, narrowest cut-out, board width/height and copper layer count. The "
+    "limits are the document's, the measurements are the board's, and every rule the "
+    "document leaves out is reported as UNANSWERED rather than passed. " + _NOT_WRITTEN,
+    {"type": "object", "properties": dict({
+        "capability": {"type": "object", "description":
+                       "the same document dfm_capability validates"},
+        "layer": _str("restrict the track/clearance measurements to one copper layer"),
+        "window_mm": _num("search radius for the nearest-feature measurements "
+                          "(hole-to-hole, copper-to-edge); a feature farther than this "
+                          "is reported as a proven bound, not as a number", 5.0),
+        "check_clearance": _bool("run the pairwise copper sweep (the expensive one)",
+                                 True),
+    }, **_COMMON), "required": ["path", "capability"]},
+    _board_tool(lambda b, a: _oracle.dfm_check(
+        b, a.get("capability"), layer=a.get("layer"),
+        window_mm=(a["window_mm"] if a.get("window_mm") is not None else 5.0),
+        check_clearance=(a["check_clearance"]
+                         if a.get("check_clearance") is not None else True)),
+        derived=True),
 )
 
 _tool(

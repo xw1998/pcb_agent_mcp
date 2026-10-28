@@ -1277,3 +1277,330 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                                       "temperature rise feedback (rho uses temp_c)",
                                       "current capacity / fusing (needs a "
                                       "temperature-rise criterion, not a current)"]})
+
+
+# ------------------------------------------------------------------------ DFM
+# Design-for-manufacture: measure the facts a fab capability document talks
+# about, and hand them to calc/dfm.py. The limits never come from here - this
+# half of the job is only "what does the board actually carry".
+def _hole_list(board):
+    """Every drilled hole on the board, vias and pads together.
+
+    One list on purpose: a fab's hole-to-hole rule does not care whether the two
+    holes are vias, through-hole pads or mounting holes.
+    """
+    holes = []
+    for via in board.vias:
+        drill = via.get("drill")
+        if drill is None:
+            continue
+        dia = via.get("diameter") or drill
+        holes.append({"kind": "via",
+                      "ref": "via@(%.3f,%.3f)" % (via["x"], via["y"]),
+                      "x": float(via["x"]), "y": float(via["y"]),
+                      "drill_mm": float(drill), "diameter_mm": float(dia)})
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            hole = pad.get("hole_mm")
+            if hole is None:
+                continue
+            holes.append({"kind": "pad",
+                          "ref": "%s.%s" % (fp.get("ref") or "?",
+                                            pad.get("number") or "?"),
+                          "x": float(pad["x"]), "y": float(pad["y"]),
+                          "drill_mm": float(hole),
+                          "diameter_mm": min(float(pad.get("w") or 0.0),
+                                             float(pad.get("h") or 0.0))})
+    return holes
+
+def _hole_web(holes, window_mm=5.0):
+    """Smallest wall-to-wall gap between two holes, or a proven lower bound.
+
+    Bucketed so a 2000-pad BGA does not become 2 million comparisons, but the
+    answer stays exact whenever it matters: every pair whose gap is below
+    `window_mm` is guaranteed to be compared (the buckets are walked with a
+    one-cell halo, and the radius subtraction is folded into the test), so a
+    found gap smaller than the window IS the global minimum. If nothing is
+    found the caller is told "at least window_mm", not a number.
+    """
+    if len(holes) < 2:
+        return {"not_applicable": "fewer than two drilled holes on this board"}
+    cell = float(window_mm)
+    grid = {}
+    for idx, h in enumerate(holes):
+        key = (int(math.floor(h["x"] / cell)), int(math.floor(h["y"] / cell)))
+        grid.setdefault(key, []).append(idx)
+    best = None
+    seen = set()
+    for (gx, gy), bucket in grid.items():
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                other = grid.get((gx + dx, gy + dy))
+                if not other:
+                    continue
+                for i in bucket:
+                    for j in other:
+                        if i >= j:
+                            continue
+                        pair = (i, j)
+                        if pair in seen:
+                            continue
+                        seen.add(pair)
+                        a, b = holes[i], holes[j]
+                        gap = (math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+                               - a["drill_mm"] / 2.0 - b["drill_mm"] / 2.0)
+                        if gap <= window_mm and (best is None or gap < best[0]):
+                            best = (gap, a, b)
+    if best is None:
+        return {"lower_bound": float(window_mm),
+                "where": "no two holes are within %.2f mm of each other" % window_mm}
+    return {"measured": max(0.0, best[0]),
+            "where": "%s and %s (drill %.3f / %.3f mm)"
+                     % (best[1]["ref"], best[2]["ref"],
+                        best[1]["drill_mm"], best[2]["drill_mm"])}
+
+def _edge_segments(board):
+    """Board outline and cut-out contours as plain segments (arcs are already polylines)."""
+    segs = []
+    for kind, contours in (("outline", board.outline or []),
+                           ("cutout", board.cutouts or [])):
+        for contour in contours:
+            n = len(contour)
+            if n < 2:
+                continue
+            for i in range(n):
+                a, b = contour[i], contour[(i + 1) % n]
+                if a == b:
+                    continue
+                segs.append((tuple(a), tuple(b), kind))
+    for chain in board.outline_open or []:
+        n = len(chain)
+        for i in range(n - 1):
+            segs.append((tuple(chain[i]), tuple(chain[i + 1]), "outline_open"))
+    return segs
+
+def _dist_item_to_edge(item, a, b):
+    if "poly" in item:
+        return G.dist_polygon_polygon(item["poly"], [a, b])
+    p1, p2, w = item["seg"]
+    return max(0.0, G.dist_segment_segment(p1, p2, a, b) - w / 2.0)
+
+def _min_copper_to_edge(board, items, segs, window_mm=5.0):
+    if not segs:
+        return {"why": "the board has no closed outline (or only open chains), so "
+                       "there is no edge to measure against"}
+    cell = float(window_mm)
+    grid = {}
+    for idx, (a, b, _kind) in enumerate(segs):
+        x0, y0 = min(a[0], b[0]), min(a[1], b[1])
+        x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+        for gx in range(int(math.floor(x0 / cell)), int(math.floor(x1 / cell)) + 1):
+            for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
+                grid.setdefault((gx, gy), []).append(idx)
+    best = None
+    for item in items:
+        x0, y0, x1, y1 = _item_bbox(item)
+        cand = set()
+        for gx in range(int(math.floor((x0 - cell) / cell)),
+                        int(math.floor((x1 + cell) / cell)) + 1):
+            for gy in range(int(math.floor((y0 - cell) / cell)),
+                            int(math.floor((y1 + cell) / cell)) + 1):
+                cand.update(grid.get((gx, gy)) or ())
+        for idx in cand:
+            a, b, _kind = segs[idx]
+            d = _dist_item_to_edge(item, a, b)
+            if d <= window_mm and (best is None or d < best[0]):
+                best = (d, item["ref"], idx)
+    if best is None:
+        return {"lower_bound": float(window_mm),
+                "where": "no copper is within %.2f mm of a board edge" % window_mm}
+    a, b, kind = segs[best[2]]
+    return {"measured": max(0.0, best[0]),
+            "where": "%s vs %s edge (%.3f,%.3f)-(%.3f,%.3f)"
+                     % (best[1], kind, a[0], a[1], b[0], b[1])}
+
+def _polygon_throat(points):
+    """Narrowest distance across a simple polygon: min over vertices of the
+    distance to a non-adjacent edge.
+
+    This is the "slot width" a fab cares about. It is exact for a rectangle
+    (both short edges give the width) and conservative-to-the-point for a
+    curved slot, because the contour is already a polyline.
+    """
+    n = len(points)
+    if n < 3:
+        return None
+    best = None
+    for i, p in enumerate(points):
+        for j in range(n):
+            if j in ((i - 1) % n, i, (i + 1) % n):
+                continue
+            d = G.dist_point_segment(p, points[j], points[(j + 1) % n])
+            if d > 1e-9 and (best is None or d < best):
+                best = d
+    return best
+
+def _dfm_facts(board, rules, layer=None, window_mm=5.0, check_clearance=True):
+    """Measure the facts a capability document can talk about.
+
+    Each fact is `measured` (a number, or a proven bound) or explains why it is
+    not: `not_applicable` when the board has no such feature, `why` when this
+    server cannot measure it.
+    """
+    facts = {}
+
+    # -- narrowest track ---------------------------------------------------
+    tracks = [t for t in board.tracks if t.get("width")]
+    if layer:
+        tracks = [t for t in tracks if t.get("layer") == layer]
+    if tracks:
+        t = min(tracks, key=lambda x: float(x["width"]))
+        facts["narrowest_track"] = {
+            "measured": float(t["width"]),
+            "where": "%s track on %s" % ("%.4g mm wide" % float(t["width"]),
+                                         t.get("layer"))}
+    else:
+        facts["narrowest_track"] = {"not_applicable": "no copper track on this board"}
+
+    # -- copper-to-copper gap ---------------------------------------------
+    if "min_clearance_mm" not in rules:
+        facts["min_copper_gap"] = {"why": "the capability document does not state "
+                                          "min_clearance_mm, so the (expensive) "
+                                          "pairwise sweep was skipped"}
+    elif not check_clearance:
+        facts["min_copper_gap"] = {"why": "check_clearance=False; the pairwise sweep "
+                                          "was not run"}
+    else:
+        limit = rules["min_clearance_mm"]
+        res = clearance(board, threshold_mm=max(limit, 1e-3), layer=layer)
+        if res.get("status") != "ok":
+            facts["min_copper_gap"] = {"why": res.get("message") or "clearance failed"}
+        else:
+            val = res["value"]
+            gap = val.get("min_gap_mm")
+            cell = (res.get("assumptions") or {}).get("cell_mm") or 0.0
+            if gap is None:
+                facts["min_copper_gap"] = {
+                    "not_applicable": "fewer than two comparable copper items on the "
+                                      "requested layer"}
+            elif cell and gap >= cell:
+                facts["min_copper_gap"] = {
+                    "lower_bound": float(cell),
+                    "where": "no pair closer than the %.2f mm search window" % cell}
+            else:
+                btw = val.get("min_gap_between") or {}
+                facts["min_copper_gap"] = {
+                    "measured": float(gap),
+                    "where": "%s vs %s (%d pair(s) below %.3f mm)"
+                             % (btw.get("a"), btw.get("b"), val.get("violations", 0),
+                                limit)}
+
+    # -- holes -------------------------------------------------------------
+    holes = _hole_list(board)
+    if holes:
+        vias = [h for h in holes if h["kind"] == "via"]
+        if vias:
+            v = min(vias, key=lambda h: h["drill_mm"])
+            facts["min_via_drill"] = {"measured": v["drill_mm"],
+                                      "where": "%s drill" % v["ref"]}
+            h = min(vias, key=lambda x: (x["diameter_mm"] - x["drill_mm"]) / 2.0)
+            raw = (h["diameter_mm"] - h["drill_mm"]) / 2.0
+            facts["min_via_ring"] = {
+                "measured": max(0.0, raw),
+                "where": "%s: (%.3f - %.3f) / 2%s"
+                         % (h["ref"], h["diameter_mm"], h["drill_mm"],
+                            "" if raw >= 0 else " = NEGATIVE (drill wider than copper)")}
+        else:
+            facts["min_via_drill"] = {"not_applicable": "no via on this board"}
+            facts["min_via_ring"] = {"not_applicable": "no via on this board"}
+        pads = [h for h in holes if h["kind"] == "pad"]
+        if pads:
+            p = min(pads, key=lambda h: (h["diameter_mm"] - h["drill_mm"]) / 2.0)
+            raw = (p["diameter_mm"] - p["drill_mm"]) / 2.0
+            facts["min_pad_ring"] = {
+                "measured": max(0.0, raw),
+                "where": "%s: (%.3f - %.3f) / 2%s"
+                         % (p["ref"], p["diameter_mm"], p["drill_mm"],
+                            "" if raw >= 0 else " = NEGATIVE (drill wider than copper)")}
+        else:
+            facts["min_pad_ring"] = {"not_applicable":
+                                     "no plated through-hole pad on this board"}
+        facts["min_hole_web"] = _hole_web(holes, window_mm=window_mm)
+    else:
+        for k in ("min_via_drill", "min_via_ring", "min_pad_ring", "min_hole_web"):
+            facts[k] = {"not_applicable": "no drilled hole on this board"}
+
+    # -- copper to board edge ---------------------------------------------
+    # Copper only: a footprint's silkscreen outline is an item too, and counting
+    # silk as copper would invent a copper-to-edge violation nobody has.
+    items = [it for it in _items(board)
+             if any(str(l).endswith(".Cu") for l in (it.get("layers") or []))]
+    facts["min_copper_to_edge"] = _min_copper_to_edge(board, items,
+                                                      _edge_segments(board),
+                                                      window_mm=window_mm)
+
+    # -- internal cut-outs --------------------------------------------------
+    cutouts = [c for c in (board.cutouts or []) if len(c) >= 3]
+    if cutouts:
+        widths = [(w, i) for i, c in enumerate(cutouts)
+                  for w in [_polygon_throat(c)] if w]
+        if widths:
+            w, i = min(widths)
+            facts["min_slot_width"] = {"measured": w,
+                                       "where": "cut-out #%d (%d vertices)"
+                                                % (i, len(cutouts[i]))}
+        else:
+            facts["min_slot_width"] = {"why": "no cut-out contour has enough vertices "
+                                              "to measure a throat"}
+    else:
+        facts["min_slot_width"] = {"not_applicable": "no internal cut-out on this board"}
+
+    # -- board size --------------------------------------------------------
+    outline = [p for c in (board.outline or []) for p in c]
+    if not outline:
+        dims = None
+    else:
+        bbox = G.bbox_of(outline)
+        dims = (bbox[2] - bbox[0], bbox[3] - bbox[1])
+    if dims:
+        facts["board_width"] = {"measured": dims[0],
+                                "where": "outline bbox x extent"}
+        facts["board_height"] = {"measured": dims[1],
+                                 "where": "outline bbox y extent"}
+    else:
+        why = {"why": "no closed board outline, so there is no width to measure"}
+        facts["board_width"] = dict(why)
+        facts["board_height"] = dict(why)
+
+    # -- copper layer count ------------------------------------------------
+    cu = set()
+    for it in items:
+        for lname in it.get("layers") or []:
+            if str(lname).endswith(".Cu"):
+                cu.add(str(lname))
+    if cu:
+        facts["copper_layers"] = {"measured": float(len(cu)),
+                                  "where": "distinct copper layers carrying copper: %s"
+                                           % ", ".join(sorted(cu))}
+    else:
+        facts["copper_layers"] = {"why": "no copper item names a copper layer"}
+    return facts
+
+def dfm_check(board, capability, layer=None, window_mm=5.0, check_clearance=True):
+    """Measure this board and compare it against a SUPPPLIED capability document.
+
+    The limits are the document's; every measurement is this board's; nothing is
+    defaulted. Rules the document does not state are listed as unanswered, and
+    rules this server cannot measure come back `not_checked` with the reason.
+    """
+    from .calc import dfm as _dfm
+    rules, e = _dfm.read_capability(capability)
+    if e:
+        return e
+    facts = _dfm_facts(board, rules, layer=layer, window_mm=float(window_mm),
+                       check_clearance=bool(check_clearance))
+    out = _dfm.evaluate(capability, facts)
+    if out.get("status") == "ok":
+        out["value"]["facts"] = {k: v for k, v in sorted(facts.items())}
+        out["value"]["search_window_mm"] = float(window_mm)
+    return out
