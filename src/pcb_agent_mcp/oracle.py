@@ -1604,3 +1604,139 @@ def dfm_check(board, capability, layer=None, window_mm=5.0, check_clearance=True
         out["value"]["facts"] = {k: v for k, v in sorted(facts.items())}
         out["value"]["search_window_mm"] = float(window_mm)
     return out
+
+# ------------------------------------------------------------- vibration
+def board_vibration(board, mount="corners", material="fr4", thickness_mm=None,
+                    n_modes=4, poly_degree=7, probe="components"):
+    """Natural frequencies of THIS board, and where on it each component sits.
+
+    The plate is the board's outline bounding box; the thickness is the stated
+    board thickness or the stackup sum. The mode shapes are then sampled at the
+    component positions, so the answer to "which part gets shaken hardest" is a
+    number per reference designator rather than a picture.
+
+    Two approximations are named in the envelope and are large enough to matter:
+      * a non-rectangular outline is replaced by its bounding box, which is
+        bigger and therefore softer - f1 comes out LOW;
+      * component mass (which adds inertia and lowers f) and copper (which adds
+        stiffness and raises it) are both ignored.
+    """
+    from .calc import vibration as _vib
+
+    polys = [p for p in (board.outline or []) if p and len(p) >= 3]
+    if not polys:
+        return err("the board has no closed outline", "OUTLINE_MISSING",
+                   hint="natural frequency needs a plate - there is no bbox to "
+                        "measure without a closed edge contour")
+    ring = polys[0]
+    x0, y0, x1, y1 = G.bbox_of(ring)
+    a_mm = abs(x1 - x0)
+    b_mm = abs(y1 - y0)
+    if a_mm <= 0.0 or b_mm <= 0.0:
+        return err("the outline bbox has zero size", "OUTLINE_INVALID")
+
+    poly_area = abs(G.polygon_area(ring))
+    bbox_area = a_mm * b_mm
+    fill = poly_area / bbox_area if bbox_area > 0 else 0.0
+
+    th = _stack_thickness(board) if thickness_mm is None else None
+    try:
+        th = float(thickness_mm) if thickness_mm is not None else th
+    except (TypeError, ValueError):
+        return err("thickness_mm must be a number", "ARG_INVALID")
+    if th is None or th <= 0.0:
+        return err("board thickness unknown", "ARG_REQUIRED",
+                   hint="the stackup carries no total thickness and no "
+                        "thickness_mm was given; f ~ h, so this cannot be defaulted")
+
+    # probe points: component origins, in bbox-relative plate coordinates
+    probes = []
+    if probe == "components":
+        for fp in board.footprints or []:
+            try:
+                px = float(fp.get("x"))
+                py = float(fp.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if not (x0 <= px <= x1 and y0 <= py <= y1):
+                continue
+            probes.append({"name": str(fp.get("ref") or "?"),
+                           "x_mm": px - x0, "y_mm": py - y0})
+    elif isinstance(probe, list):
+        for pp in probe:
+            probes.append(pp)
+    elif probe is not None:
+        return err("probe must be 'components' or a list of {name,x_mm,y_mm}",
+                   "ARG_INVALID")
+
+    res = _vib.plate_modes(a_mm, b_mm, th, material=material, mount=mount,
+                           n_modes=n_modes, poly_degree=poly_degree,
+                           probe_points=probes or None)
+    if res.get("status") != "ok":
+        return res
+    val = res["value"]
+
+    # re-origin the reported geometry into board coordinates
+    modes = []
+    for m in val["modes"]:
+        m2 = dict(m)
+        if "antinode_mm" in m2:
+            m2["antinode_board_mm"] = [_sig2(m2["antinode_mm"][0] + x0),
+                                       _sig2(m2["antinode_mm"][1] + y0)]
+        modes.append(m2)
+
+    warnings = list(val.get("warnings") or [])
+    if fill < 0.99:
+        warnings.append(
+            "the outline fills only %.1f %% of its bounding box, so the plate "
+            "model is bigger and softer than the real board: f1 is biased LOW "
+            "(the bias is not computed - it needs a real 2-D mesh)"
+            % (100.0 * fill))
+    warnings.append("component mass is not added; a heavy part lowers f1 and "
+                    "moves the mode")
+
+    # which components sit on the antinodes of the first mode
+    hot = []
+    if probes and modes:
+        first = modes[0]
+        if first.get("deflection_at_probes"):
+            ranked = sorted(first["deflection_at_probes"],
+                            key=lambda d: -abs(d["normalised_deflection"]))
+            for d in ranked:
+                hot.append({"ref": d["name"],
+                            "normalised_deflection": d["normalised_deflection"],
+                            "near_antinode": abs(d["normalised_deflection"]) >= 0.5})
+
+    out = ok(
+        {
+            "plate_mm": [_sig2(a_mm), _sig2(b_mm)],
+            "thickness_mm": th,
+            "outline_fill_fraction_of_bbox": _sig2(fill),
+            "mount": mount,
+            "modes": modes,
+            "hotspots": hot[:12],
+            "probe_count": len(probes),
+            "warnings": warnings,
+        },
+        "Hz",
+        res["model"],
+        "Kirchhoff thin plate over the outline bounding box, mount=%r" % mount,
+        "mode frequencies inherit the plate model's accuracy (exact for a "
+        "rectangular SSSS/CCCC plate, 0.15 % for free edges) plus the two "
+        "outline/mass approximations named in warnings",
+        {"note": "use vibration_random_response / vibration_fatigue with modes[0]"
+                 "['freq_hz'] and a PSD and an allowable deflection to get from "
+                 "'it rings at N Hz' to 'it survives M hours'",
+         "answer_source": "computed by this server from geometry",
+         "authoritative": False,
+         "verdict_available_from": "no vendor engine computes this - it is a "
+                                   "design estimate, not a DRC rule"},
+    )
+    return out
+
+
+def _sig2(x):
+    try:
+        return float("%.6g" % float(x))
+    except (TypeError, ValueError):
+        return None

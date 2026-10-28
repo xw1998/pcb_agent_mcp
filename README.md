@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.4` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.5` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -13,7 +13,7 @@ KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对
 | **Fidelity** | 把整份板文件**转换**成 AI 可读的表达：每个节点都进树，事实从树里读，往返由 KiCad 自己验证 | 已实现（KiCad 侧已被 kicad-cli 判决） |
 | **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（KiCad 侧：13 块真实板与 DRC 对账、412 个 pad 与 `pcbnew` 逐点对账；立创侧：194 个真实归档实测） |
 | **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积 / 单网 IR drop） | 已实现 |
-| **Sim** | 无板子的物理计算：SPICE 子集（DC/瞬态/AC）、铜阻与 PDN、热阻与 2-D 板温度 | 已实现（子集，未实现项逐条点名拒绝） |
+| **Sim** | 无板子的物理计算：SPICE 子集（DC/瞬态/AC）、铜阻与 PDN、热阻与 2-D 板温度、薄板模态与振动响应 | 已实现（子集，未实现项逐条点名拒绝） |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
 | **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 六道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 实测口径＝原地重写一个成员） |
 
@@ -26,7 +26,8 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 > 设计文档在 [`docs/`](docs/)，按编号顺序读：
 > `00` 调研与架构 → `05` 无损转化架构总纲 → `06` 存储形式与信息传递 → `07` 自研定位与风险分期
 > → `10` 桌面控制与双栈读路径 → `11` 保真层 → `12` 写路径 → `13` 立创实测（真实存储与记录格式）
-> → `14` 原理图写路径 → `15` 对账（推导对着厂商判决）→ `16` 天线与馈线 → `17` 仿真层。
+> → `14` 原理图写路径 → `15` 对账（推导对着厂商判决）→ `16` 天线与馈线 → `17` 仿真层
+> → `18` DFM 工艺能力校验 → `19` 机械振动（薄板 Ritz 模态、Miles、Steinberg、冲击、传递率）。
 
 ## 为什么不是"又一个图元 MCP"
 
@@ -96,7 +97,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（82 个）
+## 工具（88 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -189,6 +190,12 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_ir_drop` | 按**板上真实铜**算单网压降（节点带层号，两层只在 via/镀通孔相连） | 铜厚/镀铜未知或汇点不通即拒绝；`authoritative:false` |
 | `dfm_capability` | 只校验一份**工艺能力文档**：11 条规则键、单位、方向、出处 | 未知键 / 没有 `source` / 空文档**整份拒收**；不内置任何板厂表 |
 | `dfm_check` | 拿能力文档去量板上真实几何，逐条给 `pass/fail/not_checked/not_applicable` + 余量 + `where` | 文档里没写的规则列进 `missing_known_rules`（不是 pass）；有界搜索窗外只给 `lower_bound` |
+| `vibration_plate_modes` | 矩形薄板自由振动：频率/模态形状（Rayleigh–Ritz 单轴单项式基 + 边界零空间 + 质量白化 + Jacobi）；四边简支/固支/自由/悬臂/四角点支撑 | 只有 Kirchhoff 薄板；不算阻尼、不算预紧/大变形、不算开孔与加强筋 |
+| `vibration_random_response` | 随机振动：Miles 等效（平坦闭式 + 实测谱积分互证）→ g_rms / 位移 rms | 单模态；非平坦谱逐段积分只在足迹内，谱外不计 |
+| `vibration_fatigue` | Steinberg 三带（3σ/2σ/1σ）+ Miner 线性累积 → 循环数与小时寿命 | `z_allow_mm` **必填**（不内置「典型允许挠度」） |
+| `vibration_shock` | 半正弦冲击：SDOF Newmark（β=1/4、γ=1/2）→ 峰值位移/加速度、DLF | 单自由度；不算应力、不算二次冲击与接触碰撞 |
+| `vibration_isolator` | 隔振：传递率曲线、隔振起点 `f_n√2`、r=1 处 `Q√(1+1/Q²)` | 高频按 **1/r** 掉（分子含 (2ζr)²），不是 1/r²；不算隔振器非线性与蠕变 |
+| `board_vibration` | 按板上真实板框（bbox）+ 叠层厚度算 f₁/周期/热点，热点标 `near_antinode` | 派生量 `authoritative:false`；非矩形轮廓回 `outline_fill_fraction_of_bbox` 并说 f₁ 偏低 |
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
@@ -198,9 +205,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.4
-python run_server.py --selftest      # 协议级自检，41/41（含板与原理图写路径端到端、天线四问、仿真四问、DFM 三问）
-python -m unittest discover -s tests # 559 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
+python run_server.py --version       # 0.0.5
+python run_server.py --selftest      # 协议级自检，46/46（含板与原理图写路径端到端、天线四问、仿真四问、DFM 三问、振动五问）
+python -m unittest discover -s tests # 611 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -347,6 +354,25 @@ MCP 客户端配置（stdio）：
   于是显式画出来的挖空（1 mm 铣槽）与板边分不开、`cutouts` 永远为空——槽宽这一条根本量不出来。
   改后按面积挑外轮廓、其余进 `cutouts`，28 个用例里有手算金标守护。
 
+### 振动层：薄板、单模态、线性（[docs/19](docs/19-机械振动.md)）
+
+- **不抄模态表，直接解特征值问题。** 一套 Rayleigh–Ritz（单轴单项式基 + 边界约束零空间 + 质量度量白化
+  + Jacobi）覆盖 SS/CC/free/悬臂/四角点支撑与任意长宽比、任意 ν，少一个「查表查错」的错误源。
+  精度是量出来的：SSSS 330.385 Hz、CCCC 602.382 Hz 与解析解**精确吻合**，free-free 方板 λ²=13.4687
+  对 Leissa 13.489（0.15%），振型对着 `sin(π·0.05)=0.1564` 逐点核过。
+- **三个只在写代码时才会犯的错，已经钉在文档里。** 应变能是二次型 ⇒ 刚度系数是 `D` 而不是 `0.5D`
+  （写错会让所有频率恰好偏低 √2 倍）；二维装配混合项必须 `ICxw[i][k]*I1yw[j][l]`（y 轴转置，写错会在
+  自由边界吐出 −92000 量级的负特征值）；Jacobi 的特征向量矩阵要转置（否则特征值精确、振型全错）。
+- **四角点支撑不近似成四边简支。** 「四角支撑」当成 SSSS 是给错答案（约束形状完全不同）；
+  实现是 free×free 加 4 个角点 `w=0` 点约束，零空间在二维装配后再投影。
+- **疲劳判据要用户给允许挠度。** `steinberg_fatigue` 的 `z_allow_mm` 必填，与 DFM「不内置板厂表」同一纪律：
+  Steinberg 的 ±1.5 mm@2×10⁷ 是「引线类」这个类别的数，不是板上这颗器件的数据。
+- **冲击只做单自由度。** 半正弦冲击走 Newmark（β=1/4、γ=1/2，无条件稳定），`dt ≤ min(T_n/24, 脉冲/60)`；
+  阶跃在 ζ→0 时 DLF 实测 1.99953（解析 2），半正弦峰值对 `1+exp(−ζπ/√(1−ζ²))` 三档 ζ 全部 ≤0.13%。
+  不算应力、不算接触碰撞、不算多自由度追赶。
+- **`board_vibration` 用板框 bbox 而不是真实轮廓**，并明说方向：非矩形轮廓会**偏软**（f₁ 偏低），
+  同时回 `outline_fill_fraction_of_bbox` 让人自己判程度。不算元件质量、不算安装点刚度、不算板内开孔。
+
 ## 项目结构
 
 ```
@@ -355,7 +381,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 82 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 88 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -399,14 +425,15 @@ pcb_agent_mcp/
 │       ├── spice.py              # SPICE 子集：MNA + 牛顿 + pnjlim + gmin 步进
 │       ├── power.py              # 铜阻/过孔/自感/电阻网络/IR drop/电容组/PDN
 │       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
-│       └── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
+│       ├── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
+│       └── vibration.py          # 振动：薄板 Ritz 模态 + Miles + Steinberg + 冲击 + 传递率
 ├── data/
 │   ├── creepage_tables.json      # 空表 + verified:false + why_empty（故意不填）
 │   └── ipc2152_tables.json       # 同上；表本身由 calc/safety_table.py 可执行地体检
-├── tests/                        # 559 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 611 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~18，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~19，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
@@ -422,6 +449,9 @@ pcb_agent_mcp/
 - DFM 校验是**工艺能力核对**，不是板厂签核。它只回答「给定这份能力文档，板上哪几条越界了」；
   蚀刻公差、阻焊桥、丝印可读性、拼板与基准点、铜到成品孔壁这 8 类静态文件里没有可比事实，
   一律 `not_checked_by_design`，不要把它读成「通过」。
+- 振动估算是**设计参考，不是应力分析**。薄板 Kirchhoff 理论只管「板本身怎么弯」，不管焊点/引线/器件的
+  实际应力；疲劳用 Steinberg 三带 + Miner 线性累积，允许挠度必须由你按器件类别给；冲击是单自由度
+  响应，不是有限元接触分析。
 - 爬电/间隙**故意不给默认值**。安规间距须按适用标准与电压等级查表，本项目只做查表与一致性检查；
   涉及市电、医疗、车载等场景请由有资质的工程师评审。
 - MIT 许可证，作者不对任何设计后果承担责任。

@@ -525,6 +525,57 @@ def selftest():
         check("dfm fails the same board against a 0.25 mm limit and names the rule",
               (payload.get("value") or {}).get("failed_rules") == ["min_track_width_mm"],
               str((payload.get("value") or {}).get("failed_rules")))
+
+        # --- vibration. The four numbers below are the closed forms, so a
+        # mistake in the Ritz assembly cannot pass them by agreeing with itself.
+        r = handle({"jsonrpc": "2.0", "id": 81, "method": "tools/call",
+                    "params": {"name": "vibration_plate_modes", "arguments": {
+                        "a_mm": 100, "b_mm": 100, "thickness_mm": 1.0,
+                        "material": "fr4", "mount": "edges", "n_modes": 1}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _f = ((payload.get("value") or {}).get("modes") or [{}])[0].get("freq_hz", 0)
+        # pi^2 sqrt(D/rho h) / a^2 / 2 pi with E=24 GPa, nu=0.15, rho=1850
+        check("vibration SSSS square f11 = 330.385 Hz (analytic)",
+              abs(_f - 330.385) < 0.05, str(_f))
+
+        r = handle({"jsonrpc": "2.0", "id": 82, "method": "tools/call",
+                    "params": {"name": "vibration_plate_modes", "arguments": {
+                        "a_mm": 100, "b_mm": 100, "thickness_mm": 1.0,
+                        "material": "fr4", "mount": "clamped", "n_modes": 1}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        mode = ((payload.get("value") or {}).get("modes") or [{}])[0]
+        check("vibration CCCC square f11 = 602.382 Hz (Leissa 35.99) and the "
+              "antinode is at the centre",
+              abs(mode.get("freq_hz", 0) - 602.382) < 0.05
+              and abs(mode.get("antinode_mm", [0, 0])[0] - 50.0) < 5.0,
+              str(mode.get("freq_hz")))
+
+        r = handle({"jsonrpc": "2.0", "id": 83, "method": "tools/call",
+                    "params": {"name": "vibration_shock", "arguments": {
+                        "f_n_hz": 100, "zeta": 0.1,
+                        "pulse": {"type": "step", "amplitude_g": 10}}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _dlf = (payload.get("value") or {}).get("displacement_amplification", 0)
+        check("vibration step shock DLF = 1+exp(-zeta pi/sqrt(1-zeta^2)) = 1.72925",
+              abs(_dlf - 1.72925) < 0.005, str(_dlf))
+
+        r = handle({"jsonrpc": "2.0", "id": 84, "method": "tools/call",
+                    "params": {"name": "vibration_random_response", "arguments": {
+                        "f_n_hz": 300, "q_factor": 10,
+                        "psd": {"points": [[10, 0.1], [3000, 0.1]]}}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _g = (payload.get("value") or {}).get("g_rms", 0)
+        check("vibration Miles integral matches the closed form 21.708 g inside 1 %",
+              abs(_g - 21.708) < 0.217, str(_g))
+
+        r = handle({"jsonrpc": "2.0", "id": 85, "method": "tools/call",
+                    "params": {"name": "vibration_fatigue", "arguments": {
+                        "f_n_hz": 300, "z_3sigma_mm": 0.5}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("vibration fatigue refuses without z_allow_mm",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "ARG_REQUIRED",
+              str(payload.get("reason_code")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

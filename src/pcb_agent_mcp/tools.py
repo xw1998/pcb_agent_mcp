@@ -27,6 +27,7 @@ from .calc import matching as _matching
 from .calc import power as _power
 from .calc import spice as _spice
 from .calc import thermal as _thermal
+from .calc import vibration as _vib
 from .calc.result import err
 from .adapters import FORMATS as _FORMATS
 from .adapters import detect_format as _detect_format
@@ -1193,6 +1194,14 @@ def _capabilities(_args):
                    "server ships NO fab table on purpose - the limits are the "
                    "document's and it must name its source; rules the document does "
                    "not state come back as unanswered, not as passes",
+            "vibration": "mechanical vibration: natural frequencies and mode shapes of "
+                         "a thin plate (Rayleigh-Ritz, monomial basis, exact for SSSS "
+                         "and CCCC and needs no mode table), single-mode random response "
+                         "(Miles closed form for a flat PSD, or a real integral over a "
+                         "measured PSD), Steinberg three-band fatigue with Miner's rule, "
+                         "single-DOF shock via Newmark, and mount transmissibility. "
+                         "NOT done: assembly compliance, solder-joint creep, "
+                         "random+shock combined, drop, and any nonlinear contact",
             "desktop": "find / start / stop the EDA and open a project, verified by "
                        "window title - never touches a project file",
             "write": "propose (compute only, no byte is written) -> apply (confirm=true, "
@@ -1234,6 +1243,9 @@ def _capabilities(_args):
             "thermal_transient", "thermal_heatsink", "thermal_convection",
             "board_ir_drop",
             "dfm_capability", "dfm_check",
+            "vibration_plate_modes", "vibration_random_response",
+            "vibration_fatigue", "vibration_shock", "vibration_isolator",
+            "board_vibration",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
@@ -1259,7 +1271,7 @@ def _capabilities(_args):
             "derived (this server computed it)": [
                 "board_clearance", "board_free_space", "board_pour_connectivity",
                 "board_cross_split", "board_loop_area", "board_antenna_keepout",
-                "board_ir_drop"],
+                "board_ir_drop", "board_vibration"],
             "authoritative (vendor engine said it)": ["board_drc", "board_stats"],
             "checked_against_the_vendor": {
                 "board_cross_check": "runs the derived answer and the vendor's own DRC on "
@@ -1344,6 +1356,15 @@ def _capabilities(_args):
             "(uniform plating), rth_cs is an input the user must supply, and "
             "thermal_heatsink returns the BUDGET - there is deliberately no heatsink "
             "table in this server",
+            "Vibration is a THIN-PLATE, SINGLE-MODE, LINEAR layer, by name: no shear "
+            "deformation or rotary inertia (so a thick or short plate reads too "
+            "stiff), no component mass or copper stiffening (so f1 reads high on a "
+            "board with one heavy part), no compliance in the mount itself, no "
+            "assembly-level modes, no solder-joint creep or BGA-ball fatigue (only "
+            "the Steinberg lead-wire form, whose slope and allowable YOU supply), no "
+            "random-plus-shock superposition, no drop simulation, no nonlinear "
+            "contact or rattling, and nothing here is a stress solver - it gives "
+            "displacement, never a stress or a strain",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
                     "missing fact is refused or declared absent, never defaulted",
@@ -1421,6 +1442,19 @@ def _capabilities(_args):
                           "is checked against its own energy balance (power in vs "
                           "convection out, refused above 0.5 % residual) and against "
                           "the P/(2hA) limit for a high-k plate",
+            "vibration": "checked against the closed-form plate eigenvalues, not "
+                         "against itself: a simply supported square gives "
+                         "f11 = pi^2 sqrt(D/rho h)/a^2 to 6 digits (330.385 Hz on a "
+                         "100 mm FR-4 plate) and a clamped square gives 35.99/(2 pi) "
+                         "(602.382 Hz), both exact; a free square at nu=0.3 gives "
+                         "lambda^2 = 13.4687 against Leissa's 13.489 (0.15 %); the "
+                         "mode SHAPES are checked, not just the numbers - a SSSS mode "
+                         "samples 1.0000 at the centre, sin(pi*0.05) = 0.1564 at "
+                         "y = 5 % and 0 at the (1,2) modal line. Miles' closed form "
+                         "agrees with the numerical PSD integral to 0.045 %, and the "
+                         "shock integrator reproduces the analytic step DLF of 2 "
+                         "(1.99953 at zeta=1e-4) and 1+exp(-zeta pi/sqrt(1-zeta^2)) "
+                         "to 0.13 % for zeta = 0.05..0.2",
         },
     }
 
@@ -2332,6 +2366,156 @@ _tool(
         window_mm=(a["window_mm"] if a.get("window_mm") is not None else 5.0),
         check_clearance=(a["check_clearance"]
                          if a.get("check_clearance") is not None else True)),
+        derived=True),
+)
+
+_tool(
+    "vibration_plate_modes",
+    "Natural frequencies and mode shapes of a rectangular thin plate (Kirchhoff): "
+    "Rayleigh-Ritz on a monomial basis restricted to the boundary-constraint null space, "
+    "mass-metric whitened so the eigenproblem is a plain symmetric Jacobi. Supports "
+    "simply supported / clamped / free / cantilever / four-corner-point mounts and "
+    "custom edge conditions, so it is exact for SSSS and CCCC squares (verified against "
+    "the analytic eigenvalues) and needs no mode table. Gives f1..fn, the antinode "
+    "position, the quiet-area fraction, and the normalised deflection at any probe "
+    "points you name.",
+    {"type": "object", "properties": {
+        "a_mm": _num("plate length"),
+        "b_mm": _num("plate width"),
+        "thickness_mm": _num("plate thickness"),
+        "material": _str("preset: %s" % ", ".join(sorted(_vib.MATERIALS))),
+        "e_gpa": _num("Young's modulus in GPa (overrides the preset)"),
+        "nu": _num("Poisson ratio (overrides the preset)"),
+        "rho_kg_m3": _num("density in kg/m^3 (overrides the preset)"),
+        "mount": _str("edges/ssss, clamped/cccc, free, cantilever, corners, custom"),
+        "bc_x": {"type": "array", "description":
+                 "for mount=custom: [left, right] each ss/cc/free", "items": {}},
+        "bc_y": {"type": "array", "description":
+                 "for mount=custom: [left, right] each ss/cc/free", "items": {}},
+        "n_modes": _num("how many modes to report (1..12)", 4),
+        "poly_degree": _num("polynomial degree per axis (lowered automatically to fit "
+                            "the DOF budget, and said so)", 7),
+        "probe_points": {"type": "array", "description":
+                         "list of {name, x_mm, y_mm} to sample the mode shape at",
+                         "items": {}},
+    }, "required": ["a_mm", "b_mm", "thickness_mm"]},
+    lambda a: _vib.plate_modes(
+        a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"),
+        material=a.get("material"), e_gpa=a.get("e_gpa"), nu=a.get("nu"),
+        rho_kg_m3=a.get("rho_kg_m3"),
+        mount=(a.get("mount") or "corners"), bc_x=a.get("bc_x"),
+        bc_y=a.get("bc_y"),
+        n_modes=int(a.get("n_modes") or 4),
+        poly_degree=int(a.get("poly_degree") or 7),
+        probe_points=a.get("probe_points")),
+)
+
+_tool(
+    "vibration_random_response",
+    "Single-mode (Miles) random vibration: the g_rms a mode sees under a PSD, and the "
+    "displacement that follows. A flat PSD uses Miles' closed form "
+    "g_rms = sqrt(pi/2 * f_n * Q * W); a measured PSD curve is integrated as "
+    "int W(f)|H(f)|^2 df over three panels so a high-Q peak is actually resolved. The two "
+    "agree inside 1 % on a flat PSD. Single mode only - does not sum the other modes.",
+    {"type": "object", "properties": {
+        "f_n_hz": _num("natural frequency (from vibration_plate_modes)"),
+        "psd": {"type": "object", "description":
+                '{"g2_per_hz": 0.1} or {"points": [[hz, g2/Hz], ...]}'},
+        "zeta": _num("damping ratio"),
+        "q_factor": _num("Q = 1/(2 zeta); give this OR zeta"),
+        "gamma": _num("peak factor, default 3 (3 sigma)", 3),
+    }, "required": ["f_n_hz", "psd"]},
+    lambda a: _vib.miles_response(
+        a.get("f_n_hz"), psd=a.get("psd"), zeta=a.get("zeta"),
+        q_factor=a.get("q_factor"),
+        gamma=(a["gamma"] if a.get("gamma") is not None else 3.0)),
+)
+
+_tool(
+    "vibration_fatigue",
+    "Steinberg three-band fatigue plus Miner's rule: split the 3-sigma deflection into "
+    "3s/2s/1s bands at the textbook cycle fractions, convert each to an allowable cycle "
+    "count N = N0 (z_allow/z)^b, and accumulate damage per hour. z_allow_mm is REQUIRED - "
+    "this server owns no 'typical allowable deflection', because that number belongs to "
+    "the part in your qualification report.",
+    {"type": "object", "properties": {
+        "f_n_hz": _num("natural frequency"),
+        "z_3sigma_mm": _num("3-sigma relative displacement (Miles peak with gamma=3)"),
+        "z_allow_mm": _num("deflection the joint/lead survives at n0_cycles (REQUIRED)"),
+        "exponent": _num("fatigue slope b; Steinberg uses 6.4 for lead wires", 6.4),
+        "n0_cycles": _num("cycle count z_allow is quoted at", 2.0e7),
+        "target_hours": _num("design life; if given, a pass/fail and a margin come back"),
+    }, "required": ["f_n_hz", "z_3sigma_mm", "z_allow_mm"]},
+    lambda a: _vib.steinberg_fatigue(
+        a.get("f_n_hz"), a.get("z_3sigma_mm"), a.get("z_allow_mm"),
+        exponent=(a["exponent"] if a.get("exponent") is not None else 6.4),
+        n0_cycles=(a["n0_cycles"] if a.get("n0_cycles") is not None else 2.0e7),
+        target_hours=a.get("target_hours")),
+)
+
+_tool(
+    "vibration_shock",
+    "Single-DOF shock response to a base acceleration pulse (step / rect / half_sine), "
+    "integrated with Newmark beta=1/4 gamma=1/2 (unconditionally stable). Returns the "
+    "peak relative displacement (what stresses the mount), the peak absolute "
+    "acceleration (what the component feels) and both amplification factors. Reproduces "
+    "the analytic step DLF of 2 exactly for zero damping.",
+    {"type": "object", "properties": {
+        "f_n_hz": _num("natural frequency"),
+        "zeta": _num("damping ratio"),
+        "q_factor": _num("Q = 1/(2 zeta); give this OR zeta"),
+        "pulse": {"type": "object", "description":
+                  '{"type": "step"|"rect"|"half_sine", "amplitude_g": 30, '
+                  '"duration_ms": 2} (duration not needed for step)'},
+    }, "required": ["f_n_hz", "pulse"]},
+    lambda a: _vib.shock_sdof(
+        a.get("f_n_hz"), zeta=a.get("zeta"), q_factor=a.get("q_factor"),
+        pulse=a.get("pulse")),
+)
+
+_tool(
+    "vibration_isolator",
+    "Single-DOF transmissibility of a mount: |T| at the frequencies you ask for, the peak "
+    "transmissibility and where it sits, and the isolation onset f_n*sqrt(2) - below that "
+    "the mount AMPLIFIES, which is the number people forget. Idealised 1-D mount: no "
+    "frequency-dependent stiffness and no isolator resonance of its own.",
+    {"type": "object", "properties": {
+        "f_n_hz": _num("mounted natural frequency"),
+        "zeta": _num("damping ratio"),
+        "q_factor": _num("Q = 1/(2 zeta)"),
+        "freq_hz": {"type": "array", "description": "frequencies to evaluate",
+                    "items": {}},
+        "freq_range": {"type": "array", "description":
+                       "[f_start, f_stop, n_points] to sweep", "items": {}},
+    }, "required": ["f_n_hz"]},
+    lambda a: _vib.transmissibility(
+        a.get("f_n_hz"), zeta=a.get("zeta"), q_factor=a.get("q_factor"),
+        freq_hz=a.get("freq_hz"), freq_range=a.get("freq_range")),
+)
+
+_tool(
+    "board_vibration",
+    "Natural frequencies of THIS board from its own outline and stackup, with every "
+    "component sampled against the first mode shape so you get a ranked list of which "
+    "references sit on an antinode. Uses the outline bounding box as the plate, so a "
+    "non-rectangular board comes out SOFTER (f1 biased low) - the fill fraction is "
+    "reported so you can see how much. Component mass and copper stiffening are not "
+    "modelled.",
+    {"type": "object", "properties": dict({
+        "mount": _str("edges/ssss, clamped/cccc, free, cantilever, corners", "corners"),
+        "material": _str("plate material preset", "fr4"),
+        "thickness_mm": _num("override the board thickness"),
+        "n_modes": _num("how many modes", 4),
+        "poly_degree": _num("polynomial degree per axis", 7),
+        "probe": _str("'components' (default) or a list of {name,x_mm,y_mm}"),
+    }, **_COMMON), "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.board_vibration(
+        b, mount=(a.get("mount") or "corners"),
+        material=(a.get("material") or "fr4"),
+        thickness_mm=a.get("thickness_mm"),
+        n_modes=int(a.get("n_modes") or 4),
+        poly_degree=int(a.get("poly_degree") or 7),
+        probe=(a.get("probe") if a.get("probe") is not None else "components")),
         derived=True),
 )
 
