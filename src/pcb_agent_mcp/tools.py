@@ -28,6 +28,8 @@ from .calc import power as _power
 from .calc import spice as _spice
 from .calc import thermal as _thermal
 from .calc import vibration as _vib
+from .calc import cavity as _cavity
+from .calc import electrothermal as _electro
 from .calc.result import err
 from .adapters import FORMATS as _FORMATS
 from .adapters import detect_format as _detect_format
@@ -1186,14 +1188,28 @@ def _capabilities(_args):
                           "thermal (1-D stacks, via arrays, a real 2-D plate solve "
                           "with an energy-balance check, RC transients, heatsink "
                           "budget). Every model is lumped or closed-form: no "
-                          "full-wave, no electrothermal coupling, no thermal "
-                          "radiation",
+                          "full-wave, no thermal radiation, no convection field solve",
             "dfm": "manufacturability against a capability document YOU supply: narrowest "
                    "track, copper gap, via drill and rings, hole-to-hole web, "
                    "copper-to-edge, narrowest cut-out, board size, layer count. This "
                    "server ships NO fab table on purpose - the limits are the "
                    "document's and it must name its source; rules the document does "
                    "not state come back as unanswered, not as passes",
+            "cavity": "the board as a resonator: parallel-plate (cavity) mode "
+                       "frequencies f_mn = c/(2 sqrt(er)) sqrt((m/a)^2+(n/b)^2) and the "
+                       "via-fence pitch expressed as a fraction of the guided wavelength. "
+                       "No Q, no loss, no detuning from open side walls, and NO built-in "
+                       "acceptance ratio - lambda_g/20 and lambda_g/10 both circulate, so "
+                       "the criterion is the caller's and without it the verdict is "
+                       "indeterminate",
+            "electrothermal": "the loop between current and temperature on copper: "
+                              "R(T) = rho20(1+alpha(T-20))L/(w t), P = I^2 R, "
+                              "T = T_amb + P*Rth, solved as a fixed point with the "
+                              "contraction gain dP/dT*Rth checked EXACTLY (above 1 the "
+                              "answer is THERMAL_RUNAWAY, not a converged number). Rth is "
+                              "always the caller's - one lump from thermal_stack / "
+                              "via_array_thermal / plate_temperature or a measurement. "
+                              "DC only, no skin effect, no AC loss",
             "vibration": "mechanical vibration: natural frequencies and mode shapes of "
                          "a thin plate (Rayleigh-Ritz, monomial basis, exact for SSSS "
                          "and CCCC and needs no mode table), single-mode random response "
@@ -1246,6 +1262,8 @@ def _capabilities(_args):
             "vibration_plate_modes", "vibration_random_response",
             "vibration_fatigue", "vibration_shock", "vibration_isolator",
             "board_vibration",
+            "cavity_resonance", "cavity_via_fence",
+            "electrothermal_trace", "electrothermal_conductor",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
@@ -1332,6 +1350,12 @@ def _capabilities(_args):
             "table validator (calc/safety_table.py) is in place, but the standard is "
             "paywalled and public reproductions contradict each other, so a filled row "
             "would be a guess with a citation glued on",
+            "Plane resonances as a SOLVED field: cavity_resonance gives the ideal "
+            "PMC-wall TM_mn0 eigenvalues and cavity_via_fence gives pitch/lambda_g, but "
+            "no Q (dielectric tan-delta, copper loss, radiation), no detuning from real "
+            "open edges, no plane-pair impedance and no leakage through voids. A "
+            "resonance with no Q is a location on the frequency axis, not a verdict - "
+            "when it matters, use a 3-D field solver",
             "Impedance/creepage tables for standards other than IPC-2221 / IPC-2141A",
             "Simulation is a SUBSET of SPICE, by name: the sim_spice solver handles "
             "R C L V I E G D Q M with .op/.tran/.ac/.model/.temp and rejects F H J K "
@@ -1340,10 +1364,14 @@ def _capabilities(_args):
             "Monte Carlo, subcircuits, behavioural sources, and any model card "
             "beyond the ones listed - it also uses dense LU, so it refuses above ~400 "
             "unknowns and says to use ngspice",
-            "Electrothermal coupling: nothing here feeds a temperature rise back into "
-            "rho or into the device models. board_ir_drop uses the copper temperature "
-            "you state, and the thermal tools take the power you state - the loop "
-            "between them is the user's to close by iterating",
+            "Electrothermal coupling beyond ONE lump: electrothermal_trace / "
+            "electrothermal_conductor close the loop between copper R(T) and a single "
+            "caller-supplied Rth, and nothing else. Not done: 2-D/3-D coupling (a hot "
+            "spot that warms its own neighbours and lowers its own local Rth), "
+            "transient coupling (thermal capacitance inside the loop), AC loss "
+            "(skin/proximity), device self-heating inside sim_spice, and "
+            "board_ir_drop feeding its own per-segment I^2R back into a temperature "
+            "field - that last one is still the user's to iterate",
             "Transient current density / surge and fusing: current_capacity is a "
             "steady-state table check, and board_ir_drop reports A/mm^2 with no "
             "criterion attached. Fusing a trace needs a temperature-rise criterion and "
@@ -1455,6 +1483,21 @@ def _capabilities(_args):
                          "shock integrator reproduces the analytic step DLF of 2 "
                          "(1.99953 at zeta=1e-4) and 1+exp(-zeta pi/sqrt(1-zeta^2)) "
                          "to 0.13 % for zeta = 0.05..0.2",
+            "cavity": "f_mn is closed form, so it is checked against hand arithmetic on "
+                      "cases with an obvious answer: a 100 x 80 mm plane pair at er=4.3 "
+                      "gives 0.722864 GHz for (1,0) - exactly c/(2 sqrt(4.3) * 0.1 m) - "
+                      "and lambda_g = 200 mm, which is also 2*a, the definition of the "
+                      "half-wave resonance; the (0,1) mode lands at 0.903580 GHz = "
+                      "f10*a/b. via_fence is pure division, and the tests assert that "
+                      "it refuses to PASS without a caller-supplied criterion",
+            "electrothermal": "the fixed point has a closed form dT = A/(1-G), so the "
+                              "tests compare the iteration against that closed form and "
+                              "against the definition: R20 = 0.01 ohm, I = 1 A, "
+                              "Rth = 50 K/W gives dT = 0.510829 K and R = 10.21658 mohm "
+                              "(hand-checked: P*Rth = 0.01021658*50); the same case with "
+                              "I = 1 A and Rth = 300 K/W on a 1 ohm conductor gives "
+                              "G = 4.716 > 1 and is refused as THERMAL_RUNAWAY instead "
+                              "of returning the 4th iterate",
         },
     }
 
@@ -2517,6 +2560,113 @@ _tool(
         poly_degree=int(a.get("poly_degree") or 7),
         probe=(a.get("probe") if a.get("probe") is not None else "components")),
         derived=True),
+)
+
+_tool(
+    "cavity_resonance",
+    "Parallel-plate (cavity) modes of a plane pair: f_mn = c/(2 sqrt(er)) * "
+    "sqrt((m/a)^2+(n/b)^2) (TM_mn0, perfect magnetic side walls). This is where a ground "
+    "plane stops being a ground plane - two stitching rows or a via fence are the side "
+    "walls, and between them the pair rings. Reports every mode in the requested order "
+    "with its guided wavelength, keeps degenerate pairs separate, and does NOT compute Q "
+    "or the detuning from real open edges (so it is a location on the frequency axis, not "
+    "a verdict). Optional f_operate_hz only adds the nearest-mode read-out.",
+    {"type": "object", "properties": {
+        "a_mm": _num("plane length"),
+        "b_mm": _num("plane width"),
+        "er": _num("dielectric constant BETWEEN the planes", 4.3),
+        "m_max": _num("highest m to include", 2),
+        "n_max": _num("highest n to include (>= 1)", 2),
+        "f_operate_hz": _num("optional: report the nearest mode to this frequency"),
+        "top": _num("how many modes to return, lowest first", 12),
+    }, "required": ["a_mm", "b_mm"]},
+    lambda a: _cavity.plane_resonance(
+        a.get("a_mm"), a.get("b_mm"),
+        er=(a["er"] if a.get("er") is not None else 4.3),
+        m_max=(a["m_max"] if a.get("m_max") is not None else 2),
+        n_max=(a["n_max"] if a.get("n_max") is not None else 2),
+        f_operate_hz=a.get("f_operate_hz"),
+        top=int(a["top"] if a.get("top") is not None else 12)),
+)
+
+_tool(
+    "cavity_via_fence",
+    "Via-fence pitch expressed as a fraction of the guided wavelength: pitch/lambda_g, "
+    "phase per pitch, and the maximum pitch for a criterion you supply. The criterion is "
+    "REQUIRED for a pass/fail - lambda_g/20 and lambda_g/10 both circulate and neither is "
+    "derived, so this server does not pick one; without max_pitch_ratio you get the "
+    "ratios plus verdict=indeterminate. Vias are ideal walls here: no barrel diameter, no "
+    "antipad, no leakage through plane voids.",
+    {"type": "object", "properties": {
+        "f_resonance_hz": _num("the mode frequency you are fencing against"),
+        "er": _num("dielectric constant between the planes"),
+        "pitch_mm": _num("centre-to-centre via pitch"),
+        "max_pitch_ratio": _num("your acceptance criterion, e.g. 0.05 for lambda_g/20"),
+        "fence_width_mm": _num("optional: width of the fenced region, for its electrical "
+                               "length"),
+    }, "required": ["f_resonance_hz", "er"]},
+    lambda a: _cavity.via_fence(
+        a.get("f_resonance_hz"), a.get("er"), pitch_mm=a.get("pitch_mm"),
+        max_pitch_ratio=a.get("max_pitch_ratio"),
+        fence_width_mm=a.get("fence_width_mm")),
+)
+
+_tool(
+    "electrothermal_trace",
+    "Self-consistent temperature of a straight DC trace: the copper gets hotter, the "
+    "copper gets more resistive, so it dissipates more, so it gets hotter. R(T) = "
+    "rho20(1+alpha(T-20))L/(w t), P = I^2 R, T = T_amb + P*Rth, solved as a fixed point "
+    "with the contraction gain dP/dT*Rth checked exactly - above 1 it returns "
+    "THERMAL_RUNAWAY instead of a number. Rth is REQUIRED (one lump: from thermal_stack / "
+    "via_array_thermal / plate_temperature, or measured); this module owns no default Rth. "
+    "DC only.",
+    {"type": "object", "properties": {
+        "length_mm": _num("trace length"),
+        "width_mm": _num("trace width"),
+        "thickness_um": _num("copper thickness"),
+        "current_a": _num("DC current"),
+        "rth_c_per_w": _num("thermal resistance, copper to ambient (required)"),
+        "t_ambient_c": _num("ambient temperature", 25.0),
+        "alpha_per_k": _num("temperature coefficient, default copper 0.00393", 0.00393),
+        "rho20_ohm_m": _num("resistivity at 20 C, default IACS 1.724e-8", 1.724e-8),
+        "tol_c": _num("convergence tolerance in K", 1e-4),
+        "max_iter": _num("iteration cap", 2000),
+    }, "required": ["length_mm", "width_mm", "thickness_um", "current_a",
+                    "rth_c_per_w"]},
+    lambda a: _electro.trace_self_heating(
+        a.get("length_mm"), a.get("width_mm"), a.get("thickness_um"),
+        a.get("current_a"), rth_c_per_w=a.get("rth_c_per_w"),
+        t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
+        alpha_per_k=(a["alpha_per_k"] if a.get("alpha_per_k") is not None else 0.00393),
+        rho20_ohm_m=(a["rho20_ohm_m"] if a.get("rho20_ohm_m") is not None else 1.724e-8),
+        tol_c=(a["tol_c"] if a.get("tol_c") is not None else 1e-4),
+        max_iter=int(a["max_iter"] if a.get("max_iter") is not None else 2000)),
+)
+
+_tool(
+    "electrothermal_conductor",
+    "The same electro-thermal loop with the cold resistance supplied directly, so it "
+    "applies to anything whose R20 you already have: a via barrel (via_resistance), a "
+    "chain of segments (ir_drop_chain), a shunt, a connector pin. Returns R_hot, the "
+    "resistance gain, the power, the converged temperature, the number of iterations it "
+    "actually took, and the stability margin 1 - dP/dT*Rth.",
+    {"type": "object", "properties": {
+        "r_ohm_at_20c": _num("resistance at 20 C"),
+        "current_a": _num("DC current"),
+        "rth_c_per_w": _num("thermal resistance to ambient (required)"),
+        "t_ambient_c": _num("ambient temperature", 25.0),
+        "alpha_per_k": _num("temperature coefficient, default copper 0.00393", 0.00393),
+        "tol_c": _num("convergence tolerance in K", 1e-4),
+        "max_iter": _num("iteration cap", 2000),
+        "note": _str("free text carried back, e.g. 'via barrel from via_resistance'"),
+    }, "required": ["r_ohm_at_20c", "current_a", "rth_c_per_w"]},
+    lambda a: _electro.conductor_self_heating(
+        a.get("r_ohm_at_20c"), a.get("current_a"), a.get("rth_c_per_w"),
+        t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
+        alpha_per_k=(a["alpha_per_k"] if a.get("alpha_per_k") is not None else 0.00393),
+        tol_c=(a["tol_c"] if a.get("tol_c") is not None else 1e-4),
+        max_iter=int(a["max_iter"] if a.get("max_iter") is not None else 2000),
+        note=a.get("note")),
 )
 
 _tool(

@@ -576,6 +576,60 @@ def selftest():
               payload.get("status") == "error"
               and payload.get("reason_code") == "ARG_REQUIRED",
               str(payload.get("reason_code")))
+
+        # --- cavity / electro-thermal. Again only closed forms and hand
+        # arithmetic: f10 for a 100 mm plane at er=4.3 is c/(2 sqrt(er) * 0.1 m),
+        # which is also the definition of a half guided wavelength.
+        r = handle({"jsonrpc": "2.0", "id": 86, "method": "tools/call",
+                    "params": {"name": "cavity_resonance", "arguments": {
+                        "a_mm": 100, "b_mm": 80, "er": 4.3, "m_max": 1,
+                        "n_max": 1}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _m = (payload.get("value") or [{}])[0]
+        check("cavity (1,0) mode of a 100 mm plane pair at er=4.3 = 722.864 MHz",
+              abs(_m.get("f_hz", 0) - 722864000.0) < 2000.0
+              and abs(_m.get("lambda_g_mm", 0) - 200.0) < 0.01,
+              str(_m.get("f_hz")))
+
+        r = handle({"jsonrpc": "2.0", "id": 87, "method": "tools/call",
+                    "params": {"name": "cavity_via_fence", "arguments": {
+                        "f_resonance_hz": 722864000.0, "er": 4.3,
+                        "pitch_mm": 15.0, "max_pitch_ratio": 0.05}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        # 0.05 * 200 mm = 10 mm limit, the 15 mm pitch is over it
+        check("cavity via fence fails a 15 mm pitch against a lambda_g/20 criterion",
+              (payload.get("value") or {}).get("verdict") == "fail",
+              str((payload.get("value") or {}).get("verdict")))
+
+        r = handle({"jsonrpc": "2.0", "id": 88, "method": "tools/call",
+                    "params": {"name": "cavity_via_fence", "arguments": {
+                        "f_resonance_hz": 722864000.0, "er": 4.3,
+                        "pitch_mm": 15.0}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("cavity via fence refuses to judge without a criterion",
+              (payload.get("value") or {}).get("verdict") == "indeterminate",
+              str((payload.get("value") or {}).get("verdict")))
+
+        r = handle({"jsonrpc": "2.0", "id": 89, "method": "tools/call",
+                    "params": {"name": "electrothermal_conductor", "arguments": {
+                        "r_ohm_at_20c": 0.01, "current_a": 1.0,
+                        "rth_c_per_w": 50.0}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        # A = 0.01*50*(1+0.00393*5) = 0.5098250, G = 0.001965
+        # dT = A/(1-G) = 0.510829 -> T = 25.5108
+        _t = payload.get("value", 0)
+        check("electrothermal fixed point = A/(1-G) = 25.5108 C (hand arithmetic)",
+              abs(_t - 25.510829) < 1e-3, str(_t))
+
+        r = handle({"jsonrpc": "2.0", "id": 90, "method": "tools/call",
+                    "params": {"name": "electrothermal_conductor", "arguments": {
+                        "r_ohm_at_20c": 1.0, "current_a": 2.0,
+                        "rth_c_per_w": 300.0}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("electrothermal refuses a runaway (dP/dT*Rth = 4.716 > 1)",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "THERMAL_RUNAWAY",
+              str(payload.get("reason_code")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 
