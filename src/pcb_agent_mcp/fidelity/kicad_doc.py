@@ -50,8 +50,14 @@ class KiCadDocument(object):
 
     # ---------------------------------------------------------- writing
     def to_text(self):
-        """Serialise every top-level node, one per line. No double wrapping."""
-        return "\n".join(S.dumps(item) for item in self.tree.items) + "\n"
+        """Serialise with the source's own whitespace.
+
+        Because every node carries the trivia that preceded it, re-emiting an
+        unmodified document reproduces the file **byte for byte** - indentation,
+        line endings, trailing newline, all of it. Nodes inserted by the write
+        path are indented like their siblings (`sexpr.reformat`), so a diff of
+        the result shows only the objects that actually changed."""
+        return S.dumps_document(self.tree)
 
     def to_bytes(self):
         return self.to_text().encode("utf-8", "surrogateescape")
@@ -109,15 +115,18 @@ class KiCadDocument(object):
             return {"token_identity": False, "error": str(exc)}
         same = S.signature(reparsed) == S.signature(self.tree)
         canon_same = S.canonical_text(emitted) == S.canonical_text(self.text)
+        bytes_same = emitted == self.text
         return {
             "token_identity": bool(same),
+            "bytes_identical": bool(bytes_same),
             "canonical_text_equal": bool(canon_same),
             "method": "signature(parse(dumps(tree))) == signature(tree)",
             "meaning": ("every atom, in order, with its original spelling and "
                         "quoting - no field can be dropped without this failing"),
-            "note": ("canonical_text_equal compares whitespace-squashed text; it is "
-                     "False whenever the source was pretty-printed differently, "
-                     "which is formatting, not information"),
+            "note": ("bytes_identical is the strong check: it is True only if every "
+                     "byte - including tab indentation and CRLF - came back. "
+                     "canonical_text_equal ignores whitespace and is kept for "
+                     "diagnostics when bytes_identical is False"),
         }
 
     def coverage(self, interpreted):

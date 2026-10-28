@@ -3,6 +3,52 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)；`0.x` 期间 tool 的入参与返回结构仍可能变动，
 但**信封契约（`status` / `basis` / `precision` / `reason_code`）从 0.1.0 起冻结**。
 
+## [0.6.0] - 2026-10-28
+
+**原理图进写路径，裁判从 DRC 换成网表 + ERC**。诚实清单里「不写原理图。两个 EDA 的原理图都不在
+写路径上」这一条收口为：KiCad `.kicad_sch` 能写，立创 `.esch` **明确拒写**并说明原因。
+详见 [docs/14](docs/14-原理图写路径.md)。
+
+### Added
+
+- **`fidelity/kicad_sch.py`**（新增）：整棵 `(kicad_sch ...)` 文档——`root()` / `lib_symbols()` /
+  `symbol_entry()` / `symbols()` / `project()` / `by_uuid()` / `stats()`，逐字节往返自证。
+- **`edit/sch_ops.py`**（新增）：**18 个原理图 op**——`add_wire` / `add_bus` / `add_bus_entry` /
+  `add_junction` / `add_no_connect` / `add_label` / `add_global_label` /
+  `add_hierarchical_label` / `add_netclass_flag` / `add_text` / `add_polyline` / `add_rectangle` /
+  `add_symbol` / `set_symbol_field` / `set_field_position` / `move_symbol` / `delete_symbol` /
+  `delete_object`，每条带自己的后置条件与 `coordinates` 说明。
+- **`edit/sch_plan.py`**（新增）：`digest` / `netlist_diff` / `erc_diff` / `summary` / `view` /
+  `propose` / `apply_plan`。四道闸门：`bytes_written`、`token_identity`、`postconditions`、
+  `engine`（KiCad 网表 + ERC 双向对比）。
+- **`engine.sch_erc()` / `engine.sch_netlist()`**：`kicad-cli sch erc --format json` 与
+  `kicad-cli sch export netlist --format kicadsexpr` 的封装；ERC 的 `sheets[].violations`
+  没有 `sheet` 字段，扁平化时补上。
+- **5 个 tool**：`schematic_ops` / `schematic_propose` / `schematic_apply` /
+  `schematic_summary` / `schematic_view`（工具总数 36 → 41）。
+- **`tests/test_sch_edit.py`**（新增，42 例）：逐字节往返、op 级语义、propose 不写盘、apply 只增行、
+  回滚、容器类型识别（zip / SQLite / 板 / 其它文本），加 4 个 `kicad-cli` 真图用例。
+- **`docs/14-原理图写路径.md`**。
+
+### Changed
+
+- **原理图 op 用文件坐标系（mm，Y 向下，不取反）**。板路径是 Y 向上；取反会把整张图镜像，
+  而 KiCad 不报错。每个返回重复 `frame` 说明。
+- **诚实清单第 5 条重写**：从「不写原理图」改为「KiCad 能写、立创不写、单张图纸」。
+  `calc_capabilities` 的 `not_implemented_yet` 同步收窄到 `.esch` 一条，并新增
+  `layers.write_schematic` 与 `verified_against.schematic`。
+- **自检 25 → 29 项**：加入 `schematic_propose` 不写盘、`schematic_apply` 三闸门、
+  `schematic_view` 读回对象、立创被拒四种。
+
+### Fixed（都是真图抓出来的，不在合成样本上）
+
+- **元件值改动曾被判成"网表变了"并拦住合法编辑**。网表里每个元件是 `(ref, value, footprint)`，
+  改 value 自然让记录变化。现 `netlist_diff.changed` 只认**网**与**元件增删**，值/封装变化单列
+  `metadata_changed` 只给 warning。`#PWR` 改 Value 会改电源网名——那仍然被拦，单独有用例。
+- **同一条 ERC 违规被算成"新增 + 解决"**。KiCad 会把同一条 `net_not_bus_member` 在不同次运行里
+  指向该违规的不同 item，坐标随之变化。现违规身份 = `(sheet, type, severity, description)`，
+  位置只报不判；计数上升仍会抓到，单纯移动不再伪装成新增。
+
 ## [0.5.0] - 2026-10-28
 
 **立创侧从「按格式文档推」改成「在 194 个真实 `.epro` 上测」**。核心是三条被真板子推翻的假设：

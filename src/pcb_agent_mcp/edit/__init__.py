@@ -29,6 +29,8 @@ from . import epro_edit
 from . import fsutil
 from . import ops
 from . import plan
+from . import sch_ops
+from . import sch_plan
 
 from .ops import OpError
 from .plan import EditError
@@ -40,11 +42,12 @@ from .plan import restore_checkpoint
 from .plan import save_checkpoint
 
 __all__ = [
-    "build", "checks", "epro_edit", "fsutil", "ops", "plan",
+    "build", "checks", "epro_edit", "fsutil", "ops", "plan", "sch_ops", "sch_plan",
     "EditError", "OpError", "detect_format",
     "apply_plan", "checkpoint_root", "create_board", "describe_ops",
-    "describe_epro_ops", "find_checkpoint", "list_checkpoints",
-    "propose", "restore_checkpoint", "save_checkpoint",
+    "describe_epro_ops", "describe_sch_ops", "find_checkpoint",
+    "list_checkpoints", "propose", "propose_schematic", "restore_checkpoint",
+    "save_checkpoint", "schematic_summary", "schematic_view",
 ]
 
 
@@ -56,6 +59,20 @@ def describe_ops():
 def describe_epro_ops():
     """The `.epro` operation catalogue (record-stream operations)."""
     return epro_edit.describe()
+
+def describe_sch_ops():
+    """The KiCad *schematic* operation catalogue."""
+    return sch_ops.describe()
+
+def propose_schematic(path, operations, options=None):
+    """Plan a `.kicad_sch` change. Writes nothing."""
+    return sch_plan.propose(path, operations, options)
+
+def schematic_summary(path, engine=True):
+    return sch_plan.summary(path, engine=engine)
+
+def schematic_view(path, kind="summary", limit=200):
+    return sch_plan.view(path, kind=kind, limit=limit)
 
 
 def detect_format(path):
@@ -97,8 +114,15 @@ def propose(path, operations, options=None):
 
 
 def apply_plan(plan_id, confirm=False, options=None):
-    """Write a plan, whichever format made it."""
+    """Write a plan, whichever format made it.
+
+    A plan is single-use and names its own format, so the caller never has to
+    remember which write path produced the id.
+    """
     record = plan.PLANS.get(plan_id) or {}
-    if record.get("format") == "epro":
+    fmt = record.get("format")
+    if fmt == "epro":
         return epro_edit.apply_plan(plan_id, confirm=confirm, options=options)
+    if fmt == "kicad_sch":
+        return sch_plan.apply_plan(plan_id, confirm=confirm, options=options)
     return plan.apply_plan(plan_id, confirm=confirm, options=options)

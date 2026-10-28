@@ -81,7 +81,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（36 个）
+## 工具（41 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -120,6 +120,11 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `app_status` | 是否在跑/几个实例/哪个工程/API 网关端口 | 工程名来自窗口标题，空 = 没窗口显示工程 |
 | `app_launch` | 分离启动 EDA（不带工程） | 启动进程 ≠ 打开工程 |
 | `app_close` | WM_CLOSE 关窗（等同点 X，可能弹保存框） | `force` 才 TerminateProcess；不碰文件 |
+| `schematic_ops` | 原理图写路径的 op 目录（KiCad `.kicad_sch` 18 个）+ 每条用的坐标系 | 调 `schematic_propose` 前先看它 |
+| `schematic_propose` | 只算不写：plan_id、改前/改后 digest、**预测的网表与 ERC diff** | 立创 `.esch` 直接 `WRITE_UNSUPPORTED_FORMAT` |
+| `schematic_apply` | 落盘：checkpoint → 原子写 → 四道闸门（含 KiCad 网表 + ERC 双向对比）→ 不过就回滚 | 必须 `confirm=true`；plan 单次使用 |
+| `schematic_summary` | 只读：这张图**是**什么（每个符号的真 reference/value/footprint/引脚、计数、工程名）+ KiCad 网表与 ERC | 只读，不创建任何文件 |
+| `schematic_view` | 只读：summary / symbols / objects / netlist / erc / lib_symbols / raw | 每个返回都重复坐标系说明 |
 | `app_open_project` | 打开 `.epro`/`.kicad_pro`/`.kicad_pcb` 并按标题确认 | 三态 `confirmed/unconfirmed`；缺文件拒绝且不创建 |
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
@@ -130,9 +135,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.5.0
-python run_server.py --selftest      # 协议级自检，23/23（含写路径端到端）
-python -m unittest discover -s tests # 202 个用例（约 11 分钟：kicad-cli 单次 DRC ≈ 90 s）
+python run_server.py --version       # 0.6.0
+python run_server.py --selftest      # 协议级自检，29/29（含板与原理图写路径端到端）
+python -m unittest discover -s tests # 303 个用例（约 2.5 分钟，其中 kicad-cli 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -185,7 +190,16 @@ MCP 客户端配置（stdio）：
   按「封装文档里该焊盘号的每个 PAD 对象各写一行」——8159/8159 指向同号对象是实测量，但**从未观察到
   应用自己写这一行**，所以结果标 `verified_by_app: false`。
 - **SQLite 格式（`.eprj2`）只读。** 能打开、能算度量，但写路径直接拒绝（`WRITE_UNSUPPORTED_FORMAT`）：
-  `history_data` 加密、`ticket` 单调，任何手改都可能让工程打不开。- **不写原理图。** 两个 EDA 的原理图都不在写路径上（只写了板）。
+  `history_data` 加密、`ticket` 单调，任何手改都可能让工程打不开。
+- **原理图：KiCad 能写，立创不写。** `.kicad_sch` 有 18 个 op、四道闸门，裁判换成 KiCad 的
+  网表 + ERC（[docs/14](docs/14-原理图写路径.md)）——DRC 判铜，原理图的产品是连通性，两套闸门不能照搬。
+  **立创 `.esch` 明确拒写**（`WRITE_UNSUPPORTED_FORMAT`，并按内容说出它是 zip 还是 SQLite），
+  因为它的记录布局还没在真实保存上测过；这一条不是"以后做"，是"现在拒"。
+- **原理图只写单张图纸。** 本层不做跨页改动（改 `sheet` 引脚、改 `Sheetfile`）——那会牵动父图
+  的实例路径与页码，和"改一张图"不是一个风险等级。
+- **两个闸门 bug 是被真图抓出来的**（docs/14 §5）：元件值改动曾被报成"网表变了"；同一条 ERC
+  违规被 KiCad 重新指向不同 item 时曾被算成"新增+解决"。前者会把所有正常字段编辑拦死，
+  后者会让人很快学会一按 `allow_new_violations` 了事。
 - 立创 Pro 的实时 API（websocket 网关 49620-49629）只做端口探测，**没有实现客户端**；而且它只有
   用户手动打开「外部交互权限」后才会监听。
 - `app_open_project` 的立创命令行形式 `lceda-pro.exe <工程.epro>` **未在真机确认**（返回里
@@ -202,13 +216,15 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 36 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 41 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
 │   │   ├── checks.py             # 板框闭合/越界/铜间距/digest
 │   │   ├── plan.py               # propose / apply / create_board / checkpoint
 │   │   ├── epro_edit.py          # .epro 写：6 op、原地重写一个成员、六道闸门、行级 diff
+│   │   ├── sch_ops.py            # 18 个原理图 op（Y 向下的文件坐标系）
+│   │   ├── sch_plan.py           # 原理图 propose/apply + netlist_diff/erc_diff
 │   │   └── fsutil.py             # 原子写（同卷临时文件 + fsync + os.replace）
 │   ├── desktop.py                # Desktop 层：ctypes 探测/启动/关闭/开工程（不碰文件）
 │   ├── oracle.py                 # Oracle 层：只读度量，缺事实就拒绝回答
@@ -220,7 +236,8 @@ pcb_agent_mcp/
 │   │   ├── lceda.py              # 立创记录流：行/终止符/标签表/单位（恒 mil）、append_record
 │   │   ├── eproj_doc.py          # SQLite 工程（.eprj/.eprj2）：只读打开，写一律拒绝
 │   │   ├── views.py              # 事实投影，每条记录带 raw
-│   │   └── engine.py             # 裁判：kicad-cli 的 DRC / stats / Gerbers / pos
+│   │   ├── engine.py             # 裁判：kicad-cli 的 DRC / ERC / netlist / stats / Gerbers / pos
+│   │   └── kicad_sch.py          # 整棵 (kicad_sch ...)：符号/引脚/库符号/工程名，可逐字节往返
 │   ├── adapters/                 # Adapter 层：两份格式 → 一个 Canonical
 │   │   ├── canonical.py          # 唯一真值容器 + present/absent 记账
 │   │   ├── kicad_pcb.py          # S-expr 解析、Edge.Cuts 轮廓、叠层、工程规则

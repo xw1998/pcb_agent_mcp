@@ -21,7 +21,10 @@ from .canonical import Board
 from .. import geometry as G
 
 # --------------------------------------------------------------- tokenizer
-_ESCAPES = {"n": "\n", "t": "\t", "\\": "\\", '"': '"'}
+# Same table as fidelity/sexpr.py on purpose: two readers that disagree about
+# escapes disagree about the board. An escape outside the table keeps its
+# backslash instead of quietly turning "\x" into "x".
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"'}
 
 
 def tokenize(text):
@@ -42,7 +45,7 @@ def tokenize(text):
                 ch = text[i]
                 if ch == "\\" and i + 1 < n:
                     nxt = text[i + 1]
-                    buf.append(_ESCAPES.get(nxt, nxt))
+                    buf.append(_ESCAPES.get(nxt, "\\" + nxt))
                     i += 2
                     continue
                 if ch == '"':

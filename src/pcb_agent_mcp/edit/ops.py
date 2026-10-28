@@ -115,7 +115,9 @@ class Editor(object):
 
     # ---------------------------------------------------------- mutation
     def append(self, node):
-        self.board.items.append(node)
+        # indent like its siblings: a hand-built node carries no trivia, and an
+        # unindented insert turns one line of the diff into the whole block
+        S.append_child(self.board, node)
 
     def remove(self, node):
         for i, item in enumerate(self.board.items):
@@ -628,7 +630,7 @@ def _run_move_footprint(ed, o, seed):
                 fp.items[i] = node
                 break
     else:
-        fp.items.insert(1, node)
+        S.insert_child(fp, 1, node)
     return {"reference": ref, "before": [cur_x, cur_y, cur_rot],
             "after": [new_x, new_y, new_rot]}
 
@@ -662,7 +664,7 @@ def _run_set_dnp(ed, o, seed):
     attr = S.child(fp, "attr")
     if attr is None:
         attr = B.L(B.A("attr"))
-        fp.items.insert(2, attr)
+        S.insert_child(fp, 2, attr)
     words = [a.text for a in attr.items[1:] if isinstance(a, S.Atom)]
     has = "dnp" in words
     if want and not has:
@@ -1017,7 +1019,7 @@ def _run_set_netclass(ed, o, seed):
             # nothing to extend: write the spelling this file's format expects
             aliases = _KNOB_SPELLINGS.get(knob)
             hit = aliases[1 if ed.sp.modern else 0] if aliases else knob
-            target.items.append(B.L(B.A(hit), B.A(B.num(value))))
+            S.append_child(target, B.L(B.A(hit), B.A(B.num(value))))
         changed.append({"knob": knob, "written_as": hit, "value": value})
     return {"net_class": name, "created": created, "changed": changed}
 
@@ -1057,7 +1059,7 @@ def _run_set_thickness(ed, o, seed):
     general = S.child(ed.board, "general")
     if general is None:
         general = B.L(B.A("general"))
-        ed.board.items.insert(1, general)
+        S.insert_child(ed.board, 1, general)
     node = S.child(general, "thickness")
     if node is None:
         general.items.append(B.L(B.A("thickness"), B.A(B.num(mm))))

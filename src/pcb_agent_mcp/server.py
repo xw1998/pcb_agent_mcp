@@ -8,6 +8,7 @@ official SDK later is a thin adapter, not a rewrite.
 import json
 import os
 import sys
+import zipfile
 
 from . import __version__
 from . import tools as _tools
@@ -292,6 +293,71 @@ def selftest():
             "operations") or []
         check("board_ops advertises the 6 .epro operations",
               len(epro_ops) == 6, ",".join(o["op"] for o in epro_ops))
+
+        # ---- schematic write path (no engine: this must stay fast)
+        sch_text = (
+            '(kicad_sch\n'
+            '\t(version 20250114)\n'
+            '\t(generator "eeschema")\n'
+            '\t(uuid "11111111-1111-4111-8111-111111111111")\n'
+            '\t(paper "A4")\n'
+            '\t(lib_symbols)\n'
+            '\t(sheet_instances\n\t\t(path "/" (page "1"))\n\t)\n'
+            '\t(embedded_fonts no)\n'
+            ')\n')
+        sch = os.path.join(tmp, "selftest.kicad_sch")
+        with open(sch, "wb") as fh:
+            fh.write(sch_text.encode("utf-8"))
+        with open(sch, "rb") as fh:
+            sch_before = fh.read()
+        r = handle({"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                    "params": {"name": "schematic_propose", "arguments": {
+                        "path": sch,
+                        "operations": [{"op": "add_wire",
+                                        "points": [[20, 20], [40, 20]]},
+                                       {"op": "add_label", "text": "SELFTEST",
+                                        "x": 20, "y": 20}],
+                        "options": {"engine": False}}}})
+        sprop = json.loads(r["result"]["content"][0]["text"])
+        with open(sch, "rb") as fh:
+            sch_untouched = fh.read()
+        check("schematic_propose writes nothing",
+              sprop.get("status") == "ok" and bool(sprop.get("plan_id"))
+              and sch_untouched == sch_before, str(sprop.get("status")))
+
+        r = handle({"jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                    "params": {"name": "schematic_apply", "arguments": {
+                        "plan_id": sprop.get("plan_id"), "confirm": True,
+                        "options": {"engine": False}}}})
+        sapplied = json.loads(r["result"]["content"][0]["text"])
+        check("schematic_apply passes bytes/token/postcondition gates",
+              sapplied.get("status") == "ok"
+              and {"bytes_written", "token_identity", "postconditions"}
+              <= set(sapplied.get("gates_passed") or []),
+              ",".join(sapplied.get("gates_passed") or []))
+
+        r = handle({"jsonrpc": "2.0", "id": 24, "method": "tools/call",
+                    "params": {"name": "schematic_view",
+                               "arguments": {"path": sch, "kind": "objects"}}})
+        objs = json.loads(r["result"]["content"][0]["text"])
+        check("schematic_view reads the write back as objects",
+              objs.get("status") == "ok" and (objs.get("total") or 0) == 2
+              and "DOWNWARDS" in (objs.get("frame") or ""),
+              "total=%s" % objs.get("total"))
+
+        esch = os.path.join(tmp, "proj.epro")
+        with zipfile.ZipFile(esch, "w") as zf:
+            zf.writestr("project.json", "{}")
+        r = handle({"jsonrpc": "2.0", "id": 25, "method": "tools/call",
+                    "params": {"name": "schematic_propose", "arguments": {
+                        "path": esch,
+                        "operations": [{"op": "add_wire",
+                                        "points": [[0, 0], [1, 1]]}]}}})
+        eref = json.loads(r["result"]["content"][0]["text"])
+        check("the LCEDA Pro schematic writer refuses instead of guessing",
+              eref.get("status") == "error"
+              and eref.get("reason_code") == "WRITE_UNSUPPORTED_FORMAT",
+              str(eref.get("reason_code")))
 
         junk = os.path.join(tmp, "not-a-project.epcb")
         with open(junk, "wb") as fh:

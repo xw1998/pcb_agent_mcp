@@ -618,6 +618,11 @@ def _capabilities(_args):
                      "checkpoint, atomic write, five independent gates, rollback on any "
                      "failure). KiCad edits are re-judged by kicad-cli; a new DRC "
                      "violation blocks the write",
+            "write_schematic": "KiCad .kicad_sch only: propose (compute only) -> apply "
+                               "(checkpoint, atomic write, four gates). The referee is "
+                               "the netlister + ERC, not DRC: a schematic's product is "
+                               "connectivity, and two coordinates being right does not "
+                               "prove two wires are joined",
         },
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
@@ -629,6 +634,8 @@ def _capabilities(_args):
             "board_stats", "epro_inspect",
             "board_ops", "board_create", "board_propose", "board_apply",
             "board_checkpoints", "board_restore",
+            "schematic_ops", "schematic_propose", "schematic_apply",
+            "schematic_summary", "schematic_view",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
         ],
         "fail_closed_pending_data": {
@@ -669,7 +676,10 @@ def _capabilities(_args):
             "written archive was re-opened in LCEDA Pro, so every apply says so in "
             "not_verified. Appending a record the vendor was never seen writing is "
             "reported as verified_by_app=false",
-            "Schematic editing in either EDA (this server writes boards, not sheets)",
+            "LCEDA Pro schematic (.esch) write path: the sheets live inside the .epro "
+            "archive and that record layout was never measured against a real save, "
+            "so the writer refuses it (WRITE_UNSUPPORTED_FORMAT) instead of guessing. "
+            "KiCad schematics ARE written (see schematic_ops)",
             "EasyEDA Pro live API drive (websocket gateway on 49620-49629): the port is "
             "only opened after the user enables 外部交互权限, and no client is implemented",
             "DFM checks (fabricator capability rules)",
@@ -700,6 +710,15 @@ def _capabilities(_args):
                      "DRC before/after diff; kicad-cli caught three real mistakes in the "
                      "demo build (silk text over the edge, a dangling track, a dangling "
                      "via) and rolled them back",
+            "schematic": "on a real KiCad 10 demo sheet (cm5_minima): a field edit "
+                         "passes every gate with an unchanged netlist, a dangling "
+                         "label is refused by ERC, a placed symbol is seen by the "
+                         "netlister with its pins, and renaming a #PWR value - which "
+                         "renames a power net - is blocked and rolled back. Two gate "
+                         "bugs were found this way: a value edit was being reported as "
+                         "a connectivity change, and KiCad re-points the same ERC "
+                         "warning at a different item between runs, so position is "
+                         "reported but never used as violation identity",
         },
     }
 
@@ -1114,6 +1133,135 @@ _tool(
         "keep_current": _bool("checkpoint the file being replaced (default true)", True),
     }, "required": ["checkpoint_id"]},
     _board_restore,
+)
+
+# --------------------------------------------------------- schematic write path
+def _schematic_error(exc):
+    """A schematic op error keeps its code; anything else stays visible as itself."""
+    from . import edit as _edit
+    if isinstance(exc, (_edit.EditError, _edit.OpError)):
+        return _edit_error(exc)
+    return err("%s: %s" % (type(exc).__name__, exc), "NOT_A_SCHEMATIC")
+
+def _sch_ops(_args):
+    from . import edit as _edit
+    return {"status": "ok",
+            "format": "kicad_sch only (KiCad schematic). LCEDA Pro .esch is NOT on the "
+                      "write path: its sheets live inside the .epro archive and that "
+                      "record layout was never measured, so it is refused rather than "
+                      "guessed (WRITE_UNSUPPORTED_FORMAT)",
+            "operations": _edit.describe_sch_ops(),
+            "coordinates": _edit.sch_ops.FRAME,
+            "protocol": "schematic_propose -> read the digest and the predicted "
+                        "netlist/ERC diff -> schematic_apply(confirm=true)",
+            "gates": "apply re-reads the bytes it wrote, re-parses them into exactly "
+                     "the planned tree, re-checks every operation's postcondition, "
+                     "then asks KiCad's netlister and ERC engine about BOTH files. A "
+                     "netlist that changes when only symbols/text were touched, or "
+                     "any NEW ERC violation, blocks the write and rolls it back",
+            "note": "one plan is all-or-nothing; a plan id is single use"}
+
+def _sch_propose(args):
+    from . import edit as _edit
+    try:
+        return _edit.propose_schematic(args.get("path"), args.get("operations") or [],
+                                       args.get("options") or {})
+    except Exception as exc:                       # noqa: BLE001
+        return _schematic_error(exc)
+
+def _sch_apply(args):
+    from . import edit as _edit
+    try:
+        return _edit.apply_plan(args.get("plan_id"), args.get("confirm") is True,
+                                args.get("options") or {})
+    except Exception as exc:                       # noqa: BLE001
+        return _schematic_error(exc)
+
+def _sch_view(args):
+    from . import edit as _edit
+    try:
+        return _edit.schematic_view(args.get("path"),
+                                    kind=args.get("kind") or "summary",
+                                    limit=int(args.get("limit") or 200))
+    except Exception as exc:                       # noqa: BLE001
+        return _schematic_error(exc)
+
+def _sch_summary(args):
+    from . import edit as _edit
+    try:
+        return _edit.schematic_summary(args.get("path"),
+                                       engine=args.get("engine", True) is not False)
+    except Exception as exc:                       # noqa: BLE001
+        return _schematic_error(exc)
+
+_tool(
+    "schematic_ops",
+    "The operation catalogue of the SCHEMATIC write path (KiCad .kicad_sch): wires, "
+    "buses, bus entries, junctions, no-connects, labels, global/hierarchical labels, "
+    "netclass flags, text, graphics, and symbol placement/field editing - each with the "
+    "coordinates it uses. Call it before schematic_propose.",
+    {"type": "object", "properties": {}},
+    _sch_ops,
+)
+
+_tool(
+    "schematic_propose",
+    "Plan a change to a KiCad schematic WITHOUT writing anything: returns a plan_id, the "
+    "document digest before/after, and (when kicad-cli is present) the netlist and ERC "
+    "diff the change is predicted to cause. Read it, then schematic_apply(confirm=true).",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_sch"),
+        "operations": {"type": "array", "description":
+            "list of {op, ...params}; call schematic_ops for the catalogue",
+            "items": {"type": "object"}},
+        "options": {"type": "object", "description":
+            "engine (true/false: run KiCad's netlister + ERC while planning), "
+            "allow_new_violations", "properties": {}},
+    }, "required": ["path", "operations"]},
+    _sch_propose,
+)
+
+_tool(
+    "schematic_apply",
+    "Write a planned schematic change: checkpoint -> atomic write -> four gates - the "
+    "bytes on disk are the planned bytes, re-parsing reproduces the planned tree, every "
+    "operation's postcondition holds in the file just written, and KiCad's netlister + "
+    "ERC were run on both files (a connectivity change nobody asked for, or any new ERC "
+    "violation, blocks and rolls back). Requires confirm=true.",
+    {"type": "object", "properties": {
+        "plan_id": _str("plan_id from schematic_propose"),
+        "confirm": _bool("must be true - this writes the file"),
+        "options": {"type": "object", "description":
+            "engine (default true), allow_new_violations", "properties": {}},
+    }, "required": ["plan_id"]},
+    _sch_apply,
+)
+
+_tool(
+    "schematic_summary",
+    "Read-only. What the sheet IS, in the terms the write path uses: version, paper, "
+    "every symbol with its real reference/value/footprint/pins, wire/label/junction "
+    "counts, project name and path, plus KiCad's own netlist and ERC result when "
+    "kicad-cli is available.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_sch"),
+        "engine": _bool("run kicad-cli netlist + ERC (default true)", True),
+    }, "required": ["path"]},
+    _sch_summary,
+)
+
+_tool(
+    "schematic_view",
+    "Read-only. One view of the sheet at a time: summary | symbols | objects | netlist | "
+    "erc | lib_symbols | raw. Every answer repeats the coordinate frame it is in.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_sch"),
+        "kind": _str("which view", enum=["summary", "symbols", "objects", "netlist",
+                                         "erc", "lib_symbols", "raw"],
+                     default="summary"),
+        "limit": _num("max rows per list", 200),
+    }, "required": ["path"]},
+    _sch_view,
 )
 
 _tool(

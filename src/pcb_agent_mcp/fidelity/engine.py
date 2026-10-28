@@ -157,6 +157,126 @@ def _slim_unconnected(items):
                                "pos": i.get("pos")} for i in (v.get("items") or [])[:4]]})
     return out
 
+# --------------------------------------------------------------- ERC (schematic)
+def sch_erc(path, severity="all", timeout=300):
+    """Authoritative ERC: KiCad's own electrical-rule engine on a .kicad_sch.
+
+    The report is the verdict for a schematic edit. It is *not* "this server
+    thinks two pins are unconnected": KiCad computed it, and the tool reports
+    what KiCad said, with the sheet path of every violation.
+
+    Read-only: the JSON report is written into a temp directory, and no
+    `--save-*`/rewrite flag is ever passed, so the project is untouched.
+    """
+    exe = find_kicad_cli()
+    if not exe:
+        return {"status": "error", "reason_code": "KICAD_CLI_NOT_FOUND",
+                "message": "kicad-cli was not found; install KiCad or pass an explicit path"}
+    if not os.path.isfile(path):
+        return {"status": "error", "reason_code": "PROJECT_NOT_FOUND",
+                "message": "this tool never creates files: %s" % path}
+    tmp = tempfile.mkdtemp(prefix="pcb_agent_erc_")
+    try:
+        report = os.path.join(tmp, "erc.json")
+        args = ["sch", "erc", "-o", report, "--format", "json"]
+        args.append("--severity-all" if severity == "all" else "--severity-error")
+        args.append(os.path.abspath(path))
+        res = _run(args, cwd=tmp, timeout=timeout)
+        if not os.path.isfile(report):
+            return {"status": "error", "reason_code": "ENGINE_FAILED",
+                    "message": "kicad-cli produced no ERC report",
+                    "engine": {"exe": exe, "version": version()},
+                    "engine_output": res}
+        with open(report, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        flat = []
+        per_sheet = []
+        for sheet in data.get("sheets") or []:
+            vs = sheet.get("violations") or []
+            per_sheet.append({"path": sheet.get("path"),
+                              "uuid_path": sheet.get("uuid_path"),
+                              "violations": len(vs)})
+            for v in vs:
+                flat.append(dict(v, sheet=sheet.get("path")))
+        return {
+            "status": "ok",
+            "authoritative": True,
+            "engine": {"name": "kicad-cli", "exe": exe,
+                       "version": data.get("kicad_version") or version()},
+            "verdict_source": "KiCad ERC engine (not this project's net tracing)",
+            "schema": data.get("$schema"),
+            "coordinate_units": data.get("coordinate_units"),
+            "sheets": per_sheet,
+            "violations_total": len(flat),
+            "by_severity": _count(flat, "severity"),
+            "by_type": _count(flat, "type"),
+            "ignored_checks": data.get("ignored_checks"),
+            "included_severities": data.get("included_severities"),
+            "violations": _slim_violations(flat),
+            "not_written": "no file was created or modified beside %s"
+                           % os.path.basename(path),
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+# --------------------------------------------------------------- netlist
+def sch_netlist(path, timeout=300):
+    """KiCad's own connectivity answer for a schematic, as a comparable list.
+
+    A netlist is the *netlist*: which pin of which reference lands on which
+    named net. Diffing it before/after an edit is the only cheap way to prove
+    that a wire or a label actually did what the plan claimed, because the two
+    ends of a wire can be at the right coordinates and still not connect.
+
+    Returned structure is normalised (nets sorted by name, nodes sorted), which
+    makes a diff noise-free: KiCad renumbers net codes on every export.
+    """
+    exe = find_kicad_cli()
+    if not exe:
+        return {"status": "error", "reason_code": "KICAD_CLI_NOT_FOUND"}
+    if not os.path.isfile(path):
+        return {"status": "error", "reason_code": "PROJECT_NOT_FOUND",
+                "message": "this tool never creates files: %s" % path}
+    tmp = tempfile.mkdtemp(prefix="pcb_agent_netlist_")
+    try:
+        out = os.path.join(tmp, "netlist.net")
+        res = _run(["sch", "export", "netlist", "--format", "kicadsexpr",
+                    "-o", out, os.path.abspath(path)], cwd=tmp, timeout=timeout)
+        if not os.path.isfile(out):
+            return {"status": "error", "reason_code": "ENGINE_FAILED",
+                    "engine_output": res}
+        with open(out, "r", encoding="utf-8", errors="surrogateescape") as fh:
+            text = fh.read()
+        from . import sexpr as S
+        tree = S.parse(text)
+        root = tree.items[0]
+        comps = []
+        for c in S.children(S.child(root, "components"), "comp") or []:
+            comps.append({"ref": S.arg_text(S.child(c, "ref"), 1),
+                          "value": S.arg_text(S.child(c, "value"), 1),
+                          "footprint": S.arg_text(S.child(c, "footprint"), 1)})
+        nets = []
+        for n in S.children(S.child(root, "nets"), "net") or []:
+            nodes = []
+            for nd in S.children(n, "node"):
+                nodes.append([S.arg_text(S.child(nd, "ref"), 1),
+                              S.arg_text(S.child(nd, "pin"), 1)])
+            nets.append({"name": S.arg_text(S.child(n, "name"), 1),
+                         "nodes": sorted(nodes)})
+        nets.sort(key=lambda n: (n["name"] or ""))
+        comps.sort(key=lambda c: (c["ref"] or ""))
+        return {"status": "ok", "authoritative": True,
+                "engine": {"name": "kicad-cli", "version": version()},
+                "verdict_source": "KiCad netlister",
+                "components": comps,
+                "nets": nets,
+                "components_total": len(comps),
+                "nets_total": len(nets),
+                "not_written": "no file was created or modified beside %s"
+                               % os.path.basename(path)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 
 # --------------------------------------------------------------- stats
 def stats(path, timeout=180):
