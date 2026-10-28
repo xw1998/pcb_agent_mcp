@@ -1,26 +1,163 @@
 {
  "schema": 2,
- "verified": false,
- "edition": "NOT LOADED",
- "note": "IPC-2152 is a set of measured charts, not a closed form. Nothing here is filled: the standard is paywalled, and every public copy found is a plot image or a screenshot of a plot - reading numbers out of a picture and calling them a standard table is exactly the kind of guessed engineering number this server refuses to produce. The validator that would accept a real transcription is calc/safety_table.py:validate_ipc2152.",
+ "verified": true,
+ "edition": "IPC-2152 (2009) Table 3-1 - closed-form fit by Brooks & Adam (2015)",
+ "note": "IPC-2152 itself publishes charts, not equations (KiCad's own header says so). What is stored here is therefore not a transcription of chart pixels but the published closed-form fit to that data, with the coefficients copied verbatim from KiCad 10.0 (common/track_width_calculations.cpp), which is the second independent implementation. Every coefficient below is readable in public source, so it can be checked instead of trusted.",
+ "model": {
+  "form": "dT = K * I^a * W^b * Th^c",
+  "solve_width": "W = (dT / (K * I^a * Th^c))^(1/b)",
+  "solve_current": "I = (dT / (K * W^b * Th^c))^(1/a)",
+  "units": {
+   "dT": "degC (rise above ambient)",
+   "I": "A",
+   "W": "mil",
+   "Th": "mil"
+  },
+  "external": {
+   "applies_to": "all copper weights",
+   "K": 215.3,
+   "a": 2.0,
+   "b": -1.15,
+   "c": -1.0
+  },
+  "internal": [
+   {
+    "copper_oz": 0.5,
+    "thickness_mil": 0.689,
+    "K": 120.0,
+    "a": 2.0,
+    "b": -1.10,
+    "c": -1.52
+   },
+   {
+    "copper_oz": 1.0,
+    "thickness_mil": 1.378,
+    "K": 200.0,
+    "a": 1.9,
+    "b": -1.10,
+    "c": -1.52
+   },
+   {
+    "copper_oz": 2.0,
+    "thickness_mil": 2.756,
+    "K": 300.0,
+    "a": 2.0,
+    "b": -1.15,
+    "c": -1.52
+   },
+   {
+    "copper_oz": 3.0,
+    "thickness_mil": 4.134,
+    "K": 262.5,
+    "a": 1.9,
+    "b": -1.15,
+    "c": -1.52
+   }
+  ],
+  "internal_selection_rule": "nearest nominal copper weight by supplied thickness; the switch points are the midpoints (0.689+1.378)/2, (1.378+2.756)/2, (2.756+4.134)/2 (KiCad coefficients())",
+  "thickness_mil_per_oz": 1.378,
+  "sources": [
+   {
+    "id": "KiCad 10.0, common/track_width_calculations.cpp (BA_COEFFICIENTS + coefficients())",
+    "url": "https://gitlab.com/kicad/code/kicad/-/raw/master/common/track_width_calculations.cpp",
+    "role": "independent implementation whose coefficients are copied verbatim"
+   },
+   {
+    "id": "D. G. Brooks and J. Adam, \"Trace Currents and Temperatures Revisited\" (2015), fit to IPC-2152 Table 3-1",
+    "role": "the fit itself; named as the origin in KiCad's header"
+   },
+   {
+    "id": "IPC-2152 (2009), Table 3-1 (measured data being fitted)",
+    "role": "underlying standard; not redistributed here"
+   }
+  ],
+  "model_limits": [
+   "chart fit: it reproduces the published data, it is not the data",
+   "no board thickness, no adjacent copper, no airflow, no mask opening - those are the IPC-2152 parameters the fit drops",
+   "external uses one fit for all copper weights; internal fits are picked in 4 discrete buckets, so internal answers can jump at a bucket edge"
+  ]
+ },
+ "anchors": [
+  {
+   "layer": "external",
+   "copper_oz": 1.0,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 10.9165,
+   "note": "vs IPC-2221 same question = 11.826 mil: 2152 is less conservative outside"
+  },
+  {
+   "layer": "internal",
+   "copper_oz": 1.0,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 9.78,
+   "note": "narrower than external - the 2x internal derating of IPC-2221 is not in 2152"
+  },
+  {
+   "layer": "external",
+   "copper_oz": 0.5,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 19.9456
+  },
+  {
+   "layer": "external",
+   "copper_oz": 2.0,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 5.9747
+  },
+  {
+   "layer": "external",
+   "copper_oz": 3.0,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 4.1995
+  },
+  {
+   "layer": "internal",
+   "copper_oz": 0.5,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 16.0186
+  },
+  {
+   "layer": "internal",
+   "copper_oz": 2.0,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 5.041
+  },
+  {
+   "layer": "internal",
+   "copper_oz": 3.0,
+   "current_a": 1.0,
+   "delta_t_c": 10.0,
+   "width_mil": 2.6263
+  },
+  {
+   "layer": "external",
+   "copper_oz": 1.0,
+   "current_a": 1.0,
+   "width_mil": 10.0,
+   "delta_t_c": 11.061,
+   "note": "current-from-width direction; IPC-2221 gives 13.183 degC for the same trace"
+  }
+ ],
+ "anchor_tolerance_rel": 0.005,
+ "anchor_meaning": "Anchors are produced by this repo's own solver from the coefficients above, so they catch implementation drift (wrong exponent, wrong bucket, mil/mm slip) - they do NOT validate the fit against the physical standard. The fit's own uncertainty is stated in model_limits and in every answer's precision field.",
+ "points": [],
+ "points_note": "Empty on purpose: points were meant for a digitised chart transcription, which is why this file used to refuse to be filled. The closed-form model above replaced that plan, so the row schema stays supported for anyone who does have a properly attributed transcription.",
  "why_empty": {
   "rule": "a digitised guess is not a table",
-  "what_was_looked_for": "IPC-2152 charts (current vs cross-section, per copper weight and allowed temperature rise)",
+  "what_was_looked_for": "IPC-2152 numeric tables (current vs cross-section, per copper weight and allowed temperature rise)",
   "what_was_found": "plot images and screenshots only; no numeric transcription with a stated table/figure id and edition",
-  "what_blocks_filling": [
-   "a chart read off an image has no stated uncertainty, and IPC-2152 vs IPC-2221 can differ by more than 3x - the error would be invisible",
-   "no two independent numeric transcriptions were found to check each other"
+  "what_replaced_it": "the published closed-form fit to IPC-2152 Table 3-1 (Brooks & Adam 2015), coefficients taken verbatim from KiCad 10.0 open source - checkable instead of trusted",
+  "what_is_still_missing": [
+   "board thickness / adjacent copper / airflow dependence - dropped by the fit",
+   "any statement about plated through holes; IPC-2152 does not describe them",
+   "the standard's own charts, which are not redistributed"
   ]
- },
- "expected_row_format": {
-  "copper_oz": 1.0,
-  "delta_t_c": 10,
-  "area_mil2": 100,
-  "current_a": null,
-  "table": "figure/clause id from the standard",
-  "sources": [
-   "document id or url, at least two independent"
-  ]
- },
- "points": []
+ }
 }

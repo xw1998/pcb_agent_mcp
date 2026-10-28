@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.9` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.10` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -55,9 +55,11 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 1. **没有 basis 的值一律无效。** 每个结果必须带 `model` / `basis` / `precision` / `assumptions`，
    `require_basis()` 在信封层强制；缺 `precision` 直接抛错。
-2. **一律 fail-closed。** 载流不传 `standard` 报 `STANDARD_REQUIRED`；`ipc2152` 表**未核验**
-   （`verified:false` 或零行）报 `STANDARD_DATA_NOT_LOADED`；爬电/间隙表缺失或未核验报
-   `SAFETY_TABLE_MISSING`。
+2. **一律 fail-closed（对没核验过的那一半）。** 载流不传 `standard` 报 `STANDARD_REQUIRED`；
+   `ipc2152` 的闭式系数文件若漂移（`_model_check` 不过）报 `STANDARD_DATA_NOT_LOADED`；
+   非 IEC 60664-1 族的安规标准（IEC 62368-1 / 61010-1 / UL 60950 / IPC-2221）仍报
+   `SAFETY_TABLE_MISSING`。IEC 60664-1 与 IPC-2152 已经用行为对拍/闭式锚点换成了**可重生成**的数，
+   不再靠“表里有没有行”判断。
    **猜一个安全间距比不给答案更糟。**
 3. **不复用未核验的第三方实现。** 见下节。
 
@@ -110,9 +112,10 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `trace_impedance` | 几何 → Z0（微带/带状线） | w/h 超出 0.05..3.0 标 `validity_note` |
 | `width_for_impedance` | Z0 → 线宽（二分反解） | 不可达时回 `UNREACHABLE` + 可达区间 |
 | `lambda_over_20` | λ/20 布线间距 | 与频率/εr 绑定，不给记忆值 |
-| `creepage_required` | 爬电距离查表 | 无表 fail-closed |
-| `clearance_required` | 电气间隙查表 | 无表 fail-closed |
-| `safety_table_check` | 判定一张安规表能不能用：来源≥2、随电压/材料组/污染等级单调、PD1≤PD2≤PD3、无重复 key | 只能判"转录没法作弊"，判不了"来源有没有抄错"；因此 `data/*.json` 仍 `verified:false`，查询继续拒答 |
+| `creepage_required` | 爬电距离（IEC 60664-1 Table F.5） | 非 60664 族仍 fail-closed；PD4 回 `STANDARD_SCOPE`；不覆盖 homogeneous field |
+| `clearance_required` | 电气间隙（瞬态 Table F.2 / 峰值 Table F.8 / 海拔修正） | 两分支任一越界即整题拒答（复刻 C++ 的 -1 传播）；reinforced 另走 ×1.6 |
+| `spacing_required` | 一次给出 clearance / creepage / 裁决值与 `governing` | 额外强制 `creepage >= clearance`（标准要求，`creepage_mm` 本身不夹） |
+| `safety_table_check` | 判定一张安规表能不能用；`which="iec60664"` 时走 8 条专属检查（含 F.8 与 PD 无关、线性段过原点、`not_covered` 不得被删） | 只能判“转录没法作弊 + 行为对拍过”，判不了“标准原文还有没有未覆盖的条款”；9 条变异用例保证它不是永真的 |
 | `diff_impedance` | 差分对几何 → Zdiff（边耦合微带/带状线） | s/h 超出 0.1..3.0 标 `validity_note` |
 | `diff_impedance_field` | 同一几何 → Zdiff，但解真实截面上的 div(ε∇V)=0（有限体积 + 红黑 SOR，纯 stdlib） | 参考解只覆盖零厚度带状线/孤立微带；紧间距耦合回 `reference_note`（求解器的意见，不是被核过的数）；不建模阻焊/蚀刻梯形/铜损 |
 | `diff_width` | Zdiff → 线宽（间距固定，二分） | 不可达 → `UNREACHABLE` + 可达带宽 |
@@ -180,7 +183,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `via_resistance` | 过孔桶壁电阻（截面是**铜环**不是钻孔圆） | 载流是另一码事，要温升判据 |
 | `trace_inductance` | 直线走线自感（Grover 带公式，±20%） | 只用于比两种布局；地平面像项**明确未计入** |
 | `ir_drop_chain` | 分段串联 IR drop（每段自己的宽/厚） | 不把不同线宽折算成平均宽 |
-| `pdn_impedance` | 电容组 `\|Z(f)\|` 全曲线 + 平面电容 | 要看**反谐振峰**，不是看最低点 |
+| `pdn_impedance` | 电容组 `\|Z(f)\|` 全曲线 + 平面电容；给 `plane` 时附带**腔体模诊断** | 要看**反谐振峰**，不是看最低点；`plane` 只做诊断，**不改那条曲线** |
+| `pdn_plane_modes` | 平面腔体每个模的**峰值** `|Z_peak| = w·μ0·t·ψ(r1)ψ(r2)·Q/k²`（Q=1/tanδ）与端口耦合/null | **只给峰值不给曲线**（模态求和不收敛）；过孔桶壁/反焊盘/分割平面/铜损/开放边缘失谐全部未算 |
 | `decoupling_check` | 给定电流/频段/纹波判够不够 | 三态 `pass/fail/indeterminate`；最坏点落在频段下沿说 **indeterminate**（那里由稳压器负责） |
 | `thermal_stack` | 叠层 1-D 热阻 `Σ t/(kA)` + 给定功耗的温升 | 严格 1-D，看不见扩热 |
 | `thermal_via_array` | 过孔阵列热阻（同环壁几何），可把周围 FR4 并联 | 偏乐观（桶壁中段镀层更薄） |
@@ -192,6 +196,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `dfm_capability` | 只校验一份**工艺能力文档**：11 条规则键、单位、方向、出处 | 未知键 / 没有 `source` / 空文档**整份拒收**；不内置任何板厂表 |
 | `dfm_check` | 拿能力文档去量板上真实几何，逐条给 `pass/fail/not_checked/not_applicable` + 余量 + `where` | 文档里没写的规则列进 `missing_known_rules`（不是 pass）；有界搜索窗外只给 `lower_bound` |
 | `vibration_plate_modes` | 矩形薄板自由振动：频率/模态形状（Rayleigh–Ritz 单轴单项式基 + 边界零空间 + 质量白化 + Jacobi）；四边简支/固支/自由/悬臂/四角点支撑 | 只有 Kirchhoff 薄板；不算阻尼、不算预紧/大变形、不算开孔与加强筋 |
+| `vibration_plate_stress` | 振型 → 表面应力：同一模态在多个多项式阶上各解一次，**误差棒是量出来的**（`degree_sensitivity_pct`）；von Mises 与最大主应力**各报各的点** | `amplitude_mm` **必填**（振型没有幅值）；点支承下阶梯塌成一档 ⇒ `converged=None`（没有误差棒，而不是误差棒很小） |
 | `vibration_random_response` | 随机振动：Miles 等效（平坦闭式 + 实测谱积分互证）→ g_rms / 位移 rms | 单模态；非平坦谱逐段积分只在足迹内，谱外不计 |
 | `vibration_fatigue` | Steinberg 三带（3σ/2σ/1σ）+ Miner 线性累积 → 循环数与小时寿命 | `z_allow_mm` **必填**（不内置「典型允许挠度」） |
 | `vibration_shock` | 半正弦冲击：SDOF Newmark（β=1/4、γ=1/2）→ 峰值位移/加速度、DLF | 单自由度；不算应力、不算二次冲击与接触碰撞 |
@@ -201,6 +206,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `cavity_via_fence` | 过孔围栏：`pitch/λ_g`、每间距电长度、给定判据后的 `pass/fail` | **判据必须由调用方给**（λ_g/20 与 λ_g/10 差 2 倍，都不内置）；不给就 `indeterminate` 且不反推间距 |
 | `electrothermal_trace` | 走线自洽温升：R(T) → I²R → ΔT → R(T) 的定点迭代 + 精确失控判据 `dP/dT·Rth < 1` | `rth_c_per_w` **必填**；G≥1 回 `THERMAL_RUNAWAY` 而不是最后一次迭代；只算直流 |
 | `electrothermal_conductor` | 同一环，R₂₀ 由调用方给（过孔桶壁 / 分段串联 / 分流器 / 针脚） | 回 R_hot、电阻增幅、迭代次数、稳定性余量 `1−G`；Rth 仍是调用方的 |
+| `board_electrothermal` | 板级 **2-D** 电热：均匀网格 + SOR，`rho(T)` 线性 ⇒ `alpha*T` 落在矩阵对角线上，稳态是**严格线性**的一次求解；瞬态后向 Euler；失控在**求解前**按对角判 | `h_w_m2k` **必填**；只铺介质 k，不穿真实铺铜/热过孔；DC，无趋肤/邻近损耗；不替你开 `.kicad_pcb` |
 | `filter_prototype` | 原型 g 值（Chebyshev / Butterworth），滤波器设计的起点 | Butterworth 传非零 ripple 直接 `ARG_CONFLICT`；order ∉ [1,20] 拒 |
 | `filter_lumped_bandpass` | LP→BP：每段 L/C + 两路 S21（ABCD 级联 vs 闭式 `1/(1+ε²Tn²)`） | 两路差 >0.02 dB **拒答**（`INTERNAL_CHECK_FAILED`）；无有限 Q、无寄生、无良率 |
 | `filter_coupled_microstrip` | 耦合微带反解 w/s：截面解拉普拉斯（奇模电壁/偶模磁壁）+ Broyden 反解 | 准静态无色散；k<0.02 拒；k 误差 >3% 带 `k_resolution_note`（k 是两个相近数之差） |
@@ -215,9 +221,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.9
-python run_server.py --selftest      # 协议级自检，60/60（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动五问、腔体与电热五问、滤波器三问）
-python -m unittest discover -s tests # 708 个用例（约 5 分钟，kicad-cli / pcbnew 用例占大头）
+python run_server.py --version       # 0.0.10
+python run_server.py --selftest      # 协议级自检，76/76（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问）
+python -m unittest discover -s tests # 837 个用例（约 5 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -301,13 +307,22 @@ MCP 客户端配置（stdio）：
   所以不是本层的启动方式坏了。结论：`open_argv_verified` 保持 `false`，`opened` 只会是
   `unconfirmed`；桌面控制对立创目前只到"探测到装在哪"（4.1.60，盘符扫描命中）。
 - **差分阻抗有两级：闭式近似与二维场解，两者差多少是实测的。** `diff_impedance` 仍是边耦合闭式（IPC-2141A 族），`diff_impedance_field` 解真实截面上的 div(ε∇V)=0（有限体积 + 梯度张量网格 + 红黑 SOR，纯 stdlib）。闭式在实测几何上系统性**偏低 8~11%**、方向一致，所以「调宽凑数」会把线先做窄。场解自己的误差对着两个共享零近似的参考答案量过：零厚度带状线对精确共形解（w/b 0.5..4）≤1.2%、孤立微带对 Hammerstad ≤2.8%、耦合通路在 s/h=8 处对 2×孤立精确解 ≤2.7%；这三张表由 `tests/test_field2d.py` 每次重算，不会悄悄过期。**没被独立参考答案覆盖的是紧间距耦合**——那种几何下工具自己吐 `reference_note`，说明「这是求解器的意见，不是被核过的数」。两者都不建模阻焊、蚀刻梯形与铜损/色散。
-- **IPC-2152 / IEC 60664-1 的表是空的，而且是故意空的。** `calc/safety_table.py` 把"表能不能信"
-  做成可执行的判据：来源 ≥2、随电压单调不降、随材料组变差单调不降、PD1≤PD2≤PD3、无重复 key
-  （`tests/test_safety_table.py` 17 例逐条反证）。但规则判不了"来源有没有抄错"——
-  互相抄的两个博客也能全过。公开来源对 IPC-2152 的读数互相矛盾（与 IPC-2221 差可 >3×），
-  所以 `data/ipc2152_tables.json` 与 `data/creepage_tables.json` 都保持 `verified: false`、
-  行数据留空并写清 `why_empty`，`current_capacity(standard=ipc2152)` / `creepage_required` /
-  `clearance_required` 继续 fail-closed 并说出缺什么。**填一个猜的值比拒答更糟。**
+- **两张读不到原文的表，改走两条不需要原文的路。** 标准是付费的、公开转述互相矛盾（IPC-2152
+  与 IPC-2221 差可 >3×），所以不自已抄表：
+  - **IPC-2152** 抄 KiCad 10.0 `track_width_calculations.cpp` 里已经公开发表的 **Brooks & Adam 2015
+    闭式拟合**（`ΔT = K·I^a·W^b·Th^c`，内外层各四个铜厚档），用三个独立锚点复现（1 A/10 °C/1 oz
+    外层 = 0.2773 mm、同条件内层 = 0.2484 mm、IPC-2221 外层 = 0.3021 mm）+ 反向 `current_capacity`
+    的 0.951 A 做三线校验；`data/ipc2152_tables.json` 里 `points` 仍是空的，但 `why_empty` 现在说明的是
+    “不是表模型，是闭式模型，凭空造点才是不诚实”。
+  - **IEC 60664-1:2020-05** 不抄表，**编译 KiCad 10.0 的 `iec60664.cpp` 原实现、用探针把每一道阶梯
+    反演出来、再拿全网格对拍**：三套探针共 **188 528 点，0 失配**（grid 3 760 / sweep 93 120 / raw 91 648），
+    阶梯 32 键 / 808 步落盘在 `data/iec60664_tables.json`，`verified: true`。
+  - 剩下的安规族（IEC 62368-1 / 61010-1 / UL 60950 / IPC-2221）仍**一律 fail-closed**，报 `SAFETY_TABLE_MISSING`。
+  - 这个过程中最贵的一条教训：**断点必须每次重新反演，不能从上版 JSON 继承**——自引用会让整段阶梯
+    静默消失，端口在那些区间返回下一档（偏大）。见 [docs/23](docs/23-两张读不到原文的表.md)。
+  - `calc/safety_table.py` 原有的“表能不能信”规则判据（来源 ≥2、单调、PD1≤PD2≤PD3、无重复 key，
+    `tests/test_safety_table.py` 17 例逐条反证）保留；IEC 60664-1 另走 8 条专属检查 + 9 条变异用例。
+    **填一个猜的值比拒答更糟。**
 
 ### 天线层：不做全波，这一点写在每个返回里
 
@@ -392,7 +407,13 @@ MCP 客户端配置（stdio）：
   Steinberg 的 ±1.5 mm@2×10⁷ 是「引线类」这个类别的数，不是板上这颗器件的数据。
 - **冲击只做单自由度。** 半正弦冲击走 Newmark（β=1/4、γ=1/2，无条件稳定），`dt ≤ min(T_n/24, 脉冲/60)`；
   阶跃在 ζ→0 时 DLF 实测 1.99953（解析 2），半正弦峰值对 `1+exp(−ζπ/√(1−ζ²))` 三档 ζ 全部 ≤0.13%。
-  不算应力、不算接触碰撞、不算多自由度追赶。
+  不算接触碰撞、不算多自由度追赶。
+- **应力是同一组 Ritz 曲率的副产品，不是一个场解。** 0.0.10 起 `vibration_plate_stress`
+  （与 `plate_modes(stress_amplitude_mm=…)`）报**三个分开定位的极值**：板角 von Mises
+  （`vm=√3|τ|`，因为角上两个剪应力分量同时最大）、跨中最大主应力、板边最大剪应力；
+  张量分量只在 `sigma_max` 点给出，**没有任何应力云图**，也没有孔边/加强筋的应力集中，
+  更没有把这三个数再套一个疲劳律（Steinberg 的斜率与允许值仍要你给）。
+  误差棒是 degree 阶梯的实测（K=5/7/9 时频率 0.04%、曲率 3.6%），点支承阶梯塌成一级时给 `None`。
 - **`board_vibration` 用板框 bbox 而不是真实轮廓**，并明说方向：非矩形轮廓会**偏软**（f₁ 偏低），
   同时回 `outline_fill_fraction_of_bbox` 让人自己判程度。不算元件质量、不算安装点刚度、不算板内开孔。
 
@@ -402,7 +423,12 @@ MCP 客户端配置（stdio）：
   100×80 mm / εr=4.3 的 (1,0) 落在 0.722864 GHz（λ_g 恰为 2a，即半波的定义），(1,1) 严格等于
   √(f₁₀²+f₀₁²)，方板的简并对**分行列出**。没有 Q（介损、铜损、辐射）、没有开放边缘失谐修正
   ——真实平面与其边缘不是 PMC，所以这组数是教科书值，返回里写清"实物会有几个百分点失谐"。
-  一个谐振没有 Q 就不是判决，本层因此**不判"这个模要不要紧"**。
+  一个谐振没有 Q 就不是判决，`cavity_resonance` 因此**不判"这个模要不要紧"**。
+  0.0.10 补了另一个工具而不是改这个数：`pdn_plane_modes` 从 `tanδ` 取 `Q=1/tanδ`，
+  给每个带内模的**峰值** `|Z_peak| = w·μ0·t·ψ(r1)ψ(r2)·Q/k²`，回答"这个模比我的阻抗目标高多少"。
+  **只给峰值不给曲线**：真做模态求和时 1.45 GHz 处截断 10 阶是 5.6 Ω、40 阶是 9.4 Ω，
+  随阶数漂移不收敛，那数字只是"我选了几阶"的函数。函数里带电容锚点自检（`f=首模/100` 的求和
+  必须回到 `1/(ωC_plane)` 的 1% 内），这条自检曾抓出自己 20 倍的归一化错。
 - **过孔间距的判据故意不内置。** `λ_g/20` 与 `λ_g/10` 都在流传，差 2 倍，两者都不是推出来的；
   所以只给 `pitch_mm` 时回比例 + `indeterminate`，给了 `max_pitch_ratio` 才判 pass/fail，
   只给判据时回 `max_pitch_mm` 而**不反推一个间距**。测试里同一块板、同一个 15 mm 间距在 0.05 下
@@ -414,9 +440,14 @@ MCP 客户端配置（stdio）：
 - **Rth 必须由调用方给。** 本层不知道你的叠层、铜面积、过孔与风速；默认 Rth 会是这一层唯一一个
   不是推导出来的数，和 DFM 不内置板厂表是同一纪律。替身口 `electrothermal_conductor` 让这个环能套在
   任何已知 R₂₀ 的东西上（过孔桶壁、分段串联、分流器、针脚）。
-- **只闭合一个环，别读成做了耦合仿真。** 没有 2-D/3-D 耦合（热点烤热邻居再降低自己的局部 Rth）、
-  没有瞬态耦合（热容不进环）、没有交流损耗（趋肤/邻近）、`sim_spice` 里的器件不发热、
-  `board_ir_drop` 也没把自己的 I²R 反哺进温度场——那一层仍由用户迭代。
+- **那个集中 Rth 只属于两个小工具；板级另有 2-D 场。** 0.0.10 加 `board_electrothermal`，
+  把 `k·t·∇²T − 2h(T−T_a) + q(T) + C·dT/dt = 0` 在均匀矩形网格上解（SOR，ω=1.85），
+  关键是**把 q 的温升斜率放到对角线上**（稳态严格线性、瞬态是后向 Euler），并且
+  **失控在求解之前判**（任一格 `hc + capdt − q_ref·α <= 0` ⇒ `THERMAL_RUNAWAY`）。
+  金标 50×50×1.6 mm / k=0.3 / h=10 / 2 W / cell 2 mm ⇒ 73.393487 ℃（闭式 73.39345）。
+  仍然没有的：3-D、辐射、热过孔、组件热容与接触热阻、交流损耗（趋肤/邻近）、
+  `sim_spice` 里的器件不发热、`board_ir_drop` 也不把自己的 I²R 反哺进温度场；
+  而且这个 2-D 场只沿**你给的层压板 k** 扩散，不沿真实铜面/平面导热，也不读板文件。
 
 ### 滤波器合成：给几何，不给 EM 结果（[docs/22](docs/22-微带与腔体滤波器.md)）
 
@@ -451,7 +482,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 97 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 101 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -486,7 +517,8 @@ pcb_agent_mcp/
 │       ├── diffpair.py           # 边耦合差分阻抗正/反解
 │       ├── field2d.py            # 差分截面的 2-D 场解（有限体积 + 红黑 SOR）
 │       ├── rf.py                 # λ/20
-│       ├── creepage.py           # 爬电/间隙，fail-closed
+│       ├── creepage.py           # 安规间距公共入口：IEC 60664-1 族走 iec60664，其余 fail-closed
+│       ├── iec60664.py           # IEC 60664-1:2020-05 爬电/间隙/瞬态/耐压/槽宽（行为反演）
 │       ├── safety_table.py       # 表本身的可执行体检（来源数/单调性/重复 key）
 │       ├── feedline.py           # 微带/带状线/CPW/GCPW + 反解宽度
 │       ├── antenna.py            # 贴片/印刷线/偶极单极/螺旋/小环/Chu 上限/芯片天线
@@ -496,17 +528,17 @@ pcb_agent_mcp/
 │       ├── power.py              # 铜阻/过孔/自感/电阻网络/IR drop/电容组/PDN
 │       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
 │       ├── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
-│       ├── vibration.py          # 振动：薄板 Ritz 模态 + Miles + Steinberg + 冲击 + 传递率
+│       ├── vibration.py          # 振动：Ritz 模态 + Miles/Steinberg/冲击/传递率 + 应力（degree 阶梯误差棒）
 │       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）
 │       ├── filters.py            # 滤波器合成：原型 g 值/集总带通(两路对账)/耦合线反解/耦合谐振器/TE101 腔
-│       └── electrothermal.py     # 电热耦合：R(T) 定点迭代 + 精确失控判据
+│       └── electrothermal.py     # 电热耦合：R(T) 定点迭代 + 精确失控判据 + 板级 2-D 场（SOR）
 ├── data/
-│   ├── creepage_tables.json      # 空表 + verified:false + why_empty（故意不填）
-│   └── ipc2152_tables.json       # 同上；表本身由 calc/safety_table.py 可执行地体检
-├── tests/                        # 708 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+│   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
+│   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
+├── tests/                        # 837 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~22，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~23，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明

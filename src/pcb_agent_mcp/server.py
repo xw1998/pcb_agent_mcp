@@ -142,8 +142,19 @@ def selftest():
                            "arguments": {"voltage_v": 250,
                                          "safety_standard": "IEC 60664-1"}}})
     payload = json.loads(r["result"]["content"][0]["text"])
-    check("creepage fails closed", payload["status"] == "error"
-          and payload["reason_code"] == "SAFETY_TABLE_MISSING")
+    check("creepage answers IEC 60664-1 (250 V / PD2 / IIIa = 2.5 mm)",
+          payload["status"] == "ok" and abs(payload.get("value", 0) - 2.5) < 1e-9,
+          str(payload.get("value")))
+
+    r = handle({"jsonrpc": "2.0", "id": 55, "method": "tools/call",
+                "params": {"name": "creepage_required",
+                           "arguments": {"voltage_v": 250,
+                                         "safety_standard": "IEC 62368-1"}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    check("creepage fails closed for a standard this build has no table for",
+          payload["status"] == "error"
+          and payload["reason_code"] == "SAFETY_TABLE_MISSING",
+          str(payload.get("reason_code")))
 
     r = handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
                 "params": {"name": "diff_impedance",
@@ -772,6 +783,215 @@ def selftest():
               and abs(_v.get("q_agreement_pct", 9.0)) < 2.0,
               "%.4g mm / Q %.6g" % (_v.get("length_mm", 0.0),
                                     _v.get("q_conductor", 0.0)))
+
+        # --- IPC-2152, now a closed-form fit instead of an empty table. The gold
+        # value is hand-computed from the published fit; the second check asserts a
+        # physical property (internal is NOT derated 2x) that a wrong coefficient set
+        # cannot satisfy; the third asserts the validator would notice.
+        r = handle({"jsonrpc": "2.0", "id": 100, "method": "tools/call",
+                    "params": {"name": "width_for_current", "arguments": {
+                        "current_a": 1, "delta_t_c": 10, "copper_oz": 1,
+                        "layer": "external", "standard": "ipc2152"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("ipc2152 1A/10C/1oz external is 0.2773 mm (Brooks & Adam fit)",
+              payload.get("status") == "ok" and abs(payload.get("value", 0) - 0.2773) < 0.002,
+              str(payload.get("value")))
+
+        _ext = payload.get("value", 0.0)
+        r = handle({"jsonrpc": "2.0", "id": 101, "method": "tools/call",
+                    "params": {"name": "width_for_current", "arguments": {
+                        "current_a": 1, "delta_t_c": 10, "copper_oz": 1,
+                        "layer": "internal", "standard": "ipc2152"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _int = payload.get("value") or 0.0
+        check("ipc2152 internal is not derated 2x (%.4f < %.4f mm)" % (_int, _ext),
+              0.8 * _ext < _int < _ext)
+
+        r = handle({"jsonrpc": "2.0", "id": 102, "method": "tools/call",
+                    "params": {"name": "safety_table_check",
+                               "arguments": {"which": "ipc2152"}}})
+        _st = json.loads(r["result"]["content"][0]["text"])
+        check("safety_table_check(ipc2152) is usable and names its model checks",
+              _st.get("usable") is True
+              and "model_reproduces_anchors" in [c["check"] for c in _st["checks"]],
+              str(_st.get("failed")))
+
+        # --- IEC 60664-1, recovered from KiCad 10.0's compiled implementation.
+        # 250 V rms / PD2 / material group IIIa / basic is a plain Table F.5 step;
+        # the spacing tool then has to apply the "creepage >= clearance" rule.
+        r = handle({"jsonrpc": "2.0", "id": 103, "method": "tools/call",
+                    "params": {"name": "creepage_required", "arguments": {
+                        "voltage_v": 250, "pollution_degree": 2,
+                        "material_group": "IIIa", "safety_standard": "IEC 60664-1"}}})
+        _cp = json.loads(r["result"]["content"][0]["text"])
+        check("creepage 250 V / PD2 / IIIa / basic is 2.5 mm (Table F.5)",
+              _cp.get("status") == "ok" and abs(_cp.get("value", 0) - 2.5) < 1e-9,
+              str(_cp.get("value")))
+
+        r = handle({"jsonrpc": "2.0", "id": 104, "method": "tools/call",
+                    "params": {"name": "spacing_required", "arguments": {
+                        "voltage_v": 400, "transient_v": 2500,
+                        "pollution_degree": 2, "material_group": "IIIa",
+                        "safety_standard": "IEC 60664-1"}}})
+        _sp = json.loads(r["result"]["content"][0]["text"])
+        check("spacing at 400 V takes the larger of creepage 4.0 / clearance 1.5",
+              _sp.get("status") == "ok"
+              and abs(_sp.get("value", 0) - 4.0) < 1e-9
+              and _sp.get("governing") == "creepage"
+              and _sp.get("creepage_mm", 0) >= _sp.get("clearance_mm", 0),
+              "%s / %s" % (_sp.get("value"), _sp.get("governing")))
+
+        r = handle({"jsonrpc": "2.0", "id": 105, "method": "tools/call",
+                    "params": {"name": "creepage_required", "arguments": {
+                        "voltage_v": 250, "pollution_degree": 4,
+                        "safety_standard": "IEC 60664-1"}}})
+        _pd4 = json.loads(r["result"]["content"][0]["text"])
+        check("PD4 creepage is refused as out of scope, not answered 1.6 mm",
+              _pd4.get("status") == "error"
+              and _pd4.get("reason_code") == "STANDARD_SCOPE",
+              str(_pd4.get("reason_code")))
+
+        r = handle({"jsonrpc": "2.0", "id": 106, "method": "tools/call",
+                    "params": {"name": "safety_table_check",
+                               "arguments": {"which": "iec60664"}}})
+        _iec = json.loads(r["result"]["content"][0]["text"])
+        check("safety_table_check(iec60664) is usable over 32 ladders / 808 steps",
+              _iec.get("usable") is True and _iec.get("ladders") == 32
+              and _iec.get("steps") == 808,
+              "%s / %s / %s" % (_iec.get("usable"), _iec.get("ladders"),
+                                _iec.get("steps")))
+
+        # --- board-level 2-D electro-thermal. A uniform load has a closed form,
+        # so the field solve is scored against arithmetic, not against itself.
+        r = handle({"jsonrpc": "2.0", "id": 107, "method": "tools/call",
+                    "params": {"name": "board_electrothermal", "arguments": {
+                        "width_mm": 50, "height_mm": 50, "thickness_mm": 1.6,
+                        "k_w_mk": 0.3, "h_w_m2k": 10, "uniform_power_w": 2.0,
+                        "cell_mm": 2.0}}})
+        _be = json.loads(r["result"]["content"][0]["text"])
+        _hca = 2 * 10 * (50e-3 / 25) ** 2 * 625
+        _ana = (_hca * 25 + 2.0 * (1 - 0.00393 * 20)) / (_hca - 2.0 * 0.00393)
+        check("2-D electro-thermal matches the closed form (%.4f C, %.4f C)"
+              % (_be.get("t_max_c", -1), _ana),
+              _be.get("status") == "ok"
+              and abs(_be.get("t_max_c", 0) - _ana) < 0.01,
+              str(_be.get("t_max_c")))
+
+        r = handle({"jsonrpc": "2.0", "id": 108, "method": "tools/call",
+                    "params": {"name": "board_electrothermal", "arguments": {
+                        "width_mm": 50, "height_mm": 50, "thickness_mm": 1.6,
+                        "k_w_mk": 0.3, "h_w_m2k": 10, "uniform_power_w": 2.0,
+                        "cell_mm": 2.0, "alpha_per_k": 0.0,
+                        "transient": {"t_end_s": 5000, "points": 26,
+                                      "cp_j_kg_k": 1150, "rho_kg_m3": 1850}}}})
+        _bt = json.loads(r["result"]["content"][0]["text"])
+        _hist = ((_bt.get("transient") or {}).get("history") or [])
+        # 1e-3 K of slack is the SOR tolerance, not physics: the field sits on its
+        # fixed point to within tol_k, so the last few samples can wobble by that.
+        _mono = all(_hist[k + 1]["t_max_c"] >= _hist[k]["t_max_c"] - 1e-3
+                    for k in range(len(_hist) - 1))
+        check("2-D transient rises monotonically to 25 + 2 W / 0.05 W/K = 65 C",
+              _bt.get("status") == "ok" and _mono and _hist
+              and abs(_hist[-1]["t_max_c"] - 65.0) < 0.01
+              and abs(_hist[-1]["t_s"] - 5000.0) < 1e-9,
+              "%s over %s s (%d samples)"
+              % (_hist[-1]["t_max_c"] if _hist else None,
+                 _hist[-1]["t_s"] if _hist else None, len(_hist)))
+
+        r = handle({"jsonrpc": "2.0", "id": 109, "method": "tools/call",
+                    "params": {"name": "board_electrothermal", "arguments": {
+                        "width_mm": 50, "height_mm": 50, "thickness_mm": 1.6,
+                        "k_w_mk": 0.3, "h_w_m2k": 10, "uniform_power_w": 13.0,
+                        "cell_mm": 2.0}}})
+        _br = json.loads(r["result"]["content"][0]["text"])
+        check("2-D runaway is refused before the solve when 13 W * alpha > 2hA",
+              _br.get("status") == "error"
+              and _br.get("reason_code") == "THERMAL_RUNAWAY",
+              str(_br.get("reason_code")))
+
+        # --- plate stress against the exact mode. A plate simply supported on all
+        # four edges has w = A sin(pi x/a) sin(pi y/b) as its (1,1) mode, so the
+        # surface stress at the centre is arithmetic, and the largest von Mises
+        # stress is at a CORNER (the twisting curvature peaks there).
+        r = handle({"jsonrpc": "2.0", "id": 110, "method": "tools/call",
+                    "params": {"name": "vibration_plate_stress", "arguments": {
+                        "a_mm": 100, "b_mm": 80, "thickness_mm": 1.6,
+                        "amplitude_mm": 0.2, "material": "fr4", "mount": "ssss"}}})
+        _psw = json.loads(r["result"]["content"][0]["text"])
+        _ps = (_psw.get("value") or {})
+        _E, _nu, _z = 24e9, 0.15, 0.8e-3
+        _kxn = -(3.141592653589793 / 0.1) ** 2 * 0.2e-3
+        _kyn = -(3.141592653589793 / 0.08) ** 2 * 0.2e-3
+        _ez = _E * _z / (1 - _nu * _nu)
+        _sxn = -_ez * (_kxn + _nu * _kyn)
+        _syn = -_ez * (_kyn + _nu * _kxn)
+        check("plate sigma_max sits at the bay centre and matches the sine "
+              "(%.5f MPa, %.5f MPa)" % (_ps.get("sigma_max_mpa", -1), max(_sxn, _syn) / 1e6),
+              _psw.get("status") == "ok"
+              and _ps.get("sigma_max_at_mm") == [50.0, 40.0]
+              and abs(_ps.get("sigma_max_mpa", 0) - max(_sxn, _syn) / 1e6) < 0.05,
+              str(_ps.get("sigma_max_at_mm")))
+
+        # the exact corner tensor is sigma_x = sigma_y = 0, tau = E z/(1+nu) w_xy,
+        # so vm there is sqrt(3)*|tau| - a different point from sigma_max
+        _kxy = (3.141592653589793 / 0.1) * (3.141592653589793 / 0.08) * 0.2e-3
+        _taun = _E * _z / (1 + _nu) * _kxy
+        check("plate von Mises peaks at a corner via tau_xy (%.4f MPa vs %s)"
+              % (_ps.get("von_mises_mpa", -1), 3 ** 0.5 * _taun / 1e6),
+              abs(_ps.get("von_mises_mpa", 0) - 3 ** 0.5 * _taun / 1e6) < 0.15
+              and _ps.get("sigma_max_at_mm") != _ps.get("von_mises_at_mm"),
+              str(_ps.get("von_mises_at_mm")))
+
+        r = handle({"jsonrpc": "2.0", "id": 111, "method": "tools/call",
+                    "params": {"name": "vibration_plate_stress", "arguments": {
+                        "a_mm": 100, "b_mm": 80, "thickness_mm": 1.6,
+                        "amplitude_mm": 0.2, "material": "fr4", "mount": "corners"}}})
+        _pcw = json.loads(r["result"]["content"][0]["text"])
+        _pc = (_pcw.get("value") or {})
+        check("corner-supported plate reports NO error bar rather than a small one",
+              _pcw.get("status") == "ok" and _pc.get("converged") is None
+              and _pc.get("degree_sensitivity_pct") is None,
+              str(_pc.get("converged")))
+
+        # a plane pair is a cavity: |Z| of the (1,0) mode closed form
+        #   w*mu0*t*psi(r)psi(r')*Q/k^2, psi = 2/(ab)*cos^2(pi/4) = 0.5*2/(ab)
+        r = handle({"jsonrpc": "2.0", "id": 112, "method": "tools/call",
+                    "params": {"name": "pdn_plane_modes", "arguments": {
+                        "width_mm": 50, "height_mm": 50, "er": 4.4,
+                        "thickness_mm": 1.6, "tan_delta": 0.02,
+                        "port_mm": [12.5, 25.0]}}})
+        _pw = json.loads(r["result"]["content"][0]["text"])
+        _pv = (_pw.get("value") or {})
+        _row = [m for m in (_pv.get("modes") or [])
+                if (m.get("m"), m.get("n")) == (1, 0)]
+        _a, _b, _t = 0.05, 0.05, 1.6e-3
+        _k2 = (3.141592653589793 / _a) ** 2
+        _f = 299792458.0 / (2.0 * _a * (4.4 ** 0.5))
+        _want = (2 * 3.141592653589793 * _f * 4e-7 * 3.141592653589793
+                 * _t * (2.0 / (_a * _b) * 0.5) * 50.0 / _k2)
+        _got = _row[0].get("z_peak_ohm") if _row else None
+        check("plane (1,0) peak matches the single-mode closed form (%.4f ohm vs %.4f)"
+              % (_got or -1, _want),
+              _pw.get("status") == "ok" and _got is not None
+              and abs(_got - _want) < 0.001 * _want,
+              str(_got))
+
+        r = handle({"jsonrpc": "2.0", "id": 113, "method": "tools/call",
+                    "params": {"name": "pdn_impedance", "arguments": {
+                        "freqs_hz": [1e6, 1e8, 1e9, 3e9],
+                        "caps": [{"c_farad": 1e-6, "esr_ohm": 0.01, "esl_h": 1e-9}],
+                        "plane": {"width_mm": 50, "height_mm": 50, "er": 4.4,
+                                  "thickness_mm": 1.6, "tan_delta": 0.02,
+                                  "port_mm": [12.5, 25.0]}}}})
+        _iw = json.loads(r["result"]["content"][0]["text"])
+        _iv = (_iw.get("value") or {})
+        _pm = _iv.get("plane_modes") or {}
+        check("a plane mode inside the band outranks the lumped curve",
+              _iw.get("status") == "ok"
+              and bool(_pm.get("modes_in_band"))
+              and _pm.get("worst_mode_in_band") is not None
+              and "NOT the PDN" in str(_pm.get("verdict")),
+              str((_pm.get("worst_mode_in_band") or {}).get("f_hz")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

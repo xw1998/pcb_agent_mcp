@@ -387,7 +387,8 @@ def _pick_degree(n_pairs, poly_degree, max_dof):
 
 def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                 rho_kg_m3=None, mount="corners", bc_x=None, bc_y=None,
-                n_modes=4, poly_degree=7, probe_points=None, max_dof=MAX_DOF):
+                n_modes=4, poly_degree=7, probe_points=None, max_dof=MAX_DOF,
+                stress_amplitude_mm=None):
     """Natural frequencies and mode shapes of a rectangular thin plate.
 
     Rayleigh-Ritz on a monomial basis (psi = xi^k eta^l) restricted to the null
@@ -445,6 +446,15 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
     nmodes = int(n_modes)
     if nmodes < 1 or nmodes > 12:
         return err("n_modes must be in 1..12", "ARG_INVALID")
+    amp_mm = None if stress_amplitude_mm is None else _num(stress_amplitude_mm)
+    if stress_amplitude_mm is not None:
+        if amp_mm is None or amp_mm <= 0:
+            return err("stress_amplitude_mm must be a number > 0", "ARG_RANGE",
+                       hint="the peak out-of-plane deflection of THIS mode, in mm - "
+                            "take it from miles_response' z_3sigma_mm or from a "
+                            "measurement. A mode shape on its own has no amplitude, "
+                            "and a stress computed from an unnormalised eigenvector "
+                            "is a number with no plate behind it")
     K, Bx, By = _pick_degree(pairs, poly_degree, max_dof)
     if K is None:
         return err("no polynomial degree >= 3 fits the DOF budget", "ARG_INVALID",
@@ -559,6 +569,54 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                     out.append(fx * fy)
             return out
 
+    def d2vec(vec, xi, eta):
+        """[w_xx, w_yy, w_xy] in 1/m^2 for a mode whose coefficients are `vec`.
+
+        The Ritz basis is separable - X_i(xi) * Y_j(eta) with xi = x/a - so the
+        curvatures are (1/a^2) * sum c_ij X_i'' Y_j, (1/b^2) * sum c_ij X_i Y_j''
+        and (1/(ab)) * sum c_ij X_i' Y_j'. The eigenvector carries an ARBITRARY
+        scale (it is mass-orthonormal), so these are shape curvatures, not the
+        curvatures of a plate that is actually deflecting by anything.
+        """
+        xs = []
+        for i in range(nx):
+            x0 = x1 = x2 = 0.0
+            for k in range(K + 1):
+                c = Wx[k][i]
+                if c == 0.0:
+                    continue
+                x0 += c * (xi ** k)
+                if k >= 1:
+                    x1 += k * c * (xi ** (k - 1))
+                if k >= 2:
+                    x2 += k * (k - 1) * c * (xi ** (k - 2))
+            xs.append((x0, x1, x2))
+        ys = []
+        for j in range(ny):
+            y0 = y1 = y2 = 0.0
+            for k in range(K + 1):
+                c = Wy[k][j]
+                if c == 0.0:
+                    continue
+                y0 += c * (eta ** k)
+                if k >= 1:
+                    y1 += k * c * (eta ** (k - 1))
+                if k >= 2:
+                    y2 += k * (k - 1) * c * (eta ** (k - 2))
+            ys.append((y0, y1, y2))
+        wxx = wyy = wxy = 0.0
+        for i in range(nx):
+            x0, x1, x2 = xs[i]
+            for j in range(ny):
+                cij = vec[i * ny + j]
+                if cij == 0.0:
+                    continue
+                y0, y1, y2 = ys[j]
+                wxx += cij * x2 * y0
+                wyy += cij * x0 * y2
+                wxy += cij * x1 * y1
+        return (wxx / (am * am), wyy / (bm * bm), wxy / (am * bm))
+
     if rows:
         cols, _m = _orth_nullspace(rows, ndof)
         if cols is None:
@@ -663,6 +721,82 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
             # one would be a number with no meaning behind it
             entry["antinode_mm"] = [_sig(best_xy[0]), _sig(best_xy[1])]
             entry["quiet_area_fraction"] = _sig(quiet, 3)
+        if amp_mm is not None and not is_rigid and "stress" not in entry:
+            # 21 x 21 is enough for a peak: the curvature field is smooth and the
+            # second derivative of a degree-K polynomial is degree K-2.
+            ng = 21
+            scale = (amp_mm * 1e-3) / peak      # metres per unit coefficient
+            ez = E * (hm / 2.0) / (1.0 - nu_v * nu_v)
+            g1 = E / (2.0 * (1.0 + nu_v))
+            # Two different questions, two different peaks. von Mises is largest
+            # where the TWISTING curvature w_xy is largest (a corner, for a
+            # sinusoid-like mode); the largest principal stress is where the
+            # bending curvatures w_xx/w_yy are largest (the middle of a bay).
+            # Reporting one point for both is how a "max stress" ends up 36 %
+            # below the real one.
+            best_vm = None
+            best_s = None
+            best_t = None
+            for gi in range(ng):
+                xi = gi / float(ng - 1)
+                for gj in range(ng):
+                    eta = gj / float(ng - 1)
+                    kx, ky, kxy = d2vec(vec, xi, eta)
+                    kx *= scale
+                    ky *= scale
+                    kxy *= scale
+                    sx = -ez * (kx + nu_v * ky)
+                    sy = -ez * (ky + nu_v * kx)
+                    txy = -2.0 * g1 * (hm / 2.0) * kxy
+                    mid = 0.5 * (sx + sy)
+                    rr = math.sqrt(0.25 * (sx - sy) ** 2 + txy * txy)
+                    hi = mid + rr
+                    lo = mid - rr
+                    vm = math.sqrt(hi * hi - hi * lo + lo * lo)
+                    smax = max(abs(hi), abs(lo))
+                    rec = {"vm": vm, "smax": smax, "x": xi * a, "y": eta * b,
+                           "sx": sx, "sy": sy, "t": txy, "hi": hi, "lo": lo,
+                           "kx": kx, "ky": ky, "kxy": kxy,
+                           "corner": (xi * (1.0 - xi) < 1e-12
+                                      and eta * (1.0 - eta) < 1e-12)}
+                    if best_vm is None or vm > best_vm["vm"]:
+                        best_vm = rec
+                    if best_s is None or smax > best_s["smax"]:
+                        best_s = rec
+                    at = abs(txy)
+                    if best_t is None or at > best_t[0]:
+                        best_t = (at, rec)
+            sp = best_s
+            entry["stress"] = {
+                "amplitude_mm": _sig(amp_mm),
+                "surface_z_mm": _sig(h_mm / 2.0),
+                # ---- extremes, each at its own location
+                "von_mises_mpa": _sig(best_vm["vm"] / 1e6),
+                "von_mises_at_mm": [_sig(best_vm["x"]), _sig(best_vm["y"])],
+                "sigma_max_mpa": _sig(sp["smax"] / 1e6),
+                "sigma_max_at_mm": [_sig(sp["x"]), _sig(sp["y"])],
+                "tau_xy_max_mpa": _sig(best_t[0] / 1e6),
+                "tau_xy_max_at_mm": [_sig(best_t[1]["x"]), _sig(best_t[1]["y"])],
+                # ---- the full tensor AT the sigma_max point
+                "at_mm": [_sig(sp["x"]), _sig(sp["y"])],
+                "sigma_1_mpa": _sig(sp["hi"] / 1e6),
+                "sigma_2_mpa": _sig(sp["lo"] / 1e6),
+                "sigma_x_mpa": _sig(sp["sx"] / 1e6),
+                "sigma_y_mpa": _sig(sp["sy"] / 1e6),
+                "tau_xy_mpa": _sig(sp["t"] / 1e6),
+                "curvature_per_m": [_sig(sp["kx"]), _sig(sp["ky"])],
+                "surface_strain_ue": _sig(1e6 * abs(sp["hi"]) / E),
+                "peak_locations_note":
+                    ("the reported extremes sit in symmetry-equivalent sets (the "
+                     "four corners share one value, so does each bay centre); one "
+                     "point of each set is listed")
+                    if (best_vm["corner"] and sp["corner"]) else
+                    ("von Mises peaks where w_xy does, sigma_max where w_xx/w_yy do: "
+                     "they are different points and both are reported"),
+                "formula": "sigma_x = -E z/(1-nu^2) (w_xx + nu w_yy), "
+                           "sigma_y = -E z/(1-nu^2) (w_yy + nu w_xx), "
+                           "tau_xy = -E z/(1+nu) w_xy, z = h/2",
+            }
         if probes_out is not None:
             d = []
             for pp in probes_out:
@@ -707,6 +841,18 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                       "auto_reduced": K != int(poly_degree)},
             "rigid_body_modes": rid,
             "modes": modes,
+            "stress_not_computed": (None if amp_mm is None else [
+                "stress concentrations: a hole, a notch, a connector footprint and "
+                "a solder fillet all concentrate stress, and none of them is modelled",
+                "solder-joint fatigue and creep (the joint is the usual failure site "
+                "on a vibrating board, and it is not this plate)",
+                "interlaminar shear and the copper/laminate interface",
+                "geometric nonlinearity: past roughly half the plate thickness "
+                "membrane action stiffens the plate and linear theory overstates "
+                "the stress",
+                "damping, and therefore the real amplitude - the amplitude is the "
+                "caller's, not something this solve produces",
+            ]),
             "warnings": warnings,
         },
         "Hz",
@@ -1201,3 +1347,204 @@ def transmissibility(f_n_hz, zeta=None, q_factor=None, freq_hz=None,
                     "frequency-dependent stiffness and its own resonances",
         },
     )
+
+# ------------------------------------------------------------ stress / strain
+
+_STRESS_NOT_COMPUTED = [
+    "stress concentrations: a hole, a notch, a connector footprint and a solder "
+    "fillet all concentrate stress, and none of them is in this model",
+    "solder-joint fatigue and creep - the joint is usually where a vibrating board "
+    "actually fails, and it is not this plate",
+    "interlaminar shear and the copper/laminate interface (peel and barrel stress)",
+    "geometric nonlinearity: past roughly half the plate thickness membrane action "
+    "stiffens the plate, so linear theory OVERSTATES the stress there",
+    "damping and therefore the real amplitude; the amplitude is the caller's, and "
+    "this module will not invent one",
+    "residual stress from lamination and soldering, which adds to (or relieves) "
+    "whatever vibration produces",
+]
+
+def plate_stress(a_mm, b_mm, thickness_mm, amplitude_mm, mode=1, material=None,
+                 e_gpa=None, nu=None, rho_kg_m3=None, mount="corners",
+                 bc_x=None, bc_y=None, poly_degree=None, max_dof=MAX_DOF,
+                 degrees=(5, 7, 9)):
+    """Peak plate stress for a given mode at a given peak deflection.
+
+    A mode shape on its own has no amplitude, so a stress needs one supplied: pass
+    the 3-sigma deflection from `miles_response`, a measured value, or an allowed
+    deflection. With that, Kirchhoff theory gives the surface stress straight from
+    the mode's curvatures:
+
+        sigma_x = -E z/(1-nu^2) (w_xx + nu w_yy)
+        sigma_y = -E z/(1-nu^2) (w_yy + nu w_xx)
+        tau_xy  = -E z/(1+nu)   w_xy                z = h/2
+
+    The second derivative of a polynomial fit converges SLOWER than the fit
+    itself, so a frequency that looks converged says nothing about the stress.
+    Rather than claim an accuracy, this runs the same mode at several polynomial
+    degrees and reports the spread: `degree_sensitivity_pct` is the honest error
+    bar, and it is measured on your geometry, not quoted.
+
+    Note the cap: with MAX_DOF=44 a point-supported ("corners") plate can only
+    reach degree 5, so on that mount the ladder collapses to one rung and the
+    sensitivity is UNKNOWN rather than small. That is reported, not hidden.
+    """
+    amp = _num(amplitude_mm)
+    if amp is None or amp <= 0:
+        return err("amplitude_mm is required and must be > 0", "ARG_REQUIRED",
+                   hint="the peak out-of-plane deflection of the mode, in mm - from "
+                        "miles_response' z_3sigma_mm, a measured value, or the "
+                        "deflection you are willing to allow. Zero amplitude is not "
+                        "a stress, and there is no default")
+    try:
+        midx = int(mode)
+    except (TypeError, ValueError):
+        return err("mode must be an integer", "ARG_INVALID")
+    if midx < 1 or midx > 12:
+        return err("mode must be in 1..12", "ARG_INVALID")
+    if midx < 1:
+        return err("mode must be >= 1", "ARG_INVALID")
+
+    # poly_degree CAPS the ladder; it does not replace it. Dropping it to a single
+    # rung would leave the stress with no error bar at all, which is exactly the
+    # number a caller cannot audit.
+    top = None
+    if poly_degree is not None:
+        try:
+            top = int(poly_degree)
+        except (TypeError, ValueError):
+            return err("poly_degree must be an integer", "ARG_INVALID")
+        if top < 3:
+            return err("poly_degree must be >= 3", "ARG_INVALID")
+    try:
+        ladder = [int(d) for d in (degrees or (5, 7, 9))]
+    except (TypeError, ValueError):
+        return err("degrees must be a list of integers", "ARG_INVALID")
+    if top is not None:
+        ladder = [d for d in ladder if d <= top]
+        if top not in ladder:
+            ladder.append(top)
+    ladder = [d for d in ladder if d >= 3]
+    ladder = sorted(set(ladder))
+    if not ladder:
+        return err("no usable polynomial degree (need >= 3)", "ARG_INVALID",
+                   hint="the Ritz basis needs at least degree 3 to carry any "
+                        "curvature")
+
+    rows = []
+    seen_k = set()
+    for d in ladder:
+        r = plate_modes(a_mm, b_mm, thickness_mm, material=material, e_gpa=e_gpa,
+                        nu=nu, rho_kg_m3=rho_kg_m3, mount=mount, bc_x=bc_x,
+                        bc_y=bc_y, n_modes=max(2, midx), poly_degree=d,
+                        max_dof=max_dof, stress_amplitude_mm=amp)
+        if r.get("status") == "error":
+            return r
+        val = r["value"]
+        k_used = val["basis"]["poly_degree"]
+        if k_used in seen_k:
+            continue                     # the DOF cap clamped it: same answer twice
+        seen_k.add(k_used)
+        if len(val["modes"]) < midx:
+            return err("mode %d does not exist for this plate (only %d modes)"
+                       % (midx, len(val["modes"])), "ARG_RANGE")
+        md = val["modes"][midx - 1]
+        if md.get("rigid_body"):
+            return err("mode %d is a rigid-body mode: it has no curvature and therefore "
+                       "no stress. Ask for a flexible mode." % midx, "ARG_RANGE",
+                       hint="a free or corner-supported plate has up to 3 modes at "
+                            "0 Hz; start at the first non-zero frequency")
+        st = md.get("stress")
+        if not st:
+            return err("mode %d carries no stress result" % midx, "INTERNAL")
+        rows.append({"poly_degree": k_used, "dof": val["basis"]["dof"],
+                     "freq_hz": md["freq_hz"],
+                     "von_mises_mpa": st["von_mises_mpa"],
+                     "sigma_max_mpa": st["sigma_max_mpa"],
+                     "at_mm": st["sigma_max_at_mm"]})
+    if not rows:
+        return err("no degree produced a usable mode", "INTERNAL")
+
+    best = rows[-1]
+    sens = None
+    if len(rows) >= 2:
+        prev = rows[-2]
+        if best["von_mises_mpa"]:
+            sens = abs(best["von_mises_mpa"] - prev["von_mises_mpa"]) / \
+                abs(best["von_mises_mpa"]) * 100.0
+
+    # re-run the finest rung once more to take the full stress record (the ladder
+    # only kept the summary rows)
+    r = plate_modes(a_mm, b_mm, thickness_mm, material=material, e_gpa=e_gpa, nu=nu,
+                    rho_kg_m3=rho_kg_m3, mount=mount, bc_x=bc_x, bc_y=bc_y,
+                    n_modes=max(2, midx), poly_degree=best["poly_degree"],
+                    max_dof=max_dof, stress_amplitude_mm=amp)
+    if r.get("status") == "error":
+        return r
+    val = r["value"]
+    md = val["modes"][midx - 1]
+    st = dict(md["stress"])
+
+    warnings = []
+    if sens is None:
+        warnings.append(
+            "the degree ladder collapsed to one rung (poly_degree=%d). The DOF cap "
+            "max_dof=%d will not let this mount go higher, so there is NO measured "
+            "error bar on the curvature - on a point-supported plate the stress is "
+            "the least trustworthy number here"
+            % (best["poly_degree"], max_dof))
+    elif sens > 1.0:
+        warnings.append(
+            "the stress still moves %.2f %% between degree %d and %d, so it is not "
+            "converged: raise max_dof and poly_degree before trusting the absolute "
+            "value" % (sens, rows[-2]["poly_degree"], best["poly_degree"]))
+    if st["amplitude_mm"] > 0.5 * val["thickness_mm"]:
+        warnings.append(
+            "amplitude %.4g mm is over half the plate thickness %.4g mm: linear plate "
+            "theory is out of its range there and OVERSTATES the stress"
+            % (st["amplitude_mm"], val["thickness_mm"]))
+
+    return ok({
+        "mode": midx,
+        "freq_hz": md["freq_hz"],
+        "amplitude_mm": st["amplitude_mm"],
+        "von_mises_mpa": st["von_mises_mpa"],
+        "von_mises_at_mm": st["von_mises_at_mm"],
+        "sigma_max_mpa": st["sigma_max_mpa"],
+        "sigma_max_at_mm": st["sigma_max_at_mm"],
+        "tau_xy_max_mpa": st["tau_xy_max_mpa"],
+        "tau_xy_max_at_mm": st["tau_xy_max_at_mm"],
+        "peak_locations_note": st["peak_locations_note"],
+        "sigma_1_mpa": st["sigma_1_mpa"],
+        "sigma_2_mpa": st["sigma_2_mpa"],
+        "sigma_x_mpa": st["sigma_x_mpa"],
+        "sigma_y_mpa": st["sigma_y_mpa"],
+        "tau_xy_mpa": st["tau_xy_mpa"],
+        "at_mm": st["at_mm"],
+        "curvature_per_m": st["curvature_per_m"],
+        "surface_strain_ue": st["surface_strain_ue"],
+        "surface_z_mm": st["surface_z_mm"],
+        "poly_degree": best["poly_degree"],
+        "dof": best["dof"],
+        "degree_ladder": rows,
+        "degree_sensitivity_pct": None if sens is None else _sig(sens, 3),
+        "converged": (None if sens is None else sens <= 1.0),
+        "stress_not_computed": list(_STRESS_NOT_COMPUTED),
+        "warnings": (warnings + val.get("warnings", [])),
+    }, "MPa",
+       "Kirchhoff plate stress from Rayleigh-Ritz mode curvatures "
+       "(sigma = -E z/(1-nu^2)(w_xx + nu w_yy))",
+       "Kirchhoff-Love thin plate, plane stress at the surface z = h/2; the "
+       "amplitude is the caller's, so this is a stress PER unit deflection scaled "
+       "by what the caller says the deflection is",
+       "the error bar is MEASURED (degree ladder on your geometry), not quoted: "
+       "curvature converges slower than frequency, and a point-supported plate caps "
+       "at degree 5 with max_dof=44; stress concentrations, solder joints, "
+       "interlaminar shear and residual stress are all outside this model",
+       {"amplitude_source": "caller-supplied peak deflection of this mode",
+        "z": "surface (h/2) - the laminate mid-plane carries none in this model",
+        "ladder": "same mode resolved at several polynomial degrees; a spread over "
+                  "1 % means not converged"},
+       {"material": val["material"], "bc": val["bc"], "basis": val["basis"],
+        "thickness_mm": val["thickness_mm"],
+        "formula": st["formula"]})

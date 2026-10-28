@@ -258,8 +258,10 @@ class ToolSurface(unittest.TestCase):
         from pcb_agent_mcp import tools
         c = tools.call_tool("calc_capabilities", {})
         blob = " ".join(c["not_implemented_yet"])
-        self.assertIn("ONE lump", blob)
-        self.assertIn("2-D/3-D", blob)
+        # 0.0.10 replaced it again: the coupling now reaches a 2-D laminate field,
+        # so the live wording is board_electrothermal + "2-D field".
+        self.assertIn("board_electrothermal", blob)
+        self.assertIn("2-D field", blob)
         self.assertNotIn("nothing here feeds a temperature rise back", blob)
 
     def test_tools_are_callable_through_the_dispatcher(self):

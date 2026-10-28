@@ -1,13 +1,30 @@
-"""Creepage / clearance - FAIL CLOSED by design.
+"""Creepage / clearance - FAIL CLOSED by design outside IEC 60664-1.
 
 There is no trustworthy memorised number here. IEC 60664-1 / 62368-1 tables
 depend on voltage, pollution degree, material group (CTI), insulation type,
-altitude and coating. Until a verified table is loaded this tool refuses.
+altitude and coating. Two states are possible:
+
+* ``safety_standard`` names IEC 60664-1 (any spelling) - the answer comes from
+  :mod:`pcb_agent_mcp.calc.iec60664`, whose tables were recovered by compiling
+  KiCad 10.0's own implementation and diffing against it on 188k probe points.
+  That is a table transcription with a behavioural proof, not a memory.
+* any other family - refuses. Loading a table into data/creepage_tables.json is
+  the only way to answer, because a guessed safety distance is worse than no
+  answer.
 """
 import json
 import os
+import re
 
+from . import iec60664 as _iec60664
 from .result import ok, err
+
+# "IEC 60664-1", "iec60664", "IEC 60664-1:2020", "IEC60664-1:2020-05" ...
+_IEC60664_RE = re.compile(r"^iec[\s_-]*60664(?!\d)")
+
+
+def _is_iec60664(safety_standard):
+    return bool(_IEC60664_RE.match(str(safety_standard or "").strip().lower()))
 
 DATA_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -37,7 +54,28 @@ def _load():
 
 
 def _lookup(kind, safety_standard, pollution_degree, material_group, insulation,
-            voltage_v, altitude_m, coating):
+            voltage_v, altitude_m, coating, pcb_material=False, transient_v=None):
+    if _is_iec60664(safety_standard):
+        # IEC 60664-1 is the one family this build can actually answer: the
+        # tables were recovered from KiCad 10.0's compiled implementation and
+        # diffed against it (see calc/iec60664.py).  Everything else still
+        # fails closed below.
+        if kind == "creepage":
+            return _iec60664.creepage_mm(
+                voltage_v, pollution_degree=pollution_degree,
+                material_group=material_group, insulation=insulation,
+                pcb_material=bool(pcb_material), altitude_m=altitude_m or 0,
+                coating=bool(coating))
+        if kind == "clearance":
+            return _iec60664.clearance_mm(
+                voltage_v, transient_v=transient_v,
+                pollution_degree=pollution_degree, insulation=insulation,
+                altitude_m=altitude_m or 0)
+        return _iec60664.spacing(
+            voltage_v, transient_v=transient_v,
+            pollution_degree=pollution_degree, material_group=material_group,
+            insulation=insulation, pcb_material=bool(pcb_material),
+            altitude_m=altitude_m or 0, coating=bool(coating))
     data, why = _load()
     if data is None:
         return err(
@@ -128,13 +166,29 @@ def _lookup(kind, safety_standard, pollution_degree, material_group, insulation,
 
 def creepage_required(voltage_v, pollution_degree=2, material_group="IIIa",
                       insulation="basic", altitude_m=0, coating=False,
-                      safety_standard=None):
+                      safety_standard=None, pcb_material=False):
     return _lookup("creepage", safety_standard, pollution_degree, material_group,
-                   insulation, voltage_v, altitude_m, coating)
+                   insulation, voltage_v, altitude_m, coating, pcb_material)
 
 
 def clearance_required(voltage_v, pollution_degree=2, material_group="IIIa",
                        insulation="basic", altitude_m=0, coating=False,
-                       safety_standard=None):
+                       safety_standard=None, transient_v=None):
     return _lookup("clearance", safety_standard, pollution_degree, material_group,
-                   insulation, voltage_v, altitude_m, coating)
+                   insulation, voltage_v, altitude_m, coating,
+                   transient_v=transient_v)
+
+
+def spacing_required(voltage_v, transient_v=None, pollution_degree=2,
+                     material_group="IIIa", insulation="basic", altitude_m=0,
+                     coating=False, safety_standard=None, pcb_material=False):
+    """Creepage AND clearance together, the way the standard applies them.
+
+    ``voltage_v`` is the RMS working voltage for the creepage side and the peak
+    working voltage for the clearance side (the same number for a sinusoid).
+    The answer takes the larger of the two, because IEC 60664-1 requires
+    ``creepage >= clearance``, and reports the minimum groove width with it.
+    """
+    return _lookup("spacing", safety_standard, pollution_degree, material_group,
+                   insulation, voltage_v, altitude_m, coating, pcb_material,
+                   transient_v)

@@ -104,7 +104,10 @@ def _write_binary(path, spec):
 
 def main(argv):
     if "--version" in argv:
-        sys.stdout.write("fake-ngspice 1.0 (stand-in for tests)\n")
+        # $FAKE_VERSION lets a test impersonate a specific real version string,
+        # which is how the VERIFIED_ENGINES gating is exercised without a binary.
+        sys.stdout.write(os.environ.get(
+            "FAKE_VERSION", "fake-ngspice 1.0 (stand-in for tests)") + "\n")
         return 0
     spec_path = os.environ.get("FAKE_SPEC")
     if not spec_path:

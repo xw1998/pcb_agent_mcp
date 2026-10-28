@@ -53,9 +53,83 @@ class TestCurrent(unittest.TestCase):
     def test_standard_is_mandatory(self):
         self.assertEqual(current.width_for_current(1.0)["reason_code"], "STANDARD_REQUIRED")
 
-    def test_ipc2152_fails_closed(self):
-        self.assertEqual(current.width_for_current(1.0, standard="ipc2152")["reason_code"],
-                         "STANDARD_DATA_NOT_LOADED")
+    # --- IPC-2152: the closed-form fit (Brooks & Adam 2015 to Table 3-1). The
+    # expected numbers below are computed by hand from that formula with the
+    # coefficients copied from KiCad 10.0, not read back off this implementation.
+    def test_ipc2152_one_amp_external(self):
+        # W = (10 / (215.3 * 1^2 * 1.378^-1))^(1/-1.15) = 10.9165 mil = 0.2773 mm
+        r = current.width_for_current(1.0, 10, 1, "external", "ipc2152")
+        self.assertAlmostEqual(r["value"], 0.2773, places=3)
+        self.assertEqual(r["model"], "ipc2152_brooks_adam_fit")
+
+    def test_ipc2152_current_from_width(self):
+        # 10 mil at 1 oz with 10 degC budget: I = (10 / (215.3*10^-1.15*1.378^-1))^(1/2)
+        i = current.current_capacity(0.254, 10, 1, "external", standard="ipc2152")["value"]
+        self.assertAlmostEqual(i, 0.951, places=3)
+
+    def test_ipc2152_roundtrip(self):
+        w = current.width_for_current(3.0, 15, 2, "external", "ipc2152")["value"]
+        i = current.current_capacity(w, 15, 2, "external", standard="ipc2152")["value"]
+        self.assertAlmostEqual(i, 3.0, places=2)
+
+    def test_ipc2152_internal_is_not_derated_by_two(self):
+        # IPC-2152 found internal traces cool about as well as external ones; the
+        # closed-form fit reproduces that (9.78 mil vs 10.92 mil at 1 oz), which is
+        # the opposite of the IPC-2221 2x rule. A swapped coefficient would break it.
+        ext = current.width_for_current(1.0, 10, 1, "external", "ipc2152")["value"]
+        intl = current.width_for_current(1.0, 10, 1, "internal", "ipc2152")["value"]
+        self.assertLess(intl, ext)
+        self.assertGreater(intl, ext * 0.8)
+
+    def test_ipc2152_is_less_conservative_than_ipc2221_outside(self):
+        w2152 = current.width_for_current(1.0, 10, 1, "external", "ipc2152")["value"]
+        w2221 = current.width_for_current(1.0, 10, 1, "external", "ipc2221")["value"]
+        self.assertLess(w2152, w2221)
+
+    def test_ipc2152_bucket_switch_is_at_the_midpoint(self):
+        # KiCad picks the internal bucket by nominal thickness midpoints; with
+        # 1.378 mil/oz the 0.5/1 oz boundary is 0.75 oz exactly (strictly less -> 0.5).
+        low = current.width_for_current(1.0, 10, 0.74, "internal", "ipc2152")
+        high = current.width_for_current(1.0, 10, 0.76, "internal", "ipc2152")
+        self.assertIn("0.5 oz", low["coefficient_set"])
+        self.assertIn("1 oz", high["coefficient_set"])
+
+    def test_ipc2152_flags_out_of_table_copper_weight(self):
+        r = current.width_for_current(1.0, 10, 4.0, "external", "ipc2152")
+        self.assertIn("outside_fit_copper_weight", r)
+
+    def test_ipc2152_refuses_via_barrels(self):
+        r = current.via_current_allowed(0.3, 25, 1, 10, "ipc2152")
+        self.assertEqual(r["reason_code"], "STANDARD_SCOPE")
+
+    def test_ipc2152_still_validates_arguments(self):
+        self.assertEqual(
+            current.width_for_current(1.0, 10, 1, "sideways", "ipc2152")["reason_code"],
+            "ARG_INVALID")
+        self.assertEqual(
+            current.width_for_current(-1.0, 10, 1, "external", "ipc2152")["reason_code"],
+            "ARG_RANGE")
+
+    def test_safety_table_ipc2152_model_is_judged(self):
+        from pcb_agent_mcp.calc import safety_table
+        report = safety_table.check_which("ipc2152")
+        self.assertTrue(report["usable"], report["failed"])
+        self.assertIn("model_reproduces_anchors", [c["check"] for c in report["checks"]])
+
+    def test_safety_table_ipc2152_catches_a_broken_coefficient(self):
+        import json as _json
+        from pcb_agent_mcp.calc import safety_table
+        with open(safety_table.IPC2152_PATH, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh)
+        doc["model"]["external"]["K"] = 400.0
+        report = safety_table.validate_ipc2152(doc)
+        self.assertFalse(report["usable"])
+        self.assertIn("model_reproduces_anchors", report["failed"])
+        doc["model"]["external"]["K"] = 215.3
+        doc["model"]["internal"][1]["c"] = 0.5   # thicker copper would heat up: impossible
+        report = safety_table.validate_ipc2152(doc)
+        self.assertFalse(report["usable"])
+        self.assertIn("model_coefficients_sane", report["failed"])
 
     def test_zero_temp_rise_refused(self):
         self.assertEqual(current.width_for_current(1.0, 0, standard="ipc2221")["reason_code"],

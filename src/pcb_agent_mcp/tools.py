@@ -88,10 +88,11 @@ _tool(
 
 # ------------------------------------------------------------- current
 _CUR_STD = _str(
-    "REQUIRED. Which standard to use. ipc2221 = chart fit (implemented). "
-    "ipc2152 = current standard, needs a loaded data table (not yet available). "
-    "There is no default: the two disagree by more than 3x and the wrong choice "
-    "is a wrong answer, not a smaller one.",
+    "REQUIRED. Which standard to use. ipc2221 = the 1956 NBS chart fit "
+    "(I=k*dT^0.44*A^0.725). ipc2152 = the 2009 replacement, implemented as the "
+    "published closed-form fit to its Table 3-1 (Brooks & Adam 2015). There is no "
+    "default: the two disagree by ~8% at 1 A / 10 degC / 1 oz and much more "
+    "elsewhere, and the wrong choice is a wrong answer, not a smaller one.",
     ["ipc2221", "ipc2152"],
 )
 _LAYER = _str("copper layer: external (outer) or internal (inner)", ["external", "internal"])
@@ -232,29 +233,51 @@ _SAFE_ARGS = {
     "insulation": _str("insulation type",
                        ["functional", "basic", "supplementary", "double", "reinforced"]),
     "altitude_m": _num("altitude in metres (above 2000 m needs a correction factor)", 0),
-    "coating": _bool("conformal coating applied with complete coverage"),
-    "safety_standard": _str("REQUIRED. safety standard family, e.g. IEC 60664-1, "
-                            "IEC 62368-1. Different families give different distances."),
+    "coating": _bool("conformal coating applied with complete coverage "
+                     "(solder mask does NOT count)"),
+    "pcb_material": _bool("the creepage path runs over the PCB surface, so Table "
+                          "F.5's PCB-material column applies (it is ignored above "
+                          "1000 V rms, at PD3/PD4 and for IIIb at PD2+)"),
+    "transient_v": _num("transient overvoltage the gap must withstand, in volts - "
+                        "normally the rated impulse withstand voltage. Omit only "
+                        "when you have no transient spec; the answer is then "
+                        "flagged as possibly understated"),
+    "safety_standard": _str("safety standard family. IEC 60664-1 (any spelling) is "
+                            "answered from a verified table; every other family "
+                            "FAILS CLOSED until its table is loaded. Different "
+                            "families give different distances."),
 }
 
 
 def _safety(kind):
     def handler(a):
-        fn = (_creepage.creepage_required if kind == "creepage"
-              else _creepage.clearance_required)
-        return fn(
-            a["voltage_v"], a.get("pollution_degree", 2),
-            a.get("material_group", "IIIa"), a.get("insulation", "basic"),
-            a.get("altitude_m", 0), a.get("coating", False), a.get("safety_standard"))
+        fn = {"creepage": _creepage.creepage_required,
+              "clearance": _creepage.clearance_required,
+              "spacing": _creepage.spacing_required}[kind]
+        kw = dict(
+            pollution_degree=a.get("pollution_degree", 2),
+            material_group=a.get("material_group", "IIIa"),
+            insulation=a.get("insulation", "basic"),
+            altitude_m=a.get("altitude_m", 0),
+            coating=a.get("coating", False),
+            safety_standard=a.get("safety_standard"))
+        if kind in ("clearance", "spacing"):
+            kw["transient_v"] = a.get("transient_v")
+        if kind in ("creepage", "spacing"):
+            kw["pcb_material"] = bool(a.get("pcb_material"))
+        return fn(a["voltage_v"], **kw)
     return handler
 
 
 _tool(
     "creepage_required",
-    "Required creepage distance (shortest path ALONG the insulating surface). "
-    "No EDA's DRC computes this - a spacing matrix is electrical clearance, not creepage. "
-    "FAILS CLOSED: refuses to answer until a verified standard table is loaded, because "
-    "a guessed safety distance is worse than no answer.",
+    "Required creepage distance (shortest path ALONG the insulating surface), "
+    "IEC 60664-1:2020-05 Table F.5. No EDA's DRC computes this - a spacing matrix is "
+    "electrical clearance, not creepage. IEC 60664-1 is answered from a table whose "
+    "ladders were recovered from KiCad 10.0's compiled implementation and diffed "
+    "against it on 188k probe points; any other safety_standard FAILS CLOSED, because "
+    "a guessed safety distance is worse than no answer. Table F.5 alone: the standard "
+    "also requires creepage >= clearance, which spacing_required applies.",
     {"type": "object",
      "properties": dict(_SAFE_ARGS),
      "required": ["voltage_v", "safety_standard"]},
@@ -263,28 +286,54 @@ _tool(
 
 _tool(
     "clearance_required",
-    "Required electrical clearance (shortest distance THROUGH air). "
-    "FAILS CLOSED for the same reason as creepage_required.",
+    "Required electrical clearance (shortest distance THROUGH air), IEC 60664-1 "
+    "Tables F.2/F.8 corrected by the Table A.2 altitude factor. The transient branch "
+    "and the peak branch are both evaluated and the larger wins; if one of them runs "
+    "off the end of its table the whole answer is refused instead of quietly keeping "
+    "the surviving branch. Give transient_v when you have an impulse spec - without it "
+    "the answer is flagged as possibly understated. FAILS CLOSED for the same reason "
+    "as creepage_required.",
     {"type": "object",
      "properties": dict(_SAFE_ARGS),
      "required": ["voltage_v", "safety_standard"]},
     _safety("clearance"),
 )
 
+_tool(
+    "spacing_required",
+    "Both distances at once, the way IEC 60664-1 actually applies them: creepage "
+    "(Table F.5) and clearance (Tables F.2/F.8 + A.2), with creepage raised to the "
+    "clearance when the table value is smaller, plus the minimum groove width. Use "
+    "this for a design rule - the two single-purpose tools answer one table each and "
+    "can each return the smaller of the two. Reports which of the two governed.",
+    {"type": "object",
+     "properties": dict(_SAFE_ARGS),
+     "required": ["voltage_v", "safety_standard"]},
+    _safety("spacing"),
+)
+
 
 _tool(
     "safety_table_check",
-    "Can the safety-distance / current-capacity tables be trusted? Runs the rules a "
-    "transcription has to satisfy - standard edition named, two independent sources per "
-    "row, distance monotone in voltage, monotone in material group, PD1<=PD2<=PD3, no "
-    "duplicate keys - and returns pass/fail per check. When it fails, creepage and "
-    "ipc2152 stay fail-closed. Read-only, no board needed.",
+    "Can the safety-distance / current-capacity tables be trusted? Runs the rules the "
+    "data has to satisfy and returns pass/fail per check. which=iec60664: edition "
+    "named, verified flag, two independent sources, all 32 creepage ladders present, "
+    "every ladder strictly ascending and never decreasing in distance, declared max_v "
+    "matching the last threshold, linear segments passing through the origin, Table "
+    "F.8 identical across pollution degrees, and physics probes (PD1<=PD2<=PD3, "
+    "distance never falls as voltage doubles). which=creepage: the hand-written-table "
+    "rules (edition named, two sources per row, monotone in voltage and material group). "
+    "which=ipc2152: coefficient shape (K>0, current exponent >1, width and thickness "
+    "exponents <0), two independent sources, declared anchors reproduced, and physical "
+    "probes (current rises with copper and with delta-T, internal not derated by 2x). "
+    "When it fails, that calculator stays fail-closed. Read-only, no board needed.",
     {"type": "object",
      "properties": {
-         "which": _str("which table", ["creepage", "ipc2152"], "creepage"),
+         "which": _str("which table", ["iec60664", "creepage", "ipc2152"],
+                       "iec60664"),
          "path": _str("optional alternative JSON file to check"),
      }},
-    lambda a: _safety_table.check_which(a.get("which", "creepage"), a.get("path")),
+    lambda a: _safety_table.check_which(a.get("which", "iec60664"), a.get("path")),
 )
 
 # ------------------------------------------------------------- diff pair
@@ -1205,20 +1254,30 @@ def _capabilities(_args):
                        "acceptance ratio - lambda_g/20 and lambda_g/10 both circulate, so "
                        "the criterion is the caller's and without it the verdict is "
                        "indeterminate",
-            "electrothermal": "the loop between current and temperature on copper: "
-                              "R(T) = rho20(1+alpha(T-20))L/(w t), P = I^2 R, "
-                              "T = T_amb + P*Rth, solved as a fixed point with the "
-                              "contraction gain dP/dT*Rth checked EXACTLY (above 1 the "
-                              "answer is THERMAL_RUNAWAY, not a converged number). Rth is "
-                              "always the caller's - one lump from thermal_stack / "
-                              "via_array_thermal / plate_temperature or a measurement. "
-                              "DC only, no skin effect, no AC loss",
+            "electrothermal": "the loop between current and temperature on copper, at two "
+                              "levels. electrothermal_trace / electrothermal_conductor close "
+                              "it against ONE caller-supplied lump Rth, with the contraction "
+                              "gain dP/dT*Rth checked EXACTLY (above 1 the answer is "
+                              "THERMAL_RUNAWAY, not a converged number). "
+                              "board_electrothermal closes it against a 2-D plate field: "
+                              "each conductor's I^2R lands on the grid, the field answers, "
+                              "and rho(T) goes back in - linear in T, so alpha*T sits on "
+                              "the matrix diagonal and the steady solve is exact; the "
+                              "transient is backward Euler. Runaway is refused before the "
+                              "solve when a diagonal goes non-positive, and a field that "
+                              "comes out below ambient is refused as non-physical. DC only, "
+                              "no skin effect, no AC loss",
             "vibration": "mechanical vibration: natural frequencies and mode shapes of "
                          "a thin plate (Rayleigh-Ritz, monomial basis, exact for SSSS "
                          "and CCCC and needs no mode table), single-mode random response "
                          "(Miles closed form for a flat PSD, or a real integral over a "
                          "measured PSD), Steinberg three-band fatigue with Miner's rule, "
                          "single-DOF shock via Newmark, and mount transmissibility. "
+                         "vibration_plate_stress turns a mode into surface stress and "
+                         "measures its own error bar by re-solving at several polynomial "
+                         "degrees (curvature converges slower than frequency); von Mises "
+                         "and the largest principal stress are reported at their own, "
+                         "usually different, points. "
                          "NOT done: assembly compliance, solder-joint creep, "
                          "random+shock combined, drop, and any nonlinear contact",
             "desktop": "find / start / stop the EDA and open a project, verified by "
@@ -1257,24 +1316,31 @@ def _capabilities(_args):
             "link_fresnel",
             "board_antenna_keepout",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
-            "ir_drop_chain", "pdn_impedance", "decoupling_check",
+            "ir_drop_chain", "pdn_impedance", "pdn_plane_modes", "decoupling_check",
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_convection",
             "board_ir_drop",
             "dfm_capability", "dfm_check",
-            "vibration_plate_modes", "vibration_random_response",
+            "vibration_plate_modes", "vibration_plate_stress",
+            "vibration_random_response",
             "vibration_fatigue", "vibration_shock", "vibration_isolator",
             "board_vibration",
             "cavity_resonance", "cavity_via_fence",
             "electrothermal_trace", "electrothermal_conductor",
+            "board_electrothermal",
+            "creepage_required", "clearance_required", "spacing_required",
             "filter_prototype", "filter_lumped_bandpass",
             "filter_coupled_microstrip", "filter_coupled_resonator",
             "filter_waveguide_cavity",
         ],
         "fail_closed_pending_data": {
-            "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
-            "clearance_required": "needs a verified IEC table in data/creepage_tables.json",
-            "standard=ipc2152": "needs a verified IPC-2152 data table",
+            "creepage_required": "only for safety_standard families other than "
+                                 "IEC 60664-1: those need a verified table in "
+                                 "data/creepage_tables.json",
+            "clearance_required": "same: IEC 60664-1 is answered, other families "
+                                  "need their own table",
+            "spacing_required": "same: IEC 60664-1 is answered, other families "
+                                "need their own table",
         },
         "answers_only_when_the_file_carries_the_fact": {
             "board_cross_split": "needs plane zones; without them reference-plane "
@@ -1328,11 +1394,24 @@ def _capabilities(_args):
             "frames, the 49620-49629 port scan) is implemented and unit-tested, but no "
             "gateway answered on this machine (the port only opens after the user "
             "enables 外部交互权限), so nothing was driven end to end - every reply "
-            "carries verified_against_app=false",
+            "carries verified_against_app=false. What the install DOES contain, "
+            "measured 2026-10-28: resources/app/assets/pro-api/0.3.38.25cc6d44 "
+            "(api.js + api.d.ts + extension.json declaring the default/sch/symbol/pcb/"
+            "panel services, 378 types by its own help CLI, PCB_Document 21 methods, "
+            "SCH_Document 9, PNL_Document 1). That is an IN-PROCESS extension API, not "
+            "a transport, so it does not make an out-of-process call possible - it only "
+            "means the vendor has a stable programmatic surface to target",
             "LCEDA Pro launch: lceda-pro.exe exits in about 0.5 s when started "
             "programmatically here (rc 0 with no arguments, rc 1 with a project "
             "path), no window and no user-data write - so open_argv_verified stays "
-            "false and app_open_project reports unconfirmed instead of pretending",
+            "false and app_open_project reports unconfirmed instead of pretending. "
+            "A second, better-instrumented round (2026-10-28) located the layer: the "
+            "exe never reaches Electron - the app's own log "
+            "(Documents\\LCEDA-Pro\\logs\\warn\\<date>.log) and the Chromium "
+            "debug.log get ZERO new lines, the process peaks at ~34 MB and dies with "
+            "rc 0, and '--enable-logging=stderr' is rejected by a launcher shell with "
+            "rc 9 before Chromium sees argv. kicad.exe starts fine from the same "
+            "shell, so this is not 'no GUI here'",
             "Full-wave electromagnetic simulation (method of moments / FDTD / FEM): "
             "nothing here is a solver. The antenna tools give the starting geometry "
             "from closed forms; radiation pattern, gain after a housing, efficiency "
@@ -1351,18 +1430,30 @@ def _capabilities(_args):
             "here: any built-in fab capability table - "
             "dfm_capability REJECTS a document without a source and does not fill "
             "the gaps with typical values",
-            "BGA/thermal via array temperature rise, fuse behaviour, electrothermal "
-            "coupling: data/ipc2152_tables.json ships with ZERO rows on purpose - the "
-            "table validator (calc/safety_table.py) is in place, but the standard is "
-            "paywalled and public reproductions contradict each other, so a filled row "
-            "would be a guess with a citation glued on",
+            "BGA/thermal via array temperature rise, fuse behaviour, and any IPC-2152 "
+            "parameter the published fit drops (board thickness, adjacent copper, "
+            "airflow, mask opening): data/ipc2152_tables.json no longer ships an empty "
+            "chart transcription - it ships the Brooks & Adam closed-form fit to Table "
+            "3-1 with coefficients copied from KiCad 10.0, and "
+            "safety_table_check(which=ipc2152) judges it by anchor reproduction and "
+            "physical probes. What is still missing is the data the FIT threw away, "
+            "plus any statement about plated barrels - via_current_allowed refuses "
+            "standard=ipc2152 for exactly that reason (STANDARD_SCOPE)",
             "Plane resonances as a SOLVED field: cavity_resonance gives the ideal "
             "PMC-wall TM_mn0 eigenvalues and cavity_via_fence gives pitch/lambda_g, but "
             "no Q (dielectric tan-delta, copper loss, radiation), no detuning from real "
             "open edges, no plane-pair impedance and no leakage through voids. A "
             "resonance with no Q is a location on the frequency axis, not a verdict - "
             "when it matters, use a 3-D field solver",
-            "Impedance/creepage tables for standards other than IPC-2221 / IPC-2141A",
+            "Safety-distance tables for standards other than IEC 60664-1: "
+            "IEC 62368-1, IEC 61010-1 and the instrument standards each tabulate "
+            "their own creepage/clearance, and this build only carries IEC 60664-1 "
+            "(recovered from KiCad 10.0's implementation, diffed on 188k points). "
+            "Ask for another family and it refuses rather than borrowing 60664's "
+            "numbers. Also missing from 60664: the homogeneous-field column (the "
+            "reference implementation never exposes field selection), solid "
+            "insulation / distance-through-insulation, and the pollution-degree-4 "
+            "creepage case the standard itself does not specify",
             "The BUILTIN SPICE solver is a subset, by name: it handles R C L V I E G "
             "D Q M with .op/.tran/.ac/.model/.temp and rejects F H J K S W X B T O U A "
             "cards with the card named in the error. Who wants the rest: install "
@@ -1372,27 +1463,37 @@ def _capabilities(_args):
             "real device models. That path is NOT bundled: the binary is not shipped "
             "with this server. The delegation WAS exercised against real ngspice-47 "
             "(MSYS2 Windows build) and cross-checked node by node with the builtin "
-            "solver; verified_against_engine is true only for the versions in this "
+            "solver, and then a SECOND build (ngspice-41, conda-forge) was run on the "
+            "same decks so the two engines can be compared to each other: .op and .ac "
+            "agree bit for bit, .tran differs by at most 1.24e-4 V on a 1 V step "
+            "(different internal step control, so their grids differ too - that number "
+            "is not an accuracy ranking); verified_against_engine is true only for the "
+            "versions in this "
             "build's VERIFIED_ENGINES list, and false for any other version - a "
             "different binary is not a verified engine. What neither path "
             "does: temperature sweeps (one temperature per run), noise (.noise), "
             "distortion, Monte Carlo; the builtin solver also uses dense LU and "
             "refuses above ~400 unknowns",
-            "Electrothermal coupling beyond ONE lump: electrothermal_trace / "
-            "electrothermal_conductor close the loop between copper R(T) and a single "
-            "caller-supplied Rth, and nothing else. Not done: 2-D/3-D coupling (a hot "
-            "spot that warms its own neighbours and lowers its own local Rth), "
-            "transient coupling (thermal capacitance inside the loop), AC loss "
-            "(skin/proximity), device self-heating inside sim_spice, and "
-            "board_ir_drop feeding its own per-segment I^2R back into a temperature "
-            "field - that last one is still the user's to iterate",
+            "Electrothermal coupling stops at a 2-D laminate plate: "
+            "electrothermal_trace / electrothermal_conductor close the loop against one "
+            "caller-supplied Rth; board_electrothermal closes it against a 2-D field, "
+            "but that field spreads heat through the laminate k the caller gives, NOT "
+            "through the real copper pours and planes. Not done: 3-D, radiation, "
+            "thermal vias, component thermal mass and contact resistance, AC loss "
+            "(skin/proximity), device self-heating inside sim_spice, and reading the "
+            "conductors straight off a board file - board_electrothermal takes geometry, "
+            "it does not open the .kicad_pcb for you",
             "Transient current density / surge and fusing: current_capacity is a "
             "steady-state table check, and board_ir_drop reports A/mm^2 with no "
             "criterion attached. Fusing a trace needs a temperature-rise criterion and "
             "an adiabatic energy calculation, neither of which is here",
-            "PDN plane resonances and die-package inductance: pdn_impedance / "
-            "decoupling_check are lumped RLC in parallel, so they can prove a bank is "
-            "clearly insufficient and cannot prove it is sufficient",
+            "The plane impedance CURVE (as opposed to its mode peaks): pdn_impedance / "
+            "decoupling_check are lumped RLC in parallel and can prove a bank is clearly "
+            "insufficient but not that it is sufficient; pdn_plane_modes gives the peak "
+            "|Z| at each cavity mode inside the band, but the modal SUM is not computed "
+            "because it does not converge (it moves with the truncation order), so no "
+            "anti-resonance between the plane and the caps is claimed. Die-package "
+            "inductance, split planes and via-barrel inductance are all outside",
             "Thermal plating thinning, TIM interface resistance and heatsink "
             "selection: thermal_via_array reports an OPTIMISTIC barrel resistance "
             "(uniform plating), rth_cs is an input the user must supply, and "
@@ -1405,8 +1506,13 @@ def _capabilities(_args):
             "assembly-level modes, no solder-joint creep or BGA-ball fatigue (only "
             "the Steinberg lead-wire form, whose slope and allowable YOU supply), no "
             "random-plus-shock superposition, no drop simulation, no nonlinear "
-            "contact or rattling, and nothing here is a stress solver - it gives "
-            "displacement, never a stress or a strain",
+            "contact or rattling. Stress is a LAYER ON THE SAME RITZ SOLUTION, not a "
+            "field solve: vibration_plate_stress reports three separately-located "
+            "extremes (von Mises at the corner from tau_xy, principal at mid-span, "
+            "maximum shear at the edge) and the tensor components at the sigma_max "
+            "point only - there is no stress map, no stress concentration at a hole "
+            "or a stiffener, and no fatigue law applied to those numbers (Steinberg "
+            "needs slope and allowable from you)",
             "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives ideal lossless L/C values and its own S21, but no finite-Q insertion loss, no component parasitics, no real capacitor/inductor series resonance and no tolerance or Monte-Carlo yield. filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity is TE101 only: no higher-order modes, no mode chart, no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no surface-roughness correction. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
@@ -1494,9 +1600,11 @@ def _capabilities(_args):
                           "engines and are compared node by node - a divider to 5e-9 "
                           "V, a diode to 3.5e-4 V (model difference), a BJT to 1.8e-2 V "
                           "(model difference), and an RC step and an RLC AC sweep to "
-                          "0.0 V, i.e. bit-identical; verified_against_engine is "
-                          "gated on the engine version string, not on the file "
-                          "existing",
+                          "0.0 V, i.e. bit-identical; a second build (ngspice-41) then "
+                          "ran the same decks, agreeing with 47 bit for bit on .op "
+                          "and .ac and to 1.24e-4 V on a 1 V .tran step; "
+                          "verified_against_engine is gated on the engine version "
+                          "string, not on the file existing",
             "vibration": "checked against the closed-form plate eigenvalues, not "
                          "against itself: a simply supported square gives "
                          "f11 = pi^2 sqrt(D/rho h)/a^2 to 6 digits (330.385 Hz on a "
@@ -1542,7 +1650,17 @@ def _capabilities(_args):
                               "(hand-checked: P*Rth = 0.01021658*50); the same case with "
                               "I = 1 A and Rth = 300 K/W on a 1 ohm conductor gives "
                               "G = 4.716 > 1 and is refused as THERMAL_RUNAWAY instead "
-                              "of returning the 4th iterate",
+                              "of returning the 4th iterate. The 2-D loop is pinned "
+                              "against a case that has a closed form - a 2 W load spread "
+                              "uniformly over a 50x50x1.6 mm plate (k 0.3, h 10 per face, "
+                              "2 mm cells) gives t_max = 73.393487 C against "
+                              "(2hA*Ta + P*(1-20*alpha))/(2hA - P*alpha) = 73.39345 C, "
+                              "and the same plate at 13 W is refused as THERMAL_RUNAWAY "
+                              "because 13*alpha exceeds 2hA = 0.05 W/K - that is the 1-D "
+                              "criterion P*alpha < 2hA, recovered exactly. A single 3 A "
+                              "trace (40 mm x 1 mm x 35 um) on the same plate gives "
+                              "R20 = 0.0197029 ohm, R_hot = 0.0220269 ohm and "
+                              "t_max = 50.013524 C at 1 mm cells",
         },
     }
 
@@ -2239,7 +2357,10 @@ _tool(
     "pdn_impedance",
     "|Z(f)| of a capacitor bank as seen by the die: parallel series-RLC capacitors plus "
     "optional plane capacitance. Plots the whole curve because the failure mode is the "
-    "ANTI-RESONANCE between two cap values, not a low minimum.",
+    "ANTI-RESONANCE between two cap values, not a low minimum. Pass `plane` (plane-pair "
+    "geometry + loss tangent) and it also says which CAVITY MODES fall inside the swept "
+    "band, and how high each of them peaks - because a lumped minimum of 10 mohm means "
+    "nothing if a plane mode inside the band peaks at 90 ohm.",
     {"type": "object", "properties": {
         "freqs_hz": {"type": "array", "description": "frequencies to evaluate",
                      "items": {"type": "number"}},
@@ -2247,10 +2368,49 @@ _tool(
                  "list of {c_farad, esr_ohm, esl_h}", "items": {"type": "object"}},
         "plane_cap_farad": _num("plane pair capacitance, if known"),
         "r_series_ohm": _num("series resistance in the path, if known"),
+        "plane": {"type": "object", "description":
+                  "{width_mm, height_mm, er, thickness_mm, tan_delta, port_mm, "
+                  "probe_mm, max_order}: turns on the cavity-mode diagnostic",
+                  "properties": {}},
     }, "required": ["freqs_hz", "caps"]},
     lambda a: _power.pdn_impedance(a.get("freqs_hz"), a.get("caps"),
                                    plane_cap_farad=a.get("plane_cap_farad"),
-                                   r_series_ohm=a.get("r_series_ohm") or 0.0),
+                                   r_series_ohm=a.get("r_series_ohm") or 0.0,
+                                   plane=a.get("plane")),
+)
+
+_tool(
+    "pdn_plane_modes",
+    "Peak |Z| at each parallel-plate (cavity) mode of a plane pair, from the single mode "
+    "that rings: |Z_peak| = w*mu0*t*psi_mn(r1)*psi_mn(r2)*Q/k_mn^2 with Q = 1/tan_delta. "
+    "Modes with a voltage null at either point are reported as uncoupled instead of as a "
+    "tiny number. Only peaks are given - the SUM over modes does not converge near and "
+    "above the first resonance (measured: |Z| at 1.45 GHz moves 5.6 -> 9.4 ohm when the "
+    "truncation goes from order 10 to 40), so no curve and no anti-resonance is claimed. "
+    "tan_delta is required because a lossless cavity has an infinite peak.",
+    {"type": "object", "properties": {
+        "width_mm": _num("plane width"),
+        "height_mm": _num("plane height"),
+        "er": _num("relative permittivity of the dielectric between the planes"),
+        "thickness_mm": _num("plane separation"),
+        "tan_delta": _num("loss tangent of that dielectric (FR4 is 0.015..0.025); "
+                          "Q = 1/tan_delta is the only damping here"),
+        "port_mm": {"type": "array", "description":
+                    "[x_mm, y_mm] the current is injected at (default: the centre)",
+                    "items": {"type": "number"}},
+        "probe_mm": {"type": "array", "description":
+                     "[x_mm, y_mm] the transfer impedance is measured to "
+                     "(default: the port itself)", "items": {"type": "number"}},
+        "band_hz": {"type": "array", "description":
+                    "[f_lo, f_hi] to mark which modes matter", "items": {"type": "number"}},
+        "max_order": _num("highest modal index per axis to enumerate (1..20)", 6),
+    }, "required": ["width_mm", "height_mm", "er", "thickness_mm", "tan_delta"]},
+    lambda a: _power.pdn_plane_modes(
+        a.get("width_mm"), a.get("height_mm"), a.get("er"),
+        a.get("thickness_mm"), a.get("tan_delta"),
+        probe_mm=a.get("probe_mm"), port_mm=a.get("port_mm"),
+        band_hz=a.get("band_hz"),
+        max_order=(a.get("max_order") if a.get("max_order") is not None else 6)),
 )
 
 _tool(
@@ -2504,6 +2664,10 @@ _tool(
         "probe_points": {"type": "array", "description":
                          "list of {name, x_mm, y_mm} to sample the mode shape at",
                          "items": {}},
+        "stress_amplitude_mm": _num(
+            "peak deflection of the mode, in mm. Give it and each mode also carries "
+            "the surface stress; leave it out and no stress is reported, because a "
+            "mode shape has no amplitude until you say how hard it is driven"),
     }, "required": ["a_mm", "b_mm", "thickness_mm"]},
     lambda a: _vib.plate_modes(
         a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"),
@@ -2513,7 +2677,53 @@ _tool(
         bc_y=a.get("bc_y"),
         n_modes=int(a.get("n_modes") or 4),
         poly_degree=int(a.get("poly_degree") or 7),
-        probe_points=a.get("probe_points")),
+        probe_points=a.get("probe_points"),
+        stress_amplitude_mm=a.get("stress_amplitude_mm")),
+)
+
+_tool(
+    "vibration_plate_stress",
+    "Surface stress in a vibrating plate, with a MEASURED error bar. Solves the same "
+    "Rayleigh-Ritz eigenproblem at several polynomial degrees, takes the surface "
+    "curvatures (sigma = -E z/(1-nu^2)(w_xx + nu w_yy), tau_xy = -E z/(1+nu) w_xy at "
+    "z = h/2), and reports the spread between rungs instead of quoting a tolerance. "
+    "Two different extremes are reported at their own locations: von Mises peaks where "
+    "the TWISTING curvature does (a corner, for a sinusoid-like mode - the classic "
+    "corner torque), and the largest principal stress peaks where the bending "
+    "curvatures do (a bay centre). Reporting one point for both is how a max stress "
+    "comes out a third low. Frequencies converge faster than curvatures: on SSSS the "
+    "frequency moves 0.04 % between degree 5 and 9 while the stress moves 3.6 %.",
+    {"type": "object", "properties": {
+        "a_mm": _num("plate length"),
+        "b_mm": _num("plate width"),
+        "thickness_mm": _num("plate thickness"),
+        "amplitude_mm": _num("peak deflection of this mode in mm - take it from "
+                             "miles_response's z_3sigma_mm, do not invent one"),
+        "material": _str("preset: %s" % ", ".join(sorted(_vib.MATERIALS))),
+        "e_gpa": _num("Young's modulus in GPa (overrides the preset)"),
+        "nu": _num("Poisson ratio (overrides the preset)"),
+        "rho_kg_m3": _num("density in kg/m^3 (overrides the preset)"),
+        "mount": _str("edges/ssss, clamped/cccc, free, cantilever, corners, custom",
+                      "corners"),
+        "bc_x": {"type": "array", "description":
+                 "for mount=custom: [left, right] each ss/cc/free", "items": {}},
+        "bc_y": {"type": "array", "description":
+                 "for mount=custom: [bottom, top] each ss/cc/free", "items": {}},
+        "mode": _num("which mode (1-based, flexible modes only)", 1),
+        "poly_degree": _num("highest polynomial degree to try; the ladder runs "
+                            "(5,7,9) up to this", 9),
+        "degrees": {"type": "array", "description":
+                    "explicit degree ladder, e.g. [5,7,9]", "items": {}},
+    }, "required": ["a_mm", "b_mm", "thickness_mm", "amplitude_mm"]},
+    lambda a: _vib.plate_stress(
+        a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"), a.get("amplitude_mm"),
+        mode=int(a.get("mode") or 1),
+        material=a.get("material"), e_gpa=a.get("e_gpa"), nu=a.get("nu"),
+        rho_kg_m3=a.get("rho_kg_m3"),
+        mount=(a.get("mount") or "corners"), bc_x=a.get("bc_x"),
+        bc_y=a.get("bc_y"),
+        poly_degree=(int(a["poly_degree"]) if a.get("poly_degree") is not None else None),
+        degrees=(tuple(a["degrees"]) if a.get("degrees") else None)),
 )
 
 _tool(
@@ -2730,6 +2940,58 @@ _tool(
         tol_c=(a["tol_c"] if a.get("tol_c") is not None else 1e-4),
         max_iter=int(a["max_iter"] if a.get("max_iter") is not None else 2000),
         note=a.get("note")),
+)
+
+_tool(
+    "board_electrothermal",
+    "Board-level 2-D electro-thermal: every conductor's I^2R feeds a plate solve, and "
+    "the plate temperature feeds back into rho(T). electrothermal_trace closes the loop "
+    "against ONE lump Rth - this one closes it against a 2-D field, because a 3 mm trace "
+    "dumping 4 W and the same 4 W spread over 100 mm are different boards. Because "
+    "rho(T) is linear, alpha*T sits on the matrix diagonal and the steady problem is "
+    "EXACTLY linear (SOR); the transient is backward Euler (unconditionally stable). "
+    "Runaway is refused before the solve when any diagonal goes non-positive - on a "
+    "uniform plate that reduces to the 1-D rule P*alpha < 2hA. Spreading is through the "
+    "laminate k you pass, NOT through the real copper pours, so a design with a plane "
+    "under the trace runs cooler than this says.",
+    {"type": "object", "properties": {
+        "width_mm": _num("plate width"),
+        "height_mm": _num("plate height"),
+        "thickness_mm": _num("plate thickness (also the heat capacity)"),
+        "k_w_mk": _num("in-plane conductivity; FR4 ~0.3, and it is a range 0.2..0.4"),
+        "h_w_m2k": _num("convection coefficient, per exposed face (required)"),
+        "conductors": {"type": "array", "description":
+            "heat sources AND resistances: {x1_mm,y1_mm,x2_mm,y2_mm,width_mm,"
+            "thickness_um,current_a,layers?}. The total I^2R of each trace is split "
+            "evenly over the cells it covers, so the total power is exact and only "
+            "its distribution is quantised by cell_mm", "items": {"type": "object"}},
+        "uniform_power_w": _num("optional: a total dissipation spread evenly over the "
+                                "plate (the one case with a closed form)"),
+        "t_ambient_c": _num("ambient temperature", 25.0),
+        "cell_mm": _num("grid pitch; default min(W,H)/40"),
+        "edge_temp_c": _num("optional: hold the four edges at this temperature"),
+        "alpha_per_k": _num("temperature coefficient, default copper 0.00393", 0.00393),
+        "rho20_ohm_m": _num("resistivity at 20 C, default IACS 1.724e-8", 1.724e-8),
+        "tol_k": _num("SOR convergence tolerance in K", 1e-4),
+        "sor_max_iter": _num("SOR sweep cap per solve", 60000),
+        "max_cells": _num("grid cell cap", 20000),
+        "transient": {"type": "object", "description":
+            "optional: {t_end_s, points, cp_j_kg_k, rho_kg_m3, initial_c?}, "
+            "FR4 is about cp 1150 J/(kg*K), rho 1850 kg/m^3"},
+    }, "required": ["width_mm", "height_mm", "thickness_mm", "k_w_mk", "h_w_m2k"]},
+    lambda a: _electro.board_electrothermal(
+        a.get("width_mm"), a.get("height_mm"), a.get("thickness_mm"),
+        a.get("k_w_mk"), a.get("h_w_m2k"), a.get("conductors"),
+        t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
+        cell_mm=a.get("cell_mm"), edge_temp_c=a.get("edge_temp_c"),
+        uniform_power_w=a.get("uniform_power_w"),
+        alpha_per_k=(a["alpha_per_k"] if a.get("alpha_per_k") is not None else 0.00393),
+        rho20_ohm_m=(a["rho20_ohm_m"] if a.get("rho20_ohm_m") is not None else 1.724e-8),
+        tol_k=(a["tol_k"] if a.get("tol_k") is not None else 1e-4),
+        max_iter=200,
+        sor_max_iter=int(a["sor_max_iter"] if a.get("sor_max_iter") is not None else 60000),
+        max_cells=int(a["max_cells"] if a.get("max_cells") is not None else 20000),
+        transient=a.get("transient")),
 )
 
 # ------------------------------------------------------------ filters (ADS-like)

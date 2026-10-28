@@ -1169,13 +1169,18 @@ NGSPICE_TIMEOUT_S = 120.0
 # Versions this repository has actually run the gold netlists against, with the
 # measured agreement recorded in docs/21 and asserted in tests/test_spice_engine.py.
 # Presence of a binary is not evidence; being on this list is.
-VERIFIED_ENGINES = ("ngspice-47",)
+VERIFIED_ENGINES = ("ngspice-47", "ngspice-41")
 
 ENGINE_VERIFICATION = (
-    "ngspice-47 (Windows, MSYS2 build) was run against this module's gold netlists: "
-    "10 V 1k/2k divider 5e-9 V apart, diode 0.35 mV, BJT 17.8 mV (model, not "
-    "arithmetic), RC step and RLC AC bit-identical. Any other engine version is "
-    "NOT covered by that evidence and reports verified_against_engine:false"
+    "two engine builds were run against this module's gold netlists - ngspice-47 "
+    "(Windows, MSYS2 build) and ngspice-41 (Windows, conda-forge build). Against the "
+    "builtin solver, 47 gave: 10 V 1k/2k divider 5e-9 V apart, diode 0.35 mV, BJT "
+    "17.8 mV (model, not arithmetic), RC step and RLC AC bit-identical. The two "
+    "engines were then run side by side on the same decks: .op (divider, diode, BJT) "
+    "and .ac (RLC) agree to 0.0 V, .tran disagrees by at most 1.24e-4 V on a 1 V step "
+    "(1.2e-4 relative, one time point - the two builds step differently, so the "
+    "comparison is of their own grids). Any other engine version is NOT covered by "
+    "that evidence and reports verified_against_engine:false"
 )
 
 ENGINE_NOTE = (

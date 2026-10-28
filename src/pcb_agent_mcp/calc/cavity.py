@@ -238,7 +238,6 @@ def via_fence(f_resonance_hz, er, pitch_mm=None, max_pitch_ratio=None,
         out["pitch_over_lambda_g"] = _sig(ratio)
         out["phase_per_pitch_deg"] = _sig(360.0 * ratio)
         out["vias_per_lambda_g"] = _sig(1.0 / ratio)
-        out["pitch_for_ratio"] = None  # filled below when a criterion is given
 
     crit = _num(max_pitch_ratio)
     if crit is not None:

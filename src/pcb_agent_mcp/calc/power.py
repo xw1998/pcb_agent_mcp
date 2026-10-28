@@ -18,6 +18,13 @@ K_CU = 385.0              # W/(m*K) thermal conductivity
 K_FR4 = 0.30              # W/(m*K) typical, and it is a RANGE (0.2..0.4)
 
 
+def _sig(x, digits=6):
+    """Six significant digits - the envelope's own reporting convention."""
+    if x == 0 or x != x:
+        return x
+    return float("%.*e" % (digits - 1, x))
+
+
 def _rho(temp_c):
     return RHO_CU_20 * (1.0 + ALPHA_CU * (float(temp_c) - 20.0))
 
@@ -301,12 +308,236 @@ def decoupling_self_resonance(c_farad, esl_h, esr_ohm=0.0):
                                       "dielectric absorption", "DC bias derating"]})
 
 
-def pdn_impedance(freqs_hz, caps, plane_cap_farad=None, r_series_ohm=0.0):
+MU0 = 4e-7 * math.pi
+EPS0 = 8.8541878128e-12
+C0 = 299792458.0
+
+_PLANE_NOT_COMPUTED = (
+    "the plane impedance CURVE. The modal sum for an open-edged plane pair "
+    "converges far too slowly near and above its first resonance to be quoted: "
+    "measured here, |Z| at 1.45 GHz moves 5.6 -> 9.4 ohm when the truncation goes "
+    "from order 10 to 40, so a curve would be a function of the truncation order, "
+    "not of your board. Only the single-mode peaks are reported",
+    "via barrel / antipad inductance and the capacitance of the gaps around them",
+    "split planes, moats and return-path discontinuities",
+    "copper loss and radiation: the only damping here is the loss tangent the "
+    "caller gives",
+    "open-edge detuning of the mode frequencies (a real plane rings a few percent "
+    "LOW of the PMC value)",
+)
+
+
+def pdn_plane_modes(width_mm, height_mm, er, thickness_mm, tan_delta,
+                    probe_mm=None, port_mm=None, band_hz=None, max_order=6):
+    """Peak |Z| at each parallel-plate mode, from the one mode that rings.
+
+    A plane pair is a cavity; at f_mn the "plane" is a short in the transfer
+    impedance sense, i.e. |Z| peaks. The single-mode term of the PMC Green's
+    function
+
+        Z(f) = j*w*mu0*t * sum_mn  psi_mn(r) psi_mn(r') / (k_mn^2 - k^2(1 - j/Q))
+
+    evaluated AT resonance is what this returns:
+
+        |Z_peak| = w*mu0*t*psi_mn(r)*psi_mn(r')*Q / k_mn^2,   Q = 1/tan_delta
+
+    with psi_mn = c_m c_n / sqrt(a b) * cos(m pi x/a) cos(n pi y/b) and
+    c_i = 1 for i = 0 else sqrt(2). The same expansion, summed, reproduces
+    1/(j*w*C_plane) to 0.02 % at 1 MHz - that is the check that the constants are
+    right; see tests/test_pdn_plane.py, which does exactly that.
+
+    Only the peaks are reported, and each peak is the single-mode estimate. The
+    sum over the OTHER modes is not computed, because it does not converge (see
+    not_computed) - so do not read two adjacent numbers here as a curve.
+
+    tan_delta is required: with no loss the peak is infinite and "R ohm" would be
+    a made-up number. Q = 1/tan_delta is the ONLY damping in the model, so the
+    peak scales straight with the loss tangent you state - FR4 is 0.015..0.025.
+    """
+    def num(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if v == v else None
+
+    a = num(width_mm)
+    b = num(height_mm)
+    e = num(er)
+    t = num(thickness_mm)
+    td = num(tan_delta)
+    for name, v in (("width_mm", a), ("height_mm", b), ("er", e),
+                    ("thickness_mm", t)):
+        if v is None:
+            return err("%s is required and must be a number" % name, "ARG_REQUIRED")
+        if v <= 0:
+            return err("%s must be > 0" % name, "ARG_RANGE",
+                       extra={"offending": name})
+    if e < 1.0:
+        return err("er must be >= 1", "ARG_RANGE", extra={"er": e})
+    if td is None:
+        return err("tan_delta is required: with no loss the peak impedance at a "
+                   "plane mode is infinite, so there would be no number to report",
+                   "ARG_REQUIRED",
+                   hint="FR4 is 0.015..0.025, and Q = 1/tan_delta is the only "
+                        "damping in this model, so the peak scales with what you "
+                        "state")
+    if td <= 0.0 or td >= 1.0:
+        return err("tan_delta must be in (0, 1)", "ARG_RANGE",
+                   extra={"tan_delta": td})
+    try:
+        order = int(max_order)
+    except (TypeError, ValueError):
+        return err("max_order must be an integer", "ARG_INVALID")
+    if order < 1 or order > 20:
+        return err("max_order must be in 1..20", "ARG_RANGE")
+
+    def point(p, name, default=None):
+        if p is None:
+            return None
+        if isinstance(p, dict):
+            x, y = num(p.get("x_mm")), num(p.get("y_mm"))
+        else:
+            try:
+                x, y = num(p[0]), num(p[1])
+            except (TypeError, IndexError):
+                return "bad"
+        if x is None or y is None:
+            return "bad"
+        if x < 0 or y < 0 or x > a or y > b:
+            return "out"
+        return (x, y)
+
+    r1 = point(port_mm, "port_mm")
+    if r1 in ("bad", "out"):
+        return err("port_mm must be [x_mm, y_mm] inside the plane", "ARG_RANGE")
+    r2 = point(probe_mm, "probe_mm")
+    if r2 in ("bad", "out"):
+        return err("probe_mm must be [x_mm, y_mm] inside the plane", "ARG_RANGE")
+    if r1 is None:
+        r1 = (0.5 * a, 0.5 * b)          # the middle: where a mode has its antinode
+    if r2 is None:
+        r2 = r1
+
+    a_m, b_m, t_m = a * 1e-3, b * 1e-3, t * 1e-3
+    q = 1.0 / td
+    # f = c/(2*sqrt(er)) * sqrt((m/a)^2 + (n/b)^2) = c * k_mn / (2*pi*sqrt(er)),
+    # with k_mn = pi*sqrt((m/a)^2+(n/b)^2) the transverse wavenumber in rad/m
+    k_plane = C0 / math.sqrt(e)
+
+    rows = []
+    unexcited = 0
+    for m in range(0, order + 1):
+        for n in range(0, order + 1):
+            if m == 0 and n == 0:
+                continue
+            kmn2 = (math.pi * m / a_m) ** 2 + (math.pi * n / b_m) ** 2
+            k_mn = math.sqrt(kmn2)
+            f = k_plane * k_mn / (2.0 * math.pi)
+            cm = 1.0 if m == 0 else math.sqrt(2.0)
+            cn = 1.0 if n == 0 else math.sqrt(2.0)
+            # psi_mn(r1) * psi_mn(r2) with the normalised eigenfunction
+            # psi_mn = c_m c_n / sqrt(a b) * cos(m pi x/a) cos(n pi y/b)
+            psi = ((cm * cn) ** 2 / (a_m * b_m)
+                   * math.cos(math.pi * m * r1[0] / a) * math.cos(math.pi * n * r1[1] / b)
+                   * math.cos(math.pi * m * r2[0] / a) * math.cos(math.pi * n * r2[1] / b))
+            w = 2.0 * math.pi * f
+            # a null at either point is exact (cos of 90 deg), so test the coupling
+            # against the mode's own scale rather than against an absolute epsilon
+            scale = (cm * cn) ** 2 / (a_m * b_m)
+            coupled = abs(psi) > 1e-9 * scale
+            z_peak = abs(w * MU0 * t_m * psi * q / kmn2) if coupled else 0.0
+            row = {"m": m, "n": n, "f_hz": _sig(f), "z_peak_ohm": _sig(z_peak),
+                   "coupled": coupled}
+            if band_hz:
+                try:
+                    lo, hi = float(band_hz[0]), float(band_hz[1])
+                except (TypeError, ValueError, IndexError):
+                    return err("band_hz must be [f_lo_hz, f_hi_hz]", "ARG_INVALID")
+                row["in_band"] = bool(lo <= f <= hi)
+            if not row["coupled"]:
+                unexcited += 1
+                row["why_not"] = ("this mode has a voltage null at one of the "
+                                  "points you gave, so it does not show up in the "
+                                  "transfer impedance between them")
+            rows.append(row)
+    rows.sort(key=lambda r: r["f_hz"])
+
+    # Integrity gate. The very same constants, summed, must reproduce the
+    # parallel-plate capacitance far below the first mode: the (0,0) term is that
+    # capacitor, so a wrong normalisation shows up here as a factor, and a factor
+    # is exactly the silent error this module cannot afford.
+    f_chk = rows[0]["f_hz"] / 100.0
+    k_chk = 2.0 * math.pi * f_chk * math.sqrt(EPS0 * e * MU0)
+    k2_chk = k_chk * k_chk * (1.0 - 1j / q)
+    tot = 0j
+    for m in range(0, order + 1):
+        for n in range(0, order + 1):
+            cm = 1.0 if m == 0 else math.sqrt(2.0)
+            cn = 1.0 if n == 0 else math.sqrt(2.0)
+            kmn2 = (math.pi * m / a_m) ** 2 + (math.pi * n / b_m) ** 2
+            psi = ((cm * cn) ** 2 / (a_m * b_m)
+                   * math.cos(math.pi * m * r1[0] / a) * math.cos(math.pi * n * r1[1] / b)
+                   * math.cos(math.pi * m * r2[0] / a) * math.cos(math.pi * n * r2[1] / b))
+            tot += psi / (kmn2 - k2_chk)
+    z_chk = abs(2.0 * math.pi * f_chk * MU0 * t_m * tot)
+    z_cap = 1.0 / (2.0 * math.pi * f_chk * EPS0 * e * a_m * b_m / t_m)
+    if abs(z_chk / z_cap - 1.0) > 0.01:
+        return err("the modal constants do not reproduce the plane capacitance "
+                   "(%s ohm vs %s ohm at %s Hz): the peak numbers below would be "
+                   "wrong by the same factor" % (z_chk, z_cap, f_chk),
+                   "INTERNAL_CHECK_FAILED")
+
+    coupled = [r for r in rows if r["coupled"]]
+    worst_any = max(coupled, key=lambda r: r["z_peak_ohm"]) if coupled else None
+    worst = worst_any
+    if band_hz and coupled:
+        # the caller asked about a band, so the band is the answer - including
+        # when it is empty, because "no mode in your band" is a finding
+        inband = [r for r in coupled if r.get("in_band")]
+        worst = max(inband, key=lambda r: r["z_peak_ohm"]) if inband else None
+
+    extra = {
+        "mode_count": len(rows),
+        "uncoupled_modes": unexcited,
+        "first_coupled_hz": coupled[0]["f_hz"] if coupled else None,
+        "worst_mode": worst,
+        "worst_mode_any_band": worst_any,
+        "not_computed": list(_PLANE_NOT_COMPUTED),
+    }
+    return ok({"modes": rows,
+               "port_mm": [r1[0], r1[1]], "probe_mm": [r2[0], r2[1]],
+               "q_from_loss_tangent": _sig(q),
+               "plane_capacitance_f": _sig(EPS0 * e * a_m * b_m / t_m),
+               "worst_z_peak_ohm": worst["z_peak_ohm"] if worst else None,
+               "worst_z_peak_hz": worst["f_hz"] if worst else None,
+               "worst_z_peak_any_band_ohm": (worst_any["z_peak_ohm"]
+                                             if worst_any else None)},
+              unit="ohm", model="PMC_cavity_single_mode_peak",
+              basis="|Z_peak_mn| = w*mu0*t*psi_mn(r1)*psi_mn(r2)*Q/k_mn^2 at "
+                    "f_mn = c/(2*sqrt(er))*sqrt((m/a)^2+(n/b)^2), Q = 1/tan_delta",
+              precision="single-mode peak. The other modes' tails are NOT summed "
+                        "(that sum does not converge), so two adjacent rows are not "
+                        "a curve and no anti-resonance is claimed",
+              assumptions={"er": e, "thickness_mm": t, "tan_delta": td,
+                           "loss": "dielectric only - no copper, no radiation"},
+              extra=extra)
+
+
+def pdn_impedance(freqs_hz, caps, plane_cap_farad=None, r_series_ohm=0.0,
+                  plane=None):
     """|Z(f)| seen by the die: N decoupling caps in parallel, plus optional plane.
 
     Caps are ideal R-L-C in parallel, which is what a decoupling network looks
-    like from the die until the plane resonances start - and those are NOT
-    modelled here (they need the plane geometry and a field solver).
+    like from the die until the plane resonances start. `plane_cap_farad` adds
+    the plane pair's parallel-plate capacitance (the (0,0) mode).
+
+    `plane={width_mm, height_mm, er, thickness_mm, tan_delta, port_mm, probe_mm}`
+    additionally reports the plane CAVITY MODES and which of them fall inside the
+    frequency sweep you asked for. That is a diagnostic, not a term in the sum:
+    the modal curve cannot be summed honestly (see pdn_plane_modes), so nothing
+    is added to |Z| - instead the answer tells you whether the band you are
+    looking at contains a mode whose peak is above the |Z| you just computed.
     """
     if not caps:
         return err("caps is empty", "ARG_REQUIRED",
@@ -336,9 +567,45 @@ def pdn_impedance(freqs_hz, caps, plane_cap_farad=None, r_series_ohm=0.0):
         if zmin is None or mag > 0 and mag < zmin:
             zmin = mag
             fpeak = f
+    plane_diag = None
+    if plane:
+        lo = min(float(f) for f in freqs_hz)
+        hi = max(float(f) for f in freqs_hz)
+        pm = pdn_plane_modes(plane.get("width_mm"), plane.get("height_mm"),
+                             plane.get("er"), plane.get("thickness_mm"),
+                             plane.get("tan_delta"),
+                             probe_mm=plane.get("probe_mm"),
+                             port_mm=plane.get("port_mm"),
+                             band_hz=[lo, hi],
+                             max_order=(plane.get("max_order")
+                                        if plane.get("max_order") is not None else 6))
+        if pm.get("status") == "error":
+            return pm
+        plane_diag = {
+            "sweep_band_hz": [round(lo, 6), round(hi, 6)],
+            "modes_in_band": [m for m in pm["value"]["modes"] if m.get("in_band")],
+            "worst_mode_in_band": pm["worst_mode"],
+            "z_min_lumped_ohm": round(zmin, 9),
+            "why_not_a_term": ("the modal impedance is not added to Y: the sum over "
+                               "modes does not converge near and above the first "
+                               "resonance, so it would be an artefact of the "
+                               "truncation order. Compare the mode's peak against "
+                               "the lumped |Z| instead"),
+        }
+        plane_diag["worst_mode_any_band"] = pm.get("worst_mode_any_band")
+        if plane_diag["worst_mode_in_band"]:
+            plane_diag["verdict"] = (
+                "a plane mode inside this band peaks at %s ohm, against a lumped "
+                "minimum of %s ohm - the lumped curve is NOT the PDN there"
+                % (plane_diag["worst_mode_in_band"]["z_peak_ohm"], round(zmin, 9)))
+        else:
+            plane_diag["verdict"] = ("no cavity mode of this plane pair falls inside "
+                                     "the sweep, so the lumped curve stands over it")
+
     return ok(value={"points": out, "min_z_ohm": round(zmin, 9),
                      "min_z_hz": round(fpeak, 6),
                      "caps": len(caps),
+                     "plane_modes": plane_diag,
                      "note": "a PDN is judged by its MAXIMUM |Z| over the band that "
                              "matters, not by its minimum - the minimum is just the "
                              "best case between resonances"},
@@ -349,7 +616,10 @@ def pdn_impedance(freqs_hz, caps, plane_cap_farad=None, r_series_ohm=0.0):
                         "BETWEEN two capacitor values is the number that fails, and it "
                         "is set by the plane inductance, which this model does not have",
               assumptions={"caps": len(caps), "r_series_ohm": float(r_series_ohm)},
-              extra={"not_computed": ["plane cavity resonances",
+              extra={"not_computed": ["plane cavity resonances inside the swept band"
+                                      if not plane else
+                                      "plane cavity resonances outside the swept "
+                                      "band (only the modes inside it are reported)",
                                       "anti-resonance from plane inductance",
                                       "die-package inductance",
                                       "capacitor DC bias / temperature derating"]})

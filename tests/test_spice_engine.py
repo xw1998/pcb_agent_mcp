@@ -149,6 +149,46 @@ class EngineCase(unittest.TestCase):
             json.dump(kw, fh)
 
 
+class TestVersionGating(EngineCase):
+    """Which version strings earn verified_against_engine:true.
+
+    This is the list that turns "an engine answered" into "a version this
+    repository has actually measured". It is asserted here with a stand-in that
+    renames itself, so the gate is tested even on a machine with no engine.
+    """
+
+    def _verified(self, version):
+        old = os.environ.get("FAKE_VERSION")
+        os.environ["FAKE_VERSION"] = version
+        try:
+            self.spec(kind="op", nodes={"1": 1.0, "2": 1.0})
+            r = spice.simulate(DIVIDER, engine="ngspice")
+        finally:
+            if old is None:
+                os.environ.pop("FAKE_VERSION", None)
+            else:
+                os.environ["FAKE_VERSION"] = old
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn(version.split()[0].lower(),
+                      (r.get("engine") or {}).get("version", "").lower())
+        return r["verified_against_engine"], r
+
+    def test_the_measured_builds_pass_and_the_untested_ones_do_not(self):
+        self.assertIn("ngspice-47", spice.VERIFIED_ENGINES)
+        self.assertIn("ngspice-41", spice.VERIFIED_ENGINES)
+        for v in ("ngspice-47 : Circuit level simulation program",
+                  "ngspice-41 : Circuit level simulation program"):
+            ok, r = self._verified(v)
+            self.assertTrue(ok, v)
+            self.assertIn("side by side", r["engine_verification"], v)
+
+    def test_a_version_that_was_never_run_is_named_and_refused(self):
+        for v in ("ngspice-45 : Circuit level simulation program",
+                  "fake-ngspice 1.0 (stand-in for tests)"):
+            ok, r = self._verified(v)
+            self.assertFalse(ok, v)
+            self.assertIn("not one this repository", r["engine_verification"], v)
+
 class TestDelegation(EngineCase):
     def test_operating_point_comes_from_the_engine(self):
         self.spec(kind="op", nodes={"1": 10.0, "2": 7.25})

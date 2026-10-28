@@ -9,6 +9,77 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.10] - 2026-10-28
+
+「把两张读不到原文的表做成可自证的答案」：IPC-2152 载流从"空表 + fail-closed"
+换成公开的闭式拟合，IEC 60664-1 爬电/电气间隙从"永远拒答"换成**行为反演出来的阶梯表**。
+两条路都不靠"我照 PDF 抄了一遍"，靠"我能重新生成并证明"（见 `docs/23`）。
+
+- **IEC 60664-1:2020-05 全量落地**（新增 `calc/iec60664.py`，648 行 + `data/iec60664_tables.json`）：
+  - 方法：编译 KiCad 10.0 的 `pcb_calculator/calculator_panels/iec60664.cpp`（只补 `<cstdlib>`），
+    先反演阶梯、再对拍。**三套独立探针共 188 528 点，0 失配**：
+    `grid.csv` 3 760（公共 API）、`sweep.csv` 93 120（密集几何扫描）、
+    `raw.csv` 91 648（`#define private public` 直读原始阶梯函数）。
+  - `creepage_mm` / `clearance_mm` / `impulse_withstand_v` / `min_groove_width_mm` / `spacing` /
+    `info`。32 条爬电阶梯 / 808 步、Table F.2 逐 PD 26/21/20/17 步、Table F.8 30 步、海拔 11 档。
+  - **复刻了三种"原文没写但实现有"的行为**：`Compute()` 的 `creepage >= clearance` clamp
+    （只在 `spacing()`，不在 `creepage_mm()`，并在 `extra` 里说明）；clearance 两分支
+    **任一越界即双双置 -1**（端口拒答，绝不留下还活着的那个分支去低估间距）；
+    Table F.5 的 PCB 材料列在 `V>1000`、`PD>=3`、`PD2+IIIb` 三处被静默关闭（端口把"你的开关没生效"写进 `extra`）。
+  - **断点靠恢复不靠继承**：旧做法从上一版 JSON 继承断点，导致 Table F.8 的
+    0.04/0.06/0.1/0.12/0.15/0.2/0.25 kV 与 Table F.2 的 40/50 kV 整段消失
+    （返回下一档的值，偏大且错）。新探针 `gen6.cpp` 几何走查 + 二分到 1e-12 + snap 到 1e-6 + 落边复核。
+  - `calc/creepage.py` 分流：`safety_standard` 命中 IEC 60664-1（任何写法）走新引擎，
+    其它安规族**继续 fail-closed**；新增 `spacing_required` 工具（两个距离一起算 +
+    `creepage >= clearance` + 槽宽 + `governing`）。
+- **IPC-2152 载流从空表换成闭式拟合**（`calc/current.py` + `data/ipc2152_tables.json`）：
+  Brooks & Adam 对 Table 3-1 的拟合，系数逐字抄自 KiCad 10.0 `track_width_calculations.cpp`
+  （外层 `K=215.3, a=2.0, b=-1.15, c=-1.0`，内层按铜厚四档）。金标
+  1 A / 10 °C / 1 oz / 外层 = **0.2773 mm**、内层 **0.2484 mm**、`current_capacity(0.254,10,1,ext)` = **0.951 A**。
+  系数放两处（代码常量兜底 + JSON 文档副本），**漂移即 `INTERNAL_CHECK_FAILED`**；
+  `via_current_allowed(standard="ipc2152")` 回 `STANDARD_SCOPE`（过孔载流不在这个拟合里）。
+- `safety_table_check` 新增 `which="iec60664"`（8 条检查：版本号 / verified 标志 / 两个独立来源 /
+  32 条阶梯齐全 / Table F.8 与污染等级无关 / 阶梯递增单调且 `max_v` 对齐 / 线性段过原点 /
+  物理探针 / `not_covered` 非空），并把 ipc2152 的校验从"锚点复现"扩成
+  "系数形状 + 锚点 + 物理探针"。**这两条校验都带变异测试**（改坏一处必须判死）。
+- 测试：新增 `tests/test_iec60664.py`（38 例，含变异层）、`tests/test_calc.py` 新增 11 例；
+  `--selftest` 60 → **68** 条，全绿（新增 4 条走协议级 `handle()`：2.5 mm 金标、
+  spacing 取大、PD4 拒答、校验器 usable）。
+- 文档：新增 `docs/23-两张读不到原文的表.md`。
+
+### 同一版里继续做完的四件欠账
+
+- **板级 2-D 电热场**（`calc/electrothermal.py` 264 → 780 行，`board_electrothermal`）：把
+  `k·t·∇²T − 2h(T−T_a) + q(T) + C·dT/dt = 0` 在均匀矩形网格上做 SOR（ω=1.85）。关键是
+  **把 `q` 的温升斜率放到矩阵对角线上**（`den = hc + capdt − q_slope`），于是稳态严格线性、
+  瞬态是后向 Euler；**失控在求解之前判**（任一格 `hc + capdt − q_ref·α <= 0` ⇒ `THERMAL_RUNAWAY`），
+  均匀板退化成 `P·α < 2hA`。金标：50×50×1.6、k=0.3、h=10、2 W、cell 2 mm ⇒ `t_max=73.393487`
+  （闭式 73.39345），5 W ⇒ 192.982，13 W ⇒ 拒答，α=0 时 2 W ⇒ 65.0。
+- **振动应力独立成层**（`vibration_plate_stress` + `plate_modes(stress_amplitude_mm=…)`）：
+  之前"最大应力点报在板角"只对一半——**一个点被用来回答两个问题**。角上是 `w_xy` 峰、
+  von Mises 最大（`vm=√3|τ|`），跨中是最大主应力最大（6.64 MPa，角上那份低 37%）。
+  现在三个极值分开报（`von_mises_*` / `sigma_max_*` / `tau_xy_max_*`）+ `peak_locations_note`；
+  误差棒是 degree 阶梯实测（K=5/7/9：频率 0.04%、曲率 3.6% ⇒ `degree_sensitivity_pct`），
+  点支承阶梯塌成一级时给 `None`（"没有误差棒"比"很小"诚实）。
+- **PDN 平面模态**（`pdn_plane_modes` + `pdn_impedance(plane=…)` 诊断）：单模峰值闭式
+  `|Z_peak| = w·μ0·t·ψ(r1)ψ(r2)·Q/k²`，`Q=1/tanδ`；50×50/εr4.4/1.6 mm/0.02 的 (1,0) 在
+  1.4292 GHz 峰 **91.4691 Ω**。**只给峰值不给曲线**：真跑模态求和时 1.45 GHz 处截断 10 阶是
+  5.6 Ω、40 阶是 9.4 Ω，随阶数漂移不收敛，那数字就是我选了几阶的函数。函数里带**电容锚点自检**
+  （`f=首模/100` 求和必须回到 `1/(ωC_plane)` 的 1% 内），这条校验抓出了自己 20 倍的归一化错。
+- **跨版本引擎对拍**（`VERIFIED_ENGINES = ("ngspice-47", "ngspice-41")`）：装了第二个构建
+  （conda-forge `ngspice-exe 41`，注意 conda 的 `ngspice` 只是 14 KB 元包），同一批 deck 两边
+  都跑：`.op`/`.ac` **逐位 0.0**（189 个标量），`.tran` 最多差 **1.24e-4 V**（1 V 阶跃，两构建
+  步长控制不同 ⇒ 网格也不同，这个数不是精度排名）。版本门控本身**不需要真引擎**就能测：
+  假引擎现在认 `$FAKE_VERSION`，让替身自称 `ngspice-41/47`（true）与 `ngspice-45`（false）。
+- **立创 Pro 第二轮实测（仍然起不来，但知道了死在哪一层）**：rc 0、0.5 s 内退出，`lceda-pro.exe`
+  自己的日志与 Chromium `debug.log` **一行都没写** ⇒ 它死在 Electron 之前；`--enable-logging=stderr`
+  被自有引导壳以 rc 9 拒掉；同一 shell 下 `kicad.exe` 正常起来（排除"这里起不了 GUI"）。
+  顺带读到安装目录里厂商自带的 **Pro API 0.3.38**（`resources/app/assets/pro-api/`，378 个类型、
+  `PCB_Document` 21 方法、`SCH_Document` 9、`PNL_Document` 1，附 `cli.js` 帮助器）——
+  但那是**进程内**扩展 API，不是传输，`verified_against_app` 仍是 false。
+- 测试与自检：新增 `tests/test_electrothermal_plate.py`（31）、`tests/test_vibration_stress.py`（21）、
+  `tests/test_pdn_plane.py`（27），`--selftest` 68 → **76**（新增板级应力二问、平面模态二问）。
+
 ## [0.0.9] - 2026-10-28
 
 「加类似 ADS 的功能」：把 ADS 里最常点的几个**合成**按钮做成工具——微带耦合线、

@@ -118,11 +118,46 @@ ngspice 写 ASCII rawfile 时的有效位数，不是求解差。
 
 两条由此定死的口径：
 
-- `verified_against_engine` **按版本动态判**（`VERIFIED_ENGINES = ("ngspice-47",)`）：装了引擎
-  ≠ 验证过引擎。别的版本回落 false，并在 `engine_verification` 里说明"这个版本没被本仓库的金标
-  网表跑过"。
+- `verified_against_engine` **按版本动态判**（`VERIFIED_ENGINES = ("ngspice-47", "ngspice-41")`）：
+  装了引擎 ≠ 验证过引擎。别的版本回落 false，并在 `engine_verification` 里说明"这个版本没被本仓库
+  的金标网表跑过"。
 - `simulate()` 的**默认引擎是 `builtin`**（`engine="auto"` 才能用上引擎）。默认值不能让同一
   网表在两台机器给出不同答案，而调用方从数字上看不出来。
+
+## 21.6b 跨版本对拍：两个构建说同一件事吗
+
+上一节的表是"引擎 vs 本模块内置求解器"。它有一个盲点：**如果我的 rawfile 解析或 deck 改写在
+两个版本上的行为不同，我只会看到"某一边差得多"，分不清是哪一边。** 所以又装了第二个构建，
+**同一份 deck 同时喂两边**，直接比两个引擎的数字。
+
+第二个构建：**ngspice-41**（Windows / conda-forge 的 `ngspice-exe 41 h295a5eb_0`；注意
+conda 的 `ngspice` 包本身是个 14 KB 的元包，它 `depends: ngspice-exe / ngspice-lib`，
+要单独取 `ngspice-exe`，7.6 MB，含 `Library/bin/ngspice_con.exe` 与
+`Library/lib/ngspice/{analog,digital,xtradev,xtraevt,spice2poly,table}.cm`）。
+
+| 网表 | 比较的标量 | `max\|d\|` |
+|---|---|---|
+| 分压 `.op` | 2 | **0.0** |
+| 二极管 `.op` | 2 | **0.0** |
+| BJT `.op` | 3 | **0.0** |
+| RLC `.ac`（21 频点 × 3 节点 × re/im/mag） | 189 | **0.0** |
+| RC 阶跃 `.tran`（79 点 × 2 节点） | 158 | **1.239e-04 V** |
+
+读法：
+
+- `.op` 与 `.ac` **逐位相同**（0.0，不是"小于容差"）——说明 rawfile 解析、节点名、AC 复数
+  拆分这几条管子在两个相差 6 个大版本的构建上都成立。
+- `.tran` 差 **1.24e-4 V**（1 V 阶跃上的 1.2e-4 相对），**只在一个时间点**。这不是谁错了：
+  两个构建的内部步长控制不同，各自的输出网格本来就不一样；我比的是"各自网格上最坏那一点"，
+  所以这个数**同时包含积分器差异与网格差异**，不能当"引擎 A 比 B 准"用。要拆开必须插值到
+  统一网格，那是另一个实验，没做。
+- 因此 `.tran` 这一格的上限被记成 **1.3e-4 V**，并写进 `ENGINE_VERIFICATION` 原文，而不是
+  "逐位相同"。
+
+对拍脚本留在 `_scratch/ng_cross.py`（不入库；它引用 `_scratch/ngspice/` 下的两个二进制，
+那些都不进仓库）。版本门控本身有测试，且**不需要真引擎**：假引擎现在认 `$FAKE_VERSION`，
+`tests/test_spice_engine.py::TestVersionGating` 让替身自称 `ngspice-47` / `ngspice-41`（必须
+为 true）与 `ngspice-45` / `fake-ngspice`（必须为 false）。
 
 ## 21.6a 装了引擎真正多出什么：未解析的 deck 直通
 
@@ -160,6 +195,6 @@ ngspice 写 ASCII rawfile 时的有效位数，不是求解差。
   - 未解析 deck 的文本兜底：`_last_analysis_card()` / `_tran_step_textual()`
   - 对外唯一入口：`simulate(netlist, analysis=None, max_iter=200, max_points=200,
     temp_c=None, engine="builtin", cross_check=False)`
-- `tests/test_spice_engine.py`（35 例：假引擎 `tests/_fake_ngspice.py` 覆盖解析/过滤/失败
-  路径/cross_check，7 例 `skipUnless(spice.find_ngspice())` 对着本机真引擎跑，其余纯解析/定位）
+- `tests/test_spice_engine.py`（37 例：假引擎 `tests/_fake_ngspice.py` 覆盖解析/过滤/失败
+  路径/cross_check、版本门控自称，7 例 `skipUnless(spice.find_ngspice())` 对着本机真引擎跑，其余纯解析/定位）
 - `sim_spice` 工具新增参数 `engine`、`cross_check`

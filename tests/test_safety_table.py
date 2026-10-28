@@ -23,9 +23,10 @@ def _row(v, d, pd="PD2", mg="IIIa", ins="basic", sources=("a", "b"), table="F.4"
             "sources": list(sources)}
 
 
-def _doc(rows, verified=True, edition="IEC 60664-1:2007", schema=2):
+def _doc(rows, verified=True, edition="IEC 60664-1:2007", schema=2,
+         key="creepage|IEC 60664-1"):
     return {"schema": schema, "verified": verified, "edition": edition,
-            "tables": {"creepage|IEC 60664-1": rows}}
+            "tables": {key: rows}}
 
 
 class TheShippedTablesStillRefuse(unittest.TestCase):
@@ -58,11 +59,21 @@ class TheShippedTablesStillRefuse(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0]["values_mm"], [1.5, 2.5])
 
-    def test_the_ipc2152_table_is_empty_and_not_usable(self):
+    def test_the_ipc2152_file_now_carries_the_published_fit(self):
+        # 0.0.1..0.0.9 shipped an EMPTY transcription of Table 3-1 and therefore
+        # failed closed. 0.0.10 replaced it with the Brooks & Adam closed-form fit
+        # copied from KiCad 10.0, which the checker can actually judge (anchors +
+        # physical probes), so "usable" is now the honest state - and the thing
+        # that fit throws away is still refused separately.
         rep = safety_table.check_which("ipc2152")
         self.assertEqual(rep["status"], "ok")
-        self.assertFalse(rep["usable"])
-        self.assertEqual(rep["rows"], 0)
+        self.assertTrue(rep["usable"], rep.get("failed"))
+        self.assertNotIn("declared_verified", rep.get("failed") or [])
+        # what the fit cannot cover is refused at the point of use, not here
+        from pcb_agent_mcp.calc import current
+        r = current.via_current_allowed(0.3, plating_um=25, standard="ipc2152")
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason_code"], "STANDARD_SCOPE")
 
 
 class ATableThatPassesAllTheRulesIsAccepted(unittest.TestCase):
@@ -145,8 +156,12 @@ class AnAcceptedTableActuallyAnswers(unittest.TestCase):
     """Proves the gate is not decorative: write a valid table, point the loader at it."""
 
     def test_a_valid_file_makes_the_lookup_work(self):
+        # Deliberately NOT IEC 60664-1: that family is answered by the recovered
+        # table in calc/iec60664.py and never reads this file, so pointing this
+        # test at it would assert nothing about the loader.
         rows = [_row(50, 0.6), _row(100, 0.9), _row(250, 2.5), _row(500, 3.0)]
-        doc = _doc(rows)
+        doc = _doc(rows, edition="IEC 62368-1:2018",
+                   key="creepage|IEC 62368-1")
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         try:
@@ -160,13 +175,13 @@ class AnAcceptedTableActuallyAnswers(unittest.TestCase):
             try:
                 r = creepage.creepage_required(250, pollution_degree=2,
                                                material_group="IIIa",
-                                               safety_standard="IEC 60664-1")
+                                               safety_standard="IEC 62368-1")
                 self.assertEqual(r["status"], "ok")
                 self.assertEqual(r["value"], 2.5)
                 # below the first tabulated step -> refused, not extrapolated
                 r2 = creepage.creepage_required(10, pollution_degree=2,
                                                 material_group="IIIa",
-                                                safety_standard="IEC 60664-1")
+                                                safety_standard="IEC 62368-1")
                 self.assertEqual(r2["reason_code"], "OUT_OF_TABLE")
             finally:
                 creepage.DATA_PATH = saved
