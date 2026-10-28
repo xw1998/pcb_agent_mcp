@@ -210,6 +210,59 @@ def selftest():
                              and s["residual_vswr"] < 1e-3 for s in sols),
           str([s.get("residual_vswr") for s in sols]))
 
+    # --- simulation layer. These four numbers are checked against the textbook
+    # (not against this code): a diode drop from the Shockley equation, a copper
+    # bar, a 1-D thermal resistance, and a chain drop that must NOT be computed
+    # from an averaged width.
+    r = handle({"jsonrpc": "2.0", "id": 74, "method": "tools/call",
+                "params": {"name": "sim_spice",
+                           "arguments": {
+                               "netlist": "* selftest\nV1 1 0 5\nR1 1 2 1k\n"
+                                          "D1 2 0 dmod\n.model dmod D(IS=1e-14)\n"
+                                          ".op\n.end\n"}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    _vd = ((payload.get("value") or {}).get("nodes_v") or {}).get("2")
+    check("SPICE diode at 4.3 mA sits at 0.6925 V",
+          payload.get("status") == "ok" and _vd is not None
+          and abs(_vd - 0.692543633) < 1e-5, str(_vd))
+
+    r = handle({"jsonrpc": "2.0", "id": 75, "method": "tools/call",
+                "params": {"name": "trace_resistance",
+                           "arguments": {"length_mm": 1, "width_mm": 0.2,
+                                         "thickness_um": 35}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    _r = ((payload.get("value") or {}).get("resistance_ohm"))
+    check("1 mm of 0.2 mm 35 um copper is 2.4629 mOhm (5 squares)",
+          payload.get("status") == "ok" and _r is not None
+          and abs(_r - 0.002462857) < 1e-9, str(_r))
+
+    r = handle({"jsonrpc": "2.0", "id": 76, "method": "tools/call",
+                "params": {"name": "thermal_stack",
+                           "arguments": {"layers": [{"thickness_mm": 1.6,
+                                                     "k_w_mk": 0.3}],
+                                         "area_mm2": 100, "power_w": 0.5}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    _rth = ((payload.get("value") or {}).get("rth_k_per_w"))
+    check("1.6 mm FR4 over 100 mm2 is 53.333 K/W and 0.5 W raises it 26.667 K",
+          payload.get("status") == "ok" and _rth is not None
+          and abs(_rth - 53.333333333) < 1e-6
+          and abs(payload["value"]["delta_t_k"] - 26.666667) < 1e-5, str(_rth))
+
+    r = handle({"jsonrpc": "2.0", "id": 77, "method": "tools/call",
+                "params": {"name": "ir_drop_chain",
+                           "arguments": {
+                               "segments": [{"length_mm": 10, "width_mm": 0.3,
+                                             "thickness_um": 35},
+                                            {"length_mm": 5, "width_mm": 0.2,
+                                             "thickness_um": 35}],
+                               "current_a": 1}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    _v = ((payload.get("value") or {}).get("total_drop_v"))
+    # hand: 1.724e-8*(10e-3/(0.3e-3*35e-6) + 5e-3/(0.2e-3*35e-6)) = 28.7333 mV
+    check("a chain of two widths is 28.733 mV at 1 A, not an average",
+          payload.get("status") == "ok" and _v is not None
+          and abs(_v - 0.028733333) < 1e-7, str(_v))
+
     r = handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                 "params": {"name": "board_summary",
                            "arguments": {"path": "__NO_SUCH_BOARD__.kicad_pcb"}}})

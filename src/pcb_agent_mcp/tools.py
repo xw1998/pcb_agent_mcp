@@ -23,6 +23,9 @@ from .calc import antenna as _antenna
 from .calc import feedline as _feedline
 from .calc import link as _link
 from .calc import matching as _matching
+from .calc import power as _power
+from .calc import spice as _spice
+from .calc import thermal as _thermal
 from .calc.result import err
 from .adapters import FORMATS as _FORMATS
 from .adapters import detect_format as _detect_format
@@ -1173,6 +1176,16 @@ def _capabilities(_args):
                        "distances. There is NO full-wave solver here and no pattern, "
                        "efficiency or detuning prediction - the answers are the starting "
                        "geometry, and every one of them says what it cannot see",
+            "simulation": "circuit simulation (SPICE: .op / .tran / .ac with Newton + "
+                          "junction limiting + gmin stepping, per-element results "
+                          "reported back), current and PDN (trace / via / barrel "
+                          "resistance, IR drop from the board's own copper, "
+                          "decoupling impedance and worst-case anti-resonance), and "
+                          "thermal (1-D stacks, via arrays, a real 2-D plate solve "
+                          "with an energy-balance check, RC transients, heatsink "
+                          "budget). Every model is lumped or closed-form: no "
+                          "full-wave, no electrothermal coupling, no thermal "
+                          "radiation",
             "desktop": "find / start / stop the EDA and open a project, verified by "
                        "window title - never touches a project file",
             "write": "propose (compute only, no byte is written) -> apply (confirm=true, "
@@ -1208,6 +1221,11 @@ def _capabilities(_args):
             "link_friis", "link_max_range", "link_aperture", "link_far_field",
             "link_fresnel",
             "board_antenna_keepout",
+            "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
+            "ir_drop_chain", "pdn_impedance", "decoupling_check",
+            "thermal_stack", "thermal_via_array", "thermal_plate",
+            "thermal_transient", "thermal_heatsink", "thermal_convection",
+            "board_ir_drop",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
@@ -1232,7 +1250,8 @@ def _capabilities(_args):
         "derived_vs_authoritative": {
             "derived (this server computed it)": [
                 "board_clearance", "board_free_space", "board_pour_connectivity",
-                "board_cross_split", "board_loop_area", "board_antenna_keepout"],
+                "board_cross_split", "board_loop_area", "board_antenna_keepout",
+                "board_ir_drop"],
             "authoritative (vendor engine said it)": ["board_drc", "board_stats"],
             "checked_against_the_vendor": {
                 "board_cross_check": "runs the derived answer and the vendor's own DRC on "
@@ -1285,6 +1304,29 @@ def _capabilities(_args):
             "paywalled and public reproductions contradict each other, so a filled row "
             "would be a guess with a citation glued on",
             "Impedance/creepage tables for standards other than IPC-2221 / IPC-2141A",
+            "Simulation is a SUBSET of SPICE, by name: the sim_spice solver handles "
+            "R C L V I E G D Q M with .op/.tran/.ac/.model/.temp and rejects F H J K "
+            "S W X B T O U A cards with the card named in the error. What it does not "
+            "do: temperature-dependent device models, noise (.noise), distortion, "
+            "Monte Carlo, subcircuits, behavioural sources, and any model card "
+            "beyond the ones listed - it also uses dense LU, so it refuses above ~400 "
+            "unknowns and says to use ngspice",
+            "Electrothermal coupling: nothing here feeds a temperature rise back into "
+            "rho or into the device models. board_ir_drop uses the copper temperature "
+            "you state, and the thermal tools take the power you state - the loop "
+            "between them is the user's to close by iterating",
+            "Transient current density / surge and fusing: current_capacity is a "
+            "steady-state table check, and board_ir_drop reports A/mm^2 with no "
+            "criterion attached. Fusing a trace needs a temperature-rise criterion and "
+            "an adiabatic energy calculation, neither of which is here",
+            "PDN plane resonances and die-package inductance: pdn_impedance / "
+            "decoupling_check are lumped RLC in parallel, so they can prove a bank is "
+            "clearly insufficient and cannot prove it is sufficient",
+            "Thermal plating thinning, TIM interface resistance and heatsink "
+            "selection: thermal_via_array reports an OPTIMISTIC barrel resistance "
+            "(uniform plating), rth_cs is an input the user must supply, and "
+            "thermal_heatsink returns the BUDGET - there is deliberately no heatsink "
+            "table in this server",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
                     "missing fact is refused or declared absent, never defaulted",
@@ -1340,6 +1382,21 @@ def _capabilities(_args):
                          "one field2d already scores against the 2-D solver (-0.35 % .. "
                          "-2.83 %); CPW/GCPW are NOT solver-validated, only limit-checked, "
                          "and say so",
+            "simulation": "golden values computed by hand, not by the code being "
+                          "tested: a 10 V 1k/2k divider gives 6.666666662 V (3e-9 "
+                          "from gmin), an RC step on 1k/1u matches the BACKWARD-EULER "
+                          "closed form 1-(1/(1+h/tau))^50 to all 16 digits (and differs "
+                          "from the continuous 0.993262, which is what proves the "
+                          "integrator is the one claimed), a 10 ohm / 1 mH / 100 nF "
+                          "series tank peaks at 15915.49 Hz with |V_C| = 10.0069 = Q, a "
+                          "diode at 5 V/1k lands at Vd = 0.692544 V, a BJT gives beta "
+                          "= 200.0 exactly, a MOSFET gives Vds = 4.0000 by the square "
+                          "law, and the copper/thermal numbers are rho*L/(w*t) and "
+                          "t/(k*A) to the digit (1 mm x 0.2 mm x 35 um = 2.462857 mohm; "
+                          "1.6 mm FR4 at 100 mm^2 = 53.3333 K/W). The 2-D plate solve "
+                          "is checked against its own energy balance (power in vs "
+                          "convection out, refused above 0.5 % residual) and against "
+                          "the P/(2hA) limit for a high-k plate",
         },
     }
 
@@ -1921,6 +1978,296 @@ _tool(
         "limit": _num("max rows per list", 200),
     }, "required": ["path"]},
     _sch_view,
+)
+
+# ---------------------------------------------------------------- simulation
+_tool(
+    "sim_spice",
+    "Run a real circuit simulation on a SPICE netlist: DC operating point (.op), transient "
+    "(.tran) and small-signal AC (.ac). Solves the actual nonlinear equations (Newton + "
+    "junction voltage limiting + gmin stepping), and reports per-element voltage, current "
+    "and power so the answer can be checked instead of trusted. Element cards: R C L V I "
+    "E G D Q M. Unimplemented cards (X/F/H/K/S/W/B/T/O/U/A) are REJECTED BY NAME, never "
+    "skipped silently - a netlist that half-runs is worse than one that refuses.",
+    {"type": "object", "properties": {
+        "netlist": _str("SPICE netlist text, one card per line; a leading * is a comment. "
+                        "The first line is not skipped unless it starts with * - write "
+                        "a title line beginning with * to be safe"),
+        "analysis": _str("override or omit the .op/.tran/.ac) card: e.g. "
+                         "'.tran 0.1m 5m' or '.ac dec 20 1 1meg'"),
+        "temp_c": _num("simulation temperature, 27 C default unless a .temp card is "
+                       "present", 27),
+        "max_iter": _num("Newton iteration budget per solve", 200),
+        "max_points": _num("cap on transient/AC output points", 200),
+    }, "required": ["netlist"]},
+    lambda a: _spice.simulate(a.get("netlist"), analysis=a.get("analysis"),
+                              temp_c=a.get("temp_c"),
+                              max_iter=int(a.get("max_iter") or 200),
+                              max_points=int(a.get("max_points") or 200)),
+)
+
+_tool(
+    "trace_resistance",
+    "DC resistance of a copper trace from its geometry: R = rho(T)*L/(w*t). Use it for the "
+    "quiet half of the question - the rest of it (vias, spreading, connectors) is not in "
+    "this number.",
+    {"type": "object", "properties": {
+        "length_mm": _num("trace length"),
+        "width_mm": _num("trace width"),
+        "thickness_um": _num("copper thickness (1 oz = 35 um)"),
+        "temp_c": _num("copper temperature", 20),
+        "layers": _num("how many layers carry this trace in parallel", 1),
+    }, "required": ["length_mm", "width_mm", "thickness_um"]},
+    lambda a: _power.copper_resistance(a.get("length_mm"), a.get("width_mm"),
+                                       a.get("thickness_um"),
+                                       temp_c=a.get("temp_c") or 20,
+                                       layers=int(a.get("layers") or 1)),
+)
+
+_tool(
+    "via_resistance",
+    "DC resistance of plated via barrels: the cross-section is the copper ANNULUS, not the "
+    "drill circle. Answers 'how many vias does this 3 A path need' in resistance terms - "
+    "current capacity is a separate question with a temperature-rise criterion.",
+    {"type": "object", "properties": {
+        "drill_mm": _num("finished hole diameter"),
+        "plating_um": _num("barrel wall thickness (typically 20..25 um)"),
+        "length_mm": _num("barrel length = board thickness"),
+        "temp_c": _num("copper temperature", 20),
+        "count": _num("how many vias in parallel", 1),
+    }, "required": ["drill_mm", "plating_um", "length_mm"]},
+    lambda a: _power.via_resistance(a.get("drill_mm"), a.get("plating_um"),
+                                    a.get("length_mm"),
+                                    temp_c=a.get("temp_c") or 20,
+                                    count=int(a.get("count") or 1)),
+)
+
+_tool(
+    "trace_inductance",
+    "Self-inductance of a straight trace (Grover ribbon formula). Order of magnitude "
+    "+-20%: it ranks two layouts, it does not predict a resonance. The ground-plane image "
+    "term is reported as NOT included rather than folded in silently.",
+    {"type": "object", "properties": {
+        "length_mm": _num("trace length"),
+        "width_mm": _num("trace width"),
+        "height_mm": _num("height above the return plane"),
+    }, "required": ["length_mm", "width_mm", "height_mm"]},
+    lambda a: _power.trace_inductance(a.get("length_mm"), a.get("width_mm"),
+                                      a.get("height_mm")),
+)
+
+_tool(
+    "ir_drop_chain",
+    "Series IR drop along an ordered chain of copper segments - the case that is usually "
+    "got wrong by averaging the widths. Each segment keeps its own length/width/thickness.",
+    {"type": "object", "properties": {
+        "segments": {"type": "array", "description":
+                     "list of {length_mm, width_mm, thickness_um}, in current order",
+                     "items": {"type": "object"}},
+        "current_a": _num("current through the chain"),
+        "temp_c": _num("copper temperature", 20),
+    }, "required": ["segments", "current_a"]},
+    lambda a: _power.ir_drop(a.get("segments"), a.get("current_a"),
+                             temp_c=a.get("temp_c") or 20),
+)
+
+_tool(
+    "pdn_impedance",
+    "|Z(f)| of a capacitor bank as seen by the die: parallel series-RLC capacitors plus "
+    "optional plane capacitance. Plots the whole curve because the failure mode is the "
+    "ANTI-RESONANCE between two cap values, not a low minimum.",
+    {"type": "object", "properties": {
+        "freqs_hz": {"type": "array", "description": "frequencies to evaluate",
+                     "items": {"type": "number"}},
+        "caps": {"type": "array", "description":
+                 "list of {c_farad, esr_ohm, esl_h}", "items": {"type": "object"}},
+        "plane_cap_farad": _num("plane pair capacitance, if known"),
+        "r_series_ohm": _num("series resistance in the path, if known"),
+    }, "required": ["freqs_hz", "caps"]},
+    lambda a: _power.pdn_impedance(a.get("freqs_hz"), a.get("caps"),
+                                   plane_cap_farad=a.get("plane_cap_farad"),
+                                   r_series_ohm=a.get("r_series_ohm") or 0.0),
+)
+
+_tool(
+    "decoupling_check",
+    "Does this cap bank hold the rail inside a ripple target over a band? Needs the current, "
+    "the band and the ripple - without all three the answer would be a guess. Verdict is "
+    "pass / fail / INDETERMINATE: indeterminate when the worst |Z| lands on the low band "
+    "edge, because below the regulator's crossover the REGULATOR holds the rail, not the "
+    "caps. Pass regulator_bandwidth_hz to judge only the region the caps own.",
+    {"type": "object", "properties": {
+        "vdd_v": _num("rail voltage"),
+        "load_current_a": _num("load current step / draw"),
+        "ripple_mv": _num("allowed ripple, peak-to-peak, mV"),
+        "band_hz": {"type": "array", "description": "[f_low, f_high]", "items": {"type": "number"}},
+        "caps": {"type": "array", "description":
+                 "list of {c_farad, esr_ohm, esl_h}", "items": {"type": "object"}},
+        "r_series_ohm": _num("series resistance between bank and load"),
+        "regulator_bandwidth_hz": _num("crossover of the regulator loop, if known"),
+    }, "required": ["vdd_v", "load_current_a", "ripple_mv", "band_hz", "caps"]},
+    lambda a: _power.decoupling_plan(a.get("vdd_v"), a.get("load_current_a"),
+                                     a.get("ripple_mv"), a.get("band_hz"),
+                                     a.get("caps"),
+                                     r_series_ohm=a.get("r_series_ohm") or 0.0,
+                                     regulator_bandwidth_hz=a.get("regulator_bandwidth_hz")),
+)
+
+_tool(
+    "thermal_stack",
+    "1-D thermal resistance through a stack of layers: Rth = sum(t/(k*A)), plus the "
+    "temperature rise for a stated power. Strictly 1-D - it cannot see spreading, which is "
+    "why thermal_plate exists.",
+    {"type": "object", "properties": {
+        "layers": {"type": "array", "description":
+                   "list of {name, thickness_mm, k_w_mk} - k may be the string "
+                   "'cu' / 'fr4' / 'al' / 'sac305'", "items": {"type": "object"}},
+        "area_mm2": _num("heat-crossing area (the annulus, not the drill circle)"),
+        "power_w": _num("dissipated power"),
+        "t_ambient_c": _num("ambient"),
+        "h_w_m2k": _num("convection coefficient, to report its Rth separately"),
+    }, "required": ["layers", "area_mm2"]},
+    lambda a: _thermal.thermal_stack(a.get("layers"), a.get("area_mm2"),
+                                     power_w=a.get("power_w"),
+                                     t_ambient_c=a.get("t_ambient_c"),
+                                     h_w_m2k=a.get("h_w_m2k")),
+)
+
+_tool(
+    "thermal_via_array",
+    "Thermal resistance through a field of plated vias - the thermal twin of "
+    "via_resistance, same annulus geometry. With pitch_mm the surrounding FR4 is put in "
+    "parallel, which is what a real via field looks like. An OPTIMISTIC number: plating is "
+    "thinner mid-barrel.",
+    {"type": "object", "properties": {
+        "drill_mm": _num("finished hole diameter"),
+        "plating_um": _num("barrel wall thickness"),
+        "length_mm": _num("board thickness"),
+        "count": _num("number of vias", 1),
+        "pitch_mm": _num("via pitch, to add the FR4 cell in parallel"),
+        "k_board": _num("board dielectric conductivity", 0.3),
+    }, "required": ["drill_mm", "plating_um", "length_mm"]},
+    lambda a: _thermal.via_array_thermal(a.get("drill_mm"), a.get("plating_um"),
+                                         a.get("length_mm"),
+                                         count=int(a.get("count") or 1),
+                                         pitch_mm=a.get("pitch_mm"),
+                                         k_board=a.get("k_board") or 0.3),
+)
+
+_tool(
+    "thermal_plate",
+    "2-D steady-state temperature of a plate with point heat sources: k*t*lap(T) - "
+    "2h(T-Tamb) + q'' = 0 solved by SOR, with the energy balance checked (a field whose "
+    "power does not balance is refused, not reported). This is the only tool here that "
+    "shows the HOT SPOT versus the average, i.e. how much a small pad costs compared with "
+    "spreading the same power. Give each source a size_mm (its pad) - a true point source "
+    "makes the hot spot diverge as the grid shrinks.",
+    {"type": "object", "properties": {
+        "width_mm": _num("plate width"), "height_mm": _num("plate height"),
+        "thickness_mm": _num("plate thickness"),
+        "k_w_mk": _num("in-plane conductivity (0.3 FR4, 385 copper, or an equivalent "
+                       "from a copper-coverage estimate)"),
+        "h_w_m2k": _num("convection coefficient, both faces (natural air ~10)"),
+        "sources": {"type": "array", "description":
+                    "list of {x_mm, y_mm, power_w, size_mm}", "items": {"type": "object"}},
+        "t_ambient_c": _num("ambient", 25),
+        "cell_mm": _num("grid step (default min(W,H)/40); compare layouts only at the "
+                        "same step"),
+        "edge_temp_c": _num("hold the edges at this temperature instead of insulating them"),
+    }, "required": ["width_mm", "height_mm", "thickness_mm", "k_w_mk", "h_w_m2k",
+                    "sources"]},
+    lambda a: _thermal.plate_temperature(
+        a.get("width_mm"), a.get("height_mm"), a.get("thickness_mm"),
+        a.get("k_w_mk"), a.get("h_w_m2k"), a.get("sources"),
+        t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
+        cell_mm=a.get("cell_mm"), edge_temp_c=a.get("edge_temp_c")),
+)
+
+_tool(
+    "thermal_transient",
+    "Step response of a thermal RC network (Foster form): T(t) = Tamb + P*sum R_i(1 - "
+    "exp(-t/tau_i)). Rth and Cth may be lists - a real package is 3-4 time constants, and "
+    "a single one both under-predicts a short pulse peak and mis-states the tail.",
+    {"type": "object", "properties": {
+        "rth_k_per_w": {"description": "number or list of stage resistances"},
+        "cth_j_per_k": {"description": "number or list of stage capacitances"},
+        "power_w": _num("dissipated power"),
+        "t_end_s": _num("how long to simulate"),
+        "t_ambient_c": _num("ambient", 25),
+        "points": _num("curve points", 40),
+    }, "required": ["rth_k_per_w", "cth_j_per_k", "power_w", "t_end_s"]},
+    lambda a: _thermal.thermal_transient(a.get("rth_k_per_w"), a.get("cth_j_per_k"),
+                                         a.get("power_w"), a.get("t_end_s"),
+                                         t_ambient_c=(a["t_ambient_c"]
+                                                      if a.get("t_ambient_c") is not None
+                                                      else 25.0),
+                                         points=int(a.get("points") or 40)),
+)
+
+_tool(
+    "thermal_heatsink",
+    "What Rth(junction-to-air) do I need? Solves the thermal budget and returns the target "
+    "with a safety margin. Deliberately ships NO heatsink table: a table would be the one "
+    "number in this layer not derived from a stated input.",
+    {"type": "object", "properties": {
+        "power_w": _num("dissipated power"),
+        "t_j_max_c": _num("junction limit from the datasheet"),
+        "t_ambient_c": _num("ambient inside the enclosure, not the room"),
+        "rth_jc_k_per_w": _num("junction-to-case from the datasheet"),
+        "rth_cs_k_per_w": _num("case-to-sink: TIM area and pressure matter", 0.0),
+        "safety_margin": _num("fraction of the budget you are willing to use", 0.8),
+    }, "required": ["power_w", "t_j_max_c", "t_ambient_c", "rth_jc_k_per_w"]},
+    lambda a: _thermal.heatsink_select(
+        a.get("power_w"), a.get("t_j_max_c"), a.get("t_ambient_c"),
+        a.get("rth_jc_k_per_w"),
+        rth_cs_k_per_w=(a["rth_cs_k_per_w"] if a.get("rth_cs_k_per_w") is not None
+                        else 0.0),
+        safety_margin=(a["safety_margin"] if a.get("safety_margin") is not None
+                       else 0.8)),
+)
+
+_tool(
+    "thermal_convection",
+    "Convection coefficient from airflow or surface size, so it does not have to be "
+    "invented. An engineering correlation (+-25%): use it to compare two airflow "
+    "assumptions, never to prove a design safe.",
+    {"type": "object", "properties": {
+        "airflow_m_s": _num("air speed, 0 for still air"),
+        "mode": _str("forced | natural", enum=["forced", "natural"], default="forced"),
+        "length_m": _num("surface extent, required for natural convection"),
+    }, "required": ["airflow_m_s"]},
+    lambda a: _thermal.convection_coefficient(a.get("airflow_m_s"),
+                                              length_m=a.get("length_m"),
+                                              mode=a.get("mode") or "forced"),
+)
+
+_tool(
+    "board_ir_drop",
+    "DC voltage drop across ONE net, built from the copper the board ACTUALLY carries: "
+    "every track segment becomes rho*L/(w*t) with t from the stackup copper weight, every "
+    "via a barrel, plated pads join their layers, and nodes are (x, y, layer) - so two "
+    "layers only touch where a via or a plated pad really joins them. That is the part a "
+    "length-times-sheet-resistance estimate cannot see. Refuses when copper thickness or "
+    "via plating is unknown, or when no track connects a sink to the source.",
+    {"type": "object", "properties": dict({
+        "net": _str("the net to measure (name, as board_nets prints it)"),
+        "source": _str("pad the current enters, as REF.PAD - e.g. U1.1"),
+        "sinks": {"type": "array", "description":
+                  "list of 'REF.PAD' or {pad, current_a}", "items": {}},
+        "current_a": _num("total current, split evenly over sinks that do not state "
+                          "their own"),
+        "copper_um": _num("copper thickness to use for EVERY layer; overrides the stackup"),
+        "plating_um": _num("via barrel wall thickness - required if the net has vias"),
+        "quantize_mm": _num("nodes closer than this are merged", 0.01),
+        "temp_c": _num("copper temperature", 20),
+    }, **_COMMON),
+     "required": ["path", "net", "source", "sinks"]},
+    _board_tool(lambda b, a: _oracle.board_ir_drop(
+        b, a.get("net"), a.get("source"), a.get("sinks"),
+        current_a=a.get("current_a"), copper_um=a.get("copper_um"),
+        plating_um=a.get("plating_um"),
+        quantize_mm=(a["quantize_mm"] if a.get("quantize_mm") is not None else 0.01),
+        temp_c=(a["temp_c"] if a.get("temp_c") is not None else 20.0)), derived=True),
 )
 
 _tool(

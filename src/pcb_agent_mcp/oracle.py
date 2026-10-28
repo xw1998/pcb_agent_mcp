@@ -871,3 +871,409 @@ def antenna_keepout(board, x_mm, y_mm, width_mm, length_mm, layer=None,
         assumptions={"x_mm": x, "y_mm": y, "width_mm": w, "length_mm": ln,
                      "coordinate_system": "same as board_components (board units, Y up)"},
     )
+
+
+# --------------------------------------------------------------- IR drop
+def _cu_um_by_layer(board):
+    """Copper thickness per copper layer, as far as the stackup states it."""
+    out = {}
+    for s in board.stackup or []:
+        name = str(s.get("name") or "")
+        if not name.endswith(".Cu"):
+            continue
+        t = s.get("copper_um")
+        try:
+            t = float(t) if t is not None else None
+        except (TypeError, ValueError):
+            t = None
+        if t and t > 0:
+            out[name] = t
+    return out
+
+
+def _stack_thickness(board):
+    """Board thickness for a via barrel: the stated total, or the stackup sum."""
+    t = board.thickness_mm
+    try:
+        t = float(t) if t is not None else None
+    except (TypeError, ValueError):
+        t = None
+    if t and t > 0:
+        return t
+    tot = 0.0
+    for s in board.stackup or []:
+        try:
+            v = float(s.get("thickness_mm"))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            tot += v
+    return tot if tot > 0 else None
+
+
+def _pad_lookup(board, spec):
+    """Find pads by "REF.PAD" (or by "REF" when the footprint has one pad)."""
+    want_ref, _, want_pad = str(spec).partition(".")
+    hits = []
+    for fp in board.footprints:
+        if str(fp.get("ref")) != want_ref:
+            continue
+        for pad in fp.get("pads") or []:
+            num = str(pad.get("number") or "")
+            if want_pad == "" or num == want_pad:
+                hits.append((fp, pad))
+    return hits
+
+
+def _pad_xy(fp, pad):
+    try:
+        return float(pad["x"]), float(pad["y"])
+    except (KeyError, TypeError, ValueError):
+        return float(fp.get("x") or 0.0), float(fp.get("y") or 0.0)
+
+
+def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
+                  plating_um=None, quantize_mm=0.01, temp_c=20.0,
+                  max_nodes=1200):
+    """DC voltage drop across ONE net, out of the copper the board actually carries.
+
+    This is "will 2 A make it from the regulator to the MCU without browning it
+    out", and the only honest way to answer is to build the resistor network out
+    of the real tracks, vias and pads - not to multiply a length by a sheet
+    resistance.
+
+    Nodes are (x, y, layer): two layers only touch where a via or a plated pad
+    joins them, which is exactly the thing a length-times-resistivity estimate
+    cannot see and the usual reason a real drop is much worse than the estimate.
+
+    source: "U1.1"  - the pad the current enters
+    sinks:  ["U2.8", ...] or [{"pad": "U2.8", "current_a": 0.3}, ...]
+    current_a: the total, split evenly over the sinks when they do not state
+               their own share
+
+    Refuses instead of guessing when a used layer has no copper thickness, when
+    the net has vias and `plating_um` is missing, or when nothing connects. A
+    copper pour on the same net is reported as a warning: it is in parallel, so
+    the drop is then an upper bound.
+    """
+    from .calc import power as PW
+
+    if not net:
+        return err("net is required", "ARG_REQUIRED")
+    try:
+        q = float(quantize_mm or 0.01)
+    except (TypeError, ValueError):
+        return err("quantize_mm must be a number", "ARG_INVALID")
+    if q <= 0:
+        return err("quantize_mm must be > 0", "ARG_RANGE")
+
+    cu = _cu_um_by_layer(board)
+    missing = []
+
+    # An explicitly passed copper_um WINS over the stackup (the caller may know
+    # the real post-plating weight) - and if the two disagree the fact is said
+    # out loud instead of one of them being silently used.
+    explicit = None
+    if copper_um is not None:
+        try:
+            explicit = float(copper_um)
+        except (TypeError, ValueError):
+            return err("copper_um must be a number", "ARG_INVALID")
+        if explicit <= 0:
+            return err("copper_um must be > 0", "ARG_RANGE")
+
+    def thick(layer):
+        if explicit is not None:
+            return explicit
+        if layer in cu:
+            return cu[layer]
+        missing.append(layer)
+        return None
+
+    nodes = {}
+    names = []
+    edges = []
+    warnings = []
+
+    def node(x, y, layer):
+        key = (int(round(float(x) / q)), int(round(float(y) / q)), layer)
+        if key not in nodes:
+            nodes[key] = "n%d" % len(names)
+            names.append({"id": nodes[key], "x_mm": key[0] * q,
+                          "y_mm": key[1] * q, "layer": layer})
+        return nodes[key]
+
+    def add(a, b, r, kind, label, **kw):
+        if a == b or r <= 0:
+            return None
+        e = {"a": a, "b": b, "resistance_ohm": r, "kind": kind, "label": label}
+        e.update(kw)
+        edges.append(e)
+        return e
+
+    tracks = [t for t in board.tracks if t.get("net") == net]
+    vias = [v for v in board.vias if v.get("net") == net]
+    pads = []
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            if pad.get("net") == net:
+                pads.append((fp, pad))
+
+    if not tracks:
+        return err("net %r has no tracks on this board" % (net,), "NOT_APPLICABLE",
+                   hint="without tracks there is no path to measure; an IR drop "
+                        "answered from pad positions alone would be fiction")
+
+    # ---- tracks
+    for tr in tracks:
+        layer = tr.get("layer")
+        t_um = thick(layer)
+        if t_um is None:
+            continue
+        try:
+            w = float(tr.get("width") or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+        if w <= 0:
+            return err("a track on net %r has width 0" % (net,), "INTERNAL")
+        pts = tr.get("_points") or [tr["start"], tr["end"]]
+        for i in range(len(pts) - 1):
+            x1, y1 = float(pts[i][0]), float(pts[i][1])
+            x2, y2 = float(pts[i + 1][0]), float(pts[i + 1][1])
+            L = math.hypot(x2 - x1, y2 - y1)
+            if L <= 0:
+                continue
+            r = PW._rho(temp_c) * (L * 1e-3) / (w * 1e-3 * t_um * 1e-6)
+            add(node(x1, y1, layer), node(x2, y2, layer), r, "track",
+                "%s %.4gmm x %.3gmm" % (layer, L, w),
+                layer=layer, length_mm=L, width_mm=w, copper_um=t_um)
+    if missing:
+        return err("no copper thickness for layer(s) %s: the stackup does not "
+                   "carry it and copper_um was not given" %
+                   ", ".join(sorted(set(missing))), "ARG_REQUIRED",
+                   hint="pass copper_um (1 oz = ~35 um, 2 oz = ~70 um after "
+                        "plating); guessing it moves the answer by a factor of two")
+
+    layer_warnings = []
+    if explicit is not None and cu:
+        odd = {k: v for k, v in cu.items() if abs(v - explicit) > 1e-9}
+        if odd:
+            layer_warnings.append(
+                "copper_um=%.6g was used for every layer and OVERRIDES the "
+                "stackup, which says %s" %
+                (explicit, ", ".join("%s=%.6gum" % (k, v)
+                                     for k, v in sorted(odd.items()))))
+
+    # ---- vias: the only place two layers touch
+    board_th = _stack_thickness(board)
+    for vi in vias:
+        if plating_um is None:
+            return err("net %r has %d via(s) and plating_um was not given" %
+                       (net, len(vias)), "ARG_REQUIRED",
+                       hint="a via barrel is a copper tube; without the wall "
+                            "thickness (usually 20..25 um, thinner mid-barrel) "
+                            "its resistance is not knowable")
+        if board_th is None:
+            return err("the board thickness is not stated, so the via barrel "
+                       "length is unknown", "ARG_REQUIRED",
+                       hint="pass a stackup with thickness_mm or set "
+                            "board.thickness_mm")
+        try:
+            drill = float(vi.get("drill") or 0.0)
+        except (TypeError, ValueError):
+            drill = 0.0
+        if drill <= 0:
+            return err("a via on net %r has no drill size" % (net,), "INTERNAL")
+        vr = PW.via_resistance(drill, float(plating_um), board_th, temp_c=temp_c)
+        if vr.get("status") != "ok":
+            return vr
+        r_via = vr["value"]["single_via_ohm"]
+        x, y = float(vi["x"]), float(vi["y"])
+        layers = _layer_span(board, vi.get("from"), vi.get("to"))
+        if len(layers) < 2:
+            warnings.append("via at (%.3f, %.3f) spans a single layer - ignored"
+                            % (x, y))
+            continue
+        add(node(x, y, layers[0]), node(x, y, layers[-1]), r_via, "via",
+            "via %.2gmm/%.3gum" % (drill, float(plating_um)),
+            layer="|".join([layers[0], layers[-1]]), drill_mm=drill,
+            plating_um=float(plating_um))
+
+    # ---- pads: plated holes join their layers, SMD pads are just terminals
+    pad_line = 1e-6
+    for fp, pad in pads:
+        px, py = _pad_xy(fp, pad)
+        layers = _item_layers(board, pad.get("layers"))
+        if not layers:
+            continue
+        for lay in layers:
+            node(px, py, lay)
+        if pad.get("hole_mm") and len(layers) > 1:
+            for k in range(len(layers) - 1):
+                add(node(px, py, layers[k]), node(px, py, layers[k + 1]),
+                    pad_line, "pad_barrel", "plated hole %s" % (layers[k],))
+
+    # ---- terminals
+    src_hits = [h for h in _pad_lookup(board, source) if h[1].get("net") == net]
+    if not src_hits:
+        return err("source pad %r is not on net %r" % (source, net), "ARG_INVALID",
+                   hint="give the pad the current really enters, as REF.PAD")
+
+    def terminal(fp, pad, spec):
+        px, py = _pad_xy(fp, pad)
+        layers = _item_layers(board, pad.get("layers")) or [None]
+        return node(px, py, layers[0]), px, py
+
+    src_node, sx, sy = terminal(*src_hits[0], source)
+
+    if isinstance(sinks, str):
+        sinks = [sinks]
+    if not sinks:
+        return err("sinks is empty", "ARG_REQUIRED")
+    sink_list = []
+    for s in sinks:
+        if isinstance(s, dict):
+            spec, cur = s.get("pad"), s.get("current_a")
+        else:
+            spec, cur = s, None
+        if not spec:
+            return err("a sink has no pad", "ARG_INVALID")
+        hits = [h for h in _pad_lookup(board, spec) if h[1].get("net") == net]
+        if not hits:
+            return err("sink pad %r is not on net %r" % (spec, net), "ARG_INVALID")
+        nd, gx, gy = terminal(*hits[0], spec)
+        try:
+            cur = None if cur is None else float(cur)
+        except (TypeError, ValueError):
+            return err("sink %r has a non-numeric current_a" % (spec,),
+                       "ARG_INVALID")
+        sink_list.append({"pad": spec, "node": nd, "current_a": cur,
+                          "x_mm": gx, "y_mm": gy})
+    if any(s["current_a"] is None for s in sink_list):
+        if current_a is None:
+            return err("every sink is missing current_a and no total current_a "
+                       "was given", "ARG_REQUIRED",
+                       hint="an IR drop needs a current: split a total evenly "
+                            "with current_a, or state it per sink")
+        try:
+            share = float(current_a) / len(sink_list)
+        except (TypeError, ValueError):
+            return err("current_a must be a number", "ARG_INVALID")
+        for s in sink_list:
+            if s["current_a"] is None:
+                s["current_a"] = share
+    total_a = sum(s["current_a"] for s in sink_list)
+    if total_a <= 0:
+        return err("the sink currents add up to <= 0", "ARG_RANGE")
+
+    if len(names) > max_nodes:
+        return err("the network has %d nodes (limit %d)" % (len(names), max_nodes),
+                   "TOO_LARGE",
+                   hint="raise quantize_mm - two nodes closer than that are "
+                        "merged anyway, so a 0.01 mm mesh on a big net is mostly "
+                        "noise")
+
+    # ---- solve
+    injections = {src_node: total_a}
+    for s in sink_list:
+        injections[s["node"]] = injections.get(s["node"], 0.0) - s["current_a"]
+    sol, why = PW.resistive_network([n["id"] for n in names], edges, injections,
+                                    src_node)
+    if sol is None:
+        return err("could not solve the copper network: %s" % why, "NOT_APPLICABLE",
+                   hint="the usual cause is a sink that no track on this net "
+                        "actually joins to the source")
+
+    volts = sol["voltages_v"]
+    v0 = volts[src_node]
+    sink_out = []
+    for s in sink_list:
+        v = volts[s["node"]]
+        sink_out.append({"pad": s["pad"], "current_a": s["current_a"],
+                         "voltage_v": round(v - v0, 9),
+                         "drop_mv": round((v0 - v) * 1e3, 6),
+                         "x_mm": s["x_mm"], "y_mm": s["y_mm"]})
+    if not any(abs(s["voltage_v"]) > 1e-12 for s in sink_out):
+        return err("no sink shows any voltage relative to the source - the network "
+                   "is not actually connected", "NOT_APPLICABLE",
+                   hint="check that the tracks on net %r reach the source pad" %
+                        (net,))
+
+    by_key = {}
+    for e in edges:
+        by_key.setdefault((e["a"], e["b"]), []).append(e)
+        by_key.setdefault((e["b"], e["a"]), []).append(e)
+    edge_out = []
+    worst_j = None
+    for e in sol["edges"]:
+        cand = by_key.get((e["a"], e["b"])) or []
+        src = None
+        for c in cand:
+            if abs(c["resistance_ohm"] - e["resistance_ohm"]) <= 1e-15 * max(
+                    1.0, abs(c["resistance_ohm"])):
+                src = c
+                break
+        cur = abs(e["current_a"])
+        w = float(src.get("width_mm") or 0.0) if src else 0.0
+        t_um = float(src.get("copper_um") or 0.0) if src else 0.0
+        j = cur / (w * t_um * 1e-3) if (w > 0 and t_um > 0) else None
+        rec = {"kind": src.get("kind") if src else "?",
+               "label": src.get("label") if src else "",
+               "a": e["a"], "b": e["b"],
+               "resistance_ohm": round(e["resistance_ohm"], 9),
+               "current_a": round(cur, 9),
+               "drop_mv": round(abs(e["drop_v"]) * 1e3, 6),
+               "power_mw": round(e["power_w"] * 1e3, 6),
+               "current_density_a_per_mm2": (round(j, 6) if j is not None else None)}
+        edge_out.append(rec)
+        if j is not None and (worst_j is None or j > worst_j["current_density_a_per_mm2"]):
+            worst_j = rec
+
+    warnings.extend(layer_warnings)
+    pour = [z for z in (board.zones or [])
+            if z.get("net") == net and not z.get("keepout")]
+    if pour:
+        warnings.append("%d copper zone(s) on net %r are NOT modelled: they sit in "
+                        "parallel with these tracks, so this drop is an UPPER "
+                        "bound" % (len(pour), net))
+
+    max_drop = max(s["drop_mv"] for s in sink_out)
+    worst_sink = max(sink_out, key=lambda s: s["drop_mv"])
+    loss = sum(e["power_mw"] for e in edge_out) / 1e3
+    return ok(value={"net": net,
+                     "source": source,
+                     "total_current_a": round(total_a, 9),
+                     "max_drop_mv": round(max_drop, 6),
+                     "worst_sink": worst_sink["pad"],
+                     "worst_sink_drop_pct_of_3v3": round(100.0 * max_drop / 3.3, 6),
+                     "sinks": sink_out,
+                     "total_copper_loss_w": round(loss, 9),
+                     "worst_current_density": (worst_j or {}),
+                     "edges": sorted(edge_out, key=lambda r: -r["current_a"])[:40],
+                     "edge_count": len(edge_out),
+                     "node_count": len(names),
+                     "quantize_mm": q},
+              unit="mV", model="track_via_pad_resistor_graph",
+              basis="every track segment becomes rho(T)*L/(w*t) with t from the "
+                    "stackup copper weight, every via a barrel of "
+                    "pi*((d/2)^2 - (d/2-p)^2), plated pads join their layers; the "
+                    "graph is solved by nodal analysis with the source pad at 0 V",
+              precision="a DC answer, and a bound in the direction of missing "
+                        "copper: skin effect, pad/plane spreading and connector "
+                        "contact are not in it (so the real drop is worse), while "
+                        "a pour on the same net is not in it either (so this drop "
+                        "is an upper bound). Nodes closer than quantize_mm are "
+                        "merged, so a hairline gap below that is invisible",
+              assumptions={"quantize_mm": q, "temp_c": float(temp_c),
+                           "copper_um": explicit,
+                           "copper_um_source": ("explicit" if explicit is not None
+                                                else ("stackup" if cu else None)),
+                           "plating_um": plating_um,
+                           "net": net, "board_thickness_mm": board_th},
+              extra={"warnings": warnings,
+                     "not_computed": ["copper pour / plane in parallel",
+                                      "skin effect",
+                                      "pad and plane spreading resistance",
+                                      "temperature rise feedback (rho uses temp_c)",
+                                      "current capacity / fusing (needs a "
+                                      "temperature-rise criterion, not a current)"]})

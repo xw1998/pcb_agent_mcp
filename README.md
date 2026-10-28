@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.2` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.3` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -12,7 +12,8 @@ KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对
 | **Calc** | 无板子的工程计算（载流/阻抗/差分阻抗/λ/20/爬电） | 已实现 |
 | **Fidelity** | 把整份板文件**转换**成 AI 可读的表达：每个节点都进树，事实从树里读，往返由 KiCad 自己验证 | 已实现（KiCad 侧已被 kicad-cli 判决） |
 | **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（KiCad 侧：13 块真实板与 DRC 对账、412 个 pad 与 `pcbnew` 逐点对账；立创侧：194 个真实归档实测） |
-| **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积） | 已实现 |
+| **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积 / 单网 IR drop） | 已实现 |
+| **Sim** | 无板子的物理计算：SPICE 子集（DC/瞬态/AC）、铜阻与 PDN、热阻与 2-D 板温度 | 已实现（子集，未实现项逐条点名拒绝） |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
 | **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 六道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 实测口径＝原地重写一个成员） |
 
@@ -25,7 +26,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 > 设计文档在 [`docs/`](docs/)，按编号顺序读：
 > `00` 调研与架构 → `05` 无损转化架构总纲 → `06` 存储形式与信息传递 → `07` 自研定位与风险分期
 > → `10` 桌面控制与双栈读路径 → `11` 保真层 → `12` 写路径 → `13` 立创实测（真实存储与记录格式）
-> → `14` 原理图写路径 → `15` 对账（推导对着厂商判决）。
+> → `14` 原理图写路径 → `15` 对账（推导对着厂商判决）→ `16` 天线与馈线 → `17` 仿真层。
 
 ## 为什么不是"又一个图元 MCP"
 
@@ -95,7 +96,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（66 个）
+## 工具（80 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -172,6 +173,20 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `link_far_field` | 远场距离：`max(2D²/λ, 5D, λ/2π)` 并说明哪个机制主导 | 三段都要给，只给一段会误导 |
 | `link_fresnel` | 第一菲涅耳区半径 + 60% 净空 | — |
 | `board_antenna_keepout` | 板级净空：某矩形内的铜与 **zone** | 派生量 `authoritative:false`；pad/track/via 与 zone **分开计数**（DRC 看不见铺铜失谐） |
+| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进 | 器件卡 R C L V I E G D Q M；**X/F/H/K/S/W/B/T/O/U/A 逐条点名拒绝**，不静默跳过 |
+| `trace_resistance` | 铜线直流电阻 `rho(T)·L/(w·t)` | 只管这一段；过孔/扩展/端子不在这个数里 |
+| `via_resistance` | 过孔桶壁电阻（截面是**铜环**不是钻孔圆） | 载流是另一码事，要温升判据 |
+| `trace_inductance` | 直线走线自感（Grover 带公式，±20%） | 只用于比两种布局；地平面像项**明确未计入** |
+| `ir_drop_chain` | 分段串联 IR drop（每段自己的宽/厚） | 不把不同线宽折算成平均宽 |
+| `pdn_impedance` | 电容组 `\|Z(f)\|` 全曲线 + 平面电容 | 要看**反谐振峰**，不是看最低点 |
+| `decoupling_check` | 给定电流/频段/纹波判够不够 | 三态 `pass/fail/indeterminate`；最坏点落在频段下沿说 **indeterminate**（那里由稳压器负责） |
+| `thermal_stack` | 叠层 1-D 热阻 `Σ t/(kA)` + 给定功耗的温升 | 严格 1-D，看不见扩热 |
+| `thermal_via_array` | 过孔阵列热阻（同环壁几何），可把周围 FR4 并联 | 偏乐观（桶壁中段镀层更薄） |
+| `thermal_plate` | 2-D 板稳态温度（SOR）+ 热点 vs 平均 | 能量不守恒**拒绝**；点源须给 `size_mm` |
+| `thermal_transient` | 热 RC 网络阶跃响应（Foster） | Rth/Cth 可给多级；单级会低估脉冲峰值 |
+| `thermal_heatsink` | 反解需要多少 Rth(j-a) | **不提供散热片表**（那会是唯一一个不是推导出来的数） |
+| `thermal_convection` | 由风速/尺寸给 h | 工程关联式 ±25%，只用于比两种假设 |
+| `board_ir_drop` | 按**板上真实铜**算单网压降（节点带层号，两层只在 via/镀通孔相连） | 铜厚/镀铜未知或汇点不通即拒绝；`authoritative:false` |
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
@@ -181,9 +196,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.2
-python run_server.py --selftest      # 协议级自检，34/34（含板与原理图写路径端到端、天线四问）
-python -m unittest discover -s tests # 450 个用例（约 3.5 分钟，kicad-cli / pcbnew 用例占大头）
+python run_server.py --version       # 0.0.3
+python run_server.py --selftest      # 协议级自检，38/38（含板与原理图写路径端到端、天线四问、仿真四问）
+python -m unittest discover -s tests # 531 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -292,6 +307,26 @@ MCP 客户端配置（stdio）：
   地平面压到天线下面会把谐振频率拉低，DRC 完全无视。`board_antenna_keepout` 因此把
   pad/track/via 与 zone 分开计数（StickHub 上 `(150,-100,8,6)` 实测 406 项铜 + 2 个 zone）。
 
+### 仿真层：全是子集，边界写在每个返回里
+
+- **SPICE 只做子集，而且是按名字拒绝的。** `sim_spice` 真解非线性方程（MNA + 牛顿 + pnjlim +
+  gmin 向下步进），器件卡只认 `R C L V I E G D Q M`；`X F H K S W B T O U A` 十一类一律
+  `UNSUPPORTED_CARD` 并点名，而不是跳过——**一半跑完的网表比拒答更危险**。瞬态是后向欧拉
+  （不是梯形），AC 先解工作点再只覆盖雅可比。`not_computed` 每一条都写清：没有自热、没有器件
+  电容/迁移率/击穿随温度、没有噪声/失真/傅里叶分析。
+- **AC 截断会出声。** 扫频点数超过 `max_points` 时返回 `warnings`：只解了前 N 点、末点不是 `fstop`。
+  一个还在上升的曲线被静默截断，会被读成"电路在这里谐振"。
+- **温度必须给符号正确的答案。** IS 按 SPICE 实现随温度缩放（XTI/EG/TNOM）：27 ℃ 二极管 0.6925 V，
+  100 ℃ 0.5709 V，−40 ℃ 0.8004 V。只让 Vt 随温度涨会让"高温压降更大"——那是安静的错答案。
+- **热学不给表、不猜 h。** `thermal_heatsink` 只反解预算，不发散热片库；`thermal_convection`
+  是工程关联式（±25%）并明说它只能用来比两种假设；2-D 板方程解完要过能量平衡自检（0.5%），
+  不平就报错，不报告。
+- **PDN 判最坏 |Z|，判不了就说判不了。** 只有"明显不够"才 `fail`；最坏点落在判定频段下沿时
+  回 `indeterminate`——低频端电容不是短路，是稳压器在维持。平面谐振、平面电容的准确取值都
+  未建模。
+- **板级 IR drop 用板上真实铜，不用长度乘方阻。** 节点是 `(x, y, layer)`，两层只在 via 或
+  镀通孔焊盘处相连；铜厚取自叠层（`1 oz`、`0.5 oz`），没写就拒绝，不默认 35 µm。
+
 ## 项目结构
 
 ```
@@ -300,7 +335,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 66 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 80 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -333,15 +368,24 @@ pcb_agent_mcp/
 │       ├── current.py            # IPC-2221 载流正/反解 + 过孔
 │       ├── impedance.py          # 微带/带状线正/反解 + 有效区间护栏
 │       ├── diffpair.py           # 边耦合差分阻抗正/反解
+│       ├── field2d.py            # 差分截面的 2-D 场解（有限体积 + 红黑 SOR）
 │       ├── rf.py                 # λ/20
-│       └── creepage.py           # 爬电/间隙，fail-closed
+│       ├── creepage.py           # 爬电/间隙，fail-closed
+│       ├── safety_table.py       # 表本身的可执行体检（来源数/单调性/重复 key）
+│       ├── feedline.py           # 微带/带状线/CPW/GCPW + 反解宽度
+│       ├── antenna.py            # 贴片/印刷线/偶极单极/螺旋/小环/Chu 上限/芯片天线
+│       ├── matching.py           # 反射/L/π/T/短截线/四分之一波长（每解回代）
+│       ├── link.py               # FSPL/Friis/最大距离/有效面积/远场/菲涅耳
+│       ├── spice.py              # SPICE 子集：MNA + 牛顿 + pnjlim + gmin 步进
+│       ├── power.py              # 铜阻/过孔/自感/电阻网络/IR drop/电容组/PDN
+│       └── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
 ├── data/
 │   ├── creepage_tables.json      # 空表 + verified:false + why_empty（故意不填）
 │   └── ipc2152_tables.json       # 同上；表本身由 calc/safety_table.py 可执行地体检
-├── tests/                        # 450 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 531 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~15，建议按编号顺序读
+└── docs/                         # 设计文档 00~17，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
@@ -351,6 +395,9 @@ pcb_agent_mcp/
 - 载流、阻抗、λ/20 均为**闭式近似**，误差已在 `precision` 字段声明（±12%~±30%）。差分阻抗另有二维场解
   （`diff_impedance_field`），但紧间距耦合没有独立参考答案，那种几何下它会自己声明
   `reference_note`。定稿前请用场求解器或打样厂的阻抗报告复核。
+- 仿真层是**子集**：SPICE 只有 R C L V I E G D Q M 与后向欧拉瞬态，没有自热、没有噪声/失真、
+  没有器件电容随温度；热学是 1-D/2-D 稳态与单级或多级 RC，不含 TIM 压缩、辐照与空气流场；
+  板级 IR drop 只算直流、只用叠层铜厚。逐条写在每次返回的 `not_computed` / `warnings` 里。
 - 爬电/间隙**故意不给默认值**。安规间距须按适用标准与电压等级查表，本项目只做查表与一致性检查；
   涉及市电、医疗、车载等场景请由有资质的工程师评审。
 - MIT 许可证，作者不对任何设计后果承担责任。

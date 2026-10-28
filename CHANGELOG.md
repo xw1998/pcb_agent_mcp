@@ -9,6 +9,46 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.3] - 2026-10-28
+
+仿真层：把"算得出来的答案"从单点公式扩到电路 / 电流 / 热三个域。**仍是子集**，
+每个未实现项都按名字拒绝并写进 `not_computed`。
+
+- 新增 3 个计算模块：`calc/spice.py`（MNA + 牛顿 + pnjlim + gmin 向下步进，`.op`/`.tran`/`.ac`，
+  器件卡 R C L V I E G D Q M）、`calc/power.py`（铜阻 / 过孔 / 走线自感 / 电阻网络 / 分段 IR drop /
+  电容组阻抗 / 自谐振 / PDN / 去耦三态判定）、`calc/thermal.py`（1-D 热阻串 / 过孔阵列 / 2-D 板
+  SOR / 热瞬态 / 散热片预算 / 对流系数）。
+- 新增 `oracle.board_ir_drop`（按板上真实铜算单网压降：节点带层号，两层只在 via 或镀通孔焊盘相连）。
+- 新增 14 个工具（66 → **80**）：`sim_spice`、`trace_resistance`、`via_resistance`、
+  `trace_inductance`、`ir_drop_chain`、`pdn_impedance`、`decoupling_check`、`thermal_stack`、
+  `thermal_via_array`、`thermal_plate`、`thermal_transient`、`thermal_heatsink`、
+  `thermal_convection`、`board_ir_drop`。
+- 新增 81 个用例（`test_spice` 24 / `test_power` 23 / `test_thermal` 25 / `test_board_ir_drop` 9），
+  全量 **531 passed**；`--selftest` 加 4 条指纹（二极管 0.692543633 V / 1 mm×0.2 mm×35 µm 铜
+  0.002462857 Ω / FR4 1.6 mm 100 mm² 53.333 K·W⁻¹ / 两段不同宽 IR drop 0.028733333 V），**38/38**。
+- 文档：`docs/17-仿真层.md`（十八篇），索引与 README 工具表同步。
+
+### 五个真缺陷（都是"数算得出来但语义错了"）
+
+- **`_element_report` 的二极管分支遮蔽了解向量**：`x = min(_limit_junction(...))` 把入参 `x`
+  改成 float，二极管之后的 C/R 全部 `TypeError`。改名 `xd`。
+- **温度只让 Vt 涨、IS 不动**：27 ℃ 0.6925 V、100 ℃ 反而 0.8597 V。按 SPICE 实现 `IS(T)`
+  （XTI/EG/TNOM）后 100 ℃ → 0.5709 V、−40 ℃ → 0.8004 V（≈ −2 mV/K）。
+- **瞬态多跑一步**：`tstop/h = 100.00000000000001`，裸 `ceil` 得 101 步，末点在 1.01 ms。
+  改为带相对容差的 ceil。
+- **AC 截断静默**：扫频点数被 `max_points` 截断后，末点不是 `fstop`，一条还在上升的曲线会被
+  读成"在这里谐振"。现在返回 `warnings` 点名只解了前 N 点、末点频率是多少。
+- **`thermal_transient` 的 R/C 长度不匹配报 `ARG_RANGE`**：这是输入畸形不是越界，改 `ARG_INVALID`。
+
+### 顺带收紧的口径
+
+- `_element_report` 的二极管 `model_params` 补 `IS_nominal` / `TNOM_c` / `XTI` / `EG_ev`——
+  "为什么是这个压降"不必猜。
+- `board_ir_drop` 显式给 `copper_um` 覆盖叠层时**一定**告警（`warnings` 里写 "OVERRIDES the stackup"），
+  并在 `assumptions.copper_um_source` 标 `explicit | stackup`。
+- `decoupling_check` 增 `regulator_bandwidth_hz`：只判电容真正负责的那一段，避免把稳压器
+  的环路增益算成电容的本事。
+
 ## [0.0.2] - 2026-10-28
 
 天线层：从"能算板"扩到"能设计第一个天线原型"。**不含全波求解器**，这一点写在每个返回里。
