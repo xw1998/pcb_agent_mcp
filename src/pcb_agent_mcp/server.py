@@ -995,6 +995,34 @@ def selftest():
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 
+    # The LCEDA Pro bridge must say "not running" out loud instead of hanging,
+    # and it must never rewrite a vendor error code as our own. Both are checked
+    # without a live editor: a pipe name that cannot exist, and the wire-level
+    # reply checker.
+    r = handle({"jsonrpc": "2.0", "id": 114, "method": "tools/call",
+                "params": {"name": "lceda_pro_status", "arguments": {
+                    "endpoint": "JLCEDAPro_selftest_no_such_pipe", "timeout_s": 1}}})
+    _lw = json.loads(r["result"]["content"][0]["text"])
+    check("a pipe that does not exist is APP_NOT_RUNNING, not a hang",
+          _lw.get("status") == "error" and _lw.get("reason_code") == "APP_NOT_RUNNING",
+          str(_lw.get("reason_code")))
+
+    _live_mod = _tools._live
+    _kept = None
+    try:
+        _live_mod.PipeTransport._check(
+            {"ok": False, "error": {"code": "EXECUTION_ERROR", "message": "boom"}})
+    except _live_mod.LiveError as _exc:
+        _kept = (_exc.code, _exc.message)
+    _ours = None
+    try:
+        _live_mod.PipeTransport._check({"ok": False, "error": {"code": "WHO_KNOWS"}})
+    except _live_mod.LiveError as _exc:
+        _ours = (_exc.code, _exc.extra.get("app_code"))
+    check("vendor code kept, unknown code becomes APP_ERROR (not invented)",
+          _kept == ("EXECUTION_ERROR", "boom") and _ours == ("APP_ERROR", "WHO_KNOWS"),
+          str((_kept, _ours)))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

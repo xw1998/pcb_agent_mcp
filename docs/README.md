@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这二十三篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这二十四篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 | # | 文档 | 它回答的问题 | 它推翻了什么 |
@@ -29,6 +29,7 @@
 | 21 | [SPICE：内置子集 + 可选委派真引擎](21-SPICE引擎委派.md) | 为什么不直接内置一个完整 SPICE？装了就一定用得上吗？ | 不 vendor 二进制、不加 runtime 依赖：内置子集保证有答案，装了 ngspice 就委派；`engine="ngspice"` 找不到**报错不回退**；`cross_check` 比两引擎的节点电压；**本机无二进制 ⇒ 外部路径 `verified_against_engine:false`** |
 | 22 | [微带与腔体滤波器](22-微带与腔体滤波器.md) | ADS 里那几个合成按钮，不给 EM 结果能给什么？ | 「合成 = 仿真」——只给原型 g 值 / 集总带通 / 耦合线 Newton 反解 / 耦合谐振器 / 矩形腔 TE101 的 Qc 双推导；无交叉耦合、无色散、无有限 Q、无 iris 几何、无版图、无良率 |
 | 23 | [两张读不到原文的表](23-两张读不到原文的表.md) | 标准是付费的、公开转述互相矛盾，凭什么敢把数填进去？ | 「读原文抄表」——IPC-2152 抄 KiCad 的**闭式拟合**并用锚点+物理探针三线校验；IEC 60664-1 **编译原实现、探针反演阶梯、20 万点对拍**；并记下三条只有行为对拍才发现的错（尤其**断点必须每次重新恢复，不能继承上一版 JSON**）。其余安规族仍 fail-closed |
+| 24 | [立创进程内桥](24-立创进程内桥.md) | 怎么才能看见用户正开着的那张图？应用自己的命令空间长什么样，我们凭什么敢说"读过它"？ | 「要驱动立创就得写扩展或用 websocket 网关」——其实是它自己开的命名管道 `\\.\pipe\JLCEDAPro<8 hex>` 可枚举 + ping 确认；并推翻前两轮的「它起不来」（差别在父进程有没有控制台）。写路径**一次都没做过**，逐条列在 §24.9 |
 | 07 §7 | 板框 / 开槽 / 机械层 | 待议，6 条议题 | —— |
 
 ## 三条贯穿全部文档的结论
@@ -75,4 +76,5 @@
 - `21` → `calc/spice.py` 的外部引擎段（`find_ngspice` / `_deck_for_ngspice` / `_run_ngspice` / `_parse_raw` / `_cross_check`，以及 `simulate(..., engine=…, cross_check=…)`），`tests/test_spice_engine.py`（37 例）+ `tests/_fake_ngspice.py`（假引擎）。外部路径已对着**真 ngspice-47**（MSYS2 Windows 构建）跑过并逐节点对账（分压 5e-9 V、RC 阶跃与 RLC AC 逐位 0.0），再用**第二个构建 ngspice-41**（conda-forge）跑同一批 deck 做**跨版本对拍**（`.op`/`.ac` 逐位 0.0，`.tran` 最多差 1.24e-4 V，两构建步长控制不同）；`verified_against_engine` 按**引擎版本**门控，只有 `VERIFIED_ENGINES`（`ngspice-47`、`ngspice-41`）里的版本为 true，别的二进制一律 false（门控本身由假引擎自称版本号来测，不需要真引擎）；默认引擎是 `builtin`（同一网表在两台机器不能给不同答案）。
 - `20` → `calc/cavity.py`（平行板腔体模 + 过孔围栏比例）、`calc/electrothermal.py`（R(T) 定点迭代 + 精确失控判据 + 板级 2-D 电热场 `board_electrothermal`）、`calc/power.py` 的 `pdn_plane_modes`/`pdn_impedance(plane=…)`，以及 6 个工具与 89 个测试（`test_vibration` 之外：`test_cavity_electrothermal` 31、`test_electrothermal_plate` 31、`test_pdn_plane` 27）；边界是**没有边界失谐修正**，2-D 场只沿调用方给的层压板 k 扩散（不含真实铜面/平面导热），3-D、热过孔、组件热容都缺；平面模只给峰值不给曲线。
 - `22` → `calc/filters.py`（原型 g 值 / 集总带通的两路 S21 对账 / 耦合微带 Newton 反解 / 耦合谐振器带通 / 矩形腔 TE101 的 Qc 双推导），以及 5 个 `filter_*` 工具与 31 个测试。边界是**合成而不是仿真**：给了几何，不给 EM 结果——无交叉耦合、无色散、无有限 Q、无 iris 几何、无版图、无良率。
-- 代码里的每条"拒绝回答"分支，都能在这二十三篇里找到对应的判据来源。
+- `24` → `lceda_live.py`（命管道枚举 + ping 确认 / 一行一 JSON 帧 / 9 个 op / `invoke` 在编辑器 render 进程里跑 async 函数体）与 6 个 `lceda_pro_*` 工具、26 个测试（24 个假 transport 跑失败路径 + 2 个真机用例）。边界是**只证了读**：ping / open（849 ms）/ session.list / session.close / doc.api（378 类型、PCB_Document 21 方法）/ invoke（两块板名 + uuid、抛错回 EXECUTION_ERROR）都在真机上跑过，任何写、`open` 是否碰工程字节、`destroy` 是否丢未保存改动都未验证。
+- 代码里的每条"拒绝回答"分支，都能在这二十四篇里找到对应的判据来源。

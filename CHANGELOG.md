@@ -9,6 +9,50 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.11] - 2026-10-28
+
+「能看见你正开着的那张图」：给立创 Pro 做了一条**进程内桥**——不是文件格式、不是 websocket
+网关，是应用自己开在 `\\.\pipe\JLCEDAPro<8 hex>` 上的命令空间。顺手推翻了前两轮的一条结论：
+立创 Pro 在这台机器上**起得来**，差别只在父进程有没有控制台。
+
+- **新增 `src/pcb_agent_mcp/lceda_live.py`**：帧层（一行一个 JSON、请求 ≤4 MiB / 回复 ≤16 MiB、
+  预算 60 s、0.02 s 轮询按 `\n` 切帧、超时即关管道）、端点枚举 + ping 确认、`invoke`（把一段
+  源码当 async 函数体送进编辑器 render 进程，`eda` 在作用域里）、`doc.api`、`open`、
+  `session.list` / `session.close`。
+- **新增 6 个工具**（`TOOLS` 101 → **107**）：`lceda_pro_status / _api / _open / _sessions /
+  _close / _run`。共同口径：`verified_against_app: true`（这些都真跑过）、回带 `endpoint` 与
+  `bridge_version`、`value` 是应用答复**原样**（不加字段、不四舍五入）。错误码分两类：
+  我们的（`APP_NOT_RUNNING / APP_UNREACHABLE / APP_TIMEOUT / APP_ERROR / FRAME_TOO_LARGE /
+  RESULT_TOO_LARGE / ARG_REQUIRED / ARG_INVALID`）与**厂商码原样透传**（19 个）。
+  「应用没给码」不再冒用 `INTERNAL`（那是厂商的词），改成 `APP_ERROR` + `app_code: null`。
+- **实测数字**（全部对 `_scratch/lceda/` 里的**副本**做，用户工程目录一次没进）：`ping` →
+  `bridgeVersion 4.1.60.198f38ab`；`open` 32.5 MB `.eprj` headless **849 ms**；`session.list`；
+  `session.close(destroy=true)` → `status: closed`（条目仍在列表里，只是状态变了）；
+  `doc.api` → `eda` **378** 个类型 + `callConventions.classToProperty`，`PCB_Document`
+  **21** 个方法（带厂商中文注释）；`invoke` → `await eda.dmt_Pcb.getAllPcbsInfo()` 回两块板
+  的名字与 uuid、`eda.dmt_Project.getCurrentProjectInfo()` 回工程记录、`throw new Error('boom')`
+  回 `EXECUTION_ERROR | boom`。
+- **两个会静默写错的坑**：文档名 ≠ 运行时属性名（`PCB_Document` → `eda.pcb_Document`，映射表
+  应用自己会给）；树类没有 `list()`（是 `getAllPcbsInfo()`），且 `eda.pcb_Document.*` 在没有
+  PCB 文档是"当前文档"时会**回 null**——那不是调用写错。
+- **推翻「立创起不来」**：`explorer.exe "<exe>"`（等价双击）启动 → 三个进程稳定
+  （203/36/289 MB）、管道数秒内出现；bash 直起仍 0.5 s 退出。`docs/10` 的 §1.1.1 **保留原文并
+  逐条标注错在哪**，新增 §1.1.3 记第三轮。同时查清 `bad option: --mcp` 的出处是 **exe 里 node
+  自带的选项解析器**（不是立创启动器），所以厂商自带的 `--mcp stdio|http` 服务器起不来。
+- **能力自述同步更正**（诚实性硬要求）：`tools.py` 的 `not_implemented_yet` 里
+  「LCEDA Pro launch」与「EasyEDA Pro live API drive」两条按新事实重写；`desktop.py` 的立创
+  notes 从"没有外部交互权限就完全驱动不了"改成"两扇门，其中命令空间那扇开着"；
+  `capabilities.decisions.evidence` 新增 `live bridge` 一行。
+- **新增 `docs/24-立创进程内桥.md`**：管道名推导（公式是真的、但这台机器上算不出来 ⇒ 枚举 +
+  ping）、帧格式、9 个 op、实测数字表、两个坑、`invoke` 的代码跑在哪、工具表与错误码表，
+  以及 §24.9 **没验证的 6 条**（任何写 / `open` 是否碰工程字节 / `destroy` 是否丢未保存改动 /
+  厂商 `--mcp` 传输 / `stop`、`doc.external`、`doc.format` / 多实例）。
+- **测试**：新增 `tests/test_lceda_live.py` 26 例（24 例用假 transport 跑失败路径——无管道、
+  执行报错、管道不回话、非 JSON、超 4 MiB / 16 MiB；2 例真机用例挂在
+  `skipUnless(available_endpoints())` 后面，没开应用时跳过而不是失败）。全量 837 → **863**。
+  `--selftest` 76 → **78**（新增"不存在的管道回 `APP_NOT_RUNNING` 而不是挂住"与
+  "厂商码保留 / 未知码变 `APP_ERROR` 且不冒用 `INTERNAL`"，两条都不依赖真机）。
+
 ## [0.0.10] - 2026-10-28
 
 「把两张读不到原文的表做成可自证的答案」：IPC-2152 载流从"空表 + fail-closed"

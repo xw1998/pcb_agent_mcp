@@ -8,6 +8,7 @@ import json
 
 from . import desktop as _desktop
 from . import lceda_api as _lceda_api
+from . import lceda_live as _live
 from . import fidelity as _fidelity
 from . import oracle as _oracle
 from .fidelity import views as _fviews
@@ -31,7 +32,7 @@ from .calc import vibration as _vib
 from .calc import cavity as _cavity
 from .calc import electrothermal as _electro
 from .calc import filters as _filters
-from .calc.result import err
+from .calc.result import err, ok
 from .adapters import FORMATS as _FORMATS
 from .adapters import detect_format as _detect_format
 from .adapters import open_board as _open_board
@@ -501,6 +502,289 @@ _tool(
      "required": ["app", "path"]},
     lambda a: _guarded(lambda: _desktop.open_project(
         a["app"], a["path"], reuse=a.get("reuse", True), wait=a.get("wait_s", 25.0))),
+)
+
+# ------------------------------------------------- LCEDA Pro in-process bridge
+# Everything else in this server talks to FILES. These six talk to the RUNNING
+# editor over its own command space (a named pipe carrying one JSON object per
+# line), which is the only path here that can see the design the user has open.
+# Measured 2026-10-28 on LCEDA Pro 4.1.60.198f38ab: ping, open, session.list,
+# doc.api and invoke all answered for real. Nothing that WRITES was performed,
+# so no tool below claims it.
+_LIVE_BASIS = ("the running application's own command space (LCEDA Pro named pipe, "
+               "one JSON object per line), not a file and not a reimplementation")
+_LIVE_MODEL = "lceda_pro_command_space"
+
+def _live_hint(code):
+    return {
+        "APP_NOT_RUNNING": "start LCEDA Pro and retry. Measured: launched from a "
+                           "shell (console inherited) it exits in about 0.5 s with "
+                           "rc 0 and no log; launched via explorer.exe (the double-"
+                           "click path) it stays up and the pipe appears",
+        "APP_UNREACHABLE": "the pipe vanished while talking - the editor was most "
+                           "likely closed",
+        "APP_TIMEOUT": "the app accepted the frame but did not answer within the "
+                       "budget; open and import need a larger timeout_s",
+        "APP_ERROR": "the app failed without one of its published codes; its own "
+                     "string is kept in app_code / app_message",
+        "ARG_REQUIRED": "an argument that must be non-empty was empty",
+        "ARG_INVALID": "the argument does not describe anything that exists on disk",
+        "FRAME_TOO_LARGE": "request frame exceeds the measured 4 MiB limit",
+        "RESULT_TOO_LARGE": "reply exceeds the measured 16 MiB limit; ask for less",
+        "EXECUTION_ERROR": "the snippet threw inside the editor; the message is the "
+                           "app's own and the snippet's logs are in extra.logs",
+        "SYNTAX_ERROR": "the snippet does not parse as an async function body",
+        "SESSION_NOT_FOUND": "no such session; call lceda_pro_sessions",
+    }.get(code)
+
+def _live_error(exc):
+    extra = dict(exc.extra or {})
+    extra.setdefault("vendor_code_kept", exc.code in _live.PASS_THROUGH_CODES)
+    return err(exc.message, exc.code, hint=_live_hint(exc.code), extra=extra)
+
+def _live_done(client, value, assumptions, verified, **extra):
+    identity = client.identity or {}
+    extra["endpoint"] = client.endpoint
+    extra["bridge_version"] = identity.get("bridgeVersion")
+    extra["verified_against_app"] = bool(verified)
+    return ok(value, "the application's own reply, unmodified", _LIVE_MODEL,
+              _LIVE_BASIS,
+              "exact passthrough: no field inside value is added, dropped or "
+              "rounded by this server; what the app did not send is absent",
+              assumptions, extra)
+
+def _live_client(args):
+    return _live.connect(endpoint=args.get("endpoint") or None,
+                         timeout_s=float(args.get("timeout_s") or 10.0))
+
+_LIVE_ARGS = {
+    "endpoint": _str("explicit pipe name (default: enumerate JLCEDAPro* and keep the "
+                     "first that answers a ping)"),
+    "timeout_s": _num("connect + ping budget in seconds", 10),
+}
+
+def _lceda_pro_status(args):
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    try:
+        identity = client.ping()
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    return _live_done(client, identity, {
+        "which pipe": "the first JLCEDAPro* pipe whose ping answered; the 8 hex "
+                      "suffix is opaque - it could not be reproduced from any "
+                      "candidate user-data path on this install, so it is never "
+                      "guessed",
+        "what a ping proves": "a process speaking this protocol is listening; it "
+                              "does not prove the project is the one you mean",
+        "not_run": "no write, no save, no code execution",
+    }, verified=True)
+
+def _lceda_pro_api(args):
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    try:
+        value = client.api(args.get("namespace") or "eda",
+                           class_name=args.get("class_name") or None,
+                           method_name=args.get("method_name") or None,
+                           timeout_s=float(args.get("api_timeout_s") or 30.0))
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    return _live_done(client, value, {
+        "shape": "namespace only -> {types:[{name,comment}], "
+                 "callConventions:{entry, classToProperty}}; with class_name -> "
+                 "{title, remarks, methods:[{name,comment}], callPath} (measured)",
+        "document names are not property names": "the app maps PCB_Document -> "
+                                                 "pcb_Document; read the mapping "
+                                                 "from callConventions, never guess",
+    }, verified=True)
+
+def _lceda_pro_open(args):
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    try:
+        value = client.open_project(args.get("path"),
+                                    headless=bool(args.get("headless", True)),
+                                    timeout_s=float(args.get("open_timeout_s") or 45.0))
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    return _live_done(client, value, {
+        "what was measured": "open of a copied 32.5 MB .eprj answered in 849 ms with "
+                             "a session id, renderId 3 and an 'alive' status",
+        "not measured": "whether open touches a recent-files list or a lock file - "
+                        "the project bytes were not compared before and after, so "
+                        "treat 'open does not modify the project' as unproven",
+        "headless": "headless=true still creates a live session in the running app; "
+                    "it does not hide the editor window",
+    }, verified=True)
+
+def _lceda_pro_sessions(args):
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    try:
+        value = client.sessions(timeout_s=float(args.get("list_timeout_s") or 10.0))
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    return _live_done(client, value, {
+        "what a session is": "an open document inside the editor that can be driven "
+                             "by doc.api / invoke; it is not a process",
+    }, verified=True)
+
+def _lceda_pro_close(args):
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    try:
+        value = client.close_session(args.get("session"),
+                                     destroy=bool(args.get("destroy", False)),
+                                     timeout_s=float(args.get("close_timeout_s")
+                                                     or 20.0))
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    return _live_done(client, value, {
+        "destroy": "destroy=true drops the session; whether it discards unsaved "
+                   "edits without asking was not tested, so treat it as able to "
+                   "lose work on the document that session holds",
+        "what it never does": "it does not write the project file; a closed session "
+                              "with unsaved edits loses them",
+    }, verified=True)
+
+def _lceda_pro_run(args):
+    session = args.get("session")
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    try:
+        out = client.invoke(session, args.get("code"),
+                            fn=args.get("fn") or "run",
+                            args=args.get("js_args"),
+                            timeout_ms=args.get("run_timeout_ms"))
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    return _live_done(client, out["value"], {
+        "where the code runs": "as an async function body INSIDE the editor's "
+                               "render process, with the vendor's eda object in "
+                               "scope and arguments under __CLI__.args",
+        "this can write": "any snippet you send runs with the editor's own "
+                          "privileges; a save or a move it performs is real. This "
+                          "project never performed one, so the write path stays "
+                          "unverified - the snippet, not the tool, decides",
+    }, verified=True, logs=out["logs"], duration_ms=out["duration_ms"])
+
+_tool(
+    "lceda_pro_status",
+    "Is the LCEDA Pro IN-PROCESS bridge alive, and which build is it? Speaks the "
+    "editor's own command-space pipe (named pipe, one JSON object per line) and "
+    "reports its endpoint and bridgeVersion. Measured against 4.1.60: ping answers "
+    "'{endpoint, bridgeVersion, resultChannel}'. A shell-launched app exits in about "
+    "0.5 s here; the working start is the explorer.exe (double-click) path. Runs no "
+    "code and writes nothing.",
+    {"type": "object", "properties": dict(_LIVE_ARGS)},
+    _lceda_pro_status,
+)
+
+_tool(
+    "lceda_pro_api",
+    "Ask the running editor for its own API surface: the type list of a namespace, or "
+    "the method list of one class, with the vendor's Chinese comments. This is how you "
+    "learn what invoke can call instead of guessing names - and it also returns "
+    "callConventions.classToProperty, because the document name (PCB_Document) is NOT "
+    "the runtime property name (pcb_Document). Read-only.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "namespace": _str("API namespace", default="eda"),
+         "class_name": _str("class or interface name, e.g. PCB_Document"),
+         "method_name": _str("one method, e.g. save"),
+         "api_timeout_s": _num("budget for this query", 30),
+     })},
+    _lceda_pro_api,
+)
+
+_tool(
+    "lceda_pro_open",
+    "Open a project INSIDE the running editor through its command space (not by "
+    "starting a second exe) and return the session id it created. Measured: a 32.5 MB "
+    ".eprj opened headless in 849 ms. The path must already exist. Note what is NOT "
+    "proven: the project bytes were not compared before and after, so 'open modifies "
+    "nothing' is unverified - keep a copy when it matters.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "path": _str("absolute path to an existing .eprj/.epro/.kicad_pcb"),
+         "headless": _bool("open without taking over the UI (still a live session)",
+                           True),
+         "open_timeout_s": _num("budget for the open itself", 45),
+     }),
+     "required": ["path"]},
+    _lceda_pro_open,
+)
+
+_tool(
+    "lceda_pro_sessions",
+    "List the documents the running editor has open as drivable sessions (id, render "
+    "id, state). Call this before lceda_pro_run: invoke needs a session id, and a "
+    "session is a document, not a process.",
+    {"type": "object", "properties": dict(_LIVE_ARGS, **{
+        "list_timeout_s": _num("budget for the listing", 10)})},
+    _lceda_pro_sessions,
+)
+
+_tool(
+    "lceda_pro_close",
+    "Close one session in the running editor (optionally destroy it). This never "
+    "writes the project file: a session with unsaved edits loses them, so save inside "
+    "the editor first. It does not quit the application.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "session": _str("session id from lceda_pro_open / lceda_pro_sessions"),
+         "destroy": _bool("destroy the session instead of just closing it", False),
+         "close_timeout_s": _num("budget for the close", 20),
+     }),
+     "required": ["session"]},
+    _lceda_pro_close,
+)
+
+_tool(
+    "lceda_pro_run",
+    "Run a snippet INSIDE the running editor: the code is the body of an async "
+    "function, gets the vendor's eda object in scope, and reads arguments from "
+    "__CLI__.args. This is the only tool here that can touch a live design - the "
+    "snippet, not this server, decides what happens, and a save it performs is real. "
+    "Verified: an invoke returned both PCBs of an opened project by name and uuid, and "
+    "a thrown Error came back as EXECUTION_ERROR with the app's own message. No write "
+    "was ever performed while measuring.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "session": _str("session id from lceda_pro_open / lceda_pro_sessions"),
+         "code": _str("async function body, e.g. 'return eda.dmt_Pcb.list();'"),
+         "js_args": {"type": "object",
+                     "description": "exposed to the snippet as __CLI__.args"},
+         "fn": _str("entry style the app expects", default="run"),
+         "run_timeout_ms": _num("budget passed to the app (max 60000)", 60000),
+     }),
+     "required": ["session", "code"]},
+    _lceda_pro_run,
 )
 
 # ----------------------------------------------------------------- board
@@ -1307,6 +1591,8 @@ def _capabilities(_args):
             "schematic_summary", "schematic_view",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
             "lceda_api_probe",
+            "lceda_pro_status", "lceda_pro_api", "lceda_pro_open",
+            "lceda_pro_sessions", "lceda_pro_close", "lceda_pro_run",
             "feedline_impedance", "feedline_width",
             "antenna_patch", "antenna_printed", "antenna_dipole_monopole",
             "antenna_helix", "antenna_small_loop", "antenna_q_limit", "antenna_chip",
@@ -1390,28 +1676,36 @@ def _capabilities(_args):
             "archive and that record layout was never measured against a real save, "
             "so the writer refuses it (WRITE_UNSUPPORTED_FORMAT) instead of guessing. "
             "KiCad schematics ARE written (see schematic_ops)",
-            "EasyEDA Pro live API drive: the websocket client (RFC 6455 handshake, "
-            "frames, the 49620-49629 port scan) is implemented and unit-tested, but no "
-            "gateway answered on this machine (the port only opens after the user "
-            "enables 外部交互权限), so nothing was driven end to end - every reply "
-            "carries verified_against_app=false. What the install DOES contain, "
-            "measured 2026-10-28: resources/app/assets/pro-api/0.3.38.25cc6d44 "
-            "(api.js + api.d.ts + extension.json declaring the default/sch/symbol/pcb/"
-            "panel services, 378 types by its own help CLI, PCB_Document 21 methods, "
-            "SCH_Document 9, PNL_Document 1). That is an IN-PROCESS extension API, not "
-            "a transport, so it does not make an out-of-process call possible - it only "
-            "means the vendor has a stable programmatic surface to target",
-            "LCEDA Pro launch: lceda-pro.exe exits in about 0.5 s when started "
-            "programmatically here (rc 0 with no arguments, rc 1 with a project "
-            "path), no window and no user-data write - so open_argv_verified stays "
-            "false and app_open_project reports unconfirmed instead of pretending. "
-            "A second, better-instrumented round (2026-10-28) located the layer: the "
-            "exe never reaches Electron - the app's own log "
-            "(Documents\\LCEDA-Pro\\logs\\warn\\<date>.log) and the Chromium "
-            "debug.log get ZERO new lines, the process peaks at ~34 MB and dies with "
-            "rc 0, and '--enable-logging=stderr' is rejected by a launcher shell with "
-            "rc 9 before Chromium sees argv. kicad.exe starts fine from the same "
-            "shell, so this is not 'no GUI here'",
+            "EasyEDA Pro websocket gateway: the client (RFC 6455 handshake, frames, "
+            "the 49620-49629 port scan) is implemented and unit-tested, but no gateway "
+            "answered on this machine (the port only opens after the user enables "
+            "外部交互权限), so nothing was driven through IT - lceda_api_probe still "
+            "reports verified_against_app=false. The live path that DOES work is the "
+            "editor's own command space (lceda_pro_*); both speak to the same running "
+            "app by different doors",
+            "The live bridge's unverified half (measured 2026-10-28 on 4.1.60): reads "
+            "are proven - ping, open, session.list, session.close, doc.api and invoke "
+            "were all run against the real editor (see docs/24). NOT proven: any "
+            "WRITE. No save, no create, no move, no delete was performed on any "
+            "project, so whether a snippet's save is accepted by the app (and whether "
+            "the resulting file is what the editor would have written itself) stays "
+            "open, and lceda_pro_run says in every answer that the snippet, not the "
+            "tool, decides what happens. Also not proven: that open leaves the "
+            "project bytes untouched (they were not compared before and after), and "
+            "whether the vendor's own '--mcp' transport can be reached at all - this "
+            "build's executable rejects the flag before the app sees it",
+            "LCEDA Pro launch details (CORRECTED 2026-10-28, third round): the app "
+            "DOES start here - the earlier 'it dies before Electron' reading was "
+            "wrong, it described how it was launched. From a shell that inherits a "
+            "console, lceda-pro.exe returns rc 0 in about 0.5 s and writes nothing; "
+            "via explorer.exe (the double-click path) three processes stay up "
+            "(203/36/289 MB) and its command-space pipe appears within seconds. What "
+            "is still NOT verified: attaching a project on the command line (the "
+            "argv probe still fails, and '--'-prefixed options are rejected by node's "
+            "own option parser inside the exe with rc 9, which is why the vendor's "
+            "own '--mcp stdio|http' server cannot be started from here). So "
+            "app_open_project still reports unconfirmed, but lceda_pro_open can open "
+            "a project inside a running editor",
             "Full-wave electromagnetic simulation (method of moments / FDTD / FEM): "
             "nothing here is a solver. The antenna tools give the starting geometry "
             "from closed forms; radiation pattern, gain after a housing, efficiency "
@@ -1531,10 +1825,20 @@ def _capabilities(_args):
                         "rest unrouted). KiCad side is proven against kicad-cli 10.0.7",
             "desktop": "real install: LCEDA Pro 4.1.60 and KiCad 10.0.7 both detected by "
                        "drive scan; window-title parsing unit-tested; live open confirmed "
-                       "only for KiCad's argv form. Measured this round: the "
-                       "LCEDA Pro launcher exits in ~0.5 s when started from a "
-                       "non-interactive parent, so its argv form could not be "
-                       "confirmed and stays false",
+                       "only for KiCad's argv form. Measured: the LCEDA Pro launcher "
+                       "returns rc 0 in ~0.5 s when its parent holds a console and stays "
+                       "up when started through explorer.exe, so its argv form could not "
+                       "be confirmed and stays false",
+            "live bridge": "lceda_pro_* spoken to the RUNNING editor 4.1.60 over its own "
+                           "command-space pipe: ping (bridgeVersion 4.1.60.198f38ab), "
+                           "open of a copied 32.5 MB .eprj headless in 849 ms, "
+                           "session.list, session.close (status closes; the entry "
+                           "remains listed), doc.api (378 types, PCB_Document 21 "
+                           "methods, callConventions.classToProperty) and invoke "
+                           "(both PCBs of the project by name and uuid; a thrown Error "
+                           "came back as EXECUTION_ERROR with the app's own message) "
+                           "were all run against the application. Writes were never "
+                           "exercised - verified_against_app covers the read paths only",
             "crosscheck": "board_cross_check runs the derived clearance and KiCad 10.0.7's "
                           "own DRC on the same file, in both directions, over 13 official "
                           "demo boards: every comparable violation the vendor reported was "

@@ -52,8 +52,15 @@ APPS = {
                               49625, 49626, 49627, 49628, 49629),
         "open_argv": "<exe> <project.epro>",
         "open_argv_verified": False,
-        "notes": ("The Pro API gateway listens on 49620-49629 only after '外部交互权限' is "
-                  "enabled; without it the app cannot be driven by API at all."),
+        "notes": ("Two doors, measured 2026-10-28: the Pro API gateway listens on "
+                  "49620-49629 only after '外部交互权限' is enabled (no listener here), "
+                  "while the editor's own command-space pipe "
+                  "(\\\\.\\pipe\\JLCEDAPro<8 hex>) is open whenever the app is "
+                  "running and answers ping/open/session/invoke - see lceda_pro_*. "
+                  "Launch: from a shell that inherits a console the exe returns rc 0 in "
+                  "about 0.5 s; started via explorer.exe (the double-click path) it "
+                  "stays up. The argv form for attaching a project is still "
+                  "unverified."),
     },
     "kicad": {
         "display": "KiCad (project manager)",

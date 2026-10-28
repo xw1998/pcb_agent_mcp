@@ -142,6 +142,12 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `app_detect` | EDA 装在哪（显式路径→运行中镜像→盘符→注册表） | 永远回带 `tried` 证据 |
 | `app_status` | 是否在跑/几个实例/哪个工程/API 网关端口 | 工程名来自窗口标题，空 = 没窗口显示工程 |
 | `lceda_api_probe` | 立创 Pro 的 websocket 网关（49620-49629）：端口扫描 + RFC 6455 握手到拿到能力清单 | 网关只在用户手动开「外部交互权限」后监听；没应答就回 `no_listener`，每条都带 `verified_against_app:false` |
+| `lceda_pro_status` | 立创 Pro **进程内桥**在不在：枚举 `\\.\pipe\JLCEDAPro*`、逐个 ping | 只认"答复里带 bridgeVersion"的管道；名字对不算数 |
+| `lceda_pro_api` | 问应用自己的 API 面（命名空间类型表 / 某个类的方法） | 连 `classToProperty` 一起回：`PCB_Document` 运行时叫 `pcb_Document` |
+| `lceda_pro_open` | 在**运行中**的应用里开工程，回 sessionId | 只对已存在文件；`headless` 仍是活会话。**open 是否碰工程字节未验证** |
+| `lceda_pro_sessions` | 列开着的文档会话 | 会话是文档，不是进程 |
+| `lceda_pro_close` | 关会话（可 destroy） | 不写工程文件；未保存改动会丢 |
+| `lceda_pro_run` | 在编辑器进程里跑一段 JS（async 函数体，`eda` 在作用域） | **能写**：片段自己决定做什么，本工具不担保；实测只跑过只读片段 |
 | `app_launch` | 分离启动 EDA（不带工程） | 启动进程 ≠ 打开工程 |
 | `app_close` | WM_CLOSE 关窗（等同点 X，可能弹保存框） | `force` 才 TerminateProcess；不碰文件 |
 | `schematic_ops` | 原理图写路径的 op 目录（KiCad `.kicad_sch` 18 个）+ 每条用的坐标系 | 调 `schematic_propose` 前先看它 |
@@ -223,7 +229,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 ```bash
 python run_server.py --version       # 0.0.10
 python run_server.py --selftest      # 协议级自检，76/76（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问）
-python -m unittest discover -s tests # 837 个用例（约 5 分钟，kicad-cli / pcbnew 用例占大头）
+python -m unittest discover -s tests # 863 个用例（约 5 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -296,16 +302,23 @@ MCP 客户端配置（stdio）：
 - **两个闸门 bug 是被真图抓出来的**（docs/14 §5）：元件值改动曾被报成"网表变了"；同一条 ERC
   违规被 KiCad 重新指向不同 item 时曾被算成"新增+解决"。前者会把所有正常字段编辑拦死，
   后者会让人很快学会一按 `allow_new_violations` 了事。
-- **立创 Pro 的实时 API：客户端写了，但一次都没被真应用应答过。** `lceda_api_probe` 现在真的会做
-  RFC 6455 握手、发帧、解析能力清单（`tests/test_lceda_api.py` 10 例，含握手短路/掩码/分片/超时），
-  但本机 49620-49629 全部 `no_listener`——那个网关只有在用户手动打开「外部交互权限」后才监听。
-  所以每条返回都带 `verified_against_app: false`：**代码路径通了，真应用这一侧仍是空的。**
-- **立创的"启动"和"开工程"都没能在这台机器上确认，而这次是量出来的。** 用一个临时副本
-  （`_scratch/argv_probe/`，绝不碰用户工程目录）实测：`lceda-pro.exe <工程.epro>` **0.5 s 后
-  以 rc=1 退出**，不带参数则 **0.5 s 后 rc=0 退出**，全程没有窗口、没有写用户数据目录
-  （`%APPDATA%\JLCEDA Pro` 仍是空的）；同一环境下 KiCad 10.0.7 能被正常拉起并关掉，
-  所以不是本层的启动方式坏了。结论：`open_argv_verified` 保持 `false`，`opened` 只会是
-  `unconfirmed`；桌面控制对立创目前只到"探测到装在哪"（4.1.60，盘符扫描命中）。
+- **立创 Pro 有两条活通路，只有一条真的通过。** websocket 网关那条（`lceda_api_probe`，RFC 6455
+  握手/掩码/分片/超时，`tests/test_lceda_api.py` 10 例）本机 49620-49629 全部 `no_listener`——它
+  只在用户手动打开「外部交互权限」后才监听，所以那条仍带 `verified_against_app: false`。真正跑通的
+  是**应用自己开的命令空间管道**：`lceda_pro_*` 六个工具对着运行中的 4.1.60 实测过 ping、open
+  （32.5 MB 副本 849 ms）、session.list、session.close、doc.api（`eda` 378 个类型、`PCB_Document`
+  21 个方法、带厂商中文注释）与 invoke（`await eda.dmt_Pcb.getAllPcbsInfo()` 回两块板的名字与
+  uuid，抛错回 `EXECUTION_ERROR` + 应用原话）。协议与实测数字见 [docs/24](docs/24-立创进程内桥.md)。
+  **但写路径一次都没做过**：没有 save、没有 create、没有 move，`lceda_pro_run` 每次都在
+  assumptions 里写明"片段自己能写、本工具不担保"。
+- **立创的"启动"曾经被判死，第三轮推翻了——差别只在父进程有没有控制台。** 前两轮记的是
+  "0.5 s 退出、死在 Electron 之前"，那是**从 bash（继承控制台）启动**的现象；改成
+  `explorer.exe "<exe>"`（等价双击）就稳定在三个进程上（203/36/289 MB），管道随即出现，
+  于是才有了上面那条进程内桥（[docs/10](docs/10-桌面控制与双栈读路径.md) §1.1.3）。
+  argv 形式（`lceda-pro.exe <工程.epro>`）**仍然没有确认**，`open_argv_verified` 保持
+  `false`，`app_open_project` 只会回 `unconfirmed`；要开工程请用 `lceda_pro_open`。
+  顺带查清：`--` 开头的选项（含厂商自带的 `--mcp stdio|http`）是被 **exe 里 node 自带的
+  选项解析器**以 rc 9 拒掉的（`bad option: --mcp`），跟立创启动器无关。
 - **差分阻抗有两级：闭式近似与二维场解，两者差多少是实测的。** `diff_impedance` 仍是边耦合闭式（IPC-2141A 族），`diff_impedance_field` 解真实截面上的 div(ε∇V)=0（有限体积 + 梯度张量网格 + 红黑 SOR，纯 stdlib）。闭式在实测几何上系统性**偏低 8~11%**、方向一致，所以「调宽凑数」会把线先做窄。场解自己的误差对着两个共享零近似的参考答案量过：零厚度带状线对精确共形解（w/b 0.5..4）≤1.2%、孤立微带对 Hammerstad ≤2.8%、耦合通路在 s/h=8 处对 2×孤立精确解 ≤2.7%；这三张表由 `tests/test_field2d.py` 每次重算，不会悄悄过期。**没被独立参考答案覆盖的是紧间距耦合**——那种几何下工具自己吐 `reference_note`，说明「这是求解器的意见，不是被核过的数」。两者都不建模阻焊、蚀刻梯形与铜损/色散。
 - **两张读不到原文的表，改走两条不需要原文的路。** 标准是付费的、公开转述互相矛盾（IPC-2152
   与 IPC-2221 差可 >3×），所以不自已抄表：
@@ -482,7 +495,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 101 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 107 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -493,6 +506,7 @@ pcb_agent_mcp/
 │   │   ├── sch_plan.py           # 原理图 propose/apply + netlist_diff/erc_diff
 │   │   └── fsutil.py             # 原子写（同卷临时文件 + fsync + os.replace）
 │   ├── desktop.py                # Desktop 层：ctypes 探测/启动/关闭/开工程（不碰文件）
+│   ├── lceda_live.py             # 立创 Pro 进程内桥：命令空间管道 + 帧层 + invoke/doc.api 客户端
 │   ├── oracle.py                 # Oracle 层：只读度量，缺事实就拒绝回答
 │   ├── geometry.py               # 纯 stdlib 2D 几何（mm、Y 向上）
 │   ├── fidelity/                 # 保真层：整份文档进树，事实从树里读
@@ -535,10 +549,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 837 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 863 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~23，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~24，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
