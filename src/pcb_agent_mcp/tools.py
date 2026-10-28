@@ -30,6 +30,7 @@ from .calc import thermal as _thermal
 from .calc import vibration as _vib
 from .calc import cavity as _cavity
 from .calc import electrothermal as _electro
+from .calc import filters as _filters
 from .calc.result import err
 from .adapters import FORMATS as _FORMATS
 from .adapters import detect_format as _detect_format
@@ -1266,6 +1267,9 @@ def _capabilities(_args):
             "board_vibration",
             "cavity_resonance", "cavity_via_fence",
             "electrothermal_trace", "electrothermal_conductor",
+            "filter_prototype", "filter_lumped_bandpass",
+            "filter_coupled_microstrip", "filter_coupled_resonator",
+            "filter_waveguide_cavity",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
@@ -1365,10 +1369,12 @@ def _capabilities(_args):
             "ngspice and the same tool can hand the deck to it (engine='ngspice', or "
             "'auto' once a binary is on PATH / in PCB_AGENT_NGSPICE), which covers "
             "subcircuits, behavioural sources, switches, transmission lines and the "
-            "real device models. That path is NOT bundled and NOT verified from here: "
-            "no ngspice binary exists on the machine this was built on, so every "
-            "external answer carries verified_against_engine:false, and the delegation "
-            "has only been exercised against a stand-in engine. What neither path "
+            "real device models. That path is NOT bundled: the binary is not shipped "
+            "with this server. The delegation WAS exercised against real ngspice-47 "
+            "(MSYS2 Windows build) and cross-checked node by node with the builtin "
+            "solver; verified_against_engine is true only for the versions in this "
+            "build's VERIFIED_ENGINES list, and false for any other version - a "
+            "different binary is not a verified engine. What neither path "
             "does: temperature sweeps (one temperature per run), noise (.noise), "
             "distortion, Monte Carlo; the builtin solver also uses dense LU and "
             "refuses above ~400 unknowns",
@@ -1401,6 +1407,7 @@ def _capabilities(_args):
             "random-plus-shock superposition, no drop simulation, no nonlinear "
             "contact or rattling, and nothing here is a stress solver - it gives "
             "displacement, never a stress or a strain",
+            "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives ideal lossless L/C values and its own S21, but no finite-Q insertion loss, no component parasitics, no real capacitor/inductor series resonance and no tolerance or Monte-Carlo yield. filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity is TE101 only: no higher-order modes, no mode chart, no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no surface-roughness correction. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
                     "missing fact is refused or declared absent, never defaulted",
@@ -1478,13 +1485,18 @@ def _capabilities(_args):
                           "is checked against its own energy balance (power in vs "
                           "convection out, refused above 0.5 % residual) and against "
                           "the P/(2hA) limit for a high-k plate. The ngspice "
-                          "delegation is covered the other way round: with no engine "
-                          "installed, engine='ngspice' is asserted to REFUSE "
-                          "(ENGINE_NOT_FOUND) rather than fall back, and the rawfile "
-                          "parser (both the ASCII and the binary layout, including "
-                          "the point index the ASCII form puts first) plus the "
-                          "deck filter and the three failure paths are driven by a "
-                          "stand-in engine under tests/",
+                          "delegation is covered twice: without an engine, "
+                          "engine='ngspice' is asserted to REFUSE (ENGINE_NOT_FOUND) "
+                          "rather than fall back, and the rawfile parser (both the "
+                          "ASCII and the binary layout) plus the deck filter and the "
+                          "three failure paths are driven by a stand-in engine; with "
+                          "real ngspice-47 installed the SAME decks run on both "
+                          "engines and are compared node by node - a divider to 5e-9 "
+                          "V, a diode to 3.5e-4 V (model difference), a BJT to 1.8e-2 V "
+                          "(model difference), and an RC step and an RLC AC sweep to "
+                          "0.0 V, i.e. bit-identical; verified_against_engine is "
+                          "gated on the engine version string, not on the file "
+                          "existing",
             "vibration": "checked against the closed-form plate eigenvalues, not "
                          "against itself: a simply supported square gives "
                          "f11 = pi^2 sqrt(D/rho h)/a^2 to 6 digits (330.385 Hz on a "
@@ -1505,6 +1517,24 @@ def _capabilities(_args):
                       "half-wave resonance; the (0,1) mode lands at 0.903580 GHz = "
                       "f10*a/b. via_fence is pure division, and the tests assert that "
                       "it refuses to PASS without a caller-supplied criterion",
+            "filters": "every branch is checked against an independent closed form, "
+                        "not against itself: the 3rd-order 0.5 dB Chebyshev prototype "
+                        "comes out 1.596331 / 1.096681 / 1.596331 / 1.0 and the "
+                        "Butterworth 1 / 2 / 1 / 1 (textbook); the lumped bandpass S21 "
+                        "from the ABCD cascade of the actual L/C elements agrees with "
+                        "1/(1+eps^2 Tn^2) to 0.0005 dB at f0 and both band edges, and "
+                        "the tool REFUSES (INTERNAL_CHECK_FAILED) above 0.02 dB; the "
+                        "coupled-microstrip inversion is scored on the impedances the "
+                        "2-D solver actually returns (0.24-0.29 % worst error in 4-5 "
+                        "iterations) and every iteration is reported; the mesh drift is "
+                        "measured, not assumed (Z0e 64.52 at h/3, 69.57 at h/6, 70.17 "
+                        "at h/12); the TE101 cavity gives 19.8536 mm length for WR-90 "
+                        "at 10 GHz with Qc = 7821.5 from the closed-form bracket and "
+                        "7821.5 from the numerical |H_tan|^2 wall integral (0.0 % "
+                        "apart, and >2 % is refused) and R/Q = 160.957 ohm, all three "
+                        "matching hand arithmetic. k from two close impedances is "
+                        "reported with its own resolution limit rather than presented "
+                        "as a measured number",
             "electrothermal": "the fixed point has a closed form dT = A/(1-G), so the "
                               "tests compare the iteration against that closed form and "
                               "against the definition: R20 = 0.01 ohm, I = 1 A, "
@@ -2106,7 +2136,9 @@ _tool(
     "see the engine parameter. The builtin solver takes R C L V I E G D Q M and REJECTS "
     "X/F/H/K/S/W/B/T/O/U/A BY NAME, never silently; with ngspice the deck is passed "
     "through, so those cards work, but the per-element report is then absent (this "
-    "server will not re-derive it and present its own arithmetic as the engine's).",
+    "server will not re-derive it and present its own arithmetic as the engine's). "
+    "A deck this server's own parser cannot read is reported with netlist_parsed:false "
+    "and netlist_parse_note instead of being quietly treated as a full parse.",
     {"type": "object", "properties": {
         "netlist": _str("SPICE netlist text, one card per line; a leading * is a comment. "
                         "The first line is not skipped unless it starts with * - write "
@@ -2117,12 +2149,15 @@ _tool(
                        "present", 27),
         "max_iter": _num("Newton iteration budget per solve", 200),
         "max_points": _num("cap on transient/AC output points", 200),
-        "engine": _str("which solver: auto (ngspice when found on PATH or in "
-                       "PCB_AGENT_NGSPICE, else builtin), builtin, or ngspice. "
+        "engine": _str("which solver: builtin (default - the stdlib subset), ngspice, "
+                       "or auto (ngspice when found on PATH / in PCB_AGENT_NGSPICE / "
+                       "in a standard install dir, else builtin). The default is the "
+                       "builtin on purpose: a run that silently switches model sets "
+                       "depending on what is installed would answer differently on two "
+                       "machines with no way to tell from the number. "
                        "engine='ngspice' REFUSES when no binary is found instead of "
-                       "quietly answering with the subset - the two differ in device "
-                       "models, so that substitution would be a wrong answer",
-                       enum=["auto", "builtin", "ngspice"], default="auto"),
+                       "quietly answering with the subset",
+                       enum=["builtin", "ngspice", "auto"], default="builtin"),
         "cross_check": _bool("run BOTH solvers on the same deck and report the largest "
                              "node-voltage disagreement; this is how the delegation "
                              "itself is audited", False),
@@ -2131,7 +2166,7 @@ _tool(
                               temp_c=a.get("temp_c"),
                               max_iter=int(a.get("max_iter") or 200),
                               max_points=int(a.get("max_points") or 200),
-                              engine=a.get("engine") or "auto",
+                              engine=a.get("engine") or "builtin",
                               cross_check=bool(a.get("cross_check"))),
 )
 
@@ -2695,6 +2730,131 @@ _tool(
         tol_c=(a["tol_c"] if a.get("tol_c") is not None else 1e-4),
         max_iter=int(a["max_iter"] if a.get("max_iter") is not None else 2000),
         note=a.get("note")),
+)
+
+# ------------------------------------------------------------ filters (ADS-like)
+_tool(
+    "filter_prototype",
+    "Lowpass prototype element values g1..gn for a Chebyshev or Butterworth response. "
+    "This is the starting point every lumped and distributed filter below is built on, "
+    "and its numbers are checkable against any textbook table.",
+    {"type": "object", "properties": {
+        "order": _num("filter order n (1..20)"),
+        "response": _str("prototype family", ["chebyshev", "butterworth"],
+                         default="chebyshev"),
+        "ripple_db": _num("passband ripple in dB; chebyshev defaults to 0.5, "
+                          "butterworth must be 0 or omitted"),
+    }, "required": ["order"]},
+    lambda a: _filters.prototype_gvalues(
+        a.get("order"), a.get("response") or "chebyshev", a.get("ripple_db")),
+)
+
+_tool(
+    "filter_lumped_bandpass",
+    "Lumped LC bandpass filter by lowpass-to-bandpass transformation: L and C for every "
+    "series and shunt branch, plus the S21 curve computed TWO WAYS - ABCD cascade of the "
+    "actual elements and the closed-form Chebyshev/Butterworth 1/(1+eps^2 Tn^2) - and "
+    "compared point by point. If the two disagree by more than 0.02 dB the answer is "
+    "refused (INTERNAL_CHECK_FAILED) rather than reported.",
+    {"type": "object", "properties": {
+        "order": _num("filter order"),
+        "f0_hz": _num("centre frequency in Hz"),
+        "fbw": _num("fractional bandwidth, e.g. 0.1 for 10 % (0 < fbw < 1)"),
+        "z0_ohm": _num("terminating impedance", 50.0),
+        "ripple_db": _num("passband ripple; chebyshev default 0.5"),
+        "response": _str("prototype family", ["chebyshev", "butterworth"],
+                         default="chebyshev"),
+        "points": _num("S21 sweep points", 31),
+    }, "required": ["order", "f0_hz", "fbw"]},
+    lambda a: _filters.lumped_bandpass(
+        a.get("order"), a.get("f0_hz"), a.get("fbw"),
+        z0_ohm=(a["z0_ohm"] if a.get("z0_ohm") is not None else 50.0),
+        ripple_db=a.get("ripple_db"),
+        response=a.get("response") or "chebyshev",
+        points=int(a["points"] if a.get("points") is not None else 31)),
+)
+
+_tool(
+    "filter_coupled_microstrip",
+    "Invert a symmetric coupled-microstrip pair: given the even/odd mode impedances, "
+    "return w and s. The cross-section is SOLVED (Laplace, electric wall for the odd mode "
+    "and magnetic wall for the even mode, capacitance -> impedance) and the geometry is "
+    "inverted by damped Newton/Broyden on log(w), log(s). Every iteration is reported, so "
+    "a non-converged inversion cannot look converged. k = (z0e-z0o)/(z0e+z0o) is a "
+    "difference of two close numbers: treat k as a tuning start, not a measurement.",
+    {"type": "object", "properties": {
+        "z0e_ohm": _num("even-mode impedance"),
+        "z0o_ohm": _num("odd-mode impedance (must be < z0e_ohm)"),
+        "h_mm": _num("substrate thickness"),
+        "er": _num("relative permittivity", 4.3),
+        "t_um": _num("copper thickness in um", 35.0),
+        "tol_pct": _num("impedance tolerance in percent", 0.5),
+        "fine_div": _num("mesh: cell = h/fine_div (6 is the calibrated value, 12 is ~3x "
+                         "slower for ~1 % shift)", 6.0),
+    }, "required": ["z0e_ohm", "z0o_ohm", "h_mm"]},
+    lambda a: _filters.coupled_microstrip(
+        a.get("z0e_ohm"), a.get("z0o_ohm"), a.get("h_mm"),
+        er=(a["er"] if a.get("er") is not None else 4.3),
+        t_um=(a["t_um"] if a.get("t_um") is not None else 35.0),
+        tol_pct=(a["tol_pct"] if a.get("tol_pct") is not None else 0.5),
+        fine_div=(a["fine_div"] if a.get("fine_div") is not None else 6.0)),
+)
+
+_tool(
+    "filter_coupled_resonator",
+    "Edge-coupled half-wave-resonator bandpass in microstrip: turns the prototype g "
+    "values into external Q, inter-resonator coupling coefficients k_ij, then solves the "
+    "coupled-line geometry for every coupling and the resonator length from lambda_g/2 "
+    "minus two open-end extensions. Returns target vs achieved k and whether each section "
+    "meets its target - the k resolution limit is reported, not hidden.",
+    {"type": "object", "properties": {
+        "order": _num("filter order"),
+        "f0_hz": _num("centre frequency in Hz"),
+        "fbw": _num("fractional bandwidth"),
+        "z0_ohm": _num("system impedance", 50.0),
+        "ripple_db": _num("passband ripple; chebyshev default 0.5"),
+        "response": _str("prototype family", ["chebyshev", "butterworth"],
+                         default="chebyshev"),
+        "h_mm": _num("substrate thickness", 0.2),
+        "er": _num("relative permittivity", 4.3),
+        "t_um": _num("copper thickness in um", 35.0),
+        "tol_pct": _num("impedance tolerance for each coupling solve, percent", 1.0),
+    }, "required": ["order", "f0_hz", "fbw"]},
+    lambda a: _filters.coupled_resonator_bpf(
+        a.get("order"), a.get("f0_hz"), a.get("fbw"),
+        z0_ohm=(a["z0_ohm"] if a.get("z0_ohm") is not None else 50.0),
+        ripple_db=a.get("ripple_db"),
+        response=a.get("response") or "chebyshev",
+        h_mm=(a["h_mm"] if a.get("h_mm") is not None else 0.2),
+        er=(a["er"] if a.get("er") is not None else 4.3),
+        t_um=(a["t_um"] if a.get("t_um") is not None else 35.0),
+        tol_pct=(a["tol_pct"] if a.get("tol_pct") is not None else 1.0)),
+)
+
+_tool(
+    "filter_waveguide_cavity",
+    "Rectangular waveguide cavity in the TE101 mode: resonant length for a given a and b, "
+    "unloaded Q from wall loss computed TWO independent ways (closed-form bracket vs a "
+    "numerical |H_tan|^2 surface integral over all six walls - they must agree within 2 % "
+    "or the answer is refused), and R/Q. Only TE101: no higher-order modes, no mode chart, "
+    "no iris/coupling geometry.",
+    {"type": "object", "properties": {
+        "f0_hz": _num("target resonant frequency in Hz"),
+        "a_mm": _num("broad-wall width a"),
+        "b_mm": _num("narrow-wall height b (default a/2)"),
+        "conductivity_s_m": _num("wall conductivity, default copper 5.8e7", 5.8e7),
+        "mu_r": _num("relative permeability of the fill", 1.0),
+        "er": _num("relative permittivity of the fill", 1.0),
+        "mode": _str("cavity mode", ["TE101"]),
+    }, "required": ["f0_hz", "a_mm"]},
+    lambda a: _filters.waveguide_cavity(
+        a.get("f0_hz"), a.get("a_mm"),
+        b_mm=a.get("b_mm"),
+        conductivity_s_m=(a["conductivity_s_m"]
+                          if a.get("conductivity_s_m") is not None else 5.8e7),
+        mu_r=(a["mu_r"] if a.get("mu_r") is not None else 1.0),
+        er=(a["er"] if a.get("er") is not None else 1.0),
+        mode=a.get("mode") or "TE101"),
 )
 
 _tool(

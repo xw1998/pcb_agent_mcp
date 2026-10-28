@@ -9,6 +9,72 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.9] - 2026-10-28
+
+「加类似 ADS 的功能」：把 ADS 里最常点的几个**合成**按钮做成工具——微带耦合线、
+耦合谐振器带通、矩形腔 TE101。**是合成器，不是仿真器**：给几何，不给 EM 结果。
+
+- 新增 `calc/filters.py`：
+  - `prototype_gvalues(order, response, ripple_db)`——Chebyshev / Butterworth 原型 g 值，
+    `ripple_db=None` 按 response 取自然值，Butterworth 传非零 ripple 直接 `ARG_CONFLICT`。
+  - `lumped_bandpass(order, f0, fbw, ...)`——LP→BP 变换给每段 L/C，并用**两条独立路径**
+    算 S21（真实 L/C 的 ABCD 级联 vs 闭式 `1/(1+eps^2 Tn^2)`），逐点差 > **0.02 dB**
+    返回 `INTERNAL_CHECK_FAILED`，**拒答**而不是端出未对账的数字。
+  - `coupled_microstrip(z0e, z0o, h, er, ...)`——截面用 `field2d` 解拉普拉斯（奇模电壁、
+    偶模磁壁），几何用**good Broyden + 回溯线搜索**在 `log(w), log(s)` 上反解；
+    每次迭代都回带（不收敛藏不住）。k 误差 >3% 时带 `k_resolution_note`：
+    k 是两个相近数之差，0.5% 的阻抗误差可以是 15% 的 k。
+  - `coupled_resonator_bpf(order, f0, fbw, ...)`——Qe=g1/FBW、k_ij=FBW/sqrt(g_i g_j)、
+    谐振器长 `lambda_g/2 - 2*Δl`；每段回带 target/achieved k、`meets_target`、`k_note`。
+  - `waveguide_cavity(f0, a, b, ...)`——TE101 长度、Rs、**Qc 两种推导**（闭式括号式 vs
+    六面 `|H_tan|^2` 数值面积分，差 >2% 拒答）、R/Q；低于 TE10 截止 `OUT_OF_VALIDITY`，
+    非 TE101 `NOT_IMPLEMENTED`。
+- 新增 5 个工具：`filter_prototype` / `filter_lumped_bandpass` / `filter_coupled_microstrip` /
+  `filter_coupled_resonator` / `filter_waveguide_cavity`；`calc_capabilities` 的 `available`
+  与"不做什么"清单同步（无全波、无色散、无交叉耦合、无有限 Q、无 iris 几何、无版图、无良率）。
+- 实测数字：n=3 0.5 dB g 值 1.596331/1.096681/1.596331/1.0；2.4 GHz/FBW 0.1 的集总带通
+  f0 0.0 dB、带边 0.5/0.5001 dB、两路差 0.000521 dB；耦合微带 70/40 Ω → w=0.2855 s=0.0788 mm
+  最差 0.006%（`fine_div=6`，3.5 s）；WR-90 @10 GHz → d=19.8536 mm、Qc 7821.5（两路 0.0%）、
+  R/Q 160.957 Ω。
+- 修掉一个**只在异常分支才炸**的缺陷：`k_resolution_note` 里引用了不存在的变量
+  （`z0e_target`），任何 k 误差 >3% 的调用都会 `NameError`；原来的用例都收敛得很好，
+  这个分支从没被执行过。现在有一条测试专门把它逼出来。
+- `coupled_microstrip` 的网格默认值收到 `fine_div=6`（`cell = h/6`）：实测 `h/6 → h/12`
+  只移动 0.9%/0.7%，而 quasi-static 模型自身误差更大，所以**不用 3 倍时间去换 1%**；
+  这个漂移写进 `precision` 而不是声称网格无关。
+- 测试：新增 `tests/test_filters.py` 31 例（期望值全部来自教科书表 / 手算闭式 / 必须成立的自洽关系，
+  没有一条是"跑一遍代码记下来"）；`--selftest` 57 → 60。
+- 文档：新增 `docs/22-微带与腔体滤波器.md`；`docs/README.md` 的 `21` 行改写成真引擎实测口径并加 `22` 行。
+
+## [0.0.8] - 2026-10-28
+
+「本机没有 ngspice 二进制」这条欠账清掉：**自己下载装上了**，并且用真引擎把委派跑了一遍。
+装的是外部二进制（清华 MSYS2 镜像的 `mingw-w64-x86_64-ngspice-47` 解包到
+`%LOCALAPPDATA%\ngspice-47\`），**不入仓库、不成为依赖**——本仓库仍然只用 stdlib。
+
+- 查找链补上 glob 兜底：`%LOCALAPPDATA%` / `%ProgramFiles%` / `%ProgramFiles(x86)%` 下的
+  `ngspice*`（`setx` 只对新进程生效，刚装完就调工具的那个进程看不见自己设的变量）。
+- `_run_ngspice()` 在 `SPICE_LIB_DIR` 未设且 `<exe>/../lib/ngspice` 存在时注入它——否则
+  XSPICE code model 加载失败，`T` 卡与所有 XSPICE 器件全废（能跑但读不懂半个 deck）。
+- `_engine_version()` 修 banner 解析：ngspice 版本行的第一个特征是星号行，原来取回来是 `******`。
+- `verified_against_engine` 改为**按版本动态判**（`VERIFIED_ENGINES = ("ngspice-47",)`）：
+  装了引擎不等于验证过引擎，别的版本回落 false 并在 `engine_verification` 里说明。
+- **未解析 deck 直通**：`.subckt/X`、`B`、`T` 这类本模块按名字拒绝的卡，在 `engine="ngspice"`
+  下不再致命——deck 原样交给引擎，节点表从 rawfile 读（`x1.m` 这样的子电路内部节点自然出现），
+  分析类型/步长退化为文本扫描，信封带 `netlist_parsed:false` + `netlist_parse_note`。
+  同一 deck 走 `builtin` 仍然 `NETLIST_INVALID`，能力差如实呈现。
+- 修掉直通才会暴露的缺陷：deck 过滤用 `startswith(".end")` 丢行，把 `.ends` 也丢了，
+  于是 `.subckt` 块少结束行、ngspice `ENGINE_FAILED`。
+- `simulate()` 默认引擎从 `auto` 改为 `builtin`：默认值不能让同一网表在两台机器给出不同答案，
+  而调用方从数字上看不出来。`engine="auto"` 才是"有引擎就用"。
+- 真机实测（`cross_check=True`）：分压 5e-09 V、二极管 3.47e-04 V、BJT 1.78e-02 V（模型差异）、
+  RC 阶跃与 RLC AC **逐位相同**。
+- 测试：`tests/test_spice_engine.py` 增 `TestRealEngine`（`skipUnless(spice.find_ngspice())`，
+  7 例：分压对账、RC/AC 逐位、版本门控、`.subckt` 与 `B` 直通、`netlist_parsed` 标注）；
+  `--selftest` 54 → 57（新增默认引擎断言、`engine="auto"` 选择、双引擎对账一致、B 源直通）。
+- 文档：`docs/21-SPICE引擎委派.md` §21.6 由"未验证声明"改写为真引擎实测表 + 版本门控口径，
+  新增 §21.6a 讲清"装了引擎真正多出什么"。
+
 ## [0.0.7] - 2026-10-28
 
 「SPICE 为什么只做子集」的回答：**不是懒，是零 runtime 依赖约束下唯一诚实的形态**。完整 SPICE

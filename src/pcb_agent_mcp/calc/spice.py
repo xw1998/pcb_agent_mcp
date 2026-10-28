@@ -1166,6 +1166,18 @@ NGSPICE_ENV = "PCB_AGENT_NGSPICE"
 
 NGSPICE_TIMEOUT_S = 120.0
 
+# Versions this repository has actually run the gold netlists against, with the
+# measured agreement recorded in docs/21 and asserted in tests/test_spice_engine.py.
+# Presence of a binary is not evidence; being on this list is.
+VERIFIED_ENGINES = ("ngspice-47",)
+
+ENGINE_VERIFICATION = (
+    "ngspice-47 (Windows, MSYS2 build) was run against this module's gold netlists: "
+    "10 V 1k/2k divider 5e-9 V apart, diode 0.35 mV, BJT 17.8 mV (model, not "
+    "arithmetic), RC step and RLC AC bit-identical. Any other engine version is "
+    "NOT covered by that evidence and reports verified_against_engine:false"
+)
+
 ENGINE_NOTE = (
     "engine='auto' uses ngspice when a binary is found (PCB_AGENT_NGSPICE or PATH) "
     "and the builtin stdlib solver otherwise; engine='ngspice' REFUSES rather than "
@@ -1195,6 +1207,26 @@ def find_ngspice():
         found = shutil.which(name)
         if found:
             return [found]
+    # A binary unpacked by hand (as on this machine) is not on PATH. Look in the
+    # two places a Windows install actually ends up, newest version first, so an
+    # install does not silently need an environment variable to be seen.
+    import glob
+    roots = []
+    for base in (os.environ.get("LOCALAPPDATA"),
+                 os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if base:
+            roots.append(os.path.join(base, "ngspice*"))
+    cands = []
+    for pat in roots:
+        cands.extend(glob.glob(pat))
+    cands.sort(reverse=True)
+    for d in cands:
+        for name in ("ngspice_con.exe", "ngspice.exe"):
+            p = os.path.join(d, "bin", name)
+            if os.path.isfile(p):
+                return [p]
+            if os.path.isfile(os.path.join(d, name)):
+                return [os.path.join(d, name)]
     return None
 
 
@@ -1205,12 +1237,18 @@ def _engine_version(argv):
                            timeout=20.0)
     except Exception:
         return None
-    text = (p.stdout or b"").decode("utf-8", "replace")
+    text = ((p.stdout or b"") + (p.stderr or b"")).decode("utf-8", "replace")
+    first = None
     for line in text.splitlines():
-        line = line.strip()
-        if line:
+        line = line.strip().lstrip("*").strip()
+        if not line:
+            continue
+        if first is None:
+            first = line
+        # ngspice prints a banner: the informative line is the one naming itself
+        if "ngspice" in line.lower():
             return line[:120]
-    return None
+    return first[:120] if first else None
 
 
 def _parse_raw(data):
@@ -1331,6 +1369,41 @@ def _raw_nodes(raw):
     return nodes, scales
 
 
+def _last_analysis_card(netlist):
+    """Textual LAST .op/.tran/.ac card, for decks this module cannot parse.
+
+    ngspice's own convention is the first card; this module's is the last, so the
+    deck is filtered down to exactly one card and the difference never reaches the
+    engine. Only used when parse_netlist refused the deck (X/.subckt, B, T, ...).
+    """
+    found = None
+    for ln in str(netlist or "").splitlines():
+        low = ln.strip().lower()
+        if low.startswith(".op"):
+            found = "op"
+        elif low.startswith(".tran"):
+            found = "tran"
+        elif low.startswith(".ac"):
+            found = "ac"
+    return found
+
+
+def _tran_step_textual(netlist):
+    """The second token of the last .tran card, or None. Tolerant on purpose."""
+    step = None
+    for ln in str(netlist or "").splitlines():
+        parts = ln.strip().split()
+        if parts and parts[0].lower() == ".tran":
+            if len(parts) >= 3:
+                step = parts[2]
+    if step is None:
+        return None
+    try:
+        return _value(step)
+    except Exception:
+        return None
+
+
 def _deck_for_ngspice(netlist, want):
     """The user's netlist, made runnable by ngspice, with the ANALYSIS forced.
 
@@ -1344,7 +1417,9 @@ def _deck_for_ngspice(netlist, want):
         if not low or low.startswith("*"):
             keep.append(ln)
             continue
-        if low.startswith(".end"):
+        # ".ends" terminates a .subckt and must survive: only the deck's own
+        # .end is dropped (a prefix test would delete the subcircuit's body end).
+        if low == ".end" or low.startswith(".end "):
             continue
         if low.startswith((".op", ".tran", ".ac", ".dc", ".four", ".noise")):
             continue
@@ -1379,9 +1454,21 @@ def _run_ngspice(argv, netlist, want, timeout_s=NGSPICE_TIMEOUT_S):
         with open(deck_path, "w", encoding="ascii", errors="replace") as fh:
             fh.write(deck)
         cmd = list(argv) + ["-b", "-r", raw_path, "-o", log_path, deck_path]
+        env = None
+        # An unpacked ngspice keeps its XSPICE code models in ../lib/ngspice and
+        # was compiled with an absolute default that does not exist on this
+        # machine. Without them T (transmission line) cards and every XSPICE
+        # device fail to load - a run that "works" but cannot parse half the
+        # deck is exactly the kind of partial answer this module refuses.
+        if not os.environ.get("SPICE_LIB_DIR"):
+            here = os.path.dirname(os.path.abspath(argv[0]))
+            lib = os.path.normpath(os.path.join(here, os.pardir, "lib", "ngspice"))
+            if os.path.isdir(lib):
+                env = dict(os.environ)
+                env["SPICE_LIB_DIR"] = lib
         try:
             proc = subprocess.run(cmd, cwd=tmp, capture_output=True,
-                                  timeout=timeout_s)
+                                  timeout=timeout_s, env=env)
         except subprocess.TimeoutExpired:
             return None, err("ngspice did not finish within %g s" % timeout_s,
                              "ENGINE_TIMEOUT",
@@ -1426,11 +1513,14 @@ def _run_ngspice(argv, netlist, want, timeout_s=NGSPICE_TIMEOUT_S):
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _external_envelope(raw, want, argv, tstep_hint=None, cross=None):
+def _external_envelope(raw, want, argv, tstep_hint=None, cross=None,
+                       parse_note=None):
     nodes, scales = _raw_nodes(raw)
     engine = {"engine": "ngspice", "path": argv[0], "argv": list(argv),
               "version": _engine_version(argv),
               "plotname": raw["plotname"]}
+    version = (engine.get("version") or "")
+    verified = any(tag in version.lower() for tag in VERIFIED_ENGINES)
     extra = {
         "engine_used": "ngspice",
         "engine": engine,
@@ -1441,9 +1531,23 @@ def _external_envelope(raw, want, argv, tstep_hint=None, cross=None):
                           "element currents here would be this server's arithmetic "
                           "presented as the engine's result"),
         "not_computed": NOT_COMPUTED,
-        "verified_against_engine": False,
+        "verified_against_engine": verified,
+        "engine_verification": (ENGINE_VERIFICATION if verified else
+                                "this engine's version (%s) is not one this "
+                                "repository has run the gold netlists against, so "
+                                "nothing here vouches for its answers"
+                                % (version or "unknown")),
         "engine_note": ENGINE_NOTE,
+        "netlist_parsed": parse_note is None,
     }
+    if parse_note is not None:
+        # The deck went to the engine unchanged; what this module could not do is
+        # build its own model of it. Say so instead of implying a full parse.
+        extra["netlist_parse_note"] = (
+            "this module's own parser refused the deck (%s), so the deck was handed "
+            "to ngspice unchanged and the node list below is read from the engine's "
+            "rawfile; there is no per-element report and no builtin cross-check"
+            % parse_note)
     if cross:
         extra["cross_check"] = cross
     assumptions = {"engine": "ngspice (external process, deck passed through "
@@ -1565,15 +1669,19 @@ def _cross_check(builtin, external, want):
 
 
 def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
-             temp_c=None, engine="auto", cross_check=False):
+             temp_c=None, engine="builtin", cross_check=False):
     """Run one analysis, optionally delegating to ngspice.
 
-    `engine`: "auto" (ngspice if found, else builtin), "builtin", "ngspice".
+    `engine`: "builtin" (the default), "ngspice", or "auto".
+    The DEFAULT IS THE BUILTIN SOLVER ON PURPOSE: a default that silently
+    changes its model set depending on what happens to be installed on the
+    machine makes the same netlist answer differently on two computers, and the
+    caller has no way to tell from the number alone.
     "ngspice" without a binary is ENGINE_NOT_FOUND - never a silent fall back.
     `cross_check=True` runs both engines and reports the largest node-voltage
     disagreement, which is how the delegation itself is audited.
     """
-    choice = str(engine or "auto").lower()
+    choice = str(engine or "builtin").lower()
     if choice not in ENGINE_CHOICES:
         return err("engine must be one of %s" % ", ".join(ENGINE_CHOICES),
                    "ARG_INVALID",
@@ -1608,15 +1716,22 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
     # Which analysis? Same rule as the builtin path: the caller's word, else the
     # LAST analysis card in the deck (SPICE's own convention is the first, so the
     # deck is filtered to exactly one card and the ambiguity never reaches ngspice).
+    # Unparsable cards (X/.subckt, B, T, K, S, ...) are the whole reason to have a
+    # real engine: on this path the answer is the engine's rawfile, not a model of
+    # ours, so a parse failure is not fatal HERE. The deck is passed through and
+    # the node list is read from the engine's own output. The builtin path still
+    # refuses the same deck - nothing is papered over.
+    spec = None
+    parse_note = None
     try:
         spec = parse_netlist(netlist)
     except ValueError as exc:
-        return err(str(exc), "NETLIST_INVALID",
-                   hint="the parser refuses a card it does not implement instead of "
-                        "skipping it; with an external engine the deck would be passed "
-                        "through, but the node list still comes from this parse, so an "
-                        "unparsed card would make the report incomplete")
-    want = (analysis or (spec["analyses"][-1]["kind"] if spec["analyses"] else "op")).lower()
+        parse_note = str(exc)
+    if spec is None:
+        want = (analysis or _last_analysis_card(netlist) or "op").lower()
+    else:
+        want = (analysis
+                or (spec["analyses"][-1]["kind"] if spec["analyses"] else "op")).lower()
     if want not in ("op", "tran", "ac"):
         return err("analysis must be op, tran or ac", "ARG_INVALID")
     if temp_c is not None:
@@ -1632,9 +1747,13 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
         netlist = str(netlist).rstrip() + "\n.temp %g\n" % temp_c
 
     tstep = None
-    card = next((a for a in spec["analyses"] if a["kind"] == want), None)
-    if card and want == "tran":
-        tstep = card.get("tmax") or card.get("tstep")
+    if spec is None:
+        if want == "tran":
+            tstep = _tran_step_textual(netlist)
+    else:
+        card = next((a for a in spec["analyses"] if a["kind"] == want), None)
+        if card and want == "tran":
+            tstep = card.get("tmax") or card.get("tstep")
 
     raw_log, problem = _run_ngspice(argv, netlist, want)
     if problem is not None:
@@ -1645,7 +1764,8 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
         builtin = _simulate_builtin(netlist, analysis=analysis, max_iter=max_iter,
                                     max_points=max_points, temp_c=None)
         if builtin.get("status") == "ok":
-            external_probe = _external_envelope(raw, want, argv, tstep_hint=tstep)
+            external_probe = _external_envelope(raw, want, argv, tstep_hint=tstep,
+                                                parse_note=parse_note)
             cross = _cross_check(builtin, external_probe, want)
         else:
             cross = {"compared_nodes": 0, "max_abs_diff_v": None,
@@ -1653,4 +1773,5 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
                              "there was nothing to cross-check against - the external "
                              "answer stands alone and is NOT corroborated"
                              % builtin.get("reason_code")}
-    return _external_envelope(raw, want, argv, tstep_hint=tstep, cross=cross)
+    return _external_envelope(raw, want, argv, tstep_hint=tstep, cross=cross,
+                              parse_note=parse_note)

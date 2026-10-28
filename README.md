@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.7` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.9` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -98,7 +98,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（92 个）
+## 工具（97 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -175,7 +175,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `link_far_field` | 远场距离：`max(2D²/λ, 5D, λ/2π)` 并说明哪个机制主导 | 三段都要给，只给一段会误导 |
 | `link_fresnel` | 第一菲涅耳区半径 + 60% 净空 | — |
 | `board_antenna_keepout` | 板级净空：某矩形内的铜与 **zone** | 派生量 `authoritative:false`；pad/track/via 与 zone **分开计数**（DRC 看不见铺铜失谐） |
-| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`） | 内置子集只认 R C L V I E G D Q M，**X/F/H/K/S/W/B/T/O/U/A 逐条点名拒绝**；`engine="ngspice"` 找不到二进制**报错不回退** |
+| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`） | 内置子集只认 R C L V I E G D Q M，**X/F/H/K/S/W/B/T/O/U/A 逐条点名拒绝**（`engine="ngspice"` 下直通引擎）；`engine="ngspice"` 找不到二进制**报错不回退**；默认 `builtin` |
 | `trace_resistance` | 铜线直流电阻 `rho(T)·L/(w·t)` | 只管这一段；过孔/扩展/端子不在这个数里 |
 | `via_resistance` | 过孔桶壁电阻（截面是**铜环**不是钻孔圆） | 载流是另一码事，要温升判据 |
 | `trace_inductance` | 直线走线自感（Grover 带公式，±20%） | 只用于比两种布局；地平面像项**明确未计入** |
@@ -201,6 +201,11 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `cavity_via_fence` | 过孔围栏：`pitch/λ_g`、每间距电长度、给定判据后的 `pass/fail` | **判据必须由调用方给**（λ_g/20 与 λ_g/10 差 2 倍，都不内置）；不给就 `indeterminate` 且不反推间距 |
 | `electrothermal_trace` | 走线自洽温升：R(T) → I²R → ΔT → R(T) 的定点迭代 + 精确失控判据 `dP/dT·Rth < 1` | `rth_c_per_w` **必填**；G≥1 回 `THERMAL_RUNAWAY` 而不是最后一次迭代；只算直流 |
 | `electrothermal_conductor` | 同一环，R₂₀ 由调用方给（过孔桶壁 / 分段串联 / 分流器 / 针脚） | 回 R_hot、电阻增幅、迭代次数、稳定性余量 `1−G`；Rth 仍是调用方的 |
+| `filter_prototype` | 原型 g 值（Chebyshev / Butterworth），滤波器设计的起点 | Butterworth 传非零 ripple 直接 `ARG_CONFLICT`；order ∉ [1,20] 拒 |
+| `filter_lumped_bandpass` | LP→BP：每段 L/C + 两路 S21（ABCD 级联 vs 闭式 `1/(1+ε²Tn²)`） | 两路差 >0.02 dB **拒答**（`INTERNAL_CHECK_FAILED`）；无有限 Q、无寄生、无良率 |
+| `filter_coupled_microstrip` | 耦合微带反解 w/s：截面解拉普拉斯（奇模电壁/偶模磁壁）+ Broyden 反解 | 准静态无色散；k<0.02 拒；k 误差 >3% 带 `k_resolution_note`（k 是两个相近数之差） |
+| `filter_coupled_resonator` | 边缘耦合半波谐振器带通：Qe/k_ij/λ_g−2Δl + 每段 `meets_target` | 不建模交叉耦合（因此没有带外零点）；不给馈电间隙几何 |
+| `filter_waveguide_cavity` | 矩形腔 TE101：长度、Rs、Qc（闭式 vs 六面数值积分）、R/Q | 两路 Qc 差 >2% 拒答；低于 TE10 截止拒；只做 TE101（iris 耦合必须全波） |
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
@@ -210,9 +215,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.7
-python run_server.py --selftest      # 协议级自检，54/54（含板与原理图写路径端到端、天线四问、仿真四问、DFM 三问、振动五问、腔体与电热五问）
-python -m unittest discover -s tests # 670 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
+python run_server.py --version       # 0.0.9
+python run_server.py --selftest      # 协议级自检，60/60（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动五问、腔体与电热五问、滤波器三问）
+python -m unittest discover -s tests # 708 个用例（约 5 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -333,9 +338,14 @@ MCP 客户端配置（stdio）：
   `engine="auto"` 在 PATH / `PCB_AGENT_NGSPICE` 找到 ngspice 就把 deck 原样交给它（只过滤分析卡），
   找不到则用内置子集并在 `engine_used` / `engine_note` 里说明；`engine="ngspice"` 找不到是
   `ENGINE_NOT_FOUND` 报错，**绝不静默回退**（level-1 MOSFET 的答案冒充不了 BSIM）。
-  `cross_check=True` 跑两个引擎比节点电压——这是唯一能审计这条委派本身的手段。**本机没有
-  ngspice 二进制**，所以每条外部答案都带 `verified_against_engine:false`，管线只用
-  `tests/_fake_ngspice.py` 假引擎测通。
+  `cross_check=True` 跑两个引擎比节点电压——这是唯一能审计这条委派本身的手段。本机**已装
+  ngspice-47**（MSYS2 构建解包到 `%LOCALAPPDATA%\ngspice-47\`，外部二进制不是仓库依赖）并对着
+  金标网表实测：分压 5e-9 V、二极管 0.35 mV、BJT 17.8 mV（模型差异）、RC 阶跃与 RLC AC 逐位相同，
+  所以 `verified_against_engine` **按版本**给 true（`VERIFIED_ENGINES`，别的版本回落 false）。
+  装了引擎才拿到的能力是**未解析 deck 直通**：`.subckt/X`、`B`、`T` 等内置按名字拒绝的卡在
+  `engine="ngspice"` 下照跑，节点表从 rawfile 读，信封带 `netlist_parsed:false` 而**不假装**
+  这是一次完整解析；同一 deck 走 `builtin` 仍然拒绝。`simulate()` 默认引擎是 `builtin`
+  （`engine="auto"` 才用引擎）——默认值不能让同一网表在两台机器给出不同答案。
 - **AC 截断会出声。** 扫频点数超过 `max_points` 时返回 `warnings`：只解了前 N 点、末点不是 `fstop`。
   一个还在上升的曲线被静默截断，会被读成"电路在这里谐振"。
 - **温度必须给符号正确的答案。** IS 按 SPICE 实现随温度缩放（XTI/EG/TNOM）：27 ℃ 二极管 0.6925 V，
@@ -408,6 +418,31 @@ MCP 客户端配置（stdio）：
   没有瞬态耦合（热容不进环）、没有交流损耗（趋肤/邻近）、`sim_spice` 里的器件不发热、
   `board_ir_drop` 也没把自己的 I²R 反哺进温度场——那一层仍由用户迭代。
 
+### 滤波器合成：给几何，不给 EM 结果（[docs/22](docs/22-微带与腔体滤波器.md)）
+
+- **是合成器，不是仿真器。** 五个 `filter_*` 工具回答的是"要画成什么样"：原型 g 值、
+  集总 L/C、耦合线 `w/s`、耦合谐振器 `Qe/k/λ_g/2`、矩形腔 TE101 的长度与 Q。凡是需要
+  全波才能回答的问题（交叉耦合、色散、有限 Q、iris 几何、辐射）全部进 `not_computed`，
+  并在每一份答案里带出去——调用方不读文档也知道边界。
+- **两路独立推导必须对上，否则拒答。** 集总带通把真实 L/C 级联的 S21 与闭式
+  `1/(1+ε²Tn²)` 逐点比，差 >0.02 dB 就 `INTERNAL_CHECK_FAILED`；腔体 Qc 用闭式括号式与
+  六面 `|H_tan|²` 数值积分两路算，差 >2% 就拒答。实测 n=3 / 2.4 GHz / FBW 0.1：
+  f0 0.0 dB、带边 0.5/0.5001 dB、两路差 0.000521 dB；WR-90 @10 GHz：d=19.8536 mm、
+  Qc=7821.5（两路 0.0%）、R/Q=160.957 Ω。
+- **耦合线反解是数值的，不是查表的。** 截面用 `field2d` 解拉普拉斯（奇模电壁、偶模磁壁），
+  几何用 good Broyden + 回溯线搜索在 `log(w), log(s)` 上反解，**每次迭代都回带**。
+  70/40 Ω @0.2 mm/εr4.3 得 w=0.2855、s=0.0788 mm，最差 0.006%、3.5 s。
+- **网格追基板高，不追 gap。** `cell = h/fine_div`（默认 6）：实测 `h/6→h/12` 只移动
+  0.9%/0.7%，而 quasi-static 模型自身误差更大，所以不拿 3 倍时间换 1%。这个漂移写进
+  `precision`，不声称网格无关。
+- **k 的分辨率极限要说出口。** `k=(z0e−z0o)/(z0e+z0o)` 是两个相近数之差：阻抗解到 0.5%
+  时 k 的误差可以是 13~15%。所以 k 误差 >3% 就带 `k_resolution_note`，
+  `coupled_resonator_bpf` 的每段直接给 `meets_target: false` —— 这个耦合太弱，
+  准静态解不出可信的 s，去 EM 里调。
+- **一个只在异常分支才炸的缺陷。** `k_resolution_note` 里引用了不存在的变量（`z0e_target`），
+  任何 k 误差 >3% 的调用都会 `NameError`；原来的用例都收敛得很好，这个分支从没被执行过。
+  修完补了一条专门把它逼出来的测试——只在异常路径上输出的解释性代码，也得有测试。
+
 ## 项目结构
 
 ```
@@ -416,7 +451,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 92 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 97 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -463,14 +498,15 @@ pcb_agent_mcp/
 │       ├── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
 │       ├── vibration.py          # 振动：薄板 Ritz 模态 + Miles + Steinberg + 冲击 + 传递率
 │       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）
+│       ├── filters.py            # 滤波器合成：原型 g 值/集总带通(两路对账)/耦合线反解/耦合谐振器/TE101 腔
 │       └── electrothermal.py     # 电热耦合：R(T) 定点迭代 + 精确失控判据
 ├── data/
 │   ├── creepage_tables.json      # 空表 + verified:false + why_empty（故意不填）
 │   └── ipc2152_tables.json       # 同上；表本身由 calc/safety_table.py 可执行地体检
-├── tests/                        # 670 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 708 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~21，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~22，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明

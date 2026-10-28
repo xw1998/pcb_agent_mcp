@@ -43,10 +43,21 @@ engine="ngspice"  找不到二进制 => ENGINE_NOT_FOUND 报错，绝不静默�
 NGSPICE_CMD（模块级，测试注入 argv 前缀）
   > PCB_AGENT_NGSPICE（环境变量：一个路径，或一整条命令行）
   > PATH 上的 ngspice / ngspice.exe / ngspice_con / ngspice_con.exe
+  > %LOCALAPPDATA%\ngspice*  %ProgramFiles%\ngspice*  %ProgramFiles(x86)%\ngspice*
+    （倒序扫，取 bin/ 下的 exe，或根目录同名 exe）
 ```
 
 环境变量的取值先当**整个路径**试（Windows 下路径常带空格），不是文件才按命令行拆——把
 `C:\Program Files\ngspice\bin\ngspice_con.exe` 按空格拆开是这条链上最容易犯的错。
+
+最后一档 glob 是必需的而不是顺手：`setx` 只对**此后新开的进程**生效，而"刚装完就调工具"
+这个过程往往看不见自己刚设的变量。
+
+装了引擎之后还要补一件事：MSYS2 打包的 ngspice 把 XSPICE code model 编成
+`<prefix>/lib/ngspice/*.cm`，但二进制里写死的默认路径是 `/mingw64/lib/ngspice`（编译机上的
+绝对路径，本机不存在）。少了这些 cm，`T` 卡和所有 XSPICE 器件**加载失败**——一个"能跑但读不懂
+半个 deck"的引擎，比没有引擎更容易骗人。所以 `_run_ngspice()` 在 `SPICE_LIB_DIR` 未设、
+且 `<exe 所在目录>/../lib/ngspice` 存在时，把它注入子进程环境。
 
 ## 21.4 deck 与 rawfile
 
@@ -85,17 +96,48 @@ sim_spice(netlist, engine="ngspice", cross_check=True)
 `elements`（逐元件电压/电流/功率）在外部路径上是 `null`：那是内置求解器用自己的伴随模型算的，
 拿节点电压回推元件电流再当成"引擎的结果"报出去，是把自己的算术冒充引擎的答案。
 
-## 21.6 未验证声明（诚实清单的一部分）
+## 21.6 真引擎实测（本机装的 ngspice-47）
 
-本机**没有 ngspice 二进制**（`shutil.which` 为空，`C:\Program Files\ngspice*` 不存在），所以：
+本机已装 **ngspice-47**（Windows / MSYS2 构建，解包自清华 MSYS2 镜像的
+`mingw-w64-x86_64-ngspice-47`，落在 `%LOCALAPPDATA%\ngspice-47\`，38 MB，含
+`bin\` 与 `lib\ngspice\*.cm`；依赖的 6 个 MSYS2 DLL 一并取齐）。装外部二进制**不是**
+仓库依赖——仓库仍然只用 stdlib，`pip install zstandard` 只用于一次性解包。
 
-- 外部路径**从未对着真 ngspice 跑过**，每条外部 envelope 都带 `verified_against_engine: false`；
-- 管线用 `tests/_fake_ngspice.py`（假引擎，按 `$FAKE_SPEC` 决定它答什么）测通：ASCII / Binary
-  两种 rawfile、点序号丢弃、deck 过滤、三条失败路径（rc≠0 / 不写 raw / 根本没装）、cross_check
-  的三种口径；
-- 装了真 ngspice 之后，同一工具立刻能跑 `.subckt`、B 源、开关、传输线等内置拒绝的卡；
-  到那时把 `verified_against_engine` 改成 true 需要一个前置条件——**对着真引擎跑一遍现有金标网表**，
-  这件事本机做不了。
+同一 deck 双引擎对比（`cross_check=True`）：
+
+| 网表 | compared_nodes | max_abs_diff_v |
+|---|---|---|
+| 10 V / 1k / 2k 分压 `.op` | 2 | 5e-09 |
+| 二极管 5 V / 1k / IS=1e-14 | 2 | 3.47e-04 |
+| BJT V2=0.7 V, BF=200 | 3 | 1.78e-02 |
+| RC 阶跃 `.tran` | 2 | 0.0（逐位相同） |
+| RLC 串联谐振 `.ac` | 3 | 0.0（逐位相同） |
+
+BJT 的 17.8 mV **是模型差异不是算术差异**（两边模型卡不同），不假装零差。分压的 5e-09 是
+ngspice 写 ASCII rawfile 时的有效位数，不是求解差。
+
+两条由此定死的口径：
+
+- `verified_against_engine` **按版本动态判**（`VERIFIED_ENGINES = ("ngspice-47",)`）：装了引擎
+  ≠ 验证过引擎。别的版本回落 false，并在 `engine_verification` 里说明"这个版本没被本仓库的金标
+  网表跑过"。
+- `simulate()` 的**默认引擎是 `builtin`**（`engine="auto"` 才能用上引擎）。默认值不能让同一
+  网表在两台机器给出不同答案，而调用方从数字上看不出来。
+
+## 21.6a 装了引擎真正多出什么：未解析的 deck 直通
+
+内置解析器按名字拒绝 `.subckt/X`、`B`、`T`、`K`、`S`、`W`、`F`、`H`、`J`、`O`、`U`、`A`。
+在委派路径上，答案本来就是引擎自己的 rawfile 而不是本模块的模型，所以**解析失败不再致命**：
+
+- deck 原样交给引擎（只过滤分析卡、补 `.end`）；
+- 节点表**从 rawfile 里读**（`x1.m` 这样的子电路内部节点自然出现）；
+- 分析类型/步长退化为**文本扫描**（最后一张 `.op/.tran/.ac`，`.tran` 的第二个 token）；
+- 信封带 `netlist_parsed: false` + `netlist_parse_note`（写明"本模块解析器拒绝了这份 deck"），
+  绝不假装这是一次完整解析；
+- `engine="builtin"` 对同一份 deck **仍然拒绝**（`NETLIST_INVALID`）——能力差就如实呈现。
+
+顺带修掉一个只有直通才会暴露的缺陷：deck 过滤原来用 `startswith(".end")` 丢行，把
+`.ends` 也丢了，于是 `.subckt` 块体少一个结束行、ngspice 直接 `ENGINE_FAILED`。
 
 ## 21.7 失败路径一览
 
@@ -107,7 +149,7 @@ sim_spice(netlist, engine="ngspice", cross_check=True)
 | `ENGINE_OUTPUT_INVALID` | rc = 0 但没 raw / raw 解析不了 | `log_tail` 或 `raw_bytes` |
 | `ARG_CONFLICT` | `.temp` 卡与 `temp_c` 同时给 | 两张温度卡谁生效取决于行序，拒绝 |
 | `ARG_REQUIRED` | 网表里没有所请求的分析卡 | 不猜步长/频点 |
-| `NETLIST_INVALID` | 解析器遇到未实现的卡 | 节点表来自本机解析，未解析的卡会让报告不完整 |
+| `NETLIST_INVALID` | 内置求解器遇到未实现的卡 | 内置路径拒绝；`engine="ngspice"` 时同一 deck 直通引擎 |
 
 ## 21.8 代码对应
 
@@ -115,7 +157,9 @@ sim_spice(netlist, engine="ngspice", cross_check=True)
   - 内置求解器：`_simulate_builtin()`（原 `simulate`）
   - 委派：`find_ngspice()` / `_deck_for_ngspice()` / `_run_ngspice()` / `_parse_raw()` /
     `_raw_nodes()` / `_external_envelope()` / `_cross_check()`
+  - 未解析 deck 的文本兜底：`_last_analysis_card()` / `_tran_step_textual()`
   - 对外唯一入口：`simulate(netlist, analysis=None, max_iter=200, max_points=200,
-    temp_c=None, engine="auto", cross_check=False)`
-- `tests/test_spice_engine.py`（28 例）+ `tests/_fake_ngspice.py`（假引擎）
+    temp_c=None, engine="builtin", cross_check=False)`
+- `tests/test_spice_engine.py`（35 例：假引擎 `tests/_fake_ngspice.py` 覆盖解析/过滤/失败
+  路径/cross_check，7 例 `skipUnless(spice.find_ngspice())` 对着本机真引擎跑，其余纯解析/定位）
 - `sim_spice` 工具新增参数 `engine`、`cross_check`

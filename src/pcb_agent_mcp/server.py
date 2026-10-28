@@ -667,16 +667,111 @@ def selftest():
                   and payload.get("reason_code") == "ENGINE_NOT_FOUND",
                   str(payload.get("reason_code")))
 
+        # the default must not depend on what happens to be installed on the
+        # machine: same netlist, same model set, every time.
         r = handle({"jsonrpc": "2.0", "id": 93, "method": "tools/call",
                     "params": {"name": "sim_spice", "arguments": {
                         "netlist": "* div\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 2k\n.op\n",
                         "cross_check": False}}})
         payload = json.loads(r["result"]["content"][0]["text"])
-        check("auto engine still answers (and cross_check stays off unless asked)",
+        check("the default engine is builtin (machine independent), cross_check off",
               payload.get("status") == "ok"
               and "cross_check" not in payload
-              and payload.get("engine_used") in ("builtin", "ngspice"),
+              and payload.get("engine_used") == "builtin",
               str(payload.get("engine_used")))
+
+        r = handle({"jsonrpc": "2.0", "id": 94, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* div\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 2k\n.op\n",
+                        "engine": "auto"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("engine=auto prefers the engine when present, else builtin",
+              payload.get("status") == "ok"
+              and payload.get("engine_used") == ("ngspice" if _found else "builtin"),
+              str(payload.get("engine_used")))
+
+        r = handle({"jsonrpc": "2.0", "id": 95, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* div\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 2k\n.op\n",
+                        "engine": "ngspice", "cross_check": True}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        if _found:
+            _cc = payload.get("cross_check") or {}
+            _d = abs(_cc.get("max_abs_diff_v") or 0.0)
+            check("cross_check agrees with builtin (<1e-6 V) and the engine is verified",
+                  payload.get("status") == "ok"
+                  and _d < 1e-6
+                  and payload.get("verified_against_engine") is True,
+                  "%.3g V" % _d)
+        else:
+            check("cross_check is skipped when there is no engine to compare with",
+                  payload.get("status") == "ok"
+                  and "cross_check" not in payload
+                  and payload.get("verified_against_engine") is False,
+                  str(payload.get("verified_against_engine")))
+        # the point of having an engine at all: a card this module refuses by name
+        # still runs, and the envelope says the deck was not parsed here.
+        r = handle({"jsonrpc": "2.0", "id": 96, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* b\nV1 1 0 3\nB1 2 0 V = 2 * V(1) + 1\n.op\n",
+                        "engine": "ngspice"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        if _found:
+            check("a B source the builtin refuses does run under ngspice (7 V)",
+                  payload.get("status") == "ok"
+                  and payload.get("netlist_parsed") is False
+                  and abs(((payload.get("value") or {}).get("nodes_v") or {})
+                          .get("2", 0.0) - 7.0) < 1e-6,
+                  str((payload.get("value") or {}).get("nodes_v")))
+        else:
+            check("a B source is refused by the builtin when no engine is installed",
+                  payload.get("status") == "error"
+                  and payload.get("reason_code") == "ENGINE_NOT_FOUND",
+                  str(payload.get("reason_code")))
+
+        # filter synthesis: the prototype table is a textbook value, and the
+        # lumped bandpass is scored against the closed form it must agree with.
+        r = handle({"jsonrpc": "2.0", "id": 97, "method": "tools/call",
+                    "params": {"name": "filter_prototype", "arguments": {
+                        "order": 3, "response": "chebyshev", "ripple_db": 0.5}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _g = ((payload.get("value") or {}).get("g") or [])
+        check("filter_prototype: 0.5 dB Chebyshev n=3 gives 1.5963/1.0967/1.5963/1",
+              payload.get("status") == "ok" and len(_g) == 4
+              and abs(_g[0] - 1.596331) < 1e-5 and abs(_g[1] - 1.096681) < 1e-5
+              and abs(_g[3] - 1.0) < 1e-9,
+              str(_g))
+
+        r = handle({"jsonrpc": "2.0", "id": 98, "method": "tools/call",
+                    "params": {"name": "filter_lumped_bandpass", "arguments": {
+                        "order": 3, "f0_hz": 2.4e9, "fbw": 0.1}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _be = ((payload.get("value") or {}).get("band_edges") or {})
+        _sc = ((payload.get("value") or {}).get("self_check") or {})
+        check("filter_lumped_bandpass: 0 dB at f0, -0.5 dB at both edges, "
+              "ABCD and closed form agree <0.02 dB",
+              payload.get("status") == "ok"
+              and abs(_be.get("f_center_il_db", 9.0)) < 1e-6
+              and abs(_be.get("f_lower_il_db", 9.0) - 0.5) < 0.01
+              and abs(_be.get("f_upper_il_db", 9.0) - 0.5) < 0.01
+              and _sc.get("max_abs_deviation_db", 9.0) < 0.02,
+              "%.3g dB" % (_sc.get("max_abs_deviation_db", 9.0),))
+
+        # TE101 in WR-90 at 10 GHz: length is closed form, and Qc is computed
+        # twice (bracket vs wall integral) and must agree.
+        r = handle({"jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                    "params": {"name": "filter_waveguide_cavity", "arguments": {
+                        "f0_hz": 10e9, "a_mm": 22.86, "b_mm": 10.16}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        check("filter_waveguide_cavity: TE101 length 19.8536 mm and Qc agrees "
+              "two ways (7821.5)",
+              payload.get("status") == "ok"
+              and abs(_v.get("length_mm", 0.0) - 19.8536) < 0.01
+              and abs(_v.get("q_conductor", 0.0) - 7821.5) < 60.0
+              and abs(_v.get("q_agreement_pct", 9.0)) < 2.0,
+              "%.4g mm / Q %.6g" % (_v.get("length_mm", 0.0),
+                                    _v.get("q_conductor", 0.0)))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

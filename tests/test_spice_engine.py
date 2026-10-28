@@ -171,7 +171,7 @@ class TestDelegation(EngineCase):
 
     def test_transient_points_follow_the_time_scale(self):
         self.spec(kind="tran", times=[0.0, 1e-3], nodes={"2": [0.0, 6.0]})
-        r = spice.simulate(TRAN)
+        r = spice.simulate(TRAN, engine="auto")
         self.assertEqual(r["status"], "ok", r)
         pts = r["value"]["points"]
         self.assertEqual(len(pts), 2)
@@ -181,7 +181,7 @@ class TestDelegation(EngineCase):
 
     def test_ac_points_carry_mag_and_phase(self):
         self.spec(kind="ac", freqs=[1000.0], nodes={"2": [[3.0, 4.0]]})
-        r = spice.simulate(AC)
+        r = spice.simulate(AC, engine="auto")
         self.assertEqual(r["status"], "ok", r)
         n2 = r["value"]["points"][0]["nodes_v"]["2"]
         self.assertAlmostEqual(n2["mag"], 5.0, places=9)
@@ -197,11 +197,12 @@ class TestDelegation(EngineCase):
 
     def test_temp_c_is_appended_as_a_card_not_sent_twice(self):
         self.spec(kind="op", nodes={"1": 10.0, "2": 6.0})
-        r = spice.simulate(DIVIDER, temp_c=80.0)
+        r = spice.simulate(DIVIDER, temp_c=80.0, engine="auto")
         self.assertEqual(r["status"], "ok", r)
         # a deck that already states .temp plus temp_c is an argument conflict
+        # only the external path cares: the deck is handed to the engine verbatim
         r2 = spice.simulate("* x\nV1 1 0 1\nR1 1 0 1k\n.temp 27\n.op\n",
-                            temp_c=80.0)
+                            temp_c=80.0, engine="ngspice")
         self.assertEqual(r2["status"], "error")
         self.assertEqual(r2["reason_code"], "ARG_CONFLICT")
 
@@ -264,12 +265,22 @@ class TestRefusals(EngineCase):
         self.assertEqual(r["status"], "error")
         self.assertEqual(r["reason_code"], "ARG_REQUIRED")
 
-    def test_unparsed_card_is_refused_before_reaching_the_engine(self):
+    def test_unparsed_card_goes_to_the_engine_but_stops_the_builtin(self):
+        # A card this module cannot model (B here) is the reason to have an engine:
+        # on the delegation path the deck is handed over unchanged and the answer is
+        # the engine's own rawfile, so the refusal would only hide the capability.
+        # It is still a refusal for engine='builtin', and the envelope says so with
+        # netlist_parsed:false instead of pretending a full parse.
         self.spec(kind="op", nodes={"1": 1.0})
-        r = spice.simulate("* x\nV1 1 0 1\nR1 1 0 1k\nB1 2 0 V=1\n.op\n",
-                           engine="ngspice")
-        self.assertEqual(r["status"], "error")
-        self.assertEqual(r["reason_code"], "NETLIST_INVALID")
+        net = "* x\nV1 1 0 1\nR1 1 0 1k\nB1 2 0 V=1\n.op\n"
+        r = spice.simulate(net, engine="ngspice")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertEqual(r["engine_used"], "ngspice")
+        self.assertFalse(r["netlist_parsed"])
+        self.assertIn("B1", r["netlist_parse_note"])
+        b = spice.simulate(net)
+        self.assertEqual(b["status"], "error")
+        self.assertEqual(b["reason_code"], "NETLIST_INVALID")
 
 
 class TestCrossCheck(EngineCase):
@@ -323,6 +334,110 @@ class TestLocate(unittest.TestCase):
                 os.environ.pop(spice.NGSPICE_ENV, None)
             else:
                 os.environ[spice.NGSPICE_ENV] = old_env
+
+
+RC_STEP = ("* rc step\nV1 1 0 pulse(0 5 0 1n 1n 1m 2m)\n"
+           "R1 1 2 1k\nC1 2 0 1n\n.tran 1u 5u\n.end\n")
+
+SUBCKT = (
+    "* sub\n"
+    ".subckt div a b\n"
+    "R1 a m 1k\n"
+    "R2 m b 1k\n"
+    ".ends\n"
+    "V1 1 0 10\n"
+    "X1 1 0 div\n"
+    ".op\n"
+    ".end\n"
+)
+
+BSOURCE = (
+    "* b source\n"
+    "V1 1 0 3\n"
+    "B1 2 0 V = 2 * V(1) + 1\n"
+    ".op\n"
+    ".end\n"
+)
+
+
+@unittest.skipUnless(spice.find_ngspice(), "no ngspice binary on this machine")
+class TestRealEngine(unittest.TestCase):
+    """Run against whatever ngspice this machine happens to have.
+
+    Everything asserted here is a property of the pairing (this deck filter +
+    that engine), not a claim that any engine version is correct; the version
+    that the gold netlists were checked against is named in
+    spice.VERIFIED_ENGINES and only that one gets verified_against_engine:true.
+    """
+
+    def test_operating_point_matches_the_builtin_solver(self):
+        b = spice.simulate(DIVIDER)
+        r = spice.simulate(DIVIDER, engine="ngspice")
+        self.assertEqual(r["status"], "ok", r)
+        nb = (b.get("value") or {}).get("nodes_v") or {}
+        ne = (r.get("value") or {}).get("nodes_v") or {}
+        self.assertEqual(sorted(nb), sorted(ne))
+        for k in nb:
+            self.assertLess(abs(nb[k] - ne[k]), 1e-6, (k, nb[k], ne[k]))
+
+    def test_rc_step_and_ac_agree_bit_for_bit(self):
+        r = spice.simulate(RC_STEP, engine="ngspice", cross_check=True)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertEqual(r["cross_check"]["max_abs_diff_v"], 0.0, r["cross_check"])
+        self.assertEqual(r["value"]["timestep_s"], 1e-06)
+        self.assertTrue(r["verified_against_engine"])
+        r = spice.simulate(AC, engine="ngspice", cross_check=True)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertEqual(r["cross_check"]["max_abs_diff_v"], 0.0, r["cross_check"])
+
+    def test_a_plain_transient_stays_within_a_microvolt(self):
+        # the first point is the same DC bias, so this is nearly trivially true;
+        # it is the integrator later in the run that separates the two engines,
+        # which is exactly what cross_check's note says it does not compare.
+        r = spice.simulate(TRAN, engine="ngspice", cross_check=True)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertLess(r["cross_check"]["max_abs_diff_v"], 1e-6, r["cross_check"])
+
+    def test_version_is_reported_and_gates_the_verification_flag(self):
+        r = spice.simulate(DIVIDER, engine="ngspice")
+        v = (r.get("engine") or {}).get("version") or ""
+        self.assertIn("ngspice", v.lower())
+        # verified only for the versions actually exercised against the gold set
+        self.assertEqual(
+            r["verified_against_engine"],
+            any(t in v.lower() for t in spice.VERIFIED_ENGINES), v)
+
+    def test_a_subckt_hierarchy_that_the_builtin_refuses_does_run(self):
+        b = spice.simulate(SUBCKT)
+        self.assertEqual(b["status"], "error")
+        self.assertEqual(b["reason_code"], "NETLIST_INVALID")
+        self.assertIn(".subckt", b["message"])
+        r = spice.simulate(SUBCKT, engine="ngspice")
+        self.assertEqual(r["status"], "ok", r)
+        # honest labelling: our own parser refused this deck, the engine did not
+        self.assertFalse(r["netlist_parsed"])
+        self.assertIn(".subckt", r["netlist_parse_note"])
+        n = (r.get("value") or {}).get("nodes_v") or {}
+        self.assertLess(abs(n.get("1", 0.0) - 10.0), 1e-9)
+        # the internal node of the instance is half the divider: 5 V
+        inner = [k for k in n if k.startswith("x1.")]
+        self.assertEqual(len(inner), 1, n)
+        self.assertLess(abs(n[inner[0]] - 5.0), 1e-6, n)
+
+    def test_behavioural_source_that_the_builtin_refuses_does_run(self):
+        b = spice.simulate(BSOURCE)
+        self.assertEqual(b["status"], "error")
+        self.assertEqual(b["reason_code"], "NETLIST_INVALID")
+        r = spice.simulate(BSOURCE, engine="ngspice")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertFalse(r["netlist_parsed"])
+        n = (r.get("value") or {}).get("nodes_v") or {}
+        self.assertLess(abs(n.get("2", 0.0) - 7.0), 1e-6, n)
+
+    def test_a_parsed_deck_is_reported_as_parsed(self):
+        r = spice.simulate(DIVIDER, engine="ngspice")
+        self.assertTrue(r["netlist_parsed"])
+        self.assertNotIn("netlist_parse_note", r)
 
 
 if __name__ == "__main__":

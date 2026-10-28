@@ -70,6 +70,7 @@
   边界是**没有内置板厂表**：8 类量不出来的项目写进 `not_checked_by_design`，
   有界搜索窗外的情况只给 `lower_bound`，不冒充最小值。
 - `19` → `calc/vibration.py`（Rayleigh-Ritz 薄板模态 / Miles 随机响应 / Steinberg 疲劳 / Newmark 冲击 / 传递率）与 `oracle.board_vibration`（板框 bbox + stackup 厚度 + 元件当探针点），以及 6 个振动类工具与 52 个测试；边界是**薄板、单模态、线性**：不算剪切变形、元件附加质量、装配柔度、焊点蠕变、随机+冲击叠加、跌落、非线性接触，并且**只给位移不给应力**。
-- `21` → `calc/spice.py` 的外部引擎段（`find_ngspice` / `_deck_for_ngspice` / `_run_ngspice` / `_parse_raw` / `_cross_check`，以及 `simulate(..., engine=…, cross_check=…)`），`tests/test_spice_engine.py`（28 例）+ `tests/_fake_ngspice.py`（假引擎）。边界：**外部路径从未对着真 ngspice 跑过**，本机无二进制，所以每条外部答案都带 `verified_against_engine:false`。
+- `21` → `calc/spice.py` 的外部引擎段（`find_ngspice` / `_deck_for_ngspice` / `_run_ngspice` / `_parse_raw` / `_cross_check`，以及 `simulate(..., engine=…, cross_check=…)`），`tests/test_spice_engine.py`（35 例）+ `tests/_fake_ngspice.py`（假引擎）。外部路径已对着**真 ngspice-47**（MSYS2 Windows 构建）跑过并逐节点对账（分压 5e-9 V、RC 阶跃与 RLC AC 逐位 0.0）；`verified_against_engine` 按**引擎版本**门控，只有 `VERIFIED_ENGINES` 里的版本为 true，别的二进制一律 false；默认引擎是 `builtin`（同一网表在两台机器不能给不同答案）。
 - `20` → `calc/cavity.py`（平行板腔体模 + 过孔围栏比例）、`calc/electrothermal.py`（R(T) 定点迭代 + 精确失控判据），以及 4 个工具与 31 个测试；边界是**没有 Q、没有边界失谐修正**，而且热环只有一个集中 Rth（由调用方给），不含 2-D/3-D 与瞬态耦合。
-- 代码里的每条"拒绝回答"分支，都能在这二十二篇里找到对应的判据来源。
+- `22` → `calc/filters.py`（原型 g 值 / 集总带通的两路 S21 对账 / 耦合微带 Newton 反解 / 耦合谐振器带通 / 矩形腔 TE101 的 Qc 双推导），以及 5 个 `filter_*` 工具与 31 个测试。边界是**合成而不是仿真**：给了几何，不给 EM 结果——无交叉耦合、无色散、无有限 Q、无 iris 几何、无版图、无良率。
+- 代码里的每条"拒绝回答"分支，都能在这二十三篇里找到对应的判据来源。
