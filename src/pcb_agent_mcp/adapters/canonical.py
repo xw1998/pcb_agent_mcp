@@ -21,6 +21,8 @@ Oracle on demand and are marked `authoritative: false`: they are this server's
 measurement, not a verdict. KiCad's own engine has the verdict (`board_drc`).
 """
 
+import math
+
 SCHEMA = 1
 
 # Fact keys used in `present` / in `absent[].fact`. Keeping them as a closed set
@@ -64,6 +66,7 @@ class Board(object):
         self.footprints = []       # [{ref, value, lib_id, x, y, rotation, layer, bbox, pads}]
         self.tracks = []           # [{net, layer, width, start, end}]
         self.vias = []             # [{net, x, y, drill, diameter, from, to, kind}]
+        self.graphics = []         # board-level copper graphics (gr_poly/gr_line on *.Cu)
         self.zones = []            # [{net, layer, outline, fill_mode, priority, keepout, points}]
         self.nets = {}             # code -> name
         self.stackup = []          # [{name, type, thickness_mm, er, tand, copper_um}]
@@ -126,6 +129,8 @@ class Board(object):
             "tracks": len(self.tracks),
             "vias": len(self.vias),
             "zones": len(self.zones),
+            "copper_graphics": len(self.graphics) + sum(
+                len(f.get("graphics") or []) for f in self.footprints),
             "nets": len(self.nets),
             "outline_contours": len(self.outline),
             "outline_open_chains": len(self.outline_open),
@@ -156,6 +161,7 @@ class Board(object):
                 "tracks": self.tracks,
                 "vias": self.vias,
                 "zones": self.zones,
+                "graphics": self.graphics,
                 "nets": self.nets,
             })
         return out
@@ -175,8 +181,52 @@ def _bbox(polys):
             "height_mm": round(max(ys) - min(ys), 4)}
 
 
+def _stadium(w, h, n=24):
+    """Oval (stadium) outline in the pad's own frame: rectangle plus two half caps."""
+    r = min(w, h) / 2.0
+    half = n // 2
+    pts = []
+    if w >= h:
+        caps = ((w / 2.0 - r, 0.0, -90.0), (-(w / 2.0 - r), 0.0, 90.0))
+    else:
+        caps = ((0.0, h / 2.0 - r, 0.0), (0.0, -(h / 2.0 - r), 180.0))
+    for (ccx, ccy, a0) in caps:
+        for i in range(half + 1):
+            a = math.radians(a0 + 180.0 * i / half)
+            pts.append((ccx + r * math.cos(a), ccy + r * math.sin(a)))
+    return pts
+
+
+def _rounded_rect(w, h, rratio, per_corner=5):
+    r = float(rratio or 0.25) * min(w, h)
+    r = max(0.0, min(r, min(w, h) / 2.0))
+    hx, hy = w / 2.0 - r, h / 2.0 - r
+    pts = []
+    for (sx, sy, a0) in ((1, 1, 0), (-1, 1, 90), (-1, -1, 180), (1, -1, 270)):
+        for k in range(per_corner + 1):
+            a = math.radians(a0 + 90.0 * k / per_corner)
+            pts.append((sx * hx + r * math.cos(a), sy * hy + r * math.sin(a)))
+    return pts
+
+
 def pad_points(pad):
-    """Pad outline as a polygon in canonical coordinates (cached on the dict)."""
+    """Pad outline as a polygon in canonical coordinates (cached on the dict).
+
+    Built once in the pad's own frame (origin = the anchor `x`/`y`, which is the
+    point pcbnew reports as GetPosition), then turned by the pad's absolute angle
+    and shifted into board space:
+
+    * a custom pad's outline is already stored relative to its anchor;
+    * every other pad shape is centred on the anchor plus the DRILL OFFSET, because
+      pcbnew moves the copper with `(drill ... (offset ...))` (complex_hierarchy
+      Q201.1: bbox centre y+0.4, HitTest agrees over the whole pad).
+
+    The shapes are exact enough to reproduce pcbnew's own HitTest on 412 pads /
+    20188 probe points with zero disagreements -- see
+    tests/test_kicad_pad_placement.py, which reruns that sweep against the KiCad
+    install on this machine. The earlier oval was a 1.2 mm wide sliver for a
+    1.6 x 2.8 pad (it sliced the wrong arcs out of `circle_points`).
+    """
     pts = pad.get("_points")
     if pts is not None:
         return pts
@@ -185,27 +235,25 @@ def pad_points(pad):
     w, h = pad.get("w") or 0.0, pad.get("h") or 0.0
     shape = (pad.get("shape") or "rect").lower()
     ang = pad.get("rotation") or 0.0
-    if shape == "circle":
-        pts = G.circle_points(cx, cy, max(w, h) / 2.0, 24)
-    elif shape == "oval":
-        # stadium: two half circles at the ends of the long axis
-        pts = []
-        r = min(w, h) / 2.0
-        if w >= h:
-            c1, c2 = (cx - w / 2.0 + r, cy), (cx + w / 2.0 - r, cy)
-            pts = (G.circle_points(c1[0], c1[1], r, 12)[3:9] +
-                   G.circle_points(c2[0], c2[1], r, 12)[9:] )
-        else:
-            c1, c2 = (cx, cy - h / 2.0 + r), (cx, cy + h / 2.0 - r)
-            pts = (G.circle_points(c1[0], c1[1], r, 12)[:6] +
-                   G.circle_points(c2[0], c2[1], r, 12)[6:])
-        if ang:
-            pts = [G.rotate(x, y, cx, cy, ang) for x, y in pts]
-    elif shape == "custom" and pad.get("polygon"):
-        pts = [(cx + x, cy + y) for x, y in pad["polygon"]]
-        if ang:
-            pts = [G.rotate(x, y, cx, cy, ang) for x, y in pts]
+    if shape == "custom" and pad.get("polygon"):
+        local = [(float(px), float(py)) for px, py in pad["polygon"]]
     else:
-        pts = G.rect_points(cx, cy, w, h, ang)
+        ox, oy = pad.get("offset") or (0.0, 0.0)
+        if shape == "circle":
+            r = max(w, h) / 2.0
+            local = G.circle_points(0.0, 0.0, r, 24)
+        elif shape == "oval":
+            local = _stadium(w, h)
+        elif shape == "roundrect":
+            # A plain rectangle would measure the gap between two neighbouring pads up
+            # to 2*r too small (pic_programmer Q1..Q3: 0.48 mm became 0.23 mm).
+            local = _rounded_rect(w, h, pad.get("rratio"))
+        else:
+            local = [(-w / 2.0, -h / 2.0), (w / 2.0, -h / 2.0),
+                     (w / 2.0, h / 2.0), (-w / 2.0, h / 2.0)]
+        local = [(px + ox, py + oy) for px, py in local]
+    if ang:
+        local = [G.rotate(px, py, 0.0, 0.0, ang) for px, py in local]
+    pts = [(cx + px, cy + py) for px, py in local]
     pad["_points"] = pts
     return pts

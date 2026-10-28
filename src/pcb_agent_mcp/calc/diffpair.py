@@ -37,8 +37,17 @@ BASIS = {
 S_OVER_H_MIN = 0.1
 S_OVER_H_MAX = 3.0
 
-PRECISION = ("+/-15% (edge-coupled closed form, no field solver, no solder mask, "
-             "no etch trapezoid, no copper-thickness coupling correction)")
+# Not an asserted tolerance any more: the number below is what this closed form
+# actually did against the field solver in calc/field2d.py on checked geometries.
+# The old text said "+/-15%", which was a wish - on a 0.36/0.25 mm pair on 0.2 mm
+# FR-4 it is 10.9% out, and on 0.2/0.2 mm it is 8.7% out, both in the same
+# direction (the closed form reads low).
+PRECISION = ("closed form, not a field solution: measured against this server's 2-D "
+             "solver (diff_impedance_field) it reads 8..11% LOW on the checked "
+             "microstrip geometries, and agrees with the exact stripline answer only "
+             "in the stripline's own limit. No solder mask, no etch trapezoid, no "
+             "copper-thickness coupling correction. Call diff_impedance_field when the "
+             "pair has to actually be 90 or 100 ohm")
 
 
 def _single_ended(kind, w, h, t, er):
@@ -197,8 +206,10 @@ def width_for_diff_impedance(target_ohm, spacing_mm, dielectric_mm, copper_um=35
         unit="mm",
         model=kind + "_edge_coupled_closed_form_inverse",
         basis=BASIS[kind],
-        precision="+/-15% (inherits the coupling model error; verify with the fab's "
-                  "impedance coupon or a field solver)",
+        precision="inherits the forward model's error (see diff_impedance: 8..11% low "
+                  "against the field solver on checked geometries), so the width it "
+                  "gives is a starting point - solve the geometry with "
+                  "diff_impedance_field before ordering the stackup",
         assumptions={
             "target_ohm": target,
             "spacing_mm": s,

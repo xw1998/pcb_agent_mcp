@@ -2,7 +2,10 @@
 
 The reverse direction is what a designer actually needs: "I need 90 ohm, how wide?"
 Models are closed-form approximations (IPC-2141A family). They are NOT field
-solvers; expect +/-10..15% and always state which model was used.
+solvers: `calc/field2d.py` now provides one, and the difference between the two
+is measured in its VALIDATION table instead of being asserted here. When a board
+has to actually hit an impedance, run the field solver and say which answer the
+design used.
 """
 import math
 

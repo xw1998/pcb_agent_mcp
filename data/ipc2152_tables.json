@@ -1,0 +1,26 @@
+{
+ "schema": 2,
+ "verified": false,
+ "edition": "NOT LOADED",
+ "note": "IPC-2152 is a set of measured charts, not a closed form. Nothing here is filled: the standard is paywalled, and every public copy found is a plot image or a screenshot of a plot - reading numbers out of a picture and calling them a standard table is exactly the kind of guessed engineering number this server refuses to produce. The validator that would accept a real transcription is calc/safety_table.py:validate_ipc2152.",
+ "why_empty": {
+  "rule": "a digitised guess is not a table",
+  "what_was_looked_for": "IPC-2152 charts (current vs cross-section, per copper weight and allowed temperature rise)",
+  "what_was_found": "plot images and screenshots only; no numeric transcription with a stated table/figure id and edition",
+  "what_blocks_filling": [
+   "a chart read off an image has no stated uncertainty, and IPC-2152 vs IPC-2221 can differ by more than 3x - the error would be invisible",
+   "no two independent numeric transcriptions were found to check each other"
+  ]
+ },
+ "expected_row_format": {
+  "copper_oz": 1.0,
+  "delta_t_c": 10,
+  "area_mil2": 100,
+  "current_a": null,
+  "table": "figure/clause id from the standard",
+  "sources": [
+   "document id or url, at least two independent"
+  ]
+ },
+ "points": []
+}

@@ -7,14 +7,17 @@ must say what the tool will NOT do as clearly as what it does.
 import json
 
 from . import desktop as _desktop
+from . import lceda_api as _lceda_api
 from . import fidelity as _fidelity
 from . import oracle as _oracle
 from .fidelity import views as _fviews
 from .calc import current as _current
 from .calc import creepage as _creepage
 from .calc import diffpair as _diffpair
+from .calc import field2d as _field2d
 from .calc import impedance as _impedance
 from .calc import rf as _rf
+from .calc import safety_table as _safety_table
 from .calc import units as _units
 from .calc.result import err
 from .adapters import FORMATS as _FORMATS
@@ -257,6 +260,21 @@ _tool(
 )
 
 
+_tool(
+    "safety_table_check",
+    "Can the safety-distance / current-capacity tables be trusted? Runs the rules a "
+    "transcription has to satisfy - standard edition named, two independent sources per "
+    "row, distance monotone in voltage, monotone in material group, PD1<=PD2<=PD3, no "
+    "duplicate keys - and returns pass/fail per check. When it fails, creepage and "
+    "ipc2152 stay fail-closed. Read-only, no board needed.",
+    {"type": "object",
+     "properties": {
+         "which": _str("which table", ["creepage", "ipc2152"], "creepage"),
+         "path": _str("optional alternative JSON file to check"),
+     }},
+    lambda a: _safety_table.check_which(a.get("which", "creepage"), a.get("path")),
+)
+
 # ------------------------------------------------------------- diff pair
 _tool(
     "diff_impedance",
@@ -301,6 +319,49 @@ _tool(
         a["target_ohm"], a["spacing_mm"], a["dielectric_mm"],
         copper_um=a.get("copper_um", 35.0), er=a.get("er", 4.3),
         kind=a.get("kind", "microstrip")),
+)
+
+_tool(
+    "diff_impedance_field",
+    "Differential impedance from an actual 2-D field solution instead of a closed form. "
+    "Slower (seconds) and answers the one question the closed forms cannot: how far off "
+    "they are on this exact geometry. Carries its own validation table (exact conformal "
+    "stripline, Hammerstad microstrip) so the accuracy claim is measured, not promised.",
+    {"type": "object",
+     "properties": {
+         "width_mm": _num("single trace width"),
+         "spacing_mm": _num("edge-to-edge gap between the two traces"),
+         "dielectric_mm": _num("dielectric height from trace to its reference plane "
+                               "(stripline: half the plane-to-plane separation)"),
+         "copper_um": _num("copper thickness in um", 35),
+         "er": _num("relative permittivity", 4.3),
+         "kind": _str("trace geometry", ["microstrip", "stripline"], "microstrip"),
+         "levels": _num("mesh refinement levels: 1 = one mesh, 2 = coarse->fine (default)",
+                        2),
+     },
+     "required": ["width_mm", "spacing_mm", "dielectric_mm"]},
+    lambda a: _field2d.field_impedance(
+        a["width_mm"], a["spacing_mm"], a["dielectric_mm"],
+        copper_um=a.get("copper_um", 35.0), er=a.get("er", 4.3),
+        kind=a.get("kind", "microstrip"), levels=int(a.get("levels", 2))),
+)
+
+_tool(
+    "lceda_api_probe",
+    "Speak to LCEDA Pro's API gateway rather than just looking at the port: opens a "
+    "real RFC 6455 WebSocket to 127.0.0.1:49620..49629, checks the handshake, and says "
+    "which ports answered. `verified_against_app` stays false because no frame was read "
+    "from the application - a completed handshake proves a WebSocket server, not that it "
+    "is LCEDA. The gateway only listens after the user turns on 外部交互权限, so "
+    "'no_listener' is the normal answer, not a broken feature.",
+    {"type": "object",
+     "properties": {
+         "ports": {"type": "array", "items": {"type": "integer"},
+                   "description": "ports to try (default 49620..49629)"},
+         "timeout_s": _num("per-port connect+handshake timeout", 2),
+     }},
+    lambda a: _lceda_api.probe_ports(a.get("ports") or None,
+                                     timeout=float(a.get("timeout_s", 2))),
 )
 
 # --------------------------------------------------------------- desktop
@@ -627,16 +688,18 @@ def _capabilities(_args):
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
             "via_current_allowed", "trace_impedance", "width_for_impedance",
-            "diff_impedance", "diff_width", "lambda_over_20",
+            "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "board_summary", "board_components", "board_nets", "board_clearance",
             "board_free_space", "board_pour_connectivity", "board_cross_split",
             "board_loop_area", "board_fidelity", "board_view", "board_drc",
-            "board_stats", "epro_inspect",
+            "board_stats", "board_cross_check", "epro_inspect",
+            "safety_table_check",
             "board_ops", "board_create", "board_propose", "board_apply",
             "board_checkpoints", "board_restore",
             "schematic_ops", "schematic_propose", "schematic_apply",
             "schematic_summary", "schematic_view",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
+            "lceda_api_probe",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
@@ -663,6 +726,16 @@ def _capabilities(_args):
                 "board_clearance", "board_free_space", "board_pour_connectivity",
                 "board_cross_split", "board_loop_area"],
             "authoritative (vendor engine said it)": ["board_drc", "board_stats"],
+            "checked_against_the_vendor": {
+                "board_cross_check": "runs the derived answer and the vendor's own DRC on "
+                                     "the same file in both directions and reports "
+                                     "recall, missed violations and our extra pairs. Only "
+                                     "clearance has a vendor counterpart today; free_space, "
+                                     "pour_connectivity, cross_split and loop_area come "
+                                     "back not_comparable with the reason, because a "
+                                     "metric nobody can disagree with is unverified, "
+                                     "not right",
+            },
             "why_it_matters": "a computed clearance is a measurement with a model and a "
                               "precision; a DRC verdict is the tool's own ruling. When "
                               "they disagree, the verdict wins - so every derived answer "
@@ -680,11 +753,21 @@ def _capabilities(_args):
             "archive and that record layout was never measured against a real save, "
             "so the writer refuses it (WRITE_UNSUPPORTED_FORMAT) instead of guessing. "
             "KiCad schematics ARE written (see schematic_ops)",
-            "EasyEDA Pro live API drive (websocket gateway on 49620-49629): the port is "
-            "only opened after the user enables 外部交互权限, and no client is implemented",
+            "EasyEDA Pro live API drive: the websocket client (RFC 6455 handshake, "
+            "frames, the 49620-49629 port scan) is implemented and unit-tested, but no "
+            "gateway answered on this machine (the port only opens after the user "
+            "enables 外部交互权限), so nothing was driven end to end - every reply "
+            "carries verified_against_app=false",
+            "LCEDA Pro launch: lceda-pro.exe exits in about 0.5 s when started "
+            "programmatically here (rc 0 with no arguments, rc 1 with a project "
+            "path), no window and no user-data write - so open_argv_verified stays "
+            "false and app_open_project reports unconfirmed instead of pretending",
             "DFM checks (fabricator capability rules)",
             "BGA/thermal via array temperature rise, fuse behaviour, electrothermal "
-            "coupling (IPC-2152 tables not loaded)",
+            "coupling: data/ipc2152_tables.json ships with ZERO rows on purpose - the "
+            "table validator (calc/safety_table.py) is in place, but the standard is "
+            "paywalled and public reproductions contradict each other, so a filled row "
+            "would be a guess with a citation glued on",
             "Impedance/creepage tables for standards other than IPC-2221 / IPC-2141A",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
@@ -702,8 +785,19 @@ def _capabilities(_args):
                         "endpoints land on the predicted positions (54.1% exact, the "
                         "rest unrouted). KiCad side is proven against kicad-cli 10.0.7",
             "desktop": "real install: LCEDA Pro 4.1.60 and KiCad 10.0.7 both detected by "
-                       "drive scan; window-title parsing unit-tested, live open confirmed "
-                       "only for KiCad's argv form",
+                       "drive scan; window-title parsing unit-tested; live open confirmed "
+                       "only for KiCad's argv form. Measured this round: the "
+                       "LCEDA Pro launcher exits in ~0.5 s when started from a "
+                       "non-interactive parent, so its argv form could not be "
+                       "confirmed and stays false",
+            "crosscheck": "board_cross_check runs the derived clearance and KiCad 10.0.7's "
+                          "own DRC on the same file, in both directions, over 13 official "
+                          "demo boards: every comparable violation the vendor reported was "
+                          "also in our list (56/56, recall 1.0) and our extra pairs are the "
+                          "conservative side. Pad geometry is checked separately against "
+                          "pcbnew itself: 412 pads, 20188 HitTest probes, 0 mismatches. "
+                          "zone copper, board-edge/hole rules and solder mask are declared "
+                          "not measured rather than counted as misses",
             "write": "every apply is gated on re-reading the bytes just written "
                      "(bytes_written), a token-identity round trip, each op's own "
                      "postcondition, a kicad-cli stats/gerber/position comparison and a "
@@ -911,6 +1005,31 @@ _tool(
 )
 
 _tool(
+    "board_cross_check",
+    "Check this server's DERIVED answers against the vendor's own verdict, on the same "
+    "file, in both directions. Today the only metric with a vendor counterpart is "
+    "clearance: our geometric clearance is compared with KiCad's own clearance DRC "
+    "(recall, missed violations, our extra pairs), per net class. Every other derived "
+    "metric is reported as not_comparable with the reason - 'nobody can disagree with it "
+    "yet' is not the same as 'it is right'. Read-only: the DRC report lives in a temp "
+    "directory and is removed.",
+    {"type": "object",
+     "properties": {
+         "path": _str("absolute path to a .kicad_pcb"),
+         "threshold_mm": _num("override the clearance threshold instead of taking it "
+                              "from the board's own net classes"),
+         "tol_mm": _num("how far a reported DRC position may sit from our pair to count "
+                        "as the same finding", 0.1),
+         "metrics": _str("which derived metrics to cross-check",
+                         ["clearance", "free_space", "pour_connectivity",
+                          "cross_split", "loop_area"], "clearance"),
+         "worst": _num("how many example disagreements to list", 20),
+     },
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_cross_check(a)),
+)
+
+_tool(
     "board_stats",
     "AUTHORITATIVE board statistics from KiCad's own calculator: size, area, copper area "
     "per side (so a poured zone counts as the copper it really is), board thickness, pad "
@@ -937,6 +1056,19 @@ def _board_drc(args):
     out = _engine.drc(path, severity=args.get("severity") or "all")
     return out
 
+
+def _board_cross_check(args):
+    from .fidelity import crosscheck as _cc
+    path = args.get("path")
+    if not path:
+        return err("path is required", "ARG_MISSING")
+    metrics = args.get("metrics")
+    if isinstance(metrics, str):
+        metrics = [metrics]
+    return _cc.derive_all(path, metrics=metrics,
+                          threshold_mm=args.get("threshold_mm"),
+                          tol_mm=args.get("tol_mm", _cc.DEFAULT_TOL_MM),
+                          worst=int(args.get("worst") or 20))
 
 def _board_stats(args):
     from .fidelity import engine as _engine

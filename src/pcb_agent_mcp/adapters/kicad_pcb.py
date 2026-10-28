@@ -15,6 +15,7 @@ board-level DRC severities) live in `.kicad_pro` / `.kicad_dru`; when they are
 not passed in, they are declared `absent` with the reason, never defaulted.
 """
 import json
+import math
 import os
 
 from .canonical import Board
@@ -270,18 +271,32 @@ def _bezier_segments(node, steps=16):
 
 
 # --------------------------------------------------------------- footprints
+def _uuid(node):
+    """The item's own uuid, or None.
+
+    kicad-cli's DRC report identifies each offending item by uuid only (its
+    descriptions are translated, its `pos` is the item's ANCHOR, not the closest
+    point), so the uuid is the one identity both sides can agree on.
+    """
+    return (atom(child(node, "uuid"), 1, None) or None)
+
+
 def _pad_from_node(pad_node):
     number = atom(pad_node, 1, "") or ""
     kind = atom(pad_node, 2, "smd") or "smd"          # smd | thru_hole | np_thru_hole | connect
     shape = atom(pad_node, 3, "rect") or "rect"
     at = child(pad_node, "at") or []
     x, y = xy(at)
+    # KiCad stores a pad's angle as an ABSOLUTE angle (pcbnew reports exactly what the
+    # file says, even inside a rotated footprint), so it is used as-is and never
+    # composed with the footprint angle.
     rot = num(at, 3, 0.0) or 0.0
     size = child(pad_node, "size")
     w = num(size, 1, 0.0) or 0.0
     h = num(size, 2, w) if num(size, 2) is not None else w
     drill = child(pad_node, "drill")
     hole = None
+    off = None
     if drill:
         vals = [v for v in drill[1:] if not isinstance(v, list)]
         nums = []
@@ -292,6 +307,18 @@ def _pad_from_node(pad_node):
                 pass
         if nums:
             hole = max(nums)
+        # `(drill 0.75 (offset 0 0.4))` shifts the PAD COPPER, not just the hole:
+        # pcbnew's bounding box for Q201.1 on complex_hierarchy sits at y+0.4 and
+        # HitTest says the whole 1.1x1.8 rectangle moved with it. Ignoring it put 27
+        # pads of that board up to 0.4 mm off. Kept in the pad's own frame with Y
+        # canonicalised (file y grows down); `canonical.pad_points` turns it by the
+        # pad's absolute angle. Checked against pcbnew on 412 pads / 20188 probes.
+        on = child(drill, "offset")
+        if on is not None:
+            ox = num(on, 1, 0.0) or 0.0
+            oy = num(on, 2, 0.0) or 0.0
+            if ox or oy:
+                off = [ox, -oy]
     net_node = child(pad_node, "net")
     net_code = None
     net_name = None
@@ -302,9 +329,11 @@ def _pad_from_node(pad_node):
     ln = child(pad_node, "layers")
     if ln:
         layers = [v for v in ln[1:] if not isinstance(v, list)]
-    if shape == "roundrect":
-        shape = "rect"        # corner radius is not measurable by the Oracle yet
-    elif shape in ("custom",):
+    # A roundrect keeps its corner radius: on pic_programmer two neighbouring pads
+    # with r = 0.25 mm are 0.25 mm further apart than their bounding rectangles, which
+    # is exactly the difference between "violation" and "clean".
+    rratio = num(child(pad_node, "roundrect_rratio"), 1, None)
+    if shape in ("custom",):
         pts = None
         opts = child(pad_node, "primitives") or child(pad_node, "options")
         for prim in (opts or []):
@@ -312,17 +341,89 @@ def _pad_from_node(pad_node):
                 pn = child(prim, "pts")
                 pts = [xy(p) for p in children(pn, "xy")] if pn else None
         if pts:
-            cx = sum(p[0] for p in pts) / len(pts)
-            cy = sum(p[1] for p in pts) / len(pts)
-            return {"number": number, "net": net_name or net_code, "x": cx, "y": cy,
-                    "w": (max(p[0] for p in pts) - min(p[0] for p in pts)),
-                    "h": (max(p[1] for p in pts) - min(p[1] for p in pts)),
-                    "shape": "custom", "rotation": rot, "layers": layers,
-                    "hole_mm": hole, "smd": kind == "smd",
-                    "polygon": [(p[0] - cx, p[1] - cy) for p in pts]}
-    return {"number": number, "net": net_name or net_code, "x": x, "y": y,
-            "w": w, "h": h, "shape": shape, "rotation": rot, "layers": layers,
-            "hole_mm": hole, "smd": (kind == "smd")}
+            # `x`/`y` stay the pad ANCHOR, the same point pcbnew reports; the outline
+            # lives in `polygon` relative to that anchor. Reporting the polygon
+            # centroid instead lost the anchor offset and moved custom pads up to
+            # 0.9 mm away from the hole they belong to (seen on pic_programmer/JP1).
+            out = {"number": number, "net": net_name or net_code, "x": x, "y": y,
+                   "uuid": _uuid(pad_node),
+                   "w": (max(p[0] for p in pts) - min(p[0] for p in pts)),
+                   "h": (max(p[1] for p in pts) - min(p[1] for p in pts)),
+                   "shape": "custom", "rotation": rot, "layers": layers,
+                   "hole_mm": hole, "smd": kind == "smd", "type": kind,
+                   "polygon": list(pts)}
+            if off:
+                out["offset"] = off
+            return out
+    out = {"number": number, "net": net_name or net_code, "x": x, "y": y,
+           "uuid": _uuid(pad_node),
+           "w": w, "h": h, "shape": shape, "rotation": rot, "layers": layers,
+           "hole_mm": hole, "smd": (kind == "smd"), "type": kind}
+    # A pad can carry its OWN clearance: `(pad "9" ... (clearance 0.125))`.
+    pad_clear = num(child(pad_node, "clearance"), 1, None)
+    if pad_clear is not None:
+        out["clearance"] = pad_clear
+    if shape == "roundrect":
+        # 0.25 is the KiCad file format's documented default corner ratio, not a guess
+        # about this board: it applies when the file does not spell the ratio out.
+        out["rratio"] = 0.25 if rratio is None else float(rratio)
+    if off:
+        out["offset"] = off
+    return out
+
+
+def _is_copper(name):
+    n = str(name or "")
+    return n == "*.Cu" or n.endswith(".Cu")
+
+
+def _graphic_poly(g):
+    """A copper graphic as one polygon in its OWN frame (caller rotates it).
+
+    Filled polygons/rectangles/circles are their outline; a stroked line becomes the
+    rectangle around its stroke, which is enough for an edge-to-edge distance (the
+    only difference from a capsule is at the two ends).
+    """
+    kind = g[0] if g else ""
+    if kind in ("fp_poly", "gr_poly"):
+        pn = child(g, "pts")
+        return [xy(p) for p in children(pn, "xy")] if pn else None
+    if kind in ("fp_rect", "gr_rect"):
+        a, b = xy(child(g, "start")), xy(child(g, "end"))
+        return [(min(a[0], b[0]), min(a[1], b[1])), (max(a[0], b[0]), min(a[1], b[1])),
+                (max(a[0], b[0]), max(a[1], b[1])), (min(a[0], b[0]), max(a[1], b[1]))]
+    if kind in ("fp_line", "gr_line", "fp_arc", "gr_arc"):
+        if kind in ("fp_arc", "gr_arc"):
+            s_, m_, e_ = child(g, "start"), child(g, "mid"), child(g, "end")
+            if not (s_ and m_ and e_):
+                return None
+            pts = _arc_points(xy(s_), xy(m_), xy(e_))
+        else:
+            s_, e_ = child(g, "start"), child(g, "end")
+            if not (s_ and e_):
+                return None
+            pts = [xy(s_), xy(e_)]
+        w = num(child(child(g, "stroke"), "width"), 1, 0.0) or 0.0
+        half = w / 2.0
+        if half <= 0:
+            return None
+        out = []
+        for i in range(len(pts) - 1):
+            (x1, y1), (x2, y2) = pts[i], pts[i + 1]
+            d = math.hypot(x2 - x1, y2 - y1) or 1.0
+            nx, ny = -(y2 - y1) / d * half, (x2 - x1) / d * half
+            out.extend([(x1 + nx, y1 + ny), (x2 + nx, y2 + ny),
+                        (x2 - nx, y2 - ny), (x1 - nx, y1 - ny)])
+        return out or None
+    if kind in ("fp_circle", "gr_circle"):
+        c = xy(child(g, "center"))
+        e = xy(child(g, "end"))
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        return G.circle_points(c[0], c[1], r, 24) if r > 0 else None
+    return None
+
+
+_GRAPHIC_KINDS = ("fp_poly", "fp_rect", "fp_circle", "fp_line", "fp_arc")
 
 
 def _footprint(node):
@@ -331,8 +432,14 @@ def _footprint(node):
     at = child(node, "at")
     x, y = xy(at)
     rot = num(at, 3, 0.0) or 0.0
-    # Y flip reverses the sense of rotation
-    rot = -rot
+    # Canonical space is the file frame mirrored in Y. Mirroring flips the sign of a
+    # rotation *and* the sign of the angle, so a footprint at `a` degrees in the file
+    # is at `a` degrees in canonical space as well. Negating it here -- the intuitive
+    # "a Y flip reverses the sense of rotation" reading -- mirrored every rotated
+    # footprint's pads about the footprint origin: pads landed up to 111 mm away from
+    # where pcbnew puts them, and the Oracle then reported phantom clearance
+    # violations on copper that is nowhere near itself. Checked pad-by-pad against
+    # pcbnew in tests/test_kicad_rotation.py.
     ref, value = "", ""
     for prop in children(node, "property"):
         name = atom(prop, 1, "")
@@ -347,15 +454,75 @@ def _footprint(node):
         elif kind == "value":
             value = value or (atom(txt, 2, "") or "")
     pads = [_pad_from_node(p) for p in children(node, "pad")]
+    # A footprint can override the clearance of all its pads: `(clearance 0.125)`
+    # sits directly in the `(footprint ...)` node and KiCad uses it INSTEAD of the
+    # net class clearance. Ignoring it measured cm5_minima's U702 (a DFN whose
+    # footprint says 0.125 while the class says 0.13) as 7 violations that the
+    # vendor DRC does not have - a 5 micrometre difference deciding a verdict.
+    fp_clear = num(child(node, "clearance"), 1, None)
+    # `(net_tie_pad_groups "1, 2")` declares pads of one footprint that are MEANT to
+    # touch: KiCad's DRC does not report a clearance violation inside a group, and a
+    # net tie drawn as two abutting pads is common (royalblue54L_feather JP1, a
+    # bridged solder jumper). Without this the Oracle reported a 0.0 mm violation on
+    # copper the vendor deliberately connected.
+    tie_groups = []
+    for g in children(node, "net_tie_pad_groups"):
+        if isinstance(g, list) and len(g) > 1:
+            names = [str(n).strip() for n in g[1:] if not isinstance(n, list)]
+            nums = set()
+            for chunk in names:
+                nums.update(x.strip() for x in chunk.split(",") if x.strip())
+            if nums:
+                tie_groups.append(nums)
+    for pad in pads:
+        if fp_clear is not None and pad.get("clearance") is None:
+            pad["clearance"] = fp_clear
+        pad["net_tie_group"] = None
+        for gi, nums in enumerate(tie_groups):
+            if str(pad.get("number") or "") in nums:
+                pad["net_tie_group"] = gi
+                break
     # pads are stored relative to the footprint origin; place them in board space
     import math
     ca, sa = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+    # Back-side footprints need no extra mirroring here: the file already stores the
+    # pad offsets as they are drawn (checked against pcbnew on 2118 back-side pads in
+    # the `video` demo board). Adding a mirror put 260 of them 3.1 mm off.
     for pad in pads:
         px, py = pad["x"], pad["y"]
         pad["x"] = x + px * ca - py * sa
         pad["y"] = y + px * sa + py * ca
-        pad["rotation"] = rot + (pad.get("rotation") or 0.0)
+        if pad.get("polygon"):
+            # A custom pad's outline is stored relative to its anchor, so it has to
+            # turn with the footprint as well.
+            pad["polygon"] = [(qx * ca - qy * sa, qx * sa + qy * ca)
+                              for qx, qy in pad["polygon"]]
+        # pad["rotation"] stays as written: it is already absolute.
         pad["ref"] = ref
+    # Copper drawn as a footprint graphic is real copper (microwave draws its whole
+    # board out of `POLY` footprints); it has no net, so it is not a track and not a
+    # pad, but its clearance is measured by KiCad's DRC all the same.
+    graphics = []
+    for g in node:
+        if not (isinstance(g, list) and g and g[0] in _GRAPHIC_KINDS):
+            continue
+        layer = atom(child(g, "layer"), 1, "")
+        if not _is_copper(layer):
+            continue
+        poly = _graphic_poly(g)
+        if not poly:
+            continue
+        graphics.append({"layer": layer, "uuid": _uuid(g),
+                         # Same placement as a pad: the outline is stored in the
+                         # footprint frame, so it must turn AND translate. Without
+                         # the translation every polygon stayed at the board origin
+                         # (microwave's four POLY outlines all spanned
+                         # x -135.75..135.75 while the footprints sit at x 67 and
+                         # 338), so the two real pad-vs-polygon DRC violations of
+                         # that board were unreachable and four phantom
+                         # polygon-vs-polygon 0.0 mm pairs took their place.
+                         "poly": [(x + qx * ca - qy * sa, y + qx * sa + qy * ca)
+                                  for qx, qy in poly]})
     bbox = None
     if pads:
         xs, ys = [], []
@@ -371,7 +538,8 @@ def _footprint(node):
     if isinstance(flags, list) and any(not isinstance(f, str) for f in flags):
         flags = [f for f in flags if isinstance(f, str)]
     dnp = ("dnp" in flags) or (child(node, "dnp") is not None)
-    return {"ref": ref, "value": value, "lib_id": lib_id, "x": round(x, 4),
+    return {"ref": ref, "value": value, "lib_id": lib_id, "graphics": graphics,
+            "x": round(x, 4),
             "y": round(y, 4), "rotation": rot, "layer": layer,
             "bbox": _bbox_dict(bbox), "pads": pads,
             "attr": flags, "dnp": dnp}
@@ -432,6 +600,37 @@ def _zone(node):
 
 
 # ---------------------------------------------- side files: rules / stackup
+def board_net_classes(board_node):
+    """The `(net_class ...)` blocks stored INSIDE the board file.
+
+    Before net classes moved to `.kicad_pro` (v6/v7 era files, and every board this
+    server writes) the board file carried them itself:
+
+        (net_class "Default" "" (clearance 0.2) (trace_width 0.25)
+                   (via_dia 0.6) (via_drill 0.3) (add_net "GND") ...)
+
+    Ignoring these made a board with no `.kicad_pro` report "design rules absent"
+    while its own rules sat in the file - which is exactly the kind of silent gap
+    that turns into a wrong clearance verdict later.
+    """
+    out = {}
+    for nc in children(board_node, "net_class"):
+        name = atom(nc, 1) or "Default"
+        spec = {"clearance": None, "track_width": None, "via_diameter": None,
+                "via_drill": None, "nets": []}
+        pairs = {"clearance": "clearance", "trace_width": "track_width",
+                 "via_dia": "via_diameter", "via_drill": "via_drill"}
+        for key, field in pairs.items():
+            node = child(nc, key)
+            if node is not None:
+                spec[field] = num(node, 1)
+        for add in children(nc, "add_net"):
+            name_of_net = atom(add, 1)
+            if name_of_net is not None:
+                spec["nets"].append(name_of_net)
+        out[name] = spec
+    return out
+
 def load_project_rules(project_path):
     """Read `.kicad_pro` design settings. Never invents a value that is absent."""
     out = {"source": None, "clearance": {}, "track_width": {}, "via": {},
@@ -459,7 +658,8 @@ def load_project_rules(project_path):
         if key in rules:
             out["clearance" if "clearance" in key else "track_width" if "track" in key
                 else "via"][key] = rules[key]
-    classes = (data.get("net_settings") or {}).get("classes") or []
+    net_settings = data.get("net_settings") or {}
+    classes = net_settings.get("classes") or []
     for cls in classes:
         out["net_classes"][cls.get("name") or "Default"] = {
             "clearance": cls.get("clearance"),
@@ -468,6 +668,15 @@ def load_project_rules(project_path):
             "via_drill": cls.get("via_drill"),
             "nets": cls.get("nets") or [],
         }
+    # KiCad 7+ stores WHICH NET BELONGS TO WHICH CLASS outside the class itself:
+    # `net_settings.netclass_assignments` maps a net path ("/USB/D+") to a list of
+    # class names, and `netclass_patterns` maps wildcards. Reading only `classes`
+    # left every class with `nets: []`, so a net in the USB_DIFF class (clearance
+    # 0.2032) was measured against Default (0.15) - on royalblue54L_feather that
+    # silently dropped all 13 real DRC violations and declared the board clean.
+    out["netclass_assignments"] = net_settings.get("netclass_assignments") or {}
+    out["netclass_patterns"] = net_settings.get("netclass_patterns") or []
+
     dru = os.path.splitext(pro)[0] + ".kicad_dru"
     if os.path.isfile(dru):
         try:
@@ -516,6 +725,53 @@ def _stackup(board_node, thickness):
     return layers
 
 
+def _apply_netclass_assignments(rules, net_names):
+    """Put each net into the class the PROJECT says it is in.
+
+    The class table alone says what each class costs, not who is in it: KiCad 7+
+    keeps membership in `net_settings.netclass_assignments` (exact net paths) and
+    `netclass_patterns` (wildcards). A class with no members had no effect at all
+    here, which is why a board whose USB pair sits in a 0.2032 mm class was
+    measured at the Default 0.15 mm and came out clean against 13 real
+    violations.
+    """
+    classes = rules.get("net_classes") or {}
+    if not classes:
+        return
+    assign = rules.get("netclass_assignments") or {}
+    patterns = rules.get("netclass_patterns") or []
+    if not assign and not patterns:
+        return
+    import fnmatch
+    known = set(net_names)
+    used = 0
+    for net in sorted(known):
+        names = list(assign.get(net) or [])
+        if not names and assign:
+            # a net stored WITHOUT its sheet path in the board but with it in the
+            # project (or the other way round): match on the trailing segments
+            for key, cls_list in assign.items():
+                if key == net or key.endswith(net) or net.endswith(key):
+                    names = list(cls_list or [])
+                    break
+        for pat in patterns:
+            if not isinstance(pat, dict):
+                continue
+            if fnmatch.fnmatchcase(net, str(pat.get("pattern") or "")):
+                names.append(pat.get("netclass"))
+        for name in names:
+            spec = classes.get(name)
+            if not isinstance(spec, dict):
+                continue
+            if net not in (spec.get("nets") or []):
+                spec.setdefault("nets", []).append(net)
+                used += 1
+    if used:
+        src = rules.get("netclass_source")
+        extra = "net_settings.netclass_assignments"
+        rules["netclass_source"] = ("%s; %s" % (src, extra)) if src else extra
+        rules["netclass_members_assigned"] = used
+
 # ------------------------------------------------------------------- parse
 def parse_board(path, project_path=None):
     """Parse a `.kicad_pcb` file into a canonical Board. Read-only, never writes."""
@@ -548,6 +804,7 @@ def parse_board_text(text, path="<memory>", project_path=None):
 
     for seg in children(tree, "segment"):
         board.tracks.append({
+            "uuid": _uuid(seg),
             "net": atom(child(seg, "net"), 1),
             "layer": atom(child(seg, "layer"), 1),
             "width": num(child(seg, "width"), 1, 0.0),
@@ -559,6 +816,7 @@ def parse_board_text(text, path="<memory>", project_path=None):
         if s and e:
             pts = _arc_points(xy(s), xy(m), xy(e)) if m else [xy(s), xy(e)]
             board.tracks.append({
+                "uuid": _uuid(arc),
                 "net": atom(child(arc, "net"), 1),
                 "layer": atom(child(arc, "layer"), 1),
                 "width": num(child(arc, "width"), 1, 0.0),
@@ -572,6 +830,7 @@ def parse_board_text(text, path="<memory>", project_path=None):
         layers_node = child(via, "layers")
         lname = [v for v in layers_node[1:] if not isinstance(v, list)] if layers_node else []
         board.vias.append({
+            "uuid": _uuid(via),
             "net": atom(child(via, "net"), 1),
             "x": xy(child(via, "at"))[0],
             "y": xy(child(via, "at"))[1],
@@ -581,6 +840,18 @@ def parse_board_text(text, path="<memory>", project_path=None):
             "to": lname[-1] if len(lname) > 1 else (lname[0] if lname else None),
             "kind": vtype if vtype in ("blind", "micro") else "through",
         })
+
+    for gnode in tree:
+        if not (isinstance(gnode, list) and gnode and gnode[0] in
+                ("gr_poly", "gr_rect", "gr_circle", "gr_line", "gr_arc")):
+            continue
+        layer = atom(child(gnode, "layer"), 1, "")
+        if not _is_copper(layer):
+            continue
+        poly = _graphic_poly(gnode)
+        if poly:
+            board.graphics.append({"layer": layer, "poly": poly,
+                                   "uuid": _uuid(gnode)})
 
     for znode in children(tree, "zone"):
         board.zones.append(_zone(znode))
@@ -599,6 +870,18 @@ def parse_board_text(text, path="<memory>", project_path=None):
 
     board.stackup = _stackup(tree, thickness)
     rules = load_project_rules(project_path or path)
+    if not rules.get("net_classes"):
+        # the project file is absent (or has no classes): the board file's own
+        # blocks are then the only rules that exist, and they are real rules
+        own = board_net_classes(tree)
+        if own:
+            rules["net_classes"] = own
+            rules["net_class_source"] = "the board file's own (net_class ...) blocks"
+            rules["absent"] = [a for a in rules.get("absent") or []
+                               if a.get("fact") != "design_rules"]
+    # Resolve net -> class from the project's assignments/patterns now that the
+    # net names are known (they are only known after the board is parsed).
+    _apply_netclass_assignments(rules, [n for n in board.nets.values() if n])
     board.rules = rules
 
     # ---- present / absent bookkeeping (C2: declare, never default)
@@ -620,8 +903,10 @@ def parse_board_text(text, path="<memory>", project_path=None):
                None if board.stackup else "no (setup (stackup ...)) block: stackup is "
                                           "stored but this file has not been through the "
                                           "Board Setup dialog")
-    board.mark("design_rules", bool(rules.get("source")),
-               None if rules.get("source") else "rules live in .kicad_pro")
+    board.mark("design_rules",
+               bool(rules.get("source") or rules.get("net_class_source")),
+               None if (rules.get("source") or rules.get("net_class_source"))
+               else "no .kicad_pro and no (net_class ...) block in the board file")
     board.mark("pad_to_mask", False, "mask expansion lives in (setup (pad_to_mask_clearance)) "
                                      "and per-pad (solder_mask_margin); parsed only on demand")
     board.mark("component_3d", any(child(n, "model") is not None

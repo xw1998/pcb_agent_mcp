@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.5.0` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.1` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（见 [docs/13](docs/13-立创实测-真实存储与记录格式.md)），不再有「按格式文档推的假设」。
 
 | 层 | 做什么 | 状态 |
@@ -81,7 +81,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（41 个）
+## 工具（45 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -95,7 +95,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `lambda_over_20` | λ/20 布线间距 | 与频率/εr 绑定，不给记忆值 |
 | `creepage_required` | 爬电距离查表 | 无表 fail-closed |
 | `clearance_required` | 电气间隙查表 | 无表 fail-closed |
+| `safety_table_check` | 判定一张安规表能不能用：来源≥2、随电压/材料组/污染等级单调、PD1≤PD2≤PD3、无重复 key | 只能判"转录没法作弊"，判不了"来源有没有抄错"；因此 `data/*.json` 仍 `verified:false`，查询继续拒答 |
 | `diff_impedance` | 差分对几何 → Zdiff（边耦合微带/带状线） | s/h 超出 0.1..3.0 标 `validity_note` |
+| `diff_impedance_field` | 同一几何 → Zdiff，但解真实截面上的 div(ε∇V)=0（有限体积 + 红黑 SOR，纯 stdlib） | 参考解只覆盖零厚度带状线/孤立微带；紧间距耦合回 `reference_note`（求解器的意见，不是被核过的数）；不建模阻焊/蚀刻梯形/铜损 |
 | `diff_width` | Zdiff → 线宽（间距固定，二分） | 不可达 → `UNREACHABLE` + 可达带宽 |
 | `board_summary` | 开板：计数/板框 bbox/叠层/规则 + **哪些事实缺失** | 只读；格式按内容嗅探 |
 | `board_components` | 元件位置（mm、Y 向上）、角度、pad 数、bbox | — |
@@ -109,6 +111,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_view` | 从保真树读事实：nets/规则类/层/叠层/setup/元件/pad（精确尺寸·钻孔·旋转·网络）/走线/过孔/zone（含**文件里存的填充多边形**）/板框图元/板上文字/尚无规则的节点 | 每条记录都带 `raw`（原始 S 表达式），视图漏掉的不会丢 |
 | `board_drc` | **判决**：跑 KiCad 自己的 DRC 引擎，回违规项（按严重级/类型）+ 未连接项 | 立创无命令行 → 明确拒绝给判决，不近似 |
 | `board_stats` | **判决**：KiCad 自己的板统计（尺寸/面积/正反铜面积含铺铜/板厚/最小线宽与孔径） | 只读 |
+| `board_cross_check` | **对账**：同一文件上，我们的间距测量与厂商 DRC 双向比对（recall / 漏报 / 我们多报 / 判不了） | 只有 clearance 有厂商对应物；zone 铜、板边孔规则、阻焊钢网明说不比；其余四个派生量回 `not_comparable` |
 | `epro_inspect` | 不解译地列出 `.epro` 成员/类型计数/原始 key 名 | 用来"关掉未知字段"，而不是猜字段名 |
 | `board_ops` | 写路径的操作目录（KiCad 24 个 / `.epro` 6 个）+ 参数 + 它影响板子的哪一部分 | 调 `board_propose` 前先看它 |
 | `board_create` | 造一块新的空板（叠层/规则/闭合板框），写完再问 KiCad：板框闭合吗、DRC 干净吗 | 任一为否就删掉文件而不是留个“看着像板”的东西 |
@@ -118,6 +121,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_restore` | 回到某个检查点（默认把当前态先再存一份） | 必须 `confirm=true` |
 | `app_detect` | EDA 装在哪（显式路径→运行中镜像→盘符→注册表） | 永远回带 `tried` 证据 |
 | `app_status` | 是否在跑/几个实例/哪个工程/API 网关端口 | 工程名来自窗口标题，空 = 没窗口显示工程 |
+| `lceda_api_probe` | 立创 Pro 的 websocket 网关（49620-49629）：端口扫描 + RFC 6455 握手到拿到能力清单 | 网关只在用户手动开「外部交互权限」后监听；没应答就回 `no_listener`，每条都带 `verified_against_app:false` |
 | `app_launch` | 分离启动 EDA（不带工程） | 启动进程 ≠ 打开工程 |
 | `app_close` | WM_CLOSE 关窗（等同点 X，可能弹保存框） | `force` 才 TerminateProcess；不碰文件 |
 | `schematic_ops` | 原理图写路径的 op 目录（KiCad `.kicad_sch` 18 个）+ 每条用的坐标系 | 调 `schematic_propose` 前先看它 |
@@ -135,9 +139,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.6.0
+python run_server.py --version       # 0.0.1
 python run_server.py --selftest      # 协议级自检，29/29（含板与原理图写路径端到端）
-python -m unittest discover -s tests # 303 个用例（约 2.5 分钟，其中 kicad-cli 用例占大头）
+python -m unittest discover -s tests # 357 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -177,14 +181,24 @@ MCP 客户端配置（stdio）：
 
 ## 已知未实现 / 已打折扣的地方（诚实清单）
 
-- **立创侧已实测，KiCad 侧仍是合成样本。** 立创的存储形式、单位、记录布局、保存行为、焊盘网络行
-  都在 194 个真实 `.epro` 归档上核过（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；KiCad 侧
-  只有 `tests/data/sample.kicad_pcb`，因此 `.kicad_pcb` 的少见语法仍可能没被覆盖到。
+- **两侧都对着厂商自己核过了，但"核过"的边界要说清。** 立创的存储形式、单位、记录布局、保存行为、
+  焊盘网络行在 194 个真实 `.epro` 归档上核过（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
+  KiCad 侧在 13 块官方 demo 板上与 `kicad-cli 10.0.7` 的 DRC 双向对账（厂商报的 56 条可比违规
+  我们一条不漏，recall 1.0），焊盘几何另与 `pcbnew` 逐点对账（412 pad / 20188 次 HitTest / 0 不一致），
+  见 [docs/15](docs/15-对账-推导对着厂商判决.md)。剩下的边界是采样而不是方法：13 块板覆盖不到的
+  少见语法仍可能没走到。
 - **合成样本曾经连 KiCad 都不认。** 保真层的第一个产出就是抓到这件事（`(dnp)` 裸写等三处非法语法）。
   现在 `tests/data/sample.kicad_pcb` 是 v7 合法文件，且每轮被 `kicad-cli` 验证。
-- **推导仍然存在，但已被点名。** `board_clearance` / `free_space` / `pour_connectivity` /
-  `cross_split` / `loop_area` 是本服务自己算的几何量，答案里带 `authoritative: false` 和
-  `verdict_available_from: board_drc`——测量不是判决。
+- **推导仍然存在，但已经对过账，而且账上明写哪几笔比不了。** `board_clearance` /
+  `free_space` / `pour_connectivity` / `cross_split` / `loop_area` 都是本服务自己算的几何量，答案里带
+  `authoritative: false` 和 `verdict_available_from: board_drc`——测量不是判决。能对账的那一项
+  （间距）由 `board_cross_check` 双向数：13 块真实板上厂商报的 56 条全部命中，我们多报 91 对且都在
+  保守侧（会让人把线放宽，不会做窄）。比不了的四项回 `not_comparable` 并说理由；三类几何
+  **明说不建模**而不是算成漏报：铺铜（zone）铜、板边与孔规则（`copper_edge_clearance` /
+  `annular_width` / `drill_out_of_range`）、阻焊与钢网（`solder_mask_bridge`）。另有"测不出"单独
+  计数：差距与规则相差 <0.002 mm 的对（CM5 33 对、video 30 对、StickHub 20 对、tinytapeout 10 对）
+  不进 recall 也不进 extra，判决只由厂商给。实测上限也测出来了：88.7 MB 的 jetson 板 DRC 两次都
+  没出报告（823 s / 2543.8 s `ENGINE_FAILED`），所以默认超时 900 s，超时即报错、不降级。
 - **立创侧还剩两处非实测。** ① 元件焊盘位置＝库封装 + 旋转/镜像变换推导（54.1% 铜端点命中率，
   见 docs/13 §6，底面镜像只有弱证据 35.1%）；② `set_pad_net` 追加一行 `PAD_NET` 时，第 5 字段
   按「封装文档里该焊盘号的每个 PAD 对象各写一行」——8159/8159 指向同号对象是实测量，但**从未观察到
@@ -200,13 +214,24 @@ MCP 客户端配置（stdio）：
 - **两个闸门 bug 是被真图抓出来的**（docs/14 §5）：元件值改动曾被报成"网表变了"；同一条 ERC
   违规被 KiCad 重新指向不同 item 时曾被算成"新增+解决"。前者会把所有正常字段编辑拦死，
   后者会让人很快学会一按 `allow_new_violations` 了事。
-- 立创 Pro 的实时 API（websocket 网关 49620-49629）只做端口探测，**没有实现客户端**；而且它只有
-  用户手动打开「外部交互权限」后才会监听。
-- `app_open_project` 的立创命令行形式 `lceda-pro.exe <工程.epro>` **未在真机确认**（返回里
-  `open_argv_verified: false`）；KiCad 的命令行形式是确认过的。
-- 差分阻抗为边耦合闭式近似（±15%），不建模阻焊、蚀刻梯形与铜厚对耦合的影响。
-- IPC-2152 表（现行载流标准，与 IPC-2221 差可 >3×）、IEC 60664-1 爬电/间隙表 —— 需人工核验后填入
-  `data/creepage_tables.json` 并置 `verified: true`。
+- **立创 Pro 的实时 API：客户端写了，但一次都没被真应用应答过。** `lceda_api_probe` 现在真的会做
+  RFC 6455 握手、发帧、解析能力清单（`tests/test_lceda_api.py` 10 例，含握手短路/掩码/分片/超时），
+  但本机 49620-49629 全部 `no_listener`——那个网关只有在用户手动打开「外部交互权限」后才监听。
+  所以每条返回都带 `verified_against_app: false`：**代码路径通了，真应用这一侧仍是空的。**
+- **立创的"启动"和"开工程"都没能在这台机器上确认，而这次是量出来的。** 用一个临时副本
+  （`_scratch/argv_probe/`，绝不碰用户工程目录）实测：`lceda-pro.exe <工程.epro>` **0.5 s 后
+  以 rc=1 退出**，不带参数则 **0.5 s 后 rc=0 退出**，全程没有窗口、没有写用户数据目录
+  （`%APPDATA%\JLCEDA Pro` 仍是空的）；同一环境下 KiCad 10.0.7 能被正常拉起并关掉，
+  所以不是本层的启动方式坏了。结论：`open_argv_verified` 保持 `false`，`opened` 只会是
+  `unconfirmed`；桌面控制对立创目前只到"探测到装在哪"（4.1.60，盘符扫描命中）。
+- **差分阻抗有两级：闭式近似与二维场解，两者差多少是实测的。** `diff_impedance` 仍是边耦合闭式（IPC-2141A 族），`diff_impedance_field` 解真实截面上的 div(ε∇V)=0（有限体积 + 梯度张量网格 + 红黑 SOR，纯 stdlib）。闭式在实测几何上系统性**偏低 8~11%**、方向一致，所以「调宽凑数」会把线先做窄。场解自己的误差对着两个共享零近似的参考答案量过：零厚度带状线对精确共形解（w/b 0.5..4）≤1.2%、孤立微带对 Hammerstad ≤2.8%、耦合通路在 s/h=8 处对 2×孤立精确解 ≤2.7%；这三张表由 `tests/test_field2d.py` 每次重算，不会悄悄过期。**没被独立参考答案覆盖的是紧间距耦合**——那种几何下工具自己吐 `reference_note`，说明「这是求解器的意见，不是被核过的数」。两者都不建模阻焊、蚀刻梯形与铜损/色散。
+- **IPC-2152 / IEC 60664-1 的表是空的，而且是故意空的。** `calc/safety_table.py` 把"表能不能信"
+  做成可执行的判据：来源 ≥2、随电压单调不降、随材料组变差单调不降、PD1≤PD2≤PD3、无重复 key
+  （`tests/test_safety_table.py` 17 例逐条反证）。但规则判不了"来源有没有抄错"——
+  互相抄的两个博客也能全过。公开来源对 IPC-2152 的读数互相矛盾（与 IPC-2221 差可 >3×），
+  所以 `data/ipc2152_tables.json` 与 `data/creepage_tables.json` 都保持 `verified: false`、
+  行数据留空并写清 `why_empty`，`current_capacity(standard=ipc2152)` / `creepage_required` /
+  `clearance_required` 继续 fail-closed 并说出缺什么。**填一个猜的值比拒答更糟。**
 
 ## 项目结构
 

@@ -19,6 +19,51 @@ from . import geometry as G
 from .calc.result import ok, err
 
 # ---------------------------------------------------------------- item model
+def _copper_layers(board):
+    """Copper layer names, in stackup order (the order is what makes a via span)."""
+    names = [str(s.get("name")) for s in (board.stackup or [])
+             if str(s.get("name") or "").endswith(".Cu")]
+    return names or ["F.Cu", "B.Cu"]
+
+
+def _layer_span(board, frm, to):
+    """Every copper layer a via passes through, inclusive."""
+    cu = _copper_layers(board)
+    if frm in cu and to in cu:
+        i, j = cu.index(frm), cu.index(to)
+        return list(cu[min(i, j):max(i, j) + 1])
+    return list(cu)
+
+
+def _item_layers(board, raw_layers):
+    """Normalise a pad's layer list to copper layers.
+
+    Two spellings are wildcards, not layer names: `*.Cu` (any copper) and
+    `F&B.Cu` (front AND back, which is how KiCad writes an NPTH mounting hole
+    that spans the board). Keeping `F&B.Cu` as a literal layer name broke the
+    layer test in `clearance` - it never intersected `F.Cu` or `B.Cu`, so a pad
+    on it was compared against other `F&B.Cu` pads only, and two stacked
+    mounting holes of two footprints came out as a 0.0 mm "violation" on
+    cm5_minima that the vendor never reports.
+    """
+    cu = _copper_layers(board)
+    out = []
+    for name in raw_layers or []:
+        name = str(name)
+        if name in ("*.Cu", "*"):
+            out.extend(cu)
+        elif name == "F&B.Cu":
+            out.extend([n for n in cu if n in ("F.Cu", "B.Cu")])
+        elif name.endswith(".Cu"):
+            out.append(name)
+    seen, uniq = set(), []
+    for n in out:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
 def _items(board, layer=None, nets=None):
     """Flatten pads / tracks / vias into distance-comparable items.
 
@@ -26,6 +71,25 @@ def _items(board, layer=None, nets=None):
     """
     from .adapters.canonical import pad_points
     items = []
+    # Two footprints can share a reference (microwave draws its board out of four
+    # footprints all called `POLY`, and hierarchical sheets reuse refs). A duplicate
+    # ref makes a violation report point at the wrong part, so the occurrence number
+    # is appended to the SECOND and later ones.
+    seen_refs = {}
+
+    def _uniq_ref(name):
+        """Append `#2`, `#3`, ... to a reference that already occurred.
+
+        A duplicate reference is not hypothetical: microwave draws the whole
+        board out of four footprints all called `POLY`, and hierarchical sheets
+        reuse refs across instances. Two items with the same printed name make a
+        measurement useless - the caller cannot tell which one is meant - so the
+        occurrence number is part of the name.
+        """
+        n = seen_refs.get(name, 0) + 1
+        seen_refs[name] = n
+        return name if n == 1 else "%s#%d" % (name, n)
+
     for fp in board.footprints:
         for pad in fp.get("pads") or []:
             if layer and layer not in (pad.get("layers") or []):
@@ -37,10 +101,49 @@ def _items(board, layer=None, nets=None):
             pts = pad_points(pad)
             if not pts:
                 continue
+            hole = pad.get("hole_mm")
+            if (pad.get("type") == "np_thru_hole" and hole
+                    and float(pad.get("w") or 0) <= float(hole) + 1e-6
+                    and float(pad.get("h") or 0) <= float(hole) + 1e-6):
+                # An NPTH pad whose copper size equals its drill has NO copper at
+                # all (the hole is the entire pad). KiCad's DRC skips it; counting
+                # it made cm5_minima's two stacked module mounting holes a 0.0 mm
+                # violation nobody else sees.
+                continue
+            cu = _item_layers(board, pad.get("layers"))
+            if not cu:
+                # A pad on F.Paste / F.Mask only carries NO copper: it is how a
+                # stencil opening is drawn. KiCad's DRC never compares it, and
+                # comparing it here invented 0.0 mm "violations" between the paste
+                # geometry of neighbouring pads (royalblue54L_feather, openair-max).
+                continue
             items.append({"kind": "pad", "net": pad.get("net"),
-                          "layer": (pad.get("layers") or [None])[0],
+                          "uuid": pad.get("uuid"),
+                          # A local clearance on the pad/footprint replaces the net
+                          # class value for anything measured against it.
+                          "local_clearance": pad.get("clearance"),
+                          "net_tie": (fp.get("ref"), pad.get("net_tie_group"))
+                                     if pad.get("net_tie_group") is not None else None,
+                          "layer": cu[0],
+                          "layers": cu,
                           "poly": pts,
-                          "ref": "%s.%s" % (fp.get("ref") or "?", pad.get("number") or "?")})
+                          "ref": _uniq_ref("%s.%s" % (fp.get("ref") or "?",
+                                                   pad.get("number") or "?"))})
+    for gi, g in enumerate(board.graphics or []):
+        if layer and g.get("layer") != layer:
+            continue
+        items.append({"kind": "graphic", "net": None, "uuid": g.get("uuid"),
+                      "layer": g.get("layer"), "layers": [g.get("layer")],
+                      "poly": g["poly"],
+                      "ref": _uniq_ref("graphic@%s" % (g.get("layer") or "?"))})
+    for fp in board.footprints:
+        for gi, g in enumerate(fp.get("graphics") or []):
+            if layer and g.get("layer") != layer:
+                continue
+            items.append({"kind": "graphic", "net": None, "uuid": g.get("uuid"),
+                          "layer": g.get("layer"), "layers": [g.get("layer")],
+                          "poly": g["poly"],
+                          "ref": _uniq_ref("%s.graphic%d" % (fp.get("ref") or "?", gi))})
     for tr in board.tracks:
         if layer and tr.get("layer") != layer:
             continue
@@ -49,7 +152,9 @@ def _items(board, layer=None, nets=None):
         pts = tr.get("_points") or [tr["start"], tr["end"]]
         for i in range(len(pts) - 1):
             items.append({"kind": "track", "net": tr.get("net"),
+                          "uuid": tr.get("uuid"),
                           "layer": tr.get("layer"),
+                          "layers": [tr.get("layer")] if tr.get("layer") else [],
                           "seg": (tuple(pts[i]), tuple(pts[i + 1]),
                                   float(tr.get("width") or 0.0)),
                           "ref": "track@%s" % (tr.get("layer") or "?")})
@@ -59,7 +164,9 @@ def _items(board, layer=None, nets=None):
         if nets and via.get("net") not in nets:
             continue
         dia = via.get("diameter") or via.get("drill") or 0.4
-        items.append({"kind": "via", "net": via.get("net"), "layer": None,
+        items.append({"kind": "via", "net": via.get("net"),
+                      "uuid": via.get("uuid"), "layer": None,
+                      "layers": _layer_span(board, via.get("from"), via.get("to")),
                       "poly": G.circle_points(via["x"], via["y"], dia / 2.0, 16),
                       "ref": "via@(%.3f,%.3f)" % (via["x"], via["y"])})
     return items
@@ -210,12 +317,18 @@ def nets(board):
     )
 
 
-def clearance(board, net_a=None, net_b=None, threshold_mm=0.2, layer=None, worst=20):
+def clearance(board, net_a=None, net_b=None, threshold_mm=0.2, layer=None, worst=20,
+              with_items=False):
     """Minimum edge-to-edge distance between copper of DIFFERENT nets.
 
     Answers "is anything too close", not just "how many violations": every pair
     below the threshold is returned with both references and the measured gap, so
     the model can decide what to move.
+
+    `with_items=True` attaches the two raw item dicts (their `poly` / `seg`) to every
+    returned pair. It exists for the cross-check against the vendor DRC, which only
+    says WHERE it saw the violation - matching a reported position back to our own
+    shapes needs the shapes, not just the names.
     """
     if net_a and net_b and net_a == net_b:
         return err("net_a and net_b are the same net; clearance is between different nets",
@@ -255,8 +368,21 @@ def clearance(board, net_a=None, net_b=None, threshold_mm=0.2, layer=None, worst
                     continue
                 seen.add(key)
                 it1, it2 = items[a], items[b]
-                if it1["net"] == it2["net"]:
+                # Two items with the SAME net never need clearance. Copper with NO
+                # net is different: KiCad's DRC still compares it (microwave's only
+                # two violations are a no-net pad against a no-net copper polygon),
+                # so `None == None` must not be read as "same net".
+                if it1["net"] is not None and it1["net"] == it2["net"]:
                     continue
+                tie = it1.get("net_tie")
+                if tie is not None and tie == it2.get("net_tie"):
+                    # same footprint, same declared net-tie group: the vendor connects
+                    # these pads on purpose (royalblue JP1 is a bridged solder jumper),
+                    # so their overlap is not a violation
+                    continue
+                l1, l2 = it1.get("layers"), it2.get("layers")
+                if l1 and l2 and not (set(l1) & set(l2)):
+                    continue          # different copper layers: not a 2-D distance
                 if net_a and net_b:
                     got = {it1["net"], it2["net"]}
                     if got != {net_a, net_b}:
@@ -268,12 +394,16 @@ def clearance(board, net_a=None, net_b=None, threshold_mm=0.2, layer=None, worst
                 if min_pair is None or d < min_pair["gap_mm"]:
                     min_pair = {"gap_mm": round(d, 4), "a": it1, "b": it2}
                 if d < threshold:
-                    pairs.append({
+                    pair = {
                         "gap_mm": round(d, 4),
                         "net_a": it1["net"], "net_b": it2["net"],
                         "item_a": it1["ref"], "item_b": it2["ref"],
                         "kind_a": it1["kind"], "kind_b": it2["kind"],
-                    })
+                    }
+                    if with_items:
+                        pair["_item_a"] = it1
+                        pair["_item_b"] = it2
+                    pairs.append(pair)
     pairs.sort(key=lambda p: p["gap_mm"])
     out = {
         "violations": len(pairs),

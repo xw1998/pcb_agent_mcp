@@ -116,9 +116,32 @@ class TestParseSampleBoard(unittest.TestCase):
         self.assertEqual(len(zone["filled_polygons"]), 1)
         self.assertEqual(len(zone["filled_polygons"][0]), 4)
 
-    def test_missing_project_file_is_declared_not_guessed(self):
+    def test_rules_from_the_board_file_are_labelled_as_such(self):
+        """No .kicad_pro here, but the board file carries its own (net_class ...).
+
+        Those blocks ARE rules, so the fact is present -- and must say where it came
+        from, otherwise the caller cannot tell a project rule from a board-local one.
+        """
+        rules = self.board.rules
+        self.assertIn("net_class", (rules.get("net_class_source") or "").lower(),
+                      "the sample board's own net_class block is the rule source")
+        self.assertIn("Default", rules.get("net_classes") or {})
         facts = [a["fact"] for a in self.board.absent]
-        self.assertIn("design_rules", facts)
+        self.assertNotIn("design_rules", facts,
+                         "a rule source exists, so it must not be declared missing")
+
+    def test_rules_are_declared_absent_when_neither_source_exists(self):
+        text = """(kicad_pcb (version 20221018)
+  (net 0 "") (net 1 "A")
+  (footprint "T:X" (layer "F.Cu") (at 10 10 0)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "A"))
+  )
+)"""
+        board = kicad_pcb.parse_board_text(text, path="<memory>")
+        facts = [a["fact"] for a in board.absent]
+        self.assertIn("design_rules", facts,
+                      "no .kicad_pro and no (net_class ...): nothing may be guessed")
 
 
 class TestFootprintRotation(unittest.TestCase):
@@ -134,10 +157,96 @@ class TestFootprintRotation(unittest.TestCase):
 )"""
         board = kicad_pcb.parse_board_text(text, path="<memory>")
         pad = board.footprints[0]["pads"][0]
-        # local (+2,0), rotated 90 deg CCW in KiCad's frame, then Y flipped:
-        #   board x = 10 + 0 = 10, board y = -(10 + 2) = -12
+        # local (+2,0), rotated 90 deg, then Y flipped into canonical space. pcbnew
+        # 10.0.7 puts this pad at (10, 8) in the file frame, i.e. canonical (10, -8);
+        # the old expectation of -12 was the rotation-sign defect, see
+        # tests/test_kicad_pad_placement.py.
         self.assertAlmostEqual(pad["x"], 10.0, places=6)
-        self.assertAlmostEqual(pad["y"], -12.0, places=6)
+        self.assertAlmostEqual(pad["y"], -8.0, places=6)
+
+
+class TestDrillOffset(unittest.TestCase):
+    """`(drill N (offset x y))` moves the COPPER, not just the hole.
+
+    pcbnew says so: for complex_hierarchy Q201.1 (offset 0 0.4) the pad's bounding
+    box is centred 0.4 mm below GetPosition() and HitTest covers that shifted
+    rectangle. Ignoring the offset left 27 pads of that board up to 0.4 mm off --
+    enough to change a 0.25 mm clearance by a quarter of its value.
+    """
+
+    TEXT = """(kicad_pcb (version 20221018)
+  (net 0 "") (net 1 "A")
+  (footprint "T:TO92" (layer "F.Cu") (at 100 100)
+    (property "Reference" "Q1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" thru_hole rect (at 0 0) (size 1.1 1.8)
+      (drill 0.75 (offset 0 0.4)) (layers "*.Cu" "*.Mask") (net 1 "A"))
+    (pad "2" thru_hole rect (at 2 0) (size 1.1 1.8)
+      (drill 0.75) (layers "*.Cu" "*.Mask") (net 2 "B"))
+  )
+)"""
+
+    def _board(self):
+        return kicad_pcb.parse_board_text(self.TEXT, "offset.kicad_pcb")
+
+    def test_offset_is_read_and_stored_with_y_canonicalised(self):
+        pads = self._board().pads()
+        self.assertEqual(pads[0]["offset"], [0.0, -0.4])
+        self.assertNotIn("offset", pads[1])
+
+    def test_offset_shifts_the_outline_but_not_the_anchor(self):
+        from pcb_agent_mcp.adapters.canonical import pad_points
+        pads = self._board().pads()
+        # the anchor is what pcbnew reports as GetPosition(), unchanged
+        self.assertAlmostEqual(pads[0]["y"], -100.0, places=6)
+        ys = [p[1] for p in pad_points(pads[0])]
+        self.assertAlmostEqual((min(ys) + max(ys)) / 2.0, -100.4, places=6)
+        ys2 = [p[1] for p in pad_points(pads[1])]
+        self.assertAlmostEqual((min(ys2) + max(ys2)) / 2.0, -100.0, places=6)
+
+    def test_offset_turns_with_the_pad(self):
+        from pcb_agent_mcp.adapters.canonical import pad_points
+        # pcbnew on `(pad 1 thru_hole rect (at 0 0 90) (size 1.0 2.0)
+        # (drill 0.5 (offset 0 0.4)))` of a footprint at (50, 50) reports the pad
+        # bbox centre at file (50.4, 50.0): the offset turns with the pad, so the
+        # same board written at (100, 100) has its copper at canonical (100.4, -100).
+        txt = self.TEXT.replace('(at 0 0) (size 1.1 1.8)',
+                                '(at 0 0 90) (size 1.1 1.8)')
+        pad = kicad_pcb.parse_board_text(txt, "offset.kicad_pcb").pads()[0]
+        xs, ys = zip(*pad_points(pad))
+        self.assertAlmostEqual((min(xs) + max(xs)) / 2.0, 100.4, places=6)
+        self.assertAlmostEqual((min(ys) + max(ys)) / 2.0, -100.0, places=6)
+
+
+class TestPadShapeWidths(unittest.TestCase):
+    """The pad outline has to be the shape the file asks for, at full size."""
+
+    TEXT = """(kicad_pcb (version 20221018)
+  (net 0 "") (net 1 "A")
+  (footprint "T:X" (layer "F.Cu") (at 50 50)
+    (property "Reference" "P1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" thru_hole oval (at 0 0 270) (size 1.6 2.8) (drill 1)
+      (layers "*.Cu" "*.Mask") (net 1 "A"))
+    (pad "2" thru_hole roundrect (at 5 0) (size 2 1) (drill 0.5)
+      (roundrect_rratio 0.1) (layers "*.Cu" "*.Mask") (net 1 "A"))
+  )
+)"""
+
+    def test_an_oval_keeps_its_full_size(self):
+        from pcb_agent_mcp.adapters.canonical import pad_points
+        pad = kicad_pcb.parse_board_text(self.TEXT, "shape.kicad_pcb").pads()[0]
+        xs, ys = zip(*pad_points(pad))
+        # 1.6 x 2.8 at 270 deg -> 2.8 wide, 1.6 tall. The old stadium construction
+        # sliced the wrong arcs and produced a 1.2 mm wide sliver here.
+        self.assertAlmostEqual(max(xs) - min(xs), 2.8, places=6)
+        self.assertAlmostEqual(max(ys) - min(ys), 1.6, places=6)
+
+    def test_a_roundrect_keeps_its_size_and_corner_radius(self):
+        from pcb_agent_mcp.adapters.canonical import pad_points
+        pad = kicad_pcb.parse_board_text(self.TEXT, "shape.kicad_pcb").pads()[1]
+        self.assertAlmostEqual(pad["rratio"], 0.1, places=6)
+        xs, ys = zip(*pad_points(pad))
+        self.assertAlmostEqual(max(xs) - min(xs), 2.0, places=6)
+        self.assertAlmostEqual(max(ys) - min(ys), 1.0, places=6)
 
 
 class TestProjectRules(unittest.TestCase):

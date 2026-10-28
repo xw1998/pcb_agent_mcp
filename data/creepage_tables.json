@@ -1,15 +1,227 @@
 {
-  "schema": 1,
-  "verified": false,
-  "edition": "NOT LOADED",
-  "note": "Intentionally empty and unverified. Fill from the actual standard text (table number + edition) and set verified=true. The tool refuses to answer until then, because a guessed safety distance is worse than no answer.",
-  "expected_row_format": {
-    "voltage_v": 250,
+ "schema": 2,
+ "verified": false,
+ "edition": "NOT LOADED",
+ "note": "Intentionally empty and unverified. The mechanism is now checkable (calc/safety_table.py: provenance >= 2 independent sources, distance monotone in voltage, monotone in material group, PD1<=PD2<=PD3, no duplicate rows, edition named), and the evidence that was actually found is kept under `candidates` - it is NOT usable as an answer, it is the trail. No row was filled because the public transcriptions disagree; see candidates.disputes.",
+ "why_empty": {
+  "rule": "a guessed safety distance is worse than no answer",
+  "what_was_looked_for": "IEC 60664-1:2007 Table F.4 (creepage) and Table A.1/A.2 (clearance), plus IPC-2152 for current capacity",
+  "what_was_found": "secondary transcriptions only; the standard itself is paywalled",
+  "what_blocks_filling": [
+   "the two transcriptions that do state pollution degree and material group disagree by 1.67x at the same key point (250 V, PD2, IIIa: 1.5 mm vs 2.5 mm)",
+   "the certification-report annex that carries the full grid lost its column headers in extraction (7 values for a 9-column table), so no cell can be attributed",
+   "one source cannot be checked; two agreeing blogs prove nothing about the standard"
+  ]
+ },
+ "expected_row_format": {
+  "voltage_v": 250,
+  "pollution_degree": "PD2",
+  "material_group": "IIIa",
+  "insulation": "basic",
+  "distance_mm": null,
+  "table": "F.4",
+  "sources": [
+   "url or document id, at least two independent ones"
+  ]
+ },
+ "candidates": {
+  "note": "raw evidence, transcribed as found. Not an answer, not interpolatable, and not loadable: creepage.py only reads `tables`.",
+  "conflict": true,
+  "sources": [
+   {
+    "id": "elecfans-411349",
+    "url": "https://m.elecfans.com/zt/411349/",
+    "title": "pcb电容爬电距离 - 电子发烧友网",
+    "kind": "secondary (community Q&A site)",
+    "states": "PD + material group explicitly",
+    "retrieved": "2026-10-28"
+   },
+   {
+    "id": "greattong-2610",
+    "url": "http://www.greattong.com/archives/view-2610-1.html",
+    "title": "PCB Layout中爬电距离、电气间隙的确定方法（宏力捷）",
+    "kind": "secondary (PCB design house)",
+    "states": "voltage only - no pollution degree, no material group",
+    "retrieved": "2026-10-28"
+   },
+   {
+    "id": "tuv-report-E0852108-annex",
+    "url": "https://manualzilla.com/doc/6761346/product-verification-file-annex--instruction-manuals?page=160",
+    "title": "Report No. E0852108 - TABLE: Creepage distances, functional insulation",
+    "kind": "transcription of a certification report (closest to primary that was reachable)",
+    "states": "PD1/PD2/PD3 x material group, 9 columns of headings",
+    "defect": "the extracted table has 7 values per row, the headers did not survive, so no value can be attributed to a column",
+    "retrieved": "2026-10-28"
+   }
+  ],
+  "rows": [
+   {
+    "source": "elecfans-411349",
+    "table": "F.4",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
     "pollution_degree": "PD2",
     "material_group": "IIIa",
     "insulation": "basic",
-    "distance_mm": null,
-    "table": "table id from the standard"
-  },
-  "tables": {}
+    "voltage_v": 50,
+    "distance_mm": 0.6
+   },
+   {
+    "source": "elecfans-411349",
+    "table": "F.4",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "basic",
+    "voltage_v": 100,
+    "distance_mm": 0.9
+   },
+   {
+    "source": "elecfans-411349",
+    "table": "F.4",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "basic",
+    "voltage_v": 250,
+    "distance_mm": 1.5
+   },
+   {
+    "source": "elecfans-411349",
+    "table": "F.4",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "basic",
+    "voltage_v": 500,
+    "distance_mm": 3.0
+   },
+   {
+    "source": "elecfans-411349",
+    "table": "F.4",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "basic",
+    "voltage_v": 800,
+    "distance_mm": 5.0
+   },
+   {
+    "source": "greattong-2610",
+    "table": "unstated",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "unstated",
+    "voltage_v": 250,
+    "distance_mm": 2.5,
+    "caveat": "the page does not say which pollution degree or material group these creepage values belong to; PD2/IIIa is this file's reading of the context, not the page's word"
+   },
+   {
+    "source": "greattong-2610",
+    "table": "unstated",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "unstated",
+    "voltage_v": 400,
+    "distance_mm": 5.0,
+    "caveat": "same as above"
+   },
+   {
+    "source": "greattong-2610",
+    "table": "unstated",
+    "edition": "IEC 60664-1 (edition not stated by the source)",
+    "pollution_degree": "PD2",
+    "material_group": "IIIa",
+    "insulation": "unstated",
+    "voltage_v": 600,
+    "distance_mm": 8.0,
+    "caveat": "same as above"
+   }
+  ],
+  "disputes": [
+   {
+    "key": {
+     "pollution_degree": "PD2",
+     "material_group": "IIIa",
+     "voltage_v": 250
+    },
+    "values_mm": [
+     1.5,
+     2.5
+    ],
+    "consequence": "a design that follows the 1.5 mm source passes review and fails the other reading by 1 mm; there is no way to choose from public text, so the tool refuses"
+   }
+  ],
+  "annex_rows_as_extracted": {
+   "source": "tuv-report-E0852108-annex",
+   "warning": "column headers lost in extraction - listed for auditability only",
+   "rows": {
+    "> 50": [
+     0.2,
+     0.6,
+     0.8,
+     1.1,
+     1.4,
+     1.6,
+     1.8
+    ],
+    ">50 and <=125": [
+     0.3,
+     0.7,
+     1.0,
+     1.4,
+     1.8,
+     2.0,
+     2.2
+    ],
+    ">125 and <=250": [
+     0.4,
+     1.0,
+     1.4,
+     2.0,
+     2.5,
+     2.8,
+     3.2
+    ],
+    ">250 and <=400": [
+     0.8,
+     1.6,
+     2.2,
+     3.2,
+     4.0,
+     4.5,
+     5.0
+    ],
+    ">400 and <=500": [
+     1.0,
+     2.0,
+     2.8,
+     4.0,
+     5.0,
+     5.6,
+     6.3
+    ],
+    ">500 and <=800": [
+     1.8,
+     3.2,
+     4.5,
+     6.3,
+     8.0,
+     9.0,
+     10.0
+    ],
+    ">800 and <=1000": [
+     2.4,
+     4.0,
+     5.6,
+     8.0,
+     10.0,
+     11.0,
+     12.5
+    ]
+   }
+  }
+ },
+ "tables": {}
 }

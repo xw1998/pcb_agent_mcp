@@ -45,10 +45,23 @@ class TestSummary(unittest.TestCase):
         self.assertEqual(r["value"]["tracks"], 2)
 
     def test_summary_carries_presence_and_absence(self):
+        """Rules count as present when the board file carries them itself.
+
+        `sample.kicad_pcb` is a board this server wrote, so it has (net_class ...)
+        blocks and no .kicad_pro: the rules are real, and saying they are absent
+        would be wrong. The absence claim is checked on a board that carries
+        neither.
+        """
         board = kicad_pcb.parse_board(SAMPLE)
         r = oracle.summary(board)
-        self.assertIn("design_rules", [a["fact"] for a in r["absent"]])
+        self.assertTrue(r["present"]["design_rules"]["present"])
         self.assertTrue(r["present"]["stackup"]["present"])
+        self.assertNotIn("design_rules", [a["fact"] for a in r["absent"]])
+
+        bare = kicad_pcb.parse_board_text(two_parallel_tracks(0.5))
+        r2 = oracle.summary(bare)
+        self.assertIn("design_rules", [a["fact"] for a in r2["absent"]])
+        self.assertFalse(r2["present"]["design_rules"]["present"])
 
 
 class TestClearance(unittest.TestCase):
