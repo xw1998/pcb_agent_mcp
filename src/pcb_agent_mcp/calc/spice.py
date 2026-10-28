@@ -932,8 +932,8 @@ NOT_COMPUTED = [
 ]
 
 
-def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
-             temp_c=None):
+def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
+                       temp_c=None):
     """Run one analysis. Returns the standard envelope.
 
     `temp_c` overrides a `.temp` card in the netlist (the caller's stated
@@ -1135,3 +1135,522 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
               assumptions={"temp_c": circ.temp_c, "points": len(points),
                            "defaulted_model_params": circ.defaulted},
               extra={"not_computed": NOT_COMPUTED, "warnings": circ.disabled})
+
+
+# ---------------------------------------------------------------------------
+# External engine delegation
+# ---------------------------------------------------------------------------
+# Why this exists instead of "just vendor a full SPICE": a full engine is C
+# (ngspice ~500k lines) or a numpy/scipy dependency (ahkab, PySpice). This
+# server's contract is *zero runtime dependencies*, so the builtin subset stays
+# the default and never has to be installed. What CAN be done without breaking
+# that contract is to hand the same netlist to ngspice when the user already has
+# it: no bundled binary, no wheel, no import - one subprocess, and the reply
+# says which engine answered and whether that engine's path was verified here.
+#
+# Two rules that make this honest rather than "probably works":
+#   * engine="ngspice" with no binary is an ERROR (ENGINE_NOT_FOUND). It never
+#     silently falls back to the subset - a caller who asked for the reference
+#     implementation must not receive a level-1 MOSFET answer instead.
+#   * cross_check=True runs BOTH engines and reports the largest node-voltage
+#     difference. That is the only way the delegation itself gets audited, and it
+#     is exactly how a wrong raw-file parse would show up.
+
+ENGINE_CHOICES = ("auto", "builtin", "ngspice")
+
+# Tests (and an unusual install) can set this to an argv prefix, e.g.
+#   [sys.executable, "/path/to/fake_ngspice.py"]
+NGSPICE_CMD = None
+
+NGSPICE_ENV = "PCB_AGENT_NGSPICE"
+
+NGSPICE_TIMEOUT_S = 120.0
+
+ENGINE_NOTE = (
+    "engine='auto' uses ngspice when a binary is found (PCB_AGENT_NGSPICE or PATH) "
+    "and the builtin stdlib solver otherwise; engine='ngspice' REFUSES rather than "
+    "fall back, because a caller who asked for the reference implementation must not "
+    "get a level-1 MOSFET answer in its place"
+)
+
+
+def find_ngspice():
+    """Return an argv prefix for ngspice, or None. Never raises."""
+    if NGSPICE_CMD:
+        return list(NGSPICE_CMD)
+    import os
+    env = (os.environ.get(NGSPICE_ENV) or "").strip().strip('"')
+    if env:
+        # A plain path may contain spaces, so it is taken whole when it names a
+        # file; otherwise the value is split like a command line (an argv prefix
+        # is how the tests inject the stand-in engine).
+        if os.path.isfile(env):
+            return [env]
+        import shlex
+        argv = [a for a in shlex.split(env, posix=True) if a]
+        if argv:
+            return argv
+    import shutil
+    for name in ("ngspice", "ngspice.exe", "ngspice_con", "ngspice_con.exe"):
+        found = shutil.which(name)
+        if found:
+            return [found]
+    return None
+
+
+def _engine_version(argv):
+    import subprocess
+    try:
+        p = subprocess.run(list(argv) + ["--version"], capture_output=True,
+                           timeout=20.0)
+    except Exception:
+        return None
+    text = (p.stdout or b"").decode("utf-8", "replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            return line[:120]
+    return None
+
+
+def _parse_raw(data):
+    """Parse an ngspice rawfile (ASCII 'Values:' or binary 'Binary:').
+
+    Returns {"plotname", "flags", "complex", "vars": [names], "types": [...],
+    "points": [[value, ...], ...]} where a complex plot stores values as
+    (re, im) pairs flattened. Raises ValueError with the reason.
+    """
+    import struct
+    if isinstance(data, str):
+        data = data.encode("utf-8", "replace")
+    marker = None
+    for cand in (b"Values:\n", b"Values:\r\n", b"Binary:\n", b"Binary:\r\n"):
+        idx = data.find(cand)
+        if idx >= 0 and (marker is None or idx < marker[0]):
+            marker = (idx, cand)
+    if marker is None:
+        raise ValueError("no 'Values:' or 'Binary:' section - this is not a rawfile")
+    idx, cand = marker
+    head = data[:idx].decode("utf-8", "replace")
+    body = data[idx + len(cand):]
+
+    meta = {}
+    var_lines = []
+    in_vars = False
+    for line in head.splitlines():
+        low = line.strip().lower()
+        if low.startswith("variables:"):
+            in_vars = True
+            continue
+        if in_vars:
+            parts = line.split()
+            if len(parts) >= 3:
+                var_lines.append((parts[1], parts[2]))
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip().lower()] = v.strip()
+    if not var_lines:
+        raise ValueError("rawfile has no Variables: block")
+    try:
+        nvar = int(meta.get("no. variables", len(var_lines)))
+        npts = int(meta.get("no. points", "0"))
+    except ValueError:
+        raise ValueError("rawfile header has non-integer No. Variables / No. Points")
+    flags = (meta.get("flags") or "").lower()
+    is_complex = "complex" in flags
+
+    names = [v[0] for v in var_lines]
+    types = [v[1] for v in var_lines]
+    mult = 2 if is_complex else 1
+
+    points = []
+    if cand.startswith(b"Binary"):
+        need = npt_unused = None
+        size = 8 * nvar * mult
+        if npts <= 0:
+            npts = len(body) // size
+        if len(body) < size * npts:
+            raise ValueError("binary rawfile truncated: %d bytes for %d points x %d "
+                             "variables" % (len(body), npts, nvar))
+        vals = struct.unpack("<%dd" % (nvar * mult * npts), body[:size * npts])
+        step = nvar * mult
+        for p in range(npts):
+            row = list(vals[p * step:(p + 1) * step])
+            if is_complex:
+                row = [(row[2 * i], row[2 * i + 1]) for i in range(nvar)]
+            points.append(row)
+    else:
+        toks = body.decode("utf-8", "replace").split()
+        per_point = 1 + nvar * mult      # the point index comes first
+        if len(toks) < per_point:
+            raise ValueError("ASCII rawfile has %d numbers, need at least %d"
+                             % (len(toks), per_point))
+        count = len(toks) // per_point
+        if npts and count != npts:
+            raise ValueError("ASCII rawfile has %d records but the header says %d "
+                             "points" % (count, npts))
+        for p in range(count):
+            chunk = toks[p * per_point:(p + 1) * per_point][1:]
+            row = [float(t) for t in chunk]
+            if is_complex:
+                row = [(row[2 * i], row[2 * i + 1]) for i in range(nvar)]
+            points.append(row)
+
+    return {"plotname": meta.get("plotname") or "", "flags": flags,
+            "complex": is_complex, "vars": names, "types": types,
+            "points": points}
+
+
+_NODE_PREFIXES = ("v(", "V(")
+
+
+def _raw_nodes(raw):
+    """Pull v(node) vectors out of a parsed rawfile.
+
+    Returns (nodes, scales) where nodes maps node name -> list of values and
+    scales maps "time"/"frequency" -> list of the scale vector.
+    """
+    names = raw["vars"]
+    scales = {}
+    nodes = {}
+    for i, name in enumerate(names):
+        low = name.lower()
+        if low in ("time", "frequency", "freq"):
+            # In a complex (AC) rawfile EVERY vector is a (re, im) pair, the
+            # frequency axis included - its imaginary part is always 0, and
+            # taking the tuple as the frequency would put a tuple where a float
+            # is expected.
+            scales["time" if low == "time" else "frequency"] = \
+                [(v[0] if isinstance(v, tuple) else v) for v in
+                 [pt[i] for pt in raw["points"]]]
+            continue
+        if low.startswith("v(") and low.endswith(")"):
+            node = name[2:-1]
+            nodes[node] = [pt[i] for pt in raw["points"]]
+    return nodes, scales
+
+
+def _deck_for_ngspice(netlist, want):
+    """The user's netlist, made runnable by ngspice, with the ANALYSIS forced.
+
+    Only the analysis the caller asked for is kept, so a deck with several
+    cards cannot answer a different question than the one that was asked.
+    """
+    lines = [ln.rstrip() for ln in str(netlist or "").splitlines()]
+    keep = []
+    for ln in lines:
+        low = ln.strip().lower()
+        if not low or low.startswith("*"):
+            keep.append(ln)
+            continue
+        if low.startswith(".end"):
+            continue
+        if low.startswith((".op", ".tran", ".ac", ".dc", ".four", ".noise")):
+            continue
+        keep.append(ln)
+    analyses = [ln.strip() for ln in lines
+                if ln.strip().lower().startswith((".op", ".tran", ".ac"))]
+    picked = [a for a in analyses if a.lower().startswith("." + want)]
+    if not picked:
+        picked = [a for a in analyses if a.lower().startswith("." + want[:2])]
+    if not picked:
+        return None
+    return "\n".join(["* pcb-agent-mcp deck"] + keep + picked + [".end"]) + "\n"
+
+
+def _run_ngspice(argv, netlist, want, timeout_s=NGSPICE_TIMEOUT_S):
+    """Run one analysis in a temp dir. Returns (raw_or_None, err_envelope_or_None)."""
+    import os
+    import subprocess
+    import tempfile
+    deck = _deck_for_ngspice(netlist, want)
+    if deck is None:
+        # No .op/.tran/.ac card survived the filter: make one from scratch is not
+        # something to guess at (which timestep? how many decades?).
+        return None, err("the netlist has no .%s card for ngspice to run" % want,
+                         "ARG_REQUIRED",
+                         hint="ngspice reads the analysis from the deck; add the card")
+    tmp = tempfile.mkdtemp(prefix="pcb_spice_")
+    try:
+        deck_path = os.path.join(tmp, "deck.cir")
+        raw_path = os.path.join(tmp, "out.raw")
+        log_path = os.path.join(tmp, "ngspice.log")
+        with open(deck_path, "w", encoding="ascii", errors="replace") as fh:
+            fh.write(deck)
+        cmd = list(argv) + ["-b", "-r", raw_path, "-o", log_path, deck_path]
+        try:
+            proc = subprocess.run(cmd, cwd=tmp, capture_output=True,
+                                  timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return None, err("ngspice did not finish within %g s" % timeout_s,
+                             "ENGINE_TIMEOUT",
+                             hint="raise the deck's own limits or shrink the sweep; "
+                                  "the run was killed, so there is no partial answer")
+        log = ""
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                log = fh.read()
+        except OSError:
+            pass
+        if proc.returncode != 0:
+            tail = (log or (proc.stderr or b"").decode("utf-8", "replace"))
+            tail = " ".join(tail.split())[-700:]
+            return None, err("ngspice exited with %d" % proc.returncode,
+                             "ENGINE_FAILED",
+                             hint="the deck was passed through unchanged; the log tail "
+                                  "is the engine's own complaint",
+                             extra={"engine": "ngspice", "exit_code": proc.returncode,
+                                    "log_tail": tail})
+        try:
+            with open(raw_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return None, err("ngspice wrote no rawfile", "ENGINE_OUTPUT_INVALID",
+                             hint="a run that exits 0 without a result is not an answer",
+                             extra={"engine": "ngspice", "log_tail":
+                                    " ".join(log.split())[-500:]})
+        try:
+            raw = _parse_raw(data)
+        except ValueError as exc:
+            return None, err("could not parse ngspice's rawfile: %s" % exc,
+                             "ENGINE_OUTPUT_INVALID",
+                             hint="the rawfile layout is documented and stable; a parse "
+                                  "failure means the answer would be a guess, so it is "
+                                  "refused",
+                             extra={"engine": "ngspice",
+                                    "raw_bytes": len(data)})
+        return (raw, log), None
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _external_envelope(raw, want, argv, tstep_hint=None, cross=None):
+    nodes, scales = _raw_nodes(raw)
+    engine = {"engine": "ngspice", "path": argv[0], "argv": list(argv),
+              "version": _engine_version(argv),
+              "plotname": raw["plotname"]}
+    extra = {
+        "engine_used": "ngspice",
+        "engine": engine,
+        "elements": None,
+        "elements_note": ("the per-element report is produced by the builtin solver "
+                          "from its own companion models; with an external engine the "
+                          "answer is the engine's node voltages, and re-deriving "
+                          "element currents here would be this server's arithmetic "
+                          "presented as the engine's result"),
+        "not_computed": NOT_COMPUTED,
+        "verified_against_engine": False,
+        "engine_note": ENGINE_NOTE,
+    }
+    if cross:
+        extra["cross_check"] = cross
+    assumptions = {"engine": "ngspice (external process, deck passed through "
+                             "unchanged except for the analysis cards)",
+                   "rawfile": "parsed from the engine's own raw output"}
+    basis = ("the netlist is handed to ngspice unchanged (only the analysis cards "
+             "are filtered to the one requested) and ngspice's rawfile is parsed "
+             "directly; this module adds no model of its own on this path")
+    precision = ("the numbers are ngspice's, so the model error is ngspice's model "
+                 "error; what this server guarantees here is only the plumbing: the "
+                 "deck it wrote, the card it asked for, and that the parse of the "
+                 "rawfile round-trips into the same node names")
+
+    if want == "op":
+        first = {name: _round_v(vals[0]) for name, vals in nodes.items()}
+        return ok(value={"analysis": "op", "nodes_v": first},
+                  unit="mixed", model="external_ngspice",
+                  basis=basis, precision=precision, assumptions=assumptions,
+                  extra=extra)
+
+    if want == "tran":
+        t = scales.get("time") or []
+        pts = []
+        for k in range(min(len(t), min([len(v) for v in nodes.values()] or [0]) or 0)):
+            pts.append({"t": round(float(t[k]), 12),
+                        "nodes_v": {n: _round_v(v[k]) for n, v in nodes.items()}})
+        if not pts:
+            return err("ngspice's transient rawfile carries no v(node) vector",
+                       "ENGINE_OUTPUT_INVALID",
+                       hint="an answer with no nodes is not an answer")
+        return ok(value={"analysis": "tran", "points": pts,
+                         "timestep_s": tstep_hint,
+                         "points_returned": len(pts)},
+                  unit="mixed", model="external_ngspice",
+                  basis=basis, precision=precision, assumptions=assumptions,
+                  extra=extra)
+
+    # ac
+    f = scales.get("frequency") or []
+    pts = []
+    for k in range(min(len(f), min([len(v) for v in nodes.values()] or [0]) or 0)):
+        row = {}
+        for n, vals in nodes.items():
+            val = vals[k]
+            if isinstance(val, tuple):
+                re_, im_ = val
+                row[n] = {"re": _round_v(re_), "im": _round_v(im_),
+                          "mag": _round_v(math.hypot(re_, im_)),
+                          "phase_deg": round(math.degrees(math.atan2(im_, re_)), 6)}
+            else:
+                row[n] = {"re": _round_v(val), "im": 0.0,
+                          "mag": _round_v(abs(val)), "phase_deg": 0.0}
+        pts.append({"freq_hz": round(float(f[k]), 6), "nodes_v": row})
+    if not pts:
+        return err("ngspice's AC rawfile carries no v(node) vector",
+                   "ENGINE_OUTPUT_INVALID",
+                   hint="an answer with no nodes is not an answer")
+    return ok(value={"analysis": "ac", "points": pts},
+              unit="mixed", model="external_ngspice",
+              basis=basis, precision=precision, assumptions=assumptions,
+              extra=extra)
+
+
+def _round_v(v):
+    if isinstance(v, tuple):
+        return (round(v[0], 9), round(v[1], 9))
+    return round(float(v), 9)
+
+
+def _cross_check(builtin, external, want):
+    """Largest node-voltage disagreement between the two engines."""
+    bval = (builtin.get("value") or {})
+    eval_ = (external.get("value") or {})
+
+    def pairs(b, e):
+        out = []
+        for node, bv in (b or {}).items():
+            ev = (e or {}).get(node)
+            if isinstance(bv, (int, float)) and isinstance(ev, (int, float)):
+                out.append((node, abs(float(bv) - float(ev))))
+        return out
+
+    if want == "op":
+        diffs = pairs(bval.get("nodes_v"), eval_.get("nodes_v"))
+    elif want == "tran":
+        bp = bval.get("points") or [{}]
+        ep = eval_.get("points") or [{}]
+        diffs = pairs(bp[0].get("nodes_v"), ep[0].get("nodes_v"))
+    else:
+        bp = bval.get("points") or [{}]
+        ep = eval_.get("points") or [{}]
+        b0 = bp[0].get("nodes_v") or {}
+        e0 = ep[0].get("nodes_v") or {}
+        diffs = []
+        for node, bv in b0.items():
+            ev = e0.get(node)
+            if not isinstance(bv, dict) or not isinstance(ev, dict):
+                continue
+            diffs.append((node, abs(complex(bv.get("re", 0.0), bv.get("im", 0.0))
+                                    - complex(ev.get("re", 0.0), ev.get("im", 0.0)))))
+    if not diffs:
+        return {"compared_nodes": 0, "max_abs_diff_v": None,
+                "note": "no node names in common between the two engines, so nothing "
+                        "could be compared - this is NOT a pass"}
+    worst = max(diffs, key=lambda t: t[1])
+    if want == "ac":
+        note = ("point compared: the first sweep frequency only, because the "
+                "builtin AC uses the deck's own sweep points")
+    elif want == "op":
+        note = "point compared: the operating point"
+    else:
+        note = ("point compared: the first point only (both engines start at the "
+                "same DC bias; later points differ by each engine's own integrator)")
+    return {"compared_nodes": len(diffs),
+            "max_abs_diff_v": round(worst[1], 12),
+            "worst_node": worst[0],
+            "note": note,
+            "elements": "not compared (the external path has no per-element report)"}
+
+
+def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
+             temp_c=None, engine="auto", cross_check=False):
+    """Run one analysis, optionally delegating to ngspice.
+
+    `engine`: "auto" (ngspice if found, else builtin), "builtin", "ngspice".
+    "ngspice" without a binary is ENGINE_NOT_FOUND - never a silent fall back.
+    `cross_check=True` runs both engines and reports the largest node-voltage
+    disagreement, which is how the delegation itself is audited.
+    """
+    choice = str(engine or "auto").lower()
+    if choice not in ENGINE_CHOICES:
+        return err("engine must be one of %s" % ", ".join(ENGINE_CHOICES),
+                   "ARG_INVALID",
+                   hint=ENGINE_NOTE)
+    def _builtin(reason):
+        out = _simulate_builtin(netlist, analysis=analysis, max_iter=max_iter,
+                                max_points=max_points, temp_c=temp_c)
+        if isinstance(out, dict) and out.get("status") == "ok":
+            out["engine_used"] = "builtin"
+            out["engine_note"] = reason
+        return out
+
+    if choice == "builtin":
+        return _builtin("engine='builtin' was asked for, so the stdlib subset solver "
+                        "ran and no external engine was consulted")
+
+    argv = find_ngspice()
+    if argv is None:
+        if choice == "ngspice":
+            return err("engine='ngspice' was requested but no ngspice binary was found",
+                       "ENGINE_NOT_FOUND",
+                       hint="install ngspice, or point %s at it, or ask for "
+                            "engine='auto' / 'builtin'. This refuses instead of "
+                            "answering with the subset, because those are different "
+                            "device models" % NGSPICE_ENV,
+                       extra={"tried": ["%s env var" % NGSPICE_ENV,
+                                        "PATH: ngspice, ngspice_con"]})
+        return _builtin("engine='auto' found no ngspice binary (%s or PATH), so the "
+                        "stdlib subset solver ran; the answer is that subset's, not "
+                        "the reference engine's" % NGSPICE_ENV)
+
+    # Which analysis? Same rule as the builtin path: the caller's word, else the
+    # LAST analysis card in the deck (SPICE's own convention is the first, so the
+    # deck is filtered to exactly one card and the ambiguity never reaches ngspice).
+    try:
+        spec = parse_netlist(netlist)
+    except ValueError as exc:
+        return err(str(exc), "NETLIST_INVALID",
+                   hint="the parser refuses a card it does not implement instead of "
+                        "skipping it; with an external engine the deck would be passed "
+                        "through, but the node list still comes from this parse, so an "
+                        "unparsed card would make the report incomplete")
+    want = (analysis or (spec["analyses"][-1]["kind"] if spec["analyses"] else "op")).lower()
+    if want not in ("op", "tran", "ac"):
+        return err("analysis must be op, tran or ac", "ARG_INVALID")
+    if temp_c is not None:
+        try:
+            temp_c = float(temp_c)
+        except (TypeError, ValueError):
+            return err("temp_c must be a number", "ARG_INVALID")
+        if ".temp" in str(netlist).lower():
+            return err("both a .temp card and temp_c were given; the deck is passed to "
+                       "ngspice unchanged, so sending two temperatures would leave the "
+                       "answer dependent on card order", "ARG_CONFLICT",
+                       hint="keep one of them")
+        netlist = str(netlist).rstrip() + "\n.temp %g\n" % temp_c
+
+    tstep = None
+    card = next((a for a in spec["analyses"] if a["kind"] == want), None)
+    if card and want == "tran":
+        tstep = card.get("tmax") or card.get("tstep")
+
+    raw_log, problem = _run_ngspice(argv, netlist, want)
+    if problem is not None:
+        return problem
+    raw, log = raw_log
+    cross = None
+    if cross_check:
+        builtin = _simulate_builtin(netlist, analysis=analysis, max_iter=max_iter,
+                                    max_points=max_points, temp_c=None)
+        if builtin.get("status") == "ok":
+            external_probe = _external_envelope(raw, want, argv, tstep_hint=tstep)
+            cross = _cross_check(builtin, external_probe, want)
+        else:
+            cross = {"compared_nodes": 0, "max_abs_diff_v": None,
+                     "note": "the builtin solver could not solve this netlist (%s), so "
+                             "there was nothing to cross-check against - the external "
+                             "answer stands alone and is NOT corroborated"
+                             % builtin.get("reason_code")}
+    return _external_envelope(raw, want, argv, tstep_hint=tstep, cross=cross)

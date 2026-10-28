@@ -9,6 +9,42 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.7] - 2026-10-28
+
+「SPICE 为什么只做子集」的回答：**不是懒，是零 runtime 依赖约束下唯一诚实的形态**。完整 SPICE
+没有"抄进 stdlib 就能用"的版本（ngspice 约 50 万行 C，ahkab/PySpice 要 numpy/scipy），所以这一版
+加的是**可选委派**——内置子集保证有答案，机器上装了 ngspice 就把 deck 交给它。不 vendor 二进制，
+不新增任何依赖。
+
+- 新增外部引擎委派（`calc/spice.py`）：`simulate(..., engine="auto"|"builtin"|"ngspice",
+  cross_check=False)`，原求解器改名为 `_simulate_builtin`。
+  - `find_ngspice()`：`NGSPICE_CMD`（测试注入）→ `PCB_AGENT_NGSPICE`（整路径优先，带空格才不拆坏）
+    → PATH 上的 `ngspice/ngspice.exe/ngspice_con/ngspice_con.exe`。
+  - `_deck_for_ngspice()`：用户网表**原样**通过，只把 `.op/.tran/.ac/.dc/.four/.noise` 过滤到
+    调用方要的那一条并补 `.end`——SPICE 自己"跑第一张卡"的约定与本工具"调用方说的，否则最后一张"
+    不同，不过滤就会答非所问且看不出来；网表里没有对应卡时 `ARG_REQUIRED`，不猜步长/频点。
+  - `_parse_raw()`：ASCII `Values:` 与 `Binary:` 两种布局。ASCII **每条记录第一个数是点序号**
+    必须丢弃（不丢则所有节点电压整体错一位，且仍然"看起来合理"）；复数图里**每个向量都是 (re, im)
+    对，频率轴也一样**（虚部恒 0），把频率当实数读会在后面炸掉。
+  - `_external_envelope()`：`engine_used` / `engine{path,argv,version,plotname}` /
+    `elements:null` + `elements_note` / `not_computed` / **`verified_against_engine:false`**。
+    逐元件报告在外部路径上**不出**：拿节点电压回推元件电流再当成引擎的答案，是把自己的算术冒充别人。
+  - `_cross_check()`：同 deck 跑两个引擎比节点电压，只比 op 全部节点 / tran 首点 / ac 首频点
+    （后两者比的是各自积分器与频率栅格，不是模型）；节点名对不上时 `compared_nodes=0` 且写明
+    "这不是通过"。
+- 失败路径逐条有码：`ENGINE_NOT_FOUND`（`engine="ngspice"` 找不到，**绝不回退到子集**）、
+  `ENGINE_TIMEOUT`、`ENGINE_FAILED`（附 `exit_code` + `log_tail`）、`ENGINE_OUTPUT_INVALID`
+  （rc=0 但没 raw / raw 解析不了）、`ARG_CONFLICT`（`.temp` 卡与 `temp_c` 同时给）、`ARG_REQUIRED`。
+- `engine="auto"` 回退到内置时同样标注 `engine_used="builtin"` + `engine_note`：不标出来就等于
+  悄悄降级。
+- `sim_spice` 工具新增 `engine`、`cross_check` 两个参数；能力自述里「Simulation is a SUBSET」
+  改写为「内置子集 + 可委派（不打包、不验证）」，`layers.simulation` / `verified_against.simulation`
+  同步。
+- 新增 28 个用例（`tests/test_spice_engine.py` + `tests/_fake_ngspice.py` 假引擎），全量 **670 passed**；
+  `--selftest` 加 3 条（`engine=builtin` 被标注且 6.6667 V / 无二进制时 `engine="ngspice"`
+  回 `ENGINE_NOT_FOUND` 而不回退 / `auto` 仍出答案且 `cross_check` 不请自来）→ **54/54**。
+- 新增 `docs/21-SPICE引擎委派.md`。
+
 ## [0.0.6] - 2026-10-28
 
 平面谐振与电热耦合：两个"板子自己把自己搞坏"的问题。前者只给模频与间距比例（Q 不做、判据不外给），

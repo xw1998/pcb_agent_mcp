@@ -630,6 +630,53 @@ def selftest():
               payload.get("status") == "error"
               and payload.get("reason_code") == "THERMAL_RUNAWAY",
               str(payload.get("reason_code")))
+
+        # --- the ngspice delegation: what can be asserted without the engine
+        r = handle({"jsonrpc": "2.0", "id": 91, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* div\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 2k\n.op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("engine=builtin is labelled as such (10 V 1k/2k -> 6.6667 V)",
+              payload.get("status") == "ok"
+              and payload.get("engine_used") == "builtin"
+              and abs(((payload.get("value") or {}).get("nodes_v") or {})
+                      .get("2", 0) - 6.6666667) < 1e-6,
+              str(payload.get("engine_used")))
+
+        from .calc import spice as _spice_mod
+        _saved = _spice_mod.NGSPICE_CMD
+        _spice_mod.NGSPICE_CMD = None
+        try:
+            _found = _spice_mod.find_ngspice()
+        finally:
+            _spice_mod.NGSPICE_CMD = _saved
+        r = handle({"jsonrpc": "2.0", "id": 92, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* div\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 2k\n.op\n",
+                        "engine": "ngspice"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        if _found:
+            check("engine=ngspice runs the installed binary (%s)" % _found[0],
+                  payload.get("status") == "ok"
+                  and payload.get("engine_used") == "ngspice",
+                  str(payload.get("engine_used")))
+        else:
+            check("engine=ngspice REFUSES with no binary (no silent fall back)",
+                  payload.get("status") == "error"
+                  and payload.get("reason_code") == "ENGINE_NOT_FOUND",
+                  str(payload.get("reason_code")))
+
+        r = handle({"jsonrpc": "2.0", "id": 93, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* div\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 2k\n.op\n",
+                        "cross_check": False}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("auto engine still answers (and cross_check stays off unless asked)",
+              payload.get("status") == "ok"
+              and "cross_check" not in payload
+              and payload.get("engine_used") in ("builtin", "ngspice"),
+              str(payload.get("engine_used")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

@@ -1182,7 +1182,9 @@ def _capabilities(_args):
                        "geometry, and every one of them says what it cannot see",
             "simulation": "circuit simulation (SPICE: .op / .tran / .ac with Newton + "
                           "junction limiting + gmin stepping, per-element results "
-                          "reported back), current and PDN (trace / via / barrel "
+                          "reported back; the same tool can delegate to an installed "
+                          "ngspice instead, and cross-check the two solvers against "
+                          "each other), current and PDN (trace / via / barrel "
                           "resistance, IR drop from the board's own copper, "
                           "decoupling impedance and worst-case anti-resonance), and "
                           "thermal (1-D stacks, via arrays, a real 2-D plate solve "
@@ -1357,13 +1359,19 @@ def _capabilities(_args):
             "resonance with no Q is a location on the frequency axis, not a verdict - "
             "when it matters, use a 3-D field solver",
             "Impedance/creepage tables for standards other than IPC-2221 / IPC-2141A",
-            "Simulation is a SUBSET of SPICE, by name: the sim_spice solver handles "
-            "R C L V I E G D Q M with .op/.tran/.ac/.model/.temp and rejects F H J K "
-            "S W X B T O U A cards with the card named in the error. What it does not "
-            "do: temperature-dependent device models, noise (.noise), distortion, "
-            "Monte Carlo, subcircuits, behavioural sources, and any model card "
-            "beyond the ones listed - it also uses dense LU, so it refuses above ~400 "
-            "unknowns and says to use ngspice",
+            "The BUILTIN SPICE solver is a subset, by name: it handles R C L V I E G "
+            "D Q M with .op/.tran/.ac/.model/.temp and rejects F H J K S W X B T O U A "
+            "cards with the card named in the error. Who wants the rest: install "
+            "ngspice and the same tool can hand the deck to it (engine='ngspice', or "
+            "'auto' once a binary is on PATH / in PCB_AGENT_NGSPICE), which covers "
+            "subcircuits, behavioural sources, switches, transmission lines and the "
+            "real device models. That path is NOT bundled and NOT verified from here: "
+            "no ngspice binary exists on the machine this was built on, so every "
+            "external answer carries verified_against_engine:false, and the delegation "
+            "has only been exercised against a stand-in engine. What neither path "
+            "does: temperature sweeps (one temperature per run), noise (.noise), "
+            "distortion, Monte Carlo; the builtin solver also uses dense LU and "
+            "refuses above ~400 unknowns",
             "Electrothermal coupling beyond ONE lump: electrothermal_trace / "
             "electrothermal_conductor close the loop between copper R(T) and a single "
             "caller-supplied Rth, and nothing else. Not done: 2-D/3-D coupling (a hot "
@@ -1469,7 +1477,14 @@ def _capabilities(_args):
                           "1.6 mm FR4 at 100 mm^2 = 53.3333 K/W). The 2-D plate solve "
                           "is checked against its own energy balance (power in vs "
                           "convection out, refused above 0.5 % residual) and against "
-                          "the P/(2hA) limit for a high-k plate",
+                          "the P/(2hA) limit for a high-k plate. The ngspice "
+                          "delegation is covered the other way round: with no engine "
+                          "installed, engine='ngspice' is asserted to REFUSE "
+                          "(ENGINE_NOT_FOUND) rather than fall back, and the rawfile "
+                          "parser (both the ASCII and the binary layout, including "
+                          "the point index the ASCII form puts first) plus the "
+                          "deck filter and the three failure paths are driven by a "
+                          "stand-in engine under tests/",
             "vibration": "checked against the closed-form plate eigenvalues, not "
                          "against itself: a simply supported square gives "
                          "f11 = pi^2 sqrt(D/rho h)/a^2 to 6 digits (330.385 Hz on a "
@@ -2085,11 +2100,13 @@ _tool(
 _tool(
     "sim_spice",
     "Run a real circuit simulation on a SPICE netlist: DC operating point (.op), transient "
-    "(.tran) and small-signal AC (.ac). Solves the actual nonlinear equations (Newton + "
-    "junction voltage limiting + gmin stepping), and reports per-element voltage, current "
-    "and power so the answer can be checked instead of trusted. Element cards: R C L V I "
-    "E G D Q M. Unimplemented cards (X/F/H/K/S/W/B/T/O/U/A) are REJECTED BY NAME, never "
-    "skipped silently - a netlist that half-runs is worse than one that refuses.",
+    "(.tran) and small-signal AC (.ac). The answer comes from the BUILTIN stdlib solver "
+    "(Newton + junction voltage limiting + gmin stepping, per-element voltage/current/"
+    "power reported back) or, if an ngspice binary is installed, from ngspice itself - "
+    "see the engine parameter. The builtin solver takes R C L V I E G D Q M and REJECTS "
+    "X/F/H/K/S/W/B/T/O/U/A BY NAME, never silently; with ngspice the deck is passed "
+    "through, so those cards work, but the per-element report is then absent (this "
+    "server will not re-derive it and present its own arithmetic as the engine's).",
     {"type": "object", "properties": {
         "netlist": _str("SPICE netlist text, one card per line; a leading * is a comment. "
                         "The first line is not skipped unless it starts with * - write "
@@ -2100,11 +2117,22 @@ _tool(
                        "present", 27),
         "max_iter": _num("Newton iteration budget per solve", 200),
         "max_points": _num("cap on transient/AC output points", 200),
+        "engine": _str("which solver: auto (ngspice when found on PATH or in "
+                       "PCB_AGENT_NGSPICE, else builtin), builtin, or ngspice. "
+                       "engine='ngspice' REFUSES when no binary is found instead of "
+                       "quietly answering with the subset - the two differ in device "
+                       "models, so that substitution would be a wrong answer",
+                       enum=["auto", "builtin", "ngspice"], default="auto"),
+        "cross_check": _bool("run BOTH solvers on the same deck and report the largest "
+                             "node-voltage disagreement; this is how the delegation "
+                             "itself is audited", False),
     }, "required": ["netlist"]},
     lambda a: _spice.simulate(a.get("netlist"), analysis=a.get("analysis"),
                               temp_c=a.get("temp_c"),
                               max_iter=int(a.get("max_iter") or 200),
-                              max_points=int(a.get("max_points") or 200)),
+                              max_points=int(a.get("max_points") or 200),
+                              engine=a.get("engine") or "auto",
+                              cross_check=bool(a.get("cross_check"))),
 )
 
 _tool(

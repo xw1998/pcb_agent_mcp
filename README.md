@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.6` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.7` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -175,7 +175,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `link_far_field` | 远场距离：`max(2D²/λ, 5D, λ/2π)` 并说明哪个机制主导 | 三段都要给，只给一段会误导 |
 | `link_fresnel` | 第一菲涅耳区半径 + 60% 净空 | — |
 | `board_antenna_keepout` | 板级净空：某矩形内的铜与 **zone** | 派生量 `authoritative:false`；pad/track/via 与 zone **分开计数**（DRC 看不见铺铜失谐） |
-| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进 | 器件卡 R C L V I E G D Q M；**X/F/H/K/S/W/B/T/O/U/A 逐条点名拒绝**，不静默跳过 |
+| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`） | 内置子集只认 R C L V I E G D Q M，**X/F/H/K/S/W/B/T/O/U/A 逐条点名拒绝**；`engine="ngspice"` 找不到二进制**报错不回退** |
 | `trace_resistance` | 铜线直流电阻 `rho(T)·L/(w·t)` | 只管这一段；过孔/扩展/端子不在这个数里 |
 | `via_resistance` | 过孔桶壁电阻（截面是**铜环**不是钻孔圆） | 载流是另一码事，要温升判据 |
 | `trace_inductance` | 直线走线自感（Grover 带公式，±20%） | 只用于比两种布局；地平面像项**明确未计入** |
@@ -210,9 +210,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.6
-python run_server.py --selftest      # 协议级自检，51/51（含板与原理图写路径端到端、天线四问、仿真四问、DFM 三问、振动五问、腔体与电热五问）
-python -m unittest discover -s tests # 642 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
+python run_server.py --version       # 0.0.7
+python run_server.py --selftest      # 协议级自检，54/54（含板与原理图写路径端到端、天线四问、仿真四问、DFM 三问、振动五问、腔体与电热五问）
+python -m unittest discover -s tests # 670 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -328,6 +328,14 @@ MCP 客户端配置（stdio）：
   `UNSUPPORTED_CARD` 并点名，而不是跳过——**一半跑完的网表比拒答更危险**。瞬态是后向欧拉
   （不是梯形），AC 先解工作点再只覆盖雅可比。`not_computed` 每一条都写清：没有自热、没有器件
   电容/迁移率/击穿随温度、没有噪声/失真/傅里叶分析。
+- **"只做子集"不是懒，是零依赖约束下的唯一诚实解。** 完整 SPICE（ngspice 约 50 万行 C，
+  ahkab/PySpice 要 numpy/scipy）没有"抄进 stdlib 就能用"的形态，所以 0.0.7 加的是**可选委派**：
+  `engine="auto"` 在 PATH / `PCB_AGENT_NGSPICE` 找到 ngspice 就把 deck 原样交给它（只过滤分析卡），
+  找不到则用内置子集并在 `engine_used` / `engine_note` 里说明；`engine="ngspice"` 找不到是
+  `ENGINE_NOT_FOUND` 报错，**绝不静默回退**（level-1 MOSFET 的答案冒充不了 BSIM）。
+  `cross_check=True` 跑两个引擎比节点电压——这是唯一能审计这条委派本身的手段。**本机没有
+  ngspice 二进制**，所以每条外部答案都带 `verified_against_engine:false`，管线只用
+  `tests/_fake_ngspice.py` 假引擎测通。
 - **AC 截断会出声。** 扫频点数超过 `max_points` 时返回 `warnings`：只解了前 N 点、末点不是 `fstop`。
   一个还在上升的曲线被静默截断，会被读成"电路在这里谐振"。
 - **温度必须给符号正确的答案。** IS 按 SPICE 实现随温度缩放（XTI/EG/TNOM）：27 ℃ 二极管 0.6925 V，
@@ -449,7 +457,7 @@ pcb_agent_mcp/
 │       ├── antenna.py            # 贴片/印刷线/偶极单极/螺旋/小环/Chu 上限/芯片天线
 │       ├── matching.py           # 反射/L/π/T/短截线/四分之一波长（每解回代）
 │       ├── link.py               # FSPL/Friis/最大距离/有效面积/远场/菲涅耳
-│       ├── spice.py              # SPICE 子集：MNA + 牛顿 + pnjlim + gmin 步进
+│       ├── spice.py              # SPICE 子集 + 可选委派 ngspice（raw 解析 / deck 过滤 / 双引擎对账）
 │       ├── power.py              # 铜阻/过孔/自感/电阻网络/IR drop/电容组/PDN
 │       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
 │       ├── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
@@ -459,10 +467,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── creepage_tables.json      # 空表 + verified:false + why_empty（故意不填）
 │   └── ipc2152_tables.json       # 同上；表本身由 calc/safety_table.py 可执行地体检
-├── tests/                        # 642 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 670 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~20，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~21，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
