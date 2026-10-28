@@ -9,6 +9,39 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.2] - 2026-10-28
+
+天线层：从"能算板"扩到"能设计第一个天线原型"。**不含全波求解器**，这一点写在每个返回里。
+
+- 新增 4 个计算模块：`calc/feedline.py`（微带 / 带状线 / CPW / GCPW + 反解宽度）、
+  `calc/antenna.py`（贴片 / 印刷线 / 偶极单极 / 螺旋 / 小环 / Chu 上限 / 芯片天线）、
+  `calc/matching.py`（反射 / L / π / T / 单短截线 / 四分之一波长）、
+  `calc/link.py`（FSPL / Friis / 最大距离 / 有效面积 / 远场 / 菲涅耳）。
+- 新增 `oracle.antenna_keepout` 与 21 个工具（45 → **66**）：9 个 `feedline_*`/`antenna_*`、
+  6 个 `match_*`、5 个 `link_*`、1 个 `board_antenna_keepout`（派生量，pad/track/via 与 zone 分开计数）。
+- 新增 93 个用例（`test_feedline` 18 / `test_antenna` 30 / `test_matching` 26 / `test_link` 19），
+  全量 **450 passed**；`--selftest` 加 4 条天线指纹（3.14 mm 微带 / 37.2×28.8 mm 贴片 /
+  40.05 dB FSPL / 回代 50 Ω），**34/34**。
+- 文档：`docs/16-天线与馈线.md`（十七篇），索引与 README 工具表同步。
+- 边界（写进 `_capabilities().not_implemented_yet` 与每个天线信封的 `not_computed`）：
+  方向图、外壳/手持失谐、同板互耦、SAR、匹配后的实际带宽——需要全波，本层不做也不猜。
+
+### 两个真缺陷（都是"数值算得出来但语义错了"）
+
+- **`l_match` series-first 分支符号错**（`b = -xtot/den` → `+xtot/den`）：25 Ω 纯阻负载会被
+  "匹配"成 10+j20、残差 VSWR 0.707。抓到它的是"每个解必须回代重算残差"这条纪律。
+- **蛇形天线的打包方向与 fits 判定**：原实现按长度方向数折（`int((bl+gap)/(bw+gap))`）、
+  且不判"装不装得下"，会输出一个看着合理的展开长度。改为按宽度方向打包
+  （`pitch = wire_width + 0.5`）+ `fits` / `fits_without_meandering` / `fits_against`。
+
+### 顺带修掉的小口径
+
+- `feedline_width` 的有效性窗加 1e-9 相对容差：边界值本身合法（0.05 与 20.0 曾被误拒）。
+- `small_loop` 的 `r_rad` 用 6 位有效数字输出，另给 `r_rad_mohm`（原来 `round(...,5)` 把
+  2e-7 Ω 舍成 `0.0`，读起来像"不辐射"）。
+- `chip_antenna` 小净空在顶层给 `warnings`（λ/20、近场边界一半两条阈值）。
+- `reflection` / `l_match` 接受 `"100+25j"` / `"-j30"` / `"j30"` 这类字符串阻抗。
+
 ## [0.0.1] - 2026-10-28
 
 首个完整版本：六层——**Calc**（无板也能算）、**Adapter**（两种格式进同一个 Canonical）、

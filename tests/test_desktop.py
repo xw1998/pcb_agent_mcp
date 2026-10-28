@@ -36,8 +36,14 @@ class TestDetect(unittest.TestCase):
         self.assertIsInstance(r["tried"], list)
         if r["found"]:
             self.assertTrue(os.path.isfile(r["exe"]))
-            self.assertIn(r["source"],
-                          ("explicit path", "running process", "drive scan", "registry"))
+            # the running-process source carries the pid, so it can only be
+            # matched by prefix - and this branch only fires when the EDA happens
+            # to be running, which is a machine state, not a code path
+            src = r["source"]
+            self.assertTrue(
+                src in ("explicit path", "drive scan", "registry")
+                or src.startswith("running process (pid "),
+                "unexpected evidence source: %r" % (src,))
 
     def test_detect_all_covers_every_app(self):
         r = desktop.detect_all()

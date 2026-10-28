@@ -19,6 +19,10 @@ from .calc import impedance as _impedance
 from .calc import rf as _rf
 from .calc import safety_table as _safety_table
 from .calc import units as _units
+from .calc import antenna as _antenna
+from .calc import feedline as _feedline
+from .calc import link as _link
+from .calc import matching as _matching
 from .calc.result import err
 from .adapters import FORMATS as _FORMATS
 from .adapters import detect_format as _detect_format
@@ -659,7 +663,497 @@ def _epro_inspect(args):
         return err("file does not exist: %r" % path, "FILE_NOT_FOUND")
     return _epro.inspect(path, sample=int(args.get("sample", 3)))
 
+# ------------------------------------------------- antenna / feedline / link
+# Everything below is a stateless engineering calculation. None of it needs a
+# board, and none of it is a full-wave solver: the boundary of what a closed form
+# can answer is written into every answer's `precision` and `not_computed`.
+
+_Z0_ARG = _num("reference impedance in ohm", 50.0)
+
+_KIND_FEED = _str(
+    "line cross-section. microstrip / stripline take width_mm + dielectric_mm; "
+    "cpw (coplanar, no back ground) and gcpw (coplanar with a back ground plane) "
+    "also need gap_mm. For stripline, dielectric_mm is the trace-to-one-plane "
+    "distance, the same convention trace_impedance uses",
+    ["microstrip", "stripline", "cpw", "gcpw"])
+
+_ER = _num("substrate relative permittivity", 4.3)
+_COPPER_UM = _num("copper thickness in um (0 = ignore thickness)", 0.0)
+
+_tool(
+    "feedline_impedance",
+    "Z0, effective permittivity, guided wavelength and loss of a microstrip, "
+    "stripline, CPW or grounded CPW line. verify_field=true also runs the 2-D field "
+    "solver on the same cross-section and reports the closed form's error, so the "
+    "number can be checked rather than trusted.",
+    {
+        "type": "object",
+        "properties": {
+            "kind": _KIND_FEED,
+            "width_mm": _num("conductor width in mm"),
+            "dielectric_mm": _num("substrate height in mm (for stripline: "
+                                  "trace-to-one-plane distance)"),
+            "gap_mm": _num("gap to the coplanar ground in mm (cpw/gcpw only)"),
+            "copper_um": _COPPER_UM,
+            "er": _ER,
+            "freq_ghz": _num("frequency in GHz; enables lambda_g and loss"),
+            "tan_delta": _num("dielectric loss tangent; enables dielectric loss"),
+            "verify_field": _bool("run the 2-D field solver on the same cross-section "
+                                  "and report the difference (slower)"),
+            "field_levels": _num("refinement levels for the field check", 1),
+        },
+        "required": ["kind", "width_mm", "dielectric_mm"],
+    },
+    lambda a: _feedline.feedline_impedance(
+        a["kind"], a["width_mm"], a["dielectric_mm"], a.get("gap_mm"),
+        a.get("copper_um", 0.0), a.get("er", 4.3), a.get("freq_ghz"),
+        a.get("tan_delta"), a.get("verify_field", False),
+        a.get("field_levels", 1)),
+)
+
+_tool(
+    "feedline_width",
+    "The trace width that gives a target impedance, for microstrip / stripline / CPW "
+    "/ GCPW. Bisected on the same forward model feedline_impedance exposes, so the "
+    "answer can be re-checked. If the target is outside what a sane width range "
+    "reaches, it returns the reachable band as an error instead of a width that "
+    "silently misses.",
+    {
+        "type": "object",
+        "properties": {
+            "target_ohm": _num("target characteristic impedance in ohm"),
+            "kind": _KIND_FEED,
+            "dielectric_mm": _num("substrate height in mm (for stripline: "
+                                  "trace-to-one-plane distance)"),
+            "gap_mm": _num("gap to the coplanar ground in mm (cpw/gcpw only)"),
+            "copper_um": _COPPER_UM,
+            "er": _ER,
+            "tol_ohm": _num("bisection tolerance in ohm", 1e-4),
+        },
+        "required": ["target_ohm", "kind", "dielectric_mm"],
+    },
+    lambda a: _feedline.feedline_width(
+        a["target_ohm"], a["kind"], a["dielectric_mm"], a.get("gap_mm"),
+        a.get("copper_um", 0.0), a.get("er", 4.3), a.get("tol_ohm", 1e-4)),
+)
+
+_tool(
+    "antenna_patch",
+    "Rectangular microstrip patch: width, length (with the fringing correction dL), "
+    "edge input resistance, inset feed depth for a 50 ohm line, unloaded Q, VSWR<2 "
+    "bandwidth and radiation efficiency. This is the transmission-line model - it is "
+    "good enough to order a prototype and wrong about the last few percent, which "
+    "only a solver or a VNA can give.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_ghz": _num("design frequency in GHz"),
+            "er": _num("substrate relative permittivity"),
+            "height_mm": _num("substrate height in mm"),
+            "copper_um": _num("copper thickness in um", 35.0),
+            "tan_delta": _num("substrate loss tangent (for efficiency and bandwidth)"),
+            "target_rin": _num("input resistance the feed should see, ohm", 50.0),
+            "ground_margin_h": _num("ground extension beyond the patch, in substrate "
+                                    "heights (None = default 6h)"),
+        },
+        "required": ["freq_ghz", "er", "height_mm"],
+    },
+    lambda a: _antenna.patch_rectangular(
+        a["freq_ghz"], a["er"], a["height_mm"], a.get("copper_um", 35.0),
+        a.get("tan_delta"), a.get("target_rin", 50.0), a.get("ground_margin_h")),
+)
+
+_tool(
+    "antenna_printed",
+    "PCB printed quarter-wave antenna (IFA, meander, printed monopole) on a substrate: "
+    "the resonant length comes back as a RANGE (all-air lambda/4 down to "
+    "lambda/(4*sqrt((er+1)/2))) because the effective permittivity of a thin printed "
+    "conductor has no trustworthy closed form, plus the IFA feed-tap position and the "
+    "Chu bandwidth ceiling for the box it fits in.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_ghz": _num("design frequency in GHz"),
+            "er": _num("substrate relative permittivity"),
+            "height_mm": _num("substrate height in mm"),
+            "shape": _str("ifa (inverted-F with a feed tap), meander (needs bbox_mm), "
+                          "or monopole (straight printed quarter wave)",
+                          ["ifa", "meander", "monopole"], "ifa"),
+            "target_rin": _num("input resistance to match, ohm", 50.0),
+            "bbox_mm": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 2,
+                "maxItems": 2,
+                "description": "for meander: the box the element must stay inside, as "
+                               "[length, width] in mm",
+            },
+            "wire_width_mm": _num("for meander: the trace width, which sets how many "
+                                  "turns fit across the box", 0.2),
+        },
+        "required": ["freq_ghz", "er", "height_mm"],
+    },
+    lambda a: _antenna.printed_wire(
+        a["freq_ghz"], a["er"], a["height_mm"], a.get("shape", "ifa"),
+        a.get("target_rin", 50.0), a.get("bbox_mm"), a.get("wire_width_mm", 0.2)),
+)
+
+_tool(
+    "antenna_dipole_monopole",
+    "Free-space thin-wire dipole or monopole: resonance length (0.475 lambda / "
+    "0.2375 lambda, the end effect included), radiation resistance and directivity. "
+    "Pass length_mm to ask the inverse question - what resistance would THIS length "
+    "have - which is the honest direction when a housing has already fixed the size.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_ghz": _num("design frequency in GHz"),
+            "kind": _str("dipole (balanced, two arms) or monopole (one arm over a "
+                         "ground plane)", ["dipole", "monopole"], "dipole"),
+            "length_mm": _num("actual total length in mm (optional; triggers the "
+                              "inverse answer)"),
+            "wire_radius_mm": _num("conductor radius in mm (for the thin-wire "
+                                   "check)"),
+        },
+        "required": ["freq_ghz"],
+    },
+    lambda a: _antenna.dipole_monopole(
+        a["freq_ghz"], a.get("kind", "dipole"), a.get("length_mm"),
+        a.get("wire_radius_mm")),
+)
+
+_tool(
+    "antenna_helix",
+    "Axial-mode (end-fire) helix by Kraus' relations: gain in dBic, half-power beam "
+    "width and approximate input impedance. Refuses when the geometry is outside the "
+    "axial-mode window (0.75 <= C/lambda <= 1.333, pitch 11..16 deg, N >= 3) because "
+    "there the relations are not merely inaccurate, the antenna is in a different mode.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_ghz": _num("design frequency in GHz"),
+            "turns": _num("number of turns (>= 3)"),
+            "diameter_mm": _num("coil diameter in mm (centre to centre)"),
+            "turn_spacing_mm": _num("centre-to-centre spacing between turns in mm"),
+            "pitch_deg": _num("pitch angle in degrees, instead of turn_spacing_mm"),
+        },
+        "required": ["freq_ghz", "turns", "diameter_mm"],
+    },
+    lambda a: _antenna.helix_axial(
+        a["freq_ghz"], a["turns"], a["diameter_mm"], a.get("turn_spacing_mm"),
+        a.get("pitch_deg")),
+)
+
+_tool(
+    "antenna_small_loop",
+    "Electrically small loop: radiation resistance (exact below 0.1 lambda "
+    "circumference), and a refusal above that limit. A small loop radiates milliohms "
+    "and is highly inductive, so it needs a series capacitor and has very little "
+    "bandwidth - the numbers come back with that consequence spelled out.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_ghz": _num("design frequency in GHz"),
+            "area_mm2": _num("enclosed loop area in mm^2"),
+            "diameter_mm": _num("round loop diameter in mm (instead of area_mm2)"),
+            "turns": _num("number of turns", 1),
+        },
+        "required": ["freq_ghz"],
+    },
+    lambda a: _antenna.small_loop(
+        a["freq_ghz"], a.get("area_mm2"), a.get("diameter_mm"), a.get("turns", 1)),
+)
+
+_tool(
+    "antenna_q_limit",
+    "Chu/Harrington bandwidth ceiling for an antenna that must fit in a given box. "
+    "Use it before laying anything out: it says 'impossible' for free, and a real "
+    "antenna is always worse than the bound.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_ghz": _num("design frequency in GHz"),
+            "size_mm": _num("the largest dimension of the space available, in mm"),
+            "vswr": _num("VSWR the bandwidth is quoted at", 2.0),
+            "dimension": _str("how size_mm maps to the enclosing sphere",
+                              ["largest", "sphere_diameter"], "largest"),
+        },
+        "required": ["freq_ghz", "size_mm"],
+    },
+    lambda a: _antenna.q_limit(
+        a["freq_ghz"], a["size_mm"], a.get("vswr", 2.0),
+        a.get("dimension", "largest")),
+)
+
+_tool(
+    "antenna_chip",
+    "Ceramic chip antenna: the keep-out and matching checklist plus the near-field "
+    "boundary, and an explicit refusal to invent gain/bandwidth. Gain, bandwidth and "
+    "the matching network of a chip antenna are vendor measured data - they are not "
+    "derivable from frequency and package size, so any number here would be invented.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_ghz": _num("design frequency in GHz"),
+            "max_gain_dbi": _num("the datasheet peak gain, if known (used only to "
+                                 "sanity-check the link budget)"),
+            "keepout_x_mm": _num("datasheet keep-out along the feed axis, in mm"),
+            "keepout_y_mm": _num("datasheet keep-out across, in mm"),
+        },
+        "required": ["freq_ghz"],
+    },
+    lambda a: _antenna.chip_antenna(
+        a["freq_ghz"], a.get("max_gain_dbi"), a.get("keepout_x_mm"),
+        a.get("keepout_y_mm")),
+)
+
+_Z_ARG = {
+    "type": ["number", "object", "string"],
+    "description": "load impedance in ohm: a number (real only), {real, imag}, or a "
+                   "complex string like '100+25j'",
+}
+
+_tool(
+    "match_reflection",
+    "The four ways of saying the same mismatch, each with its definition: reflection "
+    "coefficient, VSWR, return loss and mismatch loss, plus the equivalent series L / "
+    "shunt C that would produce the reactance. Mixing these four up is how a '1.5:1' "
+    "spec silently becomes an '11 dB' spec.",
+    {
+        "type": "object",
+        "properties": {
+            "z_load": _Z_ARG,
+            "z0": _Z0_ARG,
+            "freq_ghz": _num("frequency in GHz (needed for the equivalent L/C)"),
+        },
+        "required": ["z_load"],
+    },
+    lambda a: _matching.reflection(a["z_load"], a.get("z0", 50.0), a.get("freq_ghz")),
+)
+
+_tool(
+    "match_l",
+    "Two-element L match, solved exactly (not a Q approximation). Returns both "
+    "topologies where they exist, each with the resulting impedance and residual VSWR "
+    "recomputed from the values - so a claimed perfect match is checkable.",
+    {
+        "type": "object",
+        "properties": {
+            "z_load": _Z_ARG,
+            "freq_ghz": _num("frequency in GHz"),
+            "z0": _Z0_ARG,
+        },
+        "required": ["z_load", "freq_ghz"],
+    },
+    lambda a: _matching.l_match(a["z_load"], a["freq_ghz"], a.get("z0", 50.0)),
+)
+
+_tool(
+    "match_pi",
+    "Pi network (shunt-series-shunt, low-pass form) between two real terminations at a "
+    "requested Q. Q is solved for the virtual resistance by bisection, so the Q that "
+    "comes back is the Q that was asked for.",
+    {
+        "type": "object",
+        "properties": {
+            "rsource": _num("source resistance, ohm"),
+            "rload": _num("load resistance, ohm"),
+            "freq_ghz": _num("frequency in GHz"),
+            "q": _num("loaded Q to design at (controls bandwidth)"),
+        },
+        "required": ["rsource", "rload", "freq_ghz"],
+    },
+    lambda a: _matching.pi_match(a["rsource"], a["rload"], a["freq_ghz"], a.get("q")),
+)
+
+_tool(
+    "match_t",
+    "T network (series-shunt-series, high-pass form), the dual of the pi network, at a "
+    "requested Q.",
+    {
+        "type": "object",
+        "properties": {
+            "rsource": _num("source resistance, ohm"),
+            "rload": _num("load resistance, ohm"),
+            "freq_ghz": _num("frequency in GHz"),
+            "q": _num("loaded Q to design at"),
+        },
+        "required": ["rsource", "rload", "freq_ghz"],
+    },
+    lambda a: _matching.t_match(a["rsource"], a["rload"], a["freq_ghz"], a.get("q")),
+)
+
+_tool(
+    "match_stub",
+    "Single-stub tuner: how far from the load the stub goes and how long it is, by "
+    "closed form (both physical solutions returned, shorter stub preferred). Shunt "
+    "stubs only - a series stub needs a cut in the line and is not implemented.",
+    {
+        "type": "object",
+        "properties": {
+            "z_load": _Z_ARG,
+            "freq_ghz": _num("frequency in GHz"),
+            "z0": _Z0_ARG,
+            "stub": _str("shunt only", ["shunt"], "shunt"),
+            "termination": _str("open or short at the end of the stub",
+                                ["open", "short"], "open"),
+        },
+        "required": ["z_load", "freq_ghz"],
+    },
+    lambda a: _matching.single_stub(
+        a["z_load"], a["freq_ghz"], a.get("z0", 50.0), a.get("stub", "shunt"),
+        a.get("termination", "open")),
+)
+
+_tool(
+    "match_quarter_wave",
+    "Quarter-wave transformer: section impedance sqrt(Z0*R), length lambda_g/4, and "
+    "the real limits. Refuses a load with significant reactance rather than ignoring "
+    "it, and warns when the resistance ratio leaves single-section territory.",
+    {
+        "type": "object",
+        "properties": {
+            "z_load": _Z_ARG,
+            "freq_ghz": _num("frequency in GHz"),
+            "z0": _Z0_ARG,
+            "er_eff": _num("effective permittivity of the quarter-wave section", 1.0),
+        },
+        "required": ["z_load", "freq_ghz"],
+    },
+    lambda a: _matching.quarter_wave(
+        a["z_load"], a["freq_ghz"], a.get("z0", 50.0), a.get("er_eff", 1.0)),
+)
+
+_tool(
+    "link_friis",
+    "Link budget term by term: received power in free space with transmitter power, "
+    "both gains, both feed losses and 'other' loss each named separately, plus EIRP "
+    "and ERP. The answer is an upper bound - multipath, body loss and interference "
+    "are not in a free-space model.",
+    {
+        "type": "object",
+        "properties": {
+            "tx_dbm": _num("transmitter power in dBm"),
+            "freq_mhz": _num("frequency in MHz"),
+            "distance_m": _num("distance in metres"),
+            "tx_gain_dbi": _num("transmit antenna gain in dBi", 0.0),
+            "rx_gain_dbi": _num("receive antenna gain in dBi", 0.0),
+            "tx_loss_db": _num("loss between transmitter and antenna, dB", 0.0),
+            "rx_loss_db": _num("loss between antenna and receiver, dB", 0.0),
+            "other_loss_db": _num("anything else that must not be hidden, dB", 0.0),
+        },
+        "required": ["tx_dbm", "freq_mhz", "distance_m"],
+    },
+    lambda a: _link.friis(
+        a["tx_dbm"], a["freq_mhz"], a["distance_m"], a.get("tx_gain_dbi", 0.0),
+        a.get("rx_gain_dbi", 0.0), a.get("tx_loss_db", 0.0),
+        a.get("rx_loss_db", 0.0), a.get("other_loss_db", 0.0)),
+)
+
+_tool(
+    "link_max_range",
+    "Free-space distance at which the received power falls to the sensitivity, with an "
+    "optional fade margin. This is the range ceiling of the radio, not a prediction: "
+    "indoor range is usually a fraction of it.",
+    {
+        "type": "object",
+        "properties": {
+            "tx_dbm": _num("transmitter power in dBm"),
+            "freq_mhz": _num("frequency in MHz"),
+            "sensitivity_dbm": _num("receiver sensitivity in dBm"),
+            "tx_gain_dbi": _num("transmit antenna gain in dBi", 0.0),
+            "rx_gain_dbi": _num("receive antenna gain in dBi", 0.0),
+            "tx_loss_db": _num("loss between transmitter and antenna, dB", 0.0),
+            "rx_loss_db": _num("loss between antenna and receiver, dB", 0.0),
+            "other_loss_db": _num("anything else that must not be hidden, dB", 0.0),
+            "fade_margin_db": _num("reserve held back for fading, dB"),
+        },
+        "required": ["tx_dbm", "freq_mhz", "sensitivity_dbm"],
+    },
+    lambda a: _link.max_range(
+        a["tx_dbm"], a["freq_mhz"], a["sensitivity_dbm"], a.get("tx_gain_dbi", 0.0),
+        a.get("rx_gain_dbi", 0.0), a.get("tx_loss_db", 0.0), a.get("rx_loss_db", 0.0),
+        a.get("other_loss_db", 0.0), a.get("fade_margin_db")),
+)
+
+_tool(
+    "link_aperture",
+    "Effective aperture of an antenna of given gain: Ae = G*lambda^2/(4*pi). This is "
+    "the area that actually collects power, and the reason a small antenna cannot be "
+    "made to have a large gain by matching alone.",
+    {
+        "type": "object",
+        "properties": {
+            "gain_dbi": _num("antenna gain in dBi"),
+            "freq_mhz": _num("frequency in MHz"),
+        },
+        "required": ["gain_dbi", "freq_mhz"],
+    },
+    lambda a: _link.aperture(a["gain_dbi"], a["freq_mhz"]),
+)
+
+_tool(
+    "link_far_field",
+    "Where the far field starts for an antenna of a given largest dimension, by three "
+    "criteria reported side by side (2D^2/lambda, lambda/(2*pi), 5D) plus the one to "
+    "use. A pattern measured closer than this is the near field, not the antenna's.",
+    {
+        "type": "object",
+        "properties": {
+            "size_mm": _num("largest dimension of the antenna in mm"),
+            "freq_mhz": _num("frequency in MHz"),
+        },
+        "required": ["size_mm", "freq_mhz"],
+    },
+    lambda a: _link.far_field(a["size_mm"], a["freq_mhz"]),
+)
+
+_tool(
+    "link_fresnel",
+    "First Fresnel zone radius at a point between two antennas, and the 60 % clearance "
+    "a line-of-sight link needs. Obstructing 40 % of the first zone costs about 1 dB; "
+    "60 % costs 6 dB or more.",
+    {
+        "type": "object",
+        "properties": {
+            "freq_mhz": _num("frequency in MHz"),
+            "d1_m": _num("distance from antenna 1 to the point of interest, in m"),
+            "d2_m": _num("distance from the point of interest to antenna 2, in m"),
+            "n": _num("zone number", 1),
+        },
+        "required": ["freq_mhz", "d1_m", "d2_m"],
+    },
+    lambda a: _link.fresnel_radius(
+        a["freq_mhz"], a["d1_m"], a["d2_m"], a.get("n", 1)),
+)
+
+_tool(
+    "board_antenna_keepout",
+    "Measure what copper is really inside a proposed antenna keep-out rectangle on a "
+    "board: every pad, track, via and copper graphic whose bounding box intersects it, "
+    "plus every pour (a pour never appears in a pad/track listing and is the usual "
+    "cause of a detuned antenna). Read-only. Conservative: 'clear' is reliable, "
+    "'occupied' may contain a false positive worth checking. Datasheet keep-out RULES "
+    "are not in the file - this only measures what the file contains.",
+    {"type": "object",
+     "properties": dict({
+         "x_mm": _num("keep-out rectangle anchor X in mm (same coordinate system as "
+                      "board_components, Y up)"),
+         "y_mm": _num("keep-out rectangle anchor Y in mm"),
+         "width_mm": _num("rectangle width in mm"),
+         "length_mm": _num("rectangle length in mm"),
+         "layer": _str("only copper on this layer (default: all copper layers)"),
+         "margin_mm": _num("grow the rectangle by this much on every side", 0.0),
+         "top": _num("how many offending items to list", 40),
+     }, **_COMMON),
+     "required": ["path", "x_mm", "y_mm", "width_mm", "length_mm"]},
+    _board_tool(lambda b, a: _oracle.antenna_keepout(
+        b, a["x_mm"], a["y_mm"], a["width_mm"], a["length_mm"], a.get("layer"),
+        a.get("margin_mm", 0.0), int(a.get("top", 40))), derived=True),
+)
+
 # ------------------------------------------------------- capabilities
+
 def _capabilities(_args):
     return {
         "status": "ok",
@@ -673,6 +1167,12 @@ def _capabilities(_args):
                         "on top of the fidelity tree - a convenience, not the truth",
             "oracle": "measurements on one parsed board (clearance, free space, pour, "
                       "reference-plane continuity, loop area)",
+            "antenna": "closed-form antenna and RF design: printed / structural / chip "
+                       "antenna sizing, feedline impedance (microstrip, stripline, CPW, "
+                       "GCPW), matching network synthesis, link budget and far-field "
+                       "distances. There is NO full-wave solver here and no pattern, "
+                       "efficiency or detuning prediction - the answers are the starting "
+                       "geometry, and every one of them says what it cannot see",
             "desktop": "find / start / stop the EDA and open a project, verified by "
                        "window title - never touches a project file",
             "write": "propose (compute only, no byte is written) -> apply (confirm=true, "
@@ -700,6 +1200,14 @@ def _capabilities(_args):
             "schematic_summary", "schematic_view",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
             "lceda_api_probe",
+            "feedline_impedance", "feedline_width",
+            "antenna_patch", "antenna_printed", "antenna_dipole_monopole",
+            "antenna_helix", "antenna_small_loop", "antenna_q_limit", "antenna_chip",
+            "match_reflection", "match_l", "match_pi", "match_t", "match_stub",
+            "match_quarter_wave",
+            "link_friis", "link_max_range", "link_aperture", "link_far_field",
+            "link_fresnel",
+            "board_antenna_keepout",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "needs a verified IEC table in data/creepage_tables.json",
@@ -724,7 +1232,7 @@ def _capabilities(_args):
         "derived_vs_authoritative": {
             "derived (this server computed it)": [
                 "board_clearance", "board_free_space", "board_pour_connectivity",
-                "board_cross_split", "board_loop_area"],
+                "board_cross_split", "board_loop_area", "board_antenna_keepout"],
             "authoritative (vendor engine said it)": ["board_drc", "board_stats"],
             "checked_against_the_vendor": {
                 "board_cross_check": "runs the derived answer and the vendor's own DRC on "
@@ -762,6 +1270,14 @@ def _capabilities(_args):
             "programmatically here (rc 0 with no arguments, rc 1 with a project "
             "path), no window and no user-data write - so open_argv_verified stays "
             "false and app_open_project reports unconfirmed instead of pretending",
+            "Full-wave electromagnetic simulation (method of moments / FDTD / FEM): "
+            "nothing here is a solver. The antenna tools give the starting geometry "
+            "from closed forms; radiation pattern, gain after a housing, efficiency "
+            "after losses, mutual coupling between two antennas, SAR and the "
+            "detuning from a battery or a hand are all NOT computed - every antenna "
+            "answer carries that list as not_computed so it cannot be mistaken for a "
+            "full answer. The hand-off is deliberate: design here, then simulate or "
+            "measure",
             "DFM checks (fabricator capability rules)",
             "BGA/thermal via array temperature rise, fuse behaviour, electrothermal "
             "coupling: data/ipc2152_tables.json ships with ZERO rows on purpose - the "
@@ -813,6 +1329,17 @@ def _capabilities(_args):
                          "a connectivity change, and KiCad re-points the same ERC "
                          "warning at a different item between runs, so position is "
                          "reported but never used as violation identity",
+            "antenna / feedline / link": "checked against reality rather than against "
+                         "itself: a 50 ohm microstrip on 1.6 mm FR4 comes out 3.14 mm "
+                         "(boards ship 3.0 mm), a 2.45 GHz FR4 patch comes out 37.6 x "
+                         "29.1 mm with a 10.7 mm inset, a single-stub 100 ohm load at "
+                         "2.4 GHz comes out 0.348 lambda + 0.098 lambda open stub "
+                         "(textbook), 2400 MHz at 1 m is 40.05 dB free-space loss, and "
+                         "the CPW model reproduces the infinite-substrate limit exactly "
+                         "(64.022 ohm from both sides). The microstrip closed form is the "
+                         "one field2d already scores against the 2-D solver (-0.35 % .. "
+                         "-2.83 %); CPW/GCPW are NOT solver-validated, only limit-checked, "
+                         "and say so",
         },
     }
 

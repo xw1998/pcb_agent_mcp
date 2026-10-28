@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.1` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.2` 已实现六层：五层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -95,7 +95,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（45 个）
+## 工具（66 个）
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -145,6 +145,34 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `schematic_view` | 只读：summary / symbols / objects / netlist / erc / lib_symbols / raw | 每个返回都重复坐标系说明 |
 | `app_open_project` | 打开 `.epro`/`.kicad_pro`/`.kicad_pcb` 并按标题确认 | 三态 `confirmed/unconfirmed`；缺文件拒绝且不创建 |
 
+### 天线 / 馈线 / 匹配 / 链路（21 个，[docs/16](docs/16-天线与馈线.md)）
+
+**这里没有全波求解器。** 方向图 / 外壳失谐 / 互耦 / SAR / 最终效率一律不计算，每个返回都带
+`not_computed` 清单（`--selftest` 逐条检查）。
+
+| tool | 作用 | 关键约束 |
+|---|---|---|
+| `feedline_impedance` | 微带 / 带状线 / CPW / GCPW → Z0 与 εeff | CPW 不建模铜厚（明说）；CPW 导体损耗回 `null` + 原因 |
+| `feedline_width` | Z0 → 线宽（二分） | 不可达回 `OUT_OF_RANGE` + `reachable_ohm` 两端实测 |
+| `antenna_patch` | 矩形贴片：W/L（含边缘 dL）、边缘 Rin、内缩深度、Q、VSWR<2 带宽、效率 | 传输线模型；内缩不含开槽宽度；效率需要 tanδ |
+| `antenna_printed` | 印刷四分之一波长（IFA / 蛇形 / 印刷单极）：长度**区间** + IFA 抽头 + Chu 上限 | εeff 无可信闭式 ⇒ 给区间不给单值；蛇形必须传 `bbox_mm` 并回 `fits` |
+| `antenna_dipole_monopole` | 细线偶极 / 单极：长度、辐射电阻、方向性、馈电缝隙 | 细线端效应 0.475λ0；粗导体不适用 |
+| `antenna_helix` | 轴向螺旋：C/λ、螺距、轴长、Kraus 增益 / HPBW / Zin | 出 Kraus 窗即拒绝 |
+| `antenna_small_loop` | 小环：C/λ、R_rad（6 位有效数字 + mΩ）、方向性 | C/λ ≥ 0.1 **拒绝**并给出"硬套会得到什么" |
+| `antenna_q_limit` | Chu/Harrington 带宽硬上限（给定包围球） | 是上限不是估计；有损天线的宽 VSWR 曲线不算证据 |
+| `antenna_chip` | 陶瓷/芯片天线：净空参考、近场边界、必核清单 | 增益与匹配元件是厂商数据 ⇒ 不计算；净空小给 `warnings` |
+| `match_reflection` | 反射系数 / VSWR / 回损 / 失配损耗 + 串联元件量 | 纯电抗负载 → `ARG_RANGE` |
+| `match_l` | L 型匹配（两种拓扑，含解析 Q） | **每个解回代重算** `resulting_z_ohm` 与 `residual_vswr` |
+| `match_pi` / `match_t` | π / T 型匹配（给 Q 或给元件值） | 同上，回代残差 |
+| `match_stub` | 单短截线（并联/串联 × 开路/短路） | 双解按距离配对报，禁止交叉配 |
+| `match_quarter_wave` | 四分之一波长变换器 | 只对纯阻负载成立，其它拒绝 |
+| `link_friis` | 链路预算：Prx / 路损 / EIRP / ERP | `FSPL_CONST = -27.5522`（写错 60 dB 的坑） |
+| `link_max_range` | 给定灵敏度与额外损耗 → 最大距离 | 额外损耗要显式给，默认 0 就说 0 dB |
+| `link_aperture` | 天线有效面积 | — |
+| `link_far_field` | 远场距离：`max(2D²/λ, 5D, λ/2π)` 并说明哪个机制主导 | 三段都要给，只给一段会误导 |
+| `link_fresnel` | 第一菲涅耳区半径 + 60% 净空 | — |
+| `board_antenna_keepout` | 板级净空：某矩形内的铜与 **zone** | 派生量 `authoritative:false`；pad/track/via 与 zone **分开计数**（DRC 看不见铺铜失谐） |
+
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
 
@@ -153,9 +181,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.1
-python run_server.py --selftest      # 协议级自检，29/29（含板与原理图写路径端到端）
-python -m unittest discover -s tests # 357 个用例（约 3 分钟，kicad-cli / pcbnew 用例占大头）
+python run_server.py --version       # 0.0.2
+python run_server.py --selftest      # 协议级自检，34/34（含板与原理图写路径端到端、天线四问）
+python -m unittest discover -s tests # 450 个用例（约 3.5 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -247,6 +275,23 @@ MCP 客户端配置（stdio）：
   行数据留空并写清 `why_empty`，`current_capacity(standard=ipc2152)` / `creepage_required` /
   `clearance_required` 继续 fail-closed 并说出缺什么。**填一个猜的值比拒答更糟。**
 
+### 天线层：不做全波，这一点写在每个返回里
+
+- **没有全波电磁求解器，也没有假装有。** 21 个天线类工具全是闭式模型（Balanis / Hammerstad /
+  Chu-Harrington / Kraus / Friis），能给出**第一个能打样的几何**与一阶阻抗/带宽/硬上限；
+  方向图、外壳与手持失谐、同板双天线互耦、SAR、匹配后的实际带宽一律不计算，写进每个信封的
+  `not_computed`，并被 `--selftest` 的 id 71 检查。换求解器（HFSS/CST/openEMS/nec2）的门槛写在
+  [docs/16 §12](docs/16-天线与馈线.md)。
+- **印刷线的长度是区间，不是单值。** 薄导体在基材上的 εeff 落在 `1` 与 `(er+1)/2` 之间，
+  没有可信闭式 ⇒ 给两端 + 起点建议（薄膜基材取自由空间端），并附 Chu 上限说明"装得下 ≠ 装得好"。
+- **CPW 不建模铜厚**，且直接说出来（"requested X µm but NOT modelled"），而不是套一个可能大 2 倍的
+  Gupta 修正；CPW 导体损耗回 `null` + 原因，只给介质损耗并标 `lower bound`。
+- **每个匹配解都回代重算残差。** 这条纪律抓到了一个真缺陷：`l_match` 的 series-first 分支符号写反，
+  会把 25 Ω 纯阻"匹配"成 10+j20（残差 VSWR 0.707）。只报元件值的话它是一组安静的错数。
+- **板级净空把 zone 单独列。** 天线净空违规在 DRC 里只报成"间距"，而真正杀死天线的是铺铜——
+  地平面压到天线下面会把谐振频率拉低，DRC 完全无视。`board_antenna_keepout` 因此把
+  pad/track/via 与 zone 分开计数（StickHub 上 `(150,-100,8,6)` 实测 406 项铜 + 2 个 zone）。
+
 ## 项目结构
 
 ```
@@ -255,7 +300,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 45 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 66 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -293,7 +338,7 @@ pcb_agent_mcp/
 ├── data/
 │   ├── creepage_tables.json      # 空表 + verified:false + why_empty（故意不填）
 │   └── ipc2152_tables.json       # 同上；表本身由 calc/safety_table.py 可执行地体检
-├── tests/                        # 357 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 450 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 └── docs/                         # 设计文档 00~15，建议按编号顺序读

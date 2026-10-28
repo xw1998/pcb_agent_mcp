@@ -162,6 +162,54 @@ def selftest():
           abs(payload.get("zdiff_recomputed", 0) - 100.0) < 0.2,
           str(payload.get("value")))
 
+    # --- antenna / feedline / link. Four numbers that are checked against the
+    # world rather than against the code: a 50 ohm trace on FR4, a 2.4 GHz patch,
+    # a free-space loss value whose constant is easy to get wrong by 60 dB, and a
+    # match that has to recombine to 50 ohm.
+    r = handle({"jsonrpc": "2.0", "id": 70, "method": "tools/call",
+                "params": {"name": "feedline_width",
+                           "arguments": {"target_ohm": 50, "kind": "microstrip",
+                                         "dielectric_mm": 1.6, "er": 4.3}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    check("50 ohm microstrip on 1.6mm FR4 is ~3.1 mm wide",
+          payload.get("status") == "ok" and abs(payload["value"]["width_mm"] - 3.1367) < 0.01,
+          str((payload.get("value") or {}).get("width_mm")))
+
+    r = handle({"jsonrpc": "2.0", "id": 71, "method": "tools/call",
+                "params": {"name": "antenna_patch",
+                           "arguments": {"freq_ghz": 2.45, "er": 4.4,
+                                         "height_mm": 1.6, "tan_delta": 0.02}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    v = payload.get("value") or {}
+    check("2.45 GHz FR4 patch is ~37.2 x 28.8 mm",
+          payload.get("status") == "ok" and abs(v.get("width_mm", 0) - 37.234) < 0.05
+          and abs(v.get("length_mm", 0) - 28.808) < 0.05,
+          "%s x %s" % (v.get("width_mm"), v.get("length_mm")))
+    _nc = payload.get("not_computed") or v.get("not_computed") or []
+    check("an antenna answer lists what it cannot compute",
+          isinstance(_nc, list) and "pattern" in " ".join(_nc).lower(),
+          str(_nc[:2]))
+
+    r = handle({"jsonrpc": "2.0", "id": 72, "method": "tools/call",
+                "params": {"name": "link_friis",
+                           "arguments": {"tx_dbm": 0, "freq_mhz": 2400,
+                                         "distance_m": 1}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    _fspl = (payload.get("value") or {}).get("path_loss_db")
+    check("free-space loss at 2400 MHz / 1 m is 40.05 dB (not 100.05)",
+          _fspl is not None and abs(_fspl - 40.052) < 0.01,
+          str(_fspl))
+
+    r = handle({"jsonrpc": "2.0", "id": 73, "method": "tools/call",
+                "params": {"name": "match_l",
+                           "arguments": {"z_load": "25+0j", "freq_ghz": 2.4}}})
+    payload = json.loads(r["result"]["content"][0]["text"])
+    sols = ((payload.get("value") or {}).get("solutions") or [])
+    check("every L-match solution recombines to 50 ohm",
+          bool(sols) and all(abs(s["resulting_z_ohm"]["real"] - 50.0) < 0.05
+                             and s["residual_vswr"] < 1e-3 for s in sols),
+          str([s.get("residual_vswr") for s in sols]))
+
     r = handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                 "params": {"name": "board_summary",
                            "arguments": {"path": "__NO_SUCH_BOARD__.kicad_pcb"}}})

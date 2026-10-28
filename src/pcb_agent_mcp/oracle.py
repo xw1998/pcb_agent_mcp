@@ -738,3 +738,136 @@ def loop_area(board, net):
         assumptions={"net": net, "tracks": len(tracks),
                      "bbox": [round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3)]},
     )
+
+# ------------------------------------------------------------- antenna keep-out
+def _rect_poly_hit(rect, poly):
+    """Does an axis-aligned rectangle touch a polygon? (any crossing or containment)"""
+    x0, y0, x1, y1 = rect
+    if len(poly) < 3:
+        return False
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    for c in corners:
+        if G.point_in_polygon(c, poly):
+            return True
+    for p in poly:
+        if x0 <= p[0] <= x1 and y0 <= p[1] <= y1:
+            return True
+    n = len(poly)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        for j in range(4):
+            if G.segments_intersect(a, b, corners[j], corners[(j + 1) % 4]):
+                return True
+    return False
+
+def antenna_keepout(board, x_mm, y_mm, width_mm, length_mm, layer=None,
+                    margin_mm=0.0, top=40):
+    """What is inside the rectangle an antenna needs to keep empty?
+
+    An antenna keep-out is not a design guideline, it is the antenna: copper under a
+    chip antenna, a ground pour next to an IFA, or a via fence across a slot all
+    shift the resonance and kill the efficiency, and the failure mode is "the radio
+    works but the range is a third of the datasheet". So the answer is the list of
+    what is actually there, with the pour polygons counted separately - a zone is
+    invisible in a pad/track listing and is exactly the thing that should be gone.
+
+    Coordinates are the board's own (same system as board_components), the rectangle
+    is given by its lower-left corner and its size.
+    """
+    try:
+        x = float(x_mm)
+        y = float(y_mm)
+        w = float(width_mm)
+        ln = float(length_mm)
+        margin = float(margin_mm or 0.0)
+    except (TypeError, ValueError):
+        return err("x_mm, y_mm, width_mm, length_mm must be numeric", "ARG_INVALID")
+    if w <= 0 or ln <= 0:
+        return err("width_mm and length_mm must be > 0", "ARG_RANGE")
+    if margin < 0:
+        return err("margin_mm must be >= 0", "ARG_RANGE")
+    rect = (x - margin, y - margin, x + w + margin, y + ln + margin)
+
+    items = _items(board)
+    hits = []
+    for it in items:
+        if layer and layer not in (it.get("layers") or []):
+            continue
+        gap = G.bbox_gap(_item_bbox(it), rect)
+        if gap > 0.0:
+            continue
+        hits.append({"kind": it["kind"], "ref": it["ref"], "net": it["net"],
+                     "layer": it.get("layer")})
+    # a pad/track listing never shows a pour, and a pour is the usual culprit
+    zone_hits = []
+    for zi, zone in enumerate(board.zones or []):
+        if layer and layer not in (zone.get("layers") or []):
+            continue
+        polys = zone.get("filled_polygons") or []
+        source = "filled_polygons"
+        if not polys:
+            polys = [zone.get("outline") or []]
+            source = "outline_only"
+        for poly in polys:
+            if len(poly) >= 3 and _rect_poly_hit(rect, poly):
+                zone_hits.append({"zone_index": zi, "net": zone.get("net"),
+                                  "layers": zone.get("layers"), "source": source,
+                                  "is_keepout": bool(zone.get("is_keepout"))})
+                break
+
+    kinds = {}
+    nets = {}
+    for h in hits:
+        kinds[h["kind"]] = kinds.get(h["kind"], 0) + 1
+        if h["net"]:
+            nets[h["net"]] = nets.get(h["net"], 0) + 1
+
+    # board outline: is any part of the rectangle off the board?
+    off_board = None
+    if board.outline:
+        outline = [p for poly in board.outline for p in poly]
+        if outline:
+            ob = G.bbox_of(outline)
+            if (rect[0] < ob[0] or rect[1] < ob[1]
+                    or rect[2] > ob[2] or rect[3] > ob[3]):
+                off_board = {"board_bbox": [round(v, 3) for v in ob],
+                             "note": "part of the rectangle is outside the board "
+                                     "outline bounding box: either the keep-out hangs "
+                                     "over the edge (fine for many chip antennas, which "
+                                     "want the ground edge) or the coordinates are wrong"}
+
+    clear = (not hits) and (not zone_hits)
+    return ok(
+        value={
+            "rect_mm": [round(v, 3) for v in rect],
+            "layer": layer or "all",
+            "margin_mm": margin,
+            "clear": clear,
+            "copper_items_inside": len(hits),
+            "by_kind": kinds,
+            "by_net": dict(sorted(nets.items(), key=lambda kv: -kv[1])[:12]),
+            "items": sorted(hits, key=lambda h: h["ref"])[:int(top)],
+            "zones_touching": zone_hits[:int(top) or 1] if zone_hits else [],
+            "off_board": off_board,
+            "verdict": ("nothing but bare substrate inside the rectangle" if clear else
+                        "%d copper item(s) and %d zone(s) intersect the rectangle: "
+                        "remove them (copper under an antenna lowers the resonant "
+                        "frequency and absorbs radiated power)"
+                        % (len(hits), len(zone_hits))),
+        },
+        unit="count",
+        model="rect_vs_copper_and_zone_bbox",
+        basis=("every pad / track / via / copper graphic whose bounding box intersects "
+               "the rectangle, plus every ZONE whose outline or filled polygon touches "
+               "it (a pour does not appear in a pad/track listing and is the usual "
+               "cause of a detuned antenna); containment tests are exact "
+               "point-in-polygon, segment crossing and bbox overlap"),
+        precision=("conservative on purpose: a bounding box that merely overlaps the "
+                   "rectangle is reported even if the copper itself misses it, so "
+                   "'clear' is reliable and 'occupied' may include a false positive "
+                   "worth checking. Keep-out RULES from a datasheet (which layers, which "
+                   "direction, how much) are not in the file - this only measures what "
+                   "the file contains"),
+        assumptions={"x_mm": x, "y_mm": y, "width_mm": w, "length_mm": ln,
+                     "coordinate_system": "same as board_components (board units, Y up)"},
+    )
