@@ -32,6 +32,10 @@ from .calc import vibration as _vib
 from .calc import cavity as _cavity
 from .calc import electrothermal as _electro
 from .calc import filters as _filters
+from .calc import magnetics as _magnetics
+from .calc import stackup as _stackup
+from .calc import chain as _chain
+from .calc import rules as _rules
 from .calc.result import err, ok
 from .adapters import FORMATS as _FORMATS
 from .adapters import detect_format as _detect_format
@@ -670,6 +674,13 @@ def _lceda_pro_close(args):
 
 def _lceda_pro_run(args):
     session = args.get("session")
+    # An argument that is missing is missing whether or not an editor is running:
+    # answer that first, so the caller is never told "app not running" for a
+    # request that could not have been sent anyway.
+    if not session:
+        return _live_error(_live.LiveError("ARG_REQUIRED", "session is required"))
+    if not args.get("code") or not str(args.get("code")).strip():
+        return _live_error(_live.LiveError("ARG_REQUIRED", "code is required"))
     try:
         client = _live_client(args)
     except _live.LiveError as exc:
@@ -1564,6 +1575,26 @@ def _capabilities(_args):
                          "usually different, points. "
                          "NOT done: assembly compliance, solder-joint creep, "
                          "random+shock combined, drop, and any nonlinear contact",
+            "magnetics": "power-inductor sizing for CCM boost / buck / buck-boost: "
+                         "duty, inductance from volt-seconds, peak / valley / RMS "
+                         "current and the load at which CCM ends. The ripple ratio is "
+                         "the caller's design choice, saturation is graded only when a "
+                         "part Isat is supplied, and there is NO core, core loss or DCM "
+                         "steady state - in DCM the duty is not 1 - Vin/Vout",
+            "stackup": "laminate shortlist (er, tan_delta, practical band, cost) and a "
+                       "4 / 6 layer stack whose signal layers each get their own "
+                       "solved trace width from the same microstrip model the feedline "
+                       "tools use, plus the lambda_g/20 stitching pitch and a copper "
+                       "symmetry check. The dielectric split is PROPORTIONAL, not a "
+                       "fab drawing; the width must be rebuilt on the fab's er",
+            "review": "the design-rule catalogues (layout and schematic) and the review "
+                      "that grades them against facts YOU (or the board_* tools) "
+                      "measured. Every rule names its source, its severity "
+                      "(Critical/High/Medium/Low) and the evidence level it needs "
+                      "(L0 file / L1 calculate / L2 simulate or bench / L3 lab). A "
+                      "rule with no measurement comes back undetermined, and a pass "
+                      "means one named failure mode was measured and not found - "
+                      "never that the design is correct",
             "desktop": "find / start / stop the EDA and open a project, verified by "
                        "window title - never touches a project file",
             "write": "propose (compute only, no byte is written) -> apply (confirm=true, "
@@ -1597,10 +1628,12 @@ def _capabilities(_args):
             "antenna_patch", "antenna_printed", "antenna_dipole_monopole",
             "antenna_helix", "antenna_small_loop", "antenna_q_limit", "antenna_chip",
             "match_reflection", "match_l", "match_pi", "match_t", "match_stub",
-            "match_quarter_wave",
+            "match_quarter_wave", "match_bandwidth",
             "link_friis", "link_max_range", "link_aperture", "link_far_field",
             "link_fresnel",
             "board_antenna_keepout",
+            "magnetics_inductor", "stackup_material", "stackup_design",
+            "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
             "ir_drop_chain", "pdn_impedance", "pdn_plane_modes", "decoupling_check",
             "thermal_stack", "thermal_via_array", "thermal_plate",
@@ -1665,6 +1698,17 @@ def _capabilities(_args):
                               "carries authoritative=false and names board_drc",
         },
         "not_implemented_yet": [
+            "Power magnetics beyond the CCM design point: no core selection, no core "
+            "loss (Steinmetz), no copper loss / DCR, no saturation curve of a real "
+            "material, no DCM steady state, no loop compensation and no soft start. "
+            "The tool answers the electrical design point and refuses the parts "
+            "question unless an Isat is supplied",
+            "Layout and schematic reviews do not read the design for you: they grade "
+            "the facts they are given. board_* / schematic_* can produce some of those "
+            "facts (clearance, nets, components), but nothing here parses a netlist "
+            "into 'this IC's power pins', so sch.* facts must be counted by the "
+            "caller - and every rule that was not measured says so instead of "
+            "returning a pass",
             "LCEDA Pro write path: the record layout, the mil unit and the "
             "'a save rewrites one member' shape are measured against the 194 .epro "
             "archives in LCEDA-Pro/projects-recovery, and the gates prove the bytes. "
@@ -1862,6 +1906,28 @@ def _capabilities(_args):
                          "a connectivity change, and KiCad re-points the same ERC "
                          "warning at a different item between runs, so position is "
                          "reported but never used as violation identity",
+            "magnetics / stackup / chain / bandwidth": "each relation is the one "
+                         "written down in the source skill and is re-derivable by hand: "
+                         "the boost duty D = 1 - eta*Vin/Vout, the Friis cascade "
+                         "reproduces rf-circuit-design's own worked example "
+                         "(0.8/15, 1.2/20, 2.0/10 dB -> 0.8369 dB this server, 0.83 dB "
+                         "in the skill), the cascaded IIP3 of 0 dBm + 10 dBm through "
+                         "20 dB comes out -10.41 dBm by hand and by code, and BW = f0/Q "
+                         "is arithmetic. The laminate table is the skill's own section "
+                         "3.1; its per-band limits are conventions and are labelled as "
+                         "such. NOT cross-checked against a vendor calculator, because "
+                         "none of these is a vendor feature",
+            "rule catalogues": "36 rules (22 layout, 14 schematic) each carrying the "
+                         "skill section it came from, so a dispute is answered by "
+                         "reading the source. The limits that are physics are computed "
+                         "instead of quoted: the 3W gap from the line's own width, the "
+                         "stitching pitch from lambda_g/20, the required power-trace "
+                         "width from the IPC chart (which REFUSES without an explicit "
+                         "standard, since ipc2221 and ipc2152 differ by more than 3x), "
+                         "and the isolation gap from IEC 60664-1 (which fails closed "
+                         "while the distance table is unverified). The pass/fail/"
+                         "undetermined split is unit-tested: a rule with no fact is "
+                         "never a pass",
             "antenna / feedline / link": "checked against reality rather than against "
                          "itself: a 50 ohm microstrip on 1.6 mm FR4 comes out 3.14 mm "
                          "(boards ship 3.0 mm), a 2.45 GHz FR4 patch comes out 37.6 x "
@@ -3421,6 +3487,168 @@ _tool(
         mu_r=(a["mu_r"] if a.get("mu_r") is not None else 1.0),
         er=(a["er"] if a.get("er") is not None else 1.0),
         mode=a.get("mode") or "TE101"),
+)
+
+_tool(
+    "magnetics_inductor",
+    "Power-inductor sizing for CCM boost / buck / buck-boost from the load, the rails "
+    "and the switching frequency: duty, inductance, peak / valley / RMS current and "
+    "where CCM ends. Ripple ratio r is a DESIGN CHOICE (0.2-0.4 typical) - it is not "
+    "derived. Saturation is graded only if you supply the part's Isat; without it the "
+    "answer says what is missing instead of guessing. No core, no core loss, no DCM "
+    "steady state (in DCM the duty is not 1-Vin/Vout).",
+    {"type": "object", "properties": {
+        "topology": _str("converter topology", list(_magnetics.TOPOLOGIES)),
+        "vin_v": _num("input voltage"),
+        "vout_v": _num("output voltage magnitude (buck-boost is inverting)"),
+        "f_sw_hz": _num("switching frequency in Hz (not kHz)"),
+        "ripple": _num("ripple ratio r = dI / Iavg, a design choice (0.2-0.4 typical)",
+                       0.3),
+        "iout_a": _num("load current - give this OR pout_w, never both"),
+        "pout_w": _num("load power - give this OR iout_a, never both"),
+        "efficiency": _num("assumed constant efficiency (0 < eta <= 1)", 1.0),
+        "isat_a": _num("the inductor's saturation current, if you have picked a part"),
+        "sat_margin": _num("headroom required above the peak current", 0.20),
+    }, "required": ["topology", "vin_v", "vout_v", "f_sw_hz"]},
+    lambda a: _magnetics.inductor_ccm(
+        a.get("topology"), a.get("vin_v"), a.get("vout_v"), a.get("f_sw_hz"),
+        ripple=(a["ripple"] if a.get("ripple") is not None else 0.3),
+        iout_a=a.get("iout_a"), pout_w=a.get("pout_w"),
+        efficiency=(a["efficiency"] if a.get("efficiency") is not None else 1.0),
+        isat_a=a.get("isat_a"),
+        sat_margin=(a["sat_margin"] if a.get("sat_margin") is not None else 0.20)),
+)
+
+_tool(
+    "stackup_material",
+    "Which laminate covers this frequency, and what the table cannot see. Cheapest "
+    "entry whose practical band covers f, with the alternatives and the failure modes "
+    "of the choice (Dk tolerance, process, loss). The band limits are engineering "
+    "conventions from rf-circuit-design 3.1, not measured thresholds.",
+    {"type": "object", "properties": {
+        "freq_ghz": _num("highest frequency of interest in GHz"),
+    }, "required": ["freq_ghz"]},
+    lambda a: _stackup.material_for(a.get("freq_ghz")),
+)
+
+_tool(
+    "stackup_design",
+    "A 4 or 6 layer stack for an RF / mixed-signal board: layer roles, copper weights, "
+    "the dielectric split, the width that gives the target impedance on EACH signal "
+    "layer (solved with the same microstrip model as feedline_width), the stitching "
+    "via pitch lambda_g/20 and whether the build is copper-symmetric. The split is "
+    "PROPORTIONAL - a real impedance-controlled stack is the fab's drawing, and the "
+    "answer says so.",
+    {"type": "object", "properties": {
+        "layers": {"type": "integer", "description": "4 or 6", "default": 4},
+        "material": _str("laminate id from stackup_material", list(_stackup.MATERIALS)),
+        "total_mm": _num("finished board thickness", 1.0),
+        "target_ohm": _num("single-ended impedance to solve for", 50.0),
+        "copper_um": _num("override the finished copper thickness for every layer"),
+        "freq_ghz": _num("highest frequency - sets the lambda/20 via pitch"),
+        "er": _num("override the laminate's er (for a laminate not in the table)"),
+    }, "required": ["layers", "material"]},
+    lambda a: _stackup.stackup_design(
+        a.get("layers", 4), a.get("material", "fr4"),
+        total_mm=(a["total_mm"] if a.get("total_mm") is not None else 1.0),
+        target_ohm=(a["target_ohm"] if a.get("target_ohm") is not None else 50.0),
+        copper_um=a.get("copper_um"), freq_ghz=a.get("freq_ghz"), er=a.get("er")),
+)
+
+_tool(
+    "rf_chain",
+    "Cascade a receive/transmit chain: total gain, Friis noise figure with each stage's "
+    "share of the excess noise, cascaded IIP3/OIP3, and (given a bandwidth) the kTB "
+    "floor and the sensitivity for a required SNR. Needs EVERY stage's nf_db to answer "
+    "NF, and every stage's iip3/oip3 to answer linearity - partial data comes back as "
+    "an explicit gap, not a number. A filter is a stage with negative gain and NF = its "
+    "loss.",
+    {"type": "object", "properties": {
+        "stages": {"type": "array", "description":
+                   "ordered blocks, input first: {name, gain_db, nf_db, iip3_dbm? or "
+                   "oip3_dbm?}. A passive part has negative gain and NF = |gain|.",
+                   "items": {"type": "object", "properties": {
+                       "name": {"type": "string"},
+                       "gain_db": {"type": "number"},
+                       "nf_db": {"type": "number"},
+                       "iip3_dbm": {"type": "number"},
+                       "oip3_dbm": {"type": "number"}}}},
+        "bandwidth_hz": _num("noise bandwidth, for the kTB floor and sensitivity"),
+        "required_snr_db": _num("SNR the demodulator needs (default 0, i.e. floor only)",
+                                0.0),
+    }, "required": ["stages"]},
+    lambda a: _chain.cascade(
+        a.get("stages"), bandwidth_hz=a.get("bandwidth_hz"),
+        required_snr_db=(a["required_snr_db"] if a.get("required_snr_db") is not None
+                         else None)),
+)
+
+_tool(
+    "match_bandwidth",
+    "Bandwidth of a single-resonant match from its loaded Q: BW = f0/Q, and the VSWR <= "
+    "S band scaled by (S-1)/sqrt(S). Give two of freq_ghz / q / bandwidth_hz. This is "
+    "the relation behind 'good at centre, narrow at the edges'; a multi-resonator match "
+    "does not follow it.",
+    {"type": "object", "properties": {
+        "q": _num("loaded Q of the match"),
+        "freq_ghz": _num("design frequency in GHz"),
+        "bandwidth_hz": _num("bandwidth in Hz (solve for Q or f instead)"),
+        "vswr": _num("also report the bandwidth inside this VSWR circle"),
+    }, "required": []},
+    lambda a: _matching.bandwidth(q=a.get("q"), freq_ghz=a.get("freq_ghz"),
+                                  bandwidth_hz=a.get("bandwidth_hz"),
+                                  vswr=a.get("vswr")),
+)
+
+_tool(
+    "design_rules",
+    "The review catalogues: every layout and schematic rule with its id, the fact it "
+    "needs, the unit, how to measure it and its evidence level (L0 read the file / L1 "
+    "calculate or multimeter / L2 simulate or bench / L3 lab). Call this before "
+    "layout_review or schematic_review - it is the list of facts those tools grade.",
+    {"type": "object", "properties": {
+        "kind": _str("which catalogue", ["layout", "schematic"]),
+        "ids": {"type": "array", "description": "only these rule ids",
+                "items": {"type": "string"}},
+        "severity": _str("only this severity", list(_rules.SEVERITIES)),
+    }, "required": ["kind"]},
+    lambda a: _rules.design_rules(a.get("kind", "layout"), a.get("ids"),
+                                  a.get("severity")),
+)
+
+_layout_review = lambda a: _rules.review("layout", a.get("facts") or {})  # noqa: E731
+_schematic_review = lambda a: _rules.review("schematic", a.get("facts") or {})  # noqa: E731
+
+_FACTS_SCHEMA = {
+    "type": "object",
+    "description": "fact_name -> measured value. A fact you did not measure must be "
+                   "left out: the rule then reports 'undetermined', never 'pass'. "
+                   "Extra keys that compute a limit (trace_width_mm, freq_ghz, "
+                   "current_a with current_standard, voltage_v) belong here too.",
+}
+
+_tool(
+    "layout_review",
+    "Grade this board's layout against the rule catalogue: reference-plane continuity, "
+    "decoupling distance and layer, stitching pitch (lambda/20), RF 3W spacing / bend "
+    "radius / edge distance / antenna keep-out, layer-change return vias, diff-pair "
+    "skew, power-trace width from the IPC chart, thermal vias, crystal keep-out, silk "
+    "over pad, test points, minimum hole and width. A rule with no measurement comes "
+    "back UNDETERMINED with what to measure - never as a pass.",
+    {"type": "object", "properties": {"facts": _FACTS_SCHEMA}, "required": ["facts"]},
+    _layout_review,
+)
+
+_tool(
+    "schematic_review",
+    "Grade a schematic / BOM against the missing-part catalogue: per-pin decoupling, "
+    "bulk per rail, floating reset or enable, LED series resistor, gate resistor, ESD on "
+    "connectors, reverse-polarity protection, fuse, regulator compensation, discharge "
+    "path, floating unused inputs, test points, RF port matching, PA bypass ladder, and "
+    "IEC 60664 isolation spacing (which fails closed while the distance table is "
+    "unverified). Undetermined is reported as undetermined, never as a pass.",
+    {"type": "object", "properties": {"facts": _FACTS_SCHEMA}, "required": ["facts"]},
+    _schematic_review,
 )
 
 _tool(

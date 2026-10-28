@@ -9,6 +9,57 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.12] - 2026-10-28
+
+「把别人写好的东西抄进来，只抄能变成可复算工具的那部分」：把 8 个指名技能里可机判的内容
+并成 **4 个新 calc 模块 + 1 个补丁 + 8 个新工具**，另加一套**缺事实永不通过**的规则引擎。
+不能复算的部分（报告写作方法论、LaTeX 绘图、付费壳）逐条写了「为什么不抄」。
+
+- **八个技能的处置**（`docs/25-技能并入清单.md` §25.1）：改用 `boost-inductor-circuit-calc`（公式）、
+  `kicad-free`（规则）、`circuit-analysis`（严重度 + 证据阶梯）、`rf-circuit-design`（板材/层叠/
+  级联/带宽）；拒 `gmai-pcb-manufacturing`、`gmai-pcb-layout-review`（付费 X402，且 `main.py` 是
+  固件安全审计样板，模板串域）、`circuit-diagram-generator`（CircuiTikZ/LaTeX，违反零依赖）、
+  `circuit-analyze`（**目录是空的**，没装）。`circuit-analysis/references/truth-knowledge-report.md`
+  是纯写作方法论 ⇒ 只吸收「证据等级」一条，变成每条规则的 `evidence_level`。
+- **新增 `calc/magnetics.py`**：CCM 功率电感（boost / buck / buck_boost），给 duty、输入电流、
+  纹波、电感量、峰值/谷值/RMS、CCM 最小输出电流、饱和校核。口径：`ripple=0.30`（技能说
+  0.20~0.40）、`isat` 打折 20%；拓扑可行性（duty 越界）**先于**负载检查，避免报错报错在错的
+  那条上。锚点：boost 5→12 V / 1 A / 500 kHz / η=0.9 / r=0.3 ⇒ duty **0.625**、ΔI **0.8 A**、
+  L **7.8125 µH**、Ipk 3.0667 A；buck 12→5 V ⇒ duty 5/12、L **19.444 µH**。
+- **新增 `calc/stackup.py`**：5 种板材（fr4 / ro4003c / ro4350b / rt5880 / megtron6，含 Dk、Df、
+  可用频率、成本序）、4 层与 6 层叠（.5/1/1/.5 与 .5/1/.5/1/1/.5）、每层 50Ω 线宽、缝合孔 λ_g/20。
+  介质分配明写是**等比建议**，回板厂压合图必须重解。锚点：4 层 1.0 mm FR4 的 L1 50Ω ≈ **0.6315 mm**
+  （介质 0.3333 mm），回代 z0 = 50.000；2.4 GHz 在 FR4 上 λ_g = 60.2 mm ⇒ λ_g/20 = **3.01 mm**。
+- **新增 `calc/chain.py`**：Friis 级联（NF 用「该级**之前**的增益连乘」，逐级 `excess_factor_share`
+  列账）+ IIP3/OIP3（`oip3` 自动转输入参考）+ kTB 灵敏度。锚点：技能 §4.4 算例 → **0.8369 dB**
+  （原文写 0.83）；级联 IIP3（0 dBm 经 20 dB → 10 dBm）→ **−10.4139 dBm**、OIP3 **19.5861 dBm**。
+- **新增 `calc/rules.py`**：**22 条布局 + 14 条原理图 = 36 条**规则目录，每条带 `severity`
+  （Critical/High/Medium/Low）、`fact`、`kind`、`how_to_measure`、`evidence_level`、`source`。
+  限值**能算就算**（3W = 3×线宽、缝合孔 = λ_g/20、载流 = IPC、隔离 = IEC 60664-1），算不出就
+  `undetermined` 并给 `next_check`。
+- **`calc/matching.py` 追加 `bandwidth()`**：BW = f0/Q；VSWR 圈内带宽 × (S−1)/√S；三个数里给两个
+  才答。
+- **新增 8 个工具**（`TOOLS` 107 → **115**）：`magnetics_inductor`、`stackup_material`、
+  `stackup_design`、`rf_chain`、`match_bandwidth`、`design_rules`、`layout_review`、
+  `schematic_review`。后两个与 `design_rules` 共用同一份 `facts` schema——模型得先知道该测什么。
+- **三条「不许错答案」**：① 规则**缺事实 ⇒ `undetermined`，永不 pass**，`facts` 全空直接
+  `ARG_MISSING` 拒答（不然就是一份「全绿」假报告）；② 拼错的 fact 键进 `unknown_facts_ignored`
+  并在回包里点名，不让笔误静默降级；③ `current.width_for_current` 必须显式 `standard`
+  （`ipc2221` 与 `ipc2152` 差 3 倍以上，替调用方选就是错答案），因此规则里带电流的限值一定要求
+  `facts["current_standard"]`，`creepage` 表 `verified:false` 则永远 fail-closed。
+- **丢掉了技能里一张自相矛盾的表**：`rf-circuit-design` §3.5 写「2.4 GHz λ/20 = 1.5 mm」，
+  与它自己给的 3.01 mm 差一倍（1.5 mm 实为 λ_g/40）⇒ **只实现公式、不搬表**，矛盾记进
+  `docs/25` §25.4。
+- **能力自述同步**：`calc_capabilities` 的 `layers` 新增 `magnetics / stackup / review` 三节、
+  `available` 增 8 名、`evidence` 增 `magnetics / stackup / chain / bandwidth` 与
+  「36 rules (22 layout, 14 schematic)」、`not_implemented_yet` 增 2 条（功率磁学只有设计点；
+  review 不替你读设计、不解析网表）。
+- **`--selftest` 78 → 87**（9 条新锚点断言，含「缺事实不 pass」「空 facts 拒答」两条不变量）；
+  **测试 863 → 907**（新增 `tests/test_skills.py` 44 例）。文档新增 `docs/25-技能并入清单.md`，
+  `docs/README.md` 与 `README.md` 索引同步。
+- **顺手修掉一处报错顺序缺陷**：`lceda_pro_run` 原先先连编辑器，于是「session 空」会被告成
+  `APP_NOT_RUNNING`；改成**先校验参数**（`ARG_REQUIRED`）再连接——参数错跟有没有开编辑器无关。
+
 ## [0.0.11] - 2026-10-28
 
 「能看见你正开着的那张图」：给立创 Pro 做了一条**进程内桥**——不是文件格式、不是 websocket

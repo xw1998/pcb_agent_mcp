@@ -178,6 +178,14 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `match_pi` / `match_t` | π / T 型匹配（给 Q 或给元件值） | 同上，回代残差 |
 | `match_stub` | 单短截线（并联/串联 × 开路/短路） | 双解按距离配对报，禁止交叉配 |
 | `match_quarter_wave` | 四分之一波长变换器 | 只对纯阻负载成立，其它拒绝 |
+| `match_bandwidth` | 单谐振匹配的带宽 `BW = f0/Q`，以及 VSWR≤S 圈内带宽（乘 `(S−1)/√S`） | 只对**单谐振**成立；多谐振匹配不服从这条关系 |
+| `magnetics_inductor` | CCM boost / buck / buck-boost：占空比、电感量、峰/谷/有效电流、CCM 结束点 | 无磁芯/磁芯损耗/DCR/DCM 稳态；`ripple` 是**你的设计选择**；没给 Isat 时饱和判 `undetermined` |
+| `stackup_material` | 这个频率该用哪种板材（er / tanδ / 适用频段 / 成本），以及它看不见什么 | 频段上限是**工程约定**；Dk-频率曲线、批次公差、工艺兼容性都不在表里 |
+| `stackup_design` | 4 / 6 层叠：层角色、铜厚、介质分配、**每信号层各自的 50Ω 线宽**、缝合孔 λ_g/20、铜对称性 | 介质分配是**等比**的，不是压合图；线宽必须回到板厂 er 上重解 |
+| `rf_chain` | 级联增益、Friis 噪声（含各级占比）、级联 IIP3/OIP3、kTB 底噪与灵敏度 | 缺任一级 `nf_db` ⇒ NF 是 `None` 不是部分和；IP3 公式是 worst case；级间失配不在里面 |
+| `design_rules` | 规则目录：id、需要哪个事实、单位、怎么测、证据等级、出处 | —— |
+| `layout_review` | 用你测到的事实判 22 条布局规则（参考面连续性 / 去耦距离与同层 / λ_g/20 / 3W / 弯曲半径 / 板边 / 天线净空 / 换层地孔 / 差分等长 / 载流线宽 / 散热孔 / 晶振 / 丝印 / 测试点 / 最小孔与线宽） | **不替你读板**；没测到的规则一律 `undetermined` 并给出怎么测，空事实集直接拒答 |
+| `schematic_review` | 用事实判 14 条原理图规则（逐脚去耦 / 每路 bulk / 复位与使能悬空 / LED 限流 / 栅极电阻 / 连接器 ESD / 防反接 / 保险丝 / 补偿 / 放电 / 悬空输入 / 测试点 / 射频匹配 / PA 旁路梯 / IEC 60664 隔离间距） | 不把网表解析成“这颗 IC 的电源脚”，事实要调用方给；隔离间距因表未验证而永远 fail-closed |
 | `link_friis` | 链路预算：Prx / 路损 / EIRP / ERP | `FSPL_CONST = -27.5522`（写错 60 dB 的坑） |
 | `link_max_range` | 给定灵敏度与额外损耗 → 最大距离 | 额外损耗要显式给，默认 0 就说 0 dB |
 | `link_aperture` | 天线有效面积 | — |
@@ -229,7 +237,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 ```bash
 python run_server.py --version       # 0.0.10
 python run_server.py --selftest      # 协议级自检，76/76（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问）
-python -m unittest discover -s tests # 863 个用例（约 5 分钟，kicad-cli / pcbnew 用例占大头）
+python -m unittest discover -s tests # 907 个用例（约 5 分钟，kicad-cli / pcbnew 用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -495,7 +503,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 107 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 115 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -536,7 +544,7 @@ pcb_agent_mcp/
 │       ├── safety_table.py       # 表本身的可执行体检（来源数/单调性/重复 key）
 │       ├── feedline.py           # 微带/带状线/CPW/GCPW + 反解宽度
 │       ├── antenna.py            # 贴片/印刷线/偶极单极/螺旋/小环/Chu 上限/芯片天线
-│       ├── matching.py           # 反射/L/π/T/短截线/四分之一波长（每解回代）
+│       ├── matching.py           # 反射/L/π/T/短截线/四分之一波长/带宽=f0/Q（每解回代）
 │       ├── link.py               # FSPL/Friis/最大距离/有效面积/远场/菲涅耳
 │       ├── spice.py              # SPICE 子集 + 可选委派 ngspice（raw 解析 / deck 过滤 / 双引擎对账）
 │       ├── power.py              # 铜阻/过孔/自感/电阻网络/IR drop/电容组/PDN
@@ -545,14 +553,18 @@ pcb_agent_mcp/
 │       ├── vibration.py          # 振动：Ritz 模态 + Miles/Steinberg/冲击/传递率 + 应力（degree 阶梯误差棒）
 │       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）
 │       ├── filters.py            # 滤波器合成：原型 g 值/集总带通(两路对账)/耦合线反解/耦合谐振器/TE101 腔
-│       └── electrothermal.py     # 电热耦合：R(T) 定点迭代 + 精确失控判据 + 板级 2-D 场（SOR）
+│       ├── electrothermal.py     # 电热耦合：R(T) 定点迭代 + 精确失控判据 + 板级 2-D 场（SOR）
+│       ├── magnetics.py          # 功率电感：CCM boost/buck/buck-boost 占空比/电感/峰值/CCM 边界
+│       ├── stackup.py           # 板材表 + 4/6 层叠 + 每层 50Ω 线宽 + λ_g/20 缝合孔
+│       ├── chain.py             # 射频链路级联：Friis NF / IIP3 / kTB 灵敏度
+│       └── rules.py             # 规则引擎：22 条布局 + 14 条原理图目录，缺事实 ⇒ undetermined
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
 ├── tests/                        # 863 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~24，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~25，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明

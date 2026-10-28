@@ -504,3 +504,73 @@ def quarter_wave(z_load, freq_ghz, z0=50.0, er_eff=1.0):
                      "load": "resistive part transformed; reactance must be removed "
                              "first"},
     )
+
+# ---------------------------------------------------------- bandwidth by Q
+def bandwidth(q=None, freq_ghz=None, bandwidth_hz=None, vswr=None):
+    """Fractional bandwidth of a resonant match, and the Q it implies.
+
+    Source: rf-circuit-design / SKILL.md 4.3 - "S11 is fine at the centre and the
+    bandwidth is narrow" is the symptom of an excessive loaded Q, and the standard
+    relation between them is BW = f0 / Q for a single-resonance match, i.e.
+    Q = f0 / BW. It is a resonance relation, not a filter synthesis rule: a
+    multi-resonator match does NOT follow it, and neither does a node whose
+    bandwidth is set by the load rather than by the matching network.
+    """
+    if q is None and bandwidth_hz is None:
+        return err("give q (loaded Q) or bandwidth_hz", "ARG_MISSING",
+                   hint="BW = f0/Q needs two of the three numbers f0, BW, Q")
+    try:
+        f = None if freq_ghz is None else float(freq_ghz)
+        Q = None if q is None else float(q)
+        b = None if bandwidth_hz is None else float(bandwidth_hz)
+    except (TypeError, ValueError):
+        return err("numeric arguments required", "ARG_INVALID")
+    if f is not None and f <= 0:
+        return err("freq_ghz must be > 0", "ARG_RANGE")
+    if Q is not None and Q <= 0:
+        return err("q must be > 0", "ARG_RANGE")
+    if b is not None and b <= 0:
+        return err("bandwidth_hz must be > 0", "ARG_RANGE")
+
+    out = {}
+    if Q is not None and f is not None:
+        b = f * 1e9 / Q
+    elif b is not None and f is not None and Q is None:
+        Q = f * 1e9 / b
+    elif Q is not None and b is not None and f is None:
+        f = Q * b / 1e9
+    else:
+        return err("two of freq_ghz / q / bandwidth_hz are needed", "ARG_MISSING")
+
+    out["freq_ghz"] = _round(f, 6)
+    out["q"] = _round(Q, 4)
+    out["bandwidth_hz"] = _round(b, 3)
+    out["fractional_bandwidth"] = _round(b / (f * 1e9), 6)
+    if vswr is not None:
+        try:
+            s = float(vswr)
+        except (TypeError, ValueError):
+            return err("vswr must be numeric", "ARG_INVALID")
+        if s <= 1.0:
+            return err("vswr must be > 1", "ARG_RANGE")
+        # the classic single-pole relation between the VSWR circle and loaded Q
+        out["bandwidth_at_vswr_hz"] = _round((f * 1e9 / Q) * ((s - 1.0) / math.sqrt(s)), 3)
+        out["vswr"] = s
+        out["bandwidth_at_vswr_note"] = (
+            "multiplied by (S-1)/sqrt(S): the width of the VSWR <= S circle for a "
+            "single resonance. For S = 2 that factor is 0.707, so the 2:1 band is "
+            "about 70 % of the BW = f0/Q band")
+    out["what_it_does_not_say"] = (
+        "the shape of S11 inside the band, the effect of component tolerance or Q, "
+        "and any multi-resonator behaviour - a two-section match can be flatter "
+        "and wider than this relation suggests")
+    return ok(
+        value=out,
+        unit="bandwidth",
+        model="single_resonance_q_bandwidth",
+        basis="BW = f0/Q (loaded Q of a single resonance); VSWR band scaled by (S-1)/sqrt(S)",
+        precision="engineering approximation: exact only for a single-resonant, "
+                  "lossless match with the loaded Q as stated",
+        assumptions={"single_resonance": True,
+                     "q_source": "the caller's loaded Q, not a computed one"},
+    )

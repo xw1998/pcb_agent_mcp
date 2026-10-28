@@ -1023,6 +1023,71 @@ def selftest():
           _kept == ("EXECUTION_ERROR", "boom") and _ours == ("APP_ERROR", "WHO_KNOWS"),
           str((_kept, _ours)))
 
+    # The skill-derived calculators: each one is checked against a number that can
+    # be re-derived by hand, and the rule engine is checked for the one property
+    # that matters - a missing measurement must never come back as a pass.
+    r = handle({"jsonrpc": "2.0", "id": 115, "method": "tools/call",
+                "params": {"name": "magnetics_inductor", "arguments": {
+                    "topology": "boost", "vin_v": 5, "vout_v": 12,
+                    "f_sw_hz": 500000, "iout_a": 1.0, "efficiency": 0.9}}})
+    _mg = json.loads(r["result"]["content"][0]["text"])
+    _mgv = _mg.get("value") or {}
+    # D = 1 - 0.9*5/12 = 0.625; Iin = 12/(0.9*5) = 2.6667 A;
+    # L = 5*0.625/(0.3*2.6667*500e3) = 7.8125e-6 H
+    check("boost duty and inductance match volt-seconds by hand",
+          _mg.get("status") == "ok" and abs(_mgv.get("duty", 0) - 0.625) < 1e-9
+          and abs(_mgv.get("inductor_uh", 0) - 7.8125) < 1e-3,
+          str(_mgv.get("inductor_uh")))
+    check("saturation is undetermined, not passed, without a part Isat",
+          (_mgv.get("saturation") or {}).get("verdict") == "undetermined")
+
+    r = handle({"jsonrpc": "2.0", "id": 116, "method": "tools/call",
+                "params": {"name": "rf_chain", "arguments": {"stages": [
+                    {"name": "LNA1", "gain_db": 15, "nf_db": 0.8},
+                    {"name": "LNA2", "gain_db": 20, "nf_db": 1.2},
+                    {"name": "LNA3", "gain_db": 10, "nf_db": 2.0}]}}})
+    _ch = (json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+    # the worked example in rf-circuit-design 4.4 gives 0.83 dB
+    check("Friis cascade reproduces the worked example (0.83 dB)",
+          abs(_ch.get("nf_total_db", 0) - 0.8369) < 5e-3,
+          str(_ch.get("nf_total_db")))
+    r = handle({"jsonrpc": "2.0", "id": 117, "method": "tools/call",
+                "params": {"name": "rf_chain",
+                           "arguments": {"stages": [{"name": "x", "gain_db": 10}]}}})
+    _ch1 = (json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+    check("cascade NF with a missing stage nf is None, not a partial number",
+          _ch1.get("nf_total_db") is None
+          and "nf_db" in str(_ch1.get("answers_only_when_every_stage_is_known")))
+
+    r = handle({"jsonrpc": "2.0", "id": 118, "method": "tools/call",
+                "params": {"name": "stackup_design", "arguments": {
+                    "layers": 4, "material": "fr4", "total_mm": 1.0,
+                    "freq_ghz": 2.4}}})
+    _su = (json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+    _given = sum(row.get("dielectric_to_next_mm", 0.0) for row in _su.get("stack", []))
+    check("stackup dielectric sums to the finished thickness",
+          _su.get("layers") == 4 and abs(_given - 1.0) < 1e-6, str(_given))
+    check("stackup solves a width on every signal layer that has a plane below",
+          len([w for w in _su.get("widths", []) if w.get("width_mm")]) == 1)
+
+    r = handle({"jsonrpc": "2.0", "id": 119, "method": "tools/call",
+                "params": {"name": "layout_review",
+                           "arguments": {"facts": {"min_via_hole_mm": 0.2}}}})
+    _lr = (json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+    check("a rule with no measurement is undetermined, never pass",
+          _lr.get("counts", {}).get("pass") == 0
+          and _lr.get("counts", {}).get("undetermined", 0) > 0,
+          str(_lr.get("counts")))
+    check("a measured violation is a fail with its limit attached",
+          [f for f in _lr.get("fails", [])
+           if f.get("id") == "layout.min_via_hole" and f.get("limit") == 0.3])
+
+    r = handle({"jsonrpc": "2.0", "id": 120, "method": "tools/call",
+                "params": {"name": "schematic_review", "arguments": {"facts": {}}}})
+    check("an empty fact set is refused (ARG_MISSING), not graded as clean",
+          json.loads(r["result"]["content"][0]["text"]).get("reason_code")
+          == "ARG_MISSING")
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
