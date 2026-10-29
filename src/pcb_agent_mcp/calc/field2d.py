@@ -466,7 +466,9 @@ def _surface_charge_faces(sec, nodeset):
     out: it cancels in the normalisation), L in whatever the grid unit is.
     """
     nx, xs, ys, ny = sec.nx, sec.xs, sec.ys, sec.ny
-    fixed = set(sec.live) | set(sec.ground)
+    # a pair section keeps its second strip in its own list; it is a fixed node
+    # like a ground as far as flux accounting goes
+    fixed = set(sec.live) | set(sec.ground) | set(getattr(sec, "live_left", ()))
     V = sec._V
     out = []
     for n in nodeset:
@@ -775,6 +777,349 @@ def coplanar_shape_factor(kind, w_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
     out["zero_thickness"] = (t <= 0.0)
     return out
 
+# "odd" and "even" are the two eigen-drives; "grounded" (neighbour held at
+# 0 V) is not a mode of the pair, it is the third solve that makes the mode
+# decomposition falsifiable: (C_odd + C_even)/2 must equal it exactly.
+COPLANAR_PAIR_MODES = ("odd", "even")
+
+class _CoplanarPair(_Coplanar):
+    """Edge-coupled coplanar pair: two strips, two coplanar grounds, optional back plane.
+
+    Geometry, in the grid unit (mm): the copper plane sits at y = h and occupies
+    h .. h+t; the two strips span s/2 .. s/2+w and -(s/2+w) .. -s/2 (so `s` is
+    the edge-to-edge gap between them, the same meaning `spacing` has on the
+    microstrip pair), and the grounds start at |x| >= s/2 + w + g.
+
+    Both symmetry conditions are read off a FULL domain instead of imposed:
+    the odd mode is solved by driving the right strip at +1 V and the left at
+    -1 V, the even mode by driving both at +1 V. On a mesh that is mirrored
+    about x = 0 (which this one is, by construction) the odd solution must come
+    out antisymmetric and the even solution symmetric to machine precision -
+    that is an exact invariant the tests assert, so a mesh that quietly
+    swallowed a bias cannot pass.
+
+    Why not exploit the symmetry plane and solve half the domain instead: the
+    odd-mode electric wall at x = 0 would be an assumption of the solver AND of
+    every limit check it is validated against (the half line of a pair whose
+    spacing goes to infinity IS the single line), and the previous batch
+    already measured what a half-cell control volume at the wall costs (2.16 %
+    on Z0 with the error invisible in the drift). The price is 2x nodes.
+    """
+
+    def __init__(self, kind, w, s, g, h, t, er, fine, far_span=8.0):
+        self.kind = kind
+        self.w, self.s, self.g, self.h, self.t, self.er = w, s, g, h, t, er
+        self.backed = (kind == "gcpw")
+        near = max(3.0 * t, min(w, s, g) / 2.0)
+        slow = max(fine * 8.0, near / 6.0)
+        a1 = s / 2.0                    # inner edge of the right strip
+        a2 = a1 + w                     # outer edge of the right strip
+        a3 = a2 + g                     # near edge of the right ground
+        x_anchor = [(0.0, slow), (max(a1 - near, 0.0), slow), (a1, fine),
+                    (a2, fine), (a3, fine)]
+        # The truncation distance is measured from the OUTER edge of the ground
+        # plane and from the strips themselves only, never from the spacing.
+        # Scaling it with s was measured to break the one limit that makes this
+        # geometry checkable at all: at s = 1.5 mm a box proportional to the
+        # footprint read 104.0 ohm for the odd mode against 89.7 for the same
+        # line solved alone - the difference was boundary distance, not physics.
+        span = w + 2.0 * g
+        far = max(far_span * span, span * 1.2)
+        half_x = _axis(x_anchor, a3 + far)
+        # mirrored, not concatenated: an asymmetric mesh would make the two
+        # strips disagree and both the antisymmetry invariant and the left/right
+        # return split would be measuring the mesh instead of the physics
+        self.xs = [-v for v in reversed(half_x[1:])] + half_x
+        y_pos = [(0.0, min(slow, h / 6.0)),
+                 (max(h - 8.0 * fine, 0.0), fine),
+                 (h, fine)]
+        if t > 0:
+            y_pos.append((h + t, fine))
+        above = _axis(y_pos, h + far)
+        if self.backed:
+            self.ys = above
+        else:
+            below = [-v for v in reversed(_axis([(0.0, min(slow, h / 6.0))], far))]
+            self.ys = [v for v in below if v < -1e-12] + above
+        self.nx, self.ny = len(self.xs), len(self.ys)
+        self.ground, self.live_left, self.live_right = [], [], []
+        eps = 1e-12
+        for j, y in enumerate(self.ys):
+            on_plane = (h - eps) <= y <= (h + t + eps)
+            on_back = self.backed and abs(y) < eps
+            for i, x in enumerate(self.xs):
+                n = j * self.nx + i
+                ax = abs(x)
+                if on_back:
+                    self.ground.append(n)
+                elif on_plane:
+                    if a1 - eps <= ax <= a2 + eps:
+                        (self.live_right if x > 0.0 else self.live_left).append(n)
+                    elif ax >= a3 - eps:
+                        self.ground.append(n)
+
+    def build(self, mode="odd"):
+        """Assemble the stencil with the drive that defines the requested mode.
+
+        `charge()` only ever sums the rows of `self.live`, so the right strip is
+        the one put there; the left strip is a fixed node set like a ground,
+        only at -1 V for the odd mode. The two strips are never adjacent, so no
+        conductor-to-conductor face exists and the flux really is the charge.
+        """
+        self.live = list(self.live_right)
+        _Section.build(self, odd=False)
+        # the base assembly only knows `live` and `ground`; the second strip has
+        # to be taken back out of the unknown set by hand, or the SOR sweep
+        # silently relaxes it as if it were empty dielectric (measured: it sat
+        # at 0.27 V instead of -1 V, and both modes came out identical)
+        left = set(self.live_left)
+        self._rows = [row for row in self._rows if row[0] not in left]
+        self._free = [n for n in self._free if n not in left]
+        val = {"odd": -1.0, "grounded": 0.0}.get(str(mode), 1.0)
+        for n in self.live_left:
+            self._fixed[n] = val
+        return self
+
+def _copl_pair_solution(kind, w, s, g, h, t, er, fine, mode="odd", coarse=4.0,
+                        max_nodes=None):
+    """Solve one edge-coupled coplanar cross-section, warm-started from a coarse mesh."""
+    init = None
+    if coarse and fine * coarse < max(w, s, g, h):
+        csec = _CoplanarPair(kind, w, s, g, h, t, er, fine * coarse)
+        csec.build(mode)
+        _check_nodes(csec, max_nodes)
+        csec._V = csec.solve()
+        sec = _CoplanarPair(kind, w, s, g, h, t, er, fine)
+        sec.build(mode)
+        _check_nodes(sec, max_nodes)
+        init = _interp(csec, sec)
+    else:
+        sec = _CoplanarPair(kind, w, s, g, h, t, er, fine)
+        sec.build(mode)
+        _check_nodes(sec, max_nodes)
+    sec._V = sec.solve(init=init)
+    return sec
+
+def _copl_pair_caps(kind, w, s, g, h, t, er, fine, mode="odd", coarse=4.0,
+                    max_nodes=None):
+    """C/eps0 of the driven strip, dielectric and vacuum, plus the solved section."""
+    sec = _copl_pair_solution(kind, w, s, g, h, t, er, fine, mode,
+                              coarse=coarse, max_nodes=max_nodes)
+    c_d = sec.charge(sec._V)
+    sea = _copl_pair_solution(kind, w, s, g, h, t, 1.0, fine, mode,
+                              coarse=coarse, max_nodes=max_nodes)
+    c_a = sea.charge(sea._V)
+    return c_d, c_a, sec
+
+def coplanar_pair_solve(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
+                        levels=(1.0, 0.65), fine_div=10.0, max_nodes=None):
+    """Odd- and even-mode impedances of an edge-coupled coplanar pair.
+
+    Conventions, spelled out because "Zdiff" means three different things
+    depending on who is asking:
+
+      * `z_odd` / `z_even` are per line, to the coplanar ground, with the other
+        strip at -V (odd) or +V (even);
+      * `z_diff` = 2*z_odd and `z_common` = 0.5*z_even, the same convention the
+        microstrip pair path uses (`_z_from_caps`);
+      * the mode is defined by the drive, not by a symmetry condition the
+        solver imposes, so the odd answer does not depend on the mesh being
+        symmetric in the sense of "we assumed it".
+
+    Z = eta0/sqrt(c_d*c_a) with both capacitances in eps0 units, exactly as
+    `coplanar_solve_pair`: L does not care about the dielectric, so sqrt(L/C)
+    with L the same in both solves.
+    """
+    kind = str(kind or "").strip().lower()
+    if kind not in COPLANAR_KINDS:
+        raise ValueError("coplanar_pair_solve: kind must be cpw or gcpw")
+    w, s, g, h, t, er = (float(w_mm), float(s_mm), float(g_mm), float(h_mm),
+                         float(t_mm), float(er))
+    if w <= 0 or s <= 0 or g <= 0 or h <= 0 or t < 0 or er < 1.0:
+        raise ValueError("coplanar_pair_solve: bad geometry")
+    fine0 = _fine_step(w, s, h, t, fine_div)
+    runs = []
+    for factor in levels:
+        fine = fine0 * factor
+        entry = {"fine_mm": fine}
+        for mode in COPLANAR_PAIR_MODES:
+            c_d, c_a, sec = _copl_pair_caps(kind, w, s, g, h, t, er, fine, mode,
+                                            max_nodes=max_nodes)
+            if c_d <= 0.0 or c_a <= 0.0:
+                raise ValueError("coplanar_pair_solve: non-positive capacitance")
+            q_r = sum(q for q, _, _ in _surface_charge_faces(sec, set(sec.live_right)))
+            q_l = sum(q for q, _, _ in _surface_charge_faces(sec, set(sec.live_left)))
+            entry[mode] = {
+                "c_dielectric": c_d, "c_air": c_a,
+                "z": ETA0 / math.sqrt(c_d * c_a), "eps_eff": c_d / c_a,
+                "q_right": q_r, "q_left": q_l,
+                "charge_balance": (q_l / q_r) if q_r else None,
+                "nodes": sec.nx * sec.ny, "sweeps": sec.sweeps,
+                "residual": sec.last_delta,
+            }
+        runs.append(entry)
+    main = runs[0]
+    z_odd = main["odd"]["z"]
+    z_even = main["even"]["z"]
+    drift_odd = drift_even = None
+    if len(runs) > 1:
+        ratio = runs[0]["fine_mm"] / runs[1]["fine_mm"]
+        drift_odd = (runs[1]["odd"]["z"] - z_odd) / (ratio - 1.0)
+        drift_even = (runs[1]["even"]["z"] - z_even) / (ratio - 1.0)
+    return {"z_odd": z_odd, "z_even": z_even, "z_diff": 2.0 * z_odd,
+            "z_common": 0.5 * z_even,
+            "eps_eff_odd": main["odd"]["eps_eff"],
+            "eps_eff_even": main["even"]["eps_eff"],
+            "drift_odd": drift_odd, "drift_even": drift_even,
+            "runs": runs, "kind": kind}
+
+def coplanar_pair_mode_check(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
+                             fine_div=10.0, max_nodes=None):
+    """Solve all THREE drives and test the mode decomposition against itself.
+
+    Linear superposition says, for two identical conductors 1 and 2:
+
+        Q1(V1, V2) = Cg*V1 + Cm*(V1 - V2)
+        odd  (V2 = -V1):  C_odd  = Cg + 2*Cm
+        even (V2 = +V1):  C_even = Cg
+        grounded (V2 = 0): C_se  = Cg + Cm  =  (C_odd + C_even)/2
+
+    The last equality is the one worth solving for: it needs no extra physics,
+    only that the three drives were assembled on the SAME mesh and that the
+    second strip was actually held at the potential it was given. That is
+    exactly the failure this repository hit while building the pair section -
+    the second strip was left in the unknown set by the base assembly, so it
+    relaxed to 0.27 V on its own, both modes came out identical, and the
+    impedance looked perfectly plausible. Measured residual when the section is
+    right: 1.9e-08 (dielectric) and 5.8e-08 (air), i.e. the SOR tolerance and
+    not machine epsilon, because the three drives are three separate sweeps.
+    When the second strip is wrong the residual is O(1); the tests assert 1e-6.
+
+    Returns the two capacitances per drive plus the residuals; it is not a tool,
+    it is the falsifiable half of the validation.
+    """
+    kind = str(kind or "").strip().lower()
+    if kind not in COPLANAR_KINDS:
+        raise ValueError("coplanar_pair_mode_check: kind must be cpw or gcpw")
+    w, s, g, h, t, er = (float(w_mm), float(s_mm), float(g_mm), float(h_mm),
+                         float(t_mm), float(er))
+    if w <= 0 or s <= 0 or g <= 0 or h <= 0 or t < 0 or er < 1.0:
+        raise ValueError("coplanar_pair_mode_check: bad geometry")
+    fine = _fine_step(w, s, h, t, fine_div)
+    c = {}
+    for mode in ("odd", "even", "grounded"):
+        c_d, c_a, sec = _copl_pair_caps(kind, w, s, g, h, t, er, fine, mode,
+                                        max_nodes=max_nodes)
+        c[mode] = {"c_dielectric": c_d, "c_air": c_a,
+                   "nodes": sec.nx * sec.ny, "sweeps": sec.sweeps}
+    out = {"kind": kind, "fine_mm": fine, "drives": c}
+    for tag, key in (("dielectric", "c_dielectric"), ("air", "c_air")):
+        mean = 0.5 * (c["odd"][key] + c["even"][key])
+        ref = c["grounded"][key]
+        out["mean_over_grounded_" + tag] = (mean / ref) if ref else None
+        out["residual_" + tag] = (mean - ref) / ref if ref else None
+    return out
+
+def coplanar_pair_shape_factor(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
+                               fine_div=8.0, refine=1.5, max_nodes=None):
+    """INT g(s)^2 ds of an edge-coupled coplanar pair in its ODD mode.
+
+    The normalisation is the one the loss formula needs and the one that is easy
+    to get wrong on a pair: g is the surface charge of every conductor divided
+    by the DIFFERENTIAL current, i.e. by the charge on the + strip. Not by each
+    conductor's own charge (on a pair, the two grounds carry opposite currents
+    whose sum is zero, and normalising them to themselves would divide by zero),
+    and not by the sum over all conductors (which is also zero).
+
+    So S = sum over all conductors of INT (q/q_ref)^2 ds, and
+
+        alpha_c = Rs/(2*Z0_mode) * S,   Z0_mode = z_odd for the odd mode.
+
+    Same zero-thickness caveats as `coplanar_shape_factor`: at t = 0 the strip
+    edges and the ground edges are all r^-1/2 singularities, so S has a
+    logarithmic mesh dependence and `mesh_drift_pct` is the honest spread. The
+    one limit that IS checkable with an independent answer is spacing -> large,
+    where the pair must fall apart into two isolated coplanar lines.
+    """
+    kind = str(kind or "").strip().lower()
+    if kind not in COPLANAR_KINDS:
+        raise ValueError("coplanar_pair_shape_factor: kind must be cpw or gcpw")
+    w, s, g, h, t, er = (float(w_mm), float(s_mm), float(g_mm), float(h_mm),
+                         float(t_mm), float(er))
+    if w <= 0 or s <= 0 or g <= 0 or h <= 0 or t < 0 or er < 1.0:
+        raise ValueError("coplanar_pair_shape_factor: bad geometry")
+    fine = _fine_step(w, s, h, t, fine_div)
+    meshes = []
+    for factor in ((1.0, refine) if refine and refine > 1.0 else (1.0,)):
+        sec = _copl_pair_solution(kind, w, s, g, h, t, er, fine * factor, "odd",
+                                  max_nodes=max_nodes)
+        faces = {
+            "strip_right": _surface_charge_faces(sec, set(sec.live_right)),
+            "strip_left": _surface_charge_faces(sec, set(sec.live_left)),
+            "ground": _surface_charge_faces(sec, set(sec.ground)),
+        }
+        q_ref = sum(q for q, _, _ in faces["strip_right"])
+        if q_ref <= 0.0:
+            raise ValueError("coplanar_pair_shape_factor: the driven strip carries "
+                             "no positive charge; the mesh is degenerate")
+        integ = 0.0
+        share = {}
+        for tag, fl in faces.items():
+            v = 0.0
+            for q, L, _ in fl:
+                v += q * q / (L * q_ref * q_ref)
+            share[tag] = v
+            integ += v
+        wing = {"left": 0.0, "right": 0.0, "back": 0.0}
+        for tag in ("left", "right", "back"):
+            nodes = []
+            for n in sec.ground:
+                x = sec.xs[n % sec.nx]
+                y = sec.ys[n // sec.nx]
+                if abs(y) < 1e-12 and sec.backed:
+                    where = "back"
+                else:
+                    where = "left" if x < 0.0 else "right"
+                if where == tag:
+                    nodes.append(n)
+            if nodes:
+                for q, L, _ in _surface_charge_faces(sec, set(nodes)):
+                    wing[tag] += q * q / (L * q_ref * q_ref)
+        meshes.append({
+            "fine_mm": fine * factor,
+            "shape_factor_per_mm": integ,
+            "strip_share": share["strip_right"] + share["strip_left"],
+            "strip_right_share": share["strip_right"],
+            "strip_left_share": share["strip_left"],
+            "ground_share": share["ground"],
+            "ground_share_left": wing["left"],
+            "ground_share_right": wing["right"],
+            "ground_share_back": wing["back"],
+            "faces": {k: len(v) for k, v in faces.items()},
+            "q_ref": q_ref,
+            "nodes": sec.nx * sec.ny,
+            "sweeps": sec.sweeps,
+            "residual": sec.last_delta,
+        })
+    best = meshes[0]
+    drift = None
+    if len(meshes) > 1:
+        coarse, fine_run = meshes[1], meshes[0]
+        if fine_run["shape_factor_per_mm"]:
+            drift = 100.0 * (fine_run["shape_factor_per_mm"]
+                             - coarse["shape_factor_per_mm"]) \
+                / fine_run["shape_factor_per_mm"]
+    out = dict(best)
+    out["mesh_drift_pct"] = drift
+    out["coarser"] = meshes[1] if len(meshes) > 1 else None
+    out["kind"] = kind
+    out["spacing_mm"] = s
+    out["gap_mm"] = g
+    out["er"] = er
+    out["mode"] = "odd"
+    out["zero_thickness"] = (t <= 0.0)
+    return out
+
 def conductor_shape_factor(kind, w_mm, h_mm, t_mm=0.0, er=1.0, fine_div=10.0,
                            gap_h=4.0, refine=1.6, max_nodes=None):
     """Shape factor of the current distribution: the number that turns Rs/Z0 into loss.
@@ -936,6 +1281,44 @@ VALIDATION = {
                 "and logarithmic, so it does not average out with mesh refinement: "
                 "at w=0.3 g=0.2 h=0.2 the answer still moves 0.09 % between "
                 "16h and 24h",
+    },
+    "coplanar_pair_modes": {
+        "case": "edge-coupled coplanar pair: (C_odd + C_even)/2 on ONE strip against "
+                "a third solve that holds its neighbour at 0 V. Linear superposition, "
+                "so the identity is exact up to the SOR tolerance - it checks the "
+                "DRIVES, not the geometry. What it cannot see is a neighbour left "
+                "floating in the unknown set (measured residual 1.5e-10 there, the "
+                "same triplicate as the honest run); the antisymmetry below is what "
+                "catches that one",
+        "geometry": "cpw w=0.3 s=0.2 g=0.2 h=0.2 er=4.3, t=0, fine_div=10",
+        "residual_dielectric": 1.9e-08,
+        "residual_air": 5.8e-08,
+        "c_dielectric": {"odd": 8.997022, "grounded": 6.347287, "even": 3.697552},
+        "c_air": {"odd": 3.741710, "grounded": 2.768722, "even": 1.795734},
+        "charge_balance_odd": -1.0,
+        "note": "the three drives must be three different numbers; when the second "
+                "strip was left in the unknown set the sweep relaxed it (0.27 V "
+                "instead of -1 V) and all three came out identical, which is exactly "
+                "what this table is here to catch",
+    },
+    "coplanar_pair_limits": {
+        "case": "the two spacing limits, which pull in opposite directions",
+        "spacing_over_width": 0.16666666666666666,
+        "z_common_error_pct": -0.87,
+        "z_common_error_pct_cheap_mesh": -0.62,
+        "cheap_mesh_fine_div": 3.0,
+        "z_odd_at_that_spacing": 45.621,
+        "z_odd_error_pct": -39.70,
+        "single_line_reference_ohm": 75.658,
+        "note": "as the spacing goes to zero the COMMON mode falls onto one strip of "
+                "width 2w (-0.87 % at spacing/width = 1/6, -0.83 % at 1/10) while the "
+                "ODD mode goes to zero, because the capacitance between two strips at "
+                "+/-V diverges logarithmically and that is the physics, not a "
+                "failure. The large-spacing limit is deliberately NOT asserted and "
+                "does not return the single line: at spacing = 0.6 / 1.5 / 4.0 mm the "
+                "odd mode reads 86.6 / 104.1 / 116.5 ohm against 89.7 for the same "
+                "strip alone, because a widely spaced pair has a ground plane on one "
+                "side of each strip only",
     },
     "worst_seen_pct": 3.39,
     "note": "all four checks land inside 3.4%. The stripline bias is positive and grows "
@@ -1189,3 +1572,200 @@ def coplanar_field(width_mm, gap_mm, dielectric_mm, copper_um=0.0, er=4.3,
         },
         extra=extra,
     )
+
+def coplanar_pair_field(width_mm, spacing_mm, gap_mm, dielectric_mm, copper_um=0.0,
+                        er=4.3, kind="cpw", levels=2, frequency_ghz=0.0,
+                        tan_delta=0.0, max_nodes=60000):
+    """Edge-coupled coplanar pair (differential CPW / GCPW) from the 2-D field solver.
+
+    Answer, in the order the schema asks for it: `value` is Zdiff = 2*Z_odd. The
+    per-line odd and even impedances, the common-mode impedance and both filling
+    factors are in `extra`, because on a differential pair the single number is
+    the least informative part of the answer.
+
+    What is checked and what is not - this is the part that matters, because
+    there is no closed form for edge-coupled coplanar lines in this repo:
+
+      * the mode decomposition is checked against a THIRD solve (neighbour held
+        at 0 V): (C_odd + C_even)/2 must equal it, and does to the solver
+        tolerance (1.9e-08 / 5.8e-08 relative);
+      * the odd solution must be antisymmetric and the even one symmetric about
+        x = 0 by construction - the mesh is mirrored, so a broken assembly shows
+        up as `charge_balance_odd` away from -1;
+      * spacing -> 0 collapses Z_common onto the impedance of ONE strip of width
+        2w, which the single-line solver answers against the conformal map
+        (measured -0.87 % at spacing = width/6);
+      * Z_odd does NOT go back to the single-line answer as the spacing grows,
+        and should not: a pair with a wide spacing has a ground on one side of
+        each strip only, so its odd-mode impedance rises above the two-sided
+        single line (89.7 -> 116.5 ohm at spacing 4 mm on w=0.3/g=0.2).
+
+    A 2-D quasi-TEM model like the rest of the module: no dispersion, no
+    radiation, no etch trapezoid, and the copper is meshed but not modelled.
+    """
+    kind = str(kind or "").strip().lower()
+    if kind not in COPLANAR_KINDS:
+        return err("kind must be cpw or gcpw", "ARG_INVALID",
+                   hint="cpw = unbacked (air under the substrate), "
+                        "gcpw = grounded coplanar (ground plane below)")
+    try:
+        w = float(width_mm)
+        s = float(spacing_mm)
+        g = float(gap_mm)
+        h = float(dielectric_mm)
+        t = float(copper_um or 0.0) / 1000.0
+        er = float(er)
+        f_ghz = float(frequency_ghz or 0.0)
+        tand = float(tan_delta or 0.0)
+    except (TypeError, ValueError):
+        return err("numeric arguments required", "ARG_INVALID")
+    if w <= 0 or s <= 0 or g <= 0 or h <= 0 or t < 0 or er < 1.0:
+        return err("width, spacing, gap and dielectric must be > 0; copper_um >= 0; "
+                   "er >= 1", "ARG_RANGE")
+    if f_ghz < 0 or tand < 0:
+        return err("frequency_ghz and tan_delta must be >= 0", "ARG_RANGE")
+    spec = (1.0, 0.65) if int(levels or 2) > 1 else (1.0,)
+    try:
+        r = coplanar_pair_solve(kind, w, s, g, h, t, er, levels=spec,
+                                max_nodes=max_nodes)
+    except ValueError as exc:
+        return err(str(exc), "OUT_OF_VALIDITY",
+                   hint="the fine step follows min(width, spacing, dielectric), so a "
+                        "spacing much smaller than the width is what makes this "
+                        "expensive; raise max_nodes, or solve with copper_um = 0")
+
+    extra = {
+        "kind": kind,
+        "z_odd_ohm": round(r["z_odd"], 3),
+        "z_even_ohm": round(r["z_even"], 3),
+        "z_common_ohm": round(r["z_common"], 3),
+        "eps_eff_odd": round(r["eps_eff_odd"], 5),
+        "eps_eff_even": round(r["eps_eff_even"], 5),
+        "mesh": r["runs"],
+        "mesh_drift_ohm": {
+            "odd": None if r["drift_odd"] is None else round(r["drift_odd"], 4),
+            "even": None if r["drift_even"] is None else round(r["drift_even"], 4),
+        },
+        "charge_balance_odd": (None if r["runs"][0]["odd"]["charge_balance"] is None
+                               else round(r["runs"][0]["odd"]["charge_balance"], 9)),
+        "mode_note": "odd = the strips driven at +V and -V (the differential mode, "
+                     "Zdiff = 2*Z_odd); even = both driven at +V (Zcommon = "
+                     "0.5*Z_even). The symmetry is not imposed, it is measured: the "
+                     "mesh runs through x = 0 and charge_balance_odd must come out "
+                     "at -1 to 9 places",
+        "limit_note": "spacing -> 0 gives Zcommon -> Z0 of one strip of width 2w "
+                      "(-0.87 %% at spacing/width = 1/6); Zodd -> 0 there because "
+                      "the capacitance between the strips diverges, and that is "
+                      "correct rather than a failure. spacing -> large does NOT "
+                      "return the single-line Z0: each strip then has a ground "
+                      "plane on one side only",
+        "validated_against": {
+            "mode_decomposition_third_solve": {
+                "case": VALIDATION["coplanar_pair_modes"]["case"],
+                "residual_dielectric":
+                    VALIDATION["coplanar_pair_modes"]["residual_dielectric"],
+                "residual_air": VALIDATION["coplanar_pair_modes"]["residual_air"],
+            },
+            "merged_strip_limit": {
+                "case": "spacing = width/6 on cpw w=0.3/g=0.2/h=0.2/er=4.3: Zcommon "
+                        "against the single-line solver for a 2w strip",
+                "error_pct": VALIDATION["coplanar_pair_limits"]["z_common_error_pct"],
+            },
+            "single_line_reference": {
+                "case": "the single-line solver this is built on is itself -1.19 % to "
+                        "-3.39 % against the quasi-static conformal map",
+                "error_pct_range": [-3.39, -1.19],
+            },
+        },
+    }
+    if f_ghz > 0.0:
+        from . import feedline as _fl
+        shape = coplanar_pair_shape_factor(kind, w, s, g, h, t, er,
+                                          max_nodes=max_nodes)
+        rs = _fl._surface_resistance(f_ghz)
+        rs_eff = rs
+        if shape["shape_factor_per_mm"]:
+            alpha_c = rs_eff / (2.0 * r["z_odd"]) * shape["shape_factor_per_mm"]
+            extra["conductor_db_per_100mm"] = round(8.686 * alpha_c * 100.0, 4)
+        lam0 = 299.792458 / f_ghz                    # mm
+        alpha_d = 0.0
+        if er > 1.0 and tand > 0.0:
+            ee = r["eps_eff_odd"]
+            alpha_d = ((math.pi / lam0) * (er / math.sqrt(ee))
+                       * ((ee - 1.0) / (er - 1.0)) * tand)
+        extra["dielectric_db_per_100mm"] = round(8.686 * alpha_d * 100.0, 4)
+        extra["total_db_per_100mm"] = round(
+            (8.686 * (alpha_c if shape["shape_factor_per_mm"] else 0.0)
+             * 100.0) + 8.686 * alpha_d * 100.0, 4)
+        extra["surface_resistance_ohm_sq"] = round(rs, 5)
+        extra["shape_factor_odd"] = {
+            "shape_factor_per_mm": round(shape["shape_factor_per_mm"], 6),
+            "strip_share": round(shape["strip_share"], 6),
+            "strip_left_share": round(shape["strip_left_share"], 6),
+            "strip_right_share": round(shape["strip_right_share"], 6),
+            "ground_share": round(shape["ground_share"], 6),
+            "ground_share_left": round(shape["ground_share_left"], 6),
+            "ground_share_right": round(shape["ground_share_right"], 6),
+            "ground_share_back": round(shape["ground_share_back"], 6),
+            "mesh_drift_pct": (None if shape["mesh_drift_pct"] is None
+                               else round(shape["mesh_drift_pct"], 2)),
+            "nodes": shape["nodes"],
+        }
+        extra["conductor_note"] = (
+            "Rs/(2*Z_odd) * INT g^2 ds with g normalised to the DIFFERENTIAL current "
+            "(charge on the + strip), summed over both strips and both ground wings. "
+            "The shape factor is a zero-thickness number (a real foil is about 10 %% "
+            "higher and that 10 %% does not converge on any mesh this module can "
+            "afford), and its own mesh drift is %.1f %% here, so the conductor figure "
+            "is a lower bound with an uncertainty, not a converged value"
+            % (shape["mesh_drift_pct"] or 0.0))
+    else:
+        extra["conductor_db_per_100mm"] = None
+        extra["conductor_note"] = ("pass frequency_ghz > 0 to get conductor loss; it "
+                                  "needs a second field solve for the surface charge")
+    if s / w < 0.25:
+        extra["validity_note"] = (
+            "spacing/width = %.3f: the fine step follows the spacing, so this costs "
+            "as many nodes as a much finer grid on the strips, and the odd-mode "
+            "answer is dominated by the (log-divergent) capacitance between the two "
+            "strips rather than by the ground" % (s / w))
+    if g / h < 0.2:
+        extra["gap_note"] = (
+            "gap/dielectric = %.3f puts the slot closer to the substrate thickness "
+            "than the coplanar agreement with the conformal map was measured at; "
+            "expect the same -3 %% class of bias the single line shows there"
+            % (g / h))
+
+    return ok(
+        value=round(r["z_diff"], 2),
+        unit="ohm",
+        model="field2d_finite_volume_laplace",
+        basis=("2-D quasi-TEM electrostatic solution of div(eps*grad V) = 0 in the "
+               "edge-coupled coplanar cross-section (two strips, two coplanar "
+               "grounds, substrate of finite thickness, air or a ground plane below), "
+               "finite-volume stencil on a graded tensor grid, red-black SOR; odd and "
+               "even modes are two drives on the SAME full mesh (no symmetry plane "
+               "assumed), Z = eta0/sqrt(C_dielectric*C_air) per line, Zdiff = 2*Z_odd"),
+        precision=("no closed form exists for edge-coupled coplanar lines, so what is "
+                   "reported is what is checked: the mode decomposition against a "
+                   "third solve (residual 1.9e-08 of the capacitance), the antisymmetry "
+                   "of the odd solution (charge balance -1.000000000), the merged-strip "
+                   "limit at spacing = width/6 (-0.87 %% on Zcommon, against a solver "
+                   "that is itself -1.19 %% to -3.39 %% from the conformal map), and "
+                   "the drift between two meshes (0.1-0.5 ohm here), which is "
+                   "self-consistency and NOT a total error bound. Still 2-D quasi-TEM: "
+                   "no dispersion, no radiation, no etch trapezoid"),
+        assumptions={
+            "width_mm": w, "spacing_mm": s, "gap_mm": g, "dielectric_mm": h,
+            "copper_um": float(copper_um), "er": er, "kind": kind,
+            "backside_ground": (kind == "gcpw"),
+            "edge_to_edge_spacing": True,
+            "tem_assumption": True,
+            "solder_mask_ignored": True,
+            "etch_trapezoid_ignored": True,
+            "outer_boundary_note": "8*(width+2*gap) beyond the outer edge of each "
+                                   "ground plane, measured from the strips",
+        },
+        extra=extra,
+    )
+

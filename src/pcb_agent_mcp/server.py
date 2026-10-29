@@ -1395,6 +1395,43 @@ def selftest():
           and _sp.get("return_back") == 0.0,
           str(_sp))
 
+    # Coplanar PAIR: no closed form exists for this geometry, so the checks are
+    # the invariants instead. The odd drive must put exactly -1 times the charge
+    # on the second strip (a free second strip is what a broken assembly looks
+    # like: both modes then come out identical, and the impedance still looks
+    # plausible), and the two ground wings must still split bit for bit.
+    r = handle({"jsonrpc": "2.0", "id": 128, "method": "tools/call",
+                "params": {"name": "coplanar_pair_field",
+                           "arguments": {"width_mm": 0.3, "spacing_mm": 0.2,
+                                         "gap_mm": 0.2, "dielectric_mm": 0.2,
+                                         "kind": "cpw", "levels": 1}}})
+    _cp = json.loads(r["result"]["content"][0]["text"])
+    check("an edge-coupled coplanar pair solves to 129.9 ohm differential and puts "
+          "exactly the opposite charge on the second strip",
+          _cp.get("status") == "ok" and abs(_cp.get("value", 0.0) - 129.86) < 1.5
+          and _cp.get("charge_balance_odd") == -1.0
+          and _cp.get("z_odd_ohm", 0.0) < _cp.get("z_even_ohm", 0.0),
+          "%s / balance %s" % (_cp.get("value"), _cp.get("charge_balance_odd")))
+
+    r = handle({"jsonrpc": "2.0", "id": 129, "method": "tools/call",
+                "params": {"name": "coplanar_pair_field",
+                           "arguments": {"width_mm": 0.3, "spacing_mm": 0.2,
+                                         "gap_mm": 0.2, "dielectric_mm": 0.2,
+                                         "kind": "cpw", "levels": 1,
+                                         "frequency_ghz": 2.4, "tan_delta": 0.02}}})
+    _cq = json.loads(r["result"]["content"][0]["text"])
+    _sf = _cq.get("shape_factor_odd") or {}
+    check("the differential conductor loss is solved, its two strips and two wings "
+          "carry identical shares, and nothing lands on a backside plane",
+          _cq.get("status") == "ok"
+          and (_cq.get("conductor_db_per_100mm") or 0.0) > 0.0
+          and (_cq.get("dielectric_db_per_100mm") or 0.0) > 0.0
+          and _sf.get("strip_left_share") == _sf.get("strip_right_share")
+          and _sf.get("ground_share_left") == _sf.get("ground_share_right")
+          and _sf.get("ground_share_back") == 0.0,
+          "%s dB/100mm, S=%s" % (_cq.get("conductor_db_per_100mm"),
+                                 _sf.get("shape_factor_per_mm")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

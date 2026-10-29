@@ -501,6 +501,45 @@ _tool(
 )
 
 _tool(
+    "coplanar_pair_field",
+    "Edge-coupled coplanar pair (differential CPW / GCPW) from the 2-D field solver: "
+    "Zdiff = 2*Z_odd plus the per-line odd and even impedances, the common-mode "
+    "impedance and both filling factors. No closed form exists for this geometry, so "
+    "the answer carries what IS checked instead: the mode decomposition against a "
+    "third solve, the antisymmetry of the odd solution, and the merged-strip limit. "
+    "Twelve to forty seconds; pass frequency_ghz to also get conductor and dielectric "
+    "loss for the differential mode.",
+    {"type": "object",
+     "properties": {
+         "width_mm": _num("width of EACH of the two strips"),
+         "spacing_mm": _num("edge-to-edge gap between the two strips"),
+         "gap_mm": _num("slot width from a strip's outer edge to its coplanar ground"),
+         "dielectric_mm": _num("substrate thickness"),
+         "copper_um": _num("copper thickness in um; 0 = zero-thickness (cheap, and the "
+                           "only case the shape factor converges anywhere)", 0),
+         "er": _num("relative permittivity", 4.3),
+         "kind": _str("cpw = air below the substrate, gcpw = ground plane below the "
+                      "substrate", ["cpw", "gcpw"], "cpw"),
+         "levels": _num("mesh refinement levels: 1 = one mesh, 2 = coarse->fine (default)",
+                        2),
+         "frequency_ghz": _num("0 = impedance only; > 0 also solves the surface charge "
+                               "and reports loss", 0),
+         "tan_delta": _num("dielectric loss tangent, used only when frequency_ghz > 0",
+                           0),
+         "max_nodes": _num("refuse rather than grind if the mesh would exceed this",
+                           60000),
+     },
+     "required": ["width_mm", "spacing_mm", "gap_mm", "dielectric_mm"]},
+    lambda a: _field2d.coplanar_pair_field(
+        a["width_mm"], a["spacing_mm"], a["gap_mm"], a["dielectric_mm"],
+        copper_um=a.get("copper_um", 0.0), er=a.get("er", 4.3),
+        kind=a.get("kind", "cpw"), levels=int(a.get("levels", 2)),
+        frequency_ghz=float(a.get("frequency_ghz", 0.0) or 0.0),
+        tan_delta=float(a.get("tan_delta", 0.0) or 0.0),
+        max_nodes=int(a.get("max_nodes", 60000))),
+)
+
+_tool(
     "lceda_api_probe",
     "Speak to LCEDA Pro's API gateway rather than just looking at the port: opens a "
     "real RFC 6455 WebSocket to 127.0.0.1:49620..49629, checks the handshake, and says "
