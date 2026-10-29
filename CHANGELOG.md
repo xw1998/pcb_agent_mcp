@@ -9,6 +9,69 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.19] - 2026-10-29
+
+「仿真层的物理深度」——上一批留下的下一个动作：把 `feedline` 的导体损耗从
+`Rs/(Z0·w)` 薄电流近似换成**自有 2-D 场解的微扰积分**。工具数不变（**144**），
+用例 1413 → **1428**，`--selftest` 仍 **95/95**。推导与实测写在 `docs/16` §13。
+
+### 为什么换：旧式的两个错误方向相反且都不报
+
+`alpha_c = Rs/(Z0·w)` 同时① 假设电流沿宽度均匀（忽略边缘拥挤，**低估**）、
+② 假设回流导体与走线等宽（回流面远宽于走线，**高估**）。实测微带 `w/h = 1.75`
+时②赢 2 倍以上，所以真值**低于**它。旧 docstring 写「a LOWER bound, typically
+20-40 % low on microstrip」——**这句话是错的，已删除**。它既不是上界也不是下界。
+
+### 换成什么：`alpha_c = Rs/(2·Z0)·∮g²ds`
+
+- `calc/field2d.py` 新增 `conductor_shape_factor(kind, w_mm, h_mm, t_mm, er, fine_div,
+  gap_h, refine, max_nodes)` + `_surface_charge_faces` + `_section_solution`（粗网格 warm start）。
+  `g` = 归一化到**信号导体总电荷**的表面电荷密度（按全导体求和恒为 0 —— Gauss；
+  这个坑一开始把结果炸成 1e11）。积分方向是 `Σ q²/(L·Q_live²)`（不是 `Σ(q/Q)²·L`）。
+- 副产品自检：`ground_to_live_charge_ratio = -1.0000`（精确），进测试。
+- `build(odd=False)`：`odd=True` 会把 `x=0` 整列伪固定成 0 V（电壁），假电荷会算进形状因子。
+- `SHAPE_FACTOR_MAX_NODES = 45000` 保险丝，检查在**第一次 SOR 之前**（否则先烧 30 s 再拒）。
+  超限则退回 `conductor_model="sheet_bound"`。
+
+### 两条独立验证（都是测试断言）
+
+- **平行板极限**：微带 `sf·w` 随 `w/h` 从 5→100 单调 1.4809 → 1.9644（理论 2）；
+  带状线 `w/b` 0.75→25 从 0.6444 → 0.9847（理论 1）。
+- **增量电感规则**（齐次带状线）：`sf/inc` 在 `fine_div=24` 时 1.034 / 1.020，收敛到 2–3 %。
+- **微带只有第一条**——`t=0` 时条带顶面/侧面无法表达成 `∂Z0/∂h`，实测差 3–5 倍。
+  这一点在文档里明写，不假装有第二条。
+
+### 零铜厚：报漂移，不报"收敛值"
+
+`t=0` 的 `∮g²ds` 对数发散。`refine=1.6` 跑两级网格、报 `mesh_drift_pct`
+（微带 6.87 %、带状线 4.08 %、带 35 µm 铜后 3.87 %）+ `shape_factor_caveat`。
+
+### 粗糙度：独立乘子
+
+Hammerstad-Jensen `K = 1 + (2/π)·atan(1.4·(Ra/δ)²)`，`δ` = 1 GHz 铜 2.0898 µm。
+新参数 `feedline_impedance(..., roughness_um=)`；`Ra = 1 µm` ⇒ `K = 1.1975`，
+只乘 `Rs` 不动几何因子（测试断言两次 `sf` 相等而 db 变大）。
+
+### 两条估计并列，不选边
+
+`conductor_db_per_100mm`（场解）+ `conductor_sheet_bound_db_per_100mm`（旧式）
++ `field_over_sheet_ratio`。实测：微带 t=0 **0.202 vs 0.3829，ratio 0.528**；
+带 35 µm 铜 + Ra 1 µm **0.273 vs 0.4916，ratio 0.555**；带状线 **0.2004 vs 0.5684，ratio 0.352**。
+`shape_factor_split` 按 signal / return / trace_sides 拆（三列相加 = 总数）；
+信号导体拿走六成以上，说明"回流面等宽"错得最狠。
+
+### CPW 仍然拒答
+
+共面线回流在同层、电流绕槽边，`field2d` 没有共面截面 ⇒ `conductor_model = "not_computed"`，
+总损耗标 `lower_bound` 并写明缺哪一块。套 Gupta 修正不叫完整，叫给错答案。
+
+### 测试
+
+新增 `tests/test_trace_loss.py` **15 项 / 18 s**：平行板单调性、w/b=10 时 `sf·w > 0.93`、
+增量电感 ratio 窗口、split 求和对账、`Q_ground/Q_live ≈ -1`、有限铜漂移小于零厚度、
+`max_nodes` 前置抛错、两条估计都在且 `total = conductor + dielectric`、t=0 带 caveat、
+粗糙度是独立乘子、`ARG_RANGE`、节点超限回退 `sheet_bound`、CPW 仍 `not_computed`。
+
 ## [0.0.18] - 2026-10-29
 
 「把审计清单做到底」——0.0.17 之后做了一次只读审计，把**没做的 / 做了但有硬边界 /

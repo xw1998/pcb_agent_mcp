@@ -25,10 +25,19 @@ Edge-coupled pairs are solved in *half* the domain: the symmetry plane at
 x = 0 is an electric wall for the odd mode (both traces at +V/-V, so Zdiff =
 2*Z_odd) and a magnetic wall for the even mode.
 
-What this is not: a mode solver. It assumes TEM, ignores conductor loss,
-dispersion, radiation and the finite-conductivity penetration. It is a much
-better cross-check than a second closed form, not a replacement for the
-fabricator's impedance coupon.
+Conductor LOSS is derived from the same solution, not modelled separately:
+`conductor_shape_factor` normalises the computed surface charge to the signal
+current and returns INT g(s)^2 ds, which is the geometry factor in
+alpha_c = Rs/(2*Z0) * INT g^2 ds. That is a first-order perturbation on a
+static solution, valid while the skin depth is far below the copper, and it
+inherits every limitation below.
+
+What this is not: a mode solver. It assumes TEM, has no dispersion, no
+radiation and no finite-conductivity penetration beyond that perturbation, and
+the surface charge it reports is only as good as the mesh at a conductor
+corner (a zero-thickness edge is log-divergent). It is a much better
+cross-check than a second closed form, not a replacement for the fabricator's
+impedance coupon.
 """
 import math
 
@@ -411,6 +420,154 @@ def solve_single(kind, w_mm, h_mm, t_mm, er, fine_div=12.0, gap_h=1.5):
     z = 1.0 / (C0 * math.sqrt(c_d * EPS0 * c_a * EPS0))
     return z, m["sec"]
 
+
+def _section_solution(kind, w, s, h, t, er, fine, odd=False, coarse=4.0):
+    """Solve one cross-section, warm-starting from a coarser mesh.
+
+    Same trick as `_cap`: the sweep count then tracks the refinement and not the
+    grid size, which is what makes the second (finer) mesh affordable.
+    """
+    init = None
+    if coarse and fine * coarse < max(w, s, h):
+        csec = _Section(kind, w, s, h, t, er, fine * coarse)
+        csec.build(odd=odd)
+        csec._V = csec.solve()
+        sec = _Section(kind, w, s, h, t, er, fine)
+        sec.build(odd=odd)
+        init = _interp(csec, sec)
+    else:
+        sec = _Section(kind, w, s, h, t, er, fine)
+        sec.build(odd=odd)
+    sec._V = sec.solve(init=init)
+    return sec
+
+def _surface_charge_faces(sec, nodeset):
+    """Per-face flux leaving a conductor, with the face length it is spread over.
+
+    A face is only counted when the other side is free space: a face onto another
+    fixed node is interior copper (or a conductor pair the solver was not asked
+    about) and carries no surface charge of its own.
+
+    Returns [(q, L, axis)], q = eps_r * (L/d) * dV in volts (the eps0 is factored
+    out: it cancels in the normalisation), L in whatever the grid unit is.
+    """
+    nx, xs, ys, ny = sec.nx, sec.xs, sec.ys, sec.ny
+    fixed = set(sec.live) | set(sec.ground)
+    V = sec._V
+    out = []
+    for n in nodeset:
+        i, j = n % nx, n // nx
+        y = ys[j]
+        hx, hy = sec._cell_w(i), sec._cell_h(j)
+        if i > 0 and (n - 1) not in fixed:
+            q = sec._eps_x(y) * hy / (xs[i] - xs[i - 1]) * (V[n] - V[n - 1])
+            out.append((q, hy, "x"))
+        if i + 1 < nx and (n + 1) not in fixed:
+            q = sec._eps_x(y) * hy / (xs[i + 1] - xs[i]) * (V[n] - V[n + 1])
+            out.append((q, hy, "x"))
+        if j > 0 and (n - nx) not in fixed:
+            q = sec._eps_y(0.5 * (y + ys[j - 1])) * hx / (y - ys[j - 1]) * (V[n] - V[n - nx])
+            out.append((q, hx, "y"))
+        if j + 1 < ny and (n + nx) not in fixed:
+            q = sec._eps_y(0.5 * (y + ys[j + 1])) * hx / (ys[j + 1] - y) * (V[n] - V[n + nx])
+            out.append((q, hx, "y"))
+    return out
+
+def conductor_shape_factor(kind, w_mm, h_mm, t_mm=0.0, er=1.0, fine_div=10.0,
+                           gap_h=4.0, refine=1.6, max_nodes=None):
+    """Shape factor of the current distribution: the number that turns Rs/Z0 into loss.
+
+    For a quasi-TEM line the skin-effect attenuation is
+
+        alpha_c = Rs / (2*Z0) * INT g(s)^2 ds,      INT g ds = 1 over one conductor
+
+    where g(s) is the surface current density normalised to the signal current.
+    The integral is a pure geometry number (1/length); this function solves the
+    electrostatics and reads it off the discrete surface charge, because in TEM
+    the surface charge and the longitudinal current are the same distribution.
+
+    This is the honest replacement for the Rs/(Z0*w) sheet estimate: it carries
+    the edge crowding that the sheet estimate misses, and on stripline it carries
+    the current split between the two reference planes, which the sheet estimate
+    does not even try.
+
+    Two things it is NOT:
+      * with t = 0 the strip edge is a 180-degree corner, where the surface
+        density diverges as r^-1/2 and INT g^2 ds diverges logarithmically. A
+        converged number therefore does not exist for zero-thickness copper; the
+        value returned is the value on the mesh it was computed on, and drift
+        between the two meshes is reported so that the dependence is visible.
+        Ask for finite thickness when the answer matters.
+      * it is a 2-D electrostatic solution, so the face of the trace that the
+        current actually turns around on (the far side of a bend) is not here.
+
+    Returns a dict (units: the grid is in mm, so the shape factor is 1/mm).
+    """
+    kind = str(kind or "").strip().lower()
+    if kind not in KINDS:
+        raise ValueError("conductor_shape_factor: kind must be microstrip or stripline")
+    w, h, t, er = float(w_mm), float(h_mm), float(t_mm), float(er)
+    if w <= 0 or h <= 0 or t < 0 or er < 1.0:
+        raise ValueError("conductor_shape_factor: bad geometry")
+    s = max(float(gap_h), 1.0) * h
+    fine = _fine_step(w, s, h, t, fine_div)
+    if max_nodes:
+        # the grid is cheap to build and expensive to solve, so the size check has
+        # to happen before the first SOR sweep, not after
+        probe = _Section(kind, w, s, h, t, er, fine)
+        if probe.nx * probe.ny > int(max_nodes):
+            raise ValueError("section needs %d mesh nodes, over the %d-node limit"
+                             % (probe.nx * probe.ny, int(max_nodes)))
+    meshes = []
+    for factor in ((1.0, refine) if refine and refine > 1.0 else (1.0,)):
+        sec = _section_solution(kind, w, s, h, t, er, fine * factor)
+        live = _surface_charge_faces(sec, sec.live)
+        ground = _surface_charge_faces(sec, sec.ground)
+        q_live = sum(q for q, _, _ in live)
+        if q_live <= 0.0:
+            raise ValueError("conductor_shape_factor: the excited conductor carries "
+                             "no positive charge; the mesh is degenerate")
+        integ = 0.0
+        share = {"live": 0.0, "ground": 0.0}
+        by_axis = {"x": 0.0, "y": 0.0}
+        for tag, faces in (("live", live), ("ground", ground)):
+            for q, L, axis in faces:
+                v = q * q / (L * q_live * q_live)
+                integ += v
+                share[tag] += v
+                by_axis[axis] += v
+        meshes.append({
+            "fine_mm": fine * factor,
+            "shape_factor_per_mm": integ,
+            "live_share": share["live"],
+            "ground_share": share["ground"],
+            "side_share": by_axis["x"],
+            "face_share": by_axis["y"],
+            "faces_live": len(live),
+            "faces_ground": len(ground),
+            "q_live": q_live,
+            "ground_to_live_charge_ratio": (
+                None if not q_live else
+                sum(q for q, _, _ in ground) / q_live),
+            "nodes": sec.nx * sec.ny,
+            "sweeps": sec.sweeps,
+            "residual": sec.last_delta,
+        })
+    best = meshes[0]
+    drift = None
+    if len(meshes) > 1:
+        coarse, fine_run = meshes[1], meshes[0]
+        if fine_run["shape_factor_per_mm"]:
+            drift = 100.0 * (fine_run["shape_factor_per_mm"]
+                             - coarse["shape_factor_per_mm"]) \
+                / fine_run["shape_factor_per_mm"]
+    out = dict(best)
+    out["mesh_drift_pct"] = drift
+    out["coarser"] = meshes[1] if len(meshes) > 1 else None
+    out["gap_h"] = gap_h
+    out["er"] = er
+    out["zero_thickness"] = (t <= 0.0)
+    return out
 
 def _z_from_caps(c_shape_d, c_shape_a, odd):
     """Zdiff (odd) or Zcommon (even) from the two dimensionless shape factors.

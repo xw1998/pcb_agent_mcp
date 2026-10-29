@@ -2322,9 +2322,13 @@ _COPPER_UM = _num("copper thickness in um (0 = ignore thickness)", 0.0)
 _tool(
     "feedline_impedance",
     "Z0, effective permittivity, guided wavelength and loss of a microstrip, "
-    "stripline, CPW or grounded CPW line. verify_field=true also runs the 2-D field "
-    "solver on the same cross-section and reports the closed form's error, so the "
-    "number can be checked rather than trusted.",
+    "stripline, CPW or grounded CPW line. Loss (with freq_ghz + tan_delta) reports "
+    "conductor loss from the 2-D field solution on microstrip and stripline - "
+    "alpha_c = Rs/(2*Z0)*INT g^2 ds, which carries the trace edge crowding and the "
+    "return-current spread - alongside the Rs/(Z0*w) sheet figure, plus an optional "
+    "Hammerstad-Jensen copper-roughness multiplier. Coplanar conductor loss is still "
+    "refused, not guessed. verify_field=true also reports the closed form's error "
+    "against the solver.",
     {
         "type": "object",
         "properties": {
@@ -2340,6 +2344,8 @@ _tool(
             "verify_field": _bool("run the 2-D field solver on the same cross-section "
                                   "and report the difference (slower)"),
             "field_levels": _num("refinement levels for the field check", 1),
+            "roughness_um": _num("copper surface roughness Ra in um; multiplies Rs by "
+                                 "the Hammerstad-Jensen factor (0 = smooth)", 0.0),
         },
         "required": ["kind", "width_mm", "dielectric_mm"],
     },
@@ -2347,7 +2353,7 @@ _tool(
         a["kind"], a["width_mm"], a["dielectric_mm"], a.get("gap_mm"),
         a.get("copper_um", 0.0), a.get("er", 4.3), a.get("freq_ghz"),
         a.get("tan_delta"), a.get("verify_field", False),
-        a.get("field_levels", 1)),
+        a.get("field_levels", 1), a.get("roughness_um", 0.0)),
 )
 
 _tool(
@@ -3281,7 +3287,17 @@ def _capabilities(_args):
                          "(64.022 ohm from both sides). The microstrip closed form is the "
                          "one field2d already scores against the 2-D solver (-0.35 % .. "
                          "-2.83 %); CPW/GCPW are NOT solver-validated, only limit-checked, "
-                         "and say so",
+                         "and say so. Conductor loss is no longer the Rs/(Z0*w) sheet "
+                         "guess on microstrip and stripline: it is alpha_c = "
+                         "Rs/(2*Z0)*INT g^2 ds read off the same 2-D charge solution, and "
+                         "it is checked two ways - the parallel-plate limits (INT g^2 ds "
+                         "-> 2/w on microstrip, -> 1/w on stripline, hit to 1.8 % and "
+                         "1.5 % at w/h 25..100) and the independent incremental-inductance "
+                         "rule on homogeneous stripline (2-3 % at w/b 1..2.5). Both "
+                         "figures are returned with their ratio, because they disagree by "
+                         "more than 2x at moderate w/h and neither is a bound. Zero "
+                         "thickness still has a log-divergent edge and carries a drift "
+                         "figure; coplanar lines still refuse",
             "dfm": "the rule catalogue is this server's, the limits are never: tests "
                    "cover both failure directions (an unknown key and a missing source "
                    "are refused, not defaulted), a measured value exactly on the limit "

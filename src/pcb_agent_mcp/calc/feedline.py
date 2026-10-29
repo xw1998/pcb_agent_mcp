@@ -154,50 +154,152 @@ def _surface_resistance(freq_ghz):
     f = float(freq_ghz) * 1e9
     return math.sqrt(math.pi * f * MU0 / SIGMA_CU)
 
-def _attenuation(kind, z0, ee, er, w, h, freq_ghz, tan_delta):
+def _skin_depth_um(freq_ghz):
+    f = float(freq_ghz) * 1e9
+    return 1e6 * math.sqrt(1.0 / (math.pi * f * MU0 * SIGMA_CU))
+
+def _roughness_factor(roughness_um, freq_ghz):
+    """Hammerstad-Jensen surface-roughness multiplier on Rs.
+
+    K = 1 + (2/pi) * atan(1.4 * (delta_rough/delta_skin)^2)
+
+    Kept as a separate multiplier instead of being folded into the geometry, so
+    that "the current crowds at the edge" and "the foil is rough" stay two
+    independently attributable numbers in the answer.
+    """
+    r = float(roughness_um or 0.0)
+    if r <= 0.0:
+        return 1.0, None
+    delta = _skin_depth_um(freq_ghz)
+    x = r / delta
+    k = 1.0 + (2.0 / math.pi) * math.atan(1.4 * x * x)
+    return k, {"roughness_um": r, "skin_depth_um": round(delta, 4),
+               "roughness_over_skin": round(x, 3), "factor": round(k, 4)}
+
+# Hard ceiling on the field mesh: the shape-factor solve is a convenience, and a
+# 10 mm wide line on a 0.2 mm stackup would otherwise spend half a minute of CPU
+# inside a unit conversion.
+SHAPE_FACTOR_MAX_NODES = 45000
+
+def conductor_shape_factor_safe(kind, w_mm, h_mm, t_mm=0.0, er=4.3, fine_div=10.0):
+    """`field2d.conductor_shape_factor`, or a reason string when it is not worth it."""
+    from . import field2d
+    try:
+        out = field2d.conductor_shape_factor(kind, w_mm, h_mm, t_mm, er=er,
+                                             fine_div=fine_div,
+                                             max_nodes=SHAPE_FACTOR_MAX_NODES)
+    except ValueError as exc:
+        return None, "the field solve refused the section: %s" % exc
+    except Exception as exc:                                # noqa: BLE001
+        return None, "the field solve failed (%s: %s)" % (type(exc).__name__, exc)
+    if out.get("nodes", 0) > SHAPE_FACTOR_MAX_NODES:
+        return None, ("the cross-section needs %d mesh nodes, over the %d-node "
+                      "ceiling: the conductor loss is the sheet bound only"
+                      % (out["nodes"], SHAPE_FACTOR_MAX_NODES))
+    return out, None
+
+def _attenuation(kind, z0, ee, er, w, h, freq_ghz, tan_delta, t_mm=0.0,
+                 roughness_um=0.0, shape=None):
     """Loss per unit length, split into the two mechanisms.
 
-    Conductor loss uses the plain Rs/(Z0*w) sheet-current estimate. It ignores
-    current crowding at the trace edges, so it is a LOWER BOUND; on microstrip the
-    real number is typically 20-40 % higher. Stated instead of silently corrected,
-    because the correction factor depends on w/h and a wrong factor is worse than
-    an honest bound.
+    Conductor loss carries TWO estimates:
+
+      * `conductor_db_per_100mm` - from the 2-D field solution,
+        alpha_c = Rs/(2*Z0) * INT g(s)^2 ds, with g the surface charge normalised
+        to the signal current. This is the number to use: it carries the edge
+        crowding on microstrip and the current split across the two reference
+        planes of a stripline, neither of which the sheet estimate can see. It is
+        checked in this repo against the parallel-plate limit (INT g^2 ds -> 2/w
+        on microstrip and -> 1/w on stripline as w/h grows: 1.8 % and 1.5 % at
+        w/h ~ 25-100) and against the independent incremental-inductance rule on
+        homogeneous stripline (2-3 % at w/b 1..2.5 on a refined mesh).
+      * `conductor_sheet_bound_db_per_100mm` - Rs/(Z0*w), always computed because
+        it costs nothing. Note what it assumes: uniform current density 1/w on the
+        signal AND on a return conductor exactly as wide as the trace. That
+        assumption is wrong in both directions - it ignores the strip's edge
+        crowding (makes the real loss higher) and it invents a return conductor as
+        narrow as the trace when the real one spreads much wider (makes the real
+        loss lower). On microstrip at w/h ~ 2 the second effect wins by more than
+        a factor of two, so the sheet figure is neither a bound nor a good
+        estimate. The ratio is reported instead of the claim.
 
     Dielectric loss uses the standard quasi-TEM filling-factor expression, which
     does not depend on the conductor shape:
 
         alpha_d = (pi/lambda0) * (er/sqrt(ee)) * ((ee-1)/(er-1)) * tan_delta
 
-    Coplanar conductor loss is NOT computed: it needs the current distribution
-    over the strip edges, and there is no closed form here that this repo can
-    stand behind. The field is reported as null with the reason, so a total
-    attenuation read off this answer is a bound rather than a guess in disguise.
+    Copper roughness multiplies Rs by the Hammerstad-Jensen factor, reported
+    separately so geometry and foil stay separable.
+
+    Coplanar conductor loss is still NOT computed: `field2d` has microstrip and
+    stripline cross-sections only, and a coplanar line is not that problem (the
+    return conductor is on the same layer and the field wraps the slot edges). The
+    field is reported as null with the reason, so a total attenuation read off
+    this answer is a bound rather than a guess in disguise.
     """
     lam0 = C0_MM_PER_NS / float(freq_ghz)          # mm
     ad = 0.0
     if er > 1.0 and tan_delta > 0.0:
         ad = (math.pi / lam0) * (er / math.sqrt(ee)) * ((ee - 1.0) / (er - 1.0)) * tan_delta
-    out = {"dielectric_db_per_100mm": round(8.686 * ad * 100.0, 4)}
+    rs = _surface_resistance(freq_ghz)
+    k_rough, rough = _roughness_factor(roughness_um, freq_ghz)
+    rs_eff = rs * k_rough
+    out = {"dielectric_db_per_100mm": round(8.686 * ad * 100.0, 4),
+           "surface_resistance_ohm_sq": round(rs, 5)}
+    if k_rough != 1.0:
+        out["effective_surface_resistance_ohm_sq"] = round(rs_eff, 5)
+        out["roughness"] = rough
     if kind in ("microstrip", "stripline"):
-        rs = _surface_resistance(freq_ghz)
-        ac = rs / (z0 * w)
-        if kind == "stripline":
-            # two reference planes carry the return current; the per-plane share is
-            # below half because the field is shared, so the simple sum is used and
-            # labelled as the same lower bound
-            ac = ac * 1.0
-        out["conductor_db_per_100mm"] = round(8.686 * ac * 100.0, 4)
-        out["conductor_note"] = ("Rs/(Z0*w), no edge-crowding term: a LOWER bound, "
-                                 "typically 20-40 % low on microstrip")
-        out["total_db_per_100mm"] = round(out["conductor_db_per_100mm"]
-                                          + out["dielectric_db_per_100mm"], 4)
+        sheet = 8.686 * (rs_eff / (z0 * w)) * 100.0
+        out["conductor_sheet_bound_db_per_100mm"] = round(sheet, 4)
+        note = ("Rs/(Z0*w) with a return conductor as wide as the trace: it ignores "
+                "the strip edge crowding AND invents a fully matching return path, "
+                "so it is neither an upper nor a lower bound")
+        if shape is None:
+            shape, why = conductor_shape_factor_safe(kind, w, h, t_mm,
+                                                     er=er if er > 1.0 else 4.3)
+            if shape is None:
+                out["conductor_db_per_100mm"] = round(sheet, 4)
+                out["conductor_model"] = "sheet_bound"
+                out["conductor_note"] = note + "; field model unavailable: " + why
+                out["total_db_per_100mm"] = round(
+                    out["conductor_db_per_100mm"] + out["dielectric_db_per_100mm"], 4)
+                return out
+        sf = shape["shape_factor_per_mm"]
+        ac = rs_eff / (2.0 * z0) * sf
+        db = 8.686 * ac * 100.0
+        out["conductor_db_per_100mm"] = round(db, 4)
+        out["conductor_model"] = "field_surface_charge"
+        out["shape_factor_per_mm"] = round(sf, 5)
+        out["shape_factor_split"] = {"signal": round(shape["live_share"], 5),
+                                     "return": round(shape["ground_share"], 5),
+                                     "trace_sides": round(shape["side_share"], 5)}
+        out["shape_factor_mesh_drift_pct"] = (
+            None if shape["mesh_drift_pct"] is None
+            else round(shape["mesh_drift_pct"], 2))
+        if shape.get("zero_thickness"):
+            out["shape_factor_caveat"] = (
+                "copper_um = 0: a zero-thickness edge makes the surface charge "
+                "diverge as r^-1/2, so INT g^2 ds has a logarithmic mesh "
+                "dependence. Read the drift figure before trusting the last digit, "
+                "and ask for finite copper when the answer decides a stackup")
+        out["conductor_note"] = ("Rs/(2*Z0) * INT g^2 ds from the 2-D field "
+                                 "solution (edge crowding and the return-current "
+                                 "spread are in it); the sheet figure above is for "
+                                 "comparison, not a bound")
+        out["total_db_per_100mm"] = round(
+            out["conductor_db_per_100mm"] + out["dielectric_db_per_100mm"], 4)
+        if sheet > 0:
+            out["field_over_sheet_ratio"] = round(db / sheet, 3)
     else:
         out["conductor_db_per_100mm"] = None
-        out["conductor_note"] = ("not computed for coplanar lines: it needs the "
-                                 "current distribution over the strip edges. The "
-                                 "total above is a LOWER bound")
+        out["conductor_model"] = "not_computed"
+        out["conductor_note"] = ("not computed for coplanar lines: field2d has "
+                                 "microstrip and stripline cross-sections only, and "
+                                 "a coplanar line puts the return conductor on the "
+                                 "same layer. The total below is the dielectric "
+                                 "term alone, a LOWER bound")
         out["total_db_per_100mm_lower_bound"] = out["dielectric_db_per_100mm"]
-    out["surface_resistance_ohm_sq"] = round(_surface_resistance(freq_ghz), 5)
     return out
 
 # ------------------------------------------------------------------ forward
@@ -250,7 +352,7 @@ _PRECISION = {
 
 def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0,
                        er=4.3, freq_ghz=None, tan_delta=None, verify_field=False,
-                       field_levels=1):
+                       field_levels=1, roughness_um=0.0):
     """Z0, effective permittivity, guided wavelength and loss for one line."""
     kind = str(kind or "").strip().lower()
     if kind not in KINDS:
@@ -320,7 +422,14 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
                 return err("tan_delta must be numeric", "ARG_INVALID")
             if td < 0:
                 return err("tan_delta must be >= 0", "ARG_RANGE")
-            out["loss"] = _attenuation(kind, z0, ee, er, w, h, f, td)
+            try:
+                rough = float(roughness_um or 0.0)
+            except (TypeError, ValueError):
+                return err("roughness_um must be numeric", "ARG_INVALID")
+            if rough < 0:
+                return err("roughness_um must be >= 0", "ARG_RANGE")
+            out["loss"] = _attenuation(kind, z0, ee, er, w, h, f, td,
+                                       t_mm=t, roughness_um=rough)
     if kind in ("cpw", "gcpw"):
         out["cpw_geometry"] = {k: (round(v, 6) if isinstance(v, float) else v)
                                for k, v in extra.items()}

@@ -178,7 +178,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
-| `feedline_impedance` | 微带 / 带状线 / CPW / GCPW → Z0 与 εeff | CPW 不建模铜厚（明说）；CPW 导体损耗回 `null` + 原因 |
+| `feedline_impedance` | 微带 / 带状线 / CPW / GCPW → Z0 与 εeff；损耗（导体 = 截面场解 `Rs/(2Z0)·∮g²ds`，另给薄电流式作第二估计 + `roughness_um`） | CPW 不建模铜厚、导体损耗回 `null` + 原因（同层回流）；`t=0` 带网格漂移告警 |
 | `feedline_width` | Z0 → 线宽（二分） | 不可达回 `OUT_OF_RANGE` + `reachable_ohm` 两端实测 |
 | `antenna_patch` | 矩形贴片：W/L（含边缘 dL）、边缘 Rin、内缩深度、Q、VSWR<2 带宽、效率 | 传输线模型；内缩不含开槽宽度；效率需要 tanδ |
 | `antenna_printed` | 印刷四分之一波长（IFA / 蛇形 / 印刷单极）：长度**区间** + IFA 抽头 + Chu 上限 | εeff 无可信闭式 ⇒ 给区间不给单值；蛇形必须传 `bbox_mm` 并回 `fits` |
@@ -584,12 +584,12 @@ pcb_agent_mcp/
 │       ├── current.py            # IPC-2221 载流正/反解 + 过孔
 │       ├── impedance.py          # 微带/带状线正/反解 + 有效区间护栏
 │       ├── diffpair.py           # 边耦合差分阻抗正/反解
-│       ├── field2d.py            # 差分截面的 2-D 场解（有限体积 + 红黑 SOR）
+│       ├── field2d.py            # 差分截面 2-D 场解（有限体积 + 红黑 SOR）+ 导体形状因子 ∮g²ds
 │       ├── rf.py                 # λ/20
 │       ├── creepage.py           # 安规间距公共入口：IEC 60664-1 族走 iec60664，其余 fail-closed
 │       ├── iec60664.py           # IEC 60664-1:2020-05 爬电/间隙/瞬态/耐压/槽宽（行为反演）
 │       ├── safety_table.py       # 表本身的可执行体检（来源数/单调性/重复 key）
-│       ├── feedline.py           # 微带/带状线/CPW/GCPW + 反解宽度
+│       ├── feedline.py           # 微带/带状线/CPW/GCPW + 反解宽度 + 导体损耗场解/薄电流双估计
 │       ├── antenna.py            # 贴片/印刷线/偶极单极/螺旋/小环/Chu 上限/芯片天线
 │       ├── matching.py           # 反射/L/π/T/短截线/四分之一波长/带宽=f0/Q（每解回代）
 │       ├── link.py               # FSPL/Friis/最大距离/有效面积/远场/菲涅耳
