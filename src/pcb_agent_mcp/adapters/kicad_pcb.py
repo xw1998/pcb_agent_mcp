@@ -133,6 +133,10 @@ def xy_raw(node):
 
 
 # ------------------------------------------------------------------- outline
+# 1 um: a pad edge that is a polygon approximation must never be the reason a
+# clearance check disagrees with KiCad by a measurable amount.
+_ARC_CHORD_TOL = 0.001
+
 def _arc_points(start, mid, end):
     """Three-point arc -> polyline (KiCad 6+ `gr_arc` stores start/mid/end)."""
     ax, ay = start
@@ -160,7 +164,7 @@ def _arc_points(start, mid, end):
     sweep = _norm(a1 - a0)
     if not (_norm(am - a0) <= sweep + 1e-6):
         sweep -= 360.0
-    return G.arc_to_points((ux, uy), r, a0, sweep)
+    return G.arc_to_points((ux, uy), r, a0, sweep, chord_tol_mm=_ARC_CHORD_TOL)
 
 
 def _chain_segments(segments, tol=1e-6):
@@ -227,7 +231,8 @@ def _edge_polygons(board_node):
                     r = G.dist_point_point(center, arc_start)
                     a0 = math.degrees(math.atan2(arc_start[1] - center[1],
                                                  arc_start[0] - center[0]))
-                    pts = G.arc_to_points(center, r, a0, ang)
+                    pts = G.arc_to_points(center, r, a0, ang,
+                                          chord_tol_mm=_ARC_CHORD_TOL)
                 for i in range(len(pts) - 1):
                     segments.append((pts[i], pts[i + 1]))
             elif kind == "gr_rect":

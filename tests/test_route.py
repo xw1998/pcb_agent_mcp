@@ -35,6 +35,7 @@ from pcb_agent_mcp.route import grid as GRID
 from pcb_agent_mcp.route import intent as INTENT
 from pcb_agent_mcp.route import rules as R
 from pcb_agent_mcp.route import router
+from pcb_agent_mcp.route import topology as TOPO
 from pcb_agent_mcp.route import tune as TUNE
 
 SPEC = {"width_mm": 60, "height_mm": 40, "copper_layers": 2, "engine": False,
@@ -1357,6 +1358,180 @@ class TestNewCopperMakesThePourStale(RouteBase):
         self.assertEqual(out["status"], "ok", out)
         self.assertTrue(out["pour"]["needs_refill"])
         self.assertTrue(out["assumptions"]["pour"]["needs_refill"])
+
+class TestARefillCanBeAskedFor(RouteBase):
+    """Reporting a stale pour is not the same as fixing it - the fix exists too.
+
+    The pour that goes stale is the one the router itself made stale, so the only
+    honest thing to offer is KiCad's own filler: `refill_pours=true` runs it after
+    the copper is written and transplants its polygons. The fill is faked here
+    (the real engine is exercised by tests/test_zone_fill.py against pcbnew);
+    what is under test is the wiring - that it runs exactly when asked, that the
+    answer says whether it ran, and that "nothing went stale" is not a refill.
+    """
+
+    def _pillars(self, net="A"):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": net}),
+                   self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": net}))
+
+    def _pillars_in_a_pour(self, net="A"):
+        self._pillars(net)
+        self.apply({"op": "add_zone", "layer": "F.Cu", "net": net,
+                    "x0": 0.0, "y0": 0.0, "x1": 60.0, "y1": 40.0})
+
+    def _fake_fill(self, calls, status="ok"):
+        def fill(path, in_place=False, timeout=300):
+            calls.append({"path": path, "in_place": in_place})
+            if status != "ok":
+                return {"status": "error", "reason_code": status,
+                        "message": "engine said no"}
+            return {"status": "ok",
+                    "value": {"zones": 1, "poured_zones": 1,
+                              "fill_area_mm2": 2400.0, "written_to_file": True,
+                              "checkpoint_id": "cp-1", "per_zone": [],
+                              "poured_nothing": []},
+                    "unit": "zones / mm2", "model": "vendor_zone_filler"}
+        return fill
+
+    def test_a_refill_runs_after_the_copper_and_says_so(self):
+        self._pillars_in_a_pour()
+        calls = []
+        real = tools._fill.fill
+        tools._fill.fill = self._fake_fill(calls)
+        try:
+            out = self.call(nets="A", layers="F.Cu", apply=True, refill_pours=True)
+        finally:
+            tools._fill.fill = real
+        self.assertEqual(out["status"], "ok", out)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(calls[0]["in_place"])
+        self.assertEqual(out["refill"]["status"], "refilled")
+        self.assertTrue(out["value"]["refilled"])
+        self.assertEqual(out["value"]["fill_area_mm2"], 2400.0)
+        self.assertTrue(out["assumptions"]["pour"]["refilled"])
+        self.assertIn("board_drc", out["next_step"])
+
+    def test_without_the_flag_no_filler_is_run(self):
+        self._pillars_in_a_pour()
+        calls = []
+        real = tools._fill.fill
+        tools._fill.fill = self._fake_fill(calls)
+        try:
+            out = self.call(nets="A", layers="F.Cu", apply=True)
+        finally:
+            tools._fill.fill = real
+        self.assertEqual(out["status"], "ok", out)
+        self.assertNotIn("refill", out)
+        self.assertEqual(calls, [])
+
+    def test_nothing_stale_is_not_a_refill(self):
+        self._pillars()                     # no zone at all: nothing can go stale
+        calls = []
+        real = tools._fill.fill
+        tools._fill.fill = self._fake_fill(calls)
+        try:
+            out = self.call(nets="A", layers="F.Cu", apply=True, refill_pours=True)
+        finally:
+            tools._fill.fill = real
+        self.assertEqual(out["refill"]["status"], "nothing_stale")
+        self.assertNotIn("refilled", out["value"])
+        self.assertEqual(calls, [])
+
+    def test_a_refusal_is_reported_and_the_copper_stays(self):
+        self._pillars_in_a_pour()
+        calls = []
+        real = tools._fill.fill
+        tools._fill.fill = self._fake_fill(calls, status="ENGINE_FAILED")
+        try:
+            out = self.call(nets="A", layers="F.Cu", apply=True, refill_pours=True)
+        finally:
+            tools._fill.fill = real
+        self.assertEqual(out["status"], "ok", out)   # the copper itself was written
+        self.assertEqual(out["refill"]["status"], "refused")
+        self.assertEqual(out["refill"]["error"]["reason_code"], "ENGINE_FAILED")
+        self.assertNotIn("refilled", out["value"])
+        self.assertIn("still the pre-routing ones", out["next_step"])
+
+class TestABranchPointIsNotAPad(RouteBase):
+    """A spanning tree may only bend at pads; copper may bend wherever it likes.
+
+    Three pads at (0,0), (2,2) and (4,0) cost 4+4 = 8 mm of Manhattan copper as a
+    spanning tree, and 2+2+2 = 6 mm if the tree branches at (2,0) - a point that
+    is not a pad. `topology="steiner"` lets the router use that point.
+
+    What is NOT claimed: this is the iterated 1-Steiner heuristic on the Hanan
+    grid, an upper bound on the exact rectilinear Steiner tree, so a saving that
+    exists can still be missed. And the lengths here are pad-centre to pad-centre
+    before the search has avoided anything; the copper that is really laid down
+    is reported per net.
+    """
+
+    def test_the_classic_star_gets_shorter(self):
+        pts = [(0.0, 0.0), (2.0, 2.0), (4.0, 0.0)]
+        mst = TOPO.tree(pts, "mst")
+        st = TOPO.tree(pts, "steiner")
+        # mst mode keeps the number the router has always reported: a Manhattan
+        # spanning tree whose edges are then measured in Euclidean mm (on this
+        # three-point tie it joins (0,0)-(2,2) and (0,0)-(4,0))
+        self.assertAlmostEqual(mst["length_mm"], 2 * math.sqrt(2) + 4.0, places=3)
+        # steiner mode reports the metric the search actually pays - Manhattan
+        self.assertEqual(st["mst_length_mm"], 8.0)
+        self.assertEqual(st["length_mm"], 6.0)
+        self.assertEqual(st["saved_mm"], 2.0)
+        self.assertEqual([list(p) for p in st["steiner"]], [[2.0, 0.0]])
+        self.assertEqual(len(st["edges"]), 3)          # 3 pads + 1 branch - 1
+
+    def test_two_pads_have_nothing_to_branch(self):
+        st = TOPO.tree([(0.0, 0.0), (5.0, 0.0)], "steiner")
+        self.assertEqual(st["steiner"], [])
+        self.assertEqual(st["length_mm"], 5.0)
+        self.assertIn("nothing to branch", st["note"])
+
+    def test_the_heuristic_never_makes_the_tree_longer(self):
+        pts = [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0), (10.0, 10.0),
+               (5.0, 3.0)]
+        st = TOPO.tree(pts, "steiner")
+        self.assertLessEqual(st["length_mm"], st["mst_length_mm"] + 1e-9)
+        self.assertGreaterEqual(st["saved_mm"], 0.0)
+
+    def test_an_unknown_topology_is_refused(self):
+        board = self.load()
+        with self.assertRaises(router.RouteError) as caught:
+            router.plan(board, topology="rmst")
+        self.assertEqual(caught.exception.reason_code, "ARG_INVALID")
+        out = self.call(nets="A", layers="F.Cu", topology="rmst")
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "ARG_INVALID")
+
+    def _star(self, net="A"):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J1", x=10.0,
+                              y=10.0, nets={"1": net}),
+                   self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J2", x=20.0,
+                              y=20.0, nets={"1": net}),
+                   self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J3", x=30.0,
+                              y=10.0, nets={"1": net}))
+
+    def test_the_router_uses_a_branch_point_when_asked(self):
+        self._star()
+        res = self.route(nets=["A"], layers=["F.Cu"], topology="steiner")
+        self.assertEqual(res["failed"], [], res["failed"])
+        self.assertEqual(res["stats"]["topology"], "steiner")
+        net = res["nets"][0]
+        self.assertEqual(net["topology"], "steiner")
+        self.assertGreaterEqual(len(net["steiner_points"]), 1)
+        self.assertLessEqual(net["tree_mm"], net["tree_mm_mst"] + 1e-9)
+        self.assertGreater(net["segments"], 0)
+
+    def test_mst_is_still_the_default(self):
+        self._star()
+        res = self.route(nets=["A"], layers=["F.Cu"])
+        net = res["nets"][0]
+        self.assertEqual(net["topology"], "mst")
+        self.assertNotIn("steiner_points", net)
+        self.assertEqual(net["edges"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

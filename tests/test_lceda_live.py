@@ -447,8 +447,17 @@ LIVE_ENDPOINTS = L.available_endpoints()
 class TheRunningEditorAnswersForReal(unittest.TestCase):
     """The only case that proves the bytes are right for the real application."""
 
+    def _connect_or_skip(self):
+        """`LIVE_ENDPOINTS` is an import-time snapshot: a pipe can be gone by the
+        time the test runs (the application was closed mid-suite), and that is a
+        missing instrument, not a regression. Skip, never fail."""
+        try:
+            return L.connect()
+        except L.LiveError as exc:
+            self.skipTest("the editor's pipe went away: %s" % (exc,))
+
     def test_ping_reports_a_bridge_version_and_the_endpoint_is_the_one_we_found(self):
-        client = L.connect()
+        client = self._connect_or_skip()
         try:
             self.assertTrue(client.verified)
             self.assertIn(client.identity.get("endpoint"), LIVE_ENDPOINTS)
@@ -457,7 +466,7 @@ class TheRunningEditorAnswersForReal(unittest.TestCase):
             client.close()
 
     def test_the_eda_namespace_lists_the_pcb_document_class(self):
-        client = L.connect()
+        client = self._connect_or_skip()
         try:
             surface = client.api("eda")
         finally:

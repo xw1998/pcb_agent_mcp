@@ -189,6 +189,28 @@ def _zones_ok(rows):
     )
 
 
+def _without_previous_fill(doc):
+    """Drop every `filled_polygon` from the zones. Returns how many were dropped.
+
+    Why this is not a cosmetic step: a `filled_polygon` is the filler's own
+    OUTPUT, never its input - KiCad recomputes it from `(polygon)` plus the
+    clearance rules every time it fills. But pcbnew 10's `LoadBoard` was measured
+    to hang (no return in 300 s, `faulthandler` inside `LoadBoard`) on the boards
+    this project writes once they carry a filled polygon, while `kicad-cli` reads
+    the very same file without complaint. Handing the engine a board that carries
+    its own previous output therefore buys nothing and can cost the whole call,
+    so the copy it fills has the stale polygons removed. The polygons that end up
+    in the answer are the ones it just produced, and the transplant still writes
+    them into the caller's file.
+    """
+    board = doc.board()
+    dropped = 0
+    for zone in S.children(board, "zone"):
+        for poly in list(S.children(zone, "filled_polygon")):
+            S.remove_child(zone, poly)
+            dropped += 1
+    return dropped
+
 # ------------------------------------------------------------------- filling
 def fill(path, in_place=False, timeout=300):
     """Ask the vendor engine to pour the zones; measure it, optionally keep it.
@@ -218,7 +240,10 @@ def fill(path, in_place=False, timeout=300):
     try:
         src_copy = os.path.join(tmp, "src.kicad_pcb")
         dst = os.path.join(tmp, "filled.kicad_pcb")
-        shutil.copyfile(path, src_copy)
+        engine_input = _kdoc.KiCadDocument.from_path(path)
+        stale_dropped = _without_previous_fill(engine_input)
+        with open(src_copy, "wb") as fh:
+            fh.write(engine_input.to_bytes())
         env = _clean_env()
         try:
             proc = subprocess.run([py, "-c", _SCRIPT, src_copy, dst],
@@ -252,7 +277,9 @@ def fill(path, in_place=False, timeout=300):
         after_rows = _zone_rows(_kdoc.KiCadDocument.from_path(path).board()) \
             if written else rows_after
         return _fill_ok(after_rows, rows_before, build, written, checkpoint,
-                        path)
+                        path, stale_dropped,
+                        _format_generation_note(before, after_rows)
+                        if written else None)
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -302,7 +329,61 @@ def _transplant(path, rows_before, rows_after):
     return (True, checkpoint, None)
 
 
-def _fill_ok(rows, rows_before, build, written, checkpoint, path):
+def _format_generation_note(doc, rows):
+    """Warn when a pre-v7 file was given polygons computed by a modern KiCad.
+
+    Measured, not guessed. On the reference pour (40x30 mm, one GND zone,
+    min_thickness 0.25, zone clearance 0.35) the transplanted vertices are
+    **identical** to the ones `kicad-cli pcb drc --refill-zones --save-board`
+    produces (254 vertices, same set), and yet:
+
+    * this file (format 20221018): KiCad 10 DRC reports `clearance 0.35 实际
+      0.2255` three times - 0.2255 = 0.35 - 0.1245, i.e. exactly min_thickness/2;
+    * the same polygons in a pcbnew-saved copy of it: no clearance violation;
+    * this file with the zone's min_thickness set to 0: no clearance violation.
+
+    So the copper is right and the *interpretation* differs: a pre-v7
+    `filled_polygon` is read as the CENTRELINE of a `min_thickness`-wide stroke,
+    and KiCad 10's DRC measures to that stroke's outer edge. A v7+ file says the
+    same thing the other way round, which is why pcbnew's own save is clean.
+    """
+    version = S.arg_text(S.child(doc.board(), "version"), 1) or ""
+    try:
+        generation = int(version)
+    except (TypeError, ValueError):
+        return None
+    if generation >= 20230000:
+        return None
+    half = []
+    for row in rows:
+        node = S.child(row["_node"], "min_thickness")
+        value = S.arg_num(node, 1) if node is not None else None
+        if value and value > 0:
+            half.append(round(value / 2.0, 6))
+    if not half:
+        return None
+    return {
+        "file_version": version,
+        "stroke_halfwidth_mm": max(half),
+        "what_is_measured": (
+            "the transplanted vertices are identical to `kicad-cli pcb drc "
+            "--refill-zones --save-board`'s (254 vertices on the reference "
+            "pour), yet KiCad 10's DRC flags this file's pour at 0.2255 mm "
+            "against a declared 0.35 - exactly min_thickness/2 closer - while "
+            "a pcbnew-saved copy of the same board is clean"),
+        "why": (
+            "a pre-v7 `filled_polygon` is read as the centreline of a "
+            "min_thickness-wide stroke, so DRC measures its outer edge; a v7+ "
+            "file reads it as the copper outline. The copper is the engine's "
+            "either way - this file just declares an older format generation "
+            "than the polygons it now carries"),
+        "remedy": ("save/convert the board with KiCad (pcbnew) before running "
+                   "DRC, or lower the zone's min_thickness, or raise the zone's "
+                   "clearance by min_thickness/2 if a pre-v7 reader must pass"),
+    }
+
+def _fill_ok(rows, rows_before, build, written, checkpoint, path,
+             stale_dropped=0, format_note=None):
     from ..calc.result import ok
     poured = [r for r in rows if r["filled_polygons"]]
     empty = [{"net": r["net"], "layer": r["layer"], "why":
@@ -316,6 +397,7 @@ def _fill_ok(rows, rows_before, build, written, checkpoint, path):
             "fill_area_mm2": area,
             "written_to_file": bool(written),
             "checkpoint_id": (checkpoint or {}).get("checkpoint_id"),
+            "stale_polygons_dropped_before_the_engine": stale_dropped,
             "per_zone": [_summary_row(r) for r in rows],
             "poured_nothing": empty,
         },
@@ -338,6 +420,13 @@ def _fill_ok(rows, rows_before, build, written, checkpoint, path):
                     "nothing was written: this call measured what a fill would "
                     "produce, on a copy"),
             "zones_before": len(rows_before),
+            "engine_saw_no_stale_polygons": (stale_dropped > 0),
+            "why_the_polygons_were_dropped": (
+                "a filled_polygon is the filler's own output, so it is removed "
+                "from the copy handed to the engine and recomputed; on these "
+                "boards pcbnew's LoadBoard was measured to hang when the file "
+                "still carried one"),
+            "format_generation": format_note,
             "path": path,
         },
     )

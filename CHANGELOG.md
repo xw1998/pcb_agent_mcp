@@ -9,6 +9,52 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.17] - 2026-10-29
+
+「把 0.0.16 停下的三个边界推到底」——铺铜从「知道过期」变成「会重填」、多端网从「只有 Prim MST」
+变成「可要求 Steiner」、弧从「固定 7.5°」变成「绝对弦差」。四件事的卡点都不在算法上，而在
+**引擎读不读得动我们的文件 / 省的是哪一段长度 / 精度问的是角度还是弦差 / 进程里有没有文档上下文**。
+逐条口径见 `docs/27` §27.13。
+
+- **铺铜自动重填**（`board_route(refill_pours=True)`，**默认 false**）：先问 `_pour_report` 有没有
+  过期（没有就 `refill.status="nothing_stale"`，**不调引擎**），有过期才委派 KiCad 的 `ZONE_FILLER`
+  并以字节保真方式把新多边形移植回**我们这份**文件（不拿 pcbnew 存的板整体替换）。
+- **引擎挂死的真因是「输入形态」不是「填充慢」**：`pcbnew.LoadBoard` 在「我们写出的 + 带
+  `filled_polygon` 的板」上挂死 300 s（`faulthandler` 栈停在 `pcbnew.py:9896 in LoadBoard`），
+  同一文件 `kicad-cli` 读得动。逐个排除到只剩这一个组合后改成 **`fill._without_previous_fill()`：
+  交给引擎之前把每个 zone 的 `filled_polygon` 剥掉**——因为它是 filler 的**输出**不是输入。
+  重填从 `TIMEOUT` 变 **0.6–1.4 s `status="refilled"`**，铜面积 1044.468 → **1023.912 mm²**
+  （新走线把铜挤开）。剥了几个写进 `value.stale_polygons_dropped_before_the_engine`，
+  `assumptions` 里同时写 `engine_saw_no_stale_polygons` 与理由。
+- **移植的铜与 `kicad-cli` 的铜是同一块**（控制臂实测）：两边都是 1 个多边形 / 252 顶点 /
+  点集完全相同 / 面积 1023.912 mm²，`identical=True`。第一版控制臂拿 pre_route（无轨道）的板去比，
+  得到 `identical=False` —— 那比的是两块不同的板，已改正。
+- **同一份铜两个 DRC 读数是版式代际差，不是几何差**：我们的 refilled（`version 20221018`）报 5 条
+  （`clearance 3` + `text_height 2`），`kicad-cli --refill-zones --save-board` 存过的报 2 条。
+  差的 3 条全是 `间距 0.3500 / 实际 0.2255`，而 `0.2255 = 0.35 − min_thickness(0.25)/2`。
+  排除矩阵（min_thickness→0、换 zone 节点、逐节点反向替换、升 version、`--save-board` 不 `--refill-zones`）
+  指向唯一解释：**pre-v7 把 `filled_polygon` 读作 `min_thickness` 宽描边的中心线，DRC 量描边外沿**。
+  处理方式是把事实写进 `assumptions.format_generation`（`file_version` / `stroke_halfwidth_mm` /
+  `what_is_measured` / `why` / 三条 `remedy`），**不偷偷改几何、不偷偷升 version**。
+- **多端网拓扑**（`route/topology.py`，新文件）：`mst` 与 `steiner`（iterated 1-Steiner on Hanan grid，
+  候选点上限 400、超限置 `hanan_truncated`）。实测经典星形 `length_mm` 6.8284（`mst`，历史欧氏口径）→
+  `steiner` 的 `mst_length_mm=8.0` / `length_mm=6.0` / `saved_mm=2.0`；五点 37.0711 → **30.0**
+  （`saved_mm=10.0`，Steiner 点 `(0,5)` / `(10,5)`）。**默认仍是 `mst`**（零行为变化），
+  Steiner 每个分支点多一次 A*；分支点落网格外→整网回退 mst 并写 `topology_note`；
+  非法值 `ARG_INVALID`。三条 NOT 写在文件头：不是精确 RSMT / 报的不是实际铜长 / 每个分支点要额外 A*。
+- **弧近似改成绝对弦差**：`geometry.arc_to_points(..., chord_tol_mm=)`，`θ_max = 2·acos(1 − tol/r)`、
+  段数夹 4~720；`adapters/kicad_pcb.py` 三处调用点（三点定圆 / legacy `(start center)(end)(angle)` /
+  `fp/gr arc`）统一 `_ARC_CHORD_TOL = 0.001`（1 µm）。默认 7.5°/段的误差与半径成正比（r=1 → 1.82 µm、
+  r=5 → 9.12/10.27 µm），改成 1 µm 弦差后 r=1/5/0.5 分别是 n=18/40/4、误差 0.00095/0.00096/0.00048 mm。
+  理由：焊盘边缘的多边形近似不该成为 clearance 判定的分歧源。
+- **立创 Pro 写路径的阻塞被钉清**：桥可达（ping / invoke / `doc.api` 全通），但同时刻 `tabs` 只有
+  Start Page、`getAllProjectsUuid()` 空、`getAllPcbsInfo()` `null`、`openDocument(...)` 回 `null`、
+  `openProject(...)` 30 s 超时 ⇒ **没有文档上下文，一切写方法都没有作用对象**。`createPcb()`
+  造游离 PCB 会进用户在线工作区，**故意不做**。`verified_against_app` 仍为 `false`，但理由从
+  「没验」换成「当前应用状态下令它不可达」。
+- **门禁**：`test_route.py` 66 → **76** 例 / 22 类（新增 `TestARefillCanBeAskedFor` 4 例、
+  `TestABranchPointIsNotAPad` 6 例）；`--selftest` 87 项不变。
+
 ## [0.0.16] - 2026-10-29
 
 「把 0.0.15 的 §27.10 那张欠账清单逐条做完」——九条加上一条新欠账。每一节都分开写**机制**与

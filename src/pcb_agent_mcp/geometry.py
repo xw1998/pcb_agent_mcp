@@ -172,13 +172,28 @@ def dist_polygon_polygon(pa, pb):
     return best
 
 
-def arc_to_points(center, radius, start_deg, sweep_deg, segments=None):
+def arc_to_points(center, radius, start_deg, sweep_deg, segments=None,
+                   chord_tol_mm=None):
     """Approximate an arc as a polyline.
 
     Chord error for `segments` pieces is r*(1-cos(theta/2)); callers that care
-    pass a `segments` count derived from a target chord error. The Oracle states
-    this approximation in its `precision` field rather than hiding it.
+    pass a `segments` count derived from a target chord error, or the error
+    itself as `chord_tol_mm` and let this function work the count out. The Oracle
+    states this approximation in its `precision` field rather than hiding it.
+
+    The default (one piece per 7.5 degrees) bounds the error by r*0.00214, which
+    is 2.1 um on a 1 mm radius but 10.7 um on a 5 mm one - the chord error is
+    proportional to the radius, so a fixed angular step is not a fixed accuracy.
+    `chord_tol_mm` is the honest way to ask for an absolute one:
+    theta_max = 2*acos(1 - tol/r), capped at 720 pieces so a huge radius cannot
+    turn a pad outline into a million-point polygon.
     """
+    if segments is None and chord_tol_mm is not None and radius > 0 \
+            and chord_tol_mm < radius:
+        import math as _m
+        step = 2.0 * _m.degrees(_m.acos(1.0 - chord_tol_mm / radius))
+        if step > 0:
+            segments = max(4, min(720, int(_m.ceil(abs(sweep_deg) / step))))
     if segments is None:
         segments = max(4, int(abs(sweep_deg) / 7.5) + 1)
     out = []

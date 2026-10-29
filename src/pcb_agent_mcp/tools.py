@@ -1214,12 +1214,27 @@ _tool(
     "the cheapest of the losers - and only the BEST round is kept, because a late "
     "round's inflated prices make detours longer rather than better. It is off by "
     "default on measurement, not modesty: on the 4-layer 50-net board below it buys "
-    "+3 nets for +61% of the time, and that is one board. What it still does NOT "
-    "do: refill a pour it has just made stale (it reports "
-    "`pour.needs_refill` instead), or synthesise a thermal relief.",
+    "+3 nets for +61% of the time, and that is one board. Refilling the pours "
+    "the new copper made stale is opt-in too (`refill_pours`, default false): by "
+    "default the report only names those zones, and when asked for, KiCad's own "
+    "ZONE_FILLER re-pours them and its polygons are transplanted into the file "
+    "(byte-preserving, checkpointed) - a thermal relief is not synthesised here, "
+    "because the spokes are ZONE_FILLER's decision and are simply inside the "
+    "polygons after a refill (`assumptions.pour.thermal_spokes` says so).",
     {"type": "object",
      "properties": dict({
          "apply": _bool("write the copper (default false: plan only)"),
+         "topology": _str(
+             "how a net with three or more pads is joined: \"mst\" (default) is a "
+             "spanning tree over the pad centres, \"steiner\" adds branch points "
+             "that are not pads (iterated 1-Steiner on the Hanan grid - an "
+             "approximation, never worse than mst, and each branch point costs one "
+             "more A*). Per net the answer carries `topology`, `tree_mm` and, for "
+             "steiner, `steiner_points` / `tree_mm_mst` / `tree_saved_mm`"),
+         "refill_pours": _bool(
+             "after writing, ask KiCad's own ZONE_FILLER to refill the zones the new "
+             "copper made stale, and transplant its polygons (default false: the "
+             "report only says which zones went stale)"),
          "intent": _str("design intent: a JSON file path or inline JSON object "
                         "({version:1, nets:{route,layers}, constraints:{...}, "
                         "diff_pairs, length_groups, impedance_targets, keepouts, "
@@ -1597,7 +1612,7 @@ def _board_route(args):
                 "return_path"):
         if args.get(key) is not None:
             kw[key] = bool(args[key])
-    for key in ("material_group", "insulation"):
+    for key in ("material_group", "insulation", "topology"):
         if args.get(key) is not None:
             kw[key] = str(args[key])
     if args.get("coating") is not None:
@@ -1733,6 +1748,41 @@ def _board_route(args):
         return _edit_error(exc)
     out["value"]["plan_id"] = plan["plan_id"]
     out["applied"] = applied
+    if args.get("refill_pours") is True:
+        # The pour is now stale by construction: the copper the router just wrote
+        # did not exist when KiCad filled it. Reporting that is not the same as
+        # fixing it, so the option to fix it exists - and it is KiCad's own
+        # ZONE_FILLER, transplanted byte-preservingly, never our re-implementation.
+        stale = (res.get("pour") or {}).get("needs_refill")
+        if not stale:
+            out["refill"] = {"status": "nothing_stale",
+                             "why": "no zone intersected the new copper, so no "
+                                    "filled_polygon became false"}
+        else:
+            filled = _fill.fill(args["path"], in_place=True)
+            out["refill"] = {
+                "status": ("refilled" if filled.get("status") == "ok"
+                           else "refused"),
+                "engine": "KiCad pcbnew ZONE_FILLER (transplanted, byte-preserving)",
+                "result": filled if filled.get("status") == "ok" else None,
+                "error": None if filled.get("status") == "ok" else filled,
+            }
+            if filled.get("status") == "ok":
+                out["value"]["refilled"] = True
+                out["value"]["fill_area_mm2"] = filled["value"]["fill_area_mm2"]
+                out["assumptions"]["pour"] = dict(
+                    out["assumptions"]["pour"] or {},
+                    refilled=True,
+                    refilled_by="pcbnew ZONE_FILLER",
+                    thermal_spokes="KiCad's decision, baked into the polygons")
+                out["next_step"] = ("the pour was refilled from KiCad's own filler; "
+                                    "run board_drc again - the DRC verdict above was "
+                                    "taken BEFORE the refill")
+            else:
+                out["next_step"] = ("the copper was written but the pour could not be "
+                                    "refilled; the filled_polygons in the file are "
+                                    "still the pre-routing ones - board_fill_zones "
+                                    "says why")
     return out
 
 _tool(

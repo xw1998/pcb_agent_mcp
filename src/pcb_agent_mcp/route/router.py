@@ -27,6 +27,7 @@ import time
 
 from .. import geometry as G
 from . import rules as R
+from . import topology as TOPO
 from . import tune
 from .grid import Grid, astar, mst_edges, simplify
 
@@ -363,7 +364,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          rip_up_rounds=1, second_sweep=True, incremental=False,
          congestion_rounds=2, congestion_max_rips=12, congestion_weight=1.0,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
-         return_path=True, return_path_net=None, progress=None):
+         return_path=True, return_path_net=None, topology="mst",
+         progress=None):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -374,7 +376,18 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     (`net`, `ok`, `status`, `s`). Routing a dense 50-net board takes minutes, and
     a caller who cannot see which net it is on has no way to tell "working" from
     "wedged".
+
+    `topology` says how a multi-pad net is joined: `"mst"` (default) is a
+    spanning tree over the pad centres, `"steiner"` adds branch points that are
+    not pads (see `route.topology`). A spanning tree can only bend at pads, so on
+    a star of pads it draws longer copper than the same search needs to; the
+    branch points cost one extra A* each and only appear where they strictly
+    shorten the tree.
     """
+    if topology not in ("mst", "steiner"):
+        raise RouteError("unknown topology %r" % (topology,), "ARG_INVALID",
+                         hint="use \"mst\" (spanning tree over pad centres) or "
+                              "\"steiner\" (adds branch points that are not pads)")
     t0 = time.time()
     bundle = R.resolve(board, clearance_mm=clearance_mm, track_mm=track_mm,
                        via_diameter_mm=via_diameter_mm, via_drill_mm=via_drill_mm,
@@ -539,14 +552,41 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             results[net]["notes"] = ((results[net]["notes"] + "; ") + note
                                      if results[net].get("notes") else note)
 
-        pts = [(it["term"]["at"][0], it["term"]["at"][1]) for it in terminals]
-        edges = mst_edges(pts)
         if not terminals:
             results[net]["status"] = "failed"
             results[net]["reason"] = {"code": "no_terminals"}
             return False
+        pts = [(it["term"]["at"][0], it["term"]["at"][1]) for it in terminals]
+        # `topology.tree` in "mst" mode reproduces `mst_edges` exactly, but its
+        # edge list indexes the *pad* list only, so the old contract holds.
+        tplan = TOPO.tree(pts, mode=topology)
+        branch = []
+        for (bx, by) in tplan["steiner"]:
+            bi, bj = grid.node(bx, by)
+            if not (0 <= bi < grid.nx and 0 <= bj < grid.ny):
+                branch = None
+                break
+            branch.append({"node": (bi, bj, None),
+                           "xy": grid.xy(bi, bj)})
+        if branch is None:                       # a branch point fell off the grid
+            branch = []
+            tplan = TOPO.tree(pts, mode="mst")
+            results[net]["topology_note"] = ("a steiner branch point landed outside "
+                                            "the grid, so mst was used")
+        edges = [tuple(e) for e in tplan["edges"]]
+        results[net]["topology"] = tplan["mode"]
+        results[net]["tree_mm"] = tplan["length_mm"]
+        if tplan["mode"] == "steiner":
+            results[net]["steiner_points"] = [list(p) for p in tplan["steiner"]]
+            results[net]["tree_mm_mst"] = tplan["mst_length_mm"]
+            results[net]["tree_saved_mm"] = tplan["saved_mm"]
 
         def goals_of(k):
+            if k >= len(terminals):
+                b = branch[k - len(terminals)]
+                i, j = b["node"][0], b["node"][1]
+                # a branch point has no pad, so it is free to sit on any layer
+                return ({(i, j)}, {(i, j): set(grid_layers)})
             it = terminals[k]
             i, j, layer = it["node"]
             return ({(i, j)}, {(i, j): set(it["term"]["layers"]) | {layer}})
@@ -574,7 +614,11 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                              via_check=_via_gate(grid, net) if allow_vias else None,
                              diag=ast_diag)
             if path is None:
-                t = terminals[b]["term"]
+                t = (terminals[b]["term"] if b < len(terminals) else
+                     {"reference": "(branch)", "pad": "-",
+                      "at": list(branch[b - len(terminals)]["xy"])})
+                bnode = (terminals[b]["node"] if b < len(terminals) else
+                         branch[b - len(terminals)]["node"][:2] + (grid_layers[0],))
                 results[net]["status"] = "failed"
                 # A search that ran out of budget has not shown there is no
                 # path, only that this router stopped looking. Saying "no_path"
@@ -583,14 +627,14 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                     "code": "search_budget" if ast_diag.get("budget_hit")
                             else "no_path",
                     "detail": [{"edge": "%s.%s -> %s.%s"
-                                % (terminals[a]["term"]["reference"],
-                                   terminals[a]["term"]["pad"],
+                                % ((terminals[a]["term"]["reference"]
+                                    if a < len(terminals) else "(branch)"),
+                                   (terminals[a]["term"]["pad"]
+                                    if a < len(terminals) else "-"),
                                    t["reference"], t["pad"]),
                                 "target": t["at"],
-                                "why": grid.blocked_reason(
-                                    terminals[b]["node"][0],
-                                    terminals[b]["node"][1],
-                                    terminals[b]["node"][2], net)}]}
+                                "why": grid.blocked_reason(bnode[0], bnode[1],
+                                                           bnode[2], net)}]}
                 ok = False
                 break
             simple = simplify(path)
@@ -620,6 +664,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         return ok
 
     stats = {"rips": 0, "sweeps": 1, "elapsed_s": 0.0, "rule_bundle": bundle,
+             "topology": topology,
              "rip_passes": 0,
              "grid_notes": list(grid.notes), "grid_cells": grid.nx * grid.ny,
              "pitch_mm": float(pitch_mm)}

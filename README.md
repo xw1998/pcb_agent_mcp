@@ -327,6 +327,10 @@ MCP 客户端配置（stdio）：
   前后一致就报 `WRITE_HAD_NO_EFFECT`、`save` 只能回 `expect=no_error`。每条答案
   `verified_against_app: false`，`not_verified` 里明写"磁盘上的文件真的变了吗 / 重载后还在吗"。
   `lceda_pro_run` 仍然在 assumptions 里写"片段自己能写、本工具不担保"。
+  **0.0.17 把阻塞钉清了：不是方法名不知道，是没有文档上下文。** 桥本身全通（ping / invoke /
+  `doc.api` 都对），但同时刻 `tabs` 只有 Start Page、`getAllProjectsUuid()` 空、`getAllPcbsInfo()`
+  `null`、`openDocument(...)` 回 `null`、`openProject(...)` 30 s 超时——一切写方法都没有作用对象。
+  唯一绕得开的 `createPcb()` 会往用户在线工作区里塞一块无名 PCB，**故意不做**。
 - **立创的"启动"曾经被判死，第三轮推翻了——差别只在父进程有没有控制台。** 前两轮记的是
   "0.5 s 退出、死在 Electron 之前"，那是**从 bash（继承控制台）启动**的现象；改成
   `explorer.exe "<exe>"`（等价双击）就稳定在三个进程上（203/36/289 MB），管道随即出现，
@@ -335,14 +339,22 @@ MCP 客户端配置（stdio）：
   `false`，`app_open_project` 只会回 `unconfirmed`；要开工程请用 `lceda_pro_open`。
   顺带查清：`--` 开头的选项（含厂商自带的 `--mcp stdio|http`）是被 **exe 里 node 自带的
   选项解析器**以 rc 9 拒掉的（`bad option: --mcp`），跟立创启动器无关。
-- **布线器的三条边界，0.0.16 之后仍然成立。** ① 拥塞协商（`congestion_rounds`）**默认关闭**：
+- **布线器的四条边界，0.0.17 之后是这样。** ① 拥塞协商（`congestion_rounds`）**默认关闭**：
   在 4 层 50 网 F401 核心板上 38/50 → 41/50，代价是 61% 的时间，而且那是**一块板**的读数，
   不是对所有板的承诺；默认开会替所有用户花掉这 61%。② 回流路径（换层配地过孔）在真板上
   **74 颗信号过孔里缝了 11 颗**，其余 63 颗被 `ground_not_on_two_layers` 拒（那几处地只在一侧有铜）；
   apply 后 `kicad-cli pcb drc` 的 `new_blocking_total = 0`，但新增 advisory 里有一条 `via_dangling`
   ——布通报 41 网不等于 41 网的铜都接上了，所以这一条的结论只能读到「不新增阻断项」。
-  ③ 新铜让铺铜过期这件事**只报不重填**：`pour.needs_refill` 与每块 zone 的 `segments_inside` 都给了，
-  重填仍是 KiCad 自己的事。
+  ③ 铺铜：**能报过期，也能重填**（`refill_pours=true`，**默认 false**）。重填委派 KiCad 自己的
+  `ZONE_FILLER`，再以字节保真方式把多边形移植回我们的文件；实测移植回来的铜与
+  `kicad-cli pcb drc --refill-zones --save-board` 填出来的**顶点集合完全相同**（1 个多边形 /
+  252 顶点 / 面积 1023.912 mm²）。但同一份铜在我们的 pre-v7 版式文件里会被 DRC 量出 3 条
+  `间距 0.3500 / 实际 0.2255` —— 那是 `min_thickness/2` 的代际差（pre-v7 把 `filled_polygon`
+  读作描边中心线），工具把它写进 `assumptions.format_generation` 并给出三条 remedy，
+  **不偷偷改几何、也不偷偷升 version**（docs/27 §27.13.3）。
+  ④ 多端网拓扑：`topology="steiner"`（iterated 1-Steiner on Hanan grid）确实省长度
+  （经典星形 8.0 → 6.0 mm、五点 37.0711 → 30.0 mm），但**默认仍是 `mst`**，每个分支点要多跑一次 A*，
+  而且它报的是 Manhattan 树干长度、不是布完之后实际的铜长，也**不是精确 RSMT**。
 - **差分阻抗有两级：闭式近似与二维场解，两者差多少是实测的。** `diff_impedance` 仍是边耦合闭式（IPC-2141A 族），`diff_impedance_field` 解真实截面上的 div(ε∇V)=0（有限体积 + 梯度张量网格 + 红黑 SOR，纯 stdlib）。闭式在实测几何上系统性**偏低 8~11%**、方向一致，所以「调宽凑数」会把线先做窄。场解自己的误差对着两个共享零近似的参考答案量过：零厚度带状线对精确共形解（w/b 0.5..4）≤1.2%、孤立微带对 Hammerstad ≤2.8%、耦合通路在 s/h=8 处对 2×孤立精确解 ≤2.7%；这三张表由 `tests/test_field2d.py` 每次重算，不会悄悄过期。**没被独立参考答案覆盖的是紧间距耦合**——那种几何下工具自己吐 `reference_note`，说明「这是求解器的意见，不是被核过的数」。两者都不建模阻焊、蚀刻梯形与铜损/色散。
 - **两张读不到原文的表，改走两条不需要原文的路。** 标准是付费的、公开转述互相矛盾（IPC-2152
   与 IPC-2221 差可 >3×），所以不自已抄表：
