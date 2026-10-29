@@ -198,8 +198,32 @@ def conductor_shape_factor_safe(kind, w_mm, h_mm, t_mm=0.0, er=4.3, fine_div=10.
                       % (out["nodes"], SHAPE_FACTOR_MAX_NODES))
     return out, None
 
+def coplanar_shape_factor_safe(kind, w_mm, g_mm, h_mm, er=4.3, fine_div=8.0):
+    """`field2d.coplanar_shape_factor` at ZERO thickness, or a reason string.
+
+    Zero thickness on purpose, and the reason is not the cost (although a 35 um
+    foil divided by four for the mesh multiplies it by ten). Measured on the same
+    code path, finite copper does NOT converge either: on w=0.3/g=0.2 the shape
+    factor reads 3.24 at two cells across the foil, 3.39 at 2.5, 3.50 at 3 and
+    3.67 at 4 - still climbing 10 % a step, so the thickness term has to be a
+    stated gap rather than a number that happens to come out of one mesh. The
+    zero-thickness value is the cheaper and better-defined one, and the missing
+    term has a known sign: real copper crowds onto its side walls and reads
+    higher.
+    """
+    from . import field2d
+    try:
+        out = field2d.coplanar_shape_factor(kind, w_mm, g_mm, h_mm, 0.0, er=er,
+                                            fine_div=fine_div,
+                                            max_nodes=SHAPE_FACTOR_MAX_NODES)
+    except ValueError as exc:
+        return None, "the field solve refused the section: %s" % exc
+    except Exception as exc:                                # noqa: BLE001
+        return None, "the field solve failed (%s: %s)" % (type(exc).__name__, exc)
+    return out, None
+
 def _attenuation(kind, z0, ee, er, w, h, freq_ghz, tan_delta, t_mm=0.0,
-                 roughness_um=0.0, shape=None):
+                 roughness_um=0.0, shape=None, g=None):
     """Loss per unit length, split into the two mechanisms.
 
     Conductor loss carries TWO estimates:
@@ -231,11 +255,22 @@ def _attenuation(kind, z0, ee, er, w, h, freq_ghz, tan_delta, t_mm=0.0,
     Copper roughness multiplies Rs by the Hammerstad-Jensen factor, reported
     separately so geometry and foil stay separable.
 
-    Coplanar conductor loss is still NOT computed: `field2d` has microstrip and
-    stripline cross-sections only, and a coplanar line is not that problem (the
-    return conductor is on the same layer and the field wraps the slot edges). The
-    field is reported as null with the reason, so a total attenuation read off
-    this answer is a bound rather than a guess in disguise.
+    Coplanar lines (cpw/gcpw) now go through the same field route with their own
+    cross-section: the return current has two wings (and, for gcpw, the backside
+    plane), and `shape_factor_split` reports all three instead of folding them
+    into one "return" number. Two things are NOT in it, both zero-thickness
+    artefacts with a known sign:
+
+      * finite copper raises INT g^2 ds (measured +10 % on w=0.3/g=0.2 between
+        two and four cells across a 35 um foil, and still climbing), so the
+        coplanar conductor figure is a LOWER bound on a real foil;
+      * the zero-thickness slot edge diverges, so the same figure has a
+        mesh-drift uncertainty of ~6-9 % that is reported, not hidden.
+
+    The sheet figure Rs/(Z0*w) is also reported for coplanar, and for coplanar it
+    is a stricter kind of wrong than on microstrip: it counts the centre strip
+    only and gives the ground planes nothing at all, while on a coplanar line the
+    return current is on the same layer and carries roughly a third of the loss.
     """
     lam0 = C0_MM_PER_NS / float(freq_ghz)          # mm
     ad = 0.0
@@ -291,14 +326,56 @@ def _attenuation(kind, z0, ee, er, w, h, freq_ghz, tan_delta, t_mm=0.0,
             out["conductor_db_per_100mm"] + out["dielectric_db_per_100mm"], 4)
         if sheet > 0:
             out["field_over_sheet_ratio"] = round(db / sheet, 3)
+    elif kind in ("cpw", "gcpw"):
+        sheet = 8.686 * (rs_eff / (z0 * w)) * 100.0
+        out["conductor_sheet_bound_db_per_100mm"] = round(sheet, 4)
+        if shape is None:
+            shape, why = coplanar_shape_factor_safe(kind, w, g, h,
+                                                    er=er if er > 1.0 else 4.3)
+        if shape is None:
+            out["conductor_db_per_100mm"] = None
+            out["conductor_model"] = "not_computed"
+            out["conductor_note"] = ("the coplanar field solve was unavailable: "
+                                     + str(why) + ". The total below is the "
+                                     "dielectric term alone, a LOWER bound")
+            out["total_db_per_100mm_lower_bound"] = out["dielectric_db_per_100mm"]
+            return out
+        sf = shape["shape_factor_per_mm"]
+        ac = rs_eff / (2.0 * z0) * sf
+        db = 8.686 * ac * 100.0
+        out["conductor_db_per_100mm"] = round(db, 4)
+        out["conductor_model"] = "field_surface_charge"
+        out["shape_factor_per_mm"] = round(sf, 5)
+        out["shape_factor_split"] = {
+            "signal": round(shape["live_share"], 5),
+            "return": round(shape["ground_share"], 5),
+            "return_left": round(shape.get("ground_share_left") or 0.0, 5),
+            "return_right": round(shape.get("ground_share_right") or 0.0, 5),
+            "return_back": round(shape.get("ground_share_back") or 0.0, 5)}
+        out["shape_factor_mesh_drift_pct"] = (
+            None if shape["mesh_drift_pct"] is None
+            else round(shape["mesh_drift_pct"], 2))
+        out["conductor_note"] = (
+            "Rs/(2*Z0) * INT g^2 ds on a coplanar cross-section: the two ground "
+            "wings%s are in it, and so is the crowding onto the slot edges. "
+            "Solved with ZERO-thickness copper, so this is a lower bound on a real "
+            "foil (finite copper measured +10%% on the same code path and not yet "
+            "converged); the sheet figure above counts the centre strip alone and "
+            "no return path at all"
+            % ("" if kind == "cpw" else " and the backside plane"))
+        if shape.get("zero_thickness"):
+            out["shape_factor_caveat"] = (
+                "the slot edges are r^-1/2 singularities at zero thickness, so "
+                "INT g^2 ds has a logarithmic mesh dependence: the drift figure "
+                "above is the honest uncertainty on the last digit")
+        out["total_db_per_100mm"] = round(
+            out["conductor_db_per_100mm"] + out["dielectric_db_per_100mm"], 4)
+        if sheet > 0:
+            out["field_over_sheet_ratio"] = round(db / sheet, 3)
     else:
         out["conductor_db_per_100mm"] = None
         out["conductor_model"] = "not_computed"
-        out["conductor_note"] = ("not computed for coplanar lines: field2d has "
-                                 "microstrip and stripline cross-sections only, and "
-                                 "a coplanar line puts the return conductor on the "
-                                 "same layer. The total below is the dielectric "
-                                 "term alone, a LOWER bound")
+        out["conductor_note"] = "kind is not a quasi-TEM line this module models"
         out["total_db_per_100mm_lower_bound"] = out["dielectric_db_per_100mm"]
     return out
 
@@ -338,16 +415,17 @@ _PRECISION = {
                   "reproduces it to 0.23 % .. 1.20 %; the thickness term is the "
                   "IPC-2141A widening, which references disagree on by up to ~2x on t "
                   "(< 2 % in Z0)"),
-    "cpw": ("quasi-static conformal model, NOT validated against a solver here - only "
-            "the two limits (er=1 -> coplanar strips in vacuum, h -> infinity -> "
-            "infinite-substrate textbook result) are asserted. Literature puts the "
-            "model itself at a few percent; thickness, dispersion and radiation are "
-            "not in it"),
-    "gcpw": ("quasi-static conformal model, NOT validated against a solver here; the "
-             "h -> infinity limit must equal the unbacked result and is asserted. "
-             "Coupling to the backside ground through the substrate is carried by the "
-             "tanh map; the parallel-plate mode that a real backed line can excite is "
-             "not modelled at all"),
+    "cpw": ("quasi-static conformal model, measured -1.19 % .. -3.39 % against the "
+            "2-D field solver over w 0.2-1.0 mm, g 0.15-0.5 mm, h 0.2-2.0 mm "
+            "(field2d.VALIDATION, coplanar case); the solver reads LOW of the closed "
+            "form everywhere, i.e. the closed form is the optimistic end. Copper "
+            "thickness, dispersion and radiation are not in it"),
+    "gcpw": ("quasi-static conformal model, measured -2.28 % .. -3.12 % against the "
+             "2-D field solver on the same range (field2d.VALIDATION, coplanar "
+             "case). Coupling to the backside ground through the substrate is carried "
+             "by the tanh map; the parallel-plate mode that a real backed line can "
+             "excite is not modelled at all, and neither are thickness, dispersion or "
+             "radiation"),
 }
 
 def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0,
@@ -429,7 +507,7 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
             if rough < 0:
                 return err("roughness_um must be >= 0", "ARG_RANGE")
             out["loss"] = _attenuation(kind, z0, ee, er, w, h, f, td,
-                                       t_mm=t, roughness_um=rough)
+                                       t_mm=t, roughness_um=rough, g=g)
     if kind in ("cpw", "gcpw"):
         out["cpw_geometry"] = {k: (round(v, 6) if isinstance(v, float) else v)
                                for k, v in extra.items()}
@@ -444,7 +522,28 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
         out["metal"] = {k: round(v, 6) for k, v in extra.items()}
         out["thickness_widening_mm"] = round(THICKNESS_WIDENING * t, 6)
 
-    if verify_field and kind in ("microstrip", "stripline"):
+    if verify_field and kind in ("cpw", "gcpw"):
+        from . import field2d as _f2d
+        levels = (1.0, 0.65) if field_levels else (1.0,)
+        z_field, drift, runs = _f2d.coplanar_solve_pair(kind, w, g, h, 0.0, er,
+                                                        levels=levels)
+        z_closed_t0 = _solve(kind, w, h, g, 0.0, er)[0]
+        out["field_check"] = {
+            "z0_field_ohm": round(z_field, 3),
+            "z0_closed_t0_ohm": round(z_closed_t0, 3),
+            "closed_minus_field_pct": round(
+                100.0 * (z_closed_t0 - z_field) / z_field, 2),
+            "mesh_drift_ohm": None if drift is None else round(drift, 4),
+            "geometry": ("zero-thickness copper on the same geometry: the coplanar "
+                         "closed form has no thickness term either, so this checks "
+                         "the geometry and not a thickness correction"),
+            "note": ("the coplanar field solution is a full-domain mesh with no "
+                     "symmetry plane, so it does not share the closed form's "
+                     "mirror assumption"),
+            "mesh": {"nodes": runs[0]["nodes"], "sweeps": runs[0]["sweeps"],
+                     "fine_mm": round(runs[0]["fine_mm"], 6)},
+        }
+    elif verify_field and kind in ("microstrip", "stripline"):
         # Deliberately solved with t = 0: `field2d` refines to min(w,h,t)/fine_div,
         # so a 35 um copper layer multiplies the node count by thousands and turns a
         # sub-second check into minutes. The check is therefore on the ZERO-thickness

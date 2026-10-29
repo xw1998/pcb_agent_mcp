@@ -1363,6 +1363,38 @@ def selftest():
           and any("no critical_strain_ue" in w for w in (_db.get("warnings") or [])),
           str(_db.get("surface_strain_ue")))
 
+    # Coplanar: the two exact invariants, plus the direction of the agreement with
+    # the conformal map. The solver must read LOW of the map (every entry in the
+    # validation table does), and the two ground wings must split the return
+    # current bit for bit - that equality is what the centred control volume buys.
+    r = handle({"jsonrpc": "2.0", "id": 126, "method": "tools/call",
+                "params": {"name": "coplanar_field",
+                           "arguments": {"width_mm": 0.3, "gap_mm": 0.2,
+                                         "dielectric_mm": 0.2, "kind": "cpw",
+                                         "levels": 1}}})
+    _cf = json.loads(r["result"]["content"][0]["text"])
+    check("coplanar cpw 0.3/0.2 on 0.2 mm er=4.3 solves to 89.7 ohm and reads low "
+          "of the conformal map",
+          _cf.get("status") == "ok" and abs(_cf.get("value", 0.0) - 89.67) < 0.9
+          and (_cf.get("closed_form_minus_solver_pct") or 1.0) < 0.0,
+          "%s vs %s" % (_cf.get("value"), _cf.get("closed_form_ohm")))
+
+    r = handle({"jsonrpc": "2.0", "id": 127, "method": "tools/call",
+                "params": {"name": "feedline_impedance",
+                           "arguments": {"kind": "cpw", "width_mm": 0.3,
+                                         "gap_mm": 0.2, "dielectric_mm": 0.2,
+                                         "freq_ghz": 2.4, "tan_delta": 0.02}}})
+    _cl = ((json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+           .get("loss") or {})
+    _sp = _cl.get("shape_factor_split") or {}
+    check("the coplanar return current splits evenly between the two wings and "
+          "nothing at all onto a backside plane that is not there",
+          _cl.get("conductor_model") == "field_surface_charge"
+          and (_cl.get("conductor_db_per_100mm") or 0.0) > 0.0
+          and _sp.get("return_left") == _sp.get("return_right")
+          and _sp.get("return_back") == 0.0,
+          str(_sp))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

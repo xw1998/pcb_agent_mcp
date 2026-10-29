@@ -471,6 +471,36 @@ _tool(
 )
 
 _tool(
+    "coplanar_field",
+    "Coplanar (cpw / gcpw) impedance from an actual 2-D field solution, drawn on a full "
+    "domain with no symmetry plane so it shares no assumption with the conformal map it "
+    "is checked against. Also returns the effective permittivity and the measured gap to "
+    "the closed form on the same geometry. Ten to forty seconds; the mesh is twice the "
+    "size of a pair section because the mirror plane is deliberately not used.",
+    {"type": "object",
+     "properties": {
+         "width_mm": _num("centre strip width"),
+         "gap_mm": _num("slot width from the strip edge to the ground edge"),
+         "dielectric_mm": _num("substrate thickness"),
+         "copper_um": _num("copper thickness in um; 0 = zero-thickness (cheap, and the "
+                           "only case the closed form has a term for)", 0),
+         "er": _num("relative permittivity", 4.3),
+         "kind": _str("cpw = air below the substrate, gcpw = ground plane below the "
+                      "substrate", ["cpw", "gcpw"], "cpw"),
+         "levels": _num("mesh refinement levels: 1 = one mesh, 2 = coarse->fine (default)",
+                        2),
+         "max_nodes": _num("refuse rather than grind if the mesh would exceed this",
+                           40000),
+     },
+     "required": ["width_mm", "gap_mm", "dielectric_mm"]},
+    lambda a: _field2d.coplanar_field(
+        a["width_mm"], a["gap_mm"], a["dielectric_mm"],
+        copper_um=a.get("copper_um", 0.0), er=a.get("er", 4.3),
+        kind=a.get("kind", "cpw"), levels=int(a.get("levels", 2)),
+        max_nodes=int(a.get("max_nodes", 40000))),
+)
+
+_tool(
     "lceda_api_probe",
     "Speak to LCEDA Pro's API gateway rather than just looking at the port: opens a "
     "real RFC 6455 WebSocket to 127.0.0.1:49620..49629, checks the handshake, and says "

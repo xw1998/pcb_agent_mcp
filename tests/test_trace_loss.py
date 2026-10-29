@@ -180,13 +180,29 @@ class TestFallbacks(unittest.TestCase):
         self.assertAlmostEqual(loss["conductor_db_per_100mm"],
                                loss["conductor_sheet_bound_db_per_100mm"], places=4)
 
-    def test_coplanar_still_refuses_conductor_loss(self):
+    def test_coplanar_conductor_loss_is_solved_and_says_what_it_leaves_out(self):
+        # 0.0.23 replaced the refusal with a field solution on a coplanar section.
+        # What must NOT change is the disclosure: the answer is a lower bound on a
+        # real foil and the note has to say so.
         r = feedline.feedline_impedance("cpw", 0.3, 0.2, gap_mm=0.2, er=4.3,
                                         freq_ghz=1.0, tan_delta=0.02)
         loss = r["value"]["loss"]
-        self.assertEqual(loss["conductor_model"], "not_computed")
-        self.assertIsNone(loss["conductor_db_per_100mm"])
-        self.assertIn("same layer", loss["conductor_note"])
+        self.assertEqual(loss["conductor_model"], "field_surface_charge")
+        self.assertGreater(loss["conductor_db_per_100mm"], 0.0)
+        self.assertIn("lower bound", loss["conductor_note"])
+        self.assertIn("centre strip alone", loss["conductor_note"])
+        self.assertIn("r^-1/2", loss["shape_factor_caveat"])
+
+    def test_a_backed_coplanar_line_returns_its_current_on_the_backside(self):
+        # gcpw: the coplanar wings are shorted to the backside plane, so almost all
+        # of the return current goes through the backside - if the partition ever
+        # forgets the backside the number collapses into the two wings instead
+        r = feedline.feedline_impedance("gcpw", 0.3, 0.2, gap_mm=0.2, er=4.3,
+                                        freq_ghz=1.0, tan_delta=0.02)
+        split = r["value"]["loss"]["shape_factor_split"]
+        self.assertGreater(split["return_back"], 0.8 * split["return"])
+        self.assertGreater(split["return_left"], 0.0)
+        self.assertAlmostEqual(split["return_left"], split["return_right"], places=5)
 
 
 if __name__ == "__main__":

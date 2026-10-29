@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这二十八篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这二十九篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 | # | 文档 | 它回答的问题 | 它推翻了什么 |
@@ -34,6 +34,7 @@
 | 26 | [分步可见与铺铜闭环](26-分步可见与铺铜闭环.md) | 过程为什么必须看得见、打得断？器件从哪来？铺铜什么时候才算真的铜？ | 「apply 必须原子」（原子是给脚本的，不是给协作者的）；「有 violation 就挡」（真板 69 条全是 warning）；「栅格能回答 pad 出不出得去」（0.5 mm 间距下必假警）；「写了 `(general (thickness 1.6))` 就是 1.6 mm」（KiCad 只累加 stackup，实造 1.18）；「`add_zone` 之后那块铜就算有了」（没有 filled_polygon 就只是轮廓） |
 | 27 | [自动布线器](27-自动布线器.md) | 搜出来的线凭什么算数？50 网板上 23 个失败是几何还是争用？自己的闸门绿了算不算绿？ | 「栅格说能走就能走」——**搜索只是提议，精确多边形几何才是判决**；两套栅格（走线/过孔）不能合并；「预算耗尽」不等于「没有路」；「缺规则就不查」也不行——板边距留空等于往板边写非法铜；并抓出五个**能在 `status: ok` 下给出错答案**的真缺陷：越界下标在 Python 里回卷、keepout 只封了边框一条带、keepout 根本不进精确判定、焊盘逃逸那段铜从来没画过、板边距只管过孔不管走线（后者由 `kicad-cli DRC` 报 6 条 error 才现形） |
 | 28 | [界面可靠性：焊点热疲劳与跌落应变](28-焊点疲劳与跌落.md) | 温循多少轮回裂？掉一下板面应变多少？ | 「许用值可以由服务器给」——**不行**：ε_f 是拟合、CTE 是典型值、临界应变只能是调用方的，不给就只回来应变 + `judged:false`；「热疲劳和振动疲劳是同一件事」——不是，Steinberg 判相对位移、这里判剪切应变与板面应变；「Engelmaier 的 c 越接近 0 越安全」——写反了，更热/驻留更久都让 c 更负、Nf 更小；「跌落可以直接调 shock_sdof」——单模态链要三段各自复核，且位移放大率可以小于 1 |
+| 29 | [共面波导：另一类截面](29-共面波导场解.md) | 共面线（cpw/gcpw）的阻抗能不能也解出来、凭什么信它、共面损耗那句「不计算」怎么消失的？ | 「共面线塞进已有的边耦合截面就行」——不行，回流在同一层、槽口是奇异点、衬底有限厚且有背面两种；「半域对称可以省一半节点」——它把 2.5% 的静默偏差和 2 倍因子一起带进来，而且场解与闭式的对账**不该共享对称假设**；「零厚度也能做增量电感校验」——零厚度 `∫g²ds` 对数发散、没有收敛值，这条检查在这里不成立，换成两条精确（尺度不变、两翼逐位相等）+ 一条机制（零厚度漂移 > 有限厚度）；「共面损耗拒绝就完了」——现在接上，但只给零厚度值 + 明确方向（真实铜箔更高约 10%，且那 10% 自己也没收敛） |
 | 07 §7 | 板框 / 开槽 / 机械层 | 待议，6 条议题 | —— |
 
 ## 三条贯穿全部文档的结论
@@ -84,9 +85,15 @@
 - `25` → `calc/magnetics.py` / `calc/stackup.py` / `calc/chain.py` / `calc/rules.py` 与 8 个新工具（`magnetics_inductor` / `stackup_material` / `stackup_design` / `rf_chain` / `match_bandwidth` / `design_rules` / `layout_review` / `schematic_review`）+ `matching.bandwidth`，36 条规则（22 布局 + 14 原理图）。边界写在每条规则上：事实缺失即 `undetermined`（空事实集直接 `ARG_MISSING`），电流限值必须显式给标准（IPC-2152 有表了：Brooks & Adam 对 Table 3-1 的闭式拟合，系数抄自 KiCad 10.0，被拟合丢掉的参数仍然没有），IEC 60664-1 隔离间距有表了（从 KiCad 实现反推、188k 点对账），其它标准族仍然 fail-closed；电感饱和没有器件就是 undetermined；磁芯损耗 / DCR / DCM 分别是独立工具（假设互不相容，不做成同一个开关）。
 - `26` → `edit/plan.py` 的分步写（`steps_apply` / `step_events` / `step_control`）、`edit/drc_policy.py`、`parts.py`（离线 `lceda-std.elib` + 在线检索）、`fidelity/fill.py`（`pcbnew ZONE_FILLER` 委派 + 节点移植）、`oracle.routability` 的几何逃逸判据、叠层总厚的 `thickness_agrees` 闸门，以及 `board_progress` / `board_zones` / `board_fill_zones` / `part_*` 共 11 个新工具；边界是**立创 in-app 分步写真机未验证**（本机非交互会话起不了 `lceda-pro.exe`）、在线器件**只有元数据没有几何**、routability **不是布线器**。
 - `27` → `route/rules.py`（三级来源 + 最严取胜 + `assumed` 公示）、`route/grid.py`（双栅格 / 精确 `seg_blockers`·`via_blockers` / keepout 环 / 事务化 `_Emitter` / A* 内联）、`route/router.py`（MST 降序、second sweep、按位置挑牺牲者的 rip-up、wish 驱动的拥塞协商、`_pour_report`、`incremental`）、`route/tune.py`（等长 45° 蛇形 + 宿主排序 + 振幅阶梯）、`route/couple.py`（差分对真耦合）、`route/return_path.py`（换层地缝合）、`route/intent.py`（一份意图对象三个消费者）、`route/topology.py`（mst / iterated 1-Steiner on Hanan grid）与 `board_route` / `board_intent` / `board_blockers` / `board_fanout` / `board_run_ledger` 工具，82 条测试在 `tests/test_route.py`（+ `test_blockers.py` 23 / `test_fanout.py` 22 / `test_ledger.py` 17）；爬电（含 IEC 60664-1 查表）、差分对间距与真耦合、等长、回流、阻抗目标、拥塞协商自 `0.0.16` 起都进了搜索，`0.0.17` 又把铺铜重填（`refill_pours`，委派 `ZONE_FILLER` + 字节保真移植，默认关）与多端网拓扑接上，边界是**拥塞协商默认关闭（一块板 +3 网 / +61% 时间）、拓扑默认 mst 且不是精确 RSMT、重填后的 DRC 差是版式代际差而不是几何差**，`routed` 不等于 DRC 干净（但 keepout 与板边距已进精确判定，端到端 apply 后 `kicad-cli DRC` 新增阻断项 = 0，见 §27.9.7）。
+- `29` → `calc/field2d.py` 的 `_Coplanar` / `coplanar_solve_pair` / `coplanar_shape_factor` /
+  `coplanar_field`、`calc/feedline.py` 的共面损耗分支（`coplanar_shape_factor_safe`）、
+  1 个新工具（`coplanar_field`）与 15 个测试（`tests/test_coplanar.py`）；
+  边界是**零厚度共形映射的对照**：场解在七个几何上一律读低 1.19%~3.39%，而铜厚只划网格不建模
+  （实测把损耗抬高约 10%，且那个数本身不收敛），零厚度 `∫g²ds` 的对数发散以 `mesh_drift_pct`
+  明示，共面差分对与有限宽地不做。
 - `0.0.18` 补上的三块没有单独开篇，口径写在 [`27`](27-自动布线器.md) §27.14：
   `fab/`（Gerber/Excellon/位置/STEP/PDF/BOM/网表/图形**只外包给 `kicad-cli` 不重算**，产物重新读一遍
   验终止符与工具表，`out_dir` 落在源目录里直接拒）、`sync/`（原理图网表 ↔ 板的**逐脚**差集，
   缺封装只报 `needs_placement`，sync 一个字节都不写）、`calc/em.py`（全波**接缝**：点名未装即
   `SOLVER_NOT_FOUND` 绝不回退，`verified_here` 恒 false）。
-- 代码里的每条"拒绝回答"分支，都能在这二十七篇里找到对应的判据来源。
+- 代码里的每条"拒绝回答"分支，都能在这二十九篇里找到对应的判据来源。

@@ -133,15 +133,24 @@ class TestLossAndWavelength(unittest.TestCase):
         self.assertAlmostEqual(f["lambda_g_mm"], 124.9135 / f["eps_eff"] ** 0.5,
                                places=2)
 
-    def test_cpw_conductor_loss_is_null_not_guessed(self):
-        # the edge current distribution is not in a closed form, so the honest
-        # answer is "not modelled", not a plausible-looking number
+    def test_cpw_conductor_loss_comes_from_the_field_not_a_guess(self):
+        # the edge current distribution is not in a closed form, so the answer has
+        # to come from a solved cross-section - with its mesh drift beside it, and
+        # with the two ground wings named separately from the centre strip
         r = feedline.feedline_impedance("cpw", 1.5, 1.6, gap_mm=0.2, er=4.3,
                                        freq_ghz=2.4, tan_delta=0.02)
         loss = r["value"]["loss"]
-        self.assertIsNone(loss.get("conductor_db_per_100mm"))
+        self.assertEqual(loss["conductor_model"], "field_surface_charge")
+        self.assertGreater(loss["conductor_db_per_100mm"], 0.0)
+        self.assertIsNotNone(loss.get("shape_factor_mesh_drift_pct"))
         self.assertIsNotNone(loss.get("dielectric_db_per_100mm"))
-        self.assertIsNotNone(loss.get("total_db_per_100mm_lower_bound"))
+        split = loss["shape_factor_split"]
+        self.assertAlmostEqual(
+            split["signal"] + split["return"],
+            loss["shape_factor_per_mm"], places=4)
+        # an unbacked coplanar line has no backside ground to return current on
+        self.assertEqual(split["return_back"], 0.0)
+        self.assertNotIn("total_db_per_100mm_lower_bound", loss)
 
     def test_microstrip_loss_grows_with_frequency(self):
         lo = feedline.feedline_impedance("microstrip", 3.0, 1.6, er=4.3,
