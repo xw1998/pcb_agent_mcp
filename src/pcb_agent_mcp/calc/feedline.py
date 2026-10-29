@@ -44,7 +44,23 @@ ETA0 = 376.730313668          # free-space wave impedance, ohm
 MU0 = 1.25663706212e-6        # H/m
 SIGMA_CU = 5.8e7              # S/m, annealed copper (what a PCB house quotes)
 
-KINDS = ("microstrip", "stripline", "cpw", "gcpw")
+KINDS = ("microstrip", "stripline", "cpw", "gcpw", "cpw_diff", "gcpw_diff")
+
+# Kinds whose cross-section is an edge-coupled coplanar PAIR. There is no closed
+# form for these at all, so the answer comes from the 2-D field solver in
+# `field2d`: they are the only kinds here that cost seconds instead of
+# microseconds, and the only ones where `z0_ohm` means a DIFFERENTIAL impedance
+# (Zdiff = 2*Z_odd) rather than a single-ended one.
+DIFF_KINDS = ("cpw_diff", "gcpw_diff")
+
+# Everything whose return path is on the same layer as the signal (finite
+# thickness substrate, optional backside plane).
+COPLANAR_KINDS = ("cpw", "gcpw", "cpw_diff", "gcpw_diff")
+
+
+def _base_kind(kind):
+    """The single-line cross-section a pair kind is built on."""
+    return {"cpw_diff": "cpw", "gcpw_diff": "gcpw"}.get(kind, kind)
 
 # The copper-thickness term. `impedance.py` already uses the IPC-2141A form
 # (0.8*w + t in the log argument), i.e. an effective widening of 1.25*t; keeping
@@ -222,8 +238,30 @@ def coplanar_shape_factor_safe(kind, w_mm, g_mm, h_mm, er=4.3, fine_div=8.0):
         return None, "the field solve failed (%s: %s)" % (type(exc).__name__, exc)
     return out, None
 
+def coplanar_pair_shape_factor_safe(kind, w_mm, s_mm, g_mm, h_mm, er=4.3,
+                                    fine_div=8.0):
+    """`field2d.coplanar_pair_shape_factor` at ZERO thickness, or a reason string.
+
+    Zero thickness for the same reason the single-line wrapper gives: finite copper
+    does not converge on any mesh this module can afford, so the thickness term is
+    a stated gap (real foil reads higher) instead of a number that happens to fall
+    out of one mesh.
+    """
+    from . import field2d
+    try:
+        out = field2d.coplanar_pair_shape_factor(_base_kind(kind), w_mm, s_mm,
+                                                 g_mm, h_mm, 0.0, er=er,
+                                                 fine_div=fine_div, refine=1.0,
+                                                 max_nodes=SHAPE_FACTOR_MAX_NODES)
+    except ValueError as exc:
+        return None, "the field solve refused the section: %s" % exc
+    except Exception as exc:                                # noqa: BLE001
+        return None, "the field solve failed (%s: %s)" % (type(exc).__name__, exc)
+    return out, None
+
+
 def _attenuation(kind, z0, ee, er, w, h, freq_ghz, tan_delta, t_mm=0.0,
-                 roughness_um=0.0, shape=None, g=None):
+                 roughness_um=0.0, shape=None, g=None, s_mm=None):
     """Loss per unit length, split into the two mechanisms.
 
     Conductor loss carries TWO estimates:
@@ -326,6 +364,55 @@ def _attenuation(kind, z0, ee, er, w, h, freq_ghz, tan_delta, t_mm=0.0,
             out["conductor_db_per_100mm"] + out["dielectric_db_per_100mm"], 4)
         if sheet > 0:
             out["field_over_sheet_ratio"] = round(db / sheet, 3)
+    elif kind in DIFF_KINDS:
+        # alpha_c = Rs/(2*Z_odd) * S, with S normalised to the DIFFERENTIAL current
+        # (= the charge on the + strip). `z0` here is Zdiff, so z_odd = z0/2 and the
+        # prefactor is Rs/z_diff - written out rather than folded in, because the
+        # half is exactly where a pair loss calculation goes wrong.
+        z_odd = 0.5 * z0
+        # the same quantity with uniform current on both strips and nothing
+        # anywhere else: S = 2/w, so alpha = Rs/(2*Z_odd) * 2/w = Rs/(Z_odd*w)
+        sheet = 8.686 * (rs_eff / (z_odd * w)) * 100.0
+        out["conductor_sheet_bound_db_per_100mm"] = round(sheet, 4)
+        if shape is None:
+            shape, why = coplanar_pair_shape_factor_safe(
+                kind, w, s_mm, g, h, er=er if er > 1.0 else 4.3)
+        if shape is None:
+            out["conductor_db_per_100mm"] = None
+            out["conductor_model"] = "not_computed"
+            out["conductor_note"] = ("the differential coplanar field solve was "
+                                     "unavailable: " + str(why) + ". The total below "
+                                     "is the dielectric term alone, a LOWER bound")
+            out["total_db_per_100mm_lower_bound"] = out["dielectric_db_per_100mm"]
+            return out
+        sf = shape["shape_factor_per_mm"]
+        db = 8.686 * (rs_eff / (2.0 * z_odd) * sf) * 100.0
+        out["conductor_db_per_100mm"] = round(db, 4)
+        out["conductor_model"] = "field_surface_charge"
+        out["shape_factor_per_mm"] = round(sf, 6)
+        out["shape_factor_split"] = {
+            "strips": round(shape["strip_share"], 6),
+            "strips_each": round(shape["strip_right_share"], 6),
+            "return": round(shape["ground_share"], 6),
+            "return_left": round(shape["ground_share_left"], 6),
+            "return_right": round(shape["ground_share_right"], 6),
+            "return_back": round(shape["ground_share_back"], 6)}
+        out["shape_factor_mesh_drift_pct"] = (
+            None if shape["mesh_drift_pct"] is None
+            else round(shape["mesh_drift_pct"], 2))
+        out["conductor_note"] = (
+            "Rs/(2*Z_odd) * INT g^2 ds on the edge-coupled coplanar cross-section in "
+            "its ODD mode, g normalised to the DIFFERENTIAL current (the charge on the "
+            "+ strip): both strips and both ground wings are in it. Solved with "
+            "ZERO-thickness copper, so it is a lower bound on a real foil (finite "
+            "copper measured +10 % on the same code path and does not converge); the "
+            "drift figure is the honest uncertainty on the last digit. The sheet "
+            "figure above assumes uniform current on the two strips and gives the "
+            "grounds nothing at all")
+        out["total_db_per_100mm"] = round(
+            out["conductor_db_per_100mm"] + out["dielectric_db_per_100mm"], 4)
+        if sheet > 0:
+            out["field_over_sheet_ratio"] = round(db / sheet, 3)
     elif kind in ("cpw", "gcpw"):
         sheet = 8.686 * (rs_eff / (z0 * w)) * 100.0
         out["conductor_sheet_bound_db_per_100mm"] = round(sheet, 4)
@@ -387,6 +474,37 @@ def _solve(kind, w, h, g, t, er):
         return _stripline(w, h, t, er)
     return _cpw(w, g, h, t, er, backed=(kind == "gcpw"))
 
+def _solve_diff(kind, w, s, g, h, er, field_levels=1, fine_div=10.0,
+                max_nodes=None):
+    """Zdiff, eps_eff_odd and the mode table for an edge-coupled coplanar pair.
+
+    Zero-thickness copper on purpose: the solver refines to min(w, s, h, t)/fine_div,
+    so asking for 35 um would multiply the node count by thousands to model a term
+    the answer does not have anyway (the solver meshes copper, it does not model it).
+    """
+    from . import field2d as _f2d
+    levels = (1.0, 0.65) if int(field_levels or 1) > 1 else (1.0,)
+    r = _f2d.coplanar_pair_solve(_base_kind(kind), w, s, g, h, 0.0, er,
+                                 levels=levels, fine_div=fine_div,
+                                 max_nodes=max_nodes)
+    extra = {
+        "z_odd_ohm": round(r["z_odd"], 4),
+        "z_even_ohm": round(r["z_even"], 4),
+        "z_common_ohm": round(r["z_common"], 4),
+        "eps_eff_odd": round(r["eps_eff_odd"], 5),
+        "eps_eff_even": round(r["eps_eff_even"], 5),
+        "charge_balance_odd": (None if r["runs"][0]["odd"]["charge_balance"] is None
+                               else round(r["runs"][0]["odd"]["charge_balance"], 9)),
+        "mesh_drift_ohm": {
+            "odd": None if r["drift_odd"] is None else round(r["drift_odd"], 4),
+            "even": None if r["drift_even"] is None else round(r["drift_even"], 4)},
+        "mesh": {"nodes": r["runs"][0]["odd"]["nodes"],
+                 "sweeps": r["runs"][0]["odd"]["sweeps"],
+                 "fine_mm": round(r["runs"][0]["fine_mm"], 6)},
+    }
+    return 2.0 * r["z_odd"], r["eps_eff_odd"], extra
+
+
 _BASIS = {
     "microstrip": ("Hammerstad closed form (the same reference field2d is checked "
                    "against): 60/sqrt(ee)*ln(8h/w+w/4h) for w/h<=1, "
@@ -405,6 +523,17 @@ _BASIS = {
     "gcpw": ("quasi-static conformal mapping of a slab that ends on a ground plane: "
              "k2 = tanh(pi*a/2h)/tanh(pi*b/2h), c_air = 2*(A+B), c = 2*(A+er*B) with "
              "A = K(k0)/K(k0') and B = K(k2)/K(k2'), Z0 = eta0/sqrt(c_air*c)"),
+    "cpw_diff": ("NO CLOSED FORM EXISTS for an edge-coupled coplanar pair, so this is "
+                 "not a formula: div(eps*grad V) = 0 is solved on the real "
+                 "cross-section (two strips, two coplanar grounds, finite-thickness "
+                 "substrate, air below) by finite volumes on a graded tensor grid with "
+                 "red-black SOR, and the two modes are two drives on ONE full mesh "
+                 "(+V/-V for odd, +V/+V for even) with no symmetry plane. "
+                 "Zdiff = 2*Z_odd"),
+    "gcpw_diff": ("NO CLOSED FORM EXISTS for an edge-coupled coplanar pair, so this is "
+                  "the 2-D quasi-TEM solution of the same pair with a ground plane "
+                  "below the substrate (field2d.coplanar_pair_solve, kind = gcpw). "
+                  "Zdiff = 2*Z_odd"),
 }
 
 _PRECISION = {
@@ -428,9 +557,25 @@ _PRECISION = {
              "radiation"),
 }
 
+_PRECISION["cpw_diff"] = (
+    "no independent reference exists, so there is no '+-x%' here. What is checked "
+    "instead (field2d.VALIDATION[coplanar_pair_modes / coplanar_pair_limits]): the "
+    "mode decomposition against a third solve (residual 1.9e-8), the antisymmetry of "
+    "the odd solution (charge balance -1.000000000), and the merged-strip limit "
+    "(spacing -> 0 gives the 2w single line to -0.87 %). The pair solver is built on "
+    "the coplanar single-line solver, which itself reads -1.19 % .. -3.39 % LOW of "
+    "the conformal map. Copper thickness, dispersion and radiation are not modelled; "
+    "one solve is 5-40 s depending on field_levels")
+_PRECISION["gcpw_diff"] = (
+    "same as cpw_diff: no independent reference, so no '+-x%'. The backside plane is "
+    "carried by the solved section rather than by a tanh map, so the parallel-plate "
+    "mode a real backed pair can excite is still not modelled, and neither are "
+    "thickness, dispersion or radiation. One solve is 5-40 s")
+
+
 def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0,
                        er=4.3, freq_ghz=None, tan_delta=None, verify_field=False,
-                       field_levels=1, roughness_um=0.0):
+                       field_levels=1, roughness_um=0.0, spacing_mm=None):
     """Z0, effective permittivity, guided wavelength and loss for one line."""
     kind = str(kind or "").strip().lower()
     if kind not in KINDS:
@@ -447,7 +592,8 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
         return err("width and dielectric must be > 0; copper_um >= 0; er >= 1",
                    "ARG_RANGE")
     g = None
-    if kind in ("cpw", "gcpw"):
+    s = None
+    if kind in COPLANAR_KINDS:
         if gap_mm is None:
             return err("a coplanar line needs gap_mm (the slot between the centre "
                        "strip and the ground)", "ARG_REQUIRED")
@@ -461,6 +607,16 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
             # a coplanar line's answer moves with the copper edge shape, and this
             # model has no thickness term at all - refusing to fold t in silently
             pass
+        if kind in DIFF_KINDS:
+            if spacing_mm is None:
+                return err("a coplanar PAIR needs spacing_mm (the edge-to-edge gap "
+                           "between the two strips)", "ARG_REQUIRED")
+            try:
+                s = float(spacing_mm)
+            except (TypeError, ValueError):
+                return err("spacing_mm must be numeric", "ARG_INVALID")
+            if s <= 0:
+                return err("spacing_mm must be > 0", "ARG_RANGE")
     else:
         u = (w + THICKNESS_WIDENING * t) / h
         # the comparison is loosened by 1e-9 relative: a width that sits exactly
@@ -473,7 +629,13 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
                        hint="change the width or the dielectric, or use "
                             "field_impedance for a solved answer")
 
-    z0, ee, extra = _solve(kind, w, h, g, t, er)
+    if kind in DIFF_KINDS:
+        # No closed form to evaluate: this branch is a field solve (5-40 s), and
+        # `z0` comes back as the DIFFERENTIAL impedance.
+        z0, ee, extra = _solve_diff(kind, w, s, g, h, er,
+                                    field_levels=field_levels)
+    else:
+        z0, ee, extra = _solve(kind, w, h, g, t, er)
     if not (z0 > 0 and ee >= 1.0):
         return err("degenerate geometry: the conformal map produced a non-physical "
                    "answer", "OUT_OF_VALIDITY")
@@ -507,8 +669,23 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
             if rough < 0:
                 return err("roughness_um must be >= 0", "ARG_RANGE")
             out["loss"] = _attenuation(kind, z0, ee, er, w, h, f, td,
-                                       t_mm=t, roughness_um=rough, g=g)
-    if kind in ("cpw", "gcpw"):
+                                       t_mm=t, roughness_um=rough, g=g, s_mm=s)
+    if kind in DIFF_KINDS:
+        out["z0_meaning"] = ("DIFFERENTIAL: value and z0_ohm are Zdiff = 2*Z_odd, and "
+                             "eps_eff is the odd-mode filling factor. z_odd_ohm is the "
+                             "impedance each strip sees against ground in the odd "
+                             "(differential) drive, z_common_ohm = 0.5*Z_even the "
+                             "common-mode one")
+        out["differential"] = extra
+        if t > 0:
+            out["copper_thickness"] = ("requested %.1f um but NOT modelled: the pair "
+                                       "section is solved with zero-thickness copper. "
+                                       "The solver refines to min(width, spacing, "
+                                       "dielectric)/fine_div, so a 35 um foil would "
+                                       "also multiply the node count for a term the "
+                                       "answer does not carry"
+                                       % (t * 1000.0))
+    elif kind in ("cpw", "gcpw"):
         out["cpw_geometry"] = {k: (round(v, 6) if isinstance(v, float) else v)
                                for k, v in extra.items()}
         if t > 0:
@@ -543,6 +720,14 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
             "mesh": {"nodes": runs[0]["nodes"], "sweeps": runs[0]["sweeps"],
                      "fine_mm": round(runs[0]["fine_mm"], 6)},
         }
+    elif verify_field and kind in DIFF_KINDS:
+        out["field_check"] = {
+            "note": ("cpw_diff / gcpw_diff ARE the field solution: there is no closed "
+                     "form to compare them with, so verify_field has nothing to add. "
+                     "The internal checks (superposition identity, odd-mode "
+                     "antisymmetry, merged-strip limit) are exposed by "
+                     "coplanar_pair_field, not by a comparison here"),
+        }
     elif verify_field and kind in ("microstrip", "stripline"):
         # Deliberately solved with t = 0: `field2d` refines to min(w,h,t)/fine_div,
         # so a 35 um copper layer multiplies the node count by thousands and turns a
@@ -576,18 +761,18 @@ def feedline_impedance(kind, width_mm, dielectric_mm, gap_mm=None, copper_um=0.0
         precision=_PRECISION[kind],
         assumptions={
             "kind": kind, "width_mm": w, "dielectric_mm": h, "gap_mm": g,
-            "copper_um": t * 1000.0, "er": er,
+            "spacing_mm": s, "copper_um": t * 1000.0, "er": er,
             "stripline_dielectric_arg": ("trace to ONE reference plane; the "
                                          "plane-to-plane gap is 2x this" if
                                          kind == "stripline" else None),
-            "backside_ground": (kind == "gcpw"),
+            "backside_ground": (kind in ("gcpw", "gcpw_diff")),
             "dispersion": "not modelled",
         },
     )
 
 # ------------------------------------------------------------------ reverse
 def feedline_width(target_ohm, kind, dielectric_mm, gap_mm=None, copper_um=0.0,
-                   er=4.3, tol_ohm=1e-4):
+                   er=4.3, tol_ohm=1e-4, spacing_mm=None):
     """The width that gives a target Z0, or the reachable band.
 
     Bisection on the forward model, so the answer is the same function the caller
@@ -608,16 +793,36 @@ def feedline_width(target_ohm, kind, dielectric_mm, gap_mm=None, copper_um=0.0,
     if target <= 0 or h <= 0 or t < 0 or er < 1.0:
         return err("target_ohm and dielectric_mm must be > 0", "ARG_RANGE")
     g = None
-    if kind in ("cpw", "gcpw"):
+    s = None
+    if kind in COPLANAR_KINDS:
         if gap_mm is None:
             return err("a coplanar line needs gap_mm", "ARG_REQUIRED")
         g = float(gap_mm)
         if g <= 0:
             return err("gap_mm must be > 0", "ARG_RANGE")
+        if kind in DIFF_KINDS:
+            if spacing_mm is None:
+                return err("a coplanar PAIR needs spacing_mm (the edge-to-edge gap "
+                           "between the two strips): it is what fixes the coupling, "
+                           "and the width alone cannot make up for it", "ARG_REQUIRED")
+            s = float(spacing_mm)
+            if s <= 0:
+                return err("spacing_mm must be > 0", "ARG_RANGE")
 
-    def z_at(width):
-        r = _solve(kind, width, h, g, t, er)[0]
-        return r
+    # The pair kinds have no closed form, so every bisection step is a field solve.
+    # They are bisected on a CHEAP mesh (fine_div = 3, i.e. ~1/9 of the default nodes
+    # in each direction) and the winning width is then re-solved on the default mesh
+    # - the returned impedance is always the default-mesh one, and the difference
+    # between the two is reported rather than hidden.
+    CHEAP_FINE = 3.0
+
+    def z_at(width, cheap=True, fine_div=None):
+        if kind in DIFF_KINDS:
+            step = (fine_div if fine_div is not None
+                    else (CHEAP_FINE if cheap else 10.0))
+            return _solve_diff(kind, width, s, g, h, er,
+                               field_levels=1, fine_div=step)[0]
+        return _solve(kind, width, h, g, t, er)[0]
 
     # Z0 falls monotonically as the width grows, for all four geometries. The
     # search window is in units of the dielectric so it means the same thing on a
@@ -625,6 +830,207 @@ def feedline_width(target_ohm, kind, dielectric_mm, gap_mm=None, copper_um=0.0,
     # accepts, so this function can never return a width that the answer it was
     # solved from would refuse (a first draft stopped at 1e-4*h and handed back
     # w/h = 0.03 for a 200 ohm target, which the forward model rejects).
+    if kind in DIFF_KINDS:
+        # Three stages, and the split is what makes this affordable: COARSE finds
+        # the bracket, CHEAP narrows it AND supplies the local slope, and the
+        # DEFAULT mesh is what actually lands on the target.
+        #
+        # The cost model is measured, and it is not intuitive:
+        #
+        #  1. A field solve's cost is set by the fine step times the BOX, and the
+        #     box has to hold the far field, which grows with the width. Measured on
+        #     this stackup: fine_div = 3 costs 22 s at w/h = 0.05, 0.8 s at w = 0.2 mm
+        #     and 28 s at w = 20h; fine_div = 10 at the answer (w = 0.8 mm, 16 k
+        #     nodes, 330 SOR sweeps) costs ~30 s per solve. So the number of DEFAULT
+        #     solves is the only thing that matters, and there may be no more than
+        #     2-3 of them - a blind +2 % probe on that mesh would cost a whole solve.
+        #  2. The cheap mesh carries a SYSTEMATIC bias, not noise: it reads -1.06 %
+        #     low at the answer (100.05 vs 101.13 ohm for a 100 ohm target). A
+        #     width chosen on it alone is therefore off by ~1 %, and "re-solve once
+        #     and report the gap" reports the error instead of removing it. Because
+        #     the bias is multiplicative, the local SLOPE survives it - which is why
+        #     the cheap stage is worth its 10 s: it hands the default stage a Newton
+        #     direction instead of a guess.
+        COARSE_FINE = 1.5
+        CHEAP_STOP = 0.15      # cheap bracket width, in units of the dielectric
+        w_lo_bound, w_hi_bound = W_OVER_H_MIN * h, W_OVER_H_MAX * h
+
+        def z_coarse(width):
+            return z_at(width, cheap=False, fine_div=COARSE_FINE)
+
+        # ---- 1. coarse ladder: start at the natural scale (one dielectric height)
+        #         and walk outward by factors of two until the sign flips.
+        la = ha = min(max(h, w_lo_bound), w_hi_bound)
+        z_la = z_ha = z_coarse(la)
+        if z_la >= target:
+            for _ in range(10):
+                nx = min(w_hi_bound, ha * 2.0)
+                if nx <= ha:
+                    break
+                ha, z_ha = nx, z_coarse(nx)
+                if z_ha <= target:
+                    break
+        else:
+            for _ in range(10):
+                nx = max(w_lo_bound, la / 2.0)
+                if nx >= la:
+                    break
+                la, z_la = nx, z_coarse(nx)
+                if z_la >= target:
+                    break
+        if not (z_ha <= target <= z_la):
+            return err(
+                "the target %.3f ohm is not bracketed by the pair solver between "
+                "%.4f mm (%.1f ohm) and %.4f mm (%.1f ohm)"
+                % (target, la, z_la, ha, z_ha),
+                "UNREACHABLE",
+                hint=("move the target by changing er, the dielectric height or the "
+                      "spacing - the width alone cannot get there"),
+                extra={"reachable_ohm": {"narrowest_width_mm": round(la, 6),
+                                         "narrowest_z_ohm": round(z_la, 3),
+                                         "widest_width_mm": round(ha, 6),
+                                         "widest_z_ohm": round(z_ha, 3)}})
+
+        # ---- 2. cheap bisection inside that bracket, with a LOOSE stop: this stage
+        #         owes the default stage a point within a few percent and a slope,
+        #         not accuracy - anything finer here is thrown away by the bias.
+        seen = []
+
+        def z_cheap(width):
+            for wq, zq in seen:
+                if abs(wq - width) <= 1e-12:
+                    return zq
+            zq = z_at(width, cheap=True)
+            seen.append((width, zq))
+            return zq
+
+        lo, hi = la, ha
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if z_cheap(mid) > target:
+                lo = mid
+            else:
+                hi = mid
+            if (hi - lo) <= CHEAP_STOP * h:
+                break
+        w_cheap = 0.5 * (lo + hi)
+        z0_cheap = z_cheap(w_cheap)
+        seen.sort()
+        slope = None
+        if len(seen) >= 2:
+            near = [it for it in seen if it[0] <= w_cheap][-1:]
+            far = [it for it in seen if it[0] > w_cheap][:1]
+            pair = near + far if near and far else seen[-2:]
+            (wa, za), (wb, zb) = pair[0], pair[1]
+            if wb != wa:
+                slope = (zb - za) / (wb - wa)
+
+        # ---- 3. default-mesh stage: one solve at the cheap width, one Newton step
+        #         using the cheap slope, then secant only if that was not enough.
+        hist = []
+
+        def ev(width):
+            for wq, zq, _eq in hist:
+                if abs(wq - width) <= 1e-12:
+                    return zq
+            z0d, eed, _ex = _solve_diff(kind, width, s, g, h, er,
+                                        field_levels=1, fine_div=10.0)
+            hist.append((width, z0d, eed))
+            return z0d
+
+        # 0.1 ohm on a 100 ohm target is 0.1 %, an order of magnitude below the
+        # solver's own discretisation: a tighter tolerance buys digits the model
+        # does not have and costs another 30 s solve (measured: the Newton step
+        # lands at +0.063 ohm, and chasing that cost a third solve for 0.0009 ohm).
+        SOLVE_TOL = max(0.1, 1e-3 * target)
+        z_default_at_cheap = ev(w_cheap)
+        cheap_vs_default_pct = (0.0 if not z_default_at_cheap else
+                                100.0 * (z0_cheap - z_default_at_cheap)
+                                / z_default_at_cheap)
+        # the secant may run slightly outside the coarse bracket: the COARSE mesh is
+        # the one that is a few percent off, so clamping to [la, ha] would lock the
+        # answer at the wrong end of the window
+        sec_lo = max(w_lo_bound, la * 0.9)
+        sec_hi = min(w_hi_bound, ha * 1.1)
+        if slope and abs(z_default_at_cheap - target) > SOLVE_TOL:
+            wn = w_cheap + (target - z_default_at_cheap) / slope
+            wn = min(max(wn, sec_lo), sec_hi)
+            if abs(wn - w_cheap) > 1e-12:
+                ev(wn)
+        for _ in range(2):
+            best = min(hist, key=lambda it: abs(it[1] - target))
+            if abs(best[1] - target) <= SOLVE_TOL:
+                break
+            if len(hist) < 2:
+                break
+            (wa, za, _ea), (wb, zb, _eb) = hist[-2], hist[-1]
+            if za == zb:
+                break
+            wn = wb + (target - zb) * (wb - wa) / (zb - za)
+            wn = min(max(wn, sec_lo), sec_hi)
+            if any(abs(wn - wq) <= 1e-12 for wq, _z, _e in hist):
+                break
+            ev(wn)
+
+        width, z0, ee = min(hist, key=lambda it: abs(it[1] - target))
+        abs_err = abs(z0 - target)
+        converged = abs_err <= SOLVE_TOL
+        return ok(
+            value={"width_mm": round(width, 6), "z0_ohm": round(z0, 4),
+                   "z0_meaning": "DIFFERENTIAL (Zdiff = 2*Z_odd)",
+                   "eps_eff_odd": round(ee, 5), "kind": kind,
+                   "spacing_mm": s, "gap_mm": g,
+                   "abs_error_ohm": round(abs_err, 4), "converged": converged,
+                   "default_solves": len(hist),
+                   "cheap_mesh_width_mm": round(w_cheap, 6),
+                   "cheap_mesh_z0_ohm": round(z0_cheap, 4),
+                   "cheap_over_default_pct": round(cheap_vs_default_pct, 3)},
+            unit="mm",
+            model="feedline_width_" + kind,
+            basis=_BASIS[kind] + "; the width is found in three stages: a coarse-mesh "
+                   "ladder (fine_div = 1.5) to bracket the target, bisection on a "
+                   "cheap mesh (fine_div = 3) inside that bracket to get a point and "
+                   "the local slope, then 1-3 DEFAULT-mesh (fine_div = 10) solves: one "
+                   "at the cheap width, a Newton step with that slope, and a secant "
+                   "only if the error is still above tolerance. The default mesh has "
+                   "the last word, so re-running feedline_impedance at the returned "
+                   "width reproduces z0_ohm",
+            precision=_PRECISION[kind],
+            assumptions={
+                "target_ohm": target, "dielectric_mm": h, "gap_mm": g,
+                "spacing_mm": s, "copper_um": t * 1000.0, "er": er,
+                "coarse_bracket_mm": [round(la, 6), round(ha, 6)],
+                "sanity_note": ("the bracket is expanded only until the target is "
+                                "inside it, so coarse_bracket_mm is where the search "
+                                "actually ran, not the model's whole validity window "
+                                "(w/h %.2f..%.1f). Re-check the answer with "
+                                "feedline_impedance, which solves the default mesh "
+                                "directly" % (W_OVER_H_MIN, W_OVER_H_MAX)),
+                "stopping_rule": ("coarse: ladder stops on the first sign flip; cheap: "
+                                  "bisection stops at a width bracket below %.2f*"
+                                  "dielectric (a tighter stop buys accuracy the "
+                                  "default stage discards); default: one Newton step "
+                                  "plus at most two secant steps, stopping at "
+                                  "|Z - target| <= %.4g ohm, and the BEST width "
+                                  "actually solved is returned with its residual"
+                                  % (CHEAP_STOP, SOLVE_TOL)),
+                "cheap_mesh_bias_note": (
+                    "cheap_over_default_pct is the cheap mesh's error at the cheap "
+                    "width, and it is a bias, not noise (measured -1.06 %% here); it "
+                    "is reported because it is the size of the correction the default "
+                    "stage had to make, not because the answer still carries it"),
+                "cost_note": ("an inverse on a pair costs 2-3 default-mesh solves "
+                              "(~70-110 s) because there is no closed form to invert "
+                              "and each default solve is ~30 s at these widths; the "
+                              "the forward call feedline_impedance is the cheap way to "
+                              "check a width by hand"),
+                "not_converged_note": (
+                    None if converged else
+                    "the default-mesh stage did not reach the tolerance; the width "
+                    "above is the best it produced and abs_error_ohm says by how much "
+                    "it misses - do not read it as exact"),
+            },
+        )
     lo, hi = W_OVER_H_MIN * h, W_OVER_H_MAX * h
     z_lo, z_hi = z_at(lo), z_at(hi)
     if z_hi == z_hi and z_lo == z_lo:

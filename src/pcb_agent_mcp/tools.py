@@ -2395,9 +2395,13 @@ _Z0_ARG = _num("reference impedance in ohm", 50.0)
 _KIND_FEED = _str(
     "line cross-section. microstrip / stripline take width_mm + dielectric_mm; "
     "cpw (coplanar, no back ground) and gcpw (coplanar with a back ground plane) "
-    "also need gap_mm. For stripline, dielectric_mm is the trace-to-one-plane "
-    "distance, the same convention trace_impedance uses",
-    ["microstrip", "stripline", "cpw", "gcpw"])
+    "also need gap_mm; cpw_diff / gcpw_diff are the EDGE-COUPLED PAIR versions and "
+    "need gap_mm + spacing_mm (spacing_mm is the edge-to-edge gap between the two "
+    "strips). For stripline, dielectric_mm is the trace-to-one-plane distance, the "
+    "same convention trace_impedance uses. The pair kinds are solved as a 2-D field "
+    "problem (no closed form exists) and a single solve takes 5-40 s, longer at wide "
+    "widths",
+    ["microstrip", "stripline", "cpw", "gcpw", "cpw_diff", "gcpw_diff"])
 
 _ER = _num("substrate relative permittivity", 4.3)
 _COPPER_UM = _num("copper thickness in um (0 = ignore thickness)", 0.0)
@@ -2409,9 +2413,13 @@ _tool(
     "conductor loss from the 2-D field solution on microstrip and stripline - "
     "alpha_c = Rs/(2*Z0)*INT g^2 ds, which carries the trace edge crowding and the "
     "return-current spread - alongside the Rs/(Z0*w) sheet figure, plus an optional "
-    "Hammerstad-Jensen copper-roughness multiplier. Coplanar conductor loss is still "
-    "refused, not guessed. verify_field=true also reports the closed form's error "
-    "against the solver.",
+    "Hammerstad-Jensen copper-roughness multiplier. Coplanar lines (cpw / gcpw) get "
+    "the same treatment from their own 2-D solve, and the edge-coupled pair kinds "
+    "(cpw_diff / gcpw_diff) report Zdiff = 2*Z_odd with both modes, the charge "
+    "balance and the mesh drift, and their conductor loss is normalised to the "
+    "DIFFERENTIAL current (both strips and both ground wings in it). verify_field "
+    "on the pair kinds is not a comparison - the field solve IS the answer - so it "
+    "only says so.",
     {
         "type": "object",
         "properties": {
@@ -2429,6 +2437,8 @@ _tool(
             "field_levels": _num("refinement levels for the field check", 1),
             "roughness_um": _num("copper surface roughness Ra in um; multiplies Rs by "
                                  "the Hammerstad-Jensen factor (0 = smooth)", 0.0),
+            "spacing_mm": _num("edge-to-edge gap between the two strips of a pair "
+                               "(cpw_diff / gcpw_diff only; required there)"),
         },
         "required": ["kind", "width_mm", "dielectric_mm"],
     },
@@ -2436,16 +2446,21 @@ _tool(
         a["kind"], a["width_mm"], a["dielectric_mm"], a.get("gap_mm"),
         a.get("copper_um", 0.0), a.get("er", 4.3), a.get("freq_ghz"),
         a.get("tan_delta"), a.get("verify_field", False),
-        a.get("field_levels", 1), a.get("roughness_um", 0.0)),
+        a.get("field_levels", 1), a.get("roughness_um", 0.0),
+        a.get("spacing_mm")),
 )
 
 _tool(
     "feedline_width",
     "The trace width that gives a target impedance, for microstrip / stripline / CPW "
-    "/ GCPW. Bisected on the same forward model feedline_impedance exposes, so the "
+    "/ GCPW and the edge-coupled pairs (cpw_diff / gcpw_diff, where target_ohm is "
+    "Zdiff). Bisected on the same forward model feedline_impedance exposes, so the "
     "answer can be re-checked. If the target is outside what a sane width range "
     "reaches, it returns the reachable band as an error instead of a width that "
-    "silently misses.",
+    "silently misses. The pair kinds have no closed form: the search runs on a coarse "
+    "and then a cheap mesh and finishes on the default mesh, which is why they cost "
+    "2-3 field solves (about 1.5-6 min) instead of microseconds - and the returned "
+    "z0_ohm is the default-mesh answer with its residual, not a claim of exactness.",
     {
         "type": "object",
         "properties": {
@@ -2457,12 +2472,15 @@ _tool(
             "copper_um": _COPPER_UM,
             "er": _ER,
             "tol_ohm": _num("bisection tolerance in ohm", 1e-4),
+            "spacing_mm": _num("edge-to-edge gap between the two strips of a pair "
+                               "(cpw_diff / gcpw_diff only; required there)"),
         },
         "required": ["target_ohm", "kind", "dielectric_mm"],
     },
     lambda a: _feedline.feedline_width(
         a["target_ohm"], a["kind"], a["dielectric_mm"], a.get("gap_mm"),
-        a.get("copper_um", 0.0), a.get("er", 4.3), a.get("tol_ohm", 1e-4)),
+        a.get("copper_um", 0.0), a.get("er", 4.3), a.get("tol_ohm", 1e-4),
+        a.get("spacing_mm")),
 )
 
 _tool(

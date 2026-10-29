@@ -9,6 +9,45 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.26] - 2026-10-30
+
+0.0.24 的边耦合共面差分对接进馈线：`feedline_impedance` / `feedline_width` 多两个 kind
+（`cpw_diff` / `gcpw_diff`）与一个必填的 `spacing_mm`。**这两个 kind 没有新增物理**，它们
+路由到同一个场解；新增的是一条通路，以及这条通路上「赔多少钱」的口径。
+
+- **差分必须标成差分**：`z0_ohm` / `value` 是 `Zdiff = 2·Z_odd`，`z0_meaning` 以
+  `DIFFERENTIAL` 开头，`value["differential"]` 带上 `z_odd_ohm` / `z_even_ohm` /
+  `z_common_ohm`（= 0.5·Z_even）/ `eps_eff_odd` / `eps_eff_even` / `charge_balance_odd` /
+  `mesh_drift_ohm` / `mesh`。`w=0.3 s=0.2 g=0.2 h=0.2 er=4.3` 实测
+  **cpw_diff 129.86 Ω**（odd 64.9301 / even 146.2017 / common 73.1009 / eps 2.40452）、
+  **gcpw_diff 101.887 Ω**（50.9437 / 65.4168 / 32.7084 / 2.88850）。
+- **损耗的分母是差分电流**：`Rs/(2·Z_odd)·∮g²ds`，覆盖两根条 + 两片地。实测算术
+  `conductor 0.4312` / `dielectric 0.5157` / `total 0.9469` dB/100mm，`strips` 4.528725 一份、
+  `strips_each` 2.264362 一根、`return_left == return_right` 0.257699、`return_back == 0.0`，
+  且 `field_over_sheet_ratio = 0.757`（薄层式不给地任何份额，所以场解必须更低）。
+- **反解：三段，且默认网格有最后一句**。粗网格阶梯找括号（不扫整个窗口）→ 便宜网格二分
+  （停条件是**宽度括号 < 0.15·h**，不是阻抗容差）+ 局部斜率 → 默认网格一次 + 一步牛顿 +
+  最多两步割线。**第一版是错的**：便宜网格定宽度、默认网格复算一遍再把差距报出来，返回
+  101.13 Ω 对目标的 100 Ω，差 1.1%——它把误差揭发出来而不是消掉。便宜网格的偏差是**乘性**
+  的（实测 −1.06%），所以斜率穿得过它，牛顿步实测落在 +0.063 Ω。
+- **耗时是网格属性，不是算法属性**：`fine_div=10` 时 w=0.3 是 5.2 s、w=0.82 是 ~30 s、
+  w=2.33 是 ~2 min；`fine_div=3` 在 w/h=0.05 / w=20h 两端要 22 s / 28 s（细步长跟着
+  `min(w,s,h)` 走，盒子却还得装远场）。于是一次反解 130 Ω **21 s**、100 Ω **85 s**、80 Ω
+  **360 s**，全部 2 次默认网格求解、残差 0.04~0.07 Ω。
+- **诚实三件套**：`abs_error_ohm` / `converged` / `default_solves` 加一条只在没收敛时出现的
+  `not_converged_note`，外加 `cheap_mesh_width_mm` / `cheap_mesh_z0_ohm` /
+  `cheap_over_default_pct`（便宜网格**必须**被纠正的量）。容差 `max(0.1, 1e-3·target)` 是有
+  依据的：解算器自身离散度 0.1~0.5%，追到 0.0009 Ω 要多花一次 30 s 求解。
+- **`spacing_mm` 必填、不默认**：缺 → `ARG_REQUIRED`，`0` / 负 → `ARG_RANGE`，非数字 →
+  `ARG_INVALID`；单线 kind 传了它**逐位不变**（`value` 与 `assumptions` 全等）。
+- **顺手修掉一句过期文案**：`feedline_impedance` 的描述里「Coplanar conductor loss is still
+  refused, not guessed.」从 0.0.23 起就不成立了，现在改成实际行为；同时给差分 kind 明写
+  「`verify_field` 不是比较——场解就是答案」。
+- `--selftest` 加 132/133/134（**111/111**）；`tests/test_feedline_diff.py` 13 例（约 167 s），
+  两个负控制：`_PairIgnored`（当成两根独立单线 = 179.35 Ω，错 27.6%）与 `_SpacingDropped`
+  （参数收下不用，与 0.0.25 真实出过的那一次同型）。全量 **1583 例 / OK（skipped=5）/ 740.7 s**
+  （比 0.0.25 的 516.9 s 多出来的部分几乎全在新增的 13 例差分对测试上：每例都要真解一次场）。
+
 ## [0.0.25] - 2026-10-29
 
 共面的地不再是无限大的：`coplanar_field` 与 `coplanar_pair_field` 各多一个可选

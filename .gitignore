@@ -6,6 +6,8 @@ dist/
 *.egg-info/
 .pytest_cache/
 *.kicad_prl
+# KiCad 在工程旁边生成的锁文件 ~<name>.kicad_pro.lck
+*.lck
 _scratch/
 # 本地大文件证据（不提交）：88.7 MB 的 jetson 板副本只作 DRC 超时实测的物证，
 # 结论已写进 README 诚实清单与 docs/15，文件本身不入库。

@@ -1479,6 +1479,75 @@ def selftest():
           and 0.5 < _odd_d < 2.0 and 15.0 < _even_d < 30.0,
           "odd %+0.2f %%, even %+0.2f %%" % (_odd_d, _even_d))
 
+    # The edge-coupled pair as a FEEDLINE kind: the point of this kind is that
+    # feedline_impedance and coplanar_pair_field must agree bit for bit (the kind
+    # adds no model, it routes to the same solve), and that the differential
+    # meaning is stated rather than left to the caller to guess.
+    r = handle({"jsonrpc": "2.0", "id": 132, "method": "tools/call",
+                "params": {"name": "feedline_impedance",
+                           "arguments": {"kind": "cpw_diff", "width_mm": 0.3,
+                                         "spacing_mm": 0.2, "gap_mm": 0.2,
+                                         "dielectric_mm": 0.2}}})
+    _fd = json.loads(r["result"]["content"][0]["text"])
+    _dv = _fd.get("value") or {}
+    _dd = _dv.get("differential") or {}
+    check("the pair feedline kind returns the same 129.86 ohm differential the pair "
+          "solver does, and says out loud that the number is Zdiff",
+          _fd.get("status") == "ok" and abs(_dv.get("z0_ohm", 0.0) - 129.86) < 0.2
+          and abs(_dd.get("z_odd_ohm", 0.0) - 64.930) < 0.2
+          and str(_dv.get("z0_meaning", "")).startswith("DIFFERENTIAL")
+          and _dd.get("charge_balance_odd") == -1.0
+          and _dd.get("z_odd_ohm", 0.0) < _dd.get("z_even_ohm", 0.0)
+          and abs(_dd.get("z_common_ohm", 0.0)
+                  - 0.5 * _dd.get("z_even_ohm", 0.0)) < 1e-3,
+          "%s ohm, odd %s / even %s" % (_dv.get("z0_ohm"), _dd.get("z_odd_ohm"),
+                                        _dd.get("z_even_ohm")))
+
+    r = handle({"jsonrpc": "2.0", "id": 133, "method": "tools/call",
+                "params": {"name": "feedline_impedance",
+                           "arguments": {"kind": "cpw_diff", "width_mm": 0.3,
+                                         "spacing_mm": 0.2, "gap_mm": 0.2,
+                                         "dielectric_mm": 0.2, "freq_ghz": 2.4,
+                                         "tan_delta": 0.02}}})
+    _fl = json.loads(r["result"]["content"][0]["text"])
+    _lo = (_fl.get("value") or {}).get("loss") or {}
+    _sp2 = _lo.get("shape_factor_split") or {}
+    check("the pair's conductor loss is normalised to the differential current: both "
+          "strips and both wings carry equal shares, nothing on a backside plane, "
+          "and the field figure stays below the sheet bound because a sheet bound "
+          "gives the grounds nothing",
+          _fl.get("status") == "ok"
+          and abs(_lo.get("conductor_db_per_100mm", 0.0) - 0.4312) < 0.02
+          and abs(_lo.get("dielectric_db_per_100mm", 0.0) - 0.5157) < 0.005
+          and abs(_sp2.get("strips_each", 0.0)
+                  - 0.5 * _sp2.get("strips", 0.0)) < 2e-5
+          and _sp2.get("return_left") == _sp2.get("return_right")
+          and _sp2.get("return_back") == 0.0
+          and (_lo.get("field_over_sheet_ratio") or 1.0) < 1.0,
+          "alpha_c %s, split %s" % (_lo.get("conductor_db_per_100mm"), _sp2))
+
+    # A pair kind without a spacing is not a defaulted parameter, it is a missing
+    # one - and a single-ended kind must not have become sensitive to it.
+    r = handle({"jsonrpc": "2.0", "id": 134, "method": "tools/call",
+                "params": {"name": "feedline_impedance",
+                           "arguments": {"kind": "cpw_diff", "width_mm": 0.3,
+                                         "gap_mm": 0.2, "dielectric_mm": 0.2}}})
+    _nf = json.loads(r["result"]["content"][0]["text"])
+    _ok1 = _nf.get("status") == "error" and _nf.get("reason_code") == "ARG_REQUIRED"
+    _ok2 = False
+    try:
+        from .calc import feedline as _fe
+        _e1 = _fe.feedline_impedance("cpw", 0.3, 0.2, gap_mm=0.2)
+        _e2 = _fe.feedline_impedance("cpw", 0.3, 0.2, gap_mm=0.2, spacing_mm=0.6)
+        _ok2 = (_e1.get("status") == "ok" and _e2.get("status") == "ok"
+                and abs(_e1["value"]["z0_ohm"] - _e2["value"]["z0_ohm"]) < 1e-9)
+    except Exception as exc:                                # noqa: BLE001
+        _ok1 = False
+        _lo_note = "feedline import failed: %s" % exc
+    check("a pair kind without spacing_mm is refused as a missing argument, and a "
+          "single-ended kind stays bit-identical when spacing_mm is passed anyway",
+          _ok1 and _ok2, str(_nf.get("reason_code")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

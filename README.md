@@ -180,8 +180,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
-| `feedline_impedance` | 微带 / 带状线 / CPW / GCPW → Z0 与 εeff；损耗（导体 = 截面场解 `Rs/(2Z0)·∮g²ds`，另给薄电流式作第二估计 + `roughness_um`） | CPW 不建模铜厚、导体损耗回 `null` + 原因（同层回流）；`t=0` 带网格漂移告警 |
-| `feedline_width` | Z0 → 线宽（二分） | 不可达回 `OUT_OF_RANGE` + `reachable_ohm` 两端实测 |
+| `feedline_impedance` | 微带 / 带状线 / CPW / GCPW，以及**边耦合差分对** `cpw_diff` / `gcpw_diff`（需 `spacing_mm`）→ Z0 或 Zdiff 与 εeff；损耗（导体 = 截面场解 `Rs/(2Z0)·∮g²ds`，另给薄电流式作第二估计 + `roughness_um`） | 差分的数**标成差分**（Zdiff = 2·Z_odd，附带 z_odd/z_even/z_common + 电荷平衡）；差分损耗分母是**差分电流**，两片地各 11.4% 形状因子；`t=0` 带网格漂移告警；差分一次求解 5~40 s（越宽越慢） |
+| `feedline_width` | Z0 或 Zdiff → 线宽 | 不可达回 `UNREACHABLE` + `reachable_ohm` 两端实测；差分没有闭式，走粗网格阶梯 → 便宜网格二分 → 默认网格牛顿/割线，残差原样报（`abs_error_ohm` / `converged` / `default_solves`），一次 21 s~6 min |
 | `antenna_patch` | 矩形贴片：W/L（含边缘 dL）、边缘 Rin、内缩深度、Q、VSWR<2 带宽、效率 | 传输线模型；内缩不含开槽宽度；效率需要 tanδ |
 | `antenna_printed` | 印刷四分之一波长（IFA / 蛇形 / 印刷单极）：长度**区间** + IFA 抽头 + Chu 上限 | εeff 无可信闭式 ⇒ 给区间不给单值；蛇形必须传 `bbox_mm` 并回 `fits` |
 | `antenna_dipole_monopole` | 细线偶极 / 单极：长度、辐射电阻、方向性、馈电缝隙 | 细线端效应 0.475λ0；粗导体不适用 |
@@ -260,9 +260,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.10
-python run_server.py --selftest      # 协议级自检，76/76（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问）
-python -m unittest discover -s tests # 1570 个用例（约 12 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.26
+python run_server.py --selftest      # 协议级自检，111/111（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问）
+python -m unittest discover -s tests # 1583 个用例（约 12 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -618,10 +618,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1570 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1583 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~31，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~32，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
@@ -632,7 +632,7 @@ pcb_agent_mcp/
   （`diff_impedance_field`），但紧间距耦合没有独立参考答案，那种几何下它会自己声明
   `reference_note`。共面线（cpw/gcpw）也有场解（`coplanar_field`），它在七个几何上都比共形映射
   **读低** 1.19%~3.39%，即共形映射是乐观的那一端；共面损耗现在由场解给出，但只有零厚度值
-  （真实铜箔更高约 10%，而那 10% 自己也没收敛）。共面的地默认按**无限宽**算，真实版图地留窄时传 `ground_mm`——单线 `g/2` 宽的地会抬 13.7%，差分对则只动差模 1.1% 而动共模 21.9%。定稿前请用场求解器或打样厂的阻抗报告复核。
+  （真实铜箔更高约 10%，而那 10% 自己也没收敛）。共面的地默认按**无限宽**算，真实版图地留窄时传 `ground_mm`——单线 `g/2` 宽的地会抬 13.7%，差分对则只动差模 1.1% 而动共模 21.9%。差分对同理，且**差分对的数一律是 Zdiff = 2·Z_odd**；要拿宽度而不是阻抗时用 `feedline_width`，它在差分对上会把残差一起报出来。定稿前请用场求解器或打样厂的阻抗报告复核。
 - 仿真层是**子集**：SPICE 只有 R C L V I E G D Q M 与后向欧拉瞬态，没有自热、没有噪声/失真、
   没有器件电容随温度；热学是 1-D/2-D 稳态与单级或多级 RC，不含 TIM 压缩、辐照与空气流场；
   板级 IR drop 只算直流、只用叠层铜厚。逐条写在每次返回的 `not_computed` / `warnings` 里。
