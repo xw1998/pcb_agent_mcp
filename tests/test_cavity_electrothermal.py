@@ -15,6 +15,7 @@ must NOT return the last iterate, and via_fence must NOT invent an acceptance
 ratio (lambda_g/20 vs lambda_g/10 is a factor of 2 disagreement that the module
 has no business resolving).
 """
+import json
 import math
 import os
 import sys
@@ -233,6 +234,150 @@ class ElectroThermalTrace(unittest.TestCase):
                          "ARG_RANGE")
         self.assertEqual(E.trace_self_heating("x", 1, 35, 1, rth_c_per_w=100)["reason_code"],
                          "ARG_INVALID")
+
+
+class PlaneQ(unittest.TestCase):
+    """Q of a plane-pair mode.
+
+    The expected numbers here are the hand-arithmetic ones: delta_s =
+    sqrt(2/(omega*mu0*sigma)), Qc = h/delta_s, Qd = 1/tan_delta, and the series
+    sum. The interesting assertions are the two structural ones, because they are
+    where a wrong factor of two hides: Qc must be independent of the plane SIZE
+    and of the MODE (at equal f), and the longhand field integration must agree
+    with the closed form without ever using it.
+    """
+
+    MU0 = 4e-7 * math.pi
+    SIGMA = 5.8e7
+
+    def _delta(self, f_hz, sigma=None):
+        return math.sqrt(2.0 / (2.0 * math.pi * f_hz * self.MU0 * (sigma or self.SIGMA)))
+
+    def test_conductor_q_is_h_over_skin_depth(self):
+        # 1 GHz, 1.6 mm of FR4 between the copper, copper at 5.8e7 S/m
+        delta = self._delta(1e9)                       # 2.0898 um
+        self.assertAlmostEqual(delta * 1e6, 2.0898, places=3)
+        r = C.plane_q(1e9, 1.6)
+        self.assertEqual(r["status"], "ok")
+        v = r["value"]
+        self.assertAlmostEqual(v["skin_depth_um"], delta * 1e6, places=3)
+        self.assertAlmostEqual(v["q_conductor"], 1.6e-3 / delta, delta=0.05)
+        self.assertAlmostEqual(v["q_conductor"], 765.6, delta=1.0)
+        # Rs = 1/(sigma*delta) must be the printed 8.25 mOhm/square
+        self.assertAlmostEqual(v["surface_resistance_ohm_sq"], 1.0 / (self.SIGMA * delta),
+                               delta=1e-6)
+
+    def test_three_derivations_agree(self):
+        # closed form, the transmission-line argument (same closed form, stated
+        # separately in the docstring) and the longhand field integration
+        for m, n in ((1, 0), (1, 1), (2, 1)):
+            modes = C.plane_resonance(100.0, 80.0, 4.3, m_max=2, n_max=2)["value"]
+            f = [row["f_hz"] for row in modes if (row["m"], row["n"]) == (m, n)][0]
+            closed = C.plane_q(f, 1.6)["value"]["q_conductor"]
+            numeric = C._plane_q_by_integration(100.0, 80.0, m, n, 1.6, f)
+            self.assertAlmostEqual(numeric / closed, 1.0, delta=2e-3,
+                                   msg="mode (%d,%d) numeric %g vs closed %g"
+                                       % (m, n, numeric, closed))
+
+    def test_conductor_q_does_not_know_the_mode_numbers(self):
+        # a square plane makes (1,0) and (0,1) degenerate: same f, different mode,
+        # so any m/n dependence would show up as a difference
+        modes = C.plane_resonance(100.0, 100.0, 4.3, m_max=1, n_max=1)["value"]
+        f10 = [row["f_hz"] for row in modes if (row["m"], row["n"]) == (1, 0)][0]
+        f01 = [row["f_hz"] for row in modes if (row["m"], row["n"]) == (0, 1)][0]
+        self.assertAlmostEqual(f10 / f01, 1.0, delta=1e-9)
+        a = C._plane_q_by_integration(100.0, 100.0, 1, 0, 1.6, f10)
+        b = C._plane_q_by_integration(100.0, 100.0, 0, 1, 1.6, f10)
+        self.assertAlmostEqual(a / b, 1.0, delta=1e-9)
+
+    def test_conductor_q_does_not_know_the_plane_size(self):
+        # at a fixed frequency, two very different plane pairs must give one answer
+        q_small = C.plane_q(2e9, 0.4)["value"]["q_conductor"]
+        self.assertAlmostEqual(q_small, 0.4e-3 / self._delta(2e9), delta=1e-2)
+        # 4x the thickness, 4x the Q (linear in h, not in h/2)
+        self.assertAlmostEqual(C.plane_q(1e9, 6.4)["value"]["q_conductor"] / 765.621,
+                               4.0, places=3)
+
+    def test_conductor_q_goes_as_sqrt_f(self):
+        q1 = C.plane_q(1e9, 1.6)["value"]["q_conductor"]
+        q4 = C.plane_q(4e9, 1.6)["value"]["q_conductor"]
+        self.assertAlmostEqual(q4 / q1, 2.0, places=3)
+
+    def test_dielectric_q_and_the_series_sum(self):
+        r = C.plane_q(1e9, 1.6, tan_delta=0.02)["value"]
+        qc = r["q_conductor"]
+        self.assertAlmostEqual(r["q_dielectric"], 50.0, places=6)
+        self.assertAlmostEqual(r["q_total"], 1.0 / (1.0 / qc + 1.0 / 50.0), places=4)
+        self.assertLess(r["q_total"], r["q_dielectric"])
+        self.assertLess(r["q_total"], qc)
+        # FR4-class prepreg: the dielectric, not the copper, sets the damping
+        self.assertEqual(r["which_dominates"], "dielectric")
+        # bandwidth and the amplitude decay time follow from Q and f, not from a
+        # second model: BW = f/Q, tau = 2Q/omega = Q/(pi*f)
+        self.assertAlmostEqual(r["half_power_bandwidth_hz"], 1e9 / r["q_total"],
+                               delta=20.0)
+        self.assertAlmostEqual(r["ringing_amplitude_tau_s"],
+                               r["q_total"] / (math.pi * 1e9), delta=1e-13)
+
+    def test_a_low_loss_laminate_flips_which_dominates(self):
+        # PTFE-class tan_delta = 5e-4 -> Qd = 2000 > Qc = 766
+        r = C.plane_q(1e9, 1.6, tan_delta=5e-4)["value"]
+        self.assertEqual(r["which_dominates"], "copper")
+        self.assertAlmostEqual(r["q_total"], 1.0 / (1.0 / 765.621 + 1.0 / 2000.0),
+                               delta=0.5)
+
+    def test_missing_tan_delta_is_said_out_loud(self):
+        r = C.plane_q(1e9, 1.6)["value"]
+        self.assertIsNone(r["q_dielectric"])
+        self.assertIn("dielectric_not_included", r)
+        self.assertIn("not conservative", r["dielectric_not_included"])
+        # the total then IS the conductor Q, and it says so
+        self.assertAlmostEqual(r["q_total"], r["q_conductor"], places=6)
+
+    def test_no_verdict_is_attached(self):
+        r = C.plane_q(1e9, 1.6, tan_delta=0.02)
+        blob = (r["precision"] + " " + json.dumps(r["assumptions"])).lower()
+        self.assertIn("upper bound on q", r["precision"].lower())
+        self.assertNotIn("verdict", json.dumps(r["value"]).lower().replace(
+            "does_not_prove", ""))
+        self.assertIn("no verdict", blob)
+
+    def test_refusals(self):
+        self.assertEqual(C.plane_q(0, 1.6)["reason_code"], "ARG_RANGE")
+        self.assertEqual(C.plane_q(1e9, 0)["reason_code"], "ARG_RANGE")
+        self.assertEqual(C.plane_q("x", 1.6)["reason_code"], "ARG_INVALID")
+        self.assertEqual(C.plane_q(1e9, "x")["reason_code"], "ARG_INVALID")
+        self.assertEqual(C.plane_q(1e9, 1.6, tan_delta=0)["reason_code"], "ARG_RANGE")
+        self.assertEqual(C.plane_q(1e9, 1.6, tan_delta=-0.02)["reason_code"], "ARG_RANGE")
+        # tan_delta >= 1 would give Qd <= 1, i.e. not a resonance at all
+        self.assertEqual(C.plane_q(1e9, 1.6, tan_delta=1.0)["reason_code"], "ARG_RANGE")
+        self.assertEqual(C.plane_q(1e9, 1.6, conductivity_s_m=0)["reason_code"],
+                         "ARG_RANGE")
+
+
+class PlaneQTools(unittest.TestCase):
+    def test_the_tool_is_registered_and_listed(self):
+        from pcb_agent_mcp import tools
+        self.assertIn("cavity_plane_q", tools.TOOLS)
+        c = tools.call_tool("calc_capabilities", {})
+        self.assertIn("cavity_plane_q", c["available"])
+
+    def test_it_runs_through_the_dispatcher(self):
+        from pcb_agent_mcp import tools
+        r = tools.call_tool("cavity_plane_q",
+                            {"f_hz": 722.864e6, "h_mm": 1.6, "tan_delta": 0.02})
+        self.assertEqual(r["status"], "ok")
+        self.assertAlmostEqual(r["value"]["q_dielectric"], 50.0, places=6)
+        # required arguments are enforced by the schema, not by a default
+        self.assertEqual(tools.call_tool("cavity_plane_q", {"f_hz": 1e9})["status"],
+                         "error")
+
+    def test_the_old_no_q_claim_is_gone(self):
+        from pcb_agent_mcp import tools
+        blob = " ".join(tools.call_tool("calc_capabilities", {})["not_implemented_yet"])
+        self.assertIn("cavity_plane_q", blob)
+        self.assertIn("UPPER bound on Q", blob)
+        self.assertNotIn("but no Q (dielectric tan-delta", blob)
 
 
 class ToolSurface(unittest.TestCase):

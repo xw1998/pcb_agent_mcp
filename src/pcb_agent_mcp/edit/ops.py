@@ -51,6 +51,31 @@ class Editor(object):
             name = S.arg_text(node, 2) or ""
             self.net_by_name[name] = code
             self.name_by_code[code] = name
+        # KiCad 10's board format drops the `(net <code> "name")` table: every
+        # object carries `(net "name")` instead and nets live in the project.
+        # Deriving the map from the references keeps every name lookup - read,
+        # verify and delete - working on those boards too, so this is a fact
+        # about the file, recorded rather than papered over.
+        self.name_only = not self.net_by_name
+        if self.name_only:
+            self._derive_nets()
+
+    def _derive_nets(self):
+        """Build the net map from `(net "name")` references (name-only formats)."""
+        def take(node):
+            net = S.child(node, "net")
+            if net is None:
+                return
+            name = S.arg_text(net, 2) or S.arg_text(net, 1) or ""
+            if name:
+                self.net_by_name[name] = name
+                self.name_by_code[name] = name
+        for fp in self.footprints():
+            for pad in S.children(fp, "pad"):
+                take(pad)
+        for kind in ("segment", "arc", "via", "zone", "group"):
+            for node in self.items(kind):
+                take(node)
 
     # ---------------------------------------------------------- lookups
     def _layers(self):
@@ -86,6 +111,12 @@ class Editor(object):
         if name in self.net_by_name:
             return self.net_by_name[name]
         if allow_create:
+            if self.name_only:
+                raise OpError(
+                    "this board's format has no net table to add to - a net "
+                    "exists here only because an object names it, so assign %r "
+                    "to the pad/zone that uses it instead" % name,
+                    "NET_CANNOT_CREATE")
             code = str(max([int(c) for c in self.name_by_code if (c or "").isdigit()]
                            or [0]) + 1)
             self.append(B.L(B.A("net"), B.A(code), B.A(name, True)))
@@ -876,7 +907,11 @@ def _run_add_footprint(ed, o, seed):
             if not isinstance(net_name, str) or not net_name:
                 raise OpError("pad_nets[%r] must be a net name" % number, "ARG_INVALID")
             code = ed.net_code(net_name, allow_create=_bool(o, "create_nets", False))
-            pad.items.append(B.L(B.A("net"), B.A(code), B.A(net_name, True)))
+            if ed.name_only:
+                # name-only boards: `(net "GND")`, no code column
+                pad.items.append(B.L(B.A("net"), B.A(net_name, True)))
+            else:
+                pad.items.append(B.L(B.A("net"), B.A(code), B.A(net_name, True)))
             assigned[number] = [code, net_name]
     ed.append(node)
     return {"reference": ref, "lib_id": lib_id, "at": [x, y, rot],
@@ -1019,7 +1054,7 @@ def _verify_add_footprint(ed, o):
     for pad in S.children(fp, "pad"):
         number = S.arg_text(pad, 1) or ""
         net = S.child(pad, "net")
-        got_name = S.arg_text(net, 2) if net is not None else None
+        got_name = (S.arg_text(net, 2) or S.arg_text(net, 1)) if net is not None else None
         want_name = pad_nets.get(number)
         if (got_name or None) != (want_name or None):
             wrong[number] = [want_name, got_name]
@@ -1520,6 +1555,1061 @@ op("set_board_thickness", {"meta"},
    "Set (general (thickness ...)) in millimetres.",
    {"mm": "mm > 0"},
    _run_set_thickness, _verify_set_thickness)
+
+# --- editing parts that are already on the board ----------------------
+def _run_delete_footprint(ed, o, seed):
+    ref = _str(o, "ref")
+    fp = ed.footprint(ref)
+    layer = S.arg_text(S.child(fp, "layer"), 1)
+    at = S.child(fp, "at")
+    pos = [S.arg_num(at, 1, 0.0), -S.arg_num(at, 2, 0.0)] if at is not None else None
+    pads = S.children(fp, "pad")
+    nets = []
+    for pad in pads:
+        node = S.child(pad, "net")
+        name = S.arg_text(node, 2) if node is not None else None
+        if name and name not in nets:
+            nets.append(name)
+    if not ed.remove(fp):
+        raise OpError("footprint %r is not a child of the board" % ref, "OP_INVALID")
+    return {"reference": ref, "at": pos, "layer": layer,
+            "pads_removed": len(pads), "nets_released": sorted(nets)}
+
+def _verify_delete_footprint(ed, o):
+    ref = _str(o, "ref")
+    alive = [ed.footprint_ref(n) for n in ed.footprints()]
+    return {"ok": ref not in alive, "footprints_left": len(alive)}
+
+op("delete_footprint", {"copper", "silk", "mech"},
+   "Remove a placed footprint (its pads and silk go with it; nets keep whatever "
+   "else still uses them). The board's outline and the libraries are untouched.",
+   {"ref": "reference designator"},
+   _run_delete_footprint, _verify_delete_footprint)
+
+def _ensure_effects(node):
+    """The text node's `(effects ...)`, created when the file has none.
+
+    A hand-written or minimal footprint may carry `(fp_text value "10k" (at 0 2)
+    (layer "F.Fab"))` with no effects block at all. Flipping it to the back must
+    still produce mirrored text, so the empty block is created rather than the
+    `mirror` word being silently dropped.
+    """
+    eff = S.child(node, "effects")
+    if eff is None:
+        eff = S.append_child(node, B.L(B.A("effects")))
+    return eff
+
+def _unmirror_justify(effects):
+    """The inverse of `_mirror_justify`: drop the `mirror` word, keep the rest."""
+    for node in S.children(effects, "justify"):
+        node.items = [it for it in node.items
+                      if not (isinstance(it, S.Atom) and it.text == "mirror")]
+        return
+
+def _flip_in_place(node, cur_angle, to_back):
+    """Flip a placed footprint's body about its own vertical axis.
+
+    Measured against KiCad 10.0 (`pcbnew.FOOTPRINT.Flip`, six combinations of
+    footprint angle {0, 30, 90} x pad angle {0, 30}) rather than derived:
+
+      * the footprint's `(at x y a)` becomes `180 - a`; the layer goes F.Cu <-> B.Cu
+        (the caller writes those two, this function skips them like `_flip_body`)
+      * a pad `(at dx dy q)` becomes `(at dx -dy 180-q)`. The pad angle in a board
+        file is **absolute**, so `q` alone flips - subtracting the footprint
+        angle as well is the mistake `_flip_body` cannot make because it always
+        receives a library body whose pads were not rotated yet
+      * every graphic point's dy is negated, an arc `(center x y a)` angle becomes
+        `180 - a`
+      * field text: dy negated, angle `180 - a`, and `mirror` in `justify` toggles
+
+    The map is its own inverse (verified by the round-trip test), so one function
+    serves both directions; `to_back` only says which way the `mirror` toggle goes.
+    """
+    back = (180.0 - float(cur_angle)) % 360.0
+
+    def neg_y(seq):
+        if len(seq.items) > 2:
+            seq.items[2].text = B.num(-(S.arg_num(seq, 2, 0.0)))
+
+    def one(child, in_pad):
+        head = S.head(child) if isinstance(child, S.Seq) else None
+        if head == "layer":
+            name = S.arg_text(child, 1)
+            if name in _LAYER_FLIP:
+                child.items[1].text = _LAYER_FLIP[name]
+        elif head == "layers":
+            for item in child.items[1:]:
+                if isinstance(item, S.Atom) and item.text in _LAYER_FLIP:
+                    item.text = _LAYER_FLIP[item.text]
+        elif head in ("start", "end", "center", "mid", "xy"):
+            neg_y(child)
+            if head == "center":
+                _set_angle(child, back)
+        elif head == "at":
+            local = S.arg_num(child, 3, 0.0) or 0.0
+            neg_y(child)
+            if in_pad:
+                _set_angle(child, (180.0 - float(local)) % 360.0)
+            else:
+                _set_angle(child, back)
+        elif head == "effects":
+            if to_back:
+                _mirror_justify(child)
+            else:
+                _unmirror_justify(child)
+            for sub in child.items[1:]:
+                one(sub, in_pad)
+        elif isinstance(child, S.Seq):
+            child_pad = (head == "pad") or in_pad
+            if to_back and head in ("fp_text", "property"):
+                _mirror_justify(_ensure_effects(child))
+            for sub in child.items[1:]:
+                one(sub, child_pad)
+
+    for child in node.items[1:]:
+        if isinstance(child, S.Seq) and S.head(child) in _FOOTPRINT_DROP:
+            continue
+        one(child, False)
+
+def _run_set_footprint_layer(ed, o, seed):
+    ref = _str(o, "ref")
+    want = _str(o, "layer")
+    if want not in ("F.Cu", "B.Cu"):
+        raise OpError("a footprint sits on F.Cu or B.Cu, not %r" % want,
+                      "LAYER_NOT_ALLOWED")
+    ed.require_layer(want)
+    fp = ed.footprint(ref)
+    lnode = S.child(fp, "layer")
+    cur = S.arg_text(lnode, 1) if lnode is not None else None
+    if cur not in ("F.Cu", "B.Cu"):
+        raise OpError("footprint %r sits on %r, which is not a side" % (ref, cur),
+                      "LAYER_NOT_ALLOWED")
+    if cur == want:
+        return {"reference": ref, "from": cur, "to": want, "changed": False}
+    at = S.child(fp, "at")
+    cur_angle = (S.arg_num(at, 3, 0.0) or 0.0) if at is not None else 0.0
+    _flip_in_place(fp, cur_angle, want == "B.Cu")
+    if at is not None:
+        _set_angle(at, (180.0 - float(cur_angle)) % 360.0)
+    if lnode is not None:
+        lnode.items[1].text = want
+    else:
+        S.insert_child(fp, 1, B.L(B.A("layer"), B.A(want, True)))
+    return {"reference": ref, "from": cur, "to": want, "changed": True,
+            "file_angle_before": cur_angle,
+            "file_angle_after": (180.0 - float(cur_angle)) % 360.0}
+
+def _verify_set_footprint_layer(ed, o):
+    fp = ed.footprint(_str(o, "ref"))
+    want = _str(o, "layer")
+    lnode = S.child(fp, "layer")
+    cur = S.arg_text(lnode, 1) if lnode is not None else None
+    opposite = "F." if want == "B.Cu" else "B."
+    wrong = 0
+    for pad in S.children(fp, "pad"):
+        for lay in S.children(pad, "layers"):
+            names = [it.text for it in lay.items[1:] if isinstance(it, S.Atom)]
+            if any(n.startswith(opposite) for n in names):
+                wrong += 1
+    return {"ok": cur == want and wrong == 0, "layer": cur,
+            "pads_on_the_other_side": wrong}
+
+op("set_footprint_layer", {"copper", "silk", "mech"},
+   "Flip a placed footprint between the front and the back of the board, mirroring "
+   "its pads, silk and fields the way KiCad's own 'flip' does (measured against "
+   "pcbnew, not derived). The footprint keeps its position.",
+   {"ref": "reference designator", "layer": "F.Cu or B.Cu"},
+   _run_set_footprint_layer, _verify_set_footprint_layer)
+
+def _net_uses(ed, code):
+    """Every place a net code is referenced, with enough detail to report it."""
+    use = {"pads": [], "tracks": 0, "vias": 0, "zones": 0}
+    for fp in ed.footprints():
+        ref = ed.footprint_ref(fp)
+        for pad in S.children(fp, "pad"):
+            node = S.child(pad, "net")
+            if node is not None and S.arg_text(node, 1) == code:
+                use["pads"].append([ref, S.arg_text(pad, 1)])
+    for kind in ("segment", "arc"):
+        for node in ed.items(kind):
+            if S.arg_text(S.child(node, "net"), 1) == code:
+                use["tracks"] += 1
+    for node in ed.items("via"):
+        if S.arg_text(S.child(node, "net"), 1) == code:
+            use["vias"] += 1
+    for node in ed.items("zone"):
+        if S.arg_text(S.child(node, "net"), 1) == code:
+            use["zones"] += 1
+    return use
+
+def _strip_net_from(node, code):
+    for child in list(node.items[1:]):
+        if isinstance(child, S.Seq) and S.head(child) == "net" \
+                and S.arg_text(child, 1) == code:
+            node.items.remove(child)
+            return True
+    return False
+
+def _run_delete_net(ed, o, seed):
+    name = _str(o, "net")
+    if name not in ed.net_by_name:
+        raise OpError("net %r does not exist on this board" % name, "NET_NOT_FOUND")
+    code = ed.net_by_name[name]
+    if not name or str(code) in ("0", "None"):
+        raise OpError("net 0 is the unnamed net; it is not an editable net",
+                      "NET_NOT_DELETABLE")
+    use = _net_uses(ed, code)
+    total = len(use["pads"]) + use["tracks"] + use["vias"] + use["zones"]
+    force = _bool(o, "force", False)
+    if total and not force:
+        raise OpError(
+            "net %r is still used by %d pads, %d tracks, %d vias and %d zones; "
+            "pass force=true to unassign all of them and delete the net"
+            % (name, len(use["pads"]), use["tracks"], use["vias"], use["zones"]),
+            "NET_IN_USE",
+            hint="deleting the declaration alone would leave copper claiming a net that "
+            "no longer exists, which DRC reports as a phantom net")
+    unassigned = 0
+    if force:
+        for fp in ed.footprints():
+            for pad in S.children(fp, "pad"):
+                if _strip_net_from(pad, code):
+                    unassigned += 1
+        for kind in ("segment", "arc"):
+            for node in ed.items(kind):
+                if _strip_net_from(node, code):
+                    unassigned += 1
+        for node in ed.items("via"):
+            if _strip_net_from(node, code):
+                unassigned += 1
+        for node in ed.items("zone"):
+            if S.arg_text(S.child(node, "net"), 1) == code:
+                ed.remove(node)
+    for node in ed.items("net"):
+        if S.arg_text(node, 1) == code:
+            ed.remove(node)
+    if name in ed.net_by_name:
+        del ed.net_by_name[name]
+    return {"net": name, "net_code": code, "uses_before": {
+                "pads": len(use["pads"]), "tracks": use["tracks"],
+                "vias": use["vias"], "zones": use["zones"]},
+            "unassigned": unassigned, "force": force}
+
+def _verify_delete_net(ed, o):
+    name = _str(o, "net")
+    left = _net_uses(ed, ed.net_by_name.get(name))
+    total = len(left["pads"]) + left["tracks"] + left["vias"] + left["zones"]
+    return {"ok": name not in ed.net_by_name and total == 0,
+            "still_declared": name in ed.net_by_name, "references_left": total}
+
+op("delete_net", {"copper", "meta"},
+   "Delete a net declaration. Refuses while pads, tracks, vias or zones still "
+   "belong to it unless force=true, which unassigns them first - a declaration "
+   "that vanished while copper still names it is a phantom net in DRC.",
+   {"net": "net name", "force": "bool - unassign every user of the net first"},
+   _run_delete_net, _verify_delete_net)
+
+def _select_zones(ed, o):
+    net = o.get("net")
+    layer = o.get("layer")
+    uid = o.get("uuid")
+    if not net and not layer and not uid:
+        raise OpError("this operation needs a selector: 'net', 'layer' or 'uuid'",
+                      "ARG_MISSING")
+    code = None
+    if net:
+        code = ed.net_by_name.get(net)
+        if code is None:
+            raise OpError("net %r does not exist on this board" % net, "NET_NOT_FOUND")
+    out = []
+    for node in ed.items("zone"):
+        if uid and ed.sp.id_of(node) != uid:
+            continue
+        if code is not None and S.arg_text(S.child(node, "net"), 1) != code:
+            continue
+        if layer and S.arg_text(S.child(node, "layer"), 1) != layer:
+            continue
+        out.append(node)
+    return out
+
+def _zone_label(ed, node):
+    return {"net": S.arg_text(S.child(node, "net_name"), 1) or "",
+            "layer": S.arg_text(S.child(node, "layer"), 1),
+            "uuid": ed.sp.id_of(node)}
+
+def _run_delete_zone(ed, o, seed):
+    targets = _select_zones(ed, o)
+    if not targets:
+        raise OpError("no zone matches that selector", "TARGET_NOT_FOUND")
+    gone = [_zone_label(ed, n) for n in targets]
+    for node in targets:
+        ed.remove(node)
+    return {"zones_removed": len(gone), "zones": gone}
+
+def _verify_delete_zone(ed, o):
+    try:
+        left = _select_zones(ed, o)
+    except OpError:
+        left = []
+    return {"ok": not left, "remaining_matches": len(left)}
+
+op("delete_zone", {"copper"},
+   "Delete copper zones (pours or keep-outs) by net, layer, uuid or a combination. "
+   "Refuses without a selector - 'delete every zone' is not an operation.",
+   {"net": "net name", "layer": "layer name", "uuid": "zone uuid"},
+   _run_delete_zone, _verify_delete_zone)
+
+def _run_set_zone_priority(ed, o, seed):
+    priority = int(_num(o, "priority"))
+    if priority < 0:
+        raise OpError("priority must be >= 0", "ARG_INVALID")
+    targets = _select_zones(ed, o)
+    if not targets:
+        raise OpError("no zone matches that selector", "TARGET_NOT_FOUND")
+    changed = []
+    for node in targets:
+        node_ = S.child(node, "priority")
+        if node_ is not None:
+            for i, item in enumerate(node.items):
+                if item is node_:
+                    node.items[i] = B.L(B.A("priority"), B.A(str(priority)))
+                    break
+        else:
+            # KiCad reads `(priority N)` as a child of `(zone ...)`; verified by
+            # loading the written board in pcbnew and asking the zone for its
+            # assigned priority.
+            S.append_child(node, B.L(B.A("priority"), B.A(str(priority))))
+        changed.append(_zone_label(ed, node))
+    return {"zones_changed": len(changed), "priority": priority, "zones": changed}
+
+def _verify_set_zone_priority(ed, o):
+    want = int(_num(o, "priority"))
+    got = []
+    for node in _select_zones(ed, o):
+        p = S.arg_num(S.child(node, "priority"), 1)
+        got.append(None if p is None else int(round(p)))
+    return {"ok": bool(got) and all(g == want for g in got), "priorities": got}
+
+op("set_zone_priority", {"copper"},
+   "Set the fill priority of the zones a selector matches (higher wins where pours "
+   "overlap). Same selector rules as delete_zone.",
+   {"priority": "integer >= 0", "net": "net name", "layer": "layer name",
+    "uuid": "zone uuid"},
+   _run_set_zone_priority, _verify_set_zone_priority)
+
+def _netclass_members(ed, node):
+    return [S.arg_text(n, 1) for n in S.children(node, "add_net")]
+
+def _run_assign_netclass(ed, o, seed):
+    net = _str(o, "net")
+    cls = _str(o, "netclass")
+    if net not in ed.net_by_name:
+        raise OpError("net %r does not exist on this board" % net, "NET_NOT_FOUND")
+    target = None
+    classes = []
+    for node in ed.items("net_class"):
+        name = S.arg_text(node, 1)
+        classes.append(name)
+        if name == cls:
+            target = node
+    if target is None:
+        raise OpError("net class %r does not exist (classes: %s)"
+                      % (cls, ", ".join(c or "?" for c in classes)),
+                      "NETCLASS_NOT_FOUND",
+                      hint="create the class first with set_netclass, which also decides "
+                      "its clearance and widths")
+    moved_from = []
+    already = False
+    for node in ed.items("net_class"):
+        name = S.arg_text(node, 1)
+        members = _netclass_members(ed, node)
+        if net not in members:
+            continue
+        if name == cls:
+            already = True
+            continue
+        # A net belongs to exactly one class in KiCad; moving it is the honest
+        # reading of "assign", and the old membership is reported, not hidden.
+        members_now = []
+        for child in list(S.children(node, "add_net")):
+            if S.arg_text(child, 1) == net:
+                node.items.remove(child)
+            else:
+                members_now.append(S.arg_text(child, 1))
+        moved_from.append({"netclass": name, "members_left": members_now})
+    if not already:
+        S.append_child(target, B.L(B.A("add_net"), B.A(net, True)))
+    return {"net": net, "netclass": cls, "changed": not already,
+            "moved_from": moved_from}
+
+def _verify_assign_netclass(ed, o):
+    net = _str(o, "net")
+    cls = _str(o, "netclass")
+    homes = []
+    for node in ed.items("net_class"):
+        if net in _netclass_members(ed, node):
+            homes.append(S.arg_text(node, 1))
+    return {"ok": homes == [cls], "net_classes_containing_the_net": homes}
+
+op("assign_netclass", {"meta", "copper"},
+   "Put a net in a net class (creating the membership, moving it out of any other "
+   "class, because a net belongs to exactly one). The class itself must exist - "
+   "its rules are what later tools quote.",
+   {"net": "net name", "netclass": "existing net class name"},
+   _run_assign_netclass, _verify_assign_netclass)
+
+def _run_set_pad_size(ed, o, seed):
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    fp = ed.footprint(ref)
+    target = None
+    have = []
+    for pad in S.children(fp, "pad"):
+        have.append(S.arg_text(pad, 1))
+        if (S.arg_text(pad, 1) or "") == number:
+            target = pad
+    if target is None:
+        raise OpError("footprint %r has no pad %r (it has: %s)"
+                      % (ref, number, ", ".join(sorted(h for h in have if h))),
+                      "PAD_NOT_FOUND")
+    w = _num(o, "width", positive=True)
+    h = _num(o, "height", required=False) or w
+    size = S.child(target, "size")
+    if size is None:
+        raise OpError("pad %r has no (size ...) node - the file is malformed" % number,
+                      "PAD_UNSUPPORTED")
+    target.items = (target.items[:target.items.index(size)]
+                    + [B.size(w, h)]
+                    + target.items[target.items.index(size) + 1:])
+    return {"reference": ref, "pad": number, "size": [w, h],
+            "before": [S.arg_num(size, 1), S.arg_num(size, 2)]}
+
+def _verify_set_pad_size(ed, o):
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    w = _num(o, "width")
+    h = _num(o, "height", required=False) or w
+    for pad in S.children(ed.footprint(ref), "pad"):
+        if (S.arg_text(pad, 1) or "") != number:
+            continue
+        size = S.child(pad, "size")
+        gw, gh = S.arg_num(size, 1), S.arg_num(size, 2)
+        ok = (gw is not None and gh is not None and abs(gw - w) < 1e-9
+              and abs(gh - h) < 1e-9)
+        return {"ok": ok, "size": [gw, gh]}
+    return {"ok": False, "error": "pad vanished"}
+
+op("set_pad_size", {"copper"},
+   "Resize one pad of a placed footprint (width, and height if it differs). The pad "
+   "shape, drill and net stay as they are; DRC is the judge of whether the new "
+   "size still meets clearance.",
+   {"ref": "reference designator", "pad": "pad number", "width": "mm > 0",
+    "height": "mm > 0 (default: the width)"},
+   _run_set_pad_size, _verify_set_pad_size)
+
+def _run_set_field(ed, o, seed):
+    ref = _str(o, "ref")
+    name = _str(o, "field")
+    if "value" not in o:
+        raise OpError("missing parameter 'value'", "ARG_MISSING")
+    value = o.get("value")
+    if not isinstance(value, str):
+        raise OpError("'value' must be a string (use \"\" to clear a field)",
+                      "ARG_INVALID")
+    fp = ed.footprint(ref)
+    target = None
+    for kind in ("property", "fp_text"):
+        for cand in S.children(fp, kind):
+            if (S.arg_text(cand, 1) or "").lower() == name.lower():
+                target = cand
+                break
+        if target is not None:
+            break
+    created = False
+    if target is None:
+        if not ed.sp.modern and name.lower() not in ("reference", "value"):
+            raise OpError(
+                "this board's format stores only Reference and Value as fp_text, "
+                "so a new field called %r has nowhere to go; use a newer board "
+                "format (KiCad 7+ writes `property`) or set an existing field"
+                % name, "FIELD_NOT_FOUND")
+        target = _field_node(name, value, 0.0, 0.0, ed.sp, "%s:%s" % (seed, name))
+        S.append_child(fp, target)
+        created = True
+    else:
+        if len(target.items) < 3:
+            raise OpError("field %r is malformed (no value atom)" % name,
+                          "FIELD_UNSUPPORTED")
+        target.items[2] = B.A(value, True)
+    visible = o.get("visible")
+    if visible is not None:
+        # `visible` is what the caller wants; `(hide yes)` is how the file spells
+        # "not visible", so the two conditions read opposite ways on purpose.
+        want = bool(visible)
+        hide = S.child(target, "hide")
+        if not want and hide is None:
+            # `(hide yes)` as a direct child of the field is what both the v7
+            # board format and the newer one accept - checked by loading the
+            # written file in pcbnew and asking the field for IsVisible().
+            S.append_child(target, B.L(B.A("hide"), B.A("yes")))
+        elif want and hide is not None:
+            target.items = [it for it in target.items if it is not hide]
+    return {"reference": ref, "field": name, "value": value,
+            "created": created, "visible": visible}
+
+def _verify_set_field(ed, o):
+    ref = _str(o, "ref")
+    name = _str(o, "field")
+    value = o.get("value")
+    fp = ed.footprint(ref)
+    for kind in ("property", "fp_text"):
+        for cand in S.children(fp, kind):
+            if (S.arg_text(cand, 1) or "").lower() != name.lower():
+                continue
+            got = S.arg_text(cand, 2)
+            out = {"field": name, "value": got, "ok": got == value}
+            if o.get("visible") is not None:
+                out["visible"] = S.child(cand, "hide") is None
+                out["ok"] = out["ok"] and out["visible"] == bool(o.get("visible"))
+            return out
+    return {"ok": False, "reason": "field not present after write"}
+
+op("set_footprint_field", {"silk", "mech", "meta"},
+   "Set the text of one field of a placed footprint (Reference, Value, or any "
+   "property) and optionally show or hide it.",
+   {"ref": "reference designator", "field": "field name, e.g. Reference",
+    "value": "string (\"\" clears it)", "visible": "bool - optional"},
+   _run_set_field, _verify_set_field)
+
+def _run_mech_arc(ed, o, seed):
+    layer = _layer(o, ed, allowed=list(MECH_LAYERS_RO) + list(SILK_LAYERS))
+    w = _num(o, "width", required=False, default=0.15)
+    ed.append(B.arc3("gr_arc", _num(o, "sx"), _num(o, "sy"), _num(o, "mx"),
+                     _num(o, "my"), _num(o, "ex"), _num(o, "ey"), layer, w,
+                     ed.sp, B.new_id(seed)))
+    return {"nodes_added": 1, "layer": layer}
+
+def _verify_mech_arc(ed, o):
+    layer = _str(o, "layer")
+    for node in ed.items("gr_arc"):
+        if S.arg_text(S.child(node, "layer"), 1) != layer:
+            continue
+        st = S.child(node, "start")
+        if st is None:
+            continue
+        if (abs(S.arg_num(st, 1, 0) - _num(o, "sx")) < 1e-4 and
+                abs(-S.arg_num(st, 2, 0) - _num(o, "sy")) < 1e-4):
+            return {"ok": True}
+    return {"ok": False}
+
+op("add_mech_arc", {"mech"},
+   "An arc on a documentation/mechanical user layer (rounded assembly outline, "
+   "connector keep-out arc).",
+   {"sx": "mm start", "sy": "mm start", "mx": "mm mid (on the arc)",
+    "my": "mm mid", "ex": "mm end", "ey": "mm end", "layer": "layer name",
+    "width": "mm"},
+   _run_mech_arc, _verify_mech_arc)
+
+def _run_set_pad_net(ed, o, seed):
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    if "net" not in o:
+        raise OpError("missing parameter 'net' (use \"\" to leave the pad unassigned)",
+                      "ARG_MISSING")
+    net = o.get("net")
+    if net is not None and not isinstance(net, str):
+        raise OpError("'net' must be a net name or \"\" to clear it", "ARG_INVALID")
+    net = net or ""
+    fp = ed.footprint(ref)
+    target = None
+    have = []
+    for pad in S.children(fp, "pad"):
+        name = S.arg_text(pad, 1) or ""
+        have.append(name)
+        if name == number:
+            target = pad
+    if target is None:
+        raise OpError("footprint %r has no pad %r (it has: %s)"
+                      % (ref, number, ", ".join(sorted(h for h in have if h))),
+                      "PAD_NOT_FOUND")
+    before = S.child(target, "net")
+    before_name = ""
+    if before is not None:
+        before_name = S.arg_text(before, 2) or S.arg_text(before, 1) or ""
+    for old in list(S.children(target, "net")):
+        target.items.remove(old)
+    code = None
+    if net:
+        code = ed.net_code(net, allow_create=_bool(o, "create_nets", False))
+        if ed.name_only:
+            target.items.append(B.L(B.A("net"), B.A(net, True)))
+        else:
+            target.items.append(B.L(B.A("net"), B.A(code), B.A(net, True)))
+    return {"reference": ref, "pad": number, "before": before_name,
+            "after": net, "net_code": code}
+
+def _verify_set_pad_net(ed, o):
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    want = o.get("net") or ""
+    for pad in S.children(ed.footprint(ref), "pad"):
+        if (S.arg_text(pad, 1) or "") != number:
+            continue
+        net = S.child(pad, "net")
+        got = ""
+        if net is not None:
+            got = S.arg_text(net, 2) or S.arg_text(net, 1) or ""
+        return {"ok": got == want, "net": got}
+    return {"ok": False, "error": "pad vanished"}
+
+op("set_pad_net", {"copper", "nets"},
+   "Assign one pad of a placed footprint to a net, or clear it (net \"\"). This is "
+   "the operation a schematic-to-board comparison needs: the netlist says pin 7 is "
+   "on SDA, the pad has to say the same, and DRC compares the two.",
+   {"ref": "reference designator", "pad": "pad number", "net": "net name (\"\" clears)",
+    "create_nets": "bool - allow a net that the board does not declare yet "
+                   "(default false)"},
+   _run_set_pad_net, _verify_set_pad_net)
+
+# --- via in pad -------------------------------------------------------
+def _pad_abs(ed, ref, number):
+    """Absolute position of one pad in the FILE frame, plus its net name.
+
+    A pad's `(at dx dy [angle])` is stored relative to the footprint origin and
+    turned by the footprint's own angle. The board file grows *down*, so the turn
+    is done in the Y-up frame - exactly the arithmetic ``adapters.kicad_pcb`` uses
+    to place pads for the clearance oracle, which was checked pad-by-pad against
+    pcbnew (2118 back-side pads included). Doing it directly in file coordinates
+    puts every pad of a rotated footprint on the wrong side: U1 of the test board
+    is at 30 deg and its pads came out 1.8 mm from where pcbnew reports them
+    (`tests/test_ops_edit.py:ViaInPadAgainstPcbnew`).
+    """
+    import math
+    fp = ed.footprint(ref)
+    at = S.child(fp, "at")
+    fx = S.arg_num(at, 1, 0.0) or 0.0
+    fy = S.arg_num(at, 2, 0.0) or 0.0
+    fa = S.arg_num(at, 3) or 0.0
+    have = []
+    for pad in S.children(fp, "pad"):
+        name = S.arg_text(pad, 1) or ""
+        have.append(name)
+        if name != number:
+            continue
+        pat = S.child(pad, "at")
+        px = (S.arg_num(pat, 1, 0.0) or 0.0) if pat is not None else 0.0
+        py = (S.arg_num(pat, 2, 0.0) or 0.0) if pat is not None else 0.0
+        # into the Y-up frame (y of the file points down)
+        cx, cy = fx, -fy
+        rx, ry = px, -py
+        ca, sa = math.cos(math.radians(fa)), math.sin(math.radians(fa))
+        x = cx + rx * ca - ry * sa
+        y = -1.0 * (cy + rx * sa + ry * ca)
+        net = S.child(pad, "net")
+        net_name = ""
+        if net is not None:
+            net_name = S.arg_text(net, 2) or S.arg_text(net, 1) or ""
+        pad_type = (S.arg_text(pad, 2) or "").lower()
+        size = S.child(pad, "size")
+        w = S.arg_num(size, 1) if size is not None else None
+        h = S.arg_num(size, 2) if size is not None else None
+        return {"node": pad, "x": x, "y": y, "net": net_name, "type": pad_type,
+                "w": w, "h": h}
+    raise OpError("footprint %r has no pad %r (it has: %s)"
+                  % (ref, number, ", ".join(sorted(h for h in have if h))),
+                  "PAD_NOT_FOUND")
+
+def _copper_stack(ed):
+    """Copper layer names in stack order, as declared in `(layers ...)`."""
+    out = []
+    node = S.child(ed.board, "layers")
+    if node is None:
+        return []
+    for item in node.items[1:]:
+        if not isinstance(item, S.Seq) or len(item.items) < 3:
+            continue
+        name = item.items[1].text if isinstance(item.items[1], S.Atom) else ""
+        kind = item.items[2].text if isinstance(item.items[2], S.Atom) else ""
+        if name.endswith(".Cu") and kind in ("signal", "power", "mixed", "jumper"):
+            out.append(name)
+    return out
+
+def _run_add_via_in_pad(ed, o, seed):
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    info = _pad_abs(ed, ref, number)
+    net = o.get("net")
+    if net is not None and not isinstance(net, str):
+        raise OpError("'net' must be a net name", "ARG_INVALID")
+    if net:
+        net = net.strip()
+    else:
+        net = info["net"]
+    if not net:
+        raise OpError(
+            "pad %s.%s has no net and no 'net' was given - a via in a pad is "
+            "electrically the pad's net, so say which net to bore through it"
+            % (ref, number), "PAD_HAS_NO_NET")
+    code = ed.net_code(net, allow_create=_bool(o, "create_net", False))
+    cls = _default_netclass(ed) or {}
+    dia = _num(o, "size", required=False, default=cls.get("via_dia") or 0.6)
+    drill = _num(o, "drill", required=False, default=cls.get("via_drill") or 0.3)
+    if drill >= dia:
+        raise OpError("drill (%r) must be smaller than the via diameter (%r)"
+                      % (drill, dia), "ARG_INVALID")
+    if drill <= 0 or dia <= 0:
+        raise OpError("via size and drill must both be > 0", "ARG_INVALID")
+    layers = o.get("layers") or None
+    stack = _copper_stack(ed)
+    if layers:
+        if not isinstance(layers, (list, tuple)) or len(layers) != 2:
+            raise OpError("'layers' must be [first, last] copper layers",
+                          "ARG_INVALID")
+        layers = [str(x) for x in layers]
+        for l in layers:
+            ed.require_layer(l)
+        if stack:
+            try:
+                i0, i1 = stack.index(layers[0]), stack.index(layers[1])
+            except ValueError:
+                raise OpError("layers %r are not both in the copper stack (%s)"
+                              % (layers, ", ".join(stack)), "LAYER_NOT_IN_COPPER")
+            if i0 > i1:
+                layers = [layers[1], layers[0]]
+                i0, i1 = i1, i0
+            span = stack[i0:i1 + 1]
+        else:
+            span = list(layers)
+    else:
+        span = stack or ["F.Cu", "B.Cu"]
+        layers = [span[0], span[-1]]
+    # A via in a pad is a drilled hole through copper that is already there: the
+    # collision model that governs ordinary vias would reject every one of them,
+    # so it is deliberately not consulted. What IS checked is that the point is
+    # free of *other* vias, because two drills in one pad is a fabrication error
+    # that looks fine in the file.
+    x_file, y_file_ = info["x"], info["y"]
+    y_up = -y_file_
+    reach = dia / 2.0
+    for node in ed.items("via"):
+        vat = S.child(node, "at")
+        if vat is None:
+            continue
+        vx = S.arg_num(vat, 1, 0.0) or 0.0
+        vy = S.arg_num(vat, 2, 0.0) or 0.0
+        if abs(vx - x_file) < reach and abs(vy - y_file_) < reach:
+            raise OpError(
+                "there is already a via at (%s, %s) mm, %.3f mm from the pad "
+                "centre - two drills in one pad is not a via in pad"
+                % (B.num(vx), B.num(-vy),
+                   ((vx - x_file) ** 2 + (vy - y_file_) ** 2) ** 0.5),
+                "VIA_EXISTS")
+    ed.append(B.via(x_file, y_up, dia, drill, code, ed.sp, B.new_id(seed),
+                    layers=[span[0], span[-1]]))
+    return {"reference": ref, "pad": number, "net": net, "x": round(x_file, 4),
+            "y": round(y_up, 4), "size": dia, "drill": drill,
+            "layers": [span[0], span[-1]], "span": span,
+            "pad_type": info["type"],
+            "pad_size": [info["w"], info["h"]],
+            "manufacturing": (
+                "a via inside a pad must be filled and plated over (IPC-4761 "
+                "type VII) or capped, otherwise solder wicks down the barrel "
+                "during reflow; this op writes the drill, the filling is a "
+                "fabrication note, not something the board file carries"),
+            "drc_note": ("KiCad's DRC flags a hole this close to the pad edge as "
+                         "'via hole too close to pad' unless the pad is marked as "
+                         "a via-in-pad pad; the geometry here is what the "
+                         "manufacturer needs, the check is the caller's call")}
+
+def _verify_add_via_in_pad(ed, o):
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    info = _pad_abs(ed, ref, number)
+    net = (o.get("net") or "").strip() or info["net"]
+    code = ed.net_by_name.get(net)
+    best = None
+    for node in ed.items("via"):
+        vat = S.child(node, "at")
+        if vat is None:
+            continue
+        vx = S.arg_num(vat, 1, 0.0) or 0.0
+        vy = S.arg_num(vat, 2, 0.0) or 0.0
+        d = ((vx - info["x"]) ** 2 + (vy - info["y"]) ** 2) ** 0.5
+        if d > 1e-3:
+            continue
+        got_net = S.arg_text(S.child(node, "net"), 1)
+        if got_net in (code, net):
+            return {"ok": True, "x": round(vx, 4), "offset_from_pad": round(d, 4)}
+        best = {"x": round(vx, 4), "net": got_net}
+    return {"ok": False, "note": "no via of that net at the pad centre",
+            "nearest_same_point": best, "want_net": net}
+
+op("add_via_in_pad", {"copper"},
+   "Bore a via through the centre of a placed pad (via-in-pad / via-in-pad for a "
+   "BGA escape, a thermal pad, or a decoupling cap whose ground must reach an "
+   "inner plane). The pad centre is computed from the footprint's placement and "
+   "angle, and the via takes the pad's net unless one is given. The hole is "
+   "written; filling it is a fabrication note, not a file fact.",
+   {"ref": "reference designator", "pad": "pad number", "size": "mm (default: net class)",
+    "drill": "mm (default: net class)", "net": "net name (default: the pad's net)",
+    "layers": "[first, last] copper layers (default: the whole stack)",
+    "create_net": "bool - allow a net the board does not declare yet"},
+   _run_add_via_in_pad, _verify_add_via_in_pad)
+
+# --- teardrops --------------------------------------------------------
+def _filled_poly(points, layer, net_code, net_name, name_only, sp, uid):
+    """A filled polygon on a copper layer carrying a net - the shape KiCad's own
+    teardrop generator makes (`PCB_SHAPE` with POLY + fill, net set). Verified by
+    loading the written board in pcbnew: the drawing comes back on F.Cu with the
+    net name, and DRC treats it as copper of that net."""
+    net = (B.L(B.A("net"), B.A(net_name, True)) if name_only
+           else B.L(B.A("net"), B.A(str(net_code))))
+    return B.L(B.A("gr_poly"), B.pts(points),
+               B.L(B.A("layer"), B.A(layer, True)),
+               B.L(B.A("width"), B.A("0")),
+               B.L(B.A("fill"), B.A("yes")),
+               net, sp.id_node(uid))
+
+def _pad_radius(info):
+    """Half the pad's smaller extent: a circle of this radius stays INSIDE the pad,
+    so a teardrop built on it never adds copper outside the pad's own outline."""
+    w = info["w"] or 0.0
+    h = info["h"] or 0.0
+    if w <= 0 or h <= 0:
+        raise OpError("pad %s.%s has no usable size in the file (%r x %r)"
+                      % (info["ref"], info["number"], w, h), "PAD_UNSUPPORTED")
+    return min(w, h) / 2.0
+
+def _teardrop_outline(P, u, r, w, L, curve, samples=16):
+    """Outline of one teardrop, in board (Y-up) coordinates.
+
+    The copper boundary is the pad circle, then a concave fillet out to the track
+    edge. The fillet is the circle that touches the track edge line at the
+    shoulder ``S = P + L*u + b*n`` (``b = w/2``) and touches the pad circle from
+    outside, so its centre sits ``R`` further out along ``n`` and its distance to
+    the pad centre is ``r + R``:
+
+        ``L^2 + (b + R)^2 = (r + R)^2  =>  R = (L^2 + b^2 - r^2) / (2 (r - b))``
+
+    ``r > b`` is required - a track as wide as the pad radius has a straight
+    boundary where the fillet should be. Getting the sign of ``n`` wrong puts the
+    arc on the inside of the copper, where it changes nothing (that was the first
+    version of this function: it produced a 35-vertex polygon with every vertex
+    within the pad+track union, which looks plausible and adds no copper at all).
+
+    ``curve=False`` joins the same two tangent points with chords: the shape a
+    hand-drawn teardrop has, and what a fab house cuts identically at 0.1 mm.
+    """
+    import math
+    ux, uy = u
+    nx, ny = -uy, ux
+    b = w / 2.0
+    def at(a, c):
+        return (P[0] + ux * a + nx * c, P[1] + uy * a + ny * c)
+    S1 = at(L, b)
+    S2 = at(L, -b)
+    T1 = at(0.0, r)
+    T2 = at(0.0, -r)
+    if not curve:
+        return [T1, S1, S2, T2]
+    if r <= b:
+        raise OpError(
+            "the pad's inner radius (%r mm) is not larger than half the track "
+            "width (%r mm), so there is no fillet to draw between them - pass "
+            "curve=false for straight chords, or a narrower track_width"
+            % (r, b), "ARG_INVALID")
+    num = L * L + b * b - r * r
+    if num <= 1e-9:
+        raise OpError(
+            "a teardrop of length %r mm reaches no further than the pad's own "
+            "radius %r mm, so the fillet would start behind the pad edge; use a "
+            "length > %.3f mm" % (L, r, math.sqrt(max(r * r - b * b, 0.0))),
+            "ARG_INVALID")
+    R = num / (2.0 * (r - b))
+    out = [T1]
+    for sign in (+1.0, -1.0):
+        S = S1 if sign > 0 else S2
+        n = (nx * sign, ny * sign)
+        C = (S[0] + R * n[0], S[1] + R * n[1])
+        dl = math.hypot(C[0] - P[0], C[1] - P[1])
+        T = (P[0] + (C[0] - P[0]) * r / dl, P[1] + (C[1] - P[1]) * r / dl)
+        a0 = math.atan2(T[1] - C[1], T[0] - C[0])
+        a1 = math.atan2(S[1] - C[1], S[0] - C[0])
+        da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+        pts = []
+        for i in range(samples + 1):
+            a = a0 + da * i / float(samples)
+            pts.append((C[0] + R * math.cos(a), C[1] + R * math.sin(a)))
+        if sign > 0:
+            out.extend(pts)
+        else:
+            out.extend(reversed(pts))
+    return out
+
+def _track_directions(ed, info, layer, r_big):
+    """Where copper leaves this pad: unit directions from the pad centre, deduped."""
+    import math
+    P = (info["x"], info["y"])
+    code = ed.net_by_name.get(info["net"])
+    out = []
+    for kind in ("segment", "arc"):
+        for node in ed.items(kind):
+            if S.arg_text(S.child(node, "layer"), 1) != layer:
+                continue
+            if code is not None and S.arg_text(S.child(node, "net"), 1) != code:
+                continue
+            ends = [S.child(node, "start"), S.child(node, "end")]
+            pts = [(S.arg_num(e, 1, 0.0) or 0.0, S.arg_num(e, 2, 0.0) or 0.0)
+                   for e in ends if e is not None]
+            if len(pts) != 2:
+                continue
+            (ax, ay), (bx, by) = pts
+            for near, far in ((( ax, ay), (bx, by)), ((bx, by), (ax, ay))):
+                if math.hypot(near[0] - P[0], near[1] - P[1]) > r_big:
+                    continue
+                dx, dy = far[0] - near[0], far[1] - near[1]
+                d = math.hypot(dx, dy)
+                if d < 1e-9:
+                    continue
+                u = (dx / d, -dy / d)      # into the Y-up frame
+                for have, _hw in out:
+                    if have[0] * u[0] + have[1] * u[1] > 0.996:
+                        break
+                else:
+                    out.append((u, S.arg_num(S.child(node, "width"), 1, 0.0) or 0.0))
+    return out
+
+def _run_add_teardrop(ed, o, seed):
+    import math
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    info = _pad_abs(ed, ref, number)
+    info["ref"] = ref
+    info["number"] = number
+    if not info["net"]:
+        raise OpError("pad %s.%s has no net - a teardrop is copper of the pad's "
+                      "net and has nowhere to belong" % (ref, number),
+                      "PAD_HAS_NO_NET")
+    code = ed.net_code(info["net"])
+    r = _pad_radius(info)
+    layer = o.get("layer") or (info["node"] and
+                               _pad_layer(info["node"])) or "F.Cu"
+    ed.require_layer(layer)
+    dirs = _track_directions(ed, info, layer, r * math.sqrt(2.0) + 1e-6)
+    if not dirs and o.get("dx") is not None:
+        dx = _num(o, "dx")
+        dy = _num(o, "dy", required=False, default=0.0)
+        d = math.hypot(dx, dy)
+        if d < 1e-9:
+            raise OpError("'dx'/'dy' must not both be zero", "ARG_INVALID")
+        dirs = [((dx / d, dy / d), 0.0)]
+    if not dirs:
+        raise OpError(
+            "no track of net %r leaves pad %s.%s on %s, so there is no corner to "
+            "tear; route the pad first, or give 'dx'/'dy' to state the direction "
+            "yourself" % (info["net"], ref, number, layer), "NO_TRACK")
+    if not _bool(o, "all", False) and len(dirs) > 1:
+        dirs = dirs[:1]
+    W = _num(o, "track_width", required=False, default=None)
+    added = []
+    for u, tw in dirs:
+        w = W or tw or (_default_netclass(ed) or {}).get("trace_width") or 0.25
+        if w <= 0:
+            raise OpError("track width must be > 0", "ARG_INVALID")
+        L = _num(o, "length", required=False,
+                 default=1.5 * max(info["w"] or 0.0, info["h"] or 0.0))
+        if L <= w / 2.0:
+            raise OpError("a teardrop of length %r mm is shorter than half the "
+                          "track width (%r mm) - it would be hidden inside the "
+                          "track" % (L, w), "ARG_INVALID")
+        pts = _teardrop_outline((info["x"], -info["y"]), u, r, w, L,
+                                _bool(o, "curve", True))
+        ed.append(_filled_poly(pts, layer, code, info["net"], ed.name_only,
+                               ed.sp, B.new_id("%s:%d" % (seed, len(added)))))
+        added.append({"direction": [round(u[0], 6), round(u[1], 6)],
+                      "track_width": w, "length": round(L, 4),
+                      "vertices": len(pts), "layer": layer})
+    return {"reference": ref, "pad": number, "net": info["net"],
+            "pad_radius": round(r, 4), "teardrops": added,
+            "count": len(added),
+            "note": ("filled copper polygon of the pad's net, which is the shape "
+                     "KiCad's own teardrop generator writes - it is copper, not an "
+                     "annotation, so DRC measures it like any other copper")}
+
+def _pad_layer(node):
+    """First copper layer a pad is on."""
+    ln = S.child(node, "layers")
+    if ln is None:
+        return None
+    for item in ln.items[1:]:
+        if isinstance(item, S.Atom) and item.text.endswith(".Cu"):
+            return item.text
+    return None
+
+def _verify_add_teardrop(ed, o):
+    import math
+    ref = _str(o, "ref")
+    number = _str(o, "pad")
+    info = _pad_abs(ed, ref, number)
+    code = ed.net_by_name.get(info["net"])
+    layer = o.get("layer") or (_pad_layer(info["node"]) if info["node"] else None)
+    want_net = info["net"]
+    polys = []
+    for node in ed.items("gr_poly"):
+        if S.arg_text(S.child(node, "layer"), 1) != layer:
+            continue
+        net = S.child(node, "net")
+        got = ""
+        if net is not None:
+            got = S.arg_text(net, 2) or S.arg_text(net, 1) or ""
+        if got not in (code, want_net):
+            continue
+        pts_node = S.child(node, "pts")
+        if pts_node is None:
+            continue
+        pts = []
+        for item in pts_node.items[1:]:
+            if isinstance(item, S.Seq):
+                pts.append((S.arg_num(item, 1, 0.0) or 0.0,
+                            -(S.arg_num(item, 2, 0.0) or 0.0)))
+        if len(pts) >= 3:
+            polys.append(pts)
+    P = (info["x"], -info["y"])
+    r = _pad_radius(info)
+    # "anchored on the pad" = some vertex lies on the pad's own circle (the fillet
+    # has to start at the pad edge, not float next to it), and "reaches out" = the
+    # polygon spans further than the pad radius.
+    best = None
+    for poly in polys:
+        dists = [math.hypot(x - P[0], y - P[1]) for x, y in poly]
+        on_circle = min(abs(d - r) for d in dists)
+        reach = max(dists)
+        if best is None or on_circle < best[0]:
+            best = (on_circle, reach, len(poly))
+    if best is None:
+        return {"ok": False, "filled_polys_of_that_net": 0}
+    on_circle, reach, npts = best
+    ok = on_circle < 0.02 and reach > r * 1.05
+    return {"ok": ok, "filled_polys_of_that_net": len(polys),
+            "vertex_off_pad_circle_mm": round(on_circle, 6),
+            "reach_from_pad_centre_mm": round(reach, 4),
+            "vertices": npts}
+
+op("add_teardrop", {"copper"},
+   "Tear the corner where a track leaves a pad: a filled polygon of the pad's net "
+   "that widens from the pad's edge into the track. It is what stops a thin track "
+   "from peeling off a pad after thermal cycling, and what a drill breakout needs. "
+   "The shape is the one KiCad's own teardrop generator writes (filled polygon with "
+   "the net set), so DRC measures it as copper.",
+   {"ref": "reference designator", "pad": "pad number",
+    "layer": "copper layer (default: the pad's first copper layer)",
+    "track_width": "mm (default: the connected track's width)",
+    "length": "mm from the pad centre (default: 1.5 x the pad's larger side)",
+    "curve": "bool - curved fillet (default true) or straight chords",
+    "all": "bool - tear every track that leaves the pad (default false: the first)",
+    "dx": "mm - direction to tear when no track is routed yet",
+    "dy": "mm"},
+   _run_add_teardrop, _verify_add_teardrop)
 
 # ----------------------------------------------------------------- driver
 def validate(op):

@@ -25,6 +25,19 @@ UM_PER_MIL = 25.4
 
 VALID_STANDARDS = ("ipc2221", "ipc2152")
 
+# --- Onderdonk (1928): the adiabatic fusing relation, in copper's own constants ---
+#     I = A_cmil * sqrt( log10((Tm - Ta)/(234 + Ta) + 1) / (33 * t) )
+# A in circular mils, t in seconds, temperatures in degC. 1083 is copper's melting
+# point, 234 its reciprocal temperature coefficient (234.5) - the SAME 234.5 that
+# shows up in the resistance-vs-temperature formula - and 33 folds in density,
+# specific heat and the room-temperature resistivity. All three constants are
+# copper's; for any other metal they change and this module does not own them.
+ONDERDONK_MELT_C = 1083.0
+ONDERDONK_REF_C = 234.0
+ONDERDONK_K = 33.0
+CMIL_PER_MIL2 = 4.0 / math.pi    # 1 cmil = pi/4 mil^2, so area_mil2 -> cmil is *4/pi
+ONDERDONK_SHORT_PULSE_S = 10.0   # beyond this the adiabatic assumption is a lie
+
 # --- IPC-2152 closed-form fit: dT = K * I^a * W^b * Th^c  (W, Th in mil, I in A) ---
 # Copied verbatim from KiCad 10.0 common/track_width_calculations.cpp, which in turn
 # names D. G. Brooks and J. Adam, "Trace Currents and Temperatures Revisited" (2015),
@@ -410,4 +423,162 @@ def via_current_allowed(hole_mm, plating_um=25.0, count=1, delta_t_c=10.0, stand
                 "unless you can measure."
             ),
         },
+    )
+
+def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
+                   t_ambient_c=25.0, delta_t_c=10.0, layer="external",
+                   standard=None):
+    """Current that melts a trace in t_s seconds, and how far that is from the rating.
+
+    The question "what current fuses this trace" is NOT a steady-state question and
+    neither standard answers it: IPC-2221 and IPC-2152 both describe a temperature
+    RISE with cooling to the board and to the air, and cooling is precisely what is
+    deleted in a fusing calculation. So this uses the relation everyone's fusing
+    table actually quotes:
+
+        Onderdonk (1928), adiabatic: I = A_cmil * sqrt(ln10( (Tm-Ta)/(234+Ta) + 1 )
+                                                       / (33 * t))
+
+    with A in circular mils, t in seconds, Ta ambient, Tm = 1083 C, and the 234/33
+    being copper's constants. Everything the formula means:
+
+      * ADIABATIC: every watt of I^2R stays in the conductor. No board, no air, no
+        radiation. Real fusing takes MORE current than this because heat escapes -
+        so the answer is on the safe (low) side for a pulse, and increasingly
+        meaningless as t grows. Beyond ~10 s it is not a fusing time, it is a
+        statement that nothing cools.
+      * melt POINT, not molten: copper reaching 1083 C, without the latent heat of
+        fusion. Blowing apart takes a little more.
+      * the resistivity rise IS inside it (that is where 234 comes from), otherwise
+        the number would be 3x optimistic.
+      * Onderdonk was fitted to round wire. A rectangular trace is converted by
+        EQUAL AREA (mil^2 -> cmil), which is an extrapolation: a thin wide trace has
+        more surface per unit area than a round wire, so it really cools better and
+        needs more current. Same direction as the adiabatic error, same caveat.
+      * one pulse, no repeats: at 1 ms the same formula ignores skin effect, which
+        for anything above ~100 kHz makes the copper effectively thinner.
+
+    `standard` (optional) is used ONLY to say how far the fusing current is from the
+    continuous rating, and that half of the answer names the standard it came from.
+    Without it you still get the fusing current; you just do not get the comparison.
+    """
+    try:
+        width_mm = float(width_mm)
+        t_s = float(t_s)
+        copper_oz = float(copper_oz)
+        t_ambient_c = float(t_ambient_c)
+        delta_t_c = float(delta_t_c)
+    except (TypeError, ValueError):
+        return err("numeric arguments required", "ARG_INVALID")
+    if thickness_um is None:
+        thick_um = copper_oz * OZ_TO_UM
+    else:
+        try:
+            thick_um = float(thickness_um)
+        except (TypeError, ValueError):
+            return err("thickness_um must be numeric", "ARG_INVALID")
+    _, layer_n = _k(layer)
+    if layer_n is None:
+        return err("layer must be external or internal", "ARG_INVALID")
+    if width_mm <= 0 or thick_um <= 0:
+        return err("width_mm and copper thickness must be > 0", "ARG_RANGE")
+    if t_s <= 0:
+        return err("t_s must be > 0", "ARG_RANGE",
+                   hint="this is a time-to-melt question; a steady-state current "
+                        "does not fuse anything in the adiabatic model")
+    if t_ambient_c <= -ONDERDONK_REF_C:
+        return err("t_ambient_c must be above -234 C (copper's resistance "
+                   "reference temperature)", "ARG_RANGE")
+    if t_ambient_c >= ONDERDONK_MELT_C:
+        return err("t_ambient_c >= copper's melting point: nothing to compute",
+                   "ARG_RANGE")
+
+    # mm -> mil is /0.0254 ; um -> mil is /25.4 (UM_PER_MIL). Mixing these two up
+    # costs a factor of 1000 and a 0.003 A "fusing current", so both are spelled out.
+    area_mil2 = (width_mm / 0.0254) * (thick_um / UM_PER_MIL)
+    area_cmil = area_mil2 * CMIL_PER_MIL2
+    ratio = (ONDERDONK_MELT_C - t_ambient_c) / (ONDERDONK_REF_C + t_ambient_c) + 1.0
+    i_fuse = area_cmil * math.sqrt(math.log10(ratio) / (ONDERDONK_K * t_s))
+
+    out = {
+        "fusing_current_a": round(i_fuse, 3),
+        "time_s": round(t_s, 6),
+        "width_mm": round(width_mm, 5),
+        "thickness_um": round(thick_um, 3),
+        "copper_oz": round(thick_um / OZ_TO_UM, 3),
+        "t_ambient_c": round(t_ambient_c, 2),
+        "area_mil2": round(area_mil2, 4),
+        "area_cmil": round(area_cmil, 4),
+        "melt_c": ONDERDONK_MELT_C,
+        "resistance_ratio_at_melt": round(ratio, 4),
+        "adiabatic": True,
+        "copper_only": True,
+    }
+    if t_s > ONDERDONK_SHORT_PULSE_S:
+        out["adiabatic_assumption"] = (
+            "VIOLATED at t = %.3g s: after ~10 s the cooling the model deletes is the "
+            "dominant term, so this is not a fusing time any more. Use it as 'the "
+            "energy the copper can absorb', not as a rating." % t_s)
+    else:
+        out["adiabatic_assumption"] = (
+            "short-pulse regime (t <= %g s): heat is treated as fully trapped, so the "
+            "real fusing current is somewhat HIGHER than this" % ONDERDONK_SHORT_PULSE_S)
+    if thick_um / OZ_TO_UM > 3.0 or thick_um / OZ_TO_UM < 0.5:
+        out["outside_usual_copper"] = (
+            "Onderdonk does not care about copper weight, but %.2f oz is outside the "
+            "0.5-3 oz range the neighbouring rating tools are fitted on"
+            % (thick_um / OZ_TO_UM))
+
+    if standard is None:
+        out["steady_rating"] = {
+            "computed": False,
+            "why": "no standard was supplied, and the continuous rating depends "
+                   "entirely on which one you mean",
+            "how": "pass standard='ipc2152' (or 'ipc2221') to get capacity_a, "
+                   "fuse_over_capacity and the adiabatic melt time at that rating",
+        }
+    else:
+        std, e = _guard_standard(standard)
+        if e:
+            return e
+        cap = current_capacity(width_mm, delta_t_c, copper_oz, layer_n, False, std)
+        if cap.get("status") != "ok":
+            return cap
+        cap_a = cap["value"]
+        melt_at_cap_s = (math.log10(ratio) /
+                         (ONDERDONK_K * (cap_a / area_cmil) ** 2))
+        out["steady_rating"] = {
+            "computed": True,
+            "standard": std,
+            "delta_t_c": round(delta_t_c, 3),
+            "capacity_a": cap_a,
+            "fuse_over_capacity": round(i_fuse / cap_a, 3),
+            "adiabatic_melt_time_at_capacity_s": round(melt_at_cap_s, 6),
+            "note": "the two numbers answer different questions: capacity_a is a "
+                    "cooled steady state by %s, fusing_current_a is an uncooled "
+                    "adiabatic melt. Their ratio is how much surge headroom the "
+                    "copper has, not a safety margin" % std,
+        }
+
+    return ok(
+        value=round(i_fuse, 3),
+        unit="A",
+        model="onderdonk_adiabatic_fusing",
+        basis="Onderdonk (1928): I = A_cmil * sqrt(log10((1083 - Ta)/(234 + Ta) + 1)"
+              " / (33*t)), A in circular mils, t in seconds; copper's constants",
+        precision="+/-30% at best and one-sided: adiabatic (no cooling), stops at the "
+                  "melt point (no latent heat), equal-area conversion from a rectangle "
+                  "to a round wire. Every one of those makes the real fusing current "
+                  "HIGHER, so treat this as the lowest current that can melt it in t",
+        assumptions={
+            "material": "copper (1083 C, 234 C reference, k = 33) - other metals are "
+                        "not covered",
+            "cooling": "none (adiabatic)",
+            "phase_change": "not modelled (melt point only)",
+            "waveform": "constant current for t seconds; a pulse of the same RMS is "
+                        "not equivalent once skin effect matters",
+            "geometry": "rectangle converted to circular mils by equal area",
+            "standard": standard,
+        },
+        extra=out,
     )

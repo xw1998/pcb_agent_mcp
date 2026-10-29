@@ -4,6 +4,7 @@ These are the only layer that can be verified exhaustively: pure functions, no
 geometry, no file format. Every expected value below was computed by hand from
 the stated formula, not copied from the implementation.
 """
+import math
 import os
 import sys
 import unittest
@@ -139,6 +140,123 @@ class TestCurrent(unittest.TestCase):
         r = current.via_current_allowed(0.3, 25, 1, 10, "ipc2221")
         self.assertIn("extrapolation", r["basis"])
         self.assertTrue(r["assumptions"]["not_standard_defined"])
+
+
+class TestFusing(unittest.TestCase):
+    """Onderdonk (1928) single-pulse fusing.
+
+    Expected numbers are recomputed here from the equation itself, with copper's
+    constants written out (1083 C, 234 C, 33) and the mil conversions spelled out
+    separately - so a wrong constant or a mm/um mix-up in the implementation cannot
+    hide behind a self-consistent test.
+    """
+
+    @staticmethod
+    def _onder(width_mm, thick_um, t_s, ta_c=25.0):
+        area_mil2 = (width_mm / 0.0254) * (thick_um / 25.4)
+        area_cmil = area_mil2 * 4.0 / math.pi
+        ratio = (1083.0 - ta_c) / (234.0 + ta_c) + 1.0
+        return area_cmil * math.sqrt(math.log10(ratio) / (33.0 * t_s))
+
+    def test_ten_mil_one_ounce_in_one_second(self):
+        # 10 mil x 1.3701 mil = 13.7008 mil^2 = 17.4444 cmil; the log term is
+        # log10(1058/259 + 1) = 0.70629 ; sqrt(0.70629/33) = 0.14631 -> 2.552 A
+        r = current.fusing_current(0.254, t_s=1.0, copper_oz=1.0)
+        self.assertEqual(r["status"], "ok")
+        self.assertAlmostEqual(r["value"], 2.552, places=3)
+        self.assertAlmostEqual(r["area_cmil"], 17.4444, places=3)
+        self.assertAlmostEqual(r["value"], self._onder(0.254, 34.8, 1.0), places=3)
+        self.assertEqual(r["model"], "onderdonk_adiabatic_fusing")
+
+    def test_the_constants_are_coppers(self):
+        # the melt temperature and the resistance reference are stated, not implied:
+        # 1058/259 + 1 = 5.0849 is the peak resistance ratio the formula believes in
+        r = current.fusing_current(0.254)
+        self.assertEqual(r["melt_c"], 1083.0)
+        self.assertAlmostEqual(r["resistance_ratio_at_melt"], 5.0849, places=3)
+
+    def test_scales_as_one_over_sqrt_t(self):
+        one = current.fusing_current(0.254, t_s=1.0)["value"]
+        four = current.fusing_current(0.254, t_s=4.0)["value"]
+        self.assertAlmostEqual(four / one, 0.5, delta=2e-3)
+
+    def test_doubles_with_copper_weight(self):
+        one = current.fusing_current(0.254, copper_oz=1.0)["value"]
+        two = current.fusing_current(0.254, copper_oz=2.0)["value"]
+        self.assertAlmostEqual(two / one, 2.0, delta=5e-3)
+
+    def test_doubles_with_width(self):
+        a = current.fusing_current(0.5, copper_oz=1.0)["value"]
+        b = current.fusing_current(1.0, copper_oz=1.0)["value"]
+        self.assertAlmostEqual(b / a, 2.0, delta=5e-3)
+
+    def test_a_hot_board_fuses_sooner(self):
+        cold = current.fusing_current(0.254, t_ambient_c=-40.0)["value"]
+        warm = current.fusing_current(0.254, t_ambient_c=25.0)["value"]
+        hot = current.fusing_current(0.254, t_ambient_c=125.0)["value"]
+        self.assertGreater(cold, warm)
+        self.assertGreater(warm, hot)
+
+    def test_thickness_um_overrides_copper_oz(self):
+        r = current.fusing_current(0.254, copper_oz=2.0, thickness_um=35.0)
+        self.assertAlmostEqual(r["thickness_um"], 35.0, places=6)
+        self.assertAlmostEqual(r["value"], self._onder(0.254, 35.0, 1.0), places=3)
+
+    def test_the_comparison_needs_a_named_standard(self):
+        # without a standard the fusing number still stands, and the missing half is
+        # reported as missing - not filled with a guess
+        r = current.fusing_current(0.254)
+        self.assertEqual(r["status"], "ok")
+        self.assertFalse(r["steady_rating"]["computed"])
+        self.assertIn("standard", r["steady_rating"]["how"])
+        r2 = current.fusing_current(0.254, standard="ipc2152")
+        self.assertTrue(r2["steady_rating"]["computed"])
+        self.assertEqual(r2["steady_rating"]["standard"], "ipc2152")
+        self.assertGreater(r2["steady_rating"]["fuse_over_capacity"], 1.0)
+
+    def test_late_time_is_flagged_not_silently_trusted(self):
+        short = current.fusing_current(0.254, t_s=1.0)
+        long = current.fusing_current(0.254, t_s=60.0)
+        self.assertIn("short-pulse regime", short["adiabatic_assumption"])
+        self.assertIn("VIOLATED", long["adiabatic_assumption"])
+
+    def test_against_the_separate_steady_rating(self):
+        # the fusing current must exceed the continuous rating, and in the ratio the
+        # two engines predict - a swapped formula would not land in the same place
+        r = current.fusing_current(0.254, standard="ipc2221")
+        cap = current.current_capacity(0.254, 10, 1, "external", standard="ipc2221")["value"]
+        self.assertAlmostEqual(r["steady_rating"]["capacity_a"], cap, places=3)
+        self.assertGreater(r["value"], cap)
+        # adiabatic time to melt AT the continuous rating: the rating is supposed to
+        # be sustainable, so that time has to be long compared with a pulse
+        self.assertGreater(r["steady_rating"]["adiabatic_melt_time_at_capacity_s"], 1.0)
+
+    def test_refusals(self):
+        self.assertEqual(current.fusing_current(0)["reason_code"], "ARG_RANGE")
+        self.assertEqual(current.fusing_current(-1)["reason_code"], "ARG_RANGE")
+        self.assertEqual(current.fusing_current(0.254, t_s=0)["reason_code"], "ARG_RANGE")
+        self.assertEqual(current.fusing_current(0.254, layer="sideways")["reason_code"],
+                         "ARG_INVALID")
+        self.assertEqual(current.fusing_current("x")["reason_code"], "ARG_INVALID")
+        self.assertEqual(current.fusing_current(0.254, thickness_um=0)["reason_code"],
+                         "ARG_RANGE")
+        self.assertEqual(current.fusing_current(0.254, t_ambient_c=1100)["reason_code"],
+                         "ARG_RANGE")
+        self.assertEqual(current.fusing_current(0.254, t_ambient_c=-300)["reason_code"],
+                         "ARG_RANGE")
+        self.assertEqual(current.fusing_current(0.254, standard="nonsense")["reason_code"],
+                         "STANDARD_UNKNOWN")
+
+    def test_the_tool_exists(self):
+        self.assertIn("fusing_current", tools.TOOLS)
+        r = tools.call_tool("fusing_current", {"width_mm": 0.254})
+        self.assertEqual(r["status"], "ok")
+        self.assertAlmostEqual(r["value"], 2.552, places=3)
+        c = tools.call_tool("calc_capabilities", {})
+        self.assertIn("fusing_current", c["available"])
+        blob = " ".join(c["not_implemented_yet"])
+        self.assertNotIn("neither of which is here", blob)
+        self.assertIn("Onderdonk", blob)
 
 
 class TestImpedance(unittest.TestCase):

@@ -259,5 +259,281 @@ class TestWaveguideCavity(unittest.TestCase):
         self.assertTrue(v["b_assumed"])
 
 
+class TestEvenOrderLadder(unittest.TestCase):
+    """Even-order Chebyshev: the prototype's load is g(n+1) != 1.
+
+    Every expected number here is a hand relation, not a run of the code:
+    0.5 dB ripple means the CENTRE of an even-order Chebyshev sits on the ripple
+    contour (Tn(0) = -1), the band edges sit on it too, and the output transformer
+    ratio is sqrt(g(n+1)) because its input impedance must be ratio^2*z0 = g*z0.
+    """
+
+    def setUp(self):
+        self.v = _ok(F.lumped_bandpass(2, 1.0e9, 0.1))["value"]
+
+    def test_centre_sits_on_the_ripple_contour(self):
+        # even order: |S21|^2 = 1/(1+eps^2) at f0, i.e. exactly the ripple
+        self.assertAlmostEqual(self.v["band_edges"]["f_center_il_db"], 0.5, delta=0.01)
+        self.assertAlmostEqual(self.v["band_edges"]["f_lower_il_db"], 0.5, delta=0.01)
+        self.assertAlmostEqual(self.v["band_edges"]["f_upper_il_db"], 0.5, delta=0.01)
+
+    def test_parity_is_series_first(self):
+        self.assertEqual([e["kind"] for e in self.v["elements"]], ["series", "shunt"])
+        v4 = _ok(F.lumped_bandpass(4, 1.0e9, 0.1))["value"]
+        self.assertEqual([e["kind"] for e in v4["elements"]],
+                         ["series", "shunt", "series", "shunt"])
+
+    def test_transformer_ratio_is_sqrt_of_the_load_ratio(self):
+        g = self.v["prototype_g"]
+        t = self.v["termination"]
+        self.assertAlmostEqual(t["output_transformer_ratio"], math.sqrt(g[2]), places=6)
+        self.assertAlmostEqual(t["ladder_load_ohm"], 50.0 * g[2], places=4)
+        # the ratio squared is what the ladder sees, i.e. g(n+1) * z0
+        self.assertAlmostEqual(t["output_transformer_ratio"] ** 2 * t["port_ohm"],
+                               t["ladder_load_ohm"], delta=1e-4)
+
+    def test_odd_order_has_no_transformer(self):
+        v = _ok(F.lumped_bandpass(3, 1.0e9, 0.1))["value"]
+        self.assertEqual(v["termination"]["output_transformer_ratio"], 1.0)
+        self.assertAlmostEqual(v["termination"]["ladder_load_ohm"], 50.0, places=9)
+
+    def test_even_order_still_passes_the_two_derivation_audit(self):
+        for n in (2, 4):
+            sc = _ok(F.lumped_bandpass(n, 1.0e9, 0.1))["value"]["self_check"]
+            self.assertLess(sc["max_abs_deviation_db"], F.RESPONSE_AGREEMENT_DB,
+                            "n=%d did not reproduce the Chebyshev polynomial" % n)
+
+    def test_power_balance_holds_with_the_transformer(self):
+        sc = self.v["self_check"]
+        self.assertLess(float(sc["power_balance_rel_error"]), 1e-9)
+        self.assertLess(float(sc["s21_squared_vs_delivered_power_rel_error"]), 1e-6)
+
+
+class TestFiniteQ(unittest.TestCase):
+    """Finite unloaded Q: the loss is computed through the cascade, and the centre
+    insertion loss is cross-checked against Matthaei's 4.343*sum(g)/(Qu*FBW)."""
+
+    def setUp(self):
+        self.f0 = 1.0e9
+        self.bw = 0.1
+
+    def _il(self, q, order=3):
+        v = _ok(F.lumped_bandpass(order, self.f0, self.bw, q_unloaded=q))["value"]
+        return v["loss"]["insertion_loss_center_db"]
+
+    def test_lossless_answer_has_no_loss_block(self):
+        v = _ok(F.lumped_bandpass(3, self.f0, self.bw))["value"]
+        self.assertNotIn("loss", v)
+
+    def test_centre_loss_matches_matthaei_dissipation_loss(self):
+        for q in (200.0, 80.0):
+            v = _ok(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=q))["value"]
+            g = v["prototype_g"]
+            want = 4.343 * sum(g[:3]) / (q * self.bw)      # hand formula
+            self.assertAlmostEqual(v["loss"]["insertion_loss_center_db"], want,
+                                   delta=max(0.15, 0.10 * want))
+
+    def test_lower_q_means_more_loss(self):
+        a, b, c = self._il(200.0), self._il(80.0), self._il(30.0)
+        self.assertLess(a, b)
+        self.assertLess(b, c)
+        self.assertGreater(a, 0.0)
+
+    def test_loss_element_is_the_definition_of_unloaded_q(self):
+        v = _ok(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=90.0))["value"]
+        w0 = 2.0 * math.pi * self.f0
+        for el in v["elements"]:
+            if el["kind"] == "series":
+                self.assertEqual(el["loss_element"]["kind"], "series_r_ohm")
+                r = el["loss_element"]["value"]
+                # Q = w0*L/R must come back to 90
+                self.assertAlmostEqual(w0 * el["L_nh"] * 1e-9 / r, 90.0, delta=1e-4)
+            else:
+                self.assertEqual(el["loss_element"]["kind"], "shunt_g_s")
+                gsh = el["loss_element"]["value"]
+                # Q = w0*C/G
+                self.assertAlmostEqual(w0 * el["C_pf"] * 1e-12 / gsh, 90.0, delta=1e-4)
+
+    def test_the_wave_identity_holds_at_the_centre(self):
+        # |S21|^2 = 1 - |S11|^2 - (dissipated fraction): the energy bookkeeping and
+        # the wave answer are two statements of the same thing, so they must agree.
+        v = _ok(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=80.0))["value"]
+        frac = v["loss"]["dissipated_fraction_at_center"]
+        self.assertGreater(frac, 0.0)
+        self.assertLess(frac, 1.0)
+        il_c = v["band_edges"]["f_center_il_db"]
+        s11_abs = 10.0 ** (-v["loss"]["s11_at_center_db"] / 20.0)
+        s21_sq = 10.0 ** (-il_c / 10.0)
+        self.assertAlmostEqual(s21_sq + s11_abs ** 2 + frac, 1.0, delta=0.01)
+
+    def test_loaded_q_is_reported_and_below_the_unloaded_q(self):
+        for qu in (200.0, 100.0):
+            L = _ok(F.lumped_bandpass(3, self.f0, self.bw,
+                                      q_unloaded=qu))["value"]["loss"]
+            self.assertIsNotNone(L["loaded_q"])
+            self.assertLess(L["loaded_q"], qu)
+            self.assertIn("3 dB of the in-band minimum", L["delta_3db_definition"])
+            self.assertIn("MEASURED", L["loaded_q_caveat"])
+            # a 3-pole 10 % band must land its loaded Q near 1/(1.15*0.1) = 8.7
+            self.assertAlmostEqual(L["loaded_q"], 8.7, delta=1.5)
+
+    def test_per_resonator_q_list(self):
+        v = _ok(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=[200.0, 60.0, 200.0]))
+        self.assertEqual(v["value"]["loss"]["q_unloaded"][1], 60.0)
+
+    def test_q_rejections(self):
+        _err(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=0.0), "ARG_INVALID")
+        _err(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=[100.0, 100.0]),
+             "ARG_INVALID")
+
+    def test_power_audit_still_holds_with_loss(self):
+        sc = _ok(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=50.0))["value"]
+        self.assertLess(float(sc["self_check"]["power_balance_rel_error"]), 1e-9)
+        self.assertLess(
+            float(sc["self_check"]["s21_squared_vs_delivered_power_rel_error"]), 1e-6)
+
+
+class TestParasitics(unittest.TestCase):
+    def setUp(self):
+        self.f0 = 1.0e9
+        self.bw = 0.1
+
+    def test_inductor_self_resonance_is_reported(self):
+        v = _ok(F.lumped_bandpass(3, self.f0, self.bw,
+                                  parasitics={"cp_f": 0.2e-12}))["value"]
+        cp = v["loss"]["parasitics"]
+        self.assertEqual(cp["cp_f"], 0.2e-12)
+        for el, srf in zip(v["elements"], cp["inductor_srf_hz"]):
+            want = 1.0 / (2.0 * math.pi * math.sqrt(el["L_nh"] * 1e-9 * 0.2e-12))
+            self.assertAlmostEqual(srf, want, delta=want * 1e-5)
+
+    def test_a_self_resonance_below_the_band_is_flagged(self):
+        # 0.5 pF across the 87 nH series inductor puts its SRF at ~762 MHz, under f0
+        v = _ok(F.lumped_bandpass(3, self.f0, self.bw,
+                                  parasitics={"cp_f": 0.5e-12}))["value"]
+        cp = v["loss"]["parasitics"]
+        self.assertTrue(cp["srf_below_3f0"])
+        self.assertIn("warning", cp)
+
+    def test_small_parasitics_barely_move_the_response(self):
+        v = _ok(F.lumped_bandpass(3, self.f0, self.bw,
+                                  parasitics={"cp_f": 1e-15,
+                                              "esl_h": 1e-15}))["value"]
+        self.assertAlmostEqual(v["loss"]["insertion_loss_center_db"], 0.0, delta=0.01)
+        self.assertFalse(v["loss"]["parasitics"]["srf_below_3f0"])
+
+    def test_parasitics_only_make_it_worse(self):
+        base = _ok(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=200.0))["value"]
+        worse = _ok(F.lumped_bandpass(3, self.f0, self.bw, q_unloaded=200.0,
+                                      parasitics={"cp_f": 0.1e-12,
+                                                  "esl_h": 0.2e-9}))["value"]
+        self.assertGreater(worse["loss"]["insertion_loss_center_db"],
+                           base["loss"]["insertion_loss_center_db"])
+
+    def test_negative_parasitics_refused(self):
+        _err(F.lumped_bandpass(3, self.f0, self.bw,
+                              parasitics={"cp_f": -1e-12}), "ARG_INVALID")
+        _err(F.lumped_bandpass(3, self.f0, self.bw,
+                              parasitics={"esl_h": -1e-9}), "ARG_INVALID")
+
+
+class TestMonteCarlo(unittest.TestCase):
+    """Tolerance yield. Zero tolerance must return the nominal design bit for bit
+    (no sampling), and a seed must make the answer reproducible."""
+
+    def setUp(self):
+        self.args = dict(f0_hz=1.0e9, fbw=0.1)
+
+    def test_zero_tolerance_is_degenerate_not_sampled(self):
+        r = _ok(F.filter_monte_carlo(3, n_draws=500, seed=1, **self.args))
+        v = r["value"]
+        self.assertTrue(v["degenerate_zero_tolerance"])
+        self.assertEqual(v["n_draws"], 1)
+        self.assertEqual(v["yield_pct"], 100.0)
+        self.assertIn("every draw IS the nominal design", r["how_to_read"])
+
+    def test_zero_tolerance_metrics_equal_the_nominal_filter(self):
+        v = _ok(F.filter_monte_carlo(3, seed=1, **self.args))["value"]
+        nom = _ok(F.lumped_bandpass(3, 1.0e9, 0.1))["value"]["band_edges"]
+        self.assertAlmostEqual(v["stats"]["il_center_db"]["median"],
+                               nom["f_center_il_db"], delta=1e-3)
+        self.assertAlmostEqual(v["stats"]["il_lower_edge_db"]["median"],
+                               nom["f_lower_il_db"], delta=1e-3)
+        self.assertAlmostEqual(v["stats"]["il_upper_edge_db"]["median"],
+                               nom["f_upper_il_db"], delta=1e-3)
+
+    def test_same_seed_same_answer(self):
+        a = _ok(F.filter_monte_carlo(3, tol_c_pct=2, tol_l_pct=2, n_draws=100,
+                                     seed=42, **self.args))["value"]
+        b = _ok(F.filter_monte_carlo(3, tol_c_pct=2, tol_l_pct=2, n_draws=100,
+                                     seed=42, **self.args))["value"]
+        self.assertEqual(a["yield_pct"], b["yield_pct"])
+        self.assertEqual(a["stats"], b["stats"])
+
+    def test_tolerance_costs_yield(self):
+        tight = _ok(F.filter_monte_carlo(3, tol_c_pct=0.5, tol_l_pct=0.5, n_draws=200,
+                                         seed=5, **self.args))["value"]
+        loose = _ok(F.filter_monte_carlo(3, tol_c_pct=5.0, tol_l_pct=5.0, n_draws=200,
+                                         seed=5, **self.args))["value"]
+        self.assertGreater(tight["yield_pct"], loose["yield_pct"])
+
+    def test_a_loose_spec_passes_everything(self):
+        v = _ok(F.filter_monte_carlo(3, tol_c_pct=1, tol_l_pct=1, n_draws=50,
+                                     seed=3, il_max_db=20.0, **self.args))["value"]
+        self.assertEqual(v["yield_pct"], 100.0)
+
+    def test_nominal_failing_the_spec_is_called_out(self):
+        r = _ok(F.filter_monte_carlo(3, tol_c_pct=1, n_draws=20, seed=3,
+                                     il_max_db=0.1, **self.args))
+        self.assertFalse(r["value"]["nominal_passes"])
+        self.assertIn("NOMINAL design already fails", r["how_to_read"])
+
+    def test_statistics_are_ordered_and_the_confidence_width_is_reported(self):
+        v = _ok(F.filter_monte_carlo(3, tol_c_pct=2, tol_l_pct=2, n_draws=200,
+                                     seed=11, **self.args))["value"]
+        st = v["stats"]["worst_passband_il_db"]
+        self.assertLessEqual(st["min"], st["median"])
+        self.assertLessEqual(st["median"], st["p95"])
+        self.assertLessEqual(st["p95"], st["max"])
+        # hand check of the binomial half-width: 1.96*sqrt(p(1-p)/n)*100
+        p = v["passed"] / float(v["n_draws"])
+        self.assertAlmostEqual(v["yield_95ci_pct"],
+                               1.96 * math.sqrt(p * (1 - p) / v["n_draws"]) * 100.0,
+                               delta=0.01)
+
+    def test_stopband_spec_is_enforced(self):
+        # asking for 60 dB at 1.4 GHz makes the yield collapse
+        r = _ok(F.filter_monte_carlo(3, tol_c_pct=1, tol_l_pct=1, n_draws=50, seed=2,
+                                     f_stop_hz=1.4e9, reject_min_db=60.0,
+                                     **self.args))
+        self.assertIn("il_stop_db", r["value"]["stats"])
+        self.assertLessEqual(r["value"]["yield_pct"], 100.0)
+
+    def test_gaussian_needs_the_sigma_definition_to_be_stated(self):
+        r = _ok(F.filter_monte_carlo(3, tol_c_pct=2, tol_l_pct=2, n_draws=50,
+                                     seed=4, distribution="gaussian", **self.args))
+        self.assertIn("2 sigma", r["assumptions"]["distribution"])
+        v = _ok(F.filter_monte_carlo(3, tol_c_pct=2, n_draws=50, seed=4,
+                                     distribution="gaussian", **self.args))["value"]
+        self.assertEqual(v["distribution"], "gaussian")
+
+    def test_argument_refusals(self):
+        _err(F.filter_monte_carlo(3, reject_min_db=40.0, **self.args), "ARG_CONFLICT")
+        _err(F.filter_monte_carlo(3, f_stop_hz=2e9, **self.args), "ARG_CONFLICT")
+        _err(F.filter_monte_carlo(3, tol_c_pct=-1, **self.args), "ARG_RANGE")
+        _err(F.filter_monte_carlo(3, tol_c_pct=120, **self.args), "ARG_RANGE")
+        _err(F.filter_monte_carlo(3, n_draws=0, **self.args), "ARG_RANGE")
+        _err(F.filter_monte_carlo(3, il_max_db=0.0, **self.args), "ARG_RANGE")
+        _err(F.filter_monte_carlo(3, distribution="normal", **self.args), "ARG_INVALID")
+        _err(F.filter_monte_carlo(3, n_draws=10, seed=1, f_stop_hz=-5.0,
+                                  reject_min_db=40.0, **self.args), "ARG_RANGE")
+
+    def test_even_order_monte_carlo_uses_the_transformer(self):
+        v = _ok(F.filter_monte_carlo(2, tol_c_pct=1, n_draws=20, seed=8,
+                                     **self.args))["value"]
+        # the nominal even-order design has 0.5 dB at the centre, on the ripple line
+        self.assertAlmostEqual(v["nominal"]["il_center_db"], 0.5, delta=0.01)
+
+
 if __name__ == "__main__":
     unittest.main()

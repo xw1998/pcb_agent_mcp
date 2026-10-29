@@ -28,6 +28,7 @@ beyond the one open-end length correction, finite-Q insertion loss, and any
 layout output. Each answer says so in its own `not_computed` list.
 """
 import math
+import random
 
 from .result import ok, err
 
@@ -50,8 +51,9 @@ NOT_COMPUTED = [
     "reports is optimistically low",
     "T-junction, step and open-end equivalent circuits other than the single "
     "Hammerstad open-end length correction used for the resonator length",
-    "finite unloaded Q: every response here is lossless, so a real filter's insertion "
-    "loss is missing (coupling coefficients and Qe are geometric, not measured)",
+    "finite unloaded Q in the DISTRIBUTED filters: lumped_bandpass takes q_unloaded "
+    "and reports the insertion loss it causes, but coupled_resonator and the cavity "
+    "still have Qe and R/Q only, no measured unloaded Q of the printed resonator",
     "cross-coupling between non-adjacent resonators (folded or canonical topologies)",
     "EM-simulated S-parameters: no full-wave engine is invoked anywhere in this module",
 ]
@@ -149,6 +151,205 @@ def prototype_gvalues(order, response="chebyshev", ripple_db=None):
                        "it is not 1 - the network ends on a series resonator"})
 
 
+# ------------------------------------------------- loss, parasitics, ladder probe
+# The lossless ladder is an idealisation nobody can buy. Two things are added here
+# and both go through the SAME ABCD cascade as the ideal case:
+#
+#   * a finite unloaded Q per resonator (loss is one element per resonator: a series
+#     resistance w0*L/Q on a series resonator, a shunt conductance w0*C/Q on a shunt
+#     one - which is exactly the definition Q = w0*L/R = w0*C/G at resonance),
+#   * first-order parasitics: every inductor gets a parallel capacitance (finite
+#     self-resonant frequency) and every capacitor a series inductance (ESL).
+#
+# Nothing is fitted or taken from a curve: the numbers come out of the same matrix
+# product. What makes them checkable is `_ladder_probe`, which propagates the actual
+# voltage and current down the same ladder and asserts power conservation, so the
+# reported S21 and the reported dissipated power cannot disagree silently.
+
+def _q_vector(q, n):
+    """None => lossless; scalar => same Q everywhere; sequence => one Q per resonator."""
+    if q is None:
+        return None
+    if isinstance(q, (int, float)):
+        vals = [float(q)] * n
+    else:
+        try:
+            vals = [float(x) for x in q]
+        except (TypeError, ValueError):
+            raise ValueError("q_unloaded must be a number or a list of numbers")
+        if len(vals) != n:
+            raise ValueError("q_unloaded has %d entries but the filter has %d resonators"
+                             % (len(vals), n))
+    for v in vals:
+        if not (v > 0.0) or v != v or v == float("inf"):
+            raise ValueError("every q_unloaded must be finite and > 0")
+    return vals
+
+def _parasitic_parts(par):
+    """{'cp_f': farads across each inductor, 'esl_h': henries with each capacitor}."""
+    if not par:
+        return None
+    try:
+        cp = float(par.get("cp_f") or 0.0)
+        esl = float(par.get("esl_h") or 0.0)
+    except (TypeError, ValueError):
+        raise ValueError("parasitics must be numbers: {'cp_f': ..., 'esl_h': ...}")
+    if cp < 0.0 or esl < 0.0:
+        raise ValueError("parasitics cannot be negative")
+    if cp == 0.0 and esl == 0.0:
+        return None
+    return {"cp_f": cp, "esl_h": esl}
+
+def _ladder_elements(order, f0, bw, z0, g):
+    """Lowpass-to-bandpass transform: one resonator per prototype element.
+
+    Odd k becomes a shunt parallel LC, even k a series LC. The impedance scaling is
+    the part that is easy to get backwards: series impedance scales with z0, shunt
+    admittance with 1/z0.
+    """
+    w0 = 2.0 * math.pi * f0
+    # Even-order Chebyshev ladders start on a SERIES element, odd-order ones on a
+    # shunt element. That parity is not cosmetic: the prototype's load is g(n+1) != 1
+    # for even order, and only the series-first pairing reproduces the equal-ripple
+    # response (verified against 1/(1+eps^2 Tn^2) out to |Omega| = 3).
+    series_first = (order % 2 == 0)
+    els = []
+    for k in range(1, order + 1):
+        gk = g[k - 1]
+        series = ((k % 2 == 1) == series_first)
+        if series:
+            L = gk * z0 / (bw * w0)
+            C = bw / (w0 * z0 * gk)
+            kind = "series"
+        else:
+            C = gk / (bw * w0 * z0)
+            L = bw * z0 / (w0 * gk)
+            kind = "shunt"
+        els.append({"k": k, "kind": kind, "L": L, "C": C})
+    return els
+
+def _ladder_sections(elements, f, w0, qs=None, par=None):
+    """[('series', Z) | ('shunt', Y)] at frequency f, with loss and parasitics.
+
+    Loss and parasitics never change which branch is series and which is shunt, so
+    the topology the prototype dictated is preserved exactly.
+    """
+    w = 2.0 * math.pi * f
+    cp = par["cp_f"] if par else 0.0
+    esl = par["esl_h"] if par else 0.0
+    out = []
+    for i, e in enumerate(elements):
+        L, C = e["L"], e["C"]
+        z_l = 1j * w * L
+        if cp:
+            z_l = 1.0 / (1.0 / z_l + 1j * w * cp)
+        z_c = 1.0 / (1j * w * C) + 1j * w * esl
+        if e["kind"] == "series":
+            z = z_l + z_c
+            if qs:
+                z = z + w0 * L / qs[i]
+            out.append(("series", z))
+        else:
+            y = 1.0 / z_c + 1.0 / z_l
+            if qs:
+                y = y + w0 * C / qs[i]
+            out.append(("shunt", y))
+    return out
+
+def _termination_ratio(order, g):
+    """Turns ratio of the ideal output transformer that makes both ports equal.
+
+    An even-order Chebyshev prototype is defined with source 1 and load g(n+1) != 1,
+    so a 50-in/50-out ladder needs a 1:sqrt(g(n+1)) transformer between the last
+    series resonator and the load. Its input impedance is ratio^2*z0 = g(n+1)*z0,
+    which is exactly the termination the prototype's g values were computed for. The
+    transformer is reported as part of the design because it is part of the network -
+    hiding it would make the element values look like a 50 ohm filter when they are
+    not.
+    """
+    if order % 2 == 0 and len(g) > order:
+        return math.sqrt(g[order])
+    return 1.0
+
+def _ladder_probe(sections, z0, ratio=1.0):
+    """S11/S21 from the ABCD product AND the power flow along the same ladder.
+
+    Two numbers come out that must agree if either is right: |S21|^2 and the power
+    actually delivered to the load (V*conj(I) at the far end), plus the claim that
+    incident power = load + source resistor + every loss element. With a lossless
+    ladder the balance is trivially 1; with loss it is the audit that the loss was
+    put in the right place, because a series resistance misplaced as a shunt
+    conductance keeps |S21| plausible while breaking the balance.
+    """
+    abcd = _abcd_cascade(sections)
+    if ratio != 1.0:
+        A, B, C, D = abcd
+        abcd = (A * ratio, B / ratio, C * ratio, D / ratio)
+    s11, s21 = _s21(abcd, z0)
+    vs = 2.0                      # peak source amplitude, chosen so |a|^2 = 1/z0 * ...
+    v_in = 1.0 + s11
+    i_in = (1.0 - s11) / z0
+    v, i = v_in, i_in
+    p_elements = []
+    for kind, val in sections:
+        if kind == "series":
+            p_elements.append(0.5 * abs(i) ** 2 * val.real)
+            v = v - val * i
+        else:
+            p_elements.append(0.5 * abs(v) ** 2 * val.real)
+            i = i - val * v
+    v = v / ratio
+    i = i * ratio                                  # ideal transformer: lossless
+    p_load = 0.5 * abs(v) ** 2 / z0
+    p_source = 0.5 * abs(vs - v_in) ** 2 / z0      # informational only, see _power_audit
+    p_incident = 0.5 * vs * vs / (4.0 * z0)
+    return {"s11": s11, "s21": s21, "p_load": p_load, "p_source": p_source,
+            "p_elements": p_elements, "p_incident": p_incident}
+
+def _power_audit(probe):
+    """(relative power-balance error, relative |S21|^2 vs delivered-power error).
+
+    The identity being checked is the wave one, not a battery one: incident power
+    splits into the reflected wave and what enters the network, and what enters the
+    network leaves as load power plus dissipation in the loss elements. The source
+    resistor is deliberately NOT part of that sum - it sits outside the reference
+    plane, and adding it is the mistake that makes a correct lossless ladder report
+    a balance error of exactly 2.
+    """
+    entered = probe["p_load"] + sum(probe["p_elements"])
+    accepted = probe["p_incident"] * (1.0 - abs(probe["s11"]) ** 2)
+    bal = abs(entered - accepted) / max(probe["p_incident"], 1e-300)
+    got = abs(probe["s21"]) ** 2
+    want = probe["p_load"] / max(probe["p_incident"], 1e-300)
+    # the floor keeps a null (-200 dB, |S21|^2 ~ 1e-20) from turning cancellation
+    # noise into a "the two derivations disagree" verdict
+    rel = abs(got - want) / max(abs(want), 1e-6)
+    return bal, rel
+
+def _il_db(s11, s21):
+    return -20.0 * math.log10(max(abs(s21), 1e-30))
+
+def _edge_db(il_fn, f0, lower, level):
+    """Frequency where the insertion loss reaches `level` dB, walking away from f0."""
+    r = 0.98 if lower else 1.02
+    inside = f0
+    f = f0
+    for _ in range(500):
+        f *= r
+        if f <= 1e-9 or (not lower and f > f0 * 1e4):
+            return None
+        if il_fn(f) >= level:
+            outside, inside_f = f, inside
+            for _ in range(120):
+                mid = 0.5 * (outside + inside_f)
+                if il_fn(mid) >= level:
+                    outside = mid
+                else:
+                    inside_f = mid
+            return 0.5 * (outside + inside_f)
+        inside = f
+    return None
+
 # ------------------------------------------------------------- lumped bandpass
 def _abcd_cascade(sections):
     """(A, B, C, D) of series-impedance / shunt-admittance sections in order."""
@@ -180,13 +381,21 @@ def _prototype_il_db(n, resp, ripple, omega):
 
 
 def lumped_bandpass(order, f0_hz, fbw, z0_ohm=50.0, ripple_db=None,
-                    response="chebyshev", points=31):
+                    response="chebyshev", points=31, q_unloaded=None,
+                    parasitics=None):
     """LC ladder bandpass from the prototype, with the response it actually gives.
 
     The element values come from the lowpass-to-bandpass transform; the S21 that
     is reported comes from cascading those elements as ABCD matrices. The ideal
     prototype formula is evaluated at the same frequencies and the two are
     compared - that comparison is the answer's own audit, not decoration.
+
+    q_unloaded turns the idealised lossless ladder into a real one: each resonator
+    may be given its own unloaded Q (a scalar applies it to all of them), and the
+    insertion loss that follows is computed, not estimated. parasitics adds the
+    two first-order effects every real LC bandpass suffers from - a parallel
+    capacitance across each inductor (finite self-resonance) and a series
+    inductance with each capacitor (ESL).
     """
     proto = prototype_gvalues(order, response, ripple_db)
     if proto["status"] != "ok":
@@ -214,40 +423,45 @@ def lumped_bandpass(order, f0_hz, fbw, z0_ohm=50.0, ripple_db=None,
     ripple = proto["value"]["ripple_db"]
     w0 = 2.0 * math.pi * f0
 
-    # lowpass -> bandpass, each g_k becomes a resonator; odd k shunt (parallel LC),
-    # even k series (series LC). The impedance scaling is the part that is easy to
-    # get backwards: series impedance scales with z0, shunt admittance with 1/z0.
+    try:
+        qs = _q_vector(q_unloaded, n)
+        par = _parasitic_parts(parasitics)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID",
+                   hint="q_unloaded = one number (all resonators) or one per resonator; "
+                        "parasitics = {'cp_f': F across each inductor, "
+                        "'esl_h': H with each capacitor}")
+
+    ratio = _termination_ratio(n, g)
+    base = _ladder_elements(n, f0, bw, z0, g)
+
     elements = []
-    for k in range(1, n + 1):
-        gk = g[k - 1]
-        if k % 2:
-            C = gk / (bw * w0 * z0)
-            L = bw * z0 / (w0 * gk)
-            elements.append({"k": k, "kind": "shunt",
-                             "C_pf": round(C * 1e12, 6),
-                             "L_nh": round(L * 1e9, 6),
-                             "f_self_res_hz": round(1.0 / (2 * math.pi * math.sqrt(L * C)), 3)})
-        else:
-            L = gk * z0 / (bw * w0)
-            C = bw / (w0 * z0 * gk)
-            elements.append({"k": k, "kind": "series",
-                             "C_pf": round(C * 1e12, 6),
-                             "L_nh": round(L * 1e9, 6),
-                             "f_self_res_hz": round(1.0 / (2 * math.pi * math.sqrt(L * C)), 3)})
+    for e in base:
+        L, C = e["L"], e["C"]
+        row = {"k": e["k"], "kind": e["kind"],
+               "C_pf": round(C * 1e12, 6), "L_nh": round(L * 1e9, 6),
+               "f_self_res_hz": round(1.0 / (2 * math.pi * math.sqrt(L * C)), 3)}
+        if qs:
+            row["q_unloaded"] = qs[e["k"] - 1]
+            row["loss_element"] = ({"kind": "series_r_ohm",
+                                    "value": round(w0 * L / qs[e["k"] - 1], 6)}
+                                   if e["kind"] == "series" else
+                                   {"kind": "shunt_g_s",
+                                    "value": round(w0 * C / qs[e["k"] - 1], 9)})
+        if par and par["cp_f"]:
+            row["l_self_res_with_cp_hz"] = round(
+                1.0 / (2 * math.pi * math.sqrt(L * par["cp_f"])), 3)
+        elements.append(row)
 
-    def sections_at(f):
-        w = 2.0 * math.pi * f
-        out = []
-        for e in elements:
-            L, C = e["L_nh"] * 1e-9, e["C_pf"] * 1e-12
-            if e["kind"] == "series":
-                out.append(("series", 1j * (w * L - 1.0 / (w * C))))
-            else:
-                out.append(("shunt", 1j * (w * C - 1.0 / (w * L))))
-        return out
+    def probe_at(f, with_loss=True):
+        sec = _ladder_sections(base, f, w0,
+                               qs if with_loss else None,
+                               par if with_loss else None)
+        return _ladder_probe(sec, z0, ratio)
 
-    def s_at(f):
-        return _s21(_abcd_cascade(sections_at(f)), z0)
+    def s_at(f, with_loss=True):
+        p = probe_at(f, with_loss)
+        return p["s11"], p["s21"]
 
     def omega_at(f):
         return (f / f0 - f0 / f) / bw
@@ -256,7 +470,8 @@ def lumped_bandpass(order, f0_hz, fbw, z0_ohm=50.0, ripple_db=None,
     # the stopband beyond the first transmission zero is skipped, because a ladder
     # of finite resonators is not the prototype there (the prototype is a
     # polynomial, the ladder goes to a null); inside and near the band they must
-    # agree to a hair.
+    # agree to a hair. It is deliberately run on the LOSSLESS ladder: the element
+    # synthesis is what is being audited, and loss would blur it.
     worst = 0.0
     worst_f = None
     f_lo = f0 / max(1e-9, (1.0 + 2.0 * bw))
@@ -266,7 +481,7 @@ def lumped_bandpass(order, f0_hz, fbw, z0_ohm=50.0, ripple_db=None,
         om = omega_at(f)
         if abs(om) > 3.0:
             continue
-        _s11, s21 = s_at(f)
+        _s11, s21 = s_at(f, with_loss=False)
         got = -20.0 * math.log10(max(abs(s21), 1e-30))
         want = _prototype_il_db(n, resp, ripple, om)
         d = abs(got - want)
@@ -280,56 +495,448 @@ def lumped_bandpass(order, f0_hz, fbw, z0_ohm=50.0, ripple_db=None,
                    hint="this is a code defect, not a user error; the answer is "
                         "withheld rather than reported with a caveat")
 
-    # band edges, where the ripple definition lives
-    # Omega = +-1 at the band edges: f/f0 - f0/f = +-FBW
+    # Power audit at the centre and at both band edges: |S21|^2 must equal the
+    # power that actually arrives at the load, and the losses must add up.
     f1 = f0 * (math.sqrt(1.0 + (bw / 2.0) ** 2) - bw / 2.0)
     f2 = f0 * (math.sqrt(1.0 + (bw / 2.0) ** 2) + bw / 2.0)
+    bal_worst, s21_worst = 0.0, 0.0
+    for f in (f1, f0, f2, f_lo, f_hi):
+        bal, rel = _power_audit(probe_at(f))
+        bal_worst = max(bal_worst, bal)
+        s21_worst = max(s21_worst, rel)
+    if bal_worst > 1e-9 or s21_worst > 1e-9:
+        return err("power is not conserved along the ladder (balance error %.3g, "
+                   "|S21|^2 vs delivered power %.3g) - the loss or parasitic element "
+                   "is in the wrong branch" % (bal_worst, s21_worst),
+                   "INTERNAL_CHECK_FAILED",
+                   hint="code defect, not a user error; run the filters tests")
+
     edges = {}
     for name, f in (("f_lower_hz", f1), ("f_center_hz", f0), ("f_upper_hz", f2)):
         _s11, s21 = s_at(f)
         edges[name] = round(f, 3)
-        edges[name.replace("_hz", "_il_db")] = round(-20.0 * math.log10(max(abs(s21), 1e-30)), 4)
+        edges[name.replace("_hz", "_il_db")] = round(_il_db(_s11, s21), 4)
 
     sweep = []
     for i in range(npts):
         f = f_lo + (f_hi - f_lo) * i / (npts - 1)
         s11, s21 = s_at(f)
         sweep.append({"f_hz": round(f, 6),
-                      "s21_db": round(-20.0 * math.log10(max(abs(s21), 1e-30)), 4),
-                      "s11_db": round(-20.0 * math.log10(max(abs(s11), 1e-30)), 4)})
+                      "s21_db": round(_il_db(s11, s21), 4),
+                      "s11_db": round(_il_db(s11, s11), 4)})
+
+    value = {"order": n, "response": resp, "ripple_db": ripple,
+             "f0_hz": round(f0, 6), "fbw": bw,
+             "z0_ohm": z0,
+             "band_hz": [round(f1, 3), round(f2, 3)],
+             "elements": elements,
+             "band_edges": edges,
+             "response": sweep,
+             "self_check": {"max_abs_deviation_db": round(worst, 6),
+                            "tolerance_db": RESPONSE_AGREEMENT_DB,
+                            "compared_against": "1/(1+eps^2*Tn^2(lambda))",
+                            "power_balance_rel_error": "%.3g" % bal_worst,
+                            "s21_squared_vs_delivered_power_rel_error": "%.3g" % s21_worst},
+             "termination": {
+                 "port_ohm": z0,
+                 "ladder_load_ohm": round(z0 * ratio * ratio, 6),
+                 "output_transformer_ratio": round(ratio, 6),
+                 "note": ("even order: the prototype's g(n+1) != 1, so a 1:ratio "
+                          "transformer (or an equivalent tapped/capacitively-tapped "
+                          "output) is part of the design; odd order terminating "
+                          "directly in z0"
+                          if ratio != 1.0 else
+                          "odd order: the prototype's load is 1, so the ladder "
+                          "terminates directly in z0")},
+             "prototype_g": proto["value"]["g"]}
+
+    precision = ("element values are exact for the lossless model; the response is "
+                 "computed from those same elements, so it is the ladder's answer and "
+                 "not a fitted curve")
+    assumptions = {"lossless": qs is None and par is None,
+                   "terminations": "z0 at both ports" if par is None
+                                   else "z0 at both ports, parasitics only on the "
+                                        "resonators (none on the ports)",
+                   "topology": ("shunt-first alternating ladder" if n % 2 else
+                                "series-first alternating ladder (even order: the "
+                                "prototype's load is g(n+1) != 1, absorbed by the "
+                                "output transformer)")}
+
+    if qs is not None or par is not None:
+        il_c = _il_db(*s_at(f0))
+        il_lo = _il_db(*s_at(f1))
+        il_hi = _il_db(*s_at(f2))
+        # "3 dB" is measured from the in-band minimum, not from 0 dB: on a lossy
+        # filter those are different levels, and measuring from 0 dB makes the
+        # apparent loaded Q *rise* as the loss goes up (the curve drops below the
+        # 3 dB line before it is 3 dB wide). The minimum is at f0 for both parities.
+        level3 = il_c + 3.0
+        f3_lo = _edge_db(lambda f: _il_db(*s_at(f)), f0, True, level3)
+        f3_hi = _edge_db(lambda f: _il_db(*s_at(f)), f0, False, level3)
+        _s11_c, _s21_c = s_at(f0)
+        loss = {"q_unloaded": (qs if qs is None else
+                               [round(x, 3) for x in qs]),
+                "insertion_loss_center_db": round(il_c, 4),
+                "s11_at_center_db": round(_il_db(_s11_c, _s11_c), 4),
+                "insertion_loss_lower_edge_db": round(il_lo, 4),
+                "insertion_loss_upper_edge_db": round(il_hi, 4),
+                "dissipated_fraction_at_center": round(
+                    sum(probe_at(f0)["p_elements"]) / probe_at(f0)["p_incident"], 6),
+                "loss_model": ("one loss element per resonator: R = w0*L/Q on a "
+                               "series resonator, G = w0*C/Q on a shunt one (that is "
+                               "the definition of unloaded Q at resonance)"),
+                "not_modelled": ["thermal drift of L and C with temperature",
+                                 "Q versus frequency (Q is frozen at f0)",
+                                 "separate Q for the inductor and the capacitor inside "
+                                 "the same resonator",
+                                 "core loss or skin effect inside the inductor"]}
+        if f3_lo and f3_hi and (f3_hi - f3_lo) > 1e-6 * f0:
+            loss["delta_3db_hz"] = round(f3_hi - f3_lo, 3)
+            loss["loaded_q"] = round(f0 / max(f3_hi - f3_lo, 1e-30), 4)
+            loss["half_power_bandwidth_over_fbw"] = round(
+                (f3_hi - f3_lo) / (f2 - f1), 4)
+            loss["delta_3db_definition"] = (
+                "band where the insertion loss stays within 3 dB of the in-band "
+                "minimum (at f0), not within 3 dB of 0 dB")
+            loss["loaded_q_caveat"] = (
+                "this loaded Q is MEASURED from the lossy response, so it is not "
+                "1/(1/Qe + 1/Qu): the loss is energy-weighted (it costs most where the "
+                "stored energy peaks, i.e. at band centre), so on a lossy filter the "
+                "response narrows slightly as Q falls and the measured ratio barely "
+                "moves - read it as a measurement, not as a synthesis input")
+        else:
+            loss["delta_3db_hz"] = None
+            loss["loaded_q"] = None
+            loss["no_3db_passband"] = (
+                "the filter never gets below 3 dB, so a half-power bandwidth and a "
+                "loaded Q do not exist - the loss is larger than the passband "
+                "definition itself")
+        if par:
+            srf = [1.0 / (2 * math.pi * math.sqrt(e["L"] * par["cp_f"]))
+                   for e in base] if par["cp_f"] else []
+            loss["parasitics"] = {"cp_f": par["cp_f"], "esl_h": par["esl_h"],
+                                  "inductor_srf_hz": [round(x, 3) for x in srf],
+                                  "srf_below_3f0": bool(srf and min(srf) < 3.0 * f0)}
+            if srf and min(srf) < 3.0 * f0:
+                loss["parasitics"]["warning"] = (
+                    "an inductor self-resonates below 3*f0, so the resonator is a "
+                    "capacitor at some frequencies inside the design band - the "
+                    "response above is the answer, but the parts do not exist")
+        else:
+            loss["parasitics"] = None
+        # Independent cross-check of the loss model, one formula that shares no code
+        # with the cascade: Matthaei's midband dissipation loss for N equal-Q
+        # resonators, L0 = 4.343 * sum(g1..gn) / (Qu * FBW). It is asymptotic (exact
+        # only in the low-loss limit), which is why it is a band, not an equality -
+        # but a factor-of-two mistake in where the loss element goes cannot survive
+        # a 50 % band.
+        if qs and par is None and (max(qs) - min(qs)) < 1e-9:
+            est = 4.343 * sum(g[:n]) / (qs[0] * bw)
+            base_il = ripple if n % 2 == 0 else 0.0
+            meas = il_c - base_il
+            loss["dissipation_loss_estimate_db"] = round(est, 4)
+            loss["dissipation_measured_db"] = round(meas, 4)
+            loss["dissipation_vs_estimate_pct"] = round(
+                100.0 * (meas - est) / max(est, 1e-12), 2)
+            loss["estimate_basis"] = (
+                "Matthaei midband dissipation loss 4.343*sum(g_k, k=1..n)/(Qu*FBW); "
+                "asymptotic in the low-loss limit, so it is compared as a band")
+            if est < 3.0 and abs(meas - est) / max(est, 1e-12) > 0.5:
+                return err("the cascade says %.3f dB of dissipation at the centre but "
+                           "the closed-form dissipation loss says %.3f dB - a factor "
+                           "that large means the loss element is misplaced"
+                           % (meas, est), "INTERNAL_CHECK_FAILED",
+                           hint="code defect, not a user error; run the filter tests")
+        else:
+            loss["dissipation_loss_estimate_db"] = None
+            loss["estimate_skipped_because"] = (
+                "the estimate is only written for equal Q on every resonator and no "
+                "parasitics (parasitics detune the resonators, so the formula would be "
+                "comparing two different filters)")
+        value["loss"] = loss
+        precision = (
+            "element values are exact for the lossless model; with q_unloaded and/or "
+            "parasitics the response is the cascade of the lossy elements, and the "
+            "insertion loss reported is that cascade's -1*20*log10|S21| at the stated "
+            "frequencies, not an estimate from a formula. The dissipated fraction and "
+            "|S21| are cross-checked against each other through power conservation "
+            "(see self_check)")
+        assumptions["loss"] = ("one loss element per resonator at the resonator's own "
+                               "f0; parasitic values are the same for every element")
+        assumptions["parasitic_sign"] = ("cp only lowers the inductor's impedance "
+                                         "above its self-resonance; esl only raises the "
+                                         "capacitor's impedance at high frequency - both "
+                                         "make the filter worse, never better")
 
     return ok(
-        value={"order": n, "response": resp, "ripple_db": ripple,
-               "f0_hz": round(f0, 6), "fbw": bw,
-               "z0_ohm": z0,
-               "band_hz": [round(f1, 3), round(f2, 3)],
-               "elements": elements,
-               "band_edges": edges,
-               "response": sweep,
-               "self_check": {"max_abs_deviation_db": round(worst, 6),
-                              "tolerance_db": RESPONSE_AGREEMENT_DB,
-                              "compared_against": "1/(1+eps^2*Tn^2(lambda))"},
-               "prototype_g": proto["value"]["g"]},
+        value=value,
         unit="mixed",
-        model="lossless LC ladder from the lowpass prototype (ABCD cascade)",
+        model=("lossless LC ladder from the lowpass prototype (ABCD cascade)"
+               if qs is None and par is None else
+               "LC ladder from the lowpass prototype with per-resonator unloaded Q "
+               "and first-order element parasitics (ABCD cascade)"),
         basis=("lowpass-to-bandpass frequency transform "
                "Omega = (1/FBW)(f/f0 - f0/f) applied to the Matthaei prototype, "
-               "impedance-scaled to z0; response from the ABCD cascade"),
-        precision=("element values are exact for the lossless model (no series "
-                   "resistance, no Q); the response is computed from those same "
-                   "elements, so it is the ladder's answer and not a fitted curve"),
-        assumptions={"lossless": True,
-                     "terminations": "z0 at both ports, no parasitics",
-                     "topology": "shunt-first alternating ladder (odd order starts "
-                                 "and ends on a shunt resonator)"},
+               "impedance-scaled to z0; response from the ABCD cascade; loss from "
+               "Q = w0*L/R = w0*C/G at resonance; parasitics as cp across L and esl "
+               "in series with C"),
+        precision=precision,
+        assumptions=assumptions,
         extra={"not_computed": NOT_COMPUTED,
                "note": "an LC ladder with these values is realisable only if the "
                        "element spread is; compare the largest and smallest C and L "
                        "before trusting a 5-pole 5 % design at 100 MHz",
                "audit": "the cascade and the prototype formula are separate code "
                         "paths; agreement to %.2f dB is what makes the element "
-                        "values checkable" % RESPONSE_AGREEMENT_DB})
+                        "values checkable" % RESPONSE_AGREEMENT_DB,
+               "yield": "for component tolerance use filter_monte_carlo, which "
+                        "perturbs these same elements and runs the same cascade"})
 
+# ------------------------------------------------------------------ tolerance
+def filter_monte_carlo(order, f0_hz, fbw, tol_c_pct=0.0, tol_l_pct=0.0,
+                       n_draws=200, seed=0, il_max_db=1.0,
+                       f_stop_hz=None, reject_min_db=None,
+                       q_unloaded=None, parasitics=None,
+                       response="chebyshev", ripple_db=None, z0_ohm=50.0,
+                       distribution="uniform"):
+    """Tolerance yield of the lumped bandpass: perturb the parts, run the same cascade.
+
+    Every draw multiplies each capacitor by 1 +- tol_c and each inductor by
+    1 +- tol_l (independently, one factor per element - the real world correlates
+    them, see `assumptions`), rebuilds the ladder and evaluates the SAME lossy
+    ABCD cascade `lumped_bandpass` uses. A draw passes when the insertion loss stays
+    at or below `il_max_db` at the centre and at both band edges, and - if asked -
+    when the attenuation at `f_stop_hz` is at least `reject_min_db`.
+
+    Zero tolerance is handled as the degenerate case it is: the nominal design is
+    evaluated once, the answer says so, and no sampling is pretended. A seed is
+    always used, so the same call always returns the same number.
+    """
+    proto = prototype_gvalues(order, response, ripple_db)
+    if proto["status"] != "ok":
+        return proto
+    try:
+        f0 = float(f0_hz)
+        bw = float(fbw)
+        z0 = float(z0_ohm)
+        tc = float(tol_c_pct or 0.0) / 100.0
+        tl = float(tol_l_pct or 0.0) / 100.0
+        nd = int(n_draws)
+        sd = int(seed)
+        il_max = float(il_max_db)
+    except (TypeError, ValueError):
+        return err("numeric f0_hz, fbw, z0_ohm, tolerances, n_draws, seed and "
+                   "il_max_db are required", "ARG_INVALID")
+    if f0 <= 0 or z0 <= 0:
+        return err("f0_hz and z0_ohm must be > 0", "ARG_RANGE")
+    if bw <= 0.0 or bw >= 1.0:
+        return err("fbw is the fractional bandwidth (0 < fbw < 1)", "ARG_RANGE")
+    if tc < 0.0 or tl < 0.0:
+        return err("tolerances are magnitudes: give 2 for +-2 %%, not -2", "ARG_RANGE")
+    if tc >= 1.0 or tl >= 1.0:
+        return err("a tolerance of 100 %% or more means the part may be absent; that is "
+                   "not a filter any more", "ARG_RANGE")
+    if nd < 1 or nd > 20000:
+        return err("n_draws must be 1..20000", "ARG_RANGE")
+    if not (il_max > 0.0):
+        return err("il_max_db is the passband insertion-loss budget and must be > 0",
+                   "ARG_RANGE")
+    dist = str(distribution or "uniform").strip().lower()
+    if dist not in ("uniform", "gaussian"):
+        return err("distribution must be 'uniform' or 'gaussian'", "ARG_INVALID")
+    if f_stop_hz is None and reject_min_db is not None:
+        return err("reject_min_db without f_stop_hz does not describe a spec",
+                   "ARG_CONFLICT",
+                   hint="give both: the frequency you must reject at, and by how much")
+    if f_stop_hz is not None:
+        try:
+            f_stop = float(f_stop_hz)
+        except (TypeError, ValueError):
+            return err("f_stop_hz must be a number", "ARG_INVALID")
+        if f_stop <= 0.0:
+            return err("f_stop_hz must be > 0", "ARG_RANGE")
+        if reject_min_db is None:
+            return err("f_stop_hz needs reject_min_db (how much attenuation you need "
+                       "there)", "ARG_CONFLICT")
+        reject = float(reject_min_db)
+        if reject <= 0.0:
+            return err("reject_min_db must be > 0", "ARG_RANGE")
+    else:
+        f_stop, reject = None, None
+
+    n = int(order)
+    g = proto["value"]["g"]
+    resp = proto["value"]["response"]
+    ripple = proto["value"]["ripple_db"]
+    w0 = 2.0 * math.pi * f0
+    try:
+        qs = _q_vector(q_unloaded, n)
+        par = _parasitic_parts(parasitics)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+
+    base = _ladder_elements(n, f0, bw, z0, g)
+    ratio = _termination_ratio(n, g)
+    f1 = f0 * (math.sqrt(1.0 + (bw / 2.0) ** 2) - bw / 2.0)
+    f2 = f0 * (math.sqrt(1.0 + (bw / 2.0) ** 2) + bw / 2.0)
+
+    def metrics(els):
+        def il(f):
+            sec = _ladder_sections(els, f, w0, qs, par)
+            p = _ladder_probe(sec, z0, ratio)
+            return _il_db(p["s11"], p["s21"])
+        out = {"il_center_db": il(f0), "il_lower_edge_db": il(f1),
+               "il_upper_edge_db": il(f2)}
+        out["worst_passband_il_db"] = max(out["il_center_db"],
+                                         out["il_lower_edge_db"],
+                                         out["il_upper_edge_db"])
+        if f_stop is not None:
+            out["il_stop_db"] = il(f_stop)
+        return out
+
+    def passes(m):
+        if m["worst_passband_il_db"] > il_max:
+            return False
+        if f_stop is not None and m["il_stop_db"] < reject:
+            return False
+        return True
+
+    nominal = metrics(base)
+    degenerate = (tc == 0.0 and tl == 0.0)
+
+    rng = random.Random(sd)
+    stats = {"il_center_db": [], "il_lower_edge_db": [], "il_upper_edge_db": [],
+             "worst_passband_il_db": []}
+    if f_stop is not None:
+        stats["il_stop_db"] = []
+    passed = 0
+    used = 0
+    invalid = 0
+    worst = None
+
+    def scored(m, factors_c, factors_l):
+        return m["worst_passband_il_db"] - (m["il_stop_db"] - reject
+                                            if f_stop is not None else 0.0)
+
+    for _ in range(1 if degenerate else nd):
+        if degenerate:
+            fc = [1.0] * n
+            fl = [1.0] * n
+        elif dist == "uniform":
+            fc = [1.0 + tc * (2.0 * rng.random() - 1.0) for _ in range(n)]
+            fl = [1.0 + tl * (2.0 * rng.random() - 1.0) for _ in range(n)]
+        else:
+            # gaussian with sd = tol/2, so +-tol is +-2 sigma (95.4 % of draws)
+            fc = [1.0 + rng.gauss(0.0, tc / 2.0) for _ in range(n)]
+            fl = [1.0 + rng.gauss(0.0, tl / 2.0) for _ in range(n)]
+        if min(fc) <= 0.0 or min(fl) <= 0.0:
+            invalid += 1          # a negative part is not a part; counted, not resampled
+            continue
+        els = [{"k": e["k"], "kind": e["kind"], "L": e["L"] * fl[i],
+                "C": e["C"] * fc[i]} for i, e in enumerate(base)]
+        m = metrics(els)
+        used += 1
+        ok_draw = passes(m)
+        if ok_draw:
+            passed += 1
+        for key in stats:
+            stats[key].append(m[key])
+        score = scored(m, fc, fl)
+        if worst is None or score > worst["_score"]:
+            worst = {"_score": score, "passes": ok_draw,
+                     "metrics": {k: round(v, 4) for k, v in m.items()},
+                     "factor_c": [round(x, 6) for x in fc],
+                     "factor_l": [round(x, 6) for x in fl]}
+
+    if used == 0:
+        return err("every draw produced a non-physical part (negative L or C); the "
+                   "tolerance is too wide for this distribution", "ARG_RANGE",
+                   hint="use distribution='uniform' or a tolerance below a few percent")
+
+    def q(vals, p):
+        s_ = sorted(vals)
+        if not s_:
+            return None
+        idx = min(len(s_) - 1, max(0, int(round(p * (len(s_) - 1)))))
+        return round(s_[idx], 4)
+
+    summary = {}
+    for key, vals in stats.items():
+        summary[key] = {"min": round(min(vals), 4), "median": q(vals, 0.5),
+                        "p95": q(vals, 0.95), "max": round(max(vals), 4)}
+    worst.pop("_score", None)
+
+    p_hat = passed / float(used)
+    ci95 = 1.96 * math.sqrt(max(p_hat * (1.0 - p_hat), 0.0) / used) * 100.0
+    value = {
+        "n_draws": used, "n_draws_requested": (1 if degenerate else nd),
+        "seed": sd, "distribution": dist,
+        "tolerances_pct": {"c": round(tc * 100.0, 6), "l": round(tl * 100.0, 6)},
+        "spec": {"il_max_db": il_max, "f_stop_hz": f_stop,
+                 "reject_min_db": reject},
+        "nominal": {k: round(v, 4) for k, v in nominal.items()},
+        "nominal_passes": passes(nominal),
+        "passed": passed, "failed": used - passed,
+        "yield_pct": round(100.0 * p_hat, 3),
+        "yield_95ci_pct": round(ci95, 3),
+        "degenerate_zero_tolerance": degenerate,
+        "stats": summary,
+        "worst_draw": worst,
+        "invalid_draws": invalid,
+        "frequencies_hz": {"center": round(f0, 3), "lower_edge": round(f1, 3),
+                           "upper_edge": round(f2, 3), "stop": f_stop},
+    }
+    if degenerate:
+        note = ("both tolerances are zero, so every draw IS the nominal design: the "
+                "yield below is 100 % or 0 % by construction and says nothing about "
+                "sensitivity")
+    elif not passes(nominal):
+        note = ("the NOMINAL design already fails this spec, so this yield is not a "
+                "tolerance yield - fix the design (order, fbw, ripple, loss) first")
+    else:
+        note = ("yield is the fraction of {0:d} draws meeting the spec; the 95 % "
+                "confidence half-width of {1:.1f} points is what {0:d} draws can "
+                "resolve".format(used, ci95))
+
+    return ok(
+        value=value,
+        unit="percent",
+        model=("Monte Carlo over per-element L/C tolerance, evaluating the same ABCD "
+               "cascade as lumped_bandpass (loss and parasitics included if given)"),
+        basis=("one independent multiplicative factor per element; band edges from "
+               "Omega = +-1 of the bandpass transform; spec checked at centre and both "
+               "edges (+ optional stopband point)"),
+        precision=("the yield is an estimate with a binomial 95 % half-width reported "
+                   "alongside it - quoting " + ("%0.1f %% from %d draws" %
+                                                (p_hat * 100.0, used)) +
+                   " without that number overstates the precision"),
+        assumptions={"independence": "each element's error is independent of every "
+                                     "other element's - correlated errors (a common "
+                                     "reel, temperature, trimming) are not modelled",
+                     "distribution": ("uniform on +-tol" if dist == "uniform" else
+                                      "gaussian, sd = tol/2, so +-tol is +-2 sigma"),
+                     "correlation_within_resonator": "L and C of the same resonator are "
+                                                     "perturbed independently; a real "
+                                                     "tuning operation moves them "
+                                                     "together, which is more benign",
+                     "samples": "one frequency point per spec item, not a mask swept "
+                                "across the band"},
+        extra={"how_to_read": note,
+               "loss_and_parasitics": ("pass q_unloaded / parasitics to include them; "
+                                       "the yield then reflects the lossy filter, and "
+                                       "every loss/parasitic caveat of lumped_bandpass "
+                                       "applies unchanged"),
+               "why_not_a_closed_form": ("a closed-form yield would assume the response "
+                                         "is linear in each part, which a ladder is not "
+                                         "near a band edge; sampling the cascade keeps "
+                                         "the answer honest at the cost of a seed"),
+               "not_computed": ["temperature coefficient of L and C",
+                                "aging and solder shift",
+                                "correlated (lot) variation",
+                                "yield of anything but this LC ladder (the microstrip "
+                                "filters are geometric and get their tolerance from the "
+                                "etch, which is a different question)",
+                                "test cost / guard band placement"]})
 
 # --------------------------------------------------- coupled microstrip geometry
 def _pair_modes(w, s, h, t, er, fine_div=6.0):

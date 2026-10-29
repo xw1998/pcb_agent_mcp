@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.14` 已实现八层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停）。
+当前版本 `0.0.18` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -16,7 +16,9 @@ KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对
 | **Sim** | 无板子的物理计算：SPICE 子集（DC/瞬态/AC）、铜阻与 PDN、热阻与 2-D 板温度、薄板模态与振动响应、平面谐振、电热耦合（单集中 Rth） | 已实现（子集，未实现项逐条点名拒绝） |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
 | **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 六道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 实测口径＝原地重写一个成员） |
-| **Route** | `board_route`：A* 布线（双栅格 + 精确多边形判决 + 事务化 + 按位置 rip-up），规则只从板/工程/调用方取，取不到就拒绝 | 已实现（50 网真板 baseline 27/50 → sweep+rip 38/50、端到端 apply 后 kicad-cli DRC 0 新增阻断项、12 网提速 5.5×；`0.0.15` 起爬电/差分对间距/等长可进搜索，但爬电只认调用方给值、差分对不耦合（`coupled:false`）、等长只做 45° 蛇形后处理；**无回流/阻抗目标/拥塞协商**） |
+| **Route** | `board_route`：A* 布线（双栅格 + 精确多边形判决 + 事务化 + 按位置 rip-up），规则只从板/工程/调用方取，取不到就拒绝 | 已实现（50 网真板 baseline 27/50 → sweep+rip 38/50、端到端 apply 后 kicad-cli DRC 0 新增阻断项、12 网提速 5.5×；`0.0.15` 起爬电/差分对间距/等长进搜索，`0.0.16` 起回流/阻抗目标/拥塞协商也进了（协商默认关，一块板 +3 网 / +61% 时间），`0.0.17` 铺铜重填与多端网拓扑，`0.0.18` 起布不通要报**挡路的是谁**（`board_blockers`）与**哪些球埋着**（`board_fanout`）；仍然四邻 + 4×45°、不拆已接受的扇出、拓扑默认 mst 且不是精确 RSMT） |
+| **Fab** | 制造输出：Gerber / Excellon / 位置文件 / gbrjob / STEP / PDF / BOM / 网表 / 图形，加 `manifest.json` 与可选 `fab.zip` | 已实现（**只外包不重算**：`kicad-cli` 在临时目录里跑，产物**重新读一遍**验终止符 / 工具表 / 行数 / ISO-10303-21，不合格判 failed；真板 15 个产物 / 103 923 字节 / `fab.zip` 33 577 字节；`out_dir` 落在源目录里直接拒） |
+| **Sync** | 原理图网表 ↔ 板：逐脚差集，再变成 op 交给写路径 | 已实现（两侧都用权威：KiCad 自己的网表器 + 板文件里的 pad net；缺封装只报 `needs_placement`，**没有诚实的默认位置**；`sync` 一个字节都不写） |
 
 写路径的三条硬规则：**提案不落盘**（plan 单次使用、1 小时过期）；**落盘要 `confirm=true`**；
 **闸门不信任写代码本身**——KiCad 侧是盘上字节、token 双射、每条 op 的后置条件、`kicad-cli` 的
@@ -102,9 +104,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（129 个）
+## 工具（144 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -123,6 +125,14 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `diff_impedance` | 差分对几何 → Zdiff（边耦合微带/带状线） | s/h 超出 0.1..3.0 标 `validity_note` |
 | `diff_impedance_field` | 同一几何 → Zdiff，但解真实截面上的 div(ε∇V)=0（有限体积 + 红黑 SOR，纯 stdlib） | 参考解只覆盖零厚度带状线/孤立微带；紧间距耦合回 `reference_note`（求解器的意见，不是被核过的数）；不建模阻焊/蚀刻梯形/铜损 |
 | `diff_width` | Zdiff → 线宽（间距固定，二分） | 不可达 → `UNREACHABLE` + 可达带宽 |
+| `schematic_pcb_diff` | 原理图网表 ↔ 板：**逐脚**差集（哪个封装的哪个脚换了网 / 板上没网） | 两侧都用权威（KiCad 自己的网表器 + 板文件里的 pad net）；缺封装只报 `needs_placement`，**不发明位置** |
+| `schematic_pcb_sync` | 把差集变成 op，走正常的 propose/apply 闸门 | 一个字节都不写；位置必须调用方给 |
+| `board_fab_package` | 制造包：Gerber/Excellon/位置/gbrjob + `manifest.json` + 可选 `fab.zip` | **只外包给 `kicad-cli` 不重算**；产物重新读一遍验终止符/工具表/行数，不合格判 failed；`out_dir` 落在源目录里直接拒（`OUT_DIR_BESIDE_SOURCE`） |
+| `board_export` / `board_graphics` | Gerber / STEP / PDF / 图形 | 同上；`kicad-cli` 缺失即 `KICAD_CLI_NOT_FOUND`，不回退自研 writer |
+| `board_blockers` | 布不通时**挡路的是谁**：八扇区哪些开着 + 每个对象的可变性标注 | 标注是**结构事实**（pad movable / 铜 reroutable / 铺铜·keepout·板框 fixed），不是替你做的决定 |
+| `board_fanout` | BGA 扇出：每个球朝外短桩 + 四次旋转，用布线器同一套精确几何判 | 不做 via-in-pad、不回拆已接受的出口、**不声称完整扇出**（`skipped` 就是埋着的球） |
+| `board_run_ledger` | 这块板试过没有、当时说了什么（按板文件 sha256 归键） | **永不改变答案、不是缓存**、不存能重建板的数据；`PCB_AGENT_LEDGER=0` 一个字不写 |
+| `fullwave_solver` | 全波**接缝**：装了哪个求解器、版本、要你给它什么 | **点名未装即 `SOLVER_NOT_FOUND`**，绝不回退闭式数；`verified_here` 恒 `false`（本仓库从未跑过任何全波求解器） |
 | `board_summary` | 开板：计数/板框 bbox/叠层/规则 + **哪些事实缺失** | 只读；格式按内容嗅探 |
 | `board_components` | 元件位置（mm、Y 向上）、角度、pad 数、bbox | — |
 | `board_nets` | 每网络 pad/线/过孔/铺铜数与总走线长 | 暴露"网络表里有、板上没铜" |
@@ -183,7 +193,10 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `match_stub` | 单短截线（并联/串联 × 开路/短路） | 双解按距离配对报，禁止交叉配 |
 | `match_quarter_wave` | 四分之一波长变换器 | 只对纯阻负载成立，其它拒绝 |
 | `match_bandwidth` | 单谐振匹配的带宽 `BW = f0/Q`，以及 VSWR≤S 圈内带宽（乘 `(S−1)/√S`） | 只对**单谐振**成立；多谐振匹配不服从这条关系 |
-| `magnetics_inductor` | CCM boost / buck / buck-boost：占空比、电感量、峰/谷/有效电流、CCM 结束点 | 无磁芯/磁芯损耗/DCR/DCM 稳态；`ripple` 是**你的设计选择**；没给 Isat 时饱和判 `undetermined` |
+| `magnetics_inductor` | CCM boost / buck / buck-boost：占空比、电感量、峰/谷/有效电流、CCM 结束点 | 不做磁芯**选型**（没有材料表）；`ripple` 是**你的设计选择**；没给 Isat 时饱和判 `undetermined` |
+| `magnetics_dcm` | DCM 稳态：`K = 2Lfs/R`、boost 的 `D = √(K·M(M−1))`、CCM 边界负载（∝ 1/L） | 环路补偿、软启动、DC 偏置下的电感量跌落 |
+| `magnetics_core_loss` | Steinmetz `Pv = k·f^α·B^β`，`k/α/β` **由你给**并写清单位约定 | 不内建材料表——同一牌号被两家拟合出两组三元组；无 DC 偏置、无磁通波形修正 |
+| `magnetics_dcr` | 绕组直流电阻：每匝平均长度 × 匝数 × 电阻率/截面 | 只有 DC 部分：无趋肤、无邻近效应、无端接与焊点 |
 | `stackup_material` | 这个频率该用哪种板材（er / tanδ / 适用频段 / 成本），以及它看不见什么 | 频段上限是**工程约定**；Dk-频率曲线、批次公差、工艺兼容性都不在表里 |
 | `stackup_design` | 4 / 6 层叠：层角色、铜厚、介质分配、**每信号层各自的 50Ω 线宽**、缝合孔 λ_g/20、铜对称性 | 介质分配是**等比**的，不是压合图；线宽必须回到板厂 er 上重解 |
 | `rf_chain` | 级联增益、Friis 噪声（含各级占比）、级联 IIP3/OIP3、kTB 底噪与灵敏度 | 缺任一级 `nf_db` ⇒ NF 是 `None` 不是部分和；IP3 公式是 worst case；级间失配不在里面 |
@@ -226,7 +239,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `electrothermal_conductor` | 同一环，R₂₀ 由调用方给（过孔桶壁 / 分段串联 / 分流器 / 针脚） | 回 R_hot、电阻增幅、迭代次数、稳定性余量 `1−G`；Rth 仍是调用方的 |
 | `board_electrothermal` | 板级 **2-D** 电热：均匀网格 + SOR，`rho(T)` 线性 ⇒ `alpha*T` 落在矩阵对角线上，稳态是**严格线性**的一次求解；瞬态后向 Euler；失控在**求解前**按对角判 | `h_w_m2k` **必填**；只铺介质 k，不穿真实铺铜/热过孔；DC，无趋肤/邻近损耗；不替你开 `.kicad_pcb` |
 | `filter_prototype` | 原型 g 值（Chebyshev / Butterworth），滤波器设计的起点 | Butterworth 传非零 ripple 直接 `ARG_CONFLICT`；order ∉ [1,20] 拒 |
-| `filter_lumped_bandpass` | LP→BP：每段 L/C + 两路 S21（ABCD 级联 vs 闭式 `1/(1+ε²Tn²)`） | 两路差 >0.02 dB **拒答**（`INTERNAL_CHECK_FAILED`）；无有限 Q、无寄生、无良率 |
+| `filter_lumped_bandpass` | LP→BP：每段 L/C + 两路 S21（ABCD 级联 vs 闭式 `1/(1+ε²Tn²)`）+ 可选有限 Q 与一阶寄生（L 并 cp / C 串 esl）+ 功率审计 | 两路差 >0.02 dB **拒答**（`INTERNAL_CHECK_FAILED`）；偶数阶不是 50Ω 网络——串联起始 + `1:√g(n+1)` 理想变压器，写在 `value.termination`；损耗是每段一只电阻（`ω0L/Q`、`ω0C/G`），不是介质/导体物理：无趋肤、无介质损耗、无温漂 |
+| `filter_mc_yield` | 容差良率：每个 L/C 各自独立抽样，跑同一条 ABCD 级联，带二项 95 % 半宽 | 只有 uniform/gaussian **独立**分布（无相关性、无批次偏移、无老化）⇒ 最坏情况；零容差报**退化**（构造上 100 %）；标称已不达标时明说，不给容差良率 |
 | `filter_coupled_microstrip` | 耦合微带反解 w/s：截面解拉普拉斯（奇模电壁/偶模磁壁）+ Broyden 反解 | 准静态无色散；k<0.02 拒；k 误差 >3% 带 `k_resolution_note`（k 是两个相近数之差） |
 | `filter_coupled_resonator` | 边缘耦合半波谐振器带通：Qe/k_ij/λ_g−2Δl + 每段 `meets_target` | 不建模交叉耦合（因此没有带外零点）；不给馈电间隙几何 |
 | `filter_waveguide_cavity` | 矩形腔 TE101：长度、Rs、Qc（闭式 vs 六面数值积分）、R/Q | 两路 Qc 差 >2% 拒答；低于 TE10 截止拒；只做 TE101（iris 耦合必须全波） |
@@ -500,12 +514,13 @@ MCP 客户端配置（stdio）：
 
 ### 滤波器合成：给几何，不给 EM 结果（[docs/22](docs/22-微带与腔体滤波器.md)）
 
-- **是合成器，不是仿真器。** 五个 `filter_*` 工具回答的是"要画成什么样"：原型 g 值、
-  集总 L/C、耦合线 `w/s`、耦合谐振器 `Qe/k/λ_g/2`、矩形腔 TE101 的长度与 Q。凡是需要
-  全波才能回答的问题（交叉耦合、色散、有限 Q、iris 几何、辐射）全部进 `not_computed`，
-  并在每一份答案里带出去——调用方不读文档也知道边界。
+- **是合成器，不是仿真器。** 六个 `filter_*` 工具回答的是"要画成什么样"：原型 g 值、
+  集总 L/C（含有限 Q、一阶寄生、蒙特卡洛良率）、耦合线 `w/s`、耦合谐振器 `Qe/k/λ_g/2`、
+  矩形腔 TE101 的长度与 Q。凡是需要全波才能回答的问题（交叉耦合、色散、分布式谐振器的实测 Q、
+  iris 几何、辐射）全部进 `not_computed`，并在每一份答案里带出去——调用方不读文档也知道边界。
 - **两路独立推导必须对上，否则拒答。** 集总带通把真实 L/C 级联的 S21 与闭式
-  `1/(1+ε²Tn²)` 逐点比，差 >0.02 dB 就 `INTERNAL_CHECK_FAILED`；腔体 Qc 用闭式括号式与
+  `1/(1+ε²Tn²)` 逐点比，差 >0.02 dB 就 `INTERNAL_CHECK_FAILED`（偶数阶要先过 `1:√g(n+1)`
+  变压器才对得上，见 [docs/27](docs/27-自动布线器.md) §27.14.9）；腔体 Qc 用闭式括号式与
   六面 `|H_tan|²` 数值积分两路算，差 >2% 就拒答。实测 n=3 / 2.4 GHz / FBW 0.1：
   f0 0.0 dB、带边 0.5/0.5001 dB、两路差 0.000521 dB；WR-90 @10 GHz：d=19.8536 mm、
   Qc=7821.5（两路 0.0%）、R/Q=160.957 Ω。
@@ -531,9 +546,9 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 129 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 144 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
-│   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
+│   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
 │   │   ├── checks.py             # 板框闭合/越界/铜间距/digest
 │   │   ├── plan.py               # propose / apply / create_board / checkpoint
@@ -559,6 +574,10 @@ pcb_agent_mcp/
 │   │   ├── kicad_pcb.py          # S-expr 解析、Edge.Cuts 轮廓、叠层、工程规则
 │   │   ├── epro.py               # ZIP 内记录流；单位恒 mil→mm；自由焊盘与封装焊盘分开报
 │   │   └── __init__.py           # 按内容嗅探格式并分发
+│   ├── fab/                      # 制造输出：只外包给 kicad-cli，产物重新读一遍验可用性
+│   ├── sync/                     # 原理图网表 ↔ 板：逐脚差集 → op（一个字节都不写）
+│   ├── fanout.py                 # BGA 扇出：朝外短桩 + 旋转阶梯 + 布线器同一套精确几何
+│   ├── ledger.py                 # 运行账本：按板 sha256 归键，永不改变答案、不是缓存
 │   └── calc/                     # Calc 层（纯算术，不读文件、不联网）
 │       ├── result.py             # 统一信封：basis/precision 强制
 │       ├── units.py              # mil/mm/inch；立创实测存 mil，0.01in 仅兼容别名
@@ -579,8 +598,9 @@ pcb_agent_mcp/
 │       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
 │       ├── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
 │       ├── vibration.py          # 振动：Ritz 模态 + Miles/Steinberg/冲击/传递率 + 应力（degree 阶梯误差棒）
-│       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）
-│       ├── filters.py            # 滤波器合成：原型 g 值/集总带通(两路对账)/耦合线反解/耦合谐振器/TE101 腔
+│       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）+ plane_q（Qc = h/δs）
+│       ├── em.py                 # 全波接缝：找出 openEMS/Meep/gprMAX、版本与 handoff（不生成几何）
+│       ├── filters.py            # 滤波器合成：原型 g 值/集总带通(两路对账 + 有限 Q + 寄生 + 蒙特卡洛)/耦合线反解/耦合谐振器/TE101 腔
 │       ├── electrothermal.py     # 电热耦合：R(T) 定点迭代 + 精确失控判据 + 板级 2-D 场（SOR）
 │       ├── magnetics.py          # 功率电感：CCM boost/buck/buck-boost 占空比/电感/峰值/CCM 边界
 │       ├── stackup.py           # 板材表 + 4/6 层叠 + 每层 50Ω 线宽 + λ_g/20 缝合孔

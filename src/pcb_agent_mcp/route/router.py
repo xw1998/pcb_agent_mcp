@@ -26,6 +26,7 @@ import math
 import time
 
 from .. import geometry as G
+from . import blockers as BLOCK
 from . import rules as R
 from . import topology as TOPO
 from . import tune
@@ -243,7 +244,7 @@ class _Emitter(object):
     """
 
     def __init__(self, grid, bundle, board=None, layers=None, pitch=None,
-                 ignore_zone_areas=False):
+                 ignore_zone_areas=False, blind_vias=False):
         self.grid = grid
         self.bundle = bundle
         self.board = board
@@ -253,6 +254,10 @@ class _Emitter(object):
         # the second pass route around pour areas the first pass had been told to
         # ignore, which is not a rip-up, it is a different board.
         self.ignore_zone_areas = bool(ignore_zone_areas)
+        # A blind/buried via is copper on a *slice* of the stack, so it is only
+        # offered when the caller asked for one: it costs more to make and it
+        # has to be checked against exactly the layers it occupies.
+        self.blind_vias = bool(blind_vias)
         self.ops = []                 # committed ops, in emission order
         self.bad = []                 # exact-check rejections, kept for the report
         self.length = {}
@@ -336,20 +341,39 @@ class _Emitter(object):
         self.length[net] = self.length.get(net, 0.0) + math.hypot(x2 - x1, y2 - y1)
         return True
 
+    def _span(self, span):
+        """The requested span as a contiguous slice of this grid's stackup."""
+        if not span:
+            return list(self.layers)
+        wanted = set(span)
+        ordered = [l for l in self.layers if l in wanted]
+        return ordered or list(self.layers)
+
     def via(self, net, x, y, span=None):
+        """Place a via. `span` is the slice of the stack it must be copper on.
+
+        With `blind_vias` off the span collapses to the whole stack **and** the
+        collision test runs over the whole stack, so what the model thinks the
+        via occupies and what the file says are the same thing. Turning it on
+        writes `layers` for a partial span - that is a blind or buried via, and
+        the exact check then covers only the layers it really sits on.
+        """
+        span = self._span(span)
+        if not self.blind_vias:
+            span = list(self.layers)
         blockers = self.grid.via_blockers(x, y, net, span)
         if blockers:
             self.bad.append({"net": net, "via_at": [round(x, 4), round(y, 4)],
-                             "why": blockers[0]})
+                             "span": [span[0], span[-1]], "why": blockers[0]})
             return False
         spec = R.for_net(self.bundle, net)
         dia = float(spec["via_diameter_mm"])
         op = {"op": "add_via", "x": round(x, 6), "y": round(y, 6), "net": net,
               "size": spec["via_diameter_mm"], "drill": spec["via_drill_mm"]}
-        # The op has no `layers` key, so the via is a through via: it is copper
-        # on every layer in the stack and therefore blocks all of them.
+        if span != list(self.layers):
+            op["layers"] = [span[0], span[-1]]
         self._buf.append((
-            {"kind": "via", "net": net, "layers": list(span or self.layers),
+            {"kind": "via", "net": net, "layers": list(span),
              "poly": G.circle_points(x, y, dia / 2.0, 16), "ref": "router"},
             op))
         return True
@@ -365,7 +389,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          congestion_rounds=2, congestion_max_rips=12, congestion_weight=1.0,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          return_path=True, return_path_net=None, topology="mst",
-         progress=None):
+         progress=None, blind_vias=False):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -406,7 +430,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     grid = Grid(board, grid_layers, float(pitch_mm), bundle,
                 ignore_zone_areas=ignore_zone_areas)
     em = _Emitter(grid, bundle, board=board, layers=grid_layers,
-                  pitch=float(pitch_mm), ignore_zone_areas=ignore_zone_areas)
+                  pitch=float(pitch_mm), ignore_zone_areas=ignore_zone_areas,
+                  blind_vias=blind_vias)
 
     terms = _pad_terminals(board, grid, routing)
     if nets:
@@ -439,7 +464,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                    for a, b in edges)
         results[net] = {"net": net, "status": "pending", "pads": len(plist),
                         "mst_mm": round(span, 3), "length_mm": 0.0, "vias": 0,
-                        "segments": 0, "edges": len(edges), "reason": None,
+                        "segments": 0, "blind_vias": 0, "edges": len(edges),
+                        "reason": None,
                         "on_plane": plane_nets.get(net)}
         work.append((span, net, plist))
     work.sort(reverse=True)          # longest first - see the module docstring
@@ -541,8 +567,11 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                     "detail": [{"pad": "%s.%s" % (t["reference"], t["pad"]),
                                 "at": t["at"],
                                 "escape_to": [round(ex, 4), round(ey, 4)],
-                                "why": em.bad[-1] if em.bad else None}]}
-                return False
+                                "why": em.bad[-1] if em.bad else None}],
+                    # what is actually in the way, and what it would take to move
+                    # it - a "no" with a reason beats a bare "no"
+                    "blockers": BLOCK.blockers(grid, net, t["at"], layer,
+                                               width=width)}
             results[net]["segments"] += 1
             escapes.append("%s.%s" % (t["reference"], t["pad"]))
         if escapes:
@@ -634,7 +663,10 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                                    t["reference"], t["pad"]),
                                 "target": t["at"],
                                 "why": grid.blocked_reason(bnode[0], bnode[1],
-                                                           bnode[2], net)}]}
+                                                           bnode[2], net)}],
+                    "blockers": BLOCK.blockers(grid, net, t["at"],
+                                               bnode[2] if bnode[2] else grid_layers[0],
+                                               width=width)}
                 ok = False
                 break
             simple = simplify(path)
@@ -642,10 +674,22 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 x1, y1 = grid.xy(p1[0], p1[1])
                 x2, y2 = grid.xy(p2[0], p2[1])
                 if p1[2] != p2[2]:
-                    if not em.via(net, x1, y1):
+                    # A through via is the cheap one, so it is tried first; a
+                    # blind via is only an escape route for a spot where the
+                    # stack is blocked for a through hole.
+                    placed = em.via(net, x1, y1)
+                    span = None
+                    if not placed and blind_vias:
+                        span = [l for l in grid_layers
+                                if l in (p1[2], p2[2])
+                                or _between(grid_layers, p1[2], p2[2], l)]
+                        placed = em.via(net, x1, y1, span)
+                    if not placed:
                         ok = False
                         break
                     results[net]["vias"] += 1
+                    if span and span != list(grid_layers):
+                        results[net]["blind_vias"] = results[net].get("blind_vias", 0) + 1
                     continue
                 if em.track(net, p1[2], (x1, y1), (x2, y2), width):
                     results[net]["segments"] += 1

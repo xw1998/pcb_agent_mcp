@@ -1535,3 +1535,65 @@ class TestABranchPointIsNotAPad(RouteBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class _StubGrid(object):
+    """Just enough grid for the emitter: it says which layers block a via."""
+    def __init__(self, layers, blocked=()):
+        self.layers = list(layers)
+        self.pitch = 0.1
+        self.via_dia = 0.6
+        self.blocked = set(blocked)
+
+    def via_blockers(self, x, y, net, span=None):
+        for layer in (span or self.layers):
+            if layer in self.blocked:
+                return [{"why": "stub: %s blocks a via" % layer}]
+        return []
+
+STUB_BUNDLE = {"default": {"via_diameter_mm": 0.6, "via_drill_mm": 0.3,
+                           "track_mm": 0.25, "clearance_mm": 0.2}}
+
+class TestBlindAndBuriedVias(unittest.TestCase):
+    """A via's span is what makes it blind, buried or through - and the file has
+    to say which one it is, or the model and KiCad disagree about the copper."""
+
+    STACK = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+
+    def emitter(self, grid, blind=False):
+        return router._Emitter(grid, STUB_BUNDLE, layers=grid.layers,
+                              blind_vias=blind)
+
+    def op(self, em):
+        return em._buf[-1][1]
+
+    def test_a_through_via_carries_no_layers_key(self):
+        em = self.emitter(_StubGrid(self.STACK))
+        self.assertTrue(em.via("A", 1.0, 1.0))
+        self.assertNotIn("layers", self.op(em))
+
+    def test_a_partial_span_is_written_when_blind_vias_are_allowed(self):
+        em = self.emitter(_StubGrid(self.STACK), blind=True)
+        self.assertTrue(em.via("A", 1.0, 1.0, ["F.Cu", "In1.Cu"]))
+        self.assertEqual(self.op(em)["layers"], ["F.Cu", "In1.Cu"])
+
+    def test_the_span_is_kept_in_stackup_order_whatever_the_caller_passed(self):
+        em = self.emitter(_StubGrid(self.STACK), blind=True)
+        self.assertTrue(em.via("A", 1.0, 1.0, ["In2.Cu", "F.Cu"]))
+        self.assertEqual(self.op(em)["layers"], ["F.Cu", "In2.Cu"])
+
+    def test_without_blind_vias_a_partial_span_becomes_a_through_via(self):
+        # B.Cu blocks a via here: a through via must be refused, so the caller
+        # cannot be told "your blind via fitted" when the file says through.
+        em = self.emitter(_StubGrid(self.STACK, blocked=["B.Cu"]), blind=False)
+        self.assertFalse(em.via("A", 1.0, 1.0, ["F.Cu", "In1.Cu"]))
+        self.assertEqual(em.bad[-1]["span"], ["F.Cu", "B.Cu"])
+
+    def test_with_blind_vias_the_same_spot_is_legal(self):
+        em = self.emitter(_StubGrid(self.STACK, blocked=["B.Cu"]), blind=True)
+        self.assertTrue(em.via("A", 1.0, 1.0, ["F.Cu", "In1.Cu"]))
+        self.assertEqual(em.bad, [])
+
+    def test_a_full_span_never_gains_a_layers_key(self):
+        em = self.emitter(_StubGrid(self.STACK), blind=True)
+        self.assertTrue(em.via("A", 1.0, 1.0, list(self.STACK)))
+        self.assertNotIn("layers", self.op(em))

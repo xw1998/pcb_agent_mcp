@@ -45,6 +45,9 @@ from .adapters import detect_format as _detect_format
 from .adapters import open_board as _open_board
 
 
+def _arr(desc):
+    return {"type": "array", "items": {"type": "string"}, "description": desc}
+
 def _num(desc, default=None):
     d = {"type": "number", "description": desc}
     if default is not None:
@@ -63,6 +66,19 @@ def _str(desc, enum=None, default=None):
 
 def _bool(desc, default=False):
     return {"type": "boolean", "description": desc, "default": default}
+
+def _parasitics_args(a):
+    """Build the parasitics dict for the filter tools, or None when nothing was asked.
+
+    Absent must stay None, not {"cp_f": 0, "esl_h": 0}: the difference between
+    "no parasitics modelled" and "parasitics modelled at zero" decides whether the
+    dissipation cross-check is allowed to run.
+    """
+    cp = a.get("parasitics_cp_f")
+    esl = a.get("parasitics_esl_h")
+    if cp is None and esl is None:
+        return None
+    return {"cp_f": cp, "esl_h": esl}
 
 
 TOOLS = {}
@@ -167,6 +183,43 @@ _tool(
     lambda a: _current.via_current_allowed(
         a["hole_mm"], a.get("plating_um", 25), a.get("count", 1),
         a.get("delta_t_c", 10), a.get("standard")),
+)
+
+_CUR_STD_OPT = _str(
+    "OPTIONAL here. Only used to say how far the fusing current sits from the "
+    "CONTINUOUS rating (capacity_a, fuse_over_capacity). The fusing number itself "
+    "comes from Onderdonk (1928) and does not depend on either standard.",
+    ["ipc2221", "ipc2152"],
+)
+
+_tool(
+    "fusing_current",
+    "Current that melts a trace in t_s seconds (Onderdonk 1928, adiabatic), and "
+    "optionally how far that is from the continuous rating. This is NOT a "
+    "steady-state question and neither IPC standard answers it - both describe a "
+    "cooled temperature rise, and a fusing calculation deletes the cooling. Read the "
+    "answer as one-sided: no cooling, no latent heat, rectangle converted to a round "
+    "wire by equal area, all of which make the real fusing current HIGHER. Beyond "
+    "~10 s the model stops meaning anything (the flag says so on the answer).",
+    {"type": "object", "properties": {
+        "width_mm": _num("trace width in mm"),
+        "t_s": _num("time to melt, seconds (short pulses; >10 s is flagged)", 1.0),
+        "copper_oz": _num("copper weight in oz (used unless thickness_um is given)", 1),
+        "thickness_um": _num("override the copper thickness in um"),
+        "t_ambient_c": _num("ambient temperature in Celsius", 25),
+        "delta_t_c": _num("temperature rise used for the continuous rating", 10),
+        "layer": _LAYER,
+        "standard": _CUR_STD_OPT,
+    }, "required": ["width_mm"]},
+    lambda a: _current.fusing_current(
+        a.get("width_mm"),
+        t_s=(a["t_s"] if a.get("t_s") is not None else 1.0),
+        copper_oz=(a["copper_oz"] if a.get("copper_oz") is not None else 1),
+        thickness_um=a.get("thickness_um"),
+        t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
+        delta_t_c=(a["delta_t_c"] if a.get("delta_t_c") is not None else 10.0),
+        layer=a.get("layer", "external"),
+        standard=a.get("standard")),
 )
 
 # ----------------------------------------------------------- impedance
@@ -1231,6 +1284,11 @@ _tool(
              "approximation, never worse than mst, and each branch point costs one "
              "more A*). Per net the answer carries `topology`, `tree_mm` and, for "
              "steiner, `steiner_points` / `tree_mm_mst` / `tree_saved_mm`"),
+         "blind_vias": _bool(
+             "allow blind/buried vias: a layer change first tries a through via and "
+             "only then a via spanning just the two layers being joined. Off by "
+             "default - a blind via costs more to make, and each one is written as "
+             "`(layers ...)` so the file says exactly which layers it occupies"),
          "refill_pours": _bool(
              "after writing, ask KiCad's own ZONE_FILLER to refill the zones the new "
              "copper made stale, and transplant its polygons (default false: the "
@@ -1373,6 +1431,378 @@ _tool(
      }, **_COMMON),
      "required": ["path"]},
     lambda a: _guarded(lambda: _board_route(a)),
+)
+
+def _board_fanout(args):
+    """Plan (or plan+write) a BGA escape.
+
+    The honest half of fan-out is the report: a ball that cannot leave the array
+    is listed with the wall it hit, never quietly dropped, and the advice names
+    the three real ways to open the array (smaller via, another layer, via in the
+    pad) instead of pretending a different direction would have worked.
+    """
+    from . import edit as _edit
+    from . import fanout as _fanout
+    from .route.rules import RulesError
+    board, e = _load_board(args)
+    if e:
+        return e
+    kw = {}
+    for key in ("escape_mm", "pitch_mm", "clearance_mm", "track_mm",
+                "via_diameter_mm", "via_drill_mm", "min_pads", "max_pitch",
+                "max_balls", "directions"):
+        if args.get(key) is not None:
+            kw[key] = args[key]
+    try:
+        res = _fanout.fanout(board, ref=args.get("ref"), layer=args.get("layer"),
+                             ignore_zone_areas=bool(args.get("ignore_zone_areas")),
+                             **kw)
+    except _fanout.FanoutError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint)
+    except RulesError as exc:
+        return err(str(exc), getattr(exc, "reason_code", "RULES_INVALID"))
+
+    _ledger_note("fanout", args["path"], {
+        "verdict": ("escaped" if not res["skipped"] else "partial"),
+        "arrays": len(res["arrays"]),
+        "balls_total": res["balls_total"],
+        "escaped": res["escaped"],
+        "buried": len(res["skipped"]),
+        "styles": res["styles"],
+        "clearance_mm": res["rules"].get("clearance_mm"),
+        "track_mm": res["rules"].get("track_mm"),
+        "via_mm": res["rules"].get("via_mm"),
+        "apply": args.get("apply") is True,
+    })
+    arrays = res["arrays"]
+    out = ok({
+        "arrays": [{"ref": a["ref"], "pads": a["pads"], "pitch_mm": a["pitch_mm"],
+                    "centre_mm": a["centre"], "bbox_mm": a["bbox_mm"]}
+                   for a in arrays],
+        "balls_total": res["balls_total"],
+        "escaped": res["escaped"],
+        "buried": len(res["skipped"]),
+        "styles": res["styles"],
+        "rules": res["rules"],
+        "where_the_numbers_came_from": res["rules"].get("sources"),
+        "assumed_by_this_server": res["rules"].get("assumed"),
+        "method": res["method"],
+        "writes_nothing": args.get("apply") is not True,
+    }, "mm",
+        model="exact clearance geometry (route.grid) judged against the copper "
+              "that already exists",
+        basis="every escape is accepted only when the stub and the via pass the "
+              "same exact segment/polygon test the router uses, run against the "
+              "board as it is PLUS the escapes accepted before it",
+        precision="\u00b10.001 mm (coordinates are rounded to 4 decimals when "
+                  "written)",
+        assumptions=([] if not res["rules"].get("assumed")
+                     else list(res["rules"].get("assumed"))),
+        extra={"skipped": res["skipped"], "advice": res["advice"],
+               "ops_preview": res["ops"][:5]})
+    if res["skipped"]:
+        out["status"] = "ok"
+        out["message"] = ("%d of %d balls could not be escaped and are listed under "
+                          "value; nothing about them is guessed"
+                          % (len(res["skipped"]), res["balls_total"]))
+        out["hint"] = res["advice"]
+    if args.get("apply") is not True:
+        out["next_step"] = ("pass apply=true to write this copper (it goes through "
+                            "board_propose + board_apply and the four gates)")
+        return out
+
+    plan = _edit.propose(args["path"], res["ops"], {"engine": True})
+    try:
+        applied = _edit.apply_plan(plan["plan_id"], confirm=True,
+                                   options={"engine": True,
+                                            "allow_new_violations": bool(
+                                                args.get("allow_new_violations")),
+                                            "strict_drc": bool(args.get("strict_drc"))})
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+    out["value"]["plan_id"] = plan["plan_id"]
+    out["applied"] = applied
+    out["value"]["writes_nothing"] = False
+    return out
+
+_tool(
+    "board_fanout",
+    "Get the balls of a BGA out of the array, or say which ones cannot come out. "
+    "Finds the arrays (pads on a lattice, pitch read off the pads - a part whose pads "
+    "are NOT a grid is refused rather than fanned out at a made-up pitch), then for "
+    "every ball tries a stub radially outwards from the array centre and rotations of "
+    "it by up to 45/90 degrees, each in two shapes: a direct stub with a via on its "
+    "end, and a dogbone (via clear of the pad, the rest of the escape on another "
+    "copper layer - the only way a ball surrounded by other balls can leave). Every "
+    "candidate is judged with the same exact clearance geometry the router uses, "
+    "against the copper that already exists plus the escapes accepted before it; an "
+    "accepted escape is never ripped up, so ball order decides and the answer is one "
+    "valid fan-out, not the smallest one. Escape lengths are in pitch units "
+    "(`escape_mm`, default: one pitch). The report carries `escaped`, the `styles` "
+    "used, and a `skipped` list with the wall each buried ball hit plus advice on the "
+    "three real ways to open the array (smaller via, another layer, via in the pad - "
+    "op add_via_in_pad, which needs a filled via from the fab). Not done and said so: "
+    "via-in-pad placement, dogbone alternatives beyond the fixed direction ladder, "
+    "rip-up, and any claim that the array is fully escaped. Returns a PLAN by default; "
+    "apply=true writes it through board_propose + board_apply (checkpoint, atomic "
+    "write, four gates, KiCad DRC).",
+    {"type": "object",
+     "properties": dict({
+         "apply": _bool("write the escapes (default false: plan only)"),
+         "ref": _str("the BGA reference; default: every latticed part on the board"),
+         "layer": _str("put every escape on this layer (default: the layer the pad "
+                       "is on)"),
+         "escape_mm": _num("how far a stub runs before its via (default: one pitch)", None),
+         "pitch_mm": _num("search raster step for the clearance checks", 0.1),
+         "clearance_mm": _num("override the net-class clearance", None),
+         "track_mm": _num("override the net-class track width", None),
+         "via_diameter_mm": _num("override the via diameter", None),
+         "via_drill_mm": _num("override the via drill", None),
+         "min_pads": _num("a part needs at least this many latticed pads to count as "
+                          "an array (default 9)", 9),
+         "max_pitch": _num("ignore arrays with a coarser pitch", None),
+         "max_balls": _num("escape at most this many balls (the rest are reported as "
+                           "max_balls reached)", None),
+         "directions": _num("how many directions to try per ball, 1/3/5/... up to "
+                            "9 (1 = radially outwards only)", 5),
+         "ignore_zone_areas": _bool("do not treat pour outlines as obstacles", False),
+         "allow_new_violations": _bool("accept newly introduced DRC violations"),
+         "strict_drc": _bool("let every new violation block, warnings included"),
+     }, **_COMMON),
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_fanout(a)),
+)
+
+def _ledger_note(kind, board_path, payload):
+    """Append one run to the ledger. BEST EFFORT - it cannot change an answer.
+
+    Kept out of every return value on purpose: `ledger.record` swallows its own
+    errors and this wrapper never raises, because recording what happened must
+    never be able to fail the work that happened.
+    """
+    try:
+        from . import ledger as _ledger
+        body = dict(payload)
+        body["board"] = _ledger.digest(board_path)
+        _ledger.record(kind, body)
+    except Exception:                        # noqa: BLE001 - see docstring
+        pass
+
+def _find_pad(board, ref, number):
+    """The pad dict of `ref`/`number` as the reader built it (file frame, y down)."""
+    want = str(number)
+    for fp in board.footprints:
+        if str(fp.get("ref")) != str(ref):
+            continue
+        for pad in fp.get("pads") or []:
+            if str(pad.get("number")) == want:
+                return pad
+    return None
+
+def _board_blockers(args):
+    """Why this point cannot get its first track out - and what could move.
+
+    A router that answers `no_path` leaves the caller with nothing to do. This
+    answers the question behind it: every other-net object within one pad-and-a-
+    bit of the point, each tagged with what it would take to get it out of the
+    way (a structural property of the object's kind - never a decision made
+    here), grouped into the eight directions a pad can leave through, so "boxed
+    in on every side" and "three sides open, the search failed upstream" are
+    different answers.
+    """
+    from .route import blockers as BLOCK
+    from .route import grid as GRID
+    from .route import rules as R
+    from .route.rules import RulesError
+    board, e = _load_board(args)
+    if e:
+        return e
+    layer = args.get("layer")
+    net = args.get("net")
+    ref, number = args.get("ref"), args.get("pad")
+    if ref is not None:
+        if number is None:
+            return err("ref was given without pad: say which pad (its number) on "
+                       "that part is the one that cannot get out", "ARG_MISSING")
+        pad = _find_pad(board, ref, number)
+        if pad is None:
+            return err("%s has no pad %r" % (ref, str(number)), "PAD_NOT_FOUND",
+                       hint="board_pads lists every pad number of a part")
+        at = (float(pad.get("x") or 0.0), float(pad.get("y") or 0.0))
+        net = net or pad.get("net")
+        if not layer:
+            layers = pad.get("layers") or []
+            layer = layers[0] if layers else None
+    else:
+        x, y = args.get("x"), args.get("y")
+        if x is None or y is None:
+            return err("give either ref + pad, or x + y (board file coordinates, "
+                       "the same frame board_pads reports)", "ARG_MISSING")
+        at = (float(x), float(y))
+    if not net:
+        return err("this point has no net: a clearance question is a question "
+                   "about one net's copper against another's, so name the net",
+                   "NET_UNKNOWN")
+    if not layer:
+        return err("layer is required when the point is not a pad", "ARG_MISSING")
+    kw = {}
+    for key in ("clearance_mm", "track_mm", "via_diameter_mm", "via_drill_mm",
+                "edge_clearance_mm"):
+        if args.get(key) is not None:
+            kw[key] = args[key]
+    try:
+        bundle = R.resolve(board, **kw)
+    except RulesError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint)
+    from .fanout import _copper_layers
+    copper = _copper_layers(board)
+    if layer not in copper:
+        return err("%s is not a copper layer of this board (have: %s)"
+                   % (layer, ", ".join(copper) or "none"), "NO_SUCH_LAYER",
+                   hint="a clearance question is about copper; F.SilkS, F.Mask and "
+                        "Edge.Cuts are not copper layers")
+    pitch = args.get("pitch_mm")
+    pitch = 0.1 if pitch is None else float(pitch)
+    try:
+        grid = GRID.Grid(board, [layer], pitch, bundle,
+                         ignore_zone_areas=bool(args.get("ignore_zone_areas")))
+    except ValueError as exc:
+        return err(str(exc), "ARG_RANGE")
+    res = BLOCK.blockers(grid, net, at, layer,
+                         width=args.get("width_mm"),
+                         radius_mm=args.get("radius_mm"),
+                         directions=args.get("directions") or 8,
+                         max_items=args.get("max_items") or 24)
+    out = ok(res, "mm",
+             model="exact clearance geometry (route.grid.seg_blockers / "
+                   "via_blockers) - the same test that rejects a router segment",
+             basis="eight rays of one pad-and-a-bit are cast from the point; every "
+                   "other-net object they violate is listed with the clearance it "
+                   "wants and by how much it is short, then grouped by direction",
+             precision="\u00b10.001 mm; the probe is a fan of 8 rays, so a wall that "
+                       "only closes a narrow gap between two rays is not seen - the "
+                       "answer is a diagnosis, not a proof of no path",
+             assumptions=res["assumptions"],
+             extra={"corridors": res["corridors"],
+                    "via_in_pad": res["via_in_pad"]})
+    if res["counts"]["total"] == 0:
+        out["message"] = res["diagnosis"]
+    elif res["open_sectors"]:
+        out["message"] = res["diagnosis"]
+        out["hint"] = ("nothing at this point needs to move: look further along the "
+                       "net (board_route on one net tells you which edge failed)")
+    else:
+        out["message"] = res["diagnosis"]
+        out["hint"] = ("the fixes that exist for a boxed-in pad are: move the part "
+                       "(a pad is movable), reroute another net's track/via, or "
+                       "escape with a via in the pad (op add_via_in_pad, needs a "
+                       "filled via from the fab)")
+    if res["via_in_pad"]["fits"] and res["counts"]["total"]:
+        out["hint"] = (out.get("hint") or "") + (
+            "; a via also fits in this pad, so via-in-pad is the third way out")
+    return out
+
+_tool(
+    "board_blockers",
+    "What is actually in the way of one pad (or one point) on one layer, and what it "
+    "would take to move each blocker. Casts eight rays of one pad-and-a-bit and lists "
+    "every other-net object that violates clearance, with how much it is short and a "
+    "mutability tag that is a STRUCTURAL property of the object's kind - a pad is "
+    "movable (the part can be moved), another net's track/via is reroutable, a pour / "
+    "keepout / board outline / copper graphic is fixed - never a decision this tool "
+    "makes for you. The eight directions are reported as open or blocked, which is "
+    "the difference between `the pad is boxed in` and `three sides are open, so the "
+    "failure is upstream or the budget ran out`. Also says whether a via would fit in "
+    "the pad (via-in-pad needs a filled via from the fab, so it is reported as an "
+    "option, not assumed). Read-only. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "ref": _str("footprint reference (use with pad)"),
+         "pad": _str("pad number on that footprint"),
+         "x": _num("point x, board file coordinates (when not using ref/pad)", None),
+         "y": _num("point y, board file coordinates", None),
+         "net": _str("the net that needs to get out (default: the pad's own net)"),
+         "layer": _str("copper layer (default: the pad's first copper layer)"),
+         "pitch_mm": _num("raster step for the copper index (default 0.1)", 0.1),
+         "width_mm": _num("track width to test with (default: the net's class)", None),
+         "radius_mm": _num("how far the probe reaches (default: clearance + track/2 "
+                           "+ 0.4 mm)", None),
+         "directions": _num("how many rays, 4 or 8 (default 8)", 8),
+         "max_items": _num("list at most this many blockers (default 24)", 24),
+         "clearance_mm": _num("override the net-class clearance", None),
+         "track_mm": _num("override the net-class track width", None),
+         "via_diameter_mm": _num("override the via diameter", None),
+         "via_drill_mm": _num("override the via drill", None),
+         "edge_clearance_mm": _num("override the copper-to-edge rule", None),
+         "ignore_zone_areas": _bool("do not treat pour outlines as obstacles", False),
+     }, **_COMMON),
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_blockers(a)),
+)
+
+def _board_run_ledger(args):
+    """What this server was asked to do to this board before, and what it said."""
+    import os
+
+    from . import ledger as _ledger
+    kind = args.get("kind")
+    if kind and kind not in _ledger.KINDS:
+        return err("unknown kind %r (know: %s)" % (kind, ", ".join(_ledger.KINDS)),
+                   "ARG_INVALID")
+    digest_value = None
+    if args.get("path"):
+        digest_value = _ledger.digest(args["path"])
+        if digest_value is None:
+            return err("cannot read %s, so its digest is unknown" % args["path"],
+                       "FILE_UNREADABLE")
+    limit = args.get("limit")
+    limit = 20 if limit is None else int(limit)
+    got = _ledger.summary(kind=kind, digest_value=digest_value, limit=limit)
+    return ok({"enabled": _ledger.enabled(), "file": got["file"],
+               "count": got["count"], "totals": got["totals"],
+               "runs": got["runs"],
+               "board_digest": (None if digest_value is None
+                                else digest_value[:12]),
+               "stores_per_line": ["board digest (sha256, first 12 shown)",
+                                   "the arguments that change behaviour",
+                                   "the verdict"],
+               "holds_no_design_data": True},
+              "runs",
+              model="append-only JSON Lines, one line per run, keyed by the sha256 "
+                    "of the board file",
+              basis="recording is best effort and never changes an answer: each "
+                    "route/fan-out/drc/fab/apply call appends the arguments that "
+                    "change behaviour plus the verdict, and nothing that could "
+                    "reconstruct the board",
+              precision="the ledger is a record of what was said, never reused as a "
+                        "result - `count` counts the runs still inside the retained "
+                        "history (one rotation at 4 MB), not every run ever made",
+              assumptions=[
+                  ("ledger home comes from PCB_AGENT_HOME = %s"
+                   % os.environ["PCB_AGENT_HOME"])
+                  if os.environ.get("PCB_AGENT_HOME")
+                  else "ledger lives in ~/.pcb_agent_mcp (PCB_AGENT_HOME unset)"],
+              extra={"kinds": list(_ledger.KINDS),
+                     "writes_nothing": True})
+
+_tool(
+    "board_run_ledger",
+    "What this server was asked to do to this board before, and what it said. One JSON "
+    "line per routing / fan-out / DRC / fab / apply run, keyed by the sha256 of the "
+    "board file, holding the arguments that change behaviour and the verdict - so a "
+    "second attempt does not have to re-derive what the first one learned. It is a "
+    "RECORD, not a cache: nothing here is ever reused as a result, and no line "
+    "contains design data that could reconstruct the board. Recording is best effort "
+    "and never changes what a tool returns; PCB_AGENT_LEDGER=0 disables it entirely. "
+    "Read-only. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "kind": _str("only runs of this kind", enum=list(
+             ("route", "fanout", "drc", "fab", "apply"))),
+         "limit": _num("newest first, at most this many rows (default 20)", 20),
+     }, **_COMMON),
+     "required": []},
+    lambda a: _guarded(lambda: _board_run_ledger(a)),
 )
 
 _tool(
@@ -1609,7 +2039,7 @@ def _board_route(args):
         if val:
             kw[key] = val
     for key in ("incremental", "allow_vias", "ignore_zone_areas", "second_sweep",
-                "return_path"):
+                "return_path", "blind_vias"):
         if args.get(key) is not None:
             kw[key] = bool(args[key])
     for key in ("material_group", "insulation", "topology"):
@@ -1654,6 +2084,21 @@ def _board_route(args):
 
     stats = res["stats"]
     failed = res["failed"]
+    _ledger_note("route", args["path"], {
+        "verdict": ("routed" if not failed else "incomplete"),
+        "nets_total": stats["nets_total"],
+        "nets_routed": stats["nets_routed"],
+        "nets_failed": stats["nets_failed"],
+        "failed": [{"net": f.get("net"), "reason": f.get("reason")}
+                   for f in failed[:8]],
+        "pitch_mm": stats["pitch_mm"],
+        "layers": res["layers_routing"],
+        "clearance_mm": res["rules"]["clearance_mm"],
+        "track_mm": res["rules"]["track_mm"],
+        "apply": args.get("apply") is True,
+        "note": ("apply was asked for" if args.get("apply") is True
+                 else "plan only"),
+    })
     segs = [o for o in res["ops"] if o["op"] == "add_track"]
     out = ok(
         value={"nets_total": stats["nets_total"], "nets_routed": stats["nets_routed"],
@@ -2417,12 +2862,16 @@ def _capabilities(_args):
                          "usually different, points. "
                          "NOT done: assembly compliance, solder-joint creep, "
                          "random+shock combined, drop, and any nonlinear contact",
-            "magnetics": "power-inductor sizing for CCM boost / buck / buck-boost: "
-                         "duty, inductance from volt-seconds, peak / valley / RMS "
-                         "current and the load at which CCM ends. The ripple ratio is "
-                         "the caller's design choice, saturation is graded only when a "
-                         "part Isat is supplied, and there is NO core, core loss or DCM "
-                         "steady state - in DCM the duty is not 1 - Vin/Vout",
+            "magnetics": "power-inductor sizing for boost / buck / buck-boost: the CCM "
+                         "design point (duty, inductance from volt-seconds, peak / "
+                         "valley / RMS current, the load at which CCM ends, winding "
+                         "loss if a DCR is supplied), the DCM steady state (a "
+                         "different duty with a diode interval, refused when the load "
+                         "is really in CCM) and Steinmetz core loss with the caller's "
+                         "k/alpha/beta and a NAMED unit convention. The ripple ratio is "
+                         "the caller's design choice; saturation is graded only when a "
+                         "part Isat is supplied; no core selection and no material "
+                         "table lives here",
             "stackup": "laminate shortlist (er, tan_delta, practical band, cost) and a "
                        "4 / 6 layer stack whose signal layers each get their own "
                        "solved trace width from the same microstrip model the feedline "
@@ -2452,6 +2901,17 @@ def _capabilities(_args):
                      "report of what was dropped. Online documents are encrypted, so an "
                      "online-only part has metadata and no geometry, and the tool says "
                      "so instead of drawing a plausible footprint",
+            "fullwave": "the seam and nothing behind it. No solver lives here: "
+                        "radiation patterns, gain, efficiency, S11 over a band, mutual "
+                        "coupling, cavity Q and enclosure detuning all need Maxwell's "
+                        "equations in 3-D, so `fullwave_solver` does the one thing that "
+                        "is honest without breaking the zero-dependency contract - it "
+                        "finds out whether openEMS / Meep / gprMAX is installed, says "
+                        "which version that binary printed, and says exactly what to "
+                        "hand it. A binary being present is not evidence: every answer "
+                        "carries verified_here=false. Asking for a named solver that is "
+                        "not installed is an ERROR, never a silent fallback to the "
+                        "closed-form starting geometry",
             "write_schematic": "KiCad .kicad_sch only: propose (compute only) -> apply "
                                "(checkpoint, atomic write, four gates). The referee is "
                                "the netlister + ERC, not DRC: a schematic's product is "
@@ -2460,7 +2920,8 @@ def _capabilities(_args):
         },
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
-            "via_current_allowed", "trace_impedance", "width_for_impedance",
+            "via_current_allowed", "fusing_current",
+            "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "board_summary", "board_components", "board_nets", "board_clearance",
             "board_free_space", "board_routability", "board_pour_connectivity",
@@ -2488,7 +2949,8 @@ def _capabilities(_args):
             "link_friis", "link_max_range", "link_aperture", "link_far_field",
             "link_fresnel",
             "board_antenna_keepout",
-            "magnetics_inductor", "stackup_material", "stackup_design",
+            "magnetics_inductor", "magnetics_dcm", "magnetics_core_loss",
+            "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
             "ir_drop_chain", "pdn_impedance", "pdn_plane_modes", "decoupling_check",
@@ -2500,13 +2962,19 @@ def _capabilities(_args):
             "vibration_random_response",
             "vibration_fatigue", "vibration_shock", "vibration_isolator",
             "board_vibration",
-            "cavity_resonance", "cavity_via_fence",
+            "cavity_resonance", "cavity_via_fence", "cavity_plane_q",
             "electrothermal_trace", "electrothermal_conductor",
             "board_electrothermal",
             "creepage_required", "clearance_required", "spacing_required",
             "filter_prototype", "filter_lumped_bandpass",
+            "filter_mc_yield",
             "filter_coupled_microstrip", "filter_coupled_resonator",
             "filter_waveguide_cavity",
+            "fullwave_solver",
+            "board_fab_package", "board_export", "board_bom", "board_netlist",
+            "board_graphics",
+            "schematic_pcb_diff", "schematic_pcb_sync",
+            "board_blockers", "board_run_ledger", "board_fanout",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "only for safety_standard families other than "
@@ -2556,11 +3024,15 @@ def _capabilities(_args):
                               "carries authoritative=false and names board_drc",
         },
         "not_implemented_yet": [
-            "Power magnetics beyond the CCM design point: no core selection, no core "
-            "loss (Steinmetz), no copper loss / DCR, no saturation curve of a real "
-            "material, no DCM steady state, no loop compensation and no soft start. "
-            "The tool answers the electrical design point and refuses the parts "
-            "question unless an Isat is supplied",
+            "Power magnetics beyond the electrical design point: no core SELECTION "
+            "and no material table (core_loss_steinmetz takes k/alpha/beta from you "
+            "and names the unit convention, because the same material fitted by two "
+            "vendors gives two triples), no saturation curve of a real material "
+            "(only a single Isat number), no AC winding resistance (skin and "
+            "proximity - the DCR loss is the DC part only), no gapped-core fringing "
+            "loss, no DC-bias Steinmetz, no loop compensation and no soft start. The "
+            "tool answers the electrical design point and refuses the parts question "
+            "unless an Isat is supplied",
             "Layout and schematic reviews do not read the design for you: they grade "
             "the facts they are given. board_* / schematic_* can produce some of those "
             "facts (clearance, nets, components), but nothing here parses a netlist "
@@ -2609,7 +3081,12 @@ def _capabilities(_args):
             "app_open_project still reports unconfirmed, but lceda_pro_open can open "
             "a project inside a running editor",
             "Full-wave electromagnetic simulation (method of moments / FDTD / FEM): "
-            "nothing here is a solver. The antenna tools give the starting geometry "
+            "nothing here is a solver, and `fullwave_solver` is a SEAM, not a "
+            "solver - it finds an installed openEMS / Meep / gprMAX, reports the "
+            "version that binary printed, and hands over (geometry from "
+            "board_export, stackup from board_summary, ports and mesh from the "
+            "solver's own tooling, which this server never emits). The antenna tools "
+            "give the starting geometry "
             "from closed forms; radiation pattern, gain after a housing, efficiency "
             "after losses, mutual coupling between two antennas, SAR and the "
             "detuning from a battery or a hand are all NOT computed - every antenna "
@@ -2636,11 +3113,15 @@ def _capabilities(_args):
             "plus any statement about plated barrels - via_current_allowed refuses "
             "standard=ipc2152 for exactly that reason (STANDARD_SCOPE)",
             "Plane resonances as a SOLVED field: cavity_resonance gives the ideal "
-            "PMC-wall TM_mn0 eigenvalues and cavity_via_fence gives pitch/lambda_g, but "
-            "no Q (dielectric tan-delta, copper loss, radiation), no detuning from real "
-            "open edges, no plane-pair impedance and no leakage through voids. A "
-            "resonance with no Q is a location on the frequency axis, not a verdict - "
-            "when it matters, use a 3-D field solver",
+            "PMC-wall TM_mn0 eigenvalues, cavity_via_fence gives pitch/lambda_g and "
+            "cavity_plane_q gives the copper + dielectric Q (Qc = h/delta_s, "
+            "Qd = 1/tan_delta). Still missing: radiation Q, surface roughness, "
+            "detuning from real open edges, plane-pair impedance and leakage through "
+            "voids - so the sum of the two modelled losses is an UPPER bound on Q, and "
+            "the dominant loss of a real PDN resonance (the caps and packages mounted "
+            "across it) is outside. Even with Q there is no verdict: a resonance is a "
+            "problem only together with an excitation and a coupling. When that "
+            "distinction decides the design, use a 3-D field solver",
             "Safety-distance tables for standards other than IEC 60664-1: "
             "IEC 62368-1, IEC 61010-1 and the instrument standards each tabulate "
             "their own creepage/clearance, and this build only carries IEC 60664-1 "
@@ -2679,10 +3160,14 @@ def _capabilities(_args):
             "(skin/proximity), device self-heating inside sim_spice, and reading the "
             "conductors straight off a board file - board_electrothermal takes geometry, "
             "it does not open the .kicad_pcb for you",
-            "Transient current density / surge and fusing: current_capacity is a "
-            "steady-state table check, and board_ir_drop reports A/mm^2 with no "
-            "criterion attached. Fusing a trace needs a temperature-rise criterion and "
-            "an adiabatic energy calculation, neither of which is here",
+            "Surge and fusing beyond one pulse: fusing_current answers the single-pulse "
+            "adiabatic question (Onderdonk 1928) and states its four one-sided "
+            "assumptions (no cooling, no latent heat, equal-area rectangle, no skin "
+            "effect). Not done: repetitive pulses with duty-cycle derating, "
+            "electromigration (Black's equation needs a current density a fab will "
+            "qualify), arc/plasma behaviour after the copper opens, and board_ir_drop's "
+            "A/mm^2 verdict - that tool still reports density with no criterion "
+            "attached",
             "The plane impedance CURVE (as opposed to its mode peaks): pdn_impedance / "
             "decoupling_check are lumped RLC in parallel and can prove a bank is clearly "
             "insufficient but not that it is sufficient; pdn_plane_modes gives the peak "
@@ -2709,7 +3194,7 @@ def _capabilities(_args):
             "point only - there is no stress map, no stress concentration at a hole "
             "or a stiffener, and no fatigue law applied to those numbers (Steinberg "
             "needs slope and allowable from you)",
-            "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives ideal lossless L/C values and its own S21, but no finite-Q insertion loss, no component parasitics, no real capacitor/inductor series resonance and no tolerance or Monte-Carlo yield. filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity is TE101 only: no higher-order modes, no mode chart, no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no surface-roughness correction. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
+            "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives L/C values with its own S21 audited two ways; finite-Q dissipation and first-order parasitics (inductor cp, capacitor esl) are available but OFF unless asked for, and the loss model is a resistor per branch, not dielectric or conductor physics - no skin effect, no substrate loss, no temperature drift. filter_mc_yield does tolerance yield, but it is uniform and independent only (no correlation, no batch shift, no ageing), so it is a worst case whose confidence half-width grows as 1/sqrt(n_draws). filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity is TE101 only: no higher-order modes, no mode chart, no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no surface-roughness correction. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
                     "missing fact is refused or declared absent, never defaulted",
@@ -3183,6 +3668,90 @@ def _edit_error(exc):
             out[key] = str(value)
     return out
 
+def _schematic_pcb_diff(args):
+    """Compare a board against KiCad's own netlist for a schematic."""
+    from pathlib import Path
+    from . import sync as _sync
+    from .fidelity import engine as _engine
+    board = args.get("path")
+    schematic = args.get("schematic")
+    if not board:
+        return err("missing parameter 'path' (the .kicad_pcb)", "ARG_MISSING")
+    if not schematic:
+        return err("missing parameter 'schematic' (the .kicad_sch)", "ARG_MISSING")
+    if Path(str(schematic)).suffix.lower() not in (".kicad_sch",):
+        return err("the schematic side must be a .kicad_sch file: %r" % (schematic,),
+                   "ARG_INVALID")
+    try:
+        netlist = _engine.sch_netlist(schematic)
+        if netlist.get("status") != "ok":
+            netlist["schematic"] = schematic
+            return netlist
+        out = _sync.compare(board, netlist)
+        out["schematic"] = schematic
+        out["schematic_source"] = netlist.get("verdict_source")
+        return out
+    except _sync.SyncError as exc:
+        return _edit_error(exc)
+    except (OSError, ValueError) as exc:
+        return err("%s: %s" % (type(exc).__name__, exc), "SYNC_FAILED")
+
+def _schematic_pcb_sync(args):
+    """Diff, then plan (or propose) the board operations that close the gap."""
+    from pathlib import Path
+    from . import sync as _sync
+    from .fidelity import engine as _engine
+    from . import edit as _edit
+    board = args.get("path")
+    schematic = args.get("schematic")
+    if not board or not schematic:
+        return err("both 'path' (board) and 'schematic' (.kicad_sch) are required",
+                   "ARG_MISSING")
+    if Path(str(schematic)).suffix.lower() not in (".kicad_sch",):
+        return err("the schematic side must be a .kicad_sch file: %r" % (schematic,),
+                   "ARG_INVALID")
+    try:
+        netlist = _engine.sch_netlist(schematic)
+        if netlist.get("status") != "ok":
+            netlist["schematic"] = schematic
+            return netlist
+        diff = _sync.compare(board, netlist)
+        plan = _sync.operations_for(
+            diff, placement=args.get("placement") or {},
+            library=args.get("library"),
+            remove_extra=args.get("remove_extra") is True,
+            clear_extra_pad_nets=args.get("clear_extra_pad_nets") is True,
+            create_nets=args.get("create_nets") is not False)
+        out = {"status": "ok", "diff": diff, "operations": plan["operations"],
+               "unresolved": plan["unresolved"],
+               "note": "operations are the diff, not a decision: read them, then "
+                       "call board_propose / board_apply, or pass propose=true"}
+        if not plan["operations"]:
+            out["plan"] = None
+            out["proposed"] = False
+            return out
+        if args.get("propose") is True:
+            proposed = _edit.propose(board, plan["operations"],
+                                     args.get("options") or {})
+            out["proposed"] = True
+            out["plan_id"] = proposed.get("plan_id")
+            out["proposal"] = proposed
+            out["next"] = ("board_apply(plan_id=%r, confirm=true) - the proposal is "
+                           "validated the same way any hand-written plan is"
+                           % (proposed.get("plan_id"),))
+        else:
+            out["proposed"] = False
+            out["next"] = "pass propose=true to have these operations validated"
+        return out
+    except _sync.SyncError as exc:
+        return _edit_error(exc)
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+    except _edit.OpError as exc:
+        return _edit_error(exc)
+    except (OSError, ValueError) as exc:
+        return err("%s: %s" % (type(exc).__name__, exc), "SYNC_FAILED")
+
 def _board_create(args):
     from . import edit as _edit
     try:
@@ -3303,6 +3872,42 @@ _tool(
             }},
     }, "required": ["path"]},
     _board_create,
+)
+
+_tool(
+    "schematic_pcb_diff",
+    "Compare a KiCad board against a schematic WITHOUT touching either: KiCad's own "
+    "netlister answers the schematic side, the board file answers the other, and the "
+    "difference is reported pin by pin (missing parts, footprint ids that disagree, a "
+    "pad that carries a different net than the netlist says, a net that reaches no "
+    "pad). This is the scriptable form of \"Update PCB from Schematic\" - read-only.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_pcb"),
+        "schematic": _str("absolute path to the .kicad_sch"),
+    }, "required": ["path", "schematic"]},
+    _schematic_pcb_diff,
+)
+
+_tool(
+    "schematic_pcb_sync",
+    "Turn schematic/board differences into board operations. A missing footprint has "
+    "no position on a board, so it is only placed when you pass one in `placement` "
+    "({ref: {x, y, rot, layer, library|footprint_file, name, pad_nets}}); everything "
+    "else becomes set_pad_net / delete_footprint operations. With propose=true the "
+    "list goes through board_propose, so nothing is written until board_apply.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_pcb"),
+        "schematic": _str("absolute path to the .kicad_sch"),
+        "library": _str(".pretty directory used for parts that only have a name"),
+        "placement": {"type": "object", "description":
+            "{ref: {x, y, rot, layer, library, name, footprint_file, lib_id, pad_nets}}"},
+        "remove_extra": _bool("delete footprints the schematic does not have"),
+        "clear_extra_pad_nets": _bool("untie board pads that no schematic pin claims"),
+        "create_nets": _bool("allow nets the board does not declare yet", True),
+        "propose": _bool("run board_propose on the operations (default: don't)"),
+        "options": {"type": "object", "description": "passed to board_propose"},
+    }, "required": ["path", "schematic"]},
+    _schematic_pcb_sync,
 )
 
 _tool(
@@ -4171,6 +4776,29 @@ _tool(
 )
 
 _tool(
+    "cavity_plane_q",
+    "Damping of a plane-pair mode: copper Q, dielectric Q and their series sum. The "
+    "conductor answer is Qc = omega*mu*h/(2*Rs) = h/delta_s - independent of the "
+    "plane size, the aspect ratio and the mode numbers, and proportional to the "
+    "dielectric thickness, which is not what most tables imply. Give tan_delta and "
+    "you also get Qd = 1/tan_delta; FR4's 0.02 gives 50, i.e. the dielectric usually "
+    "dominates and a scary mode on lossy prepreg is often a non-event. Radiation Q, "
+    "surface roughness and the damping of mounted capacitors are NOT modelled, so "
+    "read the answer as an upper bound on Q. No pass/fail: a resonance is only a "
+    "problem with an excitation and a coupling.",
+    {"type": "object", "properties": {
+        "f_hz": _num("the mode frequency, e.g. from cavity_resonance"),
+        "h_mm": _num("dielectric thickness between the two planes"),
+        "tan_delta": _num("laminate loss tangent, e.g. 0.02 for FR4 (omit for none)"),
+        "conductivity_s_m": _num("copper conductivity", 5.8e7),
+    }, "required": ["f_hz", "h_mm"]},
+    lambda a: _cavity.plane_q(
+        a.get("f_hz"), a.get("h_mm"), tan_delta=a.get("tan_delta"),
+        conductivity_s_m=(a["conductivity_s_m"]
+                          if a.get("conductivity_s_m") is not None else 5.8e7)),
+)
+
+_tool(
     "electrothermal_trace",
     "Self-consistent temperature of a straight DC trace: the copper gets hotter, the "
     "copper gets more resistive, so it dissipates more, so it gets hotter. R(T) = "
@@ -4303,7 +4931,14 @@ _tool(
     "series and shunt branch, plus the S21 curve computed TWO WAYS - ABCD cascade of the "
     "actual elements and the closed-form Chebyshev/Butterworth 1/(1+eps^2 Tn^2) - and "
     "compared point by point. If the two disagree by more than 0.02 dB the answer is "
-    "refused (INTERNAL_CHECK_FAILED) rather than reported.",
+    "refused (INTERNAL_CHECK_FAILED) rather than reported. Even orders do NOT terminate in "
+    "z0 directly: the ladder is fed series-first and needs a 1:sqrt(g(n+1)) ideal output "
+    "transformer, reported as value.termination. Pass q_unloaded (a number, or one per "
+    "resonator) to get finite-Q dissipation: the loss is a real resistor in each branch "
+    "(w0*L/Q, w0*C/G), not a formula, and the load/incident/dissipated powers are audited "
+    "against P_load + sum P_loss = P_incident*(1-|S11|^2). Pass parasitics_cp_f / "
+    "parasitics_esl_h for first-order self-resonance. Tolerance/tolerance yield is "
+    "filter_mc_yield, not here.",
     {"type": "object", "properties": {
         "order": _num("filter order"),
         "f0_hz": _num("centre frequency in Hz"),
@@ -4313,13 +4948,67 @@ _tool(
         "response": _str("prototype family", ["chebyshev", "butterworth"],
                          default="chebyshev"),
         "points": _num("S21 sweep points", 31),
+        "q_unloaded": _num("unloaded resonator Q; a single value applies to every branch. "
+                           "Omit for the ideal lossless ladder (no loss block is reported). "
+                           "Typical: 200 for air-core, 50-80 for 0402 chip parts"),
+        "parasitics_cp_f": _num("shunt capacitance across every inductor, in farads "
+                                "(self-resonance at 1/(2*pi*sqrt(L*cp)))"),
+        "parasitics_esl_h": _num("series inductance in every capacitor, in henries"),
     }, "required": ["order", "f0_hz", "fbw"]},
     lambda a: _filters.lumped_bandpass(
         a.get("order"), a.get("f0_hz"), a.get("fbw"),
         z0_ohm=(a["z0_ohm"] if a.get("z0_ohm") is not None else 50.0),
         ripple_db=a.get("ripple_db"),
         response=a.get("response") or "chebyshev",
-        points=int(a["points"] if a.get("points") is not None else 31)),
+        points=int(a["points"] if a.get("points") is not None else 31),
+        q_unloaded=a.get("q_unloaded"),
+        parasitics=_parasitics_args(a)),
+)
+
+_tool(
+    "filter_mc_yield",
+    "Monte-Carlo tolerance yield of the lumped bandpass: every L and C gets its own "
+    "multiplier from the stated tolerance, the full ABCD cascade is run for each draw and "
+    "the fraction meeting the passband/stopband spec is reported WITH its binomial 95 % "
+    "confidence half-width (a yield from 200 draws is +/-7 %, it is not a number to design "
+    "to). 'uniform + independent' is the worst case: no correlation, no temperature or "
+    "ageing drift, no batch shift. Zero tolerance on both parts is reported as a degenerate "
+    "single evaluation at 100 % by construction, not as a result. If the nominal design "
+    "already fails the spec the tool says so instead of quoting a tolerance yield.",
+    {"type": "object", "properties": {
+        "order": _num("filter order"),
+        "f0_hz": _num("centre frequency in Hz"),
+        "fbw": _num("fractional bandwidth, e.g. 0.1 for 10 %"),
+        "tol_c_pct": _num("capacitor tolerance in percent (+/-1 sigma if gaussian)", 0.0),
+        "tol_l_pct": _num("inductor tolerance in percent (+/-1 sigma if gaussian)", 0.0),
+        "n_draws": _num("number of draws", 200),
+        "seed": _num("RNG seed; same seed gives the same answer", 0),
+        "il_max_db": _num("max insertion loss allowed anywhere in the passband", 1.0),
+        "f_stop_hz": _num("optional stopband frequency to reject at"),
+        "reject_min_db": _num("insertion loss required at f_stop_hz"),
+        "q_unloaded": _num("finite unloaded Q, same meaning as for filter_lumped_bandpass"),
+        "distribution": _str("tolerance distribution", ["uniform", "gaussian"],
+                             default="uniform"),
+        "response": _str("prototype family", ["chebyshev", "butterworth"],
+                         default="chebyshev"),
+        "ripple_db": _num("passband ripple; chebyshev default 0.5"),
+        "z0_ohm": _num("terminating impedance", 50.0),
+    }, "required": ["order", "f0_hz", "fbw"]},
+    lambda a: _filters.filter_monte_carlo(
+        a.get("order"), a.get("f0_hz"), a.get("fbw"),
+        tol_c_pct=(a["tol_c_pct"] if a.get("tol_c_pct") is not None else 0.0),
+        tol_l_pct=(a["tol_l_pct"] if a.get("tol_l_pct") is not None else 0.0),
+        n_draws=int(a["n_draws"] if a.get("n_draws") is not None else 200),
+        seed=int(a["seed"] if a.get("seed") is not None else 0),
+        il_max_db=(a["il_max_db"] if a.get("il_max_db") is not None else 1.0),
+        f_stop_hz=a.get("f_stop_hz"),
+        reject_min_db=a.get("reject_min_db"),
+        q_unloaded=a.get("q_unloaded"),
+        parasitics=_parasitics_args(a),
+        response=a.get("response") or "chebyshev",
+        ripple_db=a.get("ripple_db"),
+        z0_ohm=(a["z0_ohm"] if a.get("z0_ohm") is not None else 50.0),
+        distribution=a.get("distribution") or "uniform"),
 )
 
 _tool(
@@ -4408,11 +5097,13 @@ _tool(
 _tool(
     "magnetics_inductor",
     "Power-inductor sizing for CCM boost / buck / buck-boost from the load, the rails "
-    "and the switching frequency: duty, inductance, peak / valley / RMS current and "
-    "where CCM ends. Ripple ratio r is a DESIGN CHOICE (0.2-0.4 typical) - it is not "
-    "derived. Saturation is graded only if you supply the part's Isat; without it the "
-    "answer says what is missing instead of guessing. No core, no core loss, no DCM "
-    "steady state (in DCM the duty is not 1-Vin/Vout).",
+    "and the switching frequency: duty, inductance, peak / valley / RMS current, where "
+    "CCM ends, and the winding's I^2R loss if you supply dcr_ohm. Ripple ratio r is a "
+    "DESIGN CHOICE (0.2-0.4 typical) - it is not derived. Saturation is graded only if "
+    "you supply the part's Isat; without it the answer says what is missing instead of "
+    "guessing. No core selection and no core loss here (magnetics_core_loss takes your "
+    "own Steinmetz triple); a load BELOW the CCM boundary is a different problem - use "
+    "magnetics_dcm, where the duty is not 1-Vin/Vout.",
     {"type": "object", "properties": {
         "topology": _str("converter topology", list(_magnetics.TOPOLOGIES)),
         "vin_v": _num("input voltage"),
@@ -4425,6 +5116,7 @@ _tool(
         "efficiency": _num("assumed constant efficiency (0 < eta <= 1)", 1.0),
         "isat_a": _num("the inductor's saturation current, if you have picked a part"),
         "sat_margin": _num("headroom required above the peak current", 0.20),
+        "dcr_ohm": _num("optional: the winding's DC resistance, to get its I^2R loss"),
     }, "required": ["topology", "vin_v", "vout_v", "f_sw_hz"]},
     lambda a: _magnetics.inductor_ccm(
         a.get("topology"), a.get("vin_v"), a.get("vout_v"), a.get("f_sw_hz"),
@@ -4432,7 +5124,54 @@ _tool(
         iout_a=a.get("iout_a"), pout_w=a.get("pout_w"),
         efficiency=(a["efficiency"] if a.get("efficiency") is not None else 1.0),
         isat_a=a.get("isat_a"),
-        sat_margin=(a["sat_margin"] if a.get("sat_margin") is not None else 0.20)),
+        sat_margin=(a["sat_margin"] if a.get("sat_margin") is not None else 0.20),
+        dcr_ohm=a.get("dcr_ohm")),
+)
+
+_tool(
+    "magnetics_dcm",
+    "The DCM steady state - which is NOT CCM with a smaller ripple. Three intervals "
+    "per period, a different output relation (boost D = sqrt(K*M*(M-1)), buck "
+    "D = M*sqrt(K/(1-M)), buck-boost D = M*sqrt(K) with K = 2*L*fs/R), and the ripple "
+    "is no longer a design choice: dI = 2*I_L,avg by construction. Refuses with "
+    "MODE_IS_CCM when the load is above the CCM boundary for this L (it names that "
+    "load), because otherwise the formula would answer a question nobody asked. "
+    "Lossless voltages: a single efficiency number cannot express the DCM duty shift.",
+    {"type": "object", "properties": {
+        "topology": _str("converter topology", list(_magnetics.TOPOLOGIES)),
+        "vin_v": _num("input voltage"),
+        "vout_v": _num("output voltage magnitude (buck-boost is inverting)"),
+        "f_sw_hz": _num("switching frequency in Hz (not kHz)"),
+        "l_h": _num("the inductance you have, in HENRY (1e-6 for uH)"),
+        "iout_a": _num("load current - give this OR pout_w, never both"),
+        "pout_w": _num("load power - give this OR iout_a, never both"),
+    }, "required": ["topology", "vin_v", "vout_v", "f_sw_hz", "l_h"]},
+    lambda a: _magnetics.duty_dcm(
+        a.get("topology"), a.get("vin_v"), a.get("vout_v"), a.get("f_sw_hz"),
+        a.get("l_h"), iout_a=a.get("iout_a"), pout_w=a.get("pout_w")),
+)
+
+_tool(
+    "magnetics_core_loss",
+    "Steinmetz core loss P_v = k*f^alpha*B_peak^beta with the coefficients YOU supply "
+    "and the unit convention NAMED, because the published fits differ by ~10^12 in k "
+    "purely through units (si = Hz/T/W-per-m3, khz_mt = kHz/mT/mW-per-cm3, khz_gauss). "
+    "Both unit systems are printed on every answer so a unit slip shows up as an "
+    "absurd magnitude. B_peak is the AC amplitude (half the peak-to-peak swing). Not "
+    "modelled: DC bias, non-sinusoidal flux, temperature dependence, gap loss - and "
+    "nothing about the winding, which is a separate number.",
+    {"type": "object", "properties": {
+        "f_hz": _num("frequency in Hz"),
+        "b_peak_t": _num("AC flux amplitude in tesla"),
+        "k": _num("the material's Steinmetz coefficient, in the units named below"),
+        "alpha": _num("the material's frequency exponent"),
+        "beta": _num("the material's flux exponent"),
+        "units": _str("which convention k is in", sorted(_magnetics.STEINMETZ_UNITS)),
+        "ve_mm3": _num("optional: core volume, to turn P_v into watts"),
+    }, "required": ["f_hz", "b_peak_t", "k", "alpha", "beta"]},
+    lambda a: _magnetics.core_loss_steinmetz(
+        a.get("f_hz"), a.get("b_peak_t"), a.get("k"), a.get("alpha"), a.get("beta"),
+        units=(a.get("units") or "si"), ve_mm3=a.get("ve_mm3")),
 )
 
 _tool(
@@ -4834,6 +5573,91 @@ _tool(
     _part_cache_info,
 )
 
+def _fullwave_solver(args):
+    """Which full-wave solver exists here, and what the handoff has to look like."""
+    from .calc import em as _em
+    name = args.get("solver")
+    if name and name not in _em.DETECTORS:
+        return err("unknown solver %r (know: %s)"
+                   % (name, ", ".join(sorted(_em.DETECTORS))), "ARG_INVALID",
+                   hint="a name this server does not know cannot be probed, and "
+                        "inventing a probe would be the same as claiming support")
+    probe = args.get("probe")
+    probe = True if probe is None else bool(probe)
+    timeout_s = args.get("timeout_s")
+    timeout_s = _em.PROBE_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    if timeout_s <= 0:
+        return err("timeout_s must be > 0", "ARG_RANGE")
+    try:
+        got = _em.detect(names=[name] if name else None, probe=probe,
+                         timeout_s=timeout_s)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    out = ok(got, "solvers",
+             model="PATH probe + PCB_AGENT_<SOLVER> + the documented install "
+                   "directories, then one --version run per binary",
+             basis="a solver is reported found only when a real file path exists; its "
+                   "version is whatever that binary printed, and nothing here was "
+                   "measured against a solve",
+             precision="presence and version are evidence of INSTALLATION at this "
+                       "moment, nothing more - not that the mesh converges, not that "
+                       "the ports are right, and not that this server can drive it. "
+                       "verified_here is false for every solver because no full-wave "
+                       "run has ever been recorded in this repository",
+             assumptions=[_em.VERSION_VERIFICATION])
+    out["value"]["this_server_does"] = _em.WHAT_THIS_SERVER_DOES
+    out["value"]["this_server_will_not_do"] = _em.WHAT_IT_WILL_NOT_DO
+    out["value"]["how_to_hand_over"] = list(_em._STEPS)
+    if name and not got["found"]:
+        out["status"] = "error"
+        out["reason_code"] = "SOLVER_NOT_FOUND"
+        out["message"] = ("%s was asked for by name and is not installed (looked at "
+                          "$%s, PATH and the documented install directories)"
+                          % (name, _em.DETECTORS[name]["env"]))
+        out["hint"] = ("install it or point %s at the executable; this server will not "
+                       "substitute its closed-form geometry for a solve"
+                       % _em.DETECTORS[name]["env"])
+        out["next_step"] = _em._STEPS[3]
+        return out
+    if not got["found"]:
+        out["message"] = ("no full-wave solver is installed on this machine (%s), so "
+                          "nothing here can answer a pattern, a band sweep or a "
+                          "coupling question" % ", ".join(got["missing"]))
+        out["hint"] = ("the closed-form tools give the starting geometry; the solve "
+                       "needs one of the programs listed under value.solvers")
+    else:
+        out["message"] = ("found: %s" % ", ".join(
+            "%s %s" % (r["solver"], r["version"] or "(version not printed)")
+            for r in got["solvers"] if r["found"]))
+        if got["missing"]:
+            out["value"]["also_missing"] = got["missing"]
+    return out
+
+_tool(
+    "fullwave_solver",
+    "Is a full-wave electromagnetic solver installed on this machine, which version, and "
+    "what does the handoff look like? THIS SERVER IS NOT A FULL-WAVE SOLVER and never "
+    "claims to be: radiation patterns, gain, efficiency, S11 over a band, mutual "
+    "coupling, cavity Q with a field distribution and enclosure detuning all require "
+    "solving Maxwell's equations in 3-D, which needs a mesh and a port. What this tool "
+    "does is the honest half of a delegation, the same way the SPICE tool can hand a "
+    "netlist to an installed ngspice: it looks for openEMS / Meep / gprMAX on PATH, in "
+    "$PCB_AGENT_<SOLVER> and in the documented install directories, runs --version to "
+    "report what the binary says about itself, and returns the geometry and stackup "
+    "facts you have to feed it plus where those come from here (board_export for "
+    "Gerber/STEP, board_summary for the stackup). Presence is NOT evidence: every answer "
+    "carries verified_here=false, because no full-wave run has ever been recorded in "
+    "this repository. Asking for a named solver that is not installed is refused with "
+    "SOLVER_NOT_FOUND rather than answered with the closed-form numbers.",
+    {"type": "object",
+     "properties": {
+         "solver": _str("probe only this one", enum=sorted(("openems", "meep", "gprmax"))),
+         "probe": _bool("run --version on what was found (default true)", True),
+         "timeout_s": _num("per-probe timeout (default 15 s)", 15),
+     }},
+    lambda a: _guarded(lambda: _fullwave_solver(a)),
+)
+
 _tool(
     "calc_capabilities",
     "Self-description: what this server can compute, what it refuses to compute and why, "
@@ -4842,6 +5666,156 @@ _tool(
     _capabilities,
 )
 
+
+# --------------------------------------------------- manufacturing output
+def _fab_fail(exc):
+    from .fab import FabError
+    if isinstance(exc, FabError):
+        return err(str(exc), exc.reason_code, hint=exc.hint)
+    return err("%s: %s" % (type(exc).__name__, exc), "FAB_FAILED")
+
+def _board_fab_package(args):
+    from . import fab as _fab
+    path = args.get("path")
+    if not path:
+        return err("path is required", "ARG_MISSING")
+    formats = args.get("formats")
+    if isinstance(formats, str):
+        formats = [f.strip() for f in formats.split(",") if f.strip()]
+    try:
+        return _fab.package(path, out_dir=args.get("out_dir"),
+                            formats=formats or ("gerbers", "drill", "pos"),
+                            allow_beside_source=bool(args.get("allow_beside_source")),
+                            zip_it=args.get("zip") is not False)
+    except Exception as exc:                       # noqa: BLE001
+        return _fab_fail(exc)
+
+def _board_export_graphics(args):
+    from . import fab as _fab
+    path = args.get("path")
+    if not path:
+        return err("path is required", "ARG_MISSING")
+    layers = args.get("layers")
+    if isinstance(layers, str):
+        layers = [l.strip() for l in layers.split(",") if l.strip()]
+    try:
+        return _fab.graphics(path, fmt=args.get("format") or "pdf", layers=layers,
+                             out_dir=args.get("out_dir"),
+                             allow_beside_source=bool(args.get("allow_beside_source")),
+                             black_and_white=bool(args.get("black_and_white")))
+    except Exception as exc:                       # noqa: BLE001
+        return _fab_fail(exc)
+
+def _board_export_3d(args):
+    from . import fab as _fab
+    path = args.get("path")
+    if not path:
+        return err("path is required", "ARG_MISSING")
+    try:
+        return _fab.threed(path, fmt=args.get("format") or "step",
+                           out_dir=args.get("out_dir"),
+                           allow_beside_source=bool(args.get("allow_beside_source")),
+                           board_only=bool(args.get("board_only")))
+    except Exception as exc:                       # noqa: BLE001
+        return _fab_fail(exc)
+
+def _schematic_export(args):
+    from . import fab as _fab
+    path = args.get("path")
+    if not path:
+        return err("path is required", "ARG_MISSING")
+    fields = args.get("fields")
+    if isinstance(fields, str):
+        fields = [f.strip() for f in fields.split(",") if f.strip()]
+    try:
+        return _fab.schematic_export(
+            path, fmt=args.get("format") or "pdf", out_dir=args.get("out_dir"),
+            allow_beside_source=bool(args.get("allow_beside_source")),
+            fields=fields, group_by=args.get("group_by"),
+            netlist_format=args.get("netlist_format"),
+            exclude_dnp=bool(args.get("exclude_dnp")))
+    except Exception as exc:                       # noqa: BLE001
+        return _fab_fail(exc)
+
+_tool(
+    "board_fab_package",
+    "Build a manufacturing package from a KiCad board: Gerbers (the board's own plot "
+    "settings), Excellon drill (mm, separate PTH/NPTH, plus a map and a report), a "
+    "pick-and-place position CSV, and optionally STEP / IPC-2581 / ODB++ / IPC-D-356 / "
+    "GenCAD. Every artefact is produced by kicad-cli and then re-read here - a Gerber "
+    "with no M02* terminator, an Excellon with no tool table, a position file with no "
+    "rows, a STEP that is not ISO-10303-21 comes back under `problems` instead of being "
+    "counted as success. Writes a manifest.json (source sha256, kicad-cli version, every "
+    "file with its own sha256) and a fab.zip. Refuses to write inside the source "
+    "directory tree unless allow_beside_source=true. Not included: panelisation, V-cut, "
+    "stencil, impedance report.",
+    {"type": "object", "properties": {
+        "path": _str("the .kicad_pcb file (never modified)"),
+        "formats": _arr("gerbers / drill / pos / step / ipc2581 / odb / ipcd356 / gencad"
+                        " (default gerbers, drill, pos)"),
+        "out_dir": _str("output directory; default is a fresh temp dir. A path inside "
+                        "the source directory is refused"),
+        "allow_beside_source": _bool("really write inside the design's directory", False),
+        "zip": _bool("also write fab.zip (default true)", True),
+    }, "required": ["path"]},
+    _board_fab_package,
+)
+
+_tool(
+    "board_export_graphics",
+    "Layer plot for humans: pdf / svg / dxf / ps / 3dpdf. `layers` defaults to every "
+    "copper layer plus F.SilkS / B.SilkS / Edge.Cuts, read from the board file - "
+    "kicad-cli refuses a plot with no layer list, so the list comes from the design and "
+    "is echoed back. dxf writes one file per layer.",
+    {"type": "object", "properties": {
+        "path": _str("the .kicad_pcb file"),
+        "format": _str("pdf / svg / dxf / ps / 3dpdf", enum=["pdf", "svg", "dxf", "ps", "3dpdf"]),
+        "layers": _arr("layer names, e.g. [\"F.Cu\", \"Edge.Cuts\"]"),
+        "out_dir": _str("output directory; default is a fresh temp dir"),
+        "allow_beside_source": _bool("really write inside the design's directory", False),
+        "black_and_white": _bool("monochrome plot", False),
+    }, "required": ["path"]},
+    _board_export_graphics,
+)
+
+_tool(
+    "board_export_3d",
+    "3D solid export of a KiCad board: step / stpz / brep / glb / stl / ply / vrml / xao / "
+    "u3d. A component whose 3D model path does not resolve is silently absent from the "
+    "result - KiCad gives no per-part warning, so this tool cannot report which ones. "
+    "board_only=true exports the bare board without component models.",
+    {"type": "object", "properties": {
+        "path": _str("the .kicad_pcb file"),
+        "format": _str("step / stpz / brep / glb / stl / ply / vrml / xao / u3d",
+                        enum=["step", "stpz", "brep", "glb", "stl", "ply", "vrml", "xao", "u3d"]),
+        "out_dir": _str("output directory; default is a fresh temp dir"),
+        "allow_beside_source": _bool("really write inside the design's directory", False),
+        "board_only": _bool("export the board body without component models", False),
+    }, "required": ["path"]},
+    _board_export_3d,
+)
+
+_tool(
+    "schematic_export",
+    "Schematic output: bom (CSV, parsed into rows with a placement count), netlist "
+    "(kicadsexpr / kicadxml / spice / ...), pdf, svg, dxf, ps, python-bom. The netlist "
+    "here is KiCad's own netlister - the same engine the schematic write path uses as a "
+    "gate, so a netlist taken before and after an edit is comparable.",
+    {"type": "object", "properties": {
+        "path": _str("the .kicad_sch file (never modified)"),
+        "format": _str("bom / netlist / pdf / svg / dxf / ps / python-bom",
+                        enum=["bom", "netlist", "pdf", "svg", "dxf", "ps", "python-bom"]),
+        "out_dir": _str("output directory; default is a fresh temp dir"),
+        "allow_beside_source": _bool("really write inside the design's directory", False),
+        "fields": _arr("BOM columns in order (default Reference, Value, Footprint, "
+                        "QUANTITY, DNP, Description, LCSC)"),
+        "group_by": _str("BOM grouping, e.g. \"Value,Footprint\""),
+        "netlist_format": _str("kicadsexpr (default) / kicadxml / spice / spicemodel / "
+                               "orcadpcb2 / cadstar / pads / allegro"),
+        "exclude_dnp": _bool("drop Do-Not-Populate symbols from the BOM", False),
+    }, "required": ["path"]},
+    _schematic_export,
+)
 
 def list_tools():
     return [

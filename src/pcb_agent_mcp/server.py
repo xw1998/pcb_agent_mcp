@@ -1023,6 +1023,140 @@ def selftest():
           _kept == ("EXECUTION_ERROR", "boom") and _ours == ("APP_ERROR", "WHO_KNOWS"),
           str((_kept, _ours)))
 
+    # A ball grid array has to be fanned out by geometry, and the one thing a
+    # fan-out must never do is claim a ball came out when it did not: the 1.27 mm
+    # part here fits a default net class, and the same part with a 0.4 mm track
+    # does not - the second call exists to see the refusal.
+    _vtmp = _tempfile.mkdtemp(prefix="pcbagent-fanout-")
+    try:
+        from . import edit as _edit
+        from . import fanout as _fanout
+
+        _vb = os.path.join(_vtmp, "fan.kicad_pcb")
+        _edit.create_board(_vb, {"width_mm": 40, "height_mm": 40,
+                                "copper_layers": 2, "engine": False})
+        _vlib = os.path.join(_vtmp, "lib.pretty")
+        os.makedirs(_vlib)
+        _mod = ['(footprint "SYN:BGA25" (version 20221018) (generator pcbnew)',
+                '  (layer "F.Cu") (attr smd)',
+                '  (fp_text reference "REF**" (at 0 -10) (layer "F.SilkS")',
+                '    (effects (font (size 0.7 0.7) (thickness 0.12))))',
+                '  (fp_text value "BGA25" (at 0 10) (layer "F.Fab")',
+                '    (effects (font (size 0.7 0.7) (thickness 0.12))))']
+        _num = 1
+        for _row in range(5):
+            for _col in range(5):
+                _mod.append('  (pad "%d" smd circle (at %.4f %.4f) (size 0.6 0.6)'
+                            % (_num, _col * 1.27, _row * 1.27))
+                _mod.append('    (layers "F.Cu" "F.Paste" "F.Mask") '
+                            '(tstamp 5%07d-1111-1111-1111-111111111111))' % _num)
+                _num += 1
+        _mod.append(")\n")
+        with open(os.path.join(_vlib, "BGA25.kicad_mod"), "w", encoding="utf-8",
+                  newline="\n") as _fh:
+            _fh.write("\n".join(_mod))
+        _vplan = _edit.propose(_vb, [{
+            "op": "add_footprint", "ref": "U1", "x": 20.0, "y": 20.0,
+            "library": _vlib, "name": "BGA25", "create_nets": True,
+            "pad_nets": dict((str(k), "N%d" % k) for k in range(1, 26))}])
+        _edit.apply_plan(_vplan["plan_id"], confirm=True, options={"engine": False})
+        _vboard, _verr = _tools._load_board({"path": _vb})
+        if _verr:
+            check("the fan-out self-test board loads", False, str(_verr))
+        else:
+            _fres = _fanout.fanout(_vboard)
+            check("a 1.27 mm 5x5 ball array is fully escaped (16 direct + 9 dogbone)",
+                  _fres["escaped"] == 25 and _fres["skipped"] == []
+                  and _fres["styles"] == {"direct": 16, "dogbone": 9},
+                  str((_fres["escaped"], _fres["styles"])))
+            _fres2 = _fanout.fanout(_vboard, clearance_mm=1.0)
+            check("a 1.0 mm clearance cannot fit a 1.27 mm array, and says so",
+                  _fres2["escaped"] < 25 and bool(_fres2["advice"])
+                  and bool(_fres2["skipped"]),
+                  str((_fres2["escaped"], len(_fres2["skipped"]))))
+    finally:
+        _shutil.rmtree(_vtmp, ignore_errors=True)
+
+    # A router that answers "no_path" leaves the caller with nothing to act on.
+    # `blockers` says what is in the way, tags each object with what it would take
+    # to move it, and - the part that has to be right - does not call a pad with
+    # an open side "boxed in". And the run ledger must be able to record a run
+    # without ever being able to change an answer.
+    _btmp = _tempfile.mkdtemp(prefix="pcbagent-blockers-")
+    try:
+        from . import ledger as _ledger
+        from .route import blockers as _blockers
+        from .route import grid as _grid
+        from .route import rules as _rules
+
+        _bb = os.path.join(_btmp, "blk.kicad_pcb")
+        _edit.create_board(_bb, {"width_mm": 40, "height_mm": 30,
+                                 "copper_layers": 2, "engine": False})
+        _blib = os.path.join(_btmp, "lib.pretty")
+        os.makedirs(_blib)
+        _bmod = ['(footprint "SYN:Wall" (version 20221018) (generator pcbnew)',
+                 '  (layer "F.Cu") (attr smd)',
+                 '  (fp_text reference "REF**" (at 0 -6) (layer "F.SilkS")',
+                 '    (effects (font (size 0.7 0.7) (thickness 0.12))))',
+                 '  (fp_text value "Wall" (at 0 6) (layer "F.Fab")',
+                 '    (effects (font (size 0.7 0.7) (thickness 0.12))))',
+                 '  (pad "1" smd rect (at 0 0) (size 0.6 0.6)',
+                 '    (layers "F.Cu" "F.Paste" "F.Mask") '
+                 '(tstamp 50000001-1111-1111-1111-111111111111))',
+                 '  (pad "2" smd rect (at -1.0 0) (size 0.4 0.4)',
+                 '    (layers "F.Cu" "F.Paste" "F.Mask") '
+                 '(tstamp 50000002-1111-1111-1111-111111111111))',
+                 ')\n']
+        with open(os.path.join(_blib, "Wall.kicad_mod"), "w", encoding="utf-8",
+                  newline="\n") as _fh:
+            _fh.write("\n".join(_bmod))
+        _bplan = _edit.propose(_bb, [{
+            "op": "add_footprint", "ref": "U1", "x": 20.0, "y": 15.0,
+            "library": _blib, "name": "Wall", "create_nets": True,
+            "pad_nets": {"1": "SIG", "2": "GND"}}])
+        _edit.apply_plan(_bplan["plan_id"], confirm=True, options={"engine": False})
+        _bboard, _berr = _tools._load_board({"path": _bb})
+        if _berr:
+            check("the blockers self-test board loads", False, str(_berr))
+        else:
+            _bgrid = _grid.Grid(_bboard, ["F.Cu"], 0.05, _rules.resolve(_bboard))
+            _bres = _blockers.blockers(_bgrid, "SIG", (20.0, 15.0), "F.Cu",
+                                       radius_mm=2.0)
+            check("blockers leaves a wall on one side open on the other seven",
+                  "W" not in _bres["open_sectors"]
+                  and len(_bres["open_sectors"]) == 7
+                  and not _bres["corridors"][4]["open"],
+                  str(_bres["open_sectors"]))
+            check("a mutable pad is tagged movable and the answer says the tag is "
+                  "not this tool's decision",
+                  _bres["blockers"]
+                  and _bres["blockers"][0]["mutability"] == "movable"
+                  and "not a decision made here" in _bres["mutability_rule"])
+
+        _bhome = os.environ.get("PCB_AGENT_HOME")
+        os.environ["PCB_AGENT_HOME"] = os.path.join(_btmp, "home")
+        try:
+            _bdigest = _ledger.digest(_bb)
+            _bbefore = len(_ledger.entries(kind="route"))
+            _bwrote = _ledger.record("route", {"board": _bdigest,
+                                               "verdict": "routed"})
+            check("the run ledger records one line keyed by the board digest",
+                  _bwrote and len(_ledger.entries(kind="route")) == _bbefore + 1
+                  and _ledger.entries(kind="route")[0]["payload"]["board"] == _bdigest,
+                  str(_bwrote))
+            os.environ["PCB_AGENT_LEDGER"] = "0"
+            check("the ledger's one switch off writes nothing at all",
+                  _ledger.record("route", {"verdict": "routed"}) is False
+                  and len(_ledger.entries(kind="route")) == _bbefore + 1)
+        finally:
+            os.environ.pop("PCB_AGENT_LEDGER", None)
+            if _bhome is None:
+                os.environ.pop("PCB_AGENT_HOME", None)
+            else:
+                os.environ["PCB_AGENT_HOME"] = _bhome
+    finally:
+        _shutil.rmtree(_btmp, ignore_errors=True)
+
     # The skill-derived calculators: each one is checked against a number that can
     # be re-derived by hand, and the rule engine is checked for the one property
     # that matters - a missing measurement must never come back as a pass.
@@ -1087,6 +1221,49 @@ def selftest():
     check("an empty fact set is refused (ARG_MISSING), not graded as clean",
           json.loads(r["result"]["content"][0]["text"]).get("reason_code")
           == "ARG_MISSING")
+
+    # The full-wave seam: the one thing it must never do is answer with closed-form
+    # numbers when the caller asked for a solver. `meep` has no install directory
+    # in DETECTORS, so blanking PATH and pointing its env var at nothing makes the
+    # "not installed" case reproducible on any machine - including one that has it.
+    r = handle({"jsonrpc": "2.0", "id": 121, "method": "tools/call",
+                "params": {"name": "fullwave_solver", "arguments": {"probe": False}}})
+    _fw = (json.loads(r["result"]["content"][0]["text"]))
+    _fwv = _fw.get("value") or {}
+    check("the solver probe reports every solver and claims no run evidence",
+          _fw.get("status") == "ok" and len(_fwv.get("solvers", [])) == 3
+          and all(row.get("verified_here") is False
+                  for row in _fwv.get("solvers", []))
+          and _fwv.get("found") == [row["solver"] for row in _fwv.get("solvers", [])
+                                    if row.get("found")],
+          str(_fwv.get("found")))
+
+    _fw_path = os.environ.get("PATH")
+    _fw_env = os.environ.get("PCB_AGENT_MEEP")
+    os.environ["PATH"] = ""
+    os.environ["PCB_AGENT_MEEP"] = os.path.join(_tempfile.gettempdir(),
+                                               "no_such_meep.exe")
+    try:
+        r = handle({"jsonrpc": "2.0", "id": 122, "method": "tools/call",
+                    "params": {"name": "fullwave_solver",
+                               "arguments": {"solver": "meep", "probe": False}}})
+        _fwm = json.loads(r["result"]["content"][0]["text"])
+        check("a named solver that is not installed is SOLVER_NOT_FOUND, never a "
+              "closed-form substitute",
+              _fwm.get("status") == "error"
+              and _fwm.get("reason_code") == "SOLVER_NOT_FOUND"
+              and "meep" in str(_fwm.get("message"))
+              and "not installed" in str(_fwm.get("message")),
+              str(_fwm.get("message")))
+    finally:
+        if _fw_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = _fw_path
+        if _fw_env is None:
+            os.environ.pop("PCB_AGENT_MEEP", None)
+        else:
+            os.environ["PCB_AGENT_MEEP"] = _fw_env
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
