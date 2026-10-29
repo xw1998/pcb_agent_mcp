@@ -269,13 +269,19 @@ class TheFrameLayer(unittest.TestCase):
 
 
 class TheToolsSayWhatTheyCanDo(unittest.TestCase):
-    """The six tools exist, are listed where the model looks first, and the one
-    that can write says so in its own schema."""
+    """The bridge tools exist, are listed where the model looks first, and the one
+    that can write says so in its own schema.
+
+    Seven, not six: `lceda_pro_steps` (the stepped write, so a person can watch
+    and interrupt) joined them after the first real board. It is covered by the
+    same failure-path tests as the rest, and it is NOT verified against a running
+    editor - see docs/26 §26.1.4.
+    """
 
     def test_every_bridge_tool_is_registered_and_listed(self):
         from pcb_agent_mcp import tools as T
         names = [n for n in T.TOOLS if n.startswith("lceda_pro_")]
-        self.assertEqual(len(names), 6, names)
+        self.assertEqual(len(names), 7, names)
         available = T.TOOLS["calc_capabilities"]["handler"]({})["available"]
         for name in names:
             self.assertIn(name, available)

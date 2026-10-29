@@ -9,6 +9,57 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.13] - 2026-10-29
+
+「把不可观察的地方改掉」：一次真按流程画板之后，用户点名两条 —— **过程在 EDA 窗口里看不见、
+没法打断**，以及**立创EDA 里查不到器件就只能瞎编**。同轮自审又挖出四条根因级的坑。全部修复，
+并且每条都变成闸门或测试。
+
+- **分步写（过程可见、可打断、可续跑）**：`plan.steps_apply` / `step_events` / `step_control`，
+  板与原理图共用一套方言；每块重读磁盘、比对 `sha256_before`、只跑这一块的 op、原子写、
+  写快照（`steps/<plan_id>/<seq>.*`）与一行 JSONL；块间查 `steps/STOP`（`STOPPED_BY_USER`，
+  计划不消耗），`resume` 用 `shutil.move` 归档；末块照跑完整闸门，其中一道是**分步结果 vs
+  一次性结果**的等价性。顺手修掉一个只有分步才现形的 bug：原理图 uid 依赖「本次调用里已造
+  多少对象」，`sch_ops.run_all` 现在每个 op 前把 `ed._n` 归零。
+- **器件库与在线检索**（`parts.py` + 6 个 `part_*` 工具）：`lceda-std.elib` 前 16 字节是
+  `SQLite format 3`（461 MB 不是黑箱）：devices 16 828 / components 21 310 / attributes 384 775 /
+  倒排索引；符号与封装几何在 `dataStr`，单位写在 `["CANVAS"]`（3 911 篇 mil、131 篇 mm、
+  2 篇没写 ⇒ 没写的一律拒绝）。在线 `pro.lceda.cn /api/v5/devices/search` 匿名可查
+  （count 1 613 360），但**几何是加密下发**，库外器件回 `geometry: "not_offline"`，
+  **绝不编封装**。
+- **DRC 分级**（`edit/drc_policy.py`）：`BLOCKING_SEVERITIES = {"error"}`，读不到 severity
+  ⇒ fail-closed 阻断；真板 69 条 violation 全是 warning（`text_height` 32 / `silk_over_copper` 21 /
+  `silk_overlap` 14 / `silk_edge_clearance` 2）⇒ blocking 0 / advisory 69。两处 apply 闸门改判
+  `new_blocking_total`，`strict_drc` 一键回到「warning 也算墙」。老测试原先断言「边缘丝印被挡」，
+  改成「默认落地并报 advisory / strict 下回滚」——原断言在真板上等于要求「这块板不可编辑」。
+- **`board_routability`（新工具，`oracle.routability` 重写）**：栅格模型对 0.5 mm 间距的 QFP
+  根本不成立（0.325 mm margin 让每个 pad 的光晕吞邻居，78/180 判死），改成**几何逃逸走廊 +
+  精确距离**，栅格只留作 congestion 且**带网属**（板外不计入分母，这个 bug 曾让 congestion 从
+  0.4153 虚高到 0.7556）。三态判词：`blocked_pads`（连 0.2~0.4 mm 短走廊都出不去）/
+  `bends_needed`（直线不行、拐弯可行）/ `escapes_exist`；失败给 `why_blocked`（谁挡 + 差多少 mm）；
+  已连同网 track/via 的 pad 永不进 blocked。性能靠 `_bucketize` + bbox 间隙下界，真板
+  180 pad / 4 层 14 s → **3.3 s**。真板实测：`bends_needed` / 0 blocked / 1 bend（U4 SOT-23-6 第 5 脚）/
+  `one_way` 11 / congestion F.Cu 0.4153 · In 0.191 · B.Cu 0.195。**不是路由。**
+- **叠层总厚（根因级）**：`create_board` 造 4/6 层板时介电预算除以 `inner + 1` 却只写 `inner` 层，
+  且铜+阻焊按 0.07 mm 低估 ⇒ 声明 1.6 mm 的 4 层板叠层实加 **1.18 mm**，而 KiCad 的 `stats`
+  **只累加 stackup、忽略 `(general (thickness …))`** ⇒ 引擎报 1.18，所有闸门皆绿。修法：
+  n 层铜需要 **n − 1** 层介电，`dielectric_total = thickness − 0.035·n_cu − 0.02`。并变成闸门：
+  `engine_stats` 增 `thickness_stated_mm` / `thickness_engine_mm` / `thickness_agrees`（0.005 mm），
+  不一致即创建失败；读侧 `board_summary` 增 `thickness_from_stackup_mm` / `thickness_agrees`，
+  **不跑 KiCad 也能看见**。真机复验 2/4/6 层 × 0.8/1.2/1.6 mm 全部相符。
+- **铺铜闭环**（`fidelity/fill.py` + `board_zones` / `board_fill_zones`）：没有 `filled_polygon`
+  的 zone 只是轮廓，此后所有连通性答案答的都是轮廓。现在把填充**委派**给 KiCad 自带的
+  `pcbnew.ZONE_FILLER`：默认在**临时副本**上铺并只报结果（谁都不动），`in_place=true` 时把 KiCad
+  产出的 `filled_polygon` 节点**移植**进原文件并先写 checkpoint——不让 `SaveBoard` 把整块板重写成
+  KiCad 10 排版、把 `(version 20221018)` 升成 `(version 20260206)`。`board_apply(fill_zones=true)`
+  把闭环放进写路径，**填不成即失败**，且闸门写死 `drc_rechecked: false`（那次 DRC 发生在铺铜前）
+  与「铺铜是快照」。keepout 由引擎兑现：加一个 10×10 keepout，铺铜面积实测量少 ~100 mm²。
+- 工具数 123 → **126**；`--selftest` 与全量测试见 `docs/26-分步可见与铺铜闭环.md`。
+
+**仍然欠着**：`lceda_pro_steps` 真机未验证（本机非交互会话起不了 `lceda-pro.exe`，
+`APP_NOT_RUNNING`）；在线器件只有元数据没有几何；`board_routability` 不是布线器；铺铜快照
+不会自动重铺；布线器本体仍在 `_scratch/` 脚本里、未收进 `src/`。
+
 ## [0.0.12] - 2026-10-28
 
 「把别人写好的东西抄进来，只抄能变成可复算工具的那部分」：把 8 个指名技能里可机判的内容

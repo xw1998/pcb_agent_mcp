@@ -811,5 +811,86 @@ class TestSchEngineGates(_Tmp):
         self.assertTrue(gates["netlist"]["changed"])
         self.assertEqual(self.read(path), before)
 
+class TestPinGeometry(_Tmp):
+    """A pin is a connection point but it is not a drawing object.
+
+    Its position lives in the library definition and is only mapped onto the
+    sheet by the placed symbol's `at`/`mirror`/rotation. Before `pin_points`
+    existed, a wire drawn from a pin to a label looked like it touched nothing,
+    and every such plan carried a bogus "electrically open" warning. The four
+    frames below are the whole mapping: `sheet = (X + dx, Y - dy)`.
+    """
+
+    def editor(self, text=None, **swap):
+        body = text if text is not None else schematic_text(with_symbol=True)
+        for old, new in swap.items():
+            body = body.replace(old, new)
+        self.path = self.write(body)
+        return SO.SchEditor(KS.KiCadSchematic.from_path(self.path))
+
+    def pins(self, **swap):
+        ed = self.editor(**swap)
+        return dict((number, (round(x, 4), round(y, 4)))
+                    for x, y, ref, number, lib_id in ed.pin_points()
+                    if ref == "R1")
+
+    def test_a_library_pin_lands_on_the_sheet(self):
+        # library pins at (0, 3.81) and (0, -3.81); the symbol is at (76.2, 76.2)
+        # and the sheet's y grows down while the library's grows up
+        self.assertEqual(self.pins(), {"1": (76.2, 72.39), "2": (76.2, 80.01)})
+
+    def test_a_rotated_symbol_moves_its_pins(self):
+        self.assertEqual(self.pins(**{"(at 76.2 76.2 0)": "(at 76.2 76.2 90)"}),
+                         {"1": (72.39, 76.2), "2": (80.01, 76.2)})
+
+    def test_a_180_degree_symbol_moves_its_pins(self):
+        self.assertEqual(self.pins(**{"(at 76.2 76.2 0)": "(at 76.2 76.2 180)"}),
+                         {"1": (76.2, 80.01), "2": (76.2, 72.39)})
+
+    def test_a_mirrored_symbol_moves_its_pins(self):
+        # (mirror x) flips the library's y, which on the sheet is a y flip too
+        self.assertEqual(
+            self.pins(**{"(at 76.2 76.2 0)": "(at 76.2 76.2 0)\n\t\t(mirror x)"}),
+            {"1": (76.2, 80.01), "2": (76.2, 72.39)})
+
+    def test_objects_near_finds_a_pin_and_says_whose_it_is(self):
+        ed = self.editor()
+        hits = ed.objects_near(76.2, 72.39)
+        pins = [h for h in hits if h["kind"] == "pin"]
+        self.assertEqual(len(pins), 1)
+        self.assertEqual((pins[0]["reference"], pins[0]["pin"]), ("R1", "1"))
+        self.assertEqual(pins[0]["lib_id"], "Test:R")
+
+    def test_a_point_with_nothing_on_it_has_no_objects(self):
+        self.assertEqual(self.editor().objects_near(30.0, 90.0), [])
+
+    def test_a_wire_ending_on_a_pin_is_not_called_dangling(self):
+        # two ops in one plan: the second wire's far end only exists once the
+        # first is drawn, which is exactly why the check runs on the finished
+        # tree instead of on the document as it was before the plan.
+        plan = E.propose_schematic(self.path_(), [
+            {"op": "add_wire", "points": [[76.2, 72.39], [63.5, 72.39]]},
+            {"op": "add_wire", "points": [[63.5, 72.39], [63.5, 50.8]]}],
+            {"engine": False})
+        gates = [w["gate"] for w in plan["warnings"]]
+        self.assertNotIn("endpoint_not_attached", gates, plan["warnings"])
+        self.assertEqual(plan["blocking"], [])
+
+    def test_a_floating_wire_is_still_reported(self):
+        # the negative control: without it the test above would pass even if the
+        # check had been deleted
+        plan = E.propose_schematic(self.path_(), [
+            {"op": "add_wire", "points": [[30.0, 90.0], [40.0, 90.0]]}],
+            {"engine": False})
+        gate = [w for w in plan["warnings"] if w["gate"] == "endpoint_not_attached"]
+        self.assertEqual(len(gate), 1, plan["warnings"])
+        self.assertEqual(len(gate[0]["endpoints"]), 2)
+
+    def path_(self):
+        if not getattr(self, "path", None) or not os.path.exists(self.path):
+            self.editor()
+        return self.path
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,7 @@ from ..fidelity import kicad_doc as _kdoc
 from ..fidelity import sexpr as S
 from . import build as B
 from . import checks as _checks
+from . import drc_policy as _drcp
 from . import ops as _ops
 from .fsutil import atomic_write as _atomic_write
 from .fsutil import home, sha256 as _sha256
@@ -188,8 +189,11 @@ def propose(path, operations, options=None):
 
     src = _kdoc.KiCadDocument.from_text(raw.decode("utf-8", "surrogateescape"), path)
     work = _kdoc.KiCadDocument.from_text(src.text, path)      # private copy
-    records = _ops.run_all(work, operations,
-                           seed_base="%s:%d" % (_path_key(path), int(time.time())))
+    # The seed is kept on the plan: generated ids (uuid / tstamp) are a function
+    # of (seed, absolute operation index), so a stepped write can reproduce them
+    # exactly instead of inventing its own and then failing the byte gate.
+    seed_base = "%s:%d" % (_path_key(path), int(time.time()))
+    records = _ops.run_all(work, operations, seed_base=seed_base)
     new_text = work.to_text()
     new_bytes = work.to_bytes()
 
@@ -245,7 +249,7 @@ def propose(path, operations, options=None):
         "plan_id": plan_id, "path": os.path.abspath(path),
         "created": time.time(), "expires": time.time() + PLAN_TTL,
         "sha256_before": _sha256(raw), "bytes_before": len(raw),
-        "operations": operations, "records": records,
+        "operations": operations, "records": records, "seed_base": seed_base,
         "new_text": new_text, "new_bytes": new_bytes,
         "new_signature": S.signature(work.tree),
         "affected": touched,
@@ -297,7 +301,16 @@ def _drc_keys(result):
                      round(pos["y"], 2) if pos else None))
     return keys
 
-def _drc_diff(before, after, limit=10):
+def _drc_diff(before, after, limit=10, strict=False):
+    """What the edit newly broke, split into blocking and advisory.
+
+    All 69 violations the KiCad report produced for the STM32F401 core board were
+    warnings (`text_height`, `silk_overlap`, `silk_over_copper`,
+    `silk_edge_clearance`). Treating them as blocking meant the board could not be
+    edited at all, so the split follows KiCad's own severity - see
+    `drc_policy.py` for the rule and for what a violation with no readable
+    severity does (it blocks).
+    """
     a, b = _drc_keys(before), _drc_keys(after)
     if a is None or b is None:
         return {"comparable": False,
@@ -306,10 +319,18 @@ def _drc_diff(before, after, limit=10):
     ca, cb = collections.Counter(a), collections.Counter(b)
     new = list((cb - ca).elements())
     gone = list((ca - cb).elements())
+    new_items = [{"type": t, "severity": s, "description": d,
+                  "pos": [x, y]} for t, s, d, x, y in new]
+    policy = _drcp.classify(new_items, strict=strict, limit=limit)
     return {"comparable": True,
-            "new": [{"type": t, "severity": s, "description": d,
-                     "pos": [x, y]} for t, s, d, x, y in new[:limit]],
+            "new": new_items[:limit],
             "new_total": len(new),
+            "new_by_severity": policy["by_severity"],
+            "new_blocking_total": policy["blocking_total"],
+            "new_advisory_total": policy["advisory_total"],
+            "new_blocking": policy["blocking"],
+            "new_advisory": policy["advisory"],
+            "policy": policy["policy"],
             "resolved": [{"type": t, "severity": s, "description": d}
                          for t, s, d, x, y in gone[:limit]],
             "resolved_total": len(gone),
@@ -401,9 +422,10 @@ def apply_plan(plan_id, confirm=False, options=None):
                              and (comparable or eng.get("status") == "skipped"))
             drc_before = _engine.drc(before_file)
             drc_after = _engine.drc(target)
-            gates["drc"] = _drc_diff(drc_before, drc_after)
+            gates["drc"] = _drc_diff(drc_before, drc_after,
+                                     strict=bool(options.get("strict_drc")))
             if gates["drc"].get("comparable"):
-                gates["drc"]["ok"] = not gates["drc"].get("new_total")
+                gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")
         else:
             gates["engine"] = {"status": "skipped", "reason_code": "NOT_REQUESTED",
                                "ok": None}
@@ -427,17 +449,49 @@ def apply_plan(plan_id, confirm=False, options=None):
                 blocking.append("the plan only changed metadata but KiCad's plotted "
                                 "artwork changed - that is silent corruption")
         drc = gates.get("drc") or {}
-        if drc.get("comparable") and drc.get("new_total") and \
+        if drc.get("comparable") and drc.get("new_blocking_total") and \
                 not options.get("allow_new_violations"):
-            blocking.append("%d NEW DRC violation(s) appear after this edit (%s); "
+            blocking.append("%d NEW DRC error(s) appear after this edit (%s); "
                             "pass allow_new_violations=true to accept them"
-                            % (drc["new_total"], ", ".join(
-                                sorted({v["type"] for v in drc["new"]})) ))
+                            % (drc["new_blocking_total"], ", ".join(
+                                sorted({v["type"] for v in drc["new_blocking"]})) ))
         plan_outline = _checks.outline_report(re_doc)
         if "outline" in plan["affected"] and not plan_outline["closed"] and \
                 not options.get("allow_open_outline"):
             blocking.append("the outline is still open after this edit: %s"
                             % plan_outline["message"])
+
+        # ---------------- zone fill: the pour is only real after the engine poured it
+        # A zone without filled_polygon is an OUTLINE. Every later question about
+        # the pour (connectivity, Gerber copper, `zone_fill`) would be answered
+        # from that outline, which is exactly the "intermediate layer says one
+        # thing, the board says another" failure. So when the caller asks for the
+        # closure, the engine fills it here - and failing to fill is a failure,
+        # not a footnote.
+        pours = [z for z in re_doc.items("zone") if S.child(z, "keepout") is None]
+        if options.get("fill_zones"):
+            if not pours:
+                gates["zone_fill"] = {"ok": None, "reason": "no copper pour in this edit"}
+            else:
+                from ..fidelity import fill as _fill
+                res = _fill.fill(target, in_place=True)
+                val = res.get("value") or {}
+                gates["zone_fill"] = {
+                    "ok": res.get("status") == "ok",
+                    "reason_code": res.get("reason_code"),
+                    "message": res.get("message"),
+                    "poured_zones": val.get("poured_zones"),
+                    "fill_area_mm2": val.get("fill_area_mm2"),
+                    "poured_nothing": val.get("poured_nothing"),
+                    "checkpoint_id": val.get("checkpoint_id"),
+                    "drc_rechecked": False,
+                    "note": ("the engine poured the zones after the DRC comparison "
+                             "ran, so the DRC above does not describe this copper; "
+                             "call board_drc to judge the poured board"),
+                }
+                if not gates["zone_fill"]["ok"]:
+                    blocking.append("the zones were not filled: %s"
+                                    % (res.get("message") or res.get("reason_code")))
 
         if blocking:
             rollback_reason = "; ".join(blocking)
@@ -445,6 +499,10 @@ def apply_plan(plan_id, confirm=False, options=None):
                             "GATE_BLOCKED", gates=gates, blocking=blocking)
 
         gates["outline_after"] = plan_outline
+        # the bytes on disk are the truth, and a zone fill happens after the plan
+        # was written - so re-read rather than quote a hash from before
+        with open(target, "rb") as _fh:
+            gates["bytes_written"]["sha256"] = _sha256(_fh.read())
         PLANS.pop(plan_id, None)
         return {
             "status": "ok",
@@ -472,6 +530,419 @@ def apply_plan(plan_id, confirm=False, options=None):
             _atomic_write(target, current)
         raise EditError("%s: %s (the checkpoint was restored to disk)"
                         % (type(exc).__name__, exc), "APPLY_FAILED")
+
+# --------------------------------------------------------- stepped apply
+"""Applying a plan one step at a time.
+
+Why this exists: a one-shot apply is atomic and therefore invisible. The file on
+disk jumps from "before" to "after" in one write, so a person watching the EDA
+window sees nothing happen, cannot comment on step 17, and cannot stop it. That
+is fine for a script and wrong for a collaborator.
+
+A step session keeps the same proof obligations, only spread out:
+
+* every chunk is applied to the file *as it is on disk now*, so a step never
+  overwrites an edit someone made in the editor behind our back - if the file
+  changed, the step refuses and says so;
+* every chunk leaves a complete, valid document on disk, so the EDA can be
+  reloaded after any step and shows exactly the work done so far;
+* every chunk writes a snapshot (``steps/<plan_id>/<seq>.<ext>``) and one line of
+  JSONL (``steps/<plan_id>.jsonl``) - the history is on disk, not in a process
+  that can die;
+* a stop file (``steps/STOP``) halts the session between chunks; the plan is not
+  consumed, so it can be resumed;
+* the last chunk still runs the full gates, and one of them compares the stepped
+  result against the *original one-shot plan*, which is what proves "step by
+  step" did not quietly become "something else".
+
+Both KiCad write paths (board and schematic) share this code; the differences
+are the document class, the operation catalogue and the final gates, which come
+in as a dialect.
+"""
+
+STEPS = {}                       # plan_id -> in-memory session (disk is truth)
+
+def steps_root():
+    return os.path.join(home(), "steps")
+
+def stop_file():
+    return os.path.join(steps_root(), "STOP")
+
+def _events_path(plan_id):
+    return os.path.join(steps_root(), plan_id + ".jsonl")
+
+def _snapshot_path(plan_id, seq, ext=".kicad_pcb"):
+    folder = os.path.join(steps_root(), plan_id)
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "%03d%s" % (seq, ext))
+
+def _emit(plan_id, event):
+    event = dict(event)
+    event.setdefault("utc", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    path = _events_path(plan_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return path
+
+def step_events(plan_id=None, limit=200):
+    """Read the on-disk step log. No session needed: it is just a file."""
+    root = steps_root()
+    if plan_id:
+        files = [_events_path(plan_id)]
+    elif os.path.isdir(root):
+        files = sorted((os.path.join(root, n) for n in os.listdir(root)
+                        if n.endswith(".jsonl")), reverse=True)
+    else:
+        files = []
+    out = []
+    for path in files:
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    return {"status": "ok", "root": root, "stop_file": stop_file(),
+            "stopped": os.path.isfile(stop_file()),
+            "total": len(out), "events": out[-limit:]}
+
+def step_control(action="status", note=None):
+    """Stop / resume / inspect. Stopping is one file on disk, so it also works
+    from another process and survives a restart."""
+    root = steps_root()
+    os.makedirs(root, exist_ok=True)
+    path = stop_file()
+    action = (action or "status").lower()
+    if action == "stop":
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%s\n%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                   note or "stopped by the operator"))
+        return {"status": "ok", "action": "stop", "stop_file": path,
+                "meaning": "no further step will be written until it is released"}
+    if action in ("resume", "clear"):
+        # The old stop file is kept, not deleted: a stop is a decision, and a
+        # decision that leaves no trace cannot be reviewed afterwards.
+        archived = None
+        if os.path.isfile(path):
+            archived = os.path.join(
+                root, "stop-released-%s.txt"
+                % time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+            shutil.move(path, archived)
+        return {"status": "ok", "action": "resume", "removed": bool(archived),
+                "archived_to": archived, "stop_file": path,
+                "meaning": "steps may be written again"}
+    return {"status": "ok", "action": "status", "stop_file": path,
+            "stopped": os.path.isfile(path)}
+
+# ------------------------------------------------------------- dialects
+def _dialect(schema):
+    """Everything that differs between the board path and the schematic path."""
+    if schema == "sch":
+        from . import sch_ops
+        from ..fidelity import kicad_sch as _ksch
+        return {"schema": "sch", "loader": _ksch.KiCadSchematic,
+                "ops": sch_ops, "ext": ".kicad_sch",
+                "changed_code": "SCHEMATIC_CHANGED_SINCE_STEP",
+                "kind": "schematic"}
+    return {"schema": "pcb", "loader": _kdoc.KiCadDocument, "ops": _ops,
+            "ext": ".kicad_pcb", "changed_code": "BOARD_CHANGED_SINCE_STEP",
+            "kind": "board"}
+
+def _final_gates_board(plan, target, session, options):
+    gates = {}
+    with open(target, "rb") as fh:
+        back = fh.read()
+    gates["bytes_written"] = {"ok": back == plan["new_bytes"],
+                             "sha256": _sha256(back),
+                             "expected_sha256": _sha256(plan["new_bytes"]),
+                             "bytes": len(back),
+                             "note": "stepped writes must land on the same bytes a "
+                                     "one-shot apply would have produced"}
+    re_doc = _kdoc.KiCadDocument.from_path(target)
+    gates["token_identity"] = {
+        "ok": S.signature(re_doc.tree) == plan["new_signature"],
+        "note": "the stepped result re-parses into exactly the tree the original "
+                "plan described"}
+    post = _ops.verify_all(re_doc, plan["operations"])
+    gates["postconditions"] = dict(post)
+    gates["postconditions"]["ok"] = bool(post.get("all_verified"))
+    blocking = []
+    if not gates["bytes_written"]["ok"]:
+        blocking.append("the bytes on disk are not the bytes the plan described")
+    if not gates["token_identity"]["ok"]:
+        blocking.append("re-parsing the stepped file does not reproduce the plan")
+    if not gates["postconditions"]["all_verified"]:
+        bad = [o for o in gates["postconditions"]["operations"] if not o["verified"]]
+        blocking.append("postcondition check failed for %d operation(s): %s"
+                        % (len(bad), ", ".join(o["op"] for o in bad)))
+    if options.get("engine", True):
+        before_file = find_checkpoint(session["checkpoints"][0])["body"]
+        cmp_which = ["stats", "gerbers"]
+        if "copper" in plan["affected"] or "outline" in plan["affected"]:
+            cmp_which = ["stats", "gerbers", "position"]
+        eng = _engine.compare_paths(before_file, target, which=tuple(cmp_which))
+        comparable = sum(1 for c in (eng.get("checks") or {}).values()
+                         if isinstance(c, dict) and c.get("comparable"))
+        eng["comparable_checks"] = comparable
+        eng["ok"] = bool(eng.get("status") in ("ok", "skipped")
+                         and (comparable or eng.get("status") == "skipped"))
+        gates["engine"] = eng
+        gates["drc"] = _drc_diff(_engine.drc(before_file), _engine.drc(target),
+                                 strict=bool(options.get("strict_drc")))
+        if gates["drc"].get("comparable"):
+            gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")
+        drc = gates["drc"]
+        if drc.get("comparable") and drc.get("new_blocking_total") and \
+                not options.get("allow_new_violations"):
+            blocking.append("%d NEW DRC error(s) after the stepped apply (%s)"
+                            % (drc["new_blocking_total"], ", ".join(
+                                sorted({v["type"] for v in drc["new_blocking"]}))))
+    else:
+        gates["engine"] = {"status": "skipped", "ok": None,
+                           "reason_code": "NOT_REQUESTED"}
+        gates["drc"] = {"comparable": False, "reason": "NOT_REQUESTED"}
+    gates["outline_after"] = _checks.outline_report(re_doc)
+    if not gates["outline_after"]["closed"] and "outline" in plan["affected"] \
+            and not options.get("allow_open_outline"):
+        blocking.append("the outline is still open after this edit: %s"
+                        % gates["outline_after"]["message"])
+    return gates, blocking
+
+def _final_gates_sch(plan, target, session, options):
+    from . import sch_plan as _sp
+    gates = {}
+    with open(target, "rb") as fh:
+        back = fh.read()
+    gates["bytes_written"] = {"ok": back == plan["new_bytes"],
+                             "sha256": _sha256(back),
+                             "expected_sha256": _sha256(plan["new_bytes"]),
+                             "bytes": len(back),
+                             "note": "stepped writes must land on the same bytes a "
+                                     "one-shot apply would have produced"}
+    from ..fidelity import kicad_sch as _ksch
+    re_doc = _ksch.KiCadSchematic.from_path(target)
+    gates["token_identity"] = {
+        "ok": S.signature(re_doc.tree) == plan["new_signature"],
+        "note": "the stepped result re-parses into exactly the tree the original "
+                "plan described"}
+    from . import sch_ops
+    post = sch_ops.verify_all(re_doc, plan["operations"])
+    gates["postconditions"] = dict(post)
+    gates["postconditions"]["ok"] = bool(post.get("all_verified"))
+    blocking = []
+    if not gates["bytes_written"]["ok"]:
+        blocking.append("the bytes on disk are not the bytes the plan described")
+    if not gates["token_identity"]["ok"]:
+        blocking.append("re-parsing the stepped file does not reproduce the plan")
+    if not gates["postconditions"]["ok"]:
+        bad = [o for o in gates["postconditions"]["operations"] if not o["verified"]]
+        blocking.append("postcondition check failed for %d operation(s): %s"
+                        % (len(bad), ", ".join(o["op"] for o in bad)))
+    netlist_diff_out = {"comparable": False, "reason": "NOT_REQUESTED"}
+    erc_diff_out = {"comparable": False, "reason": "NOT_REQUESTED"}
+    if options.get("engine", True):
+        before_file = find_checkpoint(session["checkpoints"][0])["body"]
+        netlist_diff_out = _sp.netlist_diff(_engine.sch_netlist(before_file),
+                                            _engine.sch_netlist(target))
+        erc_diff_out = _sp.erc_diff(_engine.sch_erc(before_file),
+                                     _engine.sch_erc(target))
+        gates["engine"] = {"ok": bool(netlist_diff_out.get("comparable")
+                                      or erc_diff_out.get("comparable")),
+                           "netlist": {"comparable": netlist_diff_out.get("comparable")},
+                           "erc": {"comparable": erc_diff_out.get("comparable")},
+                           "note": "comparable==False is NOT a pass"}
+        connectivity_ops = bool(set(plan["affected"])
+                                & {"wires", "labels", "connectivity"})
+        if netlist_diff_out.get("comparable") and not connectivity_ops \
+                and netlist_diff_out.get("changed"):
+            blocking.append("the plan only touched %s but the NETLIST changed - that "
+                            "is a connectivity change nobody asked for"
+                            % ", ".join(plan["affected"]))
+        if erc_diff_out.get("comparable") and erc_diff_out.get("new_total") \
+                and not options.get("allow_new_violations"):
+            blocking.append("%d NEW ERC violation(s) appear after this edit (%s)"
+                            % (erc_diff_out["new_total"], ", ".join(
+                                sorted({v["type"] for v in erc_diff_out["new"]}))))
+    else:
+        gates["engine"] = {"ok": None, "reason_code": "NOT_REQUESTED"}
+    gates["netlist"] = netlist_diff_out
+    gates["erc"] = erc_diff_out
+    return gates, blocking
+
+def steps_apply(plan_id, registry, schema="pcb", confirm=False, options=None):
+    """Write a plan in chunks, each chunk a complete document on disk."""
+    options = options or {}
+    d = _dialect(schema)
+    plan = registry.get(plan_id)
+    if plan is None:
+        raise EditError("unknown or finished plan %r (a plan is single-use; the step "
+                        "log under steps/ shows what was written)" % plan_id,
+                        "PLAN_NOT_FOUND")
+    if not confirm:
+        raise EditError("writing a %s file is not reversible by Ctrl+Z: call again "
+                        "with confirm=true. This plan affects %s"
+                        % (d["kind"], ", ".join(plan["affected"])),
+                        "CONFIRMATION_REQUIRED", plan_id=plan_id)
+    if os.path.isfile(stop_file()):
+        raise EditError("a stop file is present, so no step was written: %s"
+                        % stop_file(), "STOPPED_BY_USER",
+                        hint="step_control(action='resume') releases it")
+
+    step = max(1, int(options.get("step") or 1))
+    max_chunks = max(1, int(options.get("max_chunks") or 1))
+    mode = (options.get("mode") or plan["options"].get("mode") or "in_place")
+    out_path = options.get("out_path") or plan["options"].get("out_path")
+    if mode == "new_file" and not out_path:
+        raise EditError("mode=new_file needs out_path (a stepped apply needs a target "
+                        "it can rewrite over and over)", "ARG_MISSING")
+    target = plan["path"] if mode == "in_place" else os.path.abspath(out_path)
+    if mode == "new_file" and os.path.exists(target) and plan.get("created_target"):
+        target = target                      # our own earlier chunk
+    elif mode == "new_file" and os.path.exists(target):
+        raise EditError("refusing to overwrite an existing file: %s" % target,
+                        "TARGET_EXISTS")
+
+    session = STEPS.get(plan_id)
+    if session is None:
+        base_file = plan["path"] if mode == "new_file" else target
+        with open(base_file, "rb") as fh:
+            current = fh.read()
+        if mode == "in_place" and _sha256(current) != plan["sha256_before"]:
+            raise EditError("the file changed on disk after the plan was made (someone "
+                            "saved it in the editor?). Nothing was written - propose "
+                            "again", "BOARD_CHANGED_SINCE_PLAN")
+        base_checkpoint = save_checkpoint(
+            base_file, current,
+            "before stepped apply %s (%s)" % (plan_id, ", ".join(plan["affected"])),
+            plan_id=plan_id)
+        session = {"index": 0, "seq": 0,
+                   "checkpoints": [base_checkpoint["checkpoint_id"]],
+                   "target": target, "mode": mode,
+                   "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "sha256": plan["sha256_before"], "events": _events_path(plan_id)}
+        STEPS[plan_id] = session
+        plan["created_target"] = (mode == "new_file")
+        _emit(plan_id, {"kind": "begin", "plan_id": plan_id, "path": plan["path"],
+                        "target": target, "operations": len(plan["operations"]),
+                        "affected": plan["affected"], "schema": d["schema"],
+                        "checkpoint": base_checkpoint["checkpoint_id"]})
+
+    chunks = []
+    total = len(plan["operations"])
+    for _ in range(max_chunks):
+        if session["index"] >= total:
+            break
+        if os.path.isfile(stop_file()):
+            _emit(plan_id, {"kind": "stop", "at": session["index"]})
+            break
+        lo = session["index"]
+        hi = min(lo + step, total)
+        subset = plan["operations"][lo:hi]
+
+        with open(session["target"], "rb") as fh:
+            current = fh.read()
+        if _sha256(current) != session["sha256"]:
+            _emit(plan_id, {"kind": "refused", "at": lo,
+                            "why": "the file changed on disk since the last step"})
+            raise EditError(
+                "the file changed on disk since the last step (saved in the editor?). "
+                "Steps %d-%d were NOT written; %d of %d operations are already on "
+                "disk at sha256 %s" % (lo, hi, lo, total, session["sha256"]),
+                d["changed_code"],
+                hint="board_restore(checkpoint_id=%r) puts the pre-plan file back; "
+                     "otherwise propose again from the current file"
+                     % session["checkpoints"][0])
+
+        loader = d["loader"]
+        src = loader.from_text(current.decode("utf-8", "surrogateescape"),
+                               session["target"])
+        work = loader.from_text(src.text, session["target"])
+        records = d["ops"].run_all(work, subset, seed_base=plan["seed_base"],
+                                   index_offset=lo)
+        new_bytes = work.to_bytes()
+        self_check = work.verify()
+        if not self_check.get("token_identity"):
+            _emit(plan_id, {"kind": "refused", "at": lo, "why": "self_check"})
+            raise EditError("step %d-%d does not survive a serialise/parse round trip; "
+                            "nothing was written" % (lo, hi), "GENERATOR_BUG")
+
+        _atomic_write(session["target"], new_bytes)
+        seq = session["seq"] + 1
+        snap = _snapshot_path(plan_id, seq, d["ext"])
+        with open(snap, "wb") as fh:
+            fh.write(new_bytes)
+
+        re_doc = loader.from_path(session["target"])
+        post = d["ops"].verify_all(re_doc, subset)
+        session["index"] = hi
+        session["seq"] = seq
+        session["sha256"] = _sha256(new_bytes)
+        chunk = {"seq": seq, "first": lo, "last": hi - 1,
+                 "ops": [r.get("op") for r in records],
+                 "sha256": session["sha256"], "bytes": len(new_bytes),
+                 "verified": bool(post.get("all_verified")),
+                 "detail": [o for o in post.get("operations", []) if not o.get("verified")],
+                 "snapshot": snap}
+        chunks.append(chunk)
+        _emit(plan_id, dict(chunk, kind="step", target=session["target"]))
+        if not chunk["verified"]:
+            raise EditError("step %d-%d wrote but its own postconditions do not hold "
+                            "(%s); the snapshot is at %s"
+                            % (lo, hi, json.dumps(chunk["detail"])[:400], snap),
+                            "STEP_VERIFY_FAILED", steps=chunks,
+                            session=_session_out(plan_id, session, plan))
+
+    done = session["index"] >= total
+    result = {"status": "ok", "plan_id": plan_id, "target": session["target"],
+              "kind": d["kind"], "steps_written": chunks,
+              "operations_done": session["index"], "operations_total": total,
+              "done": done, "sha256": session["sha256"],
+              "checkpoint_before_all_steps": session["checkpoints"][0],
+              "events": session["events"],
+              "seeing_it": "each step left a complete file on disk; reload it in the "
+                           "EDA to look at exactly the work done so far",
+              "stopping_it": "board_progress(action='stop') stops between steps; "
+                             "action='resume' lets it go on"}
+    if not done:
+        result["next"] = ("board_apply(plan_id=%r, confirm=true, options={'step': %d}) "
+                          "writes the next %d operation(s)"
+                          % (plan_id, step, min(step, total - session["index"])))
+        return result
+
+    gates, blocking = (_final_gates_sch if schema == "sch" else _final_gates_board)(
+        plan, session["target"], session, options)
+    result["gates"] = gates
+    result["decision"] = ("every step verified itself, and the finished file passes the "
+                          "same gates a one-shot apply would have faced")
+    result["how_to_undo"] = "board_restore(checkpoint_id=%r, confirm=true)" \
+                            % session["checkpoints"][0]
+    if blocking:
+        _emit(plan_id, {"kind": "gate_blocked", "blocking": blocking})
+        raise EditError("stepped apply finished but a gate blocked it: %s (the file is "
+                        "left as written; board_restore puts the pre-plan file back)"
+                        % "; ".join(blocking), "GATE_BLOCKED", gates=gates,
+                        blocking=blocking, steps=chunks)
+    registry.pop(plan_id, None)
+    STEPS.pop(plan_id, None)
+    _emit(plan_id, {"kind": "done", "sha256": session["sha256"],
+                    "steps": len(chunks)})
+    return result
+
+def _session_out(plan_id, session, plan):
+    return {"plan_id": plan_id, "operations_done": session["index"],
+            "operations_total": len(plan["operations"]),
+            "sha256": session["sha256"], "target": session["target"],
+            "events": session["events"]}
+
+def apply_steps(plan_id, confirm=False, options=None):
+    """Stepped write for the KiCad board path."""
+    return steps_apply(plan_id, PLANS, "pcb", confirm=confirm, options=options)
 
 # --------------------------------------------------------------- create
 def create_board(path, spec):
@@ -510,13 +981,27 @@ def create_board(path, spec):
             gates["engine_drc"] = {"ok": None, "reason": "NOT_REQUESTED"}
         elif _engine.find_kicad_cli():
             st = _engine.stats(target)
+            stated = _stated_thickness(re_doc)
+            measured = _engine_mm((st.get("board") or {}).get("board_thickness"))
+            agree = (None if stated is None or measured is None
+                     else abs(stated - measured) <= 0.005)
             gates["engine_stats"] = {
                 "ok": bool(st.get("status") == "ok" and
                            (st.get("board") or {}).get("has_outline")),
                 "has_outline": (st.get("board") or {}).get("has_outline"),
                 "width": (st.get("board") or {}).get("width"),
                 "height": (st.get("board") or {}).get("height"),
+                # Intent vs measurement: KiCad sums the STACKUP and ignores
+                # `(general (thickness ...))`, so a file can state 1.6 mm and
+                # measure 1.18 mm. This board said 1.6 and measured 1.18 for as
+                # long as `create_board` divided the dielectrics wrongly, and
+                # nothing in the gates noticed. Now it is a gate.
+                "thickness_stated_mm": stated,
+                "thickness_engine_mm": measured,
+                "thickness_agrees": agree,
                 "engine": st.get("engine")}
+            if agree is False:
+                gates["engine_stats"]["ok"] = False
             drc = _engine.drc(target)
             gates["engine_drc"] = {
                 "ok": bool(drc.get("status") == "ok" and not drc.get("violations_total")),
@@ -543,6 +1028,45 @@ def create_board(path, spec):
             "next": ("board_propose(path=%r, operations=[...]) to put something on it"
                      % target),
             "note": "no checkpoint exists because there was no previous file to lose"}
+
+def _engine_mm(value):
+    """`"1.1800 mm"` -> 1.18; anything else -> None (never a guess)."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip().split()[0])
+    except (ValueError, IndexError):
+        return None
+
+def _board_node(doc):
+    """The `(kicad_pcb ...)` node. `doc.tree` is a Seq holding that ONE node."""
+    for item in doc.tree.items:
+        if S.head(item) == "kicad_pcb":
+            return item
+    return doc.tree
+
+def _stated_thickness(doc):
+    """The thickness the file STATES: `general.thickness`, else the stackup sum."""
+    root = _board_node(doc)
+    general = S.child(root, "general")
+    if general is not None:
+        th = S.child(general, "thickness")
+        t = S.arg_num(th, 1) if th is not None else None
+        if t:
+            return float(t)
+    setup = S.child(root, "setup")
+    stack = S.child(setup, "stackup") if setup is not None else None
+    if stack is None:
+        return None
+    total = 0.0
+    seen = False
+    for layer in S.children(stack, "layer"):
+        th = S.child(layer, "thickness")
+        v = S.arg_num(th, 1) if th is not None else None
+        if v:
+            total += float(v)
+            seen = True
+    return round(total, 4) if seen else None
 
 def _build_board_text(spec):
     """The smallest board that is a real board: outline, layers, rules."""
@@ -592,25 +1116,35 @@ def _build_board_text(spec):
              B.L(B.A("layer"), B.A("F.Cu", True), B.L(B.A("type"), B.A("copper", True)),
                  B.L(B.A("thickness"), B.A("0.035")))]
     inner = max(0, copper_layers - 2)
-    if inner:
-        each = max((thickness - 0.07) / (inner + 1), 0.05)
-        for i in range(1, inner + 1):
-            stack.append(B.L(B.A("layer"), B.A("dielectric %d" % i, True),
-                             B.L(B.A("type"), B.A("core", True)),
-                             B.L(B.A("thickness"), B.A(B.num(each))),
-                             B.L(B.A("material"), B.A("FR4", True)),
-                             B.L(B.A("epsilon_r"), B.A("4.3")),
-                             B.L(B.A("loss_tangent"), B.A("0.02"))))
-            stack.append(B.L(B.A("layer"), B.A("In%d.Cu" % i, True),
-                             B.L(B.A("type"), B.A("copper", True)),
-                             B.L(B.A("thickness"), B.A("0.035"))))
-    else:
-        stack.append(B.L(B.A("layer"), B.A("dielectric 1", True),
-                         B.L(B.A("type"), B.A("core", True)),
-                         B.L(B.A("thickness"), B.A(B.num(max(thickness - 0.07, 0.1)))),
-                         B.L(B.A("material"), B.A("FR4", True)),
-                         B.L(B.A("epsilon_r"), B.A("4.3")),
-                         B.L(B.A("loss_tangent"), B.A("0.02"))))
+    # The stackup has to ADD UP to the thickness in `(general (thickness ...))`,
+    # because that is the number KiCad's own statistics report: it sums the
+    # stackup and ignores `general`. Two things used to be wrong here: the
+    # copper+mask budget was under-counted (0.07 mm for a 4-layer board) and the
+    # dielectric budget was divided by `inner + 1` while only `inner` dielectrics
+    # were written - so a declared 1.6 mm four-layer board read back as 1.18 mm.
+    # A physical stack has ONE dielectric BETWEEN each pair of copper layers, so
+    # n copper layers need n-1 dielectrics; write exactly that and split the
+    # budget over it.
+    copper = 0.035 * copper_layers
+    masks = 0.02
+    n_dielectric = max(1, copper_layers - 1)
+    dielectric_total = max(thickness - copper - masks, 0.1)
+    each = max(dielectric_total / n_dielectric, 0.05)
+
+    def _dielectric(i):
+        return B.L(B.A("layer"), B.A("dielectric %d" % i, True),
+                   B.L(B.A("type"), B.A("core", True)),
+                   B.L(B.A("thickness"), B.A(B.num(each))),
+                   B.L(B.A("material"), B.A("FR4", True)),
+                   B.L(B.A("epsilon_r"), B.A("4.3")),
+                   B.L(B.A("loss_tangent"), B.A("0.02")))
+
+    for i in range(1, inner + 1):
+        stack.append(_dielectric(i))
+        stack.append(B.L(B.A("layer"), B.A("In%d.Cu" % i, True),
+                         B.L(B.A("type"), B.A("copper", True)),
+                         B.L(B.A("thickness"), B.A("0.035"))))
+    stack.append(_dielectric(inner + 1))   # the one before B.Cu
     stack.append(B.L(B.A("layer"), B.A("B.Cu", True), B.L(B.A("type"), B.A("copper", True)),
                      B.L(B.A("thickness"), B.A("0.035"))))
     stack.append(B.L(B.A("layer"), B.A("B.Mask", True),

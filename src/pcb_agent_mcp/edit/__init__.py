@@ -34,20 +34,25 @@ from . import sch_plan
 
 from .ops import OpError
 from .plan import EditError
+from .plan import apply_steps
 from .plan import checkpoint_root
 from .plan import create_board
 from .plan import find_checkpoint
 from .plan import list_checkpoints
 from .plan import restore_checkpoint
 from .plan import save_checkpoint
+from .plan import step_control
+from .plan import step_events
+from .plan import steps_root
 
 __all__ = [
     "build", "checks", "epro_edit", "fsutil", "ops", "plan", "sch_ops", "sch_plan",
     "EditError", "OpError", "detect_format",
-    "apply_plan", "checkpoint_root", "create_board", "describe_ops",
+    "apply_plan", "apply_steps", "checkpoint_root", "create_board", "describe_ops",
     "describe_epro_ops", "describe_sch_ops", "find_checkpoint",
     "list_checkpoints", "propose", "propose_schematic", "restore_checkpoint",
     "save_checkpoint", "schematic_summary", "schematic_view",
+    "step_control", "step_events", "steps_root",
 ]
 
 
@@ -118,11 +123,31 @@ def apply_plan(plan_id, confirm=False, options=None):
 
     A plan is single-use and names its own format, so the caller never has to
     remember which write path produced the id.
+
+    ``options={"step": N}`` switches to the stepped write: N operations per call,
+    each one leaving a complete board file on disk so the change can be watched
+    in the EDA and stopped between steps (see ``plan.apply_steps``).
     """
+    options = options or {}
     record = plan.PLANS.get(plan_id) or {}
     fmt = record.get("format")
+    stepped = options.get("step") is not None
     if fmt == "epro":
+        if stepped:
+            # Refuse instead of silently falling back to the one-shot write: the
+            # caller asked to watch the change, and a .epro is a record stream whose
+            # per-record write was never verified. In-app stepping goes through
+            # lceda_pro_run, where each snippet is a visible action.
+            raise EditError(
+                "a stepped apply is not implemented for .epro files (its record "
+                "stream has no verified per-record write). Nothing was written; "
+                "call board_apply without options.step, or drive the open document "
+                "step by step with lceda_pro_run", "STEP_NOT_SUPPORTED")
         return epro_edit.apply_plan(plan_id, confirm=confirm, options=options)
     if fmt == "kicad_sch":
+        if stepped:
+            return sch_plan.apply_steps(plan_id, confirm=confirm, options=options)
         return sch_plan.apply_plan(plan_id, confirm=confirm, options=options)
+    if stepped:
+        return apply_steps(plan_id, confirm=confirm, options=options)
     return plan.apply_plan(plan_id, confirm=confirm, options=options)

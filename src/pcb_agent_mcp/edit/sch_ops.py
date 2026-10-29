@@ -120,10 +120,59 @@ class SchEditor(object):
                 best = max(best, int(ref[len(prefix):]))
         return "%s%d" % (prefix, best + 1)
 
+    def pin_points(self):
+        """Absolute sheet position of every pin of every placed symbol.
+
+        `[(x, y, reference, number, lib_id)]`. Needed by `objects_near`: a pin
+        is a connection point but it is not a drawing object - its position
+        lives in the library definition (`(pin ... (at x y angle))`, y up) and
+        is only mapped onto the sheet by the placed symbol's `at`/`mirror`.
+        Without this every wire drawn from a pin to a label looks like it
+        touches nothing.
+
+        The mapping is `sheet = (X + dx, Y - dy)` with the library's +y flipped
+        to the sheet's -y, after the mirror and the rotation have been applied
+        inside the library frame. KiCad only places symbols at 90-degree steps,
+        so anything else is reported as unrotated rather than guessed.
+        """
+        out = []
+        for node in self.doc.items("symbol"):
+            entry = self.doc.symbol_entry(node)
+            definition = self.doc.lib_symbol(entry["lib_id"])
+            if definition is None or entry["x"] is None or entry["y"] is None:
+                continue
+            rot = int(round(entry["rotation"] or 0)) % 360
+            mirror = entry["mirror"]
+            for pin in _all_children(definition, "pin"):
+                at = S.child(pin, "at")
+                px, py = S.arg_num(at, 1), S.arg_num(at, 2)
+                if px is None or py is None:
+                    continue
+                if mirror == "x":
+                    py = -py
+                elif mirror == "y":
+                    px = -px
+                if rot == 90:
+                    px, py = -py, px
+                elif rot == 180:
+                    px, py = -px, -py
+                elif rot == 270:
+                    px, py = py, -px
+                number = S.arg_text(S.child(pin, "number"), 1)
+                out.append((entry["x"] + px, entry["y"] - py,
+                            entry["reference"], number, entry["lib_id"]))
+        return out
+
     def objects_near(self, x, y, tol=1e-3, kinds=None):
-        """Every drawing object whose `at`/endpoint is at (x, y). Used to catch
-        'the wire you asked for is not attached to anything' before writing."""
+        """Every drawing object whose `at`/endpoint is at (x, y), plus every
+        symbol pin sitting there. Used to catch 'the wire you asked for is not
+        attached to anything' before writing."""
         hits = []
+        if not kinds or "pin" in kinds:
+            for px, py, ref, number, lib_id in self.pin_points():
+                if abs(px - x) <= tol and abs(py - y) <= tol:
+                    hits.append({"kind": "pin", "uuid": None, "reference": ref,
+                                 "pin": number, "lib_id": lib_id})
         for item in self.root.items[1:]:
             h = S.head(item)
             if h is None or (kinds and h not in kinds):
@@ -143,6 +192,16 @@ class SchEditor(object):
                     hits.append({"kind": h, "uuid": _id(item)})
                     break
         return hits
+
+def _all_children(node, head):
+    """Descendant `(head ...)` nodes at any depth (library symbols nest their
+    bodies as `(symbol "NAME_0_1" ... (pin ...))`)."""
+    out = []
+    for child in S.children(node, head):
+        out.append(child)
+    for sub in S.children(node, "symbol"):
+        out.extend(_all_children(sub, head))
+    return out
 
 def _id(node):
     for name in ("uuid", "tstamp"):
@@ -1078,13 +1137,22 @@ def validate(o):
                       % (name, ", ".join(sorted(OPS))), "OP_UNKNOWN")
     return name
 
-def run_all(doc, ops, seed_base="schop"):
-    """Run every operation on a private copy. All-or-nothing, like the board path."""
+def run_all(doc, ops, seed_base="schop", index_offset=0):
+    """Run every operation on a private copy. All-or-nothing, like the board path.
+
+    ``index_offset`` keeps the generated ids a function of (seed_base, absolute
+    operation index), so a stepped write reproduces a one-shot write exactly.
+    """
     ed = SchEditor(doc)
     records = []
     for idx, o in enumerate(ops):
         name = validate(o)
-        ed.seed = "%s:%d" % (seed_base, idx)
+        ed.seed = "%s:%d" % (seed_base, idx + index_offset)
+        # The per-object counter has to restart with the seed, otherwise an
+        # id depends on how many objects earlier operations made in the same
+        # call - and a stepped write (one operation per call) would then
+        # produce different uuids than the one-shot apply it must equal.
+        ed._n = 0
         try:
             detail = OPS[name]["run"](ed, o, ed.seed) or {}
         except OpError as exc:

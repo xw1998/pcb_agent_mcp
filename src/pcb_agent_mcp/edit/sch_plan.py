@@ -286,9 +286,10 @@ def propose(path, operations, options=None):
     src = _ksch.KiCadSchematic.from_text(
         raw.decode("utf-8", "surrogateescape"), path)
     work = _ksch.KiCadSchematic.from_text(src.text, path)     # private copy
-    records = _ops.run_all(work, operations,
-                           seed_base="sch:%s:%d" % (_plan._path_key(path),
-                                                    int(time.time())))
+    # the seed travels with the plan so a stepped write can reproduce every
+    # generated id instead of inventing its own (see _plan.steps_apply)
+    seed_base = "sch:%s:%d" % (_plan._path_key(path), int(time.time()))
+    records = _ops.run_all(work, operations, seed_base=seed_base)
     new_text = work.to_text()
     new_bytes = work.to_bytes()
     self_check = work.verify()
@@ -308,11 +309,19 @@ def propose(path, operations, options=None):
                                     (len(outside), (work.paper() or {}).get("size")),
                          "objects": outside[:8]})
 
+    # An operation is judged when it runs, so a stub drawn before the label that
+    # will land on its far end looks danging at that moment. Re-check every
+    # flagged point against the FINISHED tree: two or more objects there (the
+    # object itself plus something else) means it is attached after all.
+    finisher = _ops.SchEditor(work)
     dangling = []
     for rec in records:
         for ep in (rec.get("detail") or {}).get("endpoints_unattached") or []:
+            pt = ep["point"]
+            if len(finisher.objects_near(pt[0], pt[1])) >= 2:
+                continue
             dangling.append({"op_index": rec["index"], "op": rec["op"],
-                             "point": ep["point"]})
+                             "point": pt})
     if dangling:
         warnings.append({"gate": "endpoint_not_attached",
                          "message": "%d wire/label endpoint(s) touch nothing else on "
@@ -340,7 +349,7 @@ def propose(path, operations, options=None):
         "plan_id": plan_id, "format": "kicad_sch", "path": os.path.abspath(path),
         "created": time.time(), "expires": time.time() + PLAN_TTL,
         "sha256_before": _sha256(raw), "bytes_before": len(raw),
-        "operations": operations, "records": records,
+        "operations": operations, "records": records, "seed_base": seed_base,
         "new_text": new_text, "new_bytes": new_bytes,
         "new_signature": S.signature(work.tree),
         "affected": touched,
@@ -583,6 +592,16 @@ def apply_plan(plan_id, confirm=False, options=None):
             _atomic_write(target, current)
         raise EditError("%s: %s (the checkpoint was restored to disk)"
                         % (type(exc).__name__, exc), "APPLY_FAILED")
+
+# --------------------------------------------------------- stepped apply
+def apply_steps(plan_id, confirm=False, options=None):
+    """Write the schematic plan in chunks, each chunk a complete file on disk.
+
+    Same contract as the board path: watch it in EDA, stop it between steps with
+    board_progress, and the finished file still has to pass the same gates.
+    """
+    return _plan.steps_apply(plan_id, PLANS, "sch", confirm=confirm,
+                             options=options)
 
 # --------------------------------------------------------------- view
 def view(path, kind="summary", limit=200):

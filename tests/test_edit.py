@@ -408,14 +408,35 @@ class TestCheckpoints(EditTestBase):
 
 @unittest.skipUnless(ENGINE.find_kicad_cli(), "kicad-cli not installed")
 class TestEngineGate(EditTestBase):
-    def test_engine_gate_really_compares_and_catches_edge_silk(self):
-        """KiCad's own DRC must block silk that touches the board edge."""
+    def test_engine_gate_sees_edge_silk_as_an_advisory_not_a_wall(self):
+        """KiCad's own DRC must SEE the edge silk - and grade it honestly.
+
+        `silk_edge_clearance` is a WARNING in KiCad's report, so since DRC grading
+        (`edit/drc_policy.py`) it is advisory: the edit lands and the violation is
+        reported. The old shape of this test demanded a hard block, but a real
+        board produced 69 warnings and 0 errors, so blocking on warnings made the
+        board uneditable - being unable to edit is not a safety property.
+        """
+        prop = E.propose(self.board, [{"op": "add_board_text", "text": "EDGE",
+                                       "x": 4, "y": 39.6, "layer": "F.SilkS",
+                                       "height": 1.6, "thickness": 0.16}])
+        r = E.apply_plan(prop["plan_id"], confirm=True)
+        drc = r["gates"]["drc"]
+        self.assertTrue(drc["comparable"], drc)
+        self.assertGreaterEqual(drc["new_total"], 1, drc)
+        self.assertEqual(drc["new_blocking_total"], 0, drc)
+        self.assertGreaterEqual(drc["new_advisory_total"], 1, drc)
+        self.assertIn("warning", drc["new_by_severity"])
+
+    def test_strict_drc_turns_that_advisory_into_a_block(self):
+        """The teeth are still there, one switch away."""
         prop = E.propose(self.board, [{"op": "add_board_text", "text": "EDGE",
                                        "x": 4, "y": 39.6, "layer": "F.SilkS",
                                        "height": 1.6, "thickness": 0.16}])
         before = self.read()
         with self.assertRaises(E.EditError) as ctx:
-            E.apply_plan(prop["plan_id"], confirm=True)
+            E.apply_plan(prop["plan_id"], confirm=True,
+                         options={"strict_drc": True})
         self.assertEqual(ctx.exception.code, "GATE_BLOCKED")
         blocking = " ".join(ctx.exception.extra["blocking"])
         self.assertIn("DRC", blocking)

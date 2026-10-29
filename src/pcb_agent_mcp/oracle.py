@@ -217,8 +217,30 @@ def _bucketize(items, cell, pad=0.0):
 
 
 # ------------------------------------------------------------------- queries
+def _stackup_total_mm(board):
+    """Sum of the declared layers, or None when no layer declares a thickness.
+
+    KiCad's own `stats` sums the stackup and ignores `(general (thickness ...))`,
+    so these two numbers disagreeing is not cosmetic: the finished board is the
+    stackup total. A file that says 1.6 and sums to 1.18 was written by us for
+    as long as `create_board` divided the dielectrics wrongly, and no gate saw it.
+    """
+    total = 0.0
+    seen = False
+    for layer in board.stackup or []:
+        v = layer.get("thickness_mm")
+        if isinstance(v, (int, float)) and v > 0:
+            total += float(v)
+            seen = True
+    return round(total, 4) if seen else None
+
+
 def summary(board):
     data = board.as_dict(items=False)
+    stackup_mm = _stackup_total_mm(board)
+    stated = board.thickness_mm
+    agrees = (None if stated is None or stackup_mm is None
+              else abs(float(stated) - stackup_mm) <= 0.005)
     return ok(
         value=data["counts"],
         unit="counts",
@@ -226,13 +248,17 @@ def summary(board):
         basis="counts and presence flags read directly from the parsed "
               "canonical model (no estimation)",
         precision="exact for counts; outline bbox is the bounding box of the "
-                  "outline vertices, not the copper extents",
+                  "outline vertices, not the copper extents; thickness_agrees "
+                  "compares the stated finished thickness with the stackup sum "
+                  "(the stackup sum is what a fab builds)",
         assumptions={"format": board.source.get("format"),
                      "path": board.source.get("path")},
         extra={
             "source": board.source,
             "outline_bbox": data["outline_bbox"],
             "thickness_mm": board.thickness_mm,
+            "thickness_from_stackup_mm": stackup_mm,
+            "thickness_agrees": agrees,
             "stackup": board.stackup,
             "present": board.present,
             "absent": board.absent,
@@ -568,6 +594,457 @@ def _free_rects(blocked, rows, cols, x0, y0, step):
                 "area_mm2": round(width_mm * height_mm, 2),
             })
     return out
+
+
+def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None,
+                escape_mm=1.5, worst=20):
+    """Can each pad get out of its own courtyard, and how crowded is the layer?
+
+    This is NOT a router and does not claim a net is routable. It answers the two
+    questions that decide whether spending ten minutes routing is worth it:
+
+    * **escape**: from each pad, is there at least one direction in which a track of
+      `track_mm` could leave the pad (for `escape_mm` measured from the pad's edge)
+      while keeping `clearance_mm` from every other net's copper, every keepout and
+      the board edge? A pad with ZERO escape directions is a hard blocker - no
+      router, no autorouter and no amount of patience can connect it, and that is
+      what a person wants to know before watching a router fail. A pad that a track
+      or via of its OWN net already touches is not a blocker: it is connected.
+    * **congestion**: what fraction of the layer's usable area is already copper,
+      measured on a raster grid (`grid_mm`).
+
+    The escape test is geometric, not rasterised, because the raster lied: a
+    0.5 mm-pitch QFP pad cannot be rasterised at 0.2 mm with a 0.325 mm clearance
+    margin without every pad's halo swallowing its neighbours, and the first run
+    reported 78 of 180 pads as unconnectable on a board where each of those pads
+    has a clear lane straight out of the package.
+    """
+    step = float(grid_mm)
+    if step <= 0:
+        return err("grid_mm must be > 0", "ARG_RANGE")
+    rules = board.rules or {}
+    # The rules live in net classes, not in one global number: a board that assigns
+    # USB_DIFF 0.2032 mm and Default 0.2 mm must not be measured with whichever of
+    # the two happened to be read first.
+    classes = dict((k, v) for k, v in (rules.get("net_classes") or {}).items()
+                   if isinstance(v, dict))
+    clr_by_net, tw_by_net = {}, {}
+    for name, spec in classes.items():
+        c = spec.get("clearance")
+        w = spec.get("track_width")
+        if w is None:
+            w = spec.get("trace_width")
+        for net in spec.get("nets") or []:
+            if c is not None:
+                clr_by_net[net] = float(c)
+            if w is not None:
+                tw_by_net[net] = float(w)
+    default_cls = classes.get("Default") or {}
+    rule_clr = default_cls.get("clearance")
+    if rule_clr is None and clr_by_net:
+        rule_clr = min(clr_by_net.values())
+    rule_tw = default_cls.get("track_width") or default_cls.get("trace_width")
+    if rule_tw is None and tw_by_net:
+        rule_tw = min(tw_by_net.values())
+    floor = (rules.get("clearance") or {}).get("min_clearance")
+    floor = float(floor) if floor else None
+    clr = float(clearance_mm) if clearance_mm is not None else float(rule_clr or 0.2)
+    tw = float(track_mm) if track_mm is not None else float(rule_tw or 0.25)
+    if floor is not None and clearance_mm is None:
+        clr = max(clr, floor)
+    rule_clr_source = ("caller" if clearance_mm is not None
+                       else "net class Default" if default_cls.get("clearance")
+                       is not None else "net class (loosest)" if clr_by_net
+                       else "nothing in the file, 0.2 mm assumed")
+    rule_tw_source = ("caller" if track_mm is not None
+                      else "net class Default"
+                      if rule_tw is not None else "nothing in the file, 0.25 mm assumed")
+    escape = float(escape_mm)
+    if escape <= 0:
+        return err("escape_mm must be > 0", "ARG_RANGE")
+    short_escape = max(0.2, min(0.4, escape / 2.0))
+
+    layers = [layer] if layer else [l for l in _copper_layers(board)]
+    for name in layers:
+        if name not in _copper_layers(board):
+            return err("no such copper layer: %r (board has %s)"
+                       % (name, ", ".join(_copper_layers(board))), "ARG_INVALID")
+
+    # Copper of other nets, bucketed per layer. Graphics with no net are skipped:
+    # a clearance figure cannot be attributed to them, so pretending they block
+    # would invent an obstacle.
+    items_by_layer, iboxes, buckets = {}, {}, {}
+    cell = max(1.0, escape + tw + 1.0)
+    for name in layers:
+        items = [it for it in _items(board, layer=name) if it.get("net")]
+        items_by_layer[name] = items
+        iboxes[name] = [_item_bbox(it) for it in items]
+        buckets[name] = _bucketize(items, cell, pad=escape + tw + 1.0)
+
+    # Keep the RINGS, do not flatten them: `point_in_polygon` wants a ring, and a
+    # flattened point list made every corridor land outside the board.
+    outline = None
+    if board.outline:
+        rings = [poly for poly in board.outline if len(poly) >= 3]
+        outline = rings or None
+
+    keepouts_by_layer = {}
+    for z in board.zones or []:
+        if not z.get("is_keepout"):
+            continue
+        for name in (z.get("layers") or []):
+            keepouts_by_layer.setdefault(name, []).append(z.get("outline") or [])
+
+    # Which pads already HAVE copper leaving them. A pad that a track or via of its
+    # own net already touches is connected whatever the free space looks like, and
+    # reporting it as "no router can connect it" would be a false alarm.
+    by_net = {}
+    for tr in board.tracks:
+        pts = tr.get("_points") or [tr.get("start"), tr.get("end")]
+        for i in range(len(pts) - 1):
+            by_net.setdefault(tr.get("net"), {"tracks": [], "vias": []})["tracks"] \
+                .append((tuple(pts[i]), tuple(pts[i + 1]),
+                         float(tr.get("width") or 0.0)))
+    for via in board.vias:
+        dia = via.get("diameter") or via.get("drill") or 0.4
+        by_net.setdefault(via.get("net"), {"tracks": [], "vias": []})["vias"] \
+            .append((float(via["x"]), float(via["y"]), float(dia)))
+
+    def _touches(pad_net, x, y, half):
+        own = by_net.get(pad_net)
+        if not own:
+            return False
+        for (x1, y1), (x2, y2), w in own["tracks"]:
+            if G.dist_point_segment((x, y), (x1, y1), (x2, y2)) <= half + w / 2.0 + 0.06:
+                return True
+        for vx, vy, dia in own["vias"]:
+            if math.hypot(vx - x, vy - y) <= half + dia / 2.0 + 0.06:
+                return True
+        return False
+
+    dirs = [(1, 0), (-1, 0), (0, 1), (0, -1),
+            (0.7071, 0.7071), (-0.7071, 0.7071),
+            (0.7071, -0.7071), (-0.7071, -0.7071)]
+
+    def _lane_blocked(name, x, y, dx, dy, half, net, pad_clr, esc=None):
+        """Is the straight lane out of this pad in this direction illegal?
+
+        Returns `(blocked, why)`, where `why` names the obstacle and how much
+        clearance is missing - "it does not fit" is useless next to "it is 0.13 mm
+        short of C4 on B's clearance".
+        """
+        esc = escape if esc is None else esc
+        end = (x + dx * (half + esc), y + dy * (half + esc))
+        lane = {"seg": ((x, y), end, tw)}
+        slack = pad_clr + tw / 2.0 + 0.05
+        bx = _item_bbox(lane)
+        cand = set()
+        for gx in range(int(math.floor((bx[0] - slack) / cell)),
+                        int(math.floor((bx[2] + slack) / cell)) + 1):
+            for gy in range(int(math.floor((bx[1] - slack) / cell)),
+                            int(math.floor((bx[3] + slack) / cell)) + 1):
+                got = buckets[name].get((gx, gy))
+                if got:
+                    cand.update(got)
+        lx0, ly0, lx1, ly1 = bx
+        worst = None
+        for idx in cand:
+            it = items_by_layer[name][idx]
+            if it.get("net") == net:
+                continue                     # its own copper never blocks it
+            ib = iboxes[name][idx]
+            # A bounding-box gap is a LOWER bound on the real distance, so a lane
+            # whose boxes are far enough apart cannot be too close. Without this
+            # the exact polygon/segment distance ran on every item in the bucket
+            # and a 180-pad board took 14 s for an answer nobody reads that fast.
+            gap_x = max(0.0, ib[0] - lx1, lx0 - ib[2])
+            gap_y = max(0.0, ib[1] - ly1, ly0 - ib[3])
+            if math.hypot(gap_x, gap_y) >= pad_clr:
+                continue
+            d = _dist(lane, it)
+            if d >= pad_clr - 1e-9:
+                continue
+            info = {"layer": name, "net": it.get("net"), "kind": it.get("kind"),
+                    "reference": it.get("ref"),
+                    "needs_mm": round(pad_clr - d, 3)}
+            if worst is None or info["needs_mm"] > worst["needs_mm"]:
+                worst = info
+        if worst is not None:
+            return True, worst
+        for ring in keepouts_by_layer.get(name) or []:
+            if len(ring) >= 3 and any(G.point_in_polygon(
+                    (x + dx * t, y + dy * t), ring)
+                    for t in (0.0, (half + esc) / 2.0, half + esc)):
+                return True, {"layer": name, "reason": "keepout",
+                              "needs_mm": None}
+        if outline:
+            # Three samples on the centreline, plus the two shoulder corners at the
+            # far end: a lane that leaves the board is not an escape, even if the
+            # copper between here and the edge happens to be free.
+            probes = [(x + dx * t, y + dy * t) for t in (0.0, (half + esc) / 2.0,
+                                                         half + esc)]
+            nx, ny = -dy, dx
+            probes.append((end[0] + nx * tw / 2.0, end[1] + ny * tw / 2.0))
+            probes.append((end[0] - nx * tw / 2.0, end[1] - ny * tw / 2.0))
+            for pt in probes:
+                if not any(G.point_in_polygon(pt, ring) for ring in outline):
+                    return True, {"layer": name, "reason": "board_edge",
+                                  "needs_mm": None}
+        return False, None
+
+    pads_out = []
+    per_net = {}
+    for fp in board.footprints:
+        ref = fp.get("ref") or fp.get("reference")
+        for pad in fp.get("pads") or []:
+            net = pad.get("net")
+            if not net:
+                continue          # an unconnected pad has nothing to escape to
+            hole = pad.get("hole_mm")
+            if pad.get("type") == "np_thru_hole" and hole and \
+                    float(pad.get("w") or 0) <= float(hole) + 1e-6 and \
+                    float(pad.get("h") or 0) <= float(hole) + 1e-6:
+                continue          # no copper at all
+            x, y = _pad_xy(fp, pad)
+            if x is None:
+                continue
+            pad_layers = [l for l in layers if l in (pad.get("layers") or [])
+                          or hole is not None]
+            if not pad_layers:
+                continue
+            half = max(float(pad.get("w") or 0), float(pad.get("h") or 0)) / 2.0
+            pad_clr = max(clr, clr_by_net.get(net, clr))
+            open_dirs, asked = [], []
+            for name in pad_layers:
+                for dx, dy in dirs:
+                    blocked, why = _lane_blocked(name, x, y, dx, dy, half, net,
+                                                 pad_clr)
+                    if blocked:
+                        asked.append(why)
+                    else:
+                        open_dirs.append((name, (dx, dy)))
+            done = _touches(net, x, y, half)
+            kind = None
+            best = None
+            if not open_dirs and not done:
+                # Every direction refused: report the one that came CLOSEST, so the
+                # caller can say "0.13 mm short of C4" instead of "blocked".
+                if asked:
+                    best = max(asked, key=lambda w: (w.get("needs_mm") or -1.0))
+                else:
+                    best = None
+
+                # A pad with no long lane is not necessarily stuck: a person can
+                # leave the pad and bend. Ask the same question over a SHORT lane;
+                # if even that fails there is no way off the pad at all, which is
+                # the claim worth making loudly.
+                short = [(_n, (dx, dy)) for _n in pad_layers for dx, dy in dirs
+                         if not _lane_blocked(_n, x, y, dx, dy, half, net, pad_clr,
+                                              short_escape)[0]]
+                kind = "bend_required" if short else "hard"
+            entry = {"reference": ref, "pad": pad.get("number"), "net": net,
+                     "at": [round(x, 3), round(y, 3)],
+                     "escape_directions": len(open_dirs),
+                     "layers_with_an_escape": sorted({d[0] for d in open_dirs}),
+                     "already_connected": done, "blocker_kind": kind,
+                     "why_blocked": best}
+            per_net.setdefault(net, {"pads": 0, "blocked": 0, "connected": 0})
+            per_net[net]["pads"] += 1
+            if done:
+                per_net[net]["connected"] += 1
+            elif not open_dirs:
+                per_net[net]["blocked"] += 1
+            pads_out.append(entry)
+
+    if not pads_out:
+        return err("no pad on this board carries a net, so there is nothing to "
+                   "escape from", "NO_GEOMETRY",
+                   hint="pads without a net assignment are not inspected: an "
+                        "unconnected pad has nothing to be connected to")
+
+    # A pad is only a hard blocker if it is neither already connected nor able to
+    # leave: "no router can connect it" must not be said about a pad a track
+    # already reaches.
+    hard = [p for p in pads_out if p["blocker_kind"] == "hard"]
+    bends = [p for p in pads_out if p["blocker_kind"] == "bend_required"]
+    blocked = hard
+    tight = [p for p in pads_out
+             if p["escape_directions"] <= 1 and not p["already_connected"]
+             and p["blocker_kind"] is None]
+    connected_pads = [p for p in pads_out if p["already_connected"]]
+
+    congestion = {}
+    for name in layers:
+        items = items_by_layer[name]
+        keepouts = [z for z in board.zones
+                    if z.get("is_keepout") and name in (z.get("layers") or [])]
+        grid = _occupancy(board, items, keepouts, step, clr + tw / 2.0)
+        used = inside = 0
+        for row in grid["cells"]:
+            for cellv in row:
+                if cellv is None:
+                    continue          # outside the board, not "usable area"
+                inside += 1
+                if cellv is not False:
+                    used += 1
+        congestion[name] = round(used / float(inside), 4) if inside else None
+
+    blocked_net = {}
+    for p in blocked:
+        blocked_net[p["net"]] = blocked_net.get(p["net"], 0) + 1
+
+    if blocked:
+        verdict = "blocked_pads"
+        why = ("%d pad(s) on %d net(s) have no way off the pad at all (not even a "
+               "%.2f mm stub) and no copper of their own net touching them: no "
+               "router can connect them as the board stands"
+               % (len(blocked), len(blocked_net), short_escape))
+    elif bends:
+        verdict = "bends_needed"
+        why = ("%d pad(s) cannot leave in a straight %.1f mm lane but CAN leave over "
+               "%.2f mm, i.e. they need a dogleg: fine for a person, a straight-lane "
+               "fanout will not do it" % (len(bends), escape, short_escape))
+    elif tight and len(tight) >= max(4, len(pads_out) // 10):
+        verdict = "tight"
+        why = ("every unconnected pad has at least one way out, but %d pad(s) have "
+               "exactly one - a single mistake during layout closes them" % len(tight))
+    else:
+        verdict = "escapes_exist"
+        why = ("every unconnected pad has at least one free direction on this grid "
+               "(%d of %d pads are already connected)" % (len(connected_pads),
+                                                          len(pads_out)))
+
+    return ok(
+        value={
+            "verdict": verdict,
+            "why": why,
+            "pads_checked": len(pads_out),
+            "already_connected_pads": len(connected_pads),
+            "blocked_pads": len(blocked),
+            "bend_required_pads": len(bends),
+            "one_way_pads": len(tight),
+            "nets_with_blocked_pads": blocked_net,
+            "blocked": sorted(blocked, key=lambda p: (p["net"], p["reference"]))[:int(worst)],
+            "bend_required": sorted(bends, key=lambda p: (p["net"], p["reference"]))[:int(worst)],
+            "one_way": tight[:int(worst)],
+            "per_net": {k: v for k, v in sorted(per_net.items())[:int(worst)]},
+            "congestion_by_layer": congestion,
+            "grid": {"step_mm": step, "layers": layers,
+                     "margin_mm": round(clr + tw / 2.0, 3)},
+        },
+        unit="mm, count, ratio (dimensionless)",
+        model="geometric_escape_lane + rasterised_congestion",
+        basis="each pad is offered 8 straight lanes of `track_mm` width leaving the "
+              "pad over `escape_mm`; a lane is illegal when its edge-to-edge distance "
+              "to any OTHER net's copper on that layer is below the clearance, when "
+              "it crosses a keepout, or when any of its 5 probe points is outside the "
+              "board outline. Congestion is rasterised copper coverage of the layer's "
+              "usable area",
+        precision="clearance is exact for pads/tracks/vias (segment and polygon "
+                  "distance, track width subtracted); a lane is a straight 8-direction "
+                  "test, so a bent or diagonal-between-orthogonals escape is reported "
+                  "as blocked when it is not. Congestion is +/-1 grid cell (%.2f mm). "
+                  "A pad counts as already connected when a track/via of its own net "
+                  "comes within half the pad plus its width" % step,
+        assumptions={"clearance_mm": clr, "track_mm": tw, "escape_mm": escape,
+                     "clearance_from": rule_clr_source,
+                     "track_width_from": rule_tw_source,
+                     "layer": layer or "any copper layer",
+                     "short_escape_mm": short_escape,
+                     "not_claimed": "this is not a route: it says a pad CAN leave, "
+                                    "not that the whole net can be connected"},
+    )
+
+def _occupancy(board, items, keepouts, step, margin):
+    """A per-layer grid where None = outside the board, False = free, a net name =
+    copper owned by that net, True = blocked for everybody (two nets or a keepout).
+
+    Storing WHICH net owns a cell is what makes an escape test meaningful: a pad is
+    always surrounded by its own copper (itself, and its neighbours in the fan-out),
+    so a grid of bare booleans reports every single pad as walled in - the first run
+    on stm32f401re_core answered "180 of 180 pads blocked", which is not a finding
+    about the board, it is the measurement counting the pad against itself.
+    """
+    xs, ys = [], []
+    for poly in (board.outline or []):
+        for p in poly:
+            xs.append(p[0])
+            ys.append(p[1])
+    for it in items:
+        bx = _item_bbox(it)
+        xs.extend([bx[0], bx[2]])
+        ys.extend([bx[1], bx[3]])
+    if not xs:
+        return {"x0": 0.0, "y0": 0.0, "step": step, "cols": 0, "rows": 0, "cells": []}
+    pad = max(margin, 1.0) + step
+    x0, y0 = min(xs) - pad, min(ys) - pad
+    x1, y1 = max(xs) + pad, max(ys) + pad
+    cols = max(1, int(math.ceil((x1 - x0) / step)))
+    rows = max(1, int(math.ceil((y1 - y0) / step)))
+    if cols * rows > 900000:
+        cols = min(cols, 900)
+        rows = min(rows, 1000)
+        step = max((x1 - x0) / cols, (y1 - y0) / rows)
+        cols = max(1, int(math.ceil((x1 - x0) / step)))
+        rows = max(1, int(math.ceil((y1 - y0) / step)))
+    cells = [[False] * cols for _ in range(rows)]
+
+    def mark(cx, cy, half, net=True):
+        gx0 = max(0, int(math.floor((cx - half - x0) / step)))
+        gx1 = min(cols - 1, int(math.floor((cx + half - x0) / step)))
+        gy0 = max(0, int(math.floor((cy - half - y0) / step)))
+        gy1 = min(rows - 1, int(math.floor((cy + half - y0) / step)))
+        for gy in range(gy0, gy1 + 1):
+            row = cells[gy]
+            for gx in range(gx0, gx1 + 1):
+                cur = row[gx]
+                if cur is False:
+                    row[gx] = net
+                elif cur is None or cur is True:
+                    pass
+                elif net is True or cur != net:
+                    row[gx] = True
+
+    for item in items:
+        net = item.get("net") or True
+        if "poly" in item:
+            bx = _item_bbox(item)
+            mark((bx[0] + bx[2]) / 2.0, (bx[1] + bx[3]) / 2.0,
+                 max(bx[2] - bx[0], bx[3] - bx[1]) / 2.0 + margin, net)
+        else:
+            a, b, w = item["seg"]
+            length = G.dist_point_point(a, b)
+            steps = max(1, int(math.ceil(length / (step / 2.0))))
+            for i in range(steps + 1):
+                t = i / float(steps)
+                mark(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                     w / 2.0 + margin, net)
+    for zone in keepouts:
+        poly = zone.get("outline") or []
+        if len(poly) < 3:
+            continue
+        zb = G.bbox_of(poly)
+        for gy in range(rows):
+            cy = y0 + (gy + 0.5) * step
+            if not (zb[1] <= cy <= zb[3]):
+                continue
+            row = cells[gy]
+            for gx in range(cols):
+                cx = x0 + (gx + 0.5) * step
+                if zb[0] <= cx <= zb[2] and G.point_in_polygon((cx, cy), poly):
+                    row[gx] = True        # a keepout blocks every net
+    if board.outline:
+        for gy in range(rows):
+            cy = y0 + (gy + 0.5) * step
+            row = cells[gy]
+            for gx in range(cols):
+                cx = x0 + (gx + 0.5) * step
+                if row[gx] is not False:
+                    continue
+                if not any(G.point_in_polygon((cx, cy), poly) for poly in board.outline):
+                    row[gx] = None
+    return {"x0": x0, "y0": y0, "step": step, "cols": cols, "rows": rows,
+            "cells": cells}
 
 
 def pour_connectivity(board, zone_index=0):

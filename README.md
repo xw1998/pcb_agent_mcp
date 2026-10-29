@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.10` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式）。
+当前版本 `0.0.13` 已实现七层：六层只读 + 一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -100,7 +100,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（97 个）
+## 工具（126 个）
+
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/26](docs/26-分步可见与铺铜闭环.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -313,7 +315,7 @@ MCP 客户端配置（stdio）：
 - **立创 Pro 有两条活通路，只有一条真的通过。** websocket 网关那条（`lceda_api_probe`，RFC 6455
   握手/掩码/分片/超时，`tests/test_lceda_api.py` 10 例）本机 49620-49629 全部 `no_listener`——它
   只在用户手动打开「外部交互权限」后才监听，所以那条仍带 `verified_against_app: false`。真正跑通的
-  是**应用自己开的命令空间管道**：`lceda_pro_*` 六个工具对着运行中的 4.1.60 实测过 ping、open
+  是**应用自己开的命令空间管道**：`lceda_pro_*` 七个工具（第七个 `lceda_pro_steps` 是分步写，**真机未验证**）对着运行中的 4.1.60 实测过 ping、open
   （32.5 MB 副本 849 ms）、session.list、session.close、doc.api（`eda` 378 个类型、`PCB_Document`
   21 个方法、带厂商中文注释）与 invoke（`await eda.dmt_Pcb.getAllPcbsInfo()` 回两块板的名字与
   uuid，抛错回 `EXECUTION_ERROR` + 应用原话）。协议与实测数字见 [docs/24](docs/24-立创进程内桥.md)。

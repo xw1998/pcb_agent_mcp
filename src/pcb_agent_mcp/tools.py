@@ -7,6 +7,7 @@ must say what the tool will NOT do as clearly as what it does.
 import json
 
 from . import desktop as _desktop
+from . import parts as _parts
 from . import lceda_api as _lceda_api
 from . import lceda_live as _live
 from . import fidelity as _fidelity
@@ -34,6 +35,7 @@ from .calc import electrothermal as _electro
 from .calc import filters as _filters
 from .calc import magnetics as _magnetics
 from .calc import stackup as _stackup
+from .fidelity import fill as _fill
 from .calc import chain as _chain
 from .calc import rules as _rules
 from .calc.result import err, ok
@@ -704,6 +706,80 @@ def _lceda_pro_run(args):
                           "unverified - the snippet, not the tool, decides",
     }, verified=True, logs=out["logs"], duration_ms=out["duration_ms"])
 
+def _lceda_pro_steps(args):
+    """Run a list of snippets in the editor one at a time, watchable and stoppable.
+
+    Each snippet is one visible action inside the running editor, so the person
+    at the screen sees the design change instruction by instruction and can stop
+    between any two of them. The stop file and the step log are the same ones the
+    KiCad stepped write uses, so ``board_progress`` controls both.
+    """
+    from . import edit as _edit
+    session = args.get("session")
+    steps = args.get("steps") or []
+    if not session:
+        return _live_error(_live.LiveError("ARG_REQUIRED", "session is required"))
+    if not steps:
+        return _live_error(_live.LiveError("ARG_REQUIRED", "steps is required"))
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    log_id = "lceda-" + str(session)
+    done, stopped_at = [], None
+    try:
+        for idx, step in enumerate(steps):
+            if os.path.isfile(_edit.plan.stop_file()):
+                stopped_at = idx
+                break
+            label = step.get("label") or ("step %d" % (idx + 1))
+            if isinstance(step, str):
+                step = {"code": step}
+                label = "step %d" % (idx + 1)
+            code = step.get("code")
+            if not code:
+                _edit.plan._emit(log_id, {"kind": "refused", "at": idx,
+                                          "why": "a step without code"})
+                return _live_error(_live.LiveError(
+                    "ARG_REQUIRED", "step %d (%s) has no code" % (idx + 1, label)))
+            try:
+                out = client.invoke(session, code, fn=step.get("fn") or "run",
+                                    args=step.get("js_args"),
+                                    timeout_ms=step.get("timeout_ms")
+                                    or args.get("run_timeout_ms"))
+            except _live.LiveError as exc:
+                _edit.plan._emit(log_id, {"kind": "step_failed", "at": idx,
+                                          "label": label, "code": exc.code})
+                return _live_error(exc)
+            item = {"index": idx, "label": label, "value": out["value"],
+                    "duration_ms": out["duration_ms"],
+                    "logs": out["logs"]}
+            done.append(item)
+            _edit.plan._emit(log_id, {"kind": "step", "seq": idx + 1, "ops": [label],
+                                      "duration_ms": out["duration_ms"],
+                                      "sha256": None,
+                                      "value_preview": str(out["value"])[:200]})
+    finally:
+        client.close()
+    extra = {"rendering": "each snippet ran inside the editor's render process; the "
+                          "canvas shows it as soon as the snippet touches a document, "
+                          "so a person can watch and comment",
+             "stopping_it": "board_progress(action='stop') stops before the next "
+                            "step; action='resume' releases it",
+             "step_log": _edit.plan.step_events(log_id, limit=200)["root"]}
+    if stopped_at is not None:
+        extra["stopped_before_step"] = stopped_at
+        extra["not_run"] = [s.get("label") if isinstance(s, dict) else "step %d" % (i + 1)
+                            for i, s in enumerate(steps[stopped_at:], start=stopped_at)]
+    return _live_done(client, {"steps_run": len(done), "steps_planned": len(steps),
+                               "stopped": stopped_at is not None,
+                               "steps": done}, {
+        "verified_against_app": "every step's value is the editor's own reply",
+        "what is not proven": "whether a snippet leaves the document saved; saving "
+                              "is the snippet's business, and the project file is "
+                              "only written when something asks the editor to save",
+    }, verified=True, logs=None, duration_ms=None, **extra)
+
 _tool(
     "lceda_pro_status",
     "Is the LCEDA Pro IN-PROCESS bridge alive, and which build is it? Speaks the "
@@ -796,6 +872,27 @@ _tool(
      }),
      "required": ["session", "code"]},
     _lceda_pro_run,
+)
+
+_tool(
+    "lceda_pro_steps",
+    "Run a design change inside the running editor ONE STEP AT A TIME, so it can be "
+    "watched and interrupted. Each step is {label, code, js_args}: the code is an async "
+    "function body with the vendor's eda object in scope, and it lands on the canvas "
+    "immediately, so a person sees step 3 before step 4 exists. The stop file and step "
+    "log are the same ones the KiCad stepped write uses - board_progress(action='stop') "
+    "stops this before the next step, board_progress() reads the log. This is the LCEDA "
+    "Pro answer to 'let me see what you are doing'.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "session": _str("session id from lceda_pro_open / lceda_pro_sessions"),
+         "steps": {"type": "array", "description":
+                   "list of {label, code, js_args, fn, timeout_ms}; a bare string is "
+                   "treated as code", "items": {"type": "object"}},
+         "run_timeout_ms": _num("per-step budget passed to the app (max 60000)", 60000),
+     }),
+     "required": ["session", "steps"]},
+    _lceda_pro_steps,
 )
 
 # ----------------------------------------------------------------- board
@@ -933,6 +1030,28 @@ _tool(
 )
 
 _tool(
+    "board_routability",
+    "Can each pad actually get off the pad, and how crowded is the layer? A pad with no "
+    "way out is a hard blocker no router can fix; a pad that needs a dogleg is fine for "
+    "a person but not for a straight fanout. Says which, and reports copper congestion "
+    "per layer. NOT a router: it never claims a net is connectable. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "layer": _str("restrict to one copper layer (default: every copper layer)"),
+         "grid_mm": _num("congestion grid step", 0.2),
+         "clearance_mm": _num("override the net-class clearance", None),
+         "track_mm": _num("width of the track that has to get out", None),
+         "escape_mm": _num("how far past the pad edge the lane must be free", 1.5),
+         "worst": _num("how many pads to list", 20),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.routability(
+        b, layer=a.get("layer"), grid_mm=a.get("grid_mm", 0.2),
+        clearance_mm=a.get("clearance_mm"), track_mm=a.get("track_mm"),
+        escape_mm=a.get("escape_mm", 1.5), worst=a.get("worst", 20)), derived=True),
+)
+
+_tool(
     "board_pour_connectivity",
     "Do the pads of the pour's net actually land inside the filled copper? A pour that "
     "looks connected in the file can be isolated in fact.",
@@ -941,6 +1060,32 @@ _tool(
      "required": ["path"]},
     _board_tool(lambda b, a: _oracle.pour_connectivity(b, a.get("zone_index", 0)),
                 derived=True),
+)
+
+_tool(
+    "board_zones",
+    "What the board actually POURS: every zone with its net, layer, outline area, "
+    "filled polygons and poured area. A zone with no filled_polygon is an outline, not "
+    "copper - and every later connectivity answer would be about that outline. " +
+    _NOT_WRITTEN,
+    {"type": "object", "properties": dict(_COMMON), "required": ["path"]},
+    lambda a: _guarded(lambda: _fill.zones(a["path"])),
+)
+
+_tool(
+    "board_fill_zones",
+    "Ask KiCad's own ZONE_FILLER to pour the zones, then report what it built (area, "
+    "polygons, zones that poured nothing and why). By default it fills a COPY and only "
+    "measures; in_place=true transplants KiCad's polygons into your file, which keeps "
+    "its own version header, and writes a checkpoint first. Not a KiCad board? Refuses. "
+    "A fill is a SNAPSHOT: any later track/pad/outline change makes it stale.",
+    {"type": "object",
+     "properties": dict({
+         "in_place": {"type": "boolean",
+                      "description": "write KiCad's polygons into this file (default "
+                                     "false: measure on a copy, touch nothing)"},
+     }, **_COMMON, **{"required": ["path"]})},
+    lambda a: _guarded(lambda: _fill.fill(a["path"], in_place=bool(a.get("in_place")))),
 )
 
 _tool(
@@ -1601,6 +1746,15 @@ def _capabilities(_args):
                      "checkpoint, atomic write, five independent gates, rollback on any "
                      "failure). KiCad edits are re-judged by kicad-cli; a new DRC "
                      "violation blocks the write",
+            "parts": "the real part catalogue, not a part generator. Offline it reads "
+                     "the SQLite library LCEDA Pro ships (lceda-std.elib: 16k devices, "
+                     "21k symbol/footprint documents, 385k attribute rows with real "
+                     "LCSC codes); online it asks pro.lceda.cn for the whole JLCPCB "
+                     "catalogue (anonymous, measured 2026-10-29). Geometry carries "
+                     "through to KiCad .kicad_sym / .kicad_mod with a field-by-field "
+                     "report of what was dropped. Online documents are encrypted, so an "
+                     "online-only part has metadata and no geometry, and the tool says "
+                     "so instead of drawing a plausible footprint",
             "write_schematic": "KiCad .kicad_sch only: propose (compute only) -> apply "
                                "(checkpoint, atomic write, four gates). The referee is "
                                "the netlister + ERC, not DRC: a schematic's product is "
@@ -1612,18 +1766,23 @@ def _capabilities(_args):
             "via_current_allowed", "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "board_summary", "board_components", "board_nets", "board_clearance",
-            "board_free_space", "board_pour_connectivity", "board_cross_split",
+            "board_free_space", "board_routability", "board_pour_connectivity",
+            "board_zones", "board_fill_zones",
+            "board_cross_split",
             "board_loop_area", "board_fidelity", "board_view", "board_drc",
             "board_stats", "board_cross_check", "epro_inspect",
             "safety_table_check",
             "board_ops", "board_create", "board_propose", "board_apply",
-            "board_checkpoints", "board_restore",
+            "board_checkpoints", "board_restore", "board_progress",
             "schematic_ops", "schematic_propose", "schematic_apply",
             "schematic_summary", "schematic_view",
+            "part_library_status", "part_search", "part_get", "part_export",
+            "part_footprint_pads", "part_cache_info",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
             "lceda_api_probe",
             "lceda_pro_status", "lceda_pro_api", "lceda_pro_open",
             "lceda_pro_sessions", "lceda_pro_close", "lceda_pro_run",
+            "lceda_pro_steps",
             "feedline_impedance", "feedline_width",
             "antenna_patch", "antenna_printed", "antenna_dipole_monopole",
             "antenna_helix", "antenna_small_loop", "antenna_q_limit", "antenna_chip",
@@ -1679,9 +1838,11 @@ def _capabilities(_args):
         "derived_vs_authoritative": {
             "derived (this server computed it)": [
                 "board_clearance", "board_free_space", "board_pour_connectivity",
+                "board_zones(reads whatever engine last filled)",
                 "board_cross_split", "board_loop_area", "board_antenna_keepout",
                 "board_ir_drop", "board_vibration"],
-            "authoritative (vendor engine said it)": ["board_drc", "board_stats"],
+            "authoritative (vendor engine said it)": ["board_drc", "board_stats",
+                                                      "board_fill_zones(a real pour)"],
             "checked_against_the_vendor": {
                 "board_cross_check": "runs the derived answer and the vendor's own DRC on "
                                      "the same file in both directions and reports "
@@ -2217,6 +2378,9 @@ _tool(
      "properties": {
          "path": _str("absolute path to a .kicad_pcb"),
          "severity": _str("which violations to include", ["all", "error"], "all"),
+         "strict": _bool("also report warnings as blocking (the write gate's strict "
+                         "mode)"),
+         "limit": _num("how many blocking/advisory entries to list", 20),
      },
      "required": ["path"]},
     lambda a: _guarded(lambda: _board_drc(a)),
@@ -2272,6 +2436,18 @@ def _board_drc(args):
                    "verdict; use the app's own DRC or board_fidelity for a conversion "
                    "report", "VERDICT_SOURCE_UNAVAILABLE")
     out = _engine.drc(path, severity=args.get("severity") or "all")
+    if out.get("status") != "ok":
+        return out
+    from .edit import drc_policy as _policy
+    view = _policy.classify(out.get("violations") or [],
+                            strict=bool(args.get("strict")),
+                            limit=int(args.get("limit") or 20))
+    out["blocking_if_this_were_an_edit"] = view
+    out["how_an_apply_treats_this"] = (
+        "board_apply compares the DRC of the file before and after the edit and blocks "
+        "on NEW violations at KiCad severity 'error' only; warnings are reported and "
+        "counted (they were 69/69 on the STM32F401 core board, all silkscreen/text). "
+        "Pass options.strict_drc=true to make every new violation block.")
     return out
 
 
@@ -2372,6 +2548,22 @@ def _board_checkpoints(args):
     from . import edit as _edit
     return _edit.list_checkpoints(args.get("path"), limit=int(args.get("limit") or 20))
 
+def _board_progress(args):
+    """Read the step log / stop file. Also the way to stop a stepped apply."""
+    from . import edit as _edit
+    action = (args.get("action") or "status").lower()
+    try:
+        if action in ("stop", "resume", "clear"):
+            return _edit.step_control(action, note=args.get("note"))
+        events = _edit.step_events(args.get("plan_id"), limit=int(args.get("limit") or 200))
+        events["action"] = "log"
+        events["how_to_stop"] = ("board_progress(action='stop') writes %s; a stepped "
+                                 "apply reads it between steps and refuses to write "
+                                 "more" % events["stop_file"])
+        return events
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+
 def _board_restore(args):
     from . import edit as _edit
     try:
@@ -2431,6 +2623,7 @@ _tool(
             "allow_new_violations / allow_open_outline / engine (default true)",
             "properties": {
                 "allow_new_violations": _bool("accept newly introduced DRC violations"),
+                "strict_drc": _bool("let every new violation block, warnings included"),
                 "allow_open_outline": _bool("accept an outline that does not close"),
                 "engine": _bool("run the kicad-cli comparison (default true)", True),
                 "mode": _str("in_place or new_file", enum=["in_place", "new_file"]),
@@ -2447,16 +2640,25 @@ _tool(
     "re-parse reproduces the planned tree, every operation's postcondition is re-read "
     "from the file, and KiCad re-reads both files (stats/plots/positions) with its DRC "
     "diffed. Any blocking failure restores the checkpoint and says so. A plan is "
-    "single-use and expires after an hour.",
+    "single-use and expires after an hour. Pass options.step=N for a stepped write "
+    "that leaves a valid board on disk after every N operations, so a person can "
+    "watch it in the EDA and interrupt it (board_progress reports and stops it); the "
+    "finished stepped file still has to pass the same four gates.",
     {"type": "object", "properties": {
         "plan_id": _str("the plan_id that board_propose returned"),
         "confirm": _bool("must be true - writing a board is not Ctrl+Z"),
         "options": {"type": "object", "properties": {
             "allow_new_violations": _bool("accept newly introduced DRC violations"),
+            "strict_drc": _bool("let every new violation block, warnings included"),
             "allow_open_outline": _bool("accept an outline that does not close"),
             "engine": _bool("run the kicad-cli comparison (default true)", True),
             "mode": _str("in_place or new_file", enum=["in_place", "new_file"]),
             "out_path": _str("target when mode=new_file"),
+            "step": _num("STEPPED WRITE: how many operations to write in this call. "
+                         "Each call leaves a complete board file on disk, so the "
+                         "change can be watched in the EDA and stopped between steps. "
+                         "Omit it for the one-shot atomic write."),
+            "max_chunks": _num("stepped write: chunks per call (default 1)"),
         }},
     }, "required": ["plan_id"]},
     _board_apply,
@@ -2483,6 +2685,23 @@ _tool(
         "keep_current": _bool("checkpoint the file being replaced (default true)", True),
     }, "required": ["checkpoint_id"]},
     _board_restore,
+)
+
+_tool(
+    "board_progress",
+    "Watch or stop a stepped apply. action=status/log reads the on-disk step log "
+    "(one JSON line per written step: which operations, sha256, bytes, whether that "
+    "step's postconditions held, and the snapshot path); action=stop writes a stop "
+    "file that a stepped apply checks between steps; action=resume removes it. Also "
+    "reports whether any stop file is currently in force.",
+    {"type": "object", "properties": {
+        "action": _str("status / log / stop / resume", enum=["status", "log", "stop",
+                                                              "resume"]),
+        "plan_id": _str("only this plan's steps"),
+        "limit": _num("how many events to return", 200),
+        "note": _str("why you stopped it (written into the stop file)"),
+    }},
+    _board_progress,
 )
 
 # --------------------------------------------------------- schematic write path
@@ -3649,6 +3868,273 @@ _tool(
     "unverified). Undetermined is reported as undetermined, never as a pass.",
     {"type": "object", "properties": {"facts": _FACTS_SCHEMA}, "required": ["facts"]},
     _schematic_review,
+)
+
+# ------------------------------------------------------------------ parts
+def _part_error(exc):
+    return err(str(exc), exc.reason_code, hint=exc.hint)
+
+
+def _part_library_status(args):
+    try:
+        info = _parts.library_status(args.get("path"))
+    except _parts.PartError as exc:
+        return _part_error(exc)
+    return ok(
+        info["counts"]["devices"], "devices",
+        "read the SQLite catalogue that LCEDA Pro ships and count its rows",
+        "lceda-std.elib: devices / components / attributes tables",
+        "exact row counts, file read with mode=ro&immutable (never written)",
+        {"library": info["path"], "how": info["how"],
+         "file_mb": round(info["size"] / 1048576.0, 1)},
+        extra={"counts": info["counts"], "library": info["path"],
+               "how": info["how"]})
+
+
+def _part_search(args):
+    query = args.get("query")
+    if not query:
+        return err("part_search needs a query", "ARG_MISSING")
+    try:
+        out = _parts.search(query, limit=args.get("limit", 20),
+                            page=args.get("page", 1),
+                            source=args.get("source", "auto"),
+                            path=args.get("path"),
+                            timeout=float(args.get("timeout_s", 20)))
+    except _parts.PartError as exc:
+        return _part_error(exc)
+    offline = out["source"] == "offline"
+    return ok(
+        len(out["parts"]), "parts",
+        "catalogue lookup: case-insensitive substring match on title, description and "
+        "every attribute value (offline) or the vendor search API (online)",
+        ("lceda-std.elib devices+attributes tables" if offline
+         else "POST https://pro.lceda.cn/api/v5/devices/search"),
+        "string match, no fuzzy ranking and no stock/price ranking; the offline "
+        "library is the subset that ships with the app, the online one is the whole "
+        "JLCPCB catalogue",
+        {"source_measured": "2026-10-29, anonymous request, no cookie or token",
+         "geometry_available": "offline only (online documents are encrypted)"},
+        extra={"source": out["source"], "query": out.get("query"),
+               "total_matches": out.get("total"), "page": out.get("page"),
+               "parts": out["parts"], "tried": out.get("tried")})
+
+
+def _part_get(args):
+    uuid = args.get("uuid")
+    if not uuid:
+        return err("part_get needs a uuid", "ARG_MISSING")
+    try:
+        part = _parts.get(uuid, source=args.get("source", "auto"),
+                          path=args.get("path"))
+    except _parts.PartError as exc:
+        return _part_error(exc)
+    return ok(
+        len(part.get("attributes") or {}), "attributes",
+        "one device row plus its attribute rows, read from the shipped catalogue",
+        "lceda-std.elib devices + attributes tables",
+        "verbatim strings from the vendor catalogue, nothing normalised",
+        {"uuid": uuid},
+        extra={"part": part})
+
+
+def _part_export(args):
+    uuid = args.get("uuid")
+    out_dir = args.get("out_dir")
+    if not uuid or not out_dir:
+        return err("part_export needs uuid and out_dir", "ARG_MISSING")
+    kind = (args.get("kind") or "both").lower()
+    if kind not in ("both", "symbol", "footprint"):
+        return err("kind must be both, symbol or footprint", "ARG_INVALID")
+    try:
+        part = _parts.get(uuid, source="offline", path=args.get("path"))
+    except _parts.PartError as exc:
+        return _part_error(exc)
+    attrs = part.get("attributes") or {}
+    want = []
+    if kind in ("both", "symbol"):
+        if not attrs.get("Symbol"):
+            return err("this device names no symbol", "SYMBOL_MISSING")
+        want.append(("symbol", attrs["Symbol"]))
+    if kind in ("both", "footprint"):
+        if not attrs.get("Footprint"):
+            return err("this device names no footprint", "FOOTPRINT_MISSING")
+        want.append(("footprint", attrs["Footprint"]))
+    try:
+        datas = _parts.data_strings([u for _, u in want], path=args.get("path"))
+    except _parts.PartError as exc:
+        return _part_error(exc)
+    name = args.get("name") or part.get("title") or uuid
+    safe = "".join(c if (c.isalnum() or c in "-_+#.") else "_" for c in name)
+    written = []
+    reports = {}
+    import io
+    import os as _os
+    try:
+        _os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        return err("cannot create out_dir: %s" % exc, "OUT_DIR_UNWRITABLE")
+    for kind_name, cuuid in want:
+        doc = datas.get(cuuid)
+        if not doc or not doc.get("data"):
+            return err("catalogue has no document for %s %s" % (kind_name, cuuid),
+                       "DOCUMENT_MISSING")
+        try:
+            if kind_name == "symbol":
+                text, rep = _parts.symbol_to_kicad(
+                    doc["data"], name=safe, reference="U",
+                    footprint=(attrs.get("Supplier Footprint") or ""),
+                    datasheet=(attrs.get("Datasheet") or ""),
+                    description=(part.get("description") or ""))
+                target = _os.path.join(out_dir, safe + ".kicad_sym")
+            else:
+                text, rep = _parts.footprint_to_kicad(
+                    doc["data"], name=safe,
+                    description=(attrs.get("Supplier Footprint") or ""))
+                target = _os.path.join(out_dir, safe + ".kicad_mod")
+        except _parts.PartError as exc:
+            return _part_error(exc)
+        if _os.path.exists(target) and not args.get("overwrite"):
+            return err("target exists: %s" % target, "TARGET_EXISTS",
+                       hint="pass overwrite=true to replace it")
+        with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        prior = None
+        with io.open(target, "r", encoding="utf-8") as fh:
+            prior = fh.read()
+        if prior != text:
+            return err("read-back of %s does not match what was written" % target,
+                       "READBACK_MISMATCH")
+        written.append(target)
+        reports[kind_name] = rep
+    return ok(
+        len(written), "files",
+        "EasyEDA Pro document -> KiCad library file, field by field, no re-derivation",
+        "EasyEDA Pro SYMBOL/FOOTPRINT document format (line JSON), unit mil declared "
+        "in its own CANVAS row; symbol unit 10 mil inferred from the pin grid",
+        "geometry copied within 1e-6 mm; pad angles from field 14; KiCad text sizes and "
+        "stroke defaults are ours, not the vendor's",
+        {"kicad_parse": "not verified inside this tool - load the file with KiCad to "
+                         "confirm", 
+         "dropped": "each report lists what did not carry over"},
+        extra={"files": written, "report": reports, "name": safe,
+               "source_uuids": dict(want)})
+
+
+def _part_footprint_pads(args):
+    uuid = args.get("footprint_uuid") or args.get("uuid")
+    if not uuid:
+        return err("part_footprint_pads needs footprint_uuid", "ARG_MISSING")
+    try:
+        datas = _parts.data_strings([uuid], path=args.get("path"))
+    except _parts.PartError as exc:
+        return _part_error(exc)
+    doc = datas.get(uuid)
+    if not doc or not doc.get("data"):
+        return err("no footprint document %s" % uuid, "DOCUMENT_MISSING")
+    pads = _parts.footprint_pads_mm(doc["data"])
+    if not pads:
+        return err("the document has no pads", "PADS_EMPTY")
+    return ok(
+        len(pads), "pads",
+        "pad table in mm, read from the vendor footprint document",
+        "EasyEDA Pro FOOTPRINT document, coordinates in mil (CANVAS row)",
+        "0.0254 mm/mil exactly; rotation is the vendor's field 14",
+        {"footprint_uuid": uuid, "title": doc.get("display_title")},
+        extra={"pads": pads, "title": doc.get("display_title")})
+
+
+def _part_cache_info(_args):
+    return ok(0, "entries", "report where the part cache would live",
+              "PCB_AGENT_CACHE or ~/.pcb_agent_mcp/parts",
+              "path only, nothing is created here",
+              {},
+              extra={"cache_dir": _parts.cache_dir(),
+                     "ttl_s": _parts._CACHE_TTL_S})
+
+
+_tool(
+    "part_library_status",
+    "Find the LCEDA Pro standard part library on this machine and count what is in "
+    "it. The library is a plain SQLite file (lceda-std.elib, ~460 MB) shipped inside "
+    "the app: devices, symbols (docType 2) and footprints (docType 4) with their real "
+    "LCSC part numbers. Read-only. If it cannot be found the answer is an error that "
+    "says where it looked, never a guess.",
+    {"type": "object", "properties": {
+        "path": _str("explicit path to lceda-std.elib (optional)")}},
+    _part_library_status,
+)
+
+_tool(
+    "part_search",
+    "Search real parts by name, LCSC code or manufacturer part number and get back "
+    "the device uuid, LCSC code, package, datasheet URL and the full vendor attribute "
+    "table. Offline it reads the catalogue that ships with LCEDA Pro; online it asks "
+    "pro.lceda.cn for the whole JLCPCB catalogue (anonymous request, measured "
+    "2026-10-29). Nothing is invented: a miss is an error, and every part says which "
+    "source answered.",
+    {"type": "object", "properties": {
+        "query": _str("part name / LCSC code / manufacturer part number"),
+        "limit": _num("how many parts to return", 20),
+        "page": _num("1-based page, for the online catalogue", 1),
+        "source": _str("where to look", ["auto", "offline", "online"]),
+        "path": _str("explicit path to lceda-std.elib (optional)"),
+        "timeout_s": _num("network timeout in seconds", 20)},
+     "required": ["query"]},
+    _part_search,
+)
+
+_tool(
+    "part_get",
+    "One device by uuid, with every attribute row the vendor catalogue carries "
+    "(Manufacturer Part, Supplier Part, Supplier Footprint, Datasheet, Symbol and "
+    "Footprint uuids, electrical parameters). Offline only: the online catalogue has "
+    "no by-uuid lookup, and this tool says so instead of returning a guessed part.",
+    {"type": "object", "properties": {
+        "uuid": _str("device uuid from part_search"),
+        "source": _str("where to look", ["auto", "offline"]),
+        "path": _str("explicit path to lceda-std.elib (optional)")},
+     "required": ["uuid"]},
+    _part_get,
+)
+
+_tool(
+    "part_export",
+    "Turn a catalogue device into KiCad library files (.kicad_sym and/or .kicad_mod) "
+    "in the directory you name, and report field by field what carried over and what "
+    "did not. The geometry is the vendor's, converted mil->mm; the report lists every "
+    "dropped element (marking/soldering layers, text) so a thinner footprint never "
+    "looks like a faithful one. Refuses to overwrite unless overwrite=true, and reads "
+    "every file back after writing it.",
+    {"type": "object", "properties": {
+        "uuid": _str("device uuid from part_search (must be in the offline library)"),
+        "out_dir": _str("directory to write into (created if missing)"),
+        "name": _str("file/library name; defaults to the device title"),
+        "kind": _str("what to write", ["both", "symbol", "footprint"]),
+        "overwrite": _bool("replace existing files", False),
+        "path": _str("explicit path to lceda-std.elib (optional)")},
+     "required": ["uuid", "out_dir"]},
+    _part_export,
+)
+
+_tool(
+    "part_footprint_pads",
+    "The pad table of a catalogue footprint in mm (number, x, y, size, shape, rotation, "
+    "drill, polygon) - the geometry a placement or routing step needs, without going "
+    "through KiCad.",
+    {"type": "object", "properties": {
+        "footprint_uuid": _str("footprint uuid from part_get attributes.Footprint"),
+        "path": _str("explicit path to lceda-std.elib (optional)")},
+     "required": ["footprint_uuid"]},
+    _part_footprint_pads,
+)
+
+_tool(
+    "part_cache_info",
+    "Where part answers are cached on disk and for how long. The cache is only used "
+    "for whole answers that came from the network.",
+    {"type": "object", "properties": {}},
+    _part_cache_info,
 )
 
 _tool(

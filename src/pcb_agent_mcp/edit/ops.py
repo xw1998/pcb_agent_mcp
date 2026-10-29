@@ -17,6 +17,8 @@ a coordinate read from a view can be passed straight back in.
 Anything that is not in `OPS` is refused. Anything whose layer or net is not in
 the file is refused (a typo'd layer name silently creates a drawing on nothing).
 """
+import os
+
 from ..fidelity import sexpr as S
 from . import build as B
 
@@ -606,6 +608,444 @@ op("add_board_text", {"mech", "silk"},
    _run_board_text, _verify_board_text)
 
 # --- placement --------------------------------------------------------
+_FOOTPRINT_DROP = ("version", "generator", "generator_version", "tedit",
+                   "layer", "at", "tstamp", "uuid")
+
+# What a footprint node may carry in the v7 (20221018) board format - read off
+# KiCad's own complaint when a newer library footprint is dropped into an older
+# board ("Expecting at, descr, locked, ... or component_classes"). A newer board
+# has no such list to keep, so it embeds the body unchanged.
+_FOOTPRINT_TOKENS = frozenset((
+    "at", "descr", "locked", "placed", "tedit", "tstamp", "uuid", "variant",
+    "autoplace_cost90", "autoplace_cost180", "attr", "clearance",
+    "embedded_files", "fp_arc", "fp_circle", "fp_curve", "fp_line", "fp_poly",
+    "fp_rect", "fp_text", "pad", "group", "generator", "model", "path",
+    "solder_mask_margin", "solder_paste_margin", "solder_paste_margin_ratio",
+    "tags", "thermal_gap", "version", "zone", "zone_connect",
+    "component_classes"))
+_NO_LIMIT = None
+
+def _read_footprint_source(o):
+    """The footprint body, from a .kicad_mod file or a .pretty directory.
+
+    Nothing is invented here: pads, drills and silk come from the file, and a
+    missing library entry is an error rather than an empty footprint that merely
+    carries the right reference.
+    """
+    path = o.get("footprint_file") or o.get("library")
+    if not path:
+        raise OpError("add_footprint needs `library` (a .pretty directory) + `name`, "
+                      "or `footprint_file` (one .kicad_mod) - refusing to invent a "
+                      "footprint body", "MISSING_FOOTPRINT_DEFINITION")
+    name = o.get("name")
+    if os.path.isdir(path):
+        if not name:
+            raise OpError("`library` is a directory, so `name` (the footprint inside "
+                          "it) is required", "ARG_MISSING")
+        fpath = os.path.join(path, name + ".kicad_mod")
+        lib = os.path.basename(os.path.normpath(path))
+        if lib.endswith(".pretty"):
+            lib = lib[:-len(".pretty")]
+    else:
+        fpath = path
+        lib = os.path.basename(os.path.normpath(os.path.dirname(path)))
+        if lib.endswith(".pretty"):
+            lib = lib[:-len(".pretty")]
+        name = name or os.path.splitext(os.path.basename(path))[0]
+    if not os.path.isfile(fpath):
+        raise OpError("footprint file does not exist: %r" % fpath, "FILE_NOT_FOUND")
+    with open(fpath, "rb") as fh:
+        data = fh.read()
+    try:
+        tree = S.parse(data.decode("utf-8", "surrogateescape"))
+    except S.SexprError as exc:
+        raise OpError("%s is not a valid .kicad_mod: %s"
+                      % (os.path.basename(fpath), exc), "PARSE_FAILED")
+    if not tree.items or S.head(tree.items[0]) not in ("footprint", "module"):
+        raise OpError("%s is not a KiCad footprint (expected `(footprint ...)`)"
+                      % fpath, "FORMAT_NOT_SUPPORTED")
+    return tree.items[0], {"path": fpath, "library": lib, "name": name}
+
+def _pad_numbers(fp):
+    out = []
+    for pad in S.children(fp, "pad"):
+        number = S.arg_text(pad, 1)
+        out.append("" if number is None else number)
+    return out
+
+def _copy_node(node):
+    """A deep copy, so a library node can be re-used without being shared."""
+    if isinstance(node, S.Seq):
+        out = S.Seq(lead=node.lead, tail=node.tail)
+        for item in node.items:
+            out.items.append(_copy_node(item))
+        return out
+    return S.Atom(node.text, node.quoted, node.lead, node.raw)
+
+
+def _lib_field(lib_node, name):
+    """The library's own Reference/Value field, if it has one.
+
+    Its position, layer and text size are the footprint author's choice - a
+    value text stuck at a guessed offset lands on top of the pads and DRC says
+    so (63 warnings on the first board this tool built). So it is copied, not
+    invented; only the text is replaced later.
+    """
+    for kind in ("property", "fp_text"):
+        for node in S.children(lib_node, kind):
+            if (S.arg_text(node, 1) or "") in (name, name.lower()):
+                return node
+    return None
+
+
+def _field_node(name, value, x, y_up, sp, seed, template=None, size=None):
+    """A Reference/Value field spelled the way this board file expects."""
+    at = B.at(x, y_up, 0)
+    layer = B.L(B.A("layer"), B.A("F.SilkS", True))
+    effects = B.L(B.A("effects"), B.L(B.A("font"), B.size(1, 1)))
+    if template is not None:
+        t_at = S.child(template, "at")
+        t_layer = S.child(template, "layer")
+        t_effects = S.child(template, "effects")
+        if t_at is not None:
+            at = _copy_node(t_at)
+        if t_layer is not None:
+            layer = _copy_node(t_layer)
+        if t_effects is not None:
+            effects = _copy_node(t_effects)
+    if size:
+        font = S.child(effects, "font")
+        if font is None:
+            font = B.L(B.A("font"))
+            effects.items.append(font)
+        node = S.child(font, "size")
+        if node is None:
+            font.items.append(B.size(float(size), float(size)))
+        else:
+            node.items[1].text = B.num(float(size))
+            node.items[2].text = B.num(float(size))
+    if sp.modern:
+        return B.L(B.A("property"), B.A(name, True), B.A(value, True),
+                   at, layer, sp.id_node(B.new_id(seed)), effects)
+    return B.L(B.A("fp_text"), B.A(name.lower()), B.A(value, True), at,
+               layer, sp.id_node(B.new_id(seed)), effects)
+
+def _set_font_size(node, size):
+    """Force a field's font size, adding `(size ...)` when the field has none.
+
+    A field copied from the library keeps the position the footprint author
+    chose, but `field_size` is the caller's decision: applying it only on the
+    invented-field path made the argument silently do nothing whenever the
+    library already carried a Reference/Value (measured, not assumed).
+    """
+    effects = S.child(node, "effects")
+    if effects is None:
+        effects = B.L(B.A("effects"))
+        node.items.append(effects)
+    font = S.child(effects, "font")
+    if font is None:
+        font = B.L(B.A("font"))
+        effects.items.append(font)
+    existing = S.child(font, "size")
+    if existing is None:
+        font.items.append(B.size(float(size), float(size)))
+    else:
+        existing.items[1].text = B.num(float(size))
+        existing.items[2].text = B.num(float(size))
+
+def _set_field(fp, name, value, x, y_up, sp, seed, template=None, size=None):
+    """Replace an existing Reference/Value field in place, keeping its position."""
+    for kind in ("property", "fp_text"):
+        for node in S.children(fp, kind):
+            if S.arg_text(node, 1) in (name, name.lower()) and len(node.items) > 2:
+                node.items[2] = B.A(value, True)
+                if size:
+                    _set_font_size(node, size)
+                return node
+    node = _field_node(name, value, x, y_up, sp, seed, template=template, size=size)
+    S.append_child(fp, node)
+    return node
+
+def _run_add_footprint(ed, o, seed):
+    ref = _str(o, "ref")
+    for node in ed.footprints():
+        if ed.footprint_ref(node) == ref:
+            raise OpError("reference %r is already on this board" % ref,
+                          "REFERENCE_EXISTS")
+    x = _num(o, "x")
+    y = _num(o, "y")
+    rot = _num(o, "rot", required=False, default=0)
+    layer = _str(o, "layer", required=False, default="F.Cu")
+    if layer not in ("F.Cu", "B.Cu"):
+        raise OpError("a footprint sits on F.Cu or B.Cu, not %r" % layer,
+                      "LAYER_NOT_ALLOWED")
+    ed.require_layer(layer)
+    lib_node, info = _read_footprint_source(o)
+    lib_id = o.get("lib_id") or "%s:%s" % (info["library"], info["name"])
+    value = o.get("value") or info["name"]
+    pads = _pad_numbers(lib_node)
+    if not pads:
+        raise OpError("%s has no pads - that is not a placeable footprint"
+                      % os.path.basename(info["path"]), "ARG_INVALID")
+
+    pad_nets = o.get("pad_nets") or {}
+    if not isinstance(pad_nets, dict):
+        raise OpError("pad_nets must be an object {pad number: net name}",
+                      "ARG_INVALID")
+    unknown = sorted(set(pad_nets) - set(pads))
+    if unknown:
+        raise OpError("pad_nets names pad(s) %s that %s does not have (it has %d: %s)"
+                      % (", ".join(unknown), info["name"], len(set(pads)),
+                         ", ".join(sorted(set(pads))[:20])), "PAD_NOT_FOUND")
+
+    allowed = _FOOTPRINT_TOKENS if not ed.sp.modern else _NO_LIMIT
+    body = []
+    dropped = []
+    for child in lib_node.items[1:]:
+        if isinstance(child, S.Atom):
+            # the library footprint's own name atom: the header already took its
+            # name from lib_id, and a second one is a syntax error
+            continue
+        if S.head(child) in _FOOTPRINT_DROP:
+            continue
+        if S.head(child) in ("property", "fp_text") \
+                and S.arg_text(child, 1) in ("Reference", "Value"):
+            continue
+        if allowed is not None and S.head(child) not in allowed:
+            # a token this board format does not define. Dropping it is a loss,
+            # so it is reported rather than quietly swallowed.
+            if S.head(child) not in dropped:
+                dropped.append(S.head(child))
+            continue
+        body.append(child)
+
+    # A back-side footprint is stored mirrored: KiCad writes `180 - angle` here
+    # (measured against a file KiCad itself flipped). The angle the caller asks
+    # for is the front-side angle; the number in the file is its mirror.
+    file_rot = (180.0 - float(rot)) % 360.0 if layer == "B.Cu" else float(rot)
+    node = B.L(B.A("footprint"), B.A(lib_id, True))
+    node.items.append(B.L(B.A("layer"), B.A(layer, True)))
+    node.items.append(ed.sp.id_node(B.new_id("%s:%s" % (seed, ref))))
+    node.items.append(B.at(x, y, file_rot))
+    node.items.extend(body)
+
+    # Field positions inside a footprint are **relative to the footprint**, not
+    # board coordinates - KiCad's own files show `(property "Reference" (at 0
+    # -3.6 ...))` for a part sitting at 149 mm. Writing board coordinates here
+    # parked the reference 20 mm away from the part.
+    field_size = o.get("field_size")
+    if field_size is not None:
+        field_size = _num(o, "field_size", required=False)
+        if field_size <= 0:
+            raise OpError("field_size must be > 0 mm", "ARG_INVALID")
+    _set_field(node, "Reference", ref, 0.0, 2.5, ed.sp, "%s:ref" % ref,
+               template=_lib_field(lib_node, "Reference"), size=field_size)
+    _set_field(node, "Value", value, 0.0, -2.5, ed.sp, "%s:val" % ref,
+               template=_lib_field(lib_node, "Value"), size=field_size)
+
+    # Pad nets: an explicit map, applied to pads that exist. A pad the map does
+    # not name stays net-less (unconnected) and DRC reports it - that is the
+    # truth, not a blank.
+    # A pad's `(at dx dy angle)` angle in a .kicad_pcb is **absolute**, while its
+    # position is relative to the footprint. Copying a library pad verbatim into
+    # a rotated footprint therefore leaves the pad pointing the old way - on the
+    # USB connector that made five 0.4 x 1.35 mm pads 0.65 mm apart overlap by
+    # 0.7 mm, which DRC reported as a short. So the rotation is added here.
+    if layer == "B.Cu":
+        _flip_body(node, rot)
+    elif rot:
+        for pad in S.children(node, "pad"):
+            _rotate_pad(pad, rot)
+        # Field angles are stored **absolute** too (a library field says 0, a
+        # footprint rotated 90 must say 90). Leaving them at 0 turns a vertical
+        # label horizontal, and on the 1x20 headers that stuck 4 mm out of the
+        # board edge.
+        for kind in ("fp_text", "property"):
+            for field in S.children(node, kind):
+                at = S.child(field, "at")
+                if at is not None:
+                    _set_angle(at, (S.arg_num(at, 3, 0.0) or 0.0) + rot)
+
+    assigned = {}
+    for pad in S.children(node, "pad"):
+        number = S.arg_text(pad, 1) or ""
+        for old in list(S.children(pad, "net")):
+            pad.items.remove(old)
+        if number in pad_nets:
+            net_name = pad_nets[number]
+            if not isinstance(net_name, str) or not net_name:
+                raise OpError("pad_nets[%r] must be a net name" % number, "ARG_INVALID")
+            code = ed.net_code(net_name, allow_create=_bool(o, "create_nets", False))
+            pad.items.append(B.L(B.A("net"), B.A(code), B.A(net_name, True)))
+            assigned[number] = [code, net_name]
+    ed.append(node)
+    return {"reference": ref, "lib_id": lib_id, "at": [x, y, rot],
+            "rotation_in_file": file_rot,
+            "layer": layer, "pads": len(pads), "pad_numbers": sorted(set(pads)),
+            "nets_assigned": assigned, "source": info["path"],
+            "dropped_for_this_board_format": dropped}
+
+_LAYER_FLIP = {
+    "F.Cu": "B.Cu", "F.SilkS": "B.SilkS", "F.Mask": "B.Mask",
+    "F.Paste": "B.Paste", "F.CrtYd": "B.CrtYd", "F.Fab": "B.Fab",
+    "F.Adhes": "B.Adhes", "F.User": "B.User",
+}
+_LAYER_FLIP.update({v: k for k, v in list(_LAYER_FLIP.items())})
+# layers that mean "both sides" never flip
+_LAYER_BOTH = (".Cu", ".Mask", ".Paste", ".SilkS")
+
+
+def _set_angle(node, value):
+    """Write the angle argument of an `(at x y angle)` / `(center ...)` node."""
+    value = float(value) % 360.0
+    if abs(value) < 1e-9:
+        value = 0.0
+    if len(node.items) > 3:
+        node.items[3].text = B.num(value)
+    else:
+        node.items.append(B.A(B.num(value)))
+
+
+def _mirror_justify(effects):
+    """Make text render mirrored - what KiCad writes for back-side text."""
+    for node in S.children(effects, "justify"):
+        if not any(isinstance(it, S.Atom) and it.text == "mirror"
+                   for it in node.items[1:]):
+            node.items.append(B.A("mirror"))
+        return
+    S.append_child(effects, B.L(B.A("justify"), B.A("mirror")))
+
+
+def _flip_body(node, rot):
+    """Turn a front-side library body into a back-side one, the way KiCad does.
+
+    This is measured, not reasoned: a footprint flipped by KiCad itself (KiCad
+    10.0 `pcbnew.FOOTPRINT.Flip(pos, False)`, then saved) writes
+
+      * footprint `(at x y ang)` with `ang = 180 - ang`, layer B.Cu
+      * every pad `(at dx dy padang)` with **dy negated** and
+        `padang = 180 - (padang + ang)`, layers B.Cu/B.Mask/B.Paste
+      * every graphic point (`start`/`end`/`center`/`mid`/`xy`) with dy negated
+      * text (`fp_text`/`property`) with dy negated, angle = the new footprint
+        angle, and `(justify mirror)` in its effects
+
+    Copying a front body onto B.Cu without this writes a part that KiCad still
+    draws on the front - DRC then reports its pads shorting against whatever is
+    really on the front at those coordinates.
+    """
+    back = (180.0 - float(rot)) % 360.0
+
+    def neg_y(seq):
+        if len(seq.items) > 2:
+            seq.items[2].text = B.num(-(S.arg_num(seq, 2, 0.0)))
+
+    def one(child, in_pad):
+        head = S.head(child) if isinstance(child, S.Seq) else None
+        if head == "layer":
+            name = S.arg_text(child, 1)
+            if name in _LAYER_FLIP:
+                child.items[1].text = _LAYER_FLIP[name]
+        elif head == "layers":
+            for item in child.items[1:]:
+                if isinstance(item, S.Atom) and item.text in _LAYER_FLIP:
+                    item.text = _LAYER_FLIP[item.text]
+        elif head in ("start", "end", "center", "mid", "xy"):
+            neg_y(child)
+            if head == "center":
+                _set_angle(child, back)
+        elif head == "at":
+            local = S.arg_num(child, 3, 0.0) or 0.0
+            neg_y(child)
+            if in_pad:
+                _set_angle(child, 180.0 - (float(local) + float(rot)))
+            else:
+                _set_angle(child, back)
+        elif head == "effects":
+            _mirror_justify(child)
+            for sub in child.items[1:]:
+                one(sub, in_pad)
+        elif isinstance(child, S.Seq):
+            child_pad = (head == "pad") or in_pad
+            for sub in child.items[1:]:
+                one(sub, child_pad)
+
+    # The footprint's own header tokens (its `at`, `layer`, `uuid`, ...) belong
+    # to this operation, not to the library: mirroring them would move the part
+    # to a different place and rename the side back to the front.
+    for child in node.items[1:]:
+        if isinstance(child, S.Seq) and S.head(child) in _FOOTPRINT_DROP:
+            continue
+        one(child, False)
+
+
+def _rotate_pad(pad, rot):
+    """Add `rot` degrees to a pad's stored angle (see the caller for why)."""
+    at = S.child(pad, "at")
+    if at is None:
+        return
+    angle = S.arg_num(at, 3, 0.0) or 0.0
+    _set_angle(at, float(angle) + float(rot))
+
+
+def _verify_add_footprint(ed, o):
+    ref = _str(o, "ref")
+    x = _num(o, "x")
+    y = _num(o, "y")
+    rot = _num(o, "rot", required=False, default=0)
+    lib_node, info = _read_footprint_source(o)
+    want_pads = _pad_numbers(lib_node)
+    pad_nets = o.get("pad_nets") or {}
+    try:
+        fp = ed.footprint(ref)
+    except OpError as exc:
+        return {"ok": False, "error": str(exc)}
+    problems = []
+    at = S.child(fp, "at")
+    got = [S.arg_num(at, 1, 0.0), -S.arg_num(at, 2, 0.0),
+           S.arg_num(at, 3) or 0.0] if at is not None else [None, None, None]
+    if abs((got[0] or 0.0) - x) > 1e-6 or abs((got[1] or 0.0) - y) > 1e-6:
+        problems.append("position is %r, wanted %r" % (got[:2], [x, y]))
+    # On the back side the file stores the mirrored angle, so 180 - rot is as
+    # correct as rot itself.
+    wanted = [float(rot) % 360.0, (180.0 - float(rot)) % 360.0]
+    have = (got[2] or 0.0) % 360.0
+    if all(abs(have - w) > 1e-6 for w in wanted):
+        problems.append("rotation is %r, wanted %r" % (got[2], rot))
+    got_pads = _pad_numbers(fp)
+    if sorted(got_pads) != sorted(want_pads):
+        problems.append("pads are %r, the library has %r"
+                        % (sorted(set(got_pads)), sorted(set(want_pads))))
+    wrong = {}
+    for pad in S.children(fp, "pad"):
+        number = S.arg_text(pad, 1) or ""
+        net = S.child(pad, "net")
+        got_name = S.arg_text(net, 2) if net is not None else None
+        want_name = pad_nets.get(number)
+        if (got_name or None) != (want_name or None):
+            wrong[number] = [want_name, got_name]
+    if wrong:
+        problems.append("pad nets differ: %r" % (wrong,))
+    return {"ok": not problems, "problems": problems, "pads": len(got_pads),
+            "at": got}
+
+op("add_footprint", {"copper", "silk", "meta"},
+   "Place one footprint from a library, embedding its body and assigning pad nets. "
+   "The body (pads, drills, silk) comes from the .kicad_mod, never from this "
+   "server; reference, position, rotation, value and the pad->net map are the "
+   "arguments. A pad the map does not name stays net-less, and DRC says so.",
+   {"ref": "reference designator", "x": "mm", "y": "mm", "rot": "deg",
+    "library": ".pretty directory (with `name`), or `footprint_file` (.kicad_mod)",
+    "name": "footprint name inside the .pretty",
+    "footprint_file": "one .kicad_mod, instead of library+name",
+    "lib_id": "optional Library:Name override",
+    "value": "optional Value field (default: the footprint name)",
+    "layer": "F.Cu (default) or B.Cu",
+    "pad_nets": "{pad number: net name}",
+    "field_size": "mm - shrink/grow the Reference and Value text (default: the library's own size)",
+    "create_nets": "bool - allow new nets (default false: a typo must not make a net)"},
+   _run_add_footprint, _verify_add_footprint)
+
+# --- placement --------------------------------------------------------
 def _run_move_footprint(ed, o, seed):
     ref = _str(o, "ref")
     fp = ed.footprint(ref)
@@ -1092,17 +1532,21 @@ def validate(op):
                       % (name, ", ".join(sorted(OPS))), "OP_UNKNOWN")
     return name
 
-def run_all(doc, ops, seed_base="op"):
+def run_all(doc, ops, seed_base="op", index_offset=0):
     """Run every operation on `doc` (a private copy). Returns one record per op.
 
     Raises OpError on the first failure, naming the index: a plan is
     all-or-nothing, so a half-applied board is never a plan.
+
+    ``index_offset`` keeps the generated ids a function of (seed_base, absolute
+    operation index) rather than of where a batch starts, which is what lets a
+    stepped write produce the same bytes as a one-shot write.
     """
     ed = Editor(doc)
     records = []
     for idx, op in enumerate(ops):
         name = validate(op)
-        seed = "%s:%d" % (seed_base, idx)
+        seed = "%s:%d" % (seed_base, idx + index_offset)
         try:
             detail = OPS[name]["run"](ed, op, seed) or {}
         except OpError as exc:
