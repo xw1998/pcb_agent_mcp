@@ -9,6 +9,80 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.20] - 2026-10-29
+
+「磁件层补上开关频率看得见的那一半」——上一批做完了**导体**损耗（`feedline`），
+这一批做**绕组**损耗：新增 `magnetics_winding_ac`，用 Dowell 一维解把 DCR 换成
+开关频率处的 `R_ac/R_dc`。工具数 **144 → 145**，用例 1428 → **1451**，
+`--selftest` 仍 **95/95**。推导、第二解与读数写在 `docs/27` §27.16。
+
+### 闭式与那条最容易抄错的项
+
+```
+F_R = D·(sinh2D + sin2D)/(cosh2D − cos2D)
+    + (2/3)(m²−1)·D·(sinhD − sinD)/(coshD + cosD)
+D   = h / δ_skin
+```
+
+**两项都带 `D`。** 漏掉第二项的 `D` 是最常见的转录错误，而且 `D = 1` 时两种写法
+**逐位相同**，所以低频/单层自测完全看不出来。本批第一版就漏了：`D = 8`、`m = 2`
+时给出 10 而真值是 24。是被第二解抓出来的。
+
+### 第二解：逐层精确 ODE，而不是再推一遍级数
+
+所有层串联 ⇒ 每层 MMF 落差分相同；第 i 层 H 从 `(i/m)H0` 到 `((i+1)/m)H0`，
+层内 `h(x) = Hl·cosh(gx) + B·sinh(gx)`、`g = (1+j)/δ`，损耗 `(1/(2σ))∫|J|²dx` 求积。
+**不含 `sinh2D + sin2D` 这一段**，与闭式是不同推导。`m ∈ {1,2,3,4,8}` ×
+`D ∈ {0.2,0.5,1,2,4,8}` 共 30 格，最大相对偏差 **< 1e-4**。另加两个解析极限：
+`D→0` → 1、`D≫1` → `D(2m²+1)/3`（后者可由表面阻抗 `P = (Rs/2)Σ[(k−1)²+k²]` 独立推出）。
+
+两次失败尝试（一维 FD、传输矩阵）留在 `_scratch/` 作反例：根因是气隙内 `H` 恒定、
+界面处 `dH/dx` **允许跳变**（`dH/dx = J`，气隙里 J = 0），所以「给两个边界条件」
+必然抹平拐点，得到 1/3 或 1/9 级的错答案；正确约束是「每层落差分相同」。
+
+### 圆线：两个取法差 30 % 以上，不替调用方选
+
+Dowell 的等价箔有两种通行取法 —— 面积等价 `h_eq = (π/4)d²/p`（DC 逐位相同）、
+孔隙率修正 `D = (h_eq/δ)·√η`（`η = h_eq/p`）。0.4 mm 线 / 0.5 mm 节距 / 2 层 /
+100 kHz：**1.815 与 1.219**。默认两个都返回（`fr_area_equivalent` /
+`fr_porosity_corrected` / `round_wire_bracket` / `reported`），`porosity_corrected=true`
+才把 `fr` 换成修正式 —— 不是舍入误差就不该由库来选边。
+
+### 温度只经电阻率进入，且两个方向都进测试
+
+`ρ(120 °C) = 2.4015e-8` ⇒ `δ` 从 208.97 涨到 246.64 µm ⇒ `D` 变小 ⇒
+**`F_R` 反而降**（1.00465 → 1.0114，同几何）；同时 `R_ac` 本身**升**。
+两条断言并列，防止把前者读成「更凉」。
+
+### 八种拒绝 + 一条必须点名的漏项
+
+`ARG_RANGE`（`freq_hz<=0`、`layers<1` 或 `>64`、`wire_diameter_mm>pitch_mm`、
+`dc_resistance_ohm<=0`、`turns<1`、`mean_length_mm<=0`）、
+`ARG_INVALID`（同时给 `thickness_mm` 与 `wire_diameter_mm`、`shape=foil` 且
+`turns≠layers`、同时给 `temperature_c` 与 `resistivity_ohm_m`、未知 `shape`）、
+`ARG_MISSING`（`shape=round` 缺 `pitch_mm`、只给 `turns` 或只给 `mean_length_mm`）。
+
+`not_modelled` 里**必须**有点名 `fringing`：有气隙电感里气隙边缘场常是最大的
+交流绕组损耗，而 Dowell 的 1-D 场**原理上看不见**它。不写会让 `F_R = 1.02`
+被当成「绕组不热」。同列表还含 `litz`（无股间模型）与 `interleaved`（本实现按
+连续层叠算，不描述交错绕法带来的场抵消）。
+
+### 落地
+
+- `calc/magnetics.py`：新增 `winding_ac_resistance(...)` + `_dowell_fr(layers, delta)`，
+  常量 `COPPER_RESISTIVITY_OHM_M` / `COPPER_TEMPCO_PER_K` / `WINDING_SHAPES`；
+  输出 `skin_depth_um` / `equivalent_foil_mm` / `delta_eq` / `fr` / `fr_own_field` /
+  `fr_proximity` / `fr_terms_add_up` / `r_ac_over_r_dc` / `reported` / `not_modelled`，
+  可选欧姆回算（`dc_resistance_ohm` 直给，或 `turns` + `mean_length_mm` 几何回算）。
+- `tools.py`：新增 `magnetics_winding_ac`（注册在 `magnetics_core_loss` 之后，`layers` 用
+  `_num` —— 本文件没有 `_int`）；`calc_capabilities` 的 magnetics 段去掉「no AC winding
+  resistance」，改写为「Dowell 1-D 不算场解 / 无气隙边缘场 / 无 litz 股模型」。
+- `tests/test_winding_ac.py`（新增 23 例）：独立逐层 ODE 解 30 格 < 1e-4、两个解析极限、
+  两项相加且 ≥1、对 D 与 m 单调、m=1 时 prox 恰为 0、读数形状、温度两方向、圆线 bracket、
+  八种拒绝、工具接线。
+- `docs/27` §27.16（含 27.16.1~27.16.5）+ §27.14.8 DCR 条目追加 + §27.15 测试表行与计数。
+- `README.md`：工具数 145、目录树注释、工具行、「没有逐行进表」清单。
+
 ## [0.0.19] - 2026-10-29
 
 「仿真层的物理深度」——上一批留下的下一个动作：把 `feedline` 的导体损耗从

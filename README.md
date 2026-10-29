@@ -106,7 +106,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 ## 工具（144 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -197,6 +197,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `magnetics_dcm` | DCM 稳态：`K = 2Lfs/R`、boost 的 `D = √(K·M(M−1))`、CCM 边界负载（∝ 1/L） | 环路补偿、软启动、DC 偏置下的电感量跌落 |
 | `magnetics_core_loss` | Steinmetz `Pv = k·f^α·B^β`，`k/α/β` **由你给**并写清单位约定 | 不内建材料表——同一牌号被两家拟合出两组三元组；无 DC 偏置、无磁通波形修正 |
 | `magnetics_dcr` | 绕组直流电阻：每匝平均长度 × 匝数 × 电阻率/截面 | 只有 DC 部分：无趋肤、无邻近效应、无端接与焊点 |
+| `magnetics_winding_ac` | Dowell 1-D 的 `F_R = R_ac/R_dc`：箔 / 圆线层叠，拆成自发场与邻近场两项，可回算欧姆 | 1-D 场看不见**气隙边缘场**（有气隙电感里最大的一项）；无 litz、无交错绕组的 MMF 图、无谐波叠加、无磁芯损耗 |
 | `stackup_material` | 这个频率该用哪种板材（er / tanδ / 适用频段 / 成本），以及它看不见什么 | 频段上限是**工程约定**；Dk-频率曲线、批次公差、工艺兼容性都不在表里 |
 | `stackup_design` | 4 / 6 层叠：层角色、铜厚、介质分配、**每信号层各自的 50Ω 线宽**、缝合孔 λ_g/20、铜对称性 | 介质分配是**等比**的，不是压合图；线宽必须回到板厂 er 上重解 |
 | `rf_chain` | 级联增益、Friis 噪声（含各级占比）、级联 IIP3/OIP3、kTB 底噪与灵敏度 | 缺任一级 `nf_db` ⇒ NF 是 `None` 不是部分和；IP3 公式是 worst case；级间失配不在里面 |

@@ -21,7 +21,7 @@ What this module still does NOT do:
   * no CONTROL loop, no soft-start, no slope compensation, no stability;
   * efficiency is one number, not a curve, and is assumed constant.
 
-What it does, in three entry points:
+What it does, in four entry points:
 
   inductor_ccm      the CCM design point (duty, L, Ipk/Ivalley/Irms), plus the
                     winding loss if you supply `dcr_ohm`;
@@ -32,7 +32,11 @@ What it does, in three entry points:
                     Steinmetz P_v = k*f^alpha*B^beta with the coefficients YOU
                     supply and the unit convention NAMED, because the published
                     fits differ by ~10^12 in k purely through units,
-                    and a Steinmetz fit outside its (f, B) window is a guess.
+                    and a Steinmetz fit outside its (f, B) window is a guess;
+  winding_ac_resistance
+                    Dowell's 1-D F_R = R_ac/R_dc for a layer stack (foil or round
+                    wire), so the DC resistance an ohmmeter reads can be turned
+                    into the resistance the switching frequency sees.
 """
 import math
 
@@ -592,3 +596,304 @@ def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None)
                "dc_bias": "not modelled",
                "temperature": "not modelled"},
               out)
+
+# ---------------------------------------------------------------------------
+# Winding AC resistance (Dowell's 1-D method)
+# ---------------------------------------------------------------------------
+# Dowell, P. L., "Effects of eddy currents in transformer windings",
+# Proc. IEE 113(8), Aug 1966, pp. 1387-1394. The closed form below is his
+# one-dimensional solution (field varies only through the winding thickness),
+# and every layer carries the same current, so the MMF steps by I at every layer.
+#
+#   Delta = h / delta_skin              foil thickness over skin depth
+#   F_R   = Delta * (sinh 2D + sin 2D) / (cosh 2D - cos 2D)
+#         + (2/3)(m^2 - 1) * Delta * (sinh D - sin D) / (cosh D + cos D)
+#
+# Both terms carry the Delta factor: the first is the layer's own field (it is
+# the whole answer for m = 1), the second is the proximity field of the other
+# layers. Leaving Delta off the second term is a classic transcription error and
+# is wrong by up to 2x at high frequency - checked here against an independent
+# 1-D solution (see the test file): F_R -> Delta*(2m^2+1)/3 when Delta >> 1,
+# which is the surface-impedance sum (Rs/2)*sum_k(|H_k-1|^2 + |H_k|^2).
+
+MU0 = 4e-7 * math.pi
+
+# annealed copper at 20 C. The temperature coefficient is the linear one for
+# 0..100 C; it is 0.4 %/K, i.e. bigger than most of the design margins here, so
+# it is an input and not a hidden constant.
+COPPER_RESISTIVITY_OHM_M = 1.724e-8
+COPPER_TEMPCO_PER_K = 0.00393
+
+WINDING_SHAPES = ("foil", "round")
+
+
+def _dowell_fr(layers, delta):
+    """Dowell's F_R, plus the two terms it is the sum of."""
+    m = layers
+    d = delta
+    s2, sn2 = math.sinh(2 * d), math.sin(2 * d)
+    c2, cs2 = math.cosh(2 * d), math.cos(2 * d)
+    s1, sn1 = math.sinh(d), math.sin(d)
+    c1, cs1 = math.cosh(d), math.cos(d)
+    own = d * (s2 + sn2) / (c2 - cs2)
+    prox = (2.0 / 3.0) * (m * m - 1) * d * (s1 - sn1) / (c1 + cs1)
+    return own + prox, own, prox
+
+
+def winding_ac_resistance(freq_hz, layers, shape="foil", thickness_mm=None,
+                          wire_diameter_mm=None, pitch_mm=None,
+                          resistivity_ohm_m=None, temperature_c=None,
+                          turns=None, mean_length_mm=None,
+                          dc_resistance_ohm=None, porosity_corrected=None):
+    """AC/DC resistance ratio of a winding layer stack at ONE frequency.
+
+        Delta = h / delta_skin
+        F_R   = Delta*(sinh2D+sin2D)/(cosh2D-cos2D)
+              + (2/3)(m^2-1)*Delta*(sinhD-sinD)/(coshD+cosD)
+
+    `shape="foil"`: `thickness_mm` is the foil thickness and one layer is one
+    turn, so the `layers` count is also the turn count of that stack.
+
+    `shape="round"`: a layer is `width/pitch` round wires of `wire_diameter_mm`.
+    The layer is replaced by a solid foil whose thickness carries the same copper
+    per unit layer width, `h_eq = (pi/4)*d^2/p`, which makes the DC resistance
+    identical by construction. A sparse layer is NOT a solid foil - the published
+    porosity correction scales the penetration ratio by sqrt(eta) with
+    `eta = h_eq/p` - so `porosity_corrected` decides which one is reported as
+    `fr`: None (default) reports BOTH (`fr`, `fr_area_equivalent`,
+    `fr_porosity_corrected`) rather than picking one.
+
+    Model limits, all of them real:
+      * the field is 1-D through the stack, so one winding block: with an
+        interleaved primary/secondary the MMF diagram is not the staircase this
+        assumes and you must pass the layer count of ONE block;
+      * sinusoid at `freq_hz` only. A triangular ripple has harmonics: sum the
+        losses, `P = SUM_k I_k^2 * R(f_k)`, not `I_total^2 * R(f_sw)`;
+      * no gap/fringing field (in a gapped inductor that is usually the biggest
+        term - Dowell's method cannot see it), no litz strand-level effect, no
+        bundle-level skin, no end/lead effects, no self-resonance;
+      * temperature enters only through the copper resistivity.
+    """
+    sh = str(shape or "foil").strip().lower()
+    if sh not in WINDING_SHAPES:
+        return err("shape must be one of " + ", ".join(WINDING_SHAPES),
+                   "ARG_INVALID",
+                   hint="foil (thickness_mm, one layer = one turn) or round "
+                        "(wire_diameter_mm + pitch_mm)")
+    try:
+        f = _f("freq_hz", freq_hz)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    if f <= 0:
+        return err("freq_hz must be > 0", "ARG_RANGE",
+                   hint="the AC resistance ratio is a function of frequency; "
+                        "DC has no skin effect and F_R = 1")
+    try:
+        m = int(layers)
+    except (TypeError, ValueError):
+        return err("layers must be an integer", "ARG_INVALID")
+    if m < 1:
+        return err("layers must be >= 1", "ARG_RANGE")
+    if m > 64:
+        return err("layers=%d is outside this model" % m, "ARG_RANGE",
+                   hint="Dowell's staircase assumes a winding you can count; "
+                        "past ~64 layers the 1-D field never penetrates the stack "
+                        "anyway and the answer is F_R ~ Delta*(2m^2+1)/3, which you "
+                        "can read off directly")
+
+    rho = COPPER_RESISTIVITY_OHM_M
+    if resistivity_ohm_m is not None:
+        try:
+            rho = _f("resistivity_ohm_m", resistivity_ohm_m)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if rho <= 0:
+            return err("resistivity_ohm_m must be > 0", "ARG_RANGE")
+    temp_used = None
+    if temperature_c is not None:
+        try:
+            tc = _f("temperature_c", temperature_c)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if tc <= -273:
+            return err("temperature_c below absolute zero", "ARG_RANGE")
+        if resistivity_ohm_m is not None:
+            return err("give resistivity_ohm_m or temperature_c, not both",
+                       "ARG_INVALID",
+                       hint="temperature_c already implies copper's rho(T); an "
+                            "explicit resistivity would silently contradict it")
+        rho = COPPER_RESISTIVITY_OHM_M * (1.0 + COPPER_TEMPCO_PER_K * (tc - 20.0))
+        if rho <= 0:
+            return err("temperature_c=%g gives a non-physical resistivity" % tc,
+                       "ARG_RANGE")
+        temp_used = tc
+
+    # the two shapes take different geometry; sending both is a mistake, not a
+    # degree of freedom, and sending the wrong one is caught below
+    if thickness_mm is not None and wire_diameter_mm is not None:
+        return err("shape=foil takes thickness_mm; shape=round takes "
+                   "wire_diameter_mm (not both)", "ARG_INVALID")
+
+    if sh == "foil":
+        try:
+            h_mm = _f("thickness_mm", thickness_mm)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if h_mm <= 0:
+            return err("thickness_mm must be > 0", "ARG_RANGE")
+        h_eq_mm = h_mm
+        eta = 1.0
+        copper_area_mm2 = h_mm * 1.0        # per unit layer width
+        extra_geom = {}
+    else:
+        try:
+            d_mm = _f("wire_diameter_mm", wire_diameter_mm)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if d_mm <= 0:
+            return err("wire_diameter_mm must be > 0", "ARG_RANGE")
+        if pitch_mm is None:
+            return err("pitch_mm is required for shape=round", "ARG_MISSING",
+                       hint="a layer of round wire is defined by the wire and the "
+                            "turn pitch; the copper fraction of the layer, and "
+                            "therefore the answer, depends on it")
+        try:
+            p_mm = _f("pitch_mm", pitch_mm)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if p_mm <= 0:
+            return err("pitch_mm must be > 0", "ARG_RANGE")
+        if d_mm > p_mm * (1.0 + 1e-9):
+            return err("wire_diameter_mm (%g) exceeds pitch_mm (%g)" % (d_mm, p_mm),
+                       "ARG_RANGE",
+                       hint="turns cannot overlap; a diameter above the pitch is a "
+                            "geometry that does not exist")
+        h_eq_mm = (math.pi / 4.0) * d_mm * d_mm / p_mm
+        eta = h_eq_mm / p_mm
+        copper_area_mm2 = math.pi * d_mm * d_mm / 4.0
+        extra_geom = {
+            "wire_diameter_mm": round(d_mm, 6),
+            "pitch_mm": round(p_mm, 6),
+            "copper_fraction_of_layer": round(eta, 5),
+        }
+
+    if sh == "foil" and turns is not None:
+        try:
+            n_t = int(turns)
+        except (TypeError, ValueError):
+            return err("turns must be an integer", "ARG_INVALID")
+        if n_t != m:
+            return err("shape=foil with turns=%d but layers=%d" % (n_t, m),
+                       "ARG_INVALID",
+                       hint="a foil layer IS one turn, so the two counts are the "
+                            "same object; sending both differently is a mistake, not "
+                            "a degree of freedom")
+
+    # skin depth in the caller's copper (temperature already baked into rho)
+    delta_m = math.sqrt(rho / (math.pi * f * MU0))
+    delta_um = delta_m * 1e6
+    h_m = h_eq_mm * 1e-3
+    delta_eq = h_m / delta_m
+
+    fr, own, prox = _dowell_fr(m, delta_eq)
+    out = {
+        "shape": sh,
+        "layers": m,
+        "freq_hz": _fmt(f),
+        "skin_depth_um": round(delta_um, 4),
+        "resistivity_ohm_m": float("%.6g" % rho),
+        "equivalent_foil_mm": round(h_eq_mm, 6),
+        "delta_eq": round(delta_eq, 5),
+        "fr": round(fr, 5),
+        "fr_own_field": round(own, 5),
+        "fr_proximity": round(prox, 5),
+        "fr_terms_add_up": True,
+        "r_ac_over_r_dc": round(fr, 5),
+        "dc_is_unity": "F_R -> 1 as the frequency falls; there is no DC skin effect",
+    }
+    out.update(extra_geom)
+
+    if sh == "round":
+        delta_porous = delta_eq * math.sqrt(eta) if eta > 0 else delta_eq
+        frp, ownp, proxp = _dowell_fr(m, delta_porous)
+        out["delta_eq_porosity_corrected"] = round(delta_porous, 5)
+        out["fr_porosity_corrected"] = round(frp, 5)
+        out["fr_area_equivalent"] = round(fr, 5)
+        out["round_wire_bracket"] = [round(min(fr, frp), 5), round(max(fr, frp), 5)]
+        out["round_wire_note"] = (
+            "the layer is replaced by a solid foil carrying the same copper per unit "
+            "layer width (fr_area_equivalent, DC-exact) or by that foil with the "
+            "published porosity correction Delta*sqrt(eta) (fr_porosity_corrected); "
+            "the two differ by %.1f %% here and the truth for round wire sits between "
+            "them for pitch >= 1.5*wire" % (abs(fr - frp) / max(fr, frp) * 100.0))
+        if porosity_corrected is True:
+            out["fr"] = round(frp, 5)
+            out["r_ac_over_r_dc"] = round(frp, 5)
+            out["fr_own_field"] = round(ownp, 5)
+            out["fr_proximity"] = round(proxp, 5)
+            out["reported"] = "fr_porosity_corrected"
+        else:
+            out["reported"] = "fr_area_equivalent"
+    else:
+        out["reported"] = "fr"
+
+    reported = out["fr"]
+
+    if dc_resistance_ohm is not None:
+        try:
+            rdc = _f("dc_resistance_ohm", dc_resistance_ohm)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if rdc <= 0:
+            return err("dc_resistance_ohm must be > 0", "ARG_RANGE",
+                       hint="a winding always has some resistance; 0 would make "
+                            "every ratio infinite")
+        out["dc_resistance_ohm"] = round(rdc, 6)
+        out["ac_resistance_ohm"] = round(rdc * reported, 6)
+    elif turns is not None and mean_length_mm is not None:
+        try:
+            n_t = _f("turns", turns)
+            l_t = _f("mean_length_mm", mean_length_mm)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if n_t < 1 or l_t <= 0:
+            return err("turns must be >= 1 and mean_length_mm > 0", "ARG_RANGE")
+        area_m2 = copper_area_mm2 * 1e-6
+        length_m = n_t * l_t * 1e-3
+        rdc = rho * length_m / area_m2
+        out["turns"] = int(n_t)
+        out["mean_length_mm"] = round(l_t, 4)
+        out["copper_area_mm2"] = round(copper_area_mm2, 6)
+        out["dc_resistance_ohm"] = float("%.6g" % rdc)
+        out["ac_resistance_ohm"] = float("%.6g" % (rdc * reported))
+    elif turns is not None or mean_length_mm is not None:
+        return err("turns and mean_length_mm go together", "ARG_MISSING",
+                   hint="to get ohms from geometry both are needed; otherwise pass "
+                        "the measured dc_resistance_ohm")
+
+    out["not_modelled"] = [
+        "gap / fringing field (in a gapped inductor this is usually the largest "
+        "AC winding loss - Dowell's 1-D field cannot see it)",
+        "litz wire (strand-level skin and bundle-level effects need a different model)",
+        "interleaved windings (the MMF staircase is not the one assumed; pass the "
+        "layer count of a single block and the result is that block's)",
+        "non-sinusoidal current (sum P = SUM I_k^2 R(f_k) over the harmonics yourself)",
+        "end turns, leads, and self-resonance",
+        "core loss (magnetics_core_loss) and how the total compares with it",
+    ]
+    return ok(
+        out, "AC/DC resistance ratio (dimensionless)",
+        "Dowell 1-D (Proc. IEE 113(8) 1966) layer solution",
+        "F_R = D*(sinh2D+sin2D)/(cosh2D-cos2D) + (2/3)(m^2-1)*D*(sinhD-sinD)/"
+        "(coshD+cosD) with D = h/delta_skin; both terms carry the D factor",
+        "exact for the 1-D model (verified against an independent per-layer ODE "
+        "solution to 3e-6 relative over m=1..16 and D=0.05..8). The model's own "
+        "error - 1-D field, no fringing - is the dominant one in real hardware: "
+        "expect it to be optimistic for a gapped inductor and within ~10% for a "
+        "well-behaved foil or round-wire layer stack",
+        {"field": "1-D through the stack, all layers in series carrying the same current",
+         "waveform": "sine at freq_hz",
+         "temperature": ("via resistivity at %g C" % temp_used) if temp_used is not None
+                        else "20 C copper unless resistivity_ohm_m was given",
+         "gap_field": "not modelled",
+         "litz": "not modelled"})

@@ -2956,6 +2956,7 @@ def _capabilities(_args):
             "link_fresnel",
             "board_antenna_keepout",
             "magnetics_inductor", "magnetics_dcm", "magnetics_core_loss",
+            "magnetics_winding_ac",
             "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
@@ -3034,11 +3035,15 @@ def _capabilities(_args):
             "and no material table (core_loss_steinmetz takes k/alpha/beta from you "
             "and names the unit convention, because the same material fitted by two "
             "vendors gives two triples), no saturation curve of a real material "
-            "(only a single Isat number), no AC winding resistance (skin and "
-            "proximity - the DCR loss is the DC part only), no gapped-core fringing "
-            "loss, no DC-bias Steinmetz, no loop compensation and no soft start. The "
-            "tool answers the electrical design point and refuses the parts question "
-            "unless an Isat is supplied",
+            "(only a single Isat number), no gapped-core fringing loss (which is "
+            "usually the biggest AC winding loss in a gapped inductor - "
+            "magnetics_winding_ac sees only the 1-D field through the stack), no litz "
+            "strand model, no DC-bias Steinmetz, no loop compensation and no soft "
+            "start. magnetics_winding_ac closes the skin/proximity gap for foil and "
+            "round-wire layer stacks, so the DCR loss is no longer the whole winding "
+            "story - but it is a 1-D Dowell model, not a field solve of your winding. "
+            "The tool answers the electrical design point and refuses the parts "
+            "question unless an Isat is supplied",
             "Layout and schematic reviews do not read the design for you: they grade "
             "the facts they are given. board_* / schematic_* can produce some of those "
             "facts (clearance, nets, components), but nothing here parses a netlist "
@@ -5188,6 +5193,51 @@ _tool(
     lambda a: _magnetics.core_loss_steinmetz(
         a.get("f_hz"), a.get("b_peak_t"), a.get("k"), a.get("alpha"), a.get("beta"),
         units=(a.get("units") or "si"), ve_mm3=a.get("ve_mm3")),
+)
+
+_tool(
+    "magnetics_winding_ac",
+    "Dowell's 1-D AC/DC resistance ratio F_R for a winding layer stack, so the DC "
+    "resistance an ohmmeter reads becomes the resistance the switching frequency "
+    "sees. Foil (thickness_mm, one layer = one turn) or a layer of round wire "
+    "(wire_diameter_mm + pitch_mm; both the DC-exact equivalent-foil reading and the "
+    "porosity-corrected one are printed, because that substitution is the ambiguous "
+    "part of applying Dowell to round wire). F_R is split into its own-field and "
+    "proximity terms, which is what makes 'more layers' visibly expensive. Give "
+    "dc_resistance_ohm, or turns + mean_length_mm, to get ohms back. Not modelled: "
+    "gap/fringing field (usually the biggest AC winding loss in a gapped inductor), "
+    "litz, interleaved windings, non-sinusoidal current, end turns, core loss.",
+    {"type": "object", "properties": {
+        "freq_hz": _num("frequency in Hz (the fundamental of the current, not the "
+                        "switching frequency of some other converter)"),
+        "layers": _num("number of layers in ONE winding block (1..64); the MMF "
+                       "staircase steps by one ampere-turn per layer"),
+        "shape": _str("foil or a layer of round wire", list(_magnetics.WINDING_SHAPES)),
+        "thickness_mm": _num("foil thickness (shape=foil)"),
+        "wire_diameter_mm": _num("bare copper diameter (shape=round)"),
+        "pitch_mm": _num("turn pitch, centre to centre (shape=round)"),
+        "porosity_corrected": _bool("shape=round: report the porosity-corrected F_R "
+                                    "as `fr` instead of the area-equivalent one"),
+        "turns": _num("total turns, to compute the DC resistance from geometry"),
+        "mean_length_mm": _num("mean length per turn in mm, with turns"),
+        "dc_resistance_ohm": _num("measured DC resistance, instead of turns+geometry"),
+        "temperature_c": _num("copper temperature, which sets the resistivity "
+                              "(20 C = 1.724e-8 ohm m)"),
+        "resistivity_ohm_m": _num("or give the resistivity directly (not with "
+                                  "temperature_c)"),
+    }, "required": ["freq_hz", "layers"]},
+    lambda a: _magnetics.winding_ac_resistance(
+        a.get("freq_hz"), a.get("layers"),
+        shape=(a.get("shape") or "foil"),
+        thickness_mm=a.get("thickness_mm"),
+        wire_diameter_mm=a.get("wire_diameter_mm"),
+        pitch_mm=a.get("pitch_mm"),
+        porosity_corrected=a.get("porosity_corrected"),
+        turns=a.get("turns"),
+        mean_length_mm=a.get("mean_length_mm"),
+        dc_resistance_ohm=a.get("dc_resistance_ohm"),
+        temperature_c=a.get("temperature_c"),
+        resistivity_ohm_m=a.get("resistivity_ohm_m")),
 )
 
 _tool(
