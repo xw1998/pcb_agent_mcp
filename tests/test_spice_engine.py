@@ -447,22 +447,23 @@ class TestRealEngine(unittest.TestCase):
             r["verified_against_engine"],
             any(t in v.lower() for t in spice.VERIFIED_ENGINES), v)
 
-    def test_a_subckt_hierarchy_that_the_builtin_refuses_does_run(self):
+    def test_a_subckt_hierarchy_runs_on_both_engines(self):
+        # 0.0.27 flattened .subckt/X in the builtin parser, so this deck is no
+        # longer the "pass-through only" example: both engines now solve it on
+        # their own, and the internal node keeps the name ngspice itself prints
+        # (x1.m) - which is what turns cross_check into a real comparison here
         b = spice.simulate(SUBCKT)
-        self.assertEqual(b["status"], "error")
-        self.assertEqual(b["reason_code"], "NETLIST_INVALID")
-        self.assertIn(".subckt", b["message"])
-        r = spice.simulate(SUBCKT, engine="ngspice")
+        self.assertEqual(b["status"], "ok", b)
+        bn = (b.get("value") or {}).get("nodes_v") or {}
+        self.assertLess(abs(bn.get("1", 0.0) - 10.0), 1e-9)
+        self.assertLess(abs(bn.get("x1.m", 0.0) - 5.0), 1e-6, bn)
+        r = spice.simulate(SUBCKT, engine="ngspice", cross_check=True)
         self.assertEqual(r["status"], "ok", r)
-        # honest labelling: our own parser refused this deck, the engine did not
-        self.assertFalse(r["netlist_parsed"])
-        self.assertIn(".subckt", r["netlist_parse_note"])
-        n = (r.get("value") or {}).get("nodes_v") or {}
-        self.assertLess(abs(n.get("1", 0.0) - 10.0), 1e-9)
-        # the internal node of the instance is half the divider: 5 V
-        inner = [k for k in n if k.startswith("x1.")]
-        self.assertEqual(len(inner), 1, n)
-        self.assertLess(abs(n[inner[0]] - 5.0), 1e-6, n)
+        self.assertTrue(r["netlist_parsed"])
+        self.assertNotIn("netlist_parse_note", r)
+        cross = r["cross_check"]
+        self.assertGreaterEqual(cross["compared_nodes"], 2, cross)
+        self.assertLess(cross["max_abs_diff_v"], 1e-6, cross)
 
     def test_behavioural_source_that_the_builtin_refuses_does_run(self):
         b = spice.simulate(BSOURCE)

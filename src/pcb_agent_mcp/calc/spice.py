@@ -21,6 +21,12 @@ What is solved
 Devices: R, C, L, V, I (DC / PULSE / SIN / PWL / AC), E (VCVS), G (VCCS),
 D (Shockley), Q (Ebers-Moll injection), M (Shichman-Hodges level 1).
 
+Hierarchy: `.subckt` / `.ends` with X instances, numeric parameters and `{...}`
+arithmetic on them. Instances are FLATTENED before the solver sees them, and the
+internal nodes keep the `<instance>.<local>` names ngspice uses in its rawfile,
+so `cross_check=True` compares the same node on both engines instead of quietly
+finding nothing in common.
+
 Why a dense solver: a PCB-level circuit is 10..300 nodes. Dense LU with partial
 pivoting is O(n^3) but branch-count independent and has no fill-in heuristics to
 get wrong; at 300 nodes it is ~10 ms. Sparse storage would be the wrong trade
@@ -32,6 +38,7 @@ Honesty rules kept from the rest of this server:
   sanity-checked without re-deriving it;
 * `.model` parameters that were defaulted are listed in `defaulted_models`.
 """
+import ast
 import cmath
 import math
 
@@ -53,7 +60,6 @@ NOT_IMPLEMENTED_CARDS = {
     "K": "coupled inductors / mutual inductance",
     "S": "voltage-controlled switch",
     "W": "current-controlled switch",
-    "X": "subcircuit instance (.subckt hierarchy)",
     "B": "behavioural source (arbitrary expressions)",
     "T": "lossless transmission line",
     "O": "lossy transmission line",
@@ -139,6 +145,10 @@ def _value(text):
 
 
 def _node(name):
+    # None is already the global ground; str(None) would be the node named "None",
+    # which is exactly the kind of quiet wrong answer this module refuses to make
+    if name is None:
+        return None
     n = str(name).strip()
     return None if n.lower() in GROUND_NAMES else n
 
@@ -149,8 +159,9 @@ def parse_netlist(text):
     """Parse the subset. Returns a spec dict; raises ValueError on anything it
     does not implement, with the line number, rather than skipping it."""
     spec = {"title": "", "elements": [], "models": {}, "analyses": [],
-            "options": {}}
+            "options": {}, "subckts": {}}
     lines = str(text or "").splitlines()
+    sub = None
     for lineno, raw in enumerate(lines, 1):
         line = raw.split(";")[0].split("$")[0].strip()
         if line.startswith("*") or line == "":
@@ -158,8 +169,48 @@ def parse_netlist(text):
                 spec["title"] = line[1:].strip()
             continue
         low = line.lower()
+        if sub is not None:
+            # inside a .subckt body: only elements and .model are meaningful, and
+            # ".ends" is checked BEFORE ".end" (which would otherwise match it)
+            if low.startswith(".ends"):
+                if sub["name"] in spec["subckts"]:
+                    raise ValueError("line %d: .subckt %r is already defined on "
+                                     "line %d"
+                                     % (lineno, sub["name"],
+                                        spec["subckts"][sub["name"]]["lineno"]))
+                spec["subckts"][sub["name"]] = sub
+                sub = None
+                continue
+            if low.startswith(".subckt"):
+                raise ValueError("line %d: a .subckt inside another .subckt is not "
+                                 "implemented here (ngspice has no nested "
+                                 "definitions either); move it to the top level"
+                                 % lineno)
+            if low.startswith(".model"):
+                _parse_model(sub, line, lineno)
+                continue
+            if low == ".end":
+                raise ValueError("line %d: .end reached while .subckt %r is still "
+                                 "open (a missing .ends, not a stray directive)"
+                                 % (lineno, sub["name"]))
+            if low.startswith("."):
+                raise ValueError("line %d: directive %r inside .subckt %r is not "
+                                 "implemented here"
+                                 % (lineno, line.split()[0], sub["name"]))
+            sub["elements"].append(_parse_element(sub, line, lineno))
+            continue
+        if low.startswith(".ends"):
+            raise ValueError("line %d: .ends without a .subckt" % lineno)
+        if low.startswith(".subckt"):
+            sub = _parse_subckt(line, lineno)
+            continue
         if low.startswith(".end"):
             break
+        if low.startswith(".param"):
+            raise ValueError("line %d: .param is not implemented here; parameters "
+                             "exist only on .subckt definitions and on their X "
+                             "instances, where the value is actually in scope"
+                             % lineno)
         if low.startswith(".model"):
             _parse_model(spec, line, lineno)
             continue
@@ -194,6 +245,11 @@ def parse_netlist(text):
                              % (lineno, line.split()[0]))
         el = _parse_element(spec, line, lineno)
         spec["elements"].append(el)
+    if sub is not None:
+        raise ValueError(".subckt %r is never closed by .ends" % sub["name"])
+    # Subcircuit instances become plain elements here, before anything downstream
+    # (model reference check, node table, solver) looks at the element list.
+    _expand_instances(spec)
     if not spec["analyses"]:
         spec["analyses"].append({"kind": "op"})
     # .model cards may come after the instances that use them, so the reference
@@ -212,6 +268,260 @@ def parse_netlist(text):
                              % (el.get("lineno", 0), el["name"],
                                 "/".join(want), model, kind))
     return spec
+
+
+# ------------------------------------------------------------------ subcircuits
+
+SUBCKT_MAX_DEPTH = 32
+
+# Only these five operators exist. Anything else is refused by name, because a
+# half-implemented expression language produces plausible wrong answers, which is
+# the one thing this module is built not to do.
+_EXPR_OPS = {ast.Add: lambda a, b: a + b,
+             ast.Sub: lambda a, b: a - b,
+             ast.Mult: lambda a, b: a * b,
+             ast.Div: lambda a, b: a / b,
+             ast.Pow: lambda a, b: a ** b}
+
+
+def _value_or_expr(tok, lineno):
+    """A number, or a ``{...}`` expression kept for later.
+
+    A subcircuit's parameters are not in scope at its definition, so the value
+    has no answer yet; it becomes one when an instance supplies (or defaults)
+    them.
+    """
+    t = str(tok).strip()
+    if len(t) > 2 and t.startswith("{") and t.endswith("}"):
+        return ("expr", t[1:-1].strip())
+    try:
+        return _value(t)
+    except ValueError:
+        raise ValueError("line %d: %r is neither a number nor a {…} expression"
+                         % (lineno, t))
+
+
+def _eval_expr(text, env, where):
+    """Evaluate ``{...}`` with a whitelisted AST, never with eval()."""
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        raise ValueError("%s: %r is not a valid expression" % (where, text))
+
+    def walk(node):
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.Constant):
+            v = node.value
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError("%s: only numbers are allowed in %r"
+                                 % (where, text))
+            return float(v)
+        if isinstance(node, ast.Name):
+            key = node.id.lower()
+            if key not in env:
+                raise ValueError("%s: %r is not a parameter in scope here (%s)"
+                                 % (where, node.id,
+                                    ", ".join(sorted(env)) if env else "none"))
+            return env[key]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op,
+                                                       (ast.UAdd, ast.USub)):
+            v = walk(node.operand)
+            return v if isinstance(node.op, ast.UAdd) else -v
+        if isinstance(node, ast.BinOp) and type(node.op) in _EXPR_OPS:
+            a, b = walk(node.left), walk(node.right)
+            if isinstance(node.op, ast.Div) and b == 0.0:
+                raise ValueError("%s: division by zero in %r" % (where, text))
+            if isinstance(node.op, ast.Pow) and abs(b) > 64:
+                raise ValueError("%s: exponent %g is out of range in %r"
+                                 % (where, b, text))
+            try:
+                return _EXPR_OPS[type(node.op)](a, b)
+            except OverflowError:
+                raise ValueError("%s: %r overflows" % (where, text))
+        raise ValueError("%s: %r uses %s, which is not implemented here (only "
+                         "+ - * / ** on numbers and parameters)"
+                         % (where, text, type(node).__name__))
+
+    out = walk(tree)
+    if not isinstance(out, float) or out != out or out in (float("inf"),
+                                                           float("-inf")):
+        raise ValueError("%s: %r does not evaluate to a finite number"
+                         % (where, text))
+    return out
+
+
+def _resolve_value(val, env, where):
+    """A number in scope: either already numeric, or ``{...}`` evaluated here."""
+    if isinstance(val, tuple):
+        return _eval_expr(val[1], env, where)
+    return float(val)
+
+
+def _parse_subckt(line, lineno):
+    """.subckt NAME p1 p2 ... [PARAMS:] k=v ...
+
+    Pins come first and parameters after: a pin name containing "=" is not a pin,
+    and accepting a parameter before the pins would make "which token is a node"
+    depend on luck.
+    """
+    parts = line.split()
+    if len(parts) < 2:
+        raise ValueError("line %d: .subckt needs a name" % lineno)
+    name = parts[1].strip().lower()
+    pins = []
+    params = {}
+    for tok in parts[2:]:
+        low = tok.lower()
+        if low in ("params:", "params"):
+            continue
+        if "=" in tok:
+            key, val = tok.split("=", 1)
+            params[key.strip().lower()] = _value_or_expr(val.strip(), lineno)
+            continue
+        if params:
+            raise ValueError("line %d: pin %r comes after a parameter in .subckt "
+                             "%r; pins must come first" % (lineno, tok, name))
+        pins.append(tok)
+    return {"name": name, "pins": pins, "params": params, "elements": [],
+            "models": {}, "lineno": lineno}
+
+
+def _parse_instance(parts, name, lineno):
+    """X<name> n1 n2 ... <subckt> [param=value ...]
+
+    The subcircuit name is the LAST token that is not a parameter. That is the
+    only place SPICE puts it; picking the token that happens to match a known
+    subcircuit name would turn a typo into a silently different circuit.
+    """
+    overrides = {}
+    tail = []
+    for tok in parts[1:]:
+        if tok.lower() in ("params:", "params"):
+            continue
+        if "=" in tok:
+            key, val = tok.split("=", 1)
+            overrides[key.strip().lower()] = _value_or_expr(val.strip(), lineno)
+            continue
+        tail.append(tok)
+    if len(tail) < 2:
+        raise ValueError("line %d: %s needs at least one node and a subcircuit "
+                         "name" % (lineno, name))
+    return {"type": "X", "name": name, "lineno": lineno,
+            "nodes": tuple(tail[:-1]), "sub": tail[-1].strip().lower(),
+            "overrides": overrides}
+
+
+def _expand_instances(spec):
+    """Flatten every X instance into plain elements.
+
+    Subcircuits are the one construct that cannot be handled where it is read (a
+    definition may come after its use, and X bodies are definitions themselves),
+    so this runs once the whole file is in hand.
+
+    Internal nodes are named ``<instance path>.<local name>`` in lower case, which
+    is also how ngspice names them in its rawfile: that is what makes
+    ``cross_check=True`` compare the same node on both engines instead of finding
+    nothing in common and calling it a day. Element names get the same prefix, so
+    two instances of one subcircuit cannot collide.
+    """
+    out = []
+    for el in spec["elements"]:
+        if el["type"] != "X":
+            out.append(el)
+            continue
+        out.extend(_instantiate(spec, el, el["name"].lower(), {}, (), 0))
+    spec["elements"] = out
+    for el in spec["elements"]:
+        for key in ("value", "gain"):
+            if isinstance(el.get(key), tuple):
+                raise ValueError("line %d: %s has a {…} value with no subcircuit "
+                                 "parameter scope in effect"
+                                 % (el.get("lineno", 0), el["name"]))
+
+
+def _instantiate(spec, el, path, caller_env, stack, depth):
+    """One instance -> its subcircuit's elements, renamed and parameterised."""
+    where = "line %d" % (el.get("lineno") or 0)
+    sub = spec["subckts"].get(el["sub"])
+    if sub is None:
+        raise ValueError("%s: %s instantiates subcircuit %r, which is not defined "
+                         "(defined: %s)"
+                         % (where, el["name"], el["sub"],
+                            ", ".join(sorted(spec["subckts"])) or "none"))
+    if el["sub"] in stack:
+        raise ValueError("%s: subcircuit %r instantiates itself (%s)"
+                         % (where, el["sub"],
+                            " -> ".join(list(stack) + [el["sub"]])))
+    if depth >= SUBCKT_MAX_DEPTH:
+        raise ValueError("%s: subcircuit %r nests deeper than %d levels"
+                         % (where, el["sub"], SUBCKT_MAX_DEPTH))
+    if len(el["nodes"]) != len(sub["pins"]):
+        raise ValueError("%s: %s gives %d node(s) to subcircuit %r, which has %d "
+                         "pin(s) (%s)"
+                         % (where, el["name"], len(el["nodes"]), el["sub"],
+                            len(sub["pins"]), " ".join(sub["pins"]) or "none"))
+    env = {}
+    for key, val in sub["params"].items():
+        env[key] = _resolve_value(val, caller_env,
+                                  "%s (.subckt %s default %s)"
+                                  % (where, el["sub"], key))
+    for key, val in el["overrides"].items():
+        if key not in sub["params"]:
+            raise ValueError("%s: %s sets parameter %r, which .subckt %r does not "
+                             "declare (%s)"
+                             % (where, el["name"], key, el["sub"],
+                                ", ".join(sorted(sub["params"])) or "none"))
+        env[key] = _resolve_value(val, caller_env,
+                                  "%s (%s %s)" % (where, el["name"], key))
+    pin_map = {}
+    for pin, actual in zip(sub["pins"], el["nodes"]):
+        # a pin tied to a ground name collapses to the one global ground, exactly
+        # like a top-level node called 0 does
+        pin_map[pin.strip().lower()] = _node(actual)
+
+    def mapped(node):
+        if node is None:
+            return None
+        low = str(node).lower()
+        if low in pin_map:
+            return pin_map[low]
+        return "%s.%s" % (path, low)
+
+    out = []
+    for body in sub["elements"]:
+        copy = dict(body)
+        # lower case throughout: internal node names are what ngspice prints in
+        # its rawfile (x9.x1.m), and a name that differs only by case compares as
+        # "no node in common" instead of a mismatch
+        copy["name"] = "%s.%s" % (path, body["name"].lower())
+        copy["nodes"] = tuple(mapped(n) for n in body["nodes"])
+        if body.get("ctrl"):
+            copy["ctrl"] = tuple(mapped(n) for n in body["ctrl"])
+        if copy["type"] == "X":
+            copy["overrides"] = dict(
+                (k, _resolve_value(v, env, "%s (%s %s)"
+                                   % (where, copy["name"], k)))
+                for k, v in body["overrides"].items())
+            out.extend(_instantiate(spec, copy, copy["name"], env,
+                                    tuple(stack) + (el["sub"],), depth + 1))
+            continue
+        for key in ("value", "gain"):
+            if key in copy:
+                copy[key] = _resolve_value(copy[key], env,
+                                           "%s (%s %s)"
+                                           % (where, copy["name"], key))
+        if "model" in copy:
+            if copy["model"] in sub["models"]:
+                full = "%s.%s" % (path, copy["model"])
+                if full not in spec["models"]:
+                    spec["models"][full] = sub["models"][copy["model"]]
+                copy["model"] = full
+            # a model name that is not defined inside the subcircuit is a GLOBAL
+            # .model: left alone on purpose, and the deferred reference check
+            # still has to find it at the top level
+        out.append(copy)
+    return out
 
 
 def _parse_model(spec, line, lineno):
@@ -255,28 +565,30 @@ def _parse_element(spec, line, lineno):
 
     if letter == "R":
         return {"type": "R", "name": name, "nodes": (_node(parts[1]), _node(parts[2])),
-                "value": _value(val(3, "resistance"))}
+                "value": _value_or_expr(val(3, "resistance"), lineno)}
     if letter == "C":
         el = {"type": "C", "name": name, "nodes": (_node(parts[1]), _node(parts[2])),
-              "value": _value(val(3, "capacitance")), "ic": None}
+              "value": _value_or_expr(val(3, "capacitance"), lineno), "ic": None}
         for p in low[4:]:
             if p.startswith("ic="):
                 el["ic"] = _value(p.split("=", 1)[1])
         return el
     if letter == "L":
         el = {"type": "L", "name": name, "nodes": (_node(parts[1]), _node(parts[2])),
-              "value": _value(val(3, "inductance")), "ic": None}
+              "value": _value_or_expr(val(3, "inductance"), lineno), "ic": None}
         for p in low[4:]:
             if p.startswith("ic="):
                 el["ic"] = _value(p.split("=", 1)[1])
         return el
     if letter in ("V", "I"):
         return _parse_source(parts, low, name, letter, lineno)
+    if letter == "X":
+        return _parse_instance(parts, name, lineno)
     if letter in ("E", "G"):
         return {"type": letter, "name": name,
                 "nodes": (_node(parts[1]), _node(parts[2])),
                 "ctrl": (_node(parts[3]), _node(parts[4])),
-                "value": _value(val(5, "gain"))}
+                "value": _value_or_expr(val(5, "gain"), lineno)}
     if letter == "D":
         model = val(3, "model name").lower()
         return {"type": "D", "name": name, "lineno": lineno,
@@ -917,7 +1229,11 @@ PRECISION = (
 )
 
 NOT_COMPUTED = [
-    "subcircuits (.subckt), hierarchical netlists",
+    "top-level .param, and .subckt parameters that are not plain numbers or "
+    "{+ - * / **} arithmetic on numbers and parameters (no functions, no node "
+    "references, no expressions in .model parameters)",
+    "a .subckt nested inside another .subckt, and any directive other than "
+    ".model inside a .subckt body",
     "current-controlled sources (F/H), switches (S/W), JFETs, coupled inductors (K)",
     "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss",
     "BEHAVIOURAL sources (B), Laplace blocks, arbitrary expressions",

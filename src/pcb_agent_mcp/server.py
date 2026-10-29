@@ -1548,6 +1548,68 @@ def selftest():
           "single-ended kind stays bit-identical when spacing_mm is passed anyway",
           _ok1 and _ok2, str(_nf.get("reason_code")))
 
+
+
+    # .subckt / X: the builtin parser flattens hierarchy itself since 0.0.27. The
+    # checks are (a) the answer is the hand-computed divider, (b) the internal node
+    # keeps the name ngspice prints, and (c) NOT_COMPUTED no longer claims
+    # subcircuits are missing - the last one is the honesty half.
+    _sub = ("* div\n.subckt div a b\nR1 a m 1k\nR2 m b 1k\n.ends\n"
+            "V1 1 0 10\nX1 1 0 div\n.op\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 135, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _sub}}})
+    _sb = json.loads(r["result"]["content"][0]["text"])
+    _sn = (_sb.get("value") or {}).get("nodes_v") or {}
+    _nc = " ".join(_sb.get("not_computed") or [])
+    check("a .subckt divider is flattened by the builtin solver: the tap lands on "
+          "5.000 V at the node name ngspice itself prints (x1.m), and the honesty "
+          "list no longer claims hierarchy is missing",
+          _sb.get("status") == "ok"
+          and abs(_sn.get("x1.m", 0.0) - 5.0) < 1e-6
+          and abs(_sn.get("1", 0.0) - 10.0) < 1e-9
+          and "subcircuits (.subckt), hierarchical netlists" not in _nc
+          and ".param" in _nc,
+          "x1.m %s" % _sn.get("x1.m"))
+
+    # A parameter that is parsed but never reaches the element is the failure this
+    # pair is built to catch: the override must MOVE the answer, and two instances
+    # of one subcircuit must stay two separate networks.
+    _sub2 = ("* div with params\n.subckt div a b params: r2=1k\nR1 a m 1k\n"
+             "R2 m b {r2}\n.ends\nV1 1 0 9\nX1 1 0 div\nX2 1 0 div r2=3k\n"
+             ".op\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 136, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _sub2}}})
+    _p = json.loads(r["result"]["content"][0]["text"])
+    _pn = (_p.get("value") or {}).get("nodes_v") or {}
+    _v1 = _pn.get("x1.m", 0.0)
+    _v2 = _pn.get("x2.m", 0.0)
+    check("a subcircuit parameter reaches the element (9/2 = 4.5 V default vs "
+          "9*3/4 = 6.75 V overridden) and the two instances are separate networks",
+          _p.get("status") == "ok"
+          and abs(_v1 - 4.5) < 1e-6 and abs(_v2 - 6.75) < 1e-6,
+          "default %s, override %s" % (_v1, _v2))
+
+    # Refusals: a recursive definition and a top-level .param card are errors with
+    # the reason named - not a deck that "runs" with the card quietly skipped.
+    _cyc = ("* cycle\n.subckt a p q\nX1 p q b\n.ends\n.subckt b p q\nX1 p q a\n"
+            ".ends\nV1 1 0 1\nX9 1 0 a\n.op\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 137, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _cyc}}})
+    _cy = json.loads(r["result"]["content"][0]["text"])
+    r = handle({"jsonrpc": "2.0", "id": 138, "method": "tools/call",
+                "params": {"name": "sim_spice",
+                           "arguments": {"netlist": ".param r=1k\nV1 1 0 1\n"
+                                                   "R1 1 0 r\n.op\n.end\n"}}})
+    _pp = json.loads(r["result"]["content"][0]["text"])
+    check("a recursive .subckt and a top-level .param are refused with the reason "
+          "named (NETLIST_INVALID), never run with the card skipped",
+          _cy.get("status") == "error" and _cy.get("reason_code") == "NETLIST_INVALID"
+          and "instantiates itself" in (_cy.get("message") or "")
+          and _pp.get("status") == "error"
+          and _pp.get("reason_code") == "NETLIST_INVALID"
+          and ".param is not implemented here" in (_pp.get("message") or ""),
+          str(_pp.get("reason_code")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

@@ -260,9 +260,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.26
-python run_server.py --selftest      # 协议级自检，111/111（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问）
-python -m unittest discover -s tests # 1583 个用例（约 12 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.27
+python run_server.py --selftest      # 协议级自检，114/114（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问）
+python -m unittest discover -s tests # 1610 个用例（约 11 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -414,10 +414,19 @@ MCP 客户端配置（stdio）：
 ### 仿真层：全是子集，边界写在每个返回里
 
 - **SPICE 只做子集，而且是按名字拒绝的。** `sim_spice` 真解非线性方程（MNA + 牛顿 + pnjlim +
-  gmin 向下步进），器件卡只认 `R C L V I E G D Q M`；`X F H K S W B T O U A` 十一类一律
+  gmin 向下步进），器件卡只认 `R C L V I E G D Q M`；`F H K S W B T O U A` 十类一律
   `UNSUPPORTED_CARD` 并点名，而不是跳过——**一半跑完的网表比拒答更危险**。瞬态是后向欧拉
   （不是梯形），AC 先解工作点再只覆盖雅可比。`not_computed` 每一条都写清：没有自热、没有器件
   电容/迁移率/击穿随温度、没有噪声/失真/傅里叶分析。
+- **`.subckt` 归内置管了，而且是拍平不是新求解器。** `0.0.27` 起内置 `sim_spice` 自己展开
+  `.subckt/.ends` 与 `X` 实例：内部节点名照抄 ngspice 的 `<实例>.<本地>` 小写（嵌套
+  `x9.x1.m`），所以 `cross_check` 的节点配对是真的——不然「0 个共同节点」会被读成「一致」。
+  参数在调用者作用域求值（`{+ - * / **}` 的 `ast` 白名单，函数与节点引用按名字拒绝），
+  子电路内 `.model` 加实例前缀、全局模型不被复制，接地引脚塌成唯一全局地。自证不靠
+  ngspice：同一电路手写平铺后逐节点比，`x1.m` 与平铺 `mid` 差 < 1e-12。边界写进
+  `not_computed`（顶层 `.param`、表达式函数、嵌套 `.subckt`）。浮空岛两引擎分歧
+  （内置 0 V 对 ngspice 2.5 V，`gmin` 约定不同）**登记而不是修掉**——手写平铺 deck 上
+  分歧幅度逐位相同（2.501057919），证明它与层次无关。
 - **"只做子集"不是懒，是零依赖约束下的唯一诚实解。** 完整 SPICE（ngspice 约 50 万行 C，
   ahkab/PySpice 要 numpy/scipy）没有"抄进 stdlib 就能用"的形态，所以 0.0.7 加的是**可选委派**：
   `engine="auto"` 在 PATH / `PCB_AGENT_NGSPICE` 找到 ngspice 就把 deck 原样交给它（只过滤分析卡），
@@ -427,7 +436,7 @@ MCP 客户端配置（stdio）：
   ngspice-47**（MSYS2 构建解包到 `%LOCALAPPDATA%\ngspice-47\`，外部二进制不是仓库依赖）并对着
   金标网表实测：分压 5e-9 V、二极管 0.35 mV、BJT 17.8 mV（模型差异）、RC 阶跃与 RLC AC 逐位相同，
   所以 `verified_against_engine` **按版本**给 true（`VERIFIED_ENGINES`，别的版本回落 false）。
-  装了引擎才拿到的能力是**未解析 deck 直通**：`.subckt/X`、`B`、`T` 等内置按名字拒绝的卡在
+  装了引擎才拿到的能力是**未解析 deck 直通**：`B`、`T`、`O`、`U`、`A` 等内置按名字拒绝的卡在（`.subckt/X` 自 `0.0.27` 起内置自己拍平就能跑，不再需要引擎）
   `engine="ngspice"` 下照跑，节点表从 rawfile 读，信封带 `netlist_parsed:false` 而**不假装**
   这是一次完整解析；同一 deck 走 `builtin` 仍然拒绝。`simulate()` 默认引擎是 `builtin`
   （`engine="auto"` 才用引擎）——默认值不能让同一网表在两台机器给出不同答案。
@@ -618,10 +627,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1583 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1610 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~32，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~33，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
