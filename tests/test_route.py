@@ -423,5 +423,304 @@ class TestCopperKeepsOffTheBoardEdge(RouteBase):
                                 "copper came out %.4f mm from Edge.Cuts while the "
                                 "rule asked for 0.1 mm" % got)
 
+class TestCreepageIsNeverInvented(RouteBase):
+    """Creepage is a standard lookup, not a board-file property.
+
+    The rule this class defends: the router either applies the number the caller
+    measured off the standard, or applies none and says so. It never translates
+    "0.2 mm of electrical clearance" into "0.2 mm of creepage", because those are
+    two different rules that happen to share a ruler.
+    """
+
+    def test_no_creepage_requested_means_no_creepage_applied(self):
+        bundle = R.resolve(self.load())
+        self.assertIsNone(bundle["creepage_mm"])
+        self.assertEqual(bundle["creepage_pairs"], [])
+        self.assertIn("never invented", bundle["sources"]["creepage"])
+        self.assertEqual([a["fact"] for a in bundle["assumed"]], ["edge_clearance"])
+        self.assertAlmostEqual(R.creepage(bundle, "A", "B"), 0.0, places=9)
+        self.assertAlmostEqual(R.pair_spacing(bundle, "A", "B"), 0.2, places=6)
+
+    def test_the_stricter_of_clearance_and_creepage_wins(self):
+        bundle = R.resolve(self.load(), clearance_mm=0.2, creepage_mm=1.0,
+                           creepage_pairs=[{"a": "A", "b": "B", "mm": 2.0}])
+        self.assertAlmostEqual(bundle["creepage_mm"], 1.0, places=6)
+        self.assertEqual(bundle["sources"]["creepage"], "caller")
+        self.assertAlmostEqual(R.pair_spacing(bundle, "A", "B"), 2.0, places=6)
+        self.assertAlmostEqual(R.pair_spacing(bundle, "B", "A"), 2.0, places=6)
+        self.assertAlmostEqual(R.pair_spacing(bundle, "A", "C"), 1.0, places=6)
+        # a pair rule never narrows a board-wide one, and vice versa
+        self.assertAlmostEqual(R.creepage(bundle, "C", "D"), 1.0, places=6)
+
+    def test_a_creepage_that_is_not_a_distance_is_refused(self):
+        for val in (0, -0.5, "wide"):
+            with self.assertRaises(R.RulesError) as ctx:
+                R.resolve(self.load(), creepage_mm=val)
+            self.assertEqual(ctx.exception.reason_code, "RULES_INVALID")
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(self.load(), creepage_pairs=[{"a": "A", "b": "A",
+                                                    "mm": 1.0}])
+        self.assertEqual(ctx.exception.reason_code, "RULES_INVALID")
+
+    def test_the_tool_refuses_a_pair_string_it_cannot_parse(self):
+        for bad in ("A:B", "A:B:narrow", "A:A:1.0"):
+            out = self.call(nets=["SIG"], creepage_pairs=bad)
+            self.assertEqual(out["status"], "error", bad)
+            self.assertEqual(out["reason_code"], "RULES_INVALID", bad)
+
+class TestCreepageReachesBothEnds(RouteBase):
+    """A creepage rule is only real if it stops the search AND the judge.
+
+    Only the raster and the search plans inside the band the exact check then
+    rejects ("the raster is not the judge"); only the exact check and the answer
+    depends on a 0.05 mm cell being drawn where nobody measured.
+    """
+
+    def _board_with_a_pad(self):
+        board = self.load()
+        board.footprints.append({"ref": "U1", "pads": [], "graphics": []})
+        return board
+
+    def _pad(self):
+        # 1.0 mm square of net A; its copper edge is at x = 30.5, y = 20.0
+        return {"kind": "pad", "net": "A", "layers": ["F.Cu"], "ref": "U1.1",
+                "poly": [(30.0, 20.5), (30.5, 20.5), (30.5, 19.5), (30.0, 19.5)]}
+
+    def test_the_band_widens_with_creepage(self):
+        board = self._board_with_a_pad()
+        tight = GRID.Grid(board, ["F.Cu"], 0.05, R.resolve(board))
+        tight.add_copper(self._pad())
+        near = tight.node(31.1, 20.0)          # 0.6 mm from the pad's copper
+        self.assertTrue(tight.free(near[0], near[1], "F.Cu", "B"))
+
+        wide = R.resolve(board, creepage_mm=1.0)
+        grid = GRID.Grid(board, ["F.Cu"], 0.05, wide)
+        grid.add_copper(self._pad())
+        self.assertFalse(grid.free(near[0], near[1], "F.Cu", "B"),
+                         "1.0 mm of creepage was asked for and a cell 0.6 mm from "
+                         "the copper was still free to the search")
+        far = grid.node(31.8, 20.0)            # 1.3 mm out: outside every margin
+        self.assertTrue(grid.free(far[0], far[1], "F.Cu", "B"))
+        self.assertTrue([n for n in grid.notes if "creepage" in n], grid.notes)
+
+    def test_the_exact_check_measures_creepage_and_names_the_number(self):
+        board = self._board_with_a_pad()
+        grid = GRID.Grid(board, ["F.Cu"], 0.1,
+                         R.resolve(board, creepage_mm=1.0))
+        grid.add_copper(self._pad())
+        # A 0.25 mm track whose copper comes 0.475 mm from the pad: legal at
+        # 0.2 mm of clearance, illegal at 1.0 mm of creepage.
+        hits = grid.seg_blockers((30.5, 21.1), (33.0, 21.1), "F.Cu", "B")
+        self.assertTrue(hits, "a 0.475 mm gap passed a 1.0 mm creepage rule")
+        self.assertAlmostEqual(hits[0]["needed_mm"], 1.0, places=4)
+        self.assertAlmostEqual(hits[0]["actual_mm"], 0.475, places=3)
+
+    def test_the_router_keeps_the_distance_it_was_given(self):
+        self.apply(self.place("Pad", [("1", 0, 0, 1.0, 1.0)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "SIG"}),
+                   self.place("Pad", [("1", 0, 0, 1.0, 1.0)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "SIG"}),
+                   self.place("Wall", [("1", 0, 0, 4.0, 6.0)], ref="U2", x=25.0,
+                              y=8.0, nets={"1": "OTHER"}))
+        wall = [(23.0, 5.0), (27.0, 5.0), (27.0, 11.0), (23.0, 11.0)]
+        n = len(wall)
+
+        def gap(res):
+            """Copper edge of the F.Cu tracks to the wall's AREA (0 if it crosses).
+
+            `dist_point_polygon` measures to the boundary only, so a track straight
+            through a pad reads as 1.7 mm from it - the measurement has to say
+            "inside" explicitly or it congratulates a short.
+            """
+            worst = None
+            for op in res["ops"]:
+                if op["op"] != "add_track" or op["layer"] != "F.Cu":
+                    continue
+                a = (op["x1"], op["y1"])
+                b = (op["x2"], op["y2"])
+                d = min(GEO.dist_segment_segment(a, b, wall[k], wall[(k + 1) % n])
+                        for k in range(n))
+                if GEO.point_in_polygon(a, wall) or GEO.point_in_polygon(b, wall):
+                    d = 0.0
+                d -= op["width"] / 2.0
+                if worst is None or d < worst:
+                    worst = d
+            return worst
+
+        # One copper layer, or the router legally drops to B.Cu underneath an SMD
+        # pad and a 2-D measurement calls that a short.
+        tight = self.route(nets=["SIG"], clearance_mm=0.2, layers=["F.Cu"])
+        self.assertEqual(tight["failed"], [], tight["failed"])
+        self.assertLess(gap(tight), 1.0,
+                        "the control arm already keeps 1 mm, so it cannot show "
+                        "what creepage changed")
+
+        wide = self.route(nets=["SIG"], clearance_mm=0.2, creepage_mm=1.0,
+                          layers=["F.Cu"])
+        self.assertEqual(wide["failed"], [], wide["failed"])
+        got = gap(wide)
+        self.assertGreaterEqual(got, 1.0 - 1e-6,
+                                "copper came within %.4f mm while creepage asked "
+                                "for 1.0 mm" % got)
+        self.assertEqual(wide["rules"]["creepage_mm"], 1.0)
+
+class TestLengthMatchingChangesTheCopper(RouteBase):
+    """Equal length is a property of the FINISHED path, so it is a post-pass.
+
+    The claim under test is the shape of the answer, not the shape of the meander:
+    a group that can be matched comes back `matched` with the skew that was
+    measured on the copper that now exists, and a group that cannot comes back
+    `length_not_matched` carrying the length it did reach - never `matched`
+    because the router tried hard.
+    """
+
+    def setUp(self):
+        RouteBase.setUp(self)
+        self.apply(self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "L1"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "L1"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J3", x=10.0,
+                              y=20.0, nets={"1": "L2"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J4", x=44.0,
+                              y=20.0, nets={"1": "L2"}))
+
+    def _lengths(self, ops):
+        out = {}
+        for op in ops:
+            if op["op"] != "add_track":
+                continue
+            out[op["net"]] = out.get(op["net"], 0.0) + math.hypot(
+                op["x2"] - op["x1"], op["y2"] - op["y1"])
+        return out
+
+    def test_a_group_that_fits_comes_back_matched(self):
+        res = self.route(nets=["L1", "L2"], layers=["F.Cu"],
+                         length_groups=[{"name": "clk", "nets": ["L1", "L2"],
+                                         "max_skew_mm": 0.5}])
+        self.assertEqual(res["failed"], [], res["failed"])
+        grp = res["length_groups"][0]
+        self.assertEqual(grp["status"], "matched", grp)
+        self.assertLessEqual(grp["skew_after_mm"], 0.5 + 1e-6)
+        # measured here, on the ops that will actually be written
+        got = self._lengths(res["ops"])
+        self.assertAlmostEqual(got["L1"], 34.0, delta=0.5)
+        self.assertAlmostEqual(got["L2"], 34.0, delta=0.5)
+        self.assertGreater(got["L1"], 31.0,
+                           "the shorter net was not lengthened at all")
+
+    def test_a_group_that_does_not_fit_says_so_and_gives_the_real_number(self):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J5", x=10.0,
+                              y=30.0, nets={"1": "L3"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J6", x=13.0,
+                              y=30.0, nets={"1": "L3"}))
+        res = self.route(nets=["L2", "L3"], layers=["F.Cu"],
+                         length_groups=[{"name": "stub", "nets": ["L2", "L3"],
+                                         "max_skew_mm": 0.5}])
+        grp = res["length_groups"][0]
+        self.assertEqual(grp["status"], "length_not_matched", grp)
+        self.assertGreater(grp["skew_after_mm"], 0.5)
+        # It lengthened what it could (a 3 mm stub holds about 1 mm of meander)
+        # and still reports the shortfall: "not matched" is not "not attempted".
+        self.assertGreater(grp["after"]["L3"], 3.0)
+        self.assertLess(grp["after"]["L3"], 5.0)
+
+    def test_the_tool_carries_the_group_through(self):
+        out = self.call(nets="L1,L2", layers="F.Cu",
+                        length_groups=[{"nets": ["L1", "L2"], "max_skew_mm": 0.5}])
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["value"]["nets_routed"], 2)
+        grp = out["length_groups"][0]
+        self.assertEqual(grp["status"], "matched")
+
+class TestDiffPairsEnterTheSearch(RouteBase):
+    """A declared pair is a distance rule and a width, not a drawing.
+
+    The router does not couple the two nets; it routes them so they cannot come
+    closer than the declared gap, gives both the declared width, and then reports
+    the gap and the skew that came out. The report says `coupled: false`, because
+    "we kept them 0.15 mm apart" and "they run side by side at 0.15 mm" are
+    different claims and only the first one is true here.
+    """
+
+    def test_the_declared_gap_is_the_distance_the_judge_uses(self):
+        board = self.load()
+        pair = {"p": "D+", "n": "D-", "gap_mm": 0.5, "width_mm": 0.2}
+        bundle = R.resolve(board, diff_pairs=[pair])
+        self.assertAlmostEqual(R.diff_gap(bundle, "D+", "D-"), 0.5)
+        self.assertAlmostEqual(R.diff_gap(bundle, "D-", "D+"), 0.5)
+        self.assertAlmostEqual(R.pair_spacing(bundle, "D+", "D-"), 0.5)
+        # both members carry the declared width, the rest of the board does not
+        self.assertAlmostEqual(R.for_net(bundle, "D+")["track_mm"], 0.2)
+        self.assertAlmostEqual(R.for_net(bundle, "D-")["track_mm"], 0.2)
+        self.assertAlmostEqual(R.for_net(bundle, "OTHER")["track_mm"], 0.25)
+
+        board.footprints.append({"ref": "U1", "pads": [], "graphics": []})
+        grid = GRID.Grid(board, ["F.Cu"], 0.05, R.resolve(board))
+        grid.add_track("D+", "F.Cu", (30.0, 20.0), (30.0, 24.0), 0.2)
+        near = (30.5, 22.0)                 # 0.5 mm centre-to-centre, 0.3 gap
+        self.assertEqual(grid.seg_blockers((30.5, 21.0), (30.5, 23.0), "F.Cu",
+                                           "D-", 0.2), [],
+                         "0.3 mm of gap is legal at the net-class clearance of 0.2")
+        wide = GRID.Grid(board, ["F.Cu"], 0.05, bundle)
+        wide.add_track("D+", "F.Cu", (30.0, 20.0), (30.0, 24.0), 0.2)
+        hits = wide.seg_blockers((30.5, 21.0), (30.5, 23.0), "F.Cu", "D-", 0.2)
+        self.assertTrue(hits, "a 0.3 mm gap passed a declared 0.5 mm pair gap")
+        self.assertAlmostEqual(hits[0]["needed_mm"], 0.5, places=4)
+
+    def test_a_pair_that_did_not_run_side_by_side_is_reported_as_such(self):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "D+"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "D+"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J3", x=10.0,
+                              y=20.0, nets={"1": "D-"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J4", x=40.0,
+                              y=20.0, nets={"1": "D-"}))
+        res = self.route(nets=["D+", "D-"], layers=["F.Cu"],
+                         diff_pairs=[{"p": "D+", "n": "D-", "gap_mm": 0.5,
+                                      "width_mm": 0.2}])
+        self.assertEqual(res["failed"], [], res["failed"])
+        rep = res["diff_pairs"][0]
+        self.assertFalse(rep["coupled"])
+        self.assertAlmostEqual(rep["gap_declared_mm"], 0.5)
+        self.assertGreater(rep["gap_achieved_mm"], 0.5 + 0.02)
+        self.assertEqual(rep["status"], "pair_not_coupled")
+        self.assertIn("does not couple", rep["why"]["note"])
+        # both nets really carry the declared width
+        self.assertTrue(all(op["width"] == 0.2 for op in res["ops"]
+                            if op["op"] == "add_track"))
+
+    def test_a_skew_budget_on_a_pair_becomes_a_length_group(self):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "D+"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "D+"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J3", x=10.0,
+                              y=12.0, nets={"1": "D-"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J4", x=44.0,
+                              y=12.0, nets={"1": "D-"}))
+        res = self.route(nets=["D+", "D-"], layers=["F.Cu"],
+                         diff_pairs=[{"p": "D+", "n": "D-", "gap_mm": 0.3,
+                                      "width_mm": 0.2, "max_skew_mm": 0.5}])
+        self.assertEqual(res["failed"], [], res["failed"])
+        self.assertEqual(len(res["length_groups"]), 1)
+        grp = res["length_groups"][0]
+        self.assertEqual(sorted(grp["nets"]), ["D+", "D-"])
+        self.assertEqual(grp["status"], "matched", grp)
+        self.assertLessEqual(grp["skew_after_mm"], 0.5 + 1e-6)
+        self.assertLessEqual(res["diff_pairs"][0]["skew_mm"], 0.5 + 1e-6)
+
+    def test_bad_structures_are_refused_not_dropped(self):
+        out = self.call(nets="D+", diff_pairs=[{"p": "D+", "n": "D-"}])
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "RULES_INVALID")
+        out = self.call(nets="D+", diff_pairs=[{"p": "D+", "n": "D+"}])
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "RULES_INVALID")
+        out = self.call(nets="D+", length_groups="not json")
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "ARG_INVALID")
+
 if __name__ == "__main__":
     unittest.main()

@@ -77,6 +77,19 @@ class Grid(object):
         self.clr = float(bundle["clearance_mm"])
         for spec in (bundle.get("per_net") or {}).values():
             self.clr = max(self.clr, float(spec["clearance_mm"]))
+        # Creepage is a second distance rule that may be larger than the electrical
+        # clearance (rules.creepage). The raster takes the widest creepage any pair
+        # asked for - one number for every net, pessimistic in the safe direction -
+        # while `seg_blockers` / `via_blockers` then judge each pair by its own
+        # `pair_spacing`. Both ends are needed: only the raster and the search
+        # plans tracks inside the band the judge later rejects.
+        self.creepage = R.creepage_max(bundle)
+        # Creepage and a declared diff-pair gap are both "distance between two
+        # nets" rules that are wider than the net-class clearance; the raster
+        # takes the widest of them, the exact check uses each pair's own number.
+        self.spacing = max(self.creepage, R.spacing_max(bundle))
+        if self.spacing > self.clr:
+            self.clr = self.spacing
         self.track = float(bundle["track_mm"])
         for spec in (bundle.get("per_net") or {}).values():
             self.track = max(self.track, float(spec["track_mm"]))
@@ -118,6 +131,12 @@ class Grid(object):
         self._set_ids = {}           # frozenset -> k (> 0)
         self.wall = set()            # kept for callers that ask about walls
         self.notes = []
+        if self.spacing > float(bundle["clearance_mm"]):
+            self.notes.append(
+                "a creepage / diff-pair rule of %.3f mm is wider than every "
+                "electrical clearance here, so the raster keeps that distance "
+                "everywhere (the exact check uses each pair's own number)"
+                % self.spacing)
         self.keepouts = []           # exact rings, for the check that is the judge
 
         self._obs = {}               # layer -> (items, bboxes, buckets)
@@ -580,7 +599,7 @@ class Grid(object):
             it = objs[k]
             if it.get("net") == net:
                 continue                      # its own copper never blocks it
-            need = R.pair_clearance(self.bundle, net, it.get("net"))
+            need = R.pair_spacing(self.bundle, net, it.get("net"))
             ib = boxes[k]
             gapx = max(0.0, ib[0] - bx[2], bx[0] - ib[2])
             gapy = max(0.0, ib[1] - bx[3], bx[1] - ib[3])
@@ -772,7 +791,7 @@ class Grid(object):
                 it = objs[k]
                 if it.get("net") == net:
                     continue
-                need = R.pair_clearance(self.bundle, net, it.get("net"))
+                need = R.pair_spacing(self.bundle, net, it.get("net"))
                 ib = boxes[k]
                 gapx = max(0.0, ib[0] - bx[2], bx[0] - ib[2])
                 gapy = max(0.0, ib[1] - bx[3], bx[1] - ib[3])

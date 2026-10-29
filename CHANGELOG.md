@@ -9,6 +9,38 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.15] - 2026-10-29
+
+「把 `kicad-free` 与 `rf-circuit-design` 里那几条**走线规则**真的变成搜索里的约束」——
+爬电距离、差分对间距、等长。三条规则的形状不同，所以落地方式也不同，但共同的硬约束只有一条：
+**数只能有一个来源，且必须写明是谁给的；没给就是没施加，绝不默许一个数**。
+
+- **爬电距离（只认调用方）**：`board_route` 新增 `creepage_mm` / `creepage_pairs`
+  （`'A:B:1.0,C:D:0.8'`）。没给值就写进 `sources["creepage"] =
+  "not supplied: creepage comes from a standard table keyed to working voltage / pollution degree /
+  coating and is never invented here"` 且**不进 `assumed`**（依据 `kicad-free` 的「不编造
+  安全间距」）；非正数 / 非数字 / 坏串 / 对里两网相同 ⇒ `RULES_INVALID`。给了值就**同时**进两处：
+  栅格取 `spacing = max(creepage_max, spacing_max)` 并顶掉 `clr`（悲观、全板让路，并在 `notes` 公示），
+  精确判定用 `pair_spacing = max(pair_clearance, creepage, diff_gap)`（每对各自的数）。
+- **差分对（只做间距，不耦合）**：新增 `diff_pairs`，每项 `{p, n, gap_mm, width_mm?, max_skew_mm?}`。
+  `gap_mm` 进上述最小间距；`width_mm` 覆盖两成员宽度（对内同宽，其他网不变）；`max_skew_mm`
+  让这一对**自动**成为一个等长组。报告给 `gap_declared_mm / spacing_required_mm / gap_achieved_mm /
+  length_p_mm / length_n_mm / skew_mm / coupled: false`——两条网是各自独立布的，不肩并肩跑，
+  实测声明 0.2 mm 的一对 `gap_achieved_mm = 1.65 mm`、状态 `pair_not_coupled`。
+- **等长（后处理，不是搜索约束）**：新增 `length_groups`（`{name?, nets, target_mm?, max_skew_mm?,
+  amplitude_mm?}`）与第四个模块 `route/tune.py`。连续 45° 三角蛇形（腿距 `max(3w, 0.5 mm)`，
+  一整齿 `2A(√2−1)`，一段最多 `0.828·(L−0.5)/2`），**末齿允许更矮**（落到目标而不是下一个整齿），
+  **跨多段分配**，每次改铜前用 `seg_blockers` 逐段精确复检（任一段被拒就整次放弃、一个点不写），
+  成功后原位替换 `ops` 并 `em.rebuild()` 重算地图。`status ∈ {matched, length_not_matched, reported}`，
+  「没配上」也报出真实可达数（`no_segment_long_enough` / `blocked`）。
+- **真板验证**：F401 核心板 `SWDIO/SWCLK`，`layers=["F.Cu"]` 禁换层，plan 9.2–10.5 s / `ops=61` /
+  `failed=[]`；等长组 `matched`，skew **9.7782 → 0.4998 mm**；端到端 `apply` 五道闸门全过，
+  `kicad-cli pcb drc` 69 条（new_blocking 0 / new_advisory 4 条 silkscreen）。
+  另留一条真结论：`creepage_mm=0.4` 下同板三条网全 `terminal_unreachable`（`needed 0.4 / actual 0.2189`）
+  ——那颗 MCU 是 0.5 mm 间距，这是物理事实，不是 bug。
+- **文档**：`docs/27` 新增 §27.11（三条规则怎么进搜索、`coupled: false` 到底承诺了什么），
+  §27.10 诚实清单同步改写；测试 16 → 30 个用例（新增 4 个类）。
+
 ## [0.0.14] - 2026-10-29
 
 「布线器从 `_scratch/` 脚本收进 `src/`」：`board_route` 兑现 0.0.13 的欠账，兑现方式不是

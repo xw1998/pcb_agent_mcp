@@ -124,13 +124,18 @@ def _pattern_hits(inner, net, classes_):
 
 
 def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
-            via_drill_mm=None, edge_clearance_mm=None):
+            via_drill_mm=None, edge_clearance_mm=None, creepage_mm=None,
+            creepage_pairs=None, diff_pairs=None):
     """Every rule the router needs, with where each number came from.
 
     Returns a dict; see the module docstring for the priority order. Numbers that
     are `None` could not be read and were NOT assumed (only `via_*` and
     `edge_clearance_mm` may be `None` - a router can work without them, a router
     cannot work without a clearance and a track width).
+
+    `creepage_mm` / `creepage_pairs` have no fallback on purpose: they are a
+    standard lookup, not a property of the board file, so `creepage_mm is None`
+    means "no creepage constraint was requested" and never "creepage is 0".
     """
     rules = board.rules or {}
     cls = classes(board)
@@ -262,6 +267,79 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
                                "board is built to something else."
                                % DEFAULT_EDGE_CLEARANCE_MM})
 
+    # ---- creepage -----------------------------------------------------
+    # Creepage is not a clearance with another name. It is the shortest path
+    # along the surface between two conductors at different potential, and its
+    # value comes from a standard table - IEC 60664-1 / IPC-2221 key it to the
+    # working voltage, the pollution degree, the material group and whether the
+    # surface is coated. The table in this project is empty (nothing here has
+    # been verified against a real standard), so there is exactly one honest
+    # source for the number: the caller. Silence means "this run applies no
+    # creepage constraint", which is stated rather than filled in with the
+    # electrical clearance - 0.2 mm of clearance is not 0.2 mm of creepage and
+    # pretending otherwise is the one answer this module exists to refuse.
+    crp = None
+    if creepage_mm is not None:
+        crp = _f(creepage_mm)
+        if crp is None or crp <= 0:
+            raise RulesError(
+                "creepage_mm=%r is not a usable distance" % (creepage_mm,),
+                "RULES_INVALID",
+                hint="creepage is a positive distance in mm, looked up for the "
+                     "working voltage, pollution degree and coating - the router "
+                     "will not invent it, so passing a non-number is refused")
+        sources["creepage"] = "caller"
+    else:
+        sources["creepage"] = (
+            "not supplied: creepage comes from a standard table keyed to working "
+            "voltage / pollution degree / coating and is never invented here")
+    pairs = []
+    for item in (creepage_pairs or []):
+        if not isinstance(item, dict):
+            raise RulesError("creepage_pairs entries must be {a, b, mm} objects, "
+                             "got %r" % (item,), "RULES_INVALID")
+        a, b, mm = item.get("a"), item.get("b"), _f(item.get("mm"))
+        if not a or not b or a == b or mm is None or mm <= 0:
+            raise RulesError(
+                "creepage_pairs entry %r needs two different nets and a positive "
+                "mm" % (item,), "RULES_INVALID",
+                hint='e.g. {"a": "L", "b": "N", "mm": 1.0}')
+        pairs.append({"a": str(a), "b": str(b), "mm": mm})
+    if pairs and crp is None:
+        sources["creepage"] = "caller (per pair only)"
+
+    # ---- diff pairs ---------------------------------------------------
+    # A diff pair reaches the search as two facts: the spacing the two nets must
+    # keep from each other, and the width both must have. Neither can come from
+    # the net class - a class says "0.2 mm from everything", which is a clearance,
+    # not a coupling gap - so both are caller-declared, and neither is invented.
+    dpairs = []
+    for item in (diff_pairs or []):
+        if not isinstance(item, dict):
+            raise RulesError("diff_pairs entries must be {p, n, gap_mm} objects, "
+                             "got %r" % (item,), "RULES_INVALID")
+        pn, nn = item.get("p"), item.get("n")
+        gap = _f(item.get("gap_mm"))
+        width = _f(item.get("width_mm"))
+        skew = _f(item.get("max_skew_mm"))
+        if not pn or not nn or str(pn) == str(nn):
+            raise RulesError("diff_pairs entry %r needs two different nets" % (item,),
+                             "RULES_INVALID",
+                             hint='e.g. {"p": "USB_D+", "n": "USB_D-"}; which of '
+                                  'them is "p" only decides the sign of the skew')
+        if gap is None or gap <= 0:
+            raise RulesError("diff_pairs entry %r needs a positive gap_mm - the "
+                             "edge-to-edge spacing the pair must keep" % (item,),
+                             "RULES_INVALID")
+        if width is not None and width <= 0:
+            raise RulesError("diff_pairs entry %r has a non-positive width_mm"
+                             % (item,), "RULES_INVALID")
+        if skew is not None and skew <= 0:
+            raise RulesError("diff_pairs entry %r has a non-positive max_skew_mm"
+                             % (item,), "RULES_INVALID")
+        dpairs.append({"p": str(pn), "n": str(nn), "gap_mm": gap,
+                       "width_mm": width, "max_skew_mm": skew})
+
     per_net = {}
     for net, per in by_net_clr.items():
         per_net[net] = {
@@ -284,6 +362,20 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
             "source": "net class of %r" % net,
         }
 
+    # Both members of a pair are the same width, declared or not.
+    for pair in dpairs:
+        w = pair.get("width_mm")
+        if w is None:
+            continue
+        for net in (pair["p"], pair["n"]):
+            entry = per_net.get(net)
+            if entry is None:
+                entry = {"clearance_mm": clr, "track_mm": w,
+                         "via_diameter_mm": via_d, "via_drill_mm": via_drill,
+                         "source": "diff pair %s/%s" % (pair["p"], pair["n"])}
+                per_net[net] = entry
+            entry["track_mm"] = w
+
     board_default = {"clearance_mm": clr, "track_mm": track,
                      "via_diameter_mm": via_d, "via_drill_mm": via_drill,
                      "source": sources.get("clearance")}
@@ -293,6 +385,9 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
         "via_diameter_mm": via_d,
         "via_drill_mm": via_drill,
         "edge_clearance_mm": edge,
+        "creepage_mm": crp,
+        "creepage_pairs": pairs,
+        "diff_pairs": dpairs,
         "default": board_default,
         "per_net": per_net,
         "classes": cls,
@@ -321,3 +416,66 @@ def pair_clearance(bundle, a, b):
     ca = for_net(bundle, a)["clearance_mm"]
     cb = for_net(bundle, b)["clearance_mm"]
     return max(ca, cb)
+
+
+def creepage(bundle, a, b):
+    """Surface distance the caller asked for between nets `a` and `b` (0: none).
+
+    Three ways to ask, and the strictest one wins: a board-wide `creepage_mm`, a
+    per-pair entry in `creepage_pairs`, or nothing at all (0.0 - no creepage
+    constraint was requested, which is not the same as "creepage is 0").
+    """
+    need = float(bundle.get("creepage_mm") or 0.0)
+    for item in bundle.get("creepage_pairs") or []:
+        if (item["a"] == a and item["b"] == b) or (item["a"] == b
+                                                   and item["b"] == a):
+            need = max(need, float(item["mm"]))
+    return need
+
+
+def creepage_max(bundle):
+    """The largest creepage any pair on this board asked for (0: none).
+
+    Used for the raster, which is one number for every net: a raster that is
+    pessimistic for the widest creepage is safe for all of them, and the exact
+    check in `grid.seg_blockers` applies each pair's own number afterwards.
+    """
+    need = float(bundle.get("creepage_mm") or 0.0)
+    for item in bundle.get("creepage_pairs") or []:
+        need = max(need, float(item["mm"]))
+    return need
+
+
+def diff_gap(bundle, a, b):
+    """The coupling gap a declared diff pair asked for (0: not a declared pair)."""
+    for item in bundle.get("diff_pairs") or []:
+        if (item["p"] == a and item["n"] == b) or (item["p"] == b
+                                                   and item["n"] == a):
+            return float(item["gap_mm"])
+    return 0.0
+
+
+def spacing_max(bundle):
+    """The widest net-to-net distance any rule on this board asked for.
+
+    Clearance is per net class, creepage and diff-pair gaps are per pair, but the
+    RASTER has one number for every net. Taking the widest is the pessimistic
+    direction: the search plans outside the band the exact check then rejects, and
+    `grid.seg_blockers` still judges each pair by its own `pair_spacing`.
+    """
+    widest = creepage_max(bundle)
+    for item in bundle.get("diff_pairs") or []:
+        widest = max(widest, float(item["gap_mm"]))
+    return widest
+
+
+def pair_spacing(bundle, a, b):
+    """The distance two nets' copper must keep: electrical clearance *or* creepage.
+
+    They are separate rules that happen to be measured with the same ruler: a
+    0.15 mm class may legally sit 0.15 mm from its neighbour electrically and
+    still fail creepage at 1.0 mm. Taking the stricter of the two is the only
+    direction that cannot produce copper the referee rejects.
+    """
+    return max(pair_clearance(bundle, a, b), creepage(bundle, a, b),
+               diff_gap(bundle, a, b))

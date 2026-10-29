@@ -1066,8 +1066,18 @@ _tool(
     "`no_path` (search exhausted), `search_budget` (the budget ran out - not the "
     "same claim), `terminal_unreachable` (a pad has no way out). Returns a PLAN by "
     "default; apply=true writes it through board_propose + board_apply (checkpoint, "
-    "atomic write, four gates, KiCad DRC). It does not do length matching, diff "
-    "pairs, return paths, creepage or negotiated congestion.",
+    "atomic write, four gates, KiCad DRC). Three distance rules reach the search "
+    "when YOU declare them, and are never invented: creepage (`creepage_mm`, or "
+    "per-pair `creepage_pairs` = 'A:B:1.0,C:D:0.8' - a standard table keyed to "
+    "working voltage, so `rules.sources.creepage` says plainly when none was "
+    "applied), diff-pair spacing (`diff_pairs`: the gap and the common width both "
+    "become search constraints) and equal length (`length_groups`: the shorter "
+    "nets get a 45-degree serpentine, every new segment re-checked, and an "
+    "unreachable target is reported as `length_not_matched` with the length it did "
+    "reach). What it does NOT do: couple a diff pair (the two nets are routed "
+    "independently at the declared spacing and the report carries "
+    "`coupled: false` plus the gap it achieved), return paths, or negotiated "
+    "congestion.",
     {"type": "object",
      "properties": dict({
          "apply": _bool("write the copper (default false: plan only)"),
@@ -1083,6 +1093,48 @@ _tool(
                                     "project's min_copper_edge_clearance, else "
                                     "KiCad's 0.5 mm board-setup default, declared "
                                     "as assumed)", None),
+         "creepage_mm": _num("surface distance to keep between any two nets "
+                             "(default: none - creepage is looked up from a "
+                             "standard by working voltage and is never invented)",
+                             None),
+         "creepage_pairs": _str("per-pair creepage, 'A:B:1.0,C:D:0.8' (mm); "
+                                "takes precedence over creepage_mm where it is "
+                                "stricter"),
+         "diff_pairs": {"type": "array", "description":
+                        "declared differential pairs: [{p, n, gap_mm, width_mm?, "
+                        "max_skew_mm?}]. gap_mm is the edge-to-edge spacing the two "
+                        "nets must keep - it enters the search as a required "
+                        "distance, so neither net is routed through the other. The "
+                        "two nets are routed INDEPENDENTLY at that spacing; this "
+                        "router does not couple them, and the report says so with "
+                        "the gap it actually achieved.",
+                        "items": {"type": "object", "properties": dict({
+                            "p": _str("one net of the pair"),
+                            "n": _str("the other net"),
+                            "gap_mm": _num("required edge-to-edge spacing"),
+                            "width_mm": _num("common track width for both"),
+                            "max_skew_mm": _num("length-matching budget; adds the "
+                                                "pair to the length groups"),
+                        }, **{"required": ["p", "n", "gap_mm"]})}},
+         "length_groups": {"type": "array", "description":
+                           "nets that must come out the same length: [{name, nets, "
+                           "target_mm?, max_skew_mm?, amplitude_mm?}]. After "
+                           "routing, the shorter nets get a 45-degree serpentine "
+                           "inserted in their longest straight segment, and every "
+                           "new segment goes back through the exact check. If the "
+                           "target cannot be reached the answer carries the length "
+                           "it actually achieved and status length_not_matched.",
+                           "items": {"type": "object", "properties": dict({
+                               "name": _str("label for the report"),
+                               "nets": {"type": "array",
+                                        "items": {"type": "string"}},
+                               "target_mm": _num("length to reach (default: the "
+                                                 "longest net in the group)"),
+                               "max_skew_mm": _num("longest-minus-shortest budget"),
+                               "amplitude_mm": _num("meander amplitude (default "
+                                                    "3*sqrt(2)*width so the legs of "
+                                                    "a tooth keep 3w apart)"),
+                           }, **{"required": ["nets"]})}},
          "rip_up_rounds": _num("how many bounded rip-up rounds (0 turns it off)", 1),
          "incremental": _bool("treat the net's existing copper as already connected "
                               "and route only what is missing", False),
@@ -1135,6 +1187,60 @@ _tool(
     lambda a: _guarded(lambda: _fill.fill(a["path"], in_place=bool(a.get("in_place")))),
 )
 
+def _parse_object_list(val, what):
+    """A list of dicts, or a JSON string that decodes to one. Anything else fails."""
+    if val is None or val == "":
+        return []
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except ValueError as exc:
+            raise ValueError("%s is not valid JSON: %s" % (what, exc))
+    if not isinstance(val, (list, tuple)):
+        raise ValueError("%s must be a list of objects" % what)
+    out = []
+    for item in val:
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except ValueError as exc:
+                raise ValueError("%s entry %r is not an object: %s"
+                                 % (what, item, exc))
+        if not isinstance(item, dict):
+            raise ValueError("%s entries must be objects, got %r" % (what, item))
+        out.append(dict(item))
+    return out
+
+def _parse_creepage_pairs(val):
+    """`"A:B:1.0,C:D:0.8"` -> `[{"a": "A", "b": "B", "mm": 1.0}, ...]`.
+
+    A bad entry is a refusal, not a silently dropped constraint: a creepage rule
+    the caller typed and the router ignored is worse than no rule at all.
+    """
+    if val is None or val == "":
+        return []
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    out = []
+    for chunk in str(val).replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.rsplit(":", 2)
+        if len(parts) != 3:
+            raise ValueError("creepage_pairs entry %r is not 'NET_A:NET_B:MM'"
+                             % chunk)
+        a, b, mm = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        try:
+            mm = float(mm)
+        except ValueError:
+            raise ValueError("creepage_pairs entry %r has no numeric mm" % chunk)
+        if not a or not b or a == b or mm <= 0:
+            raise ValueError("creepage_pairs entry %r needs two different nets "
+                             "and a positive mm" % chunk)
+        out.append({"a": a, "b": b, "mm": mm})
+    return out
+
 def _board_route(args):
     """Plan (or plan+write) a routed board.
 
@@ -1157,9 +1263,32 @@ def _board_route(args):
         return e
     kw = {}
     for key in ("pitch_mm", "clearance_mm", "track_mm", "via_diameter_mm",
-                "via_drill_mm", "edge_clearance_mm", "rip_up_rounds", "max_nets"):
+                "via_drill_mm", "edge_clearance_mm", "creepage_mm",
+                "rip_up_rounds", "max_nets"):
         if args.get(key) is not None:
             kw[key] = args[key]
+    try:
+        pairs = _parse_creepage_pairs(args.get("creepage_pairs"))
+    except ValueError as exc:
+        return err(str(exc), "RULES_INVALID",
+                   hint="creepage pairs look like 'L:N:1.0' (mm), several separated "
+                        "by commas; a rule that cannot be parsed is refused rather "
+                        "than dropped")
+    if pairs:
+        kw["creepage_pairs"] = pairs
+    try:
+        dpairs = _parse_object_list(args.get("diff_pairs"), "diff_pairs")
+        lgroups = _parse_object_list(args.get("length_groups"), "length_groups")
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID",
+                   hint='diff_pairs entries are {p, n, gap_mm} objects, '
+                        'length_groups entries are {nets: [...], max_skew_mm} '
+                        'objects; a structure that cannot be read is refused, not '
+                        'dropped')
+    if dpairs:
+        kw["diff_pairs"] = dpairs
+    if lgroups:
+        kw["length_groups"] = lgroups
     for key in ("layers", "nets"):
         val = args.get(key)
         if isinstance(val, str):
@@ -1196,13 +1325,19 @@ def _board_route(args):
                   "found a legal path for every edge of the net's spanning tree and "
                   "the exact check accepted every segment. It does NOT mean the board "
                   "is DRC clean - run board_drc after writing - and it does not mean "
-                  "the layout is good: no length matching, no diff pair, no thermal "
-                  "or return-path reasoning is applied",
+                  "the layout is good: length matching only happens for the groups "
+                  "you declared, a diff pair is two independently routed nets held "
+                  "at the declared spacing (not coupled), and no thermal, return-path "
+                  "or impedance reasoning is applied",
         assumptions={
             "clearance_mm": res["rules"]["clearance_mm"],
             "track_mm": res["rules"]["track_mm"],
             "via_mm": [res["rules"]["via_diameter_mm"],
                        res["rules"]["via_drill_mm"]],
+            "creepage_mm": res["rules"]["creepage_mm"],
+            "creepage_pairs": res["rules"]["creepage_pairs"],
+            "diff_pairs": res["rules"]["diff_pairs"],
+            "length_groups_asked": len(lgroups),
             "where_the_numbers_came_from": res["rules"]["sources"],
             "assumed_by_this_server": res["rules"]["assumed"],
             "routing_layers": res["layers_routing"],
@@ -1210,6 +1345,8 @@ def _board_route(args):
             "writes_nothing": args.get("apply") is not True,
         },
         extra={
+            "diff_pairs": res["diff_pairs"],
+            "length_groups": res["length_groups"],
             "nets": res["nets"],
             "failed": failed,
             "rejected_segments": res["rejected"],

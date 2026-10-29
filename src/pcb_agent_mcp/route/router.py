@@ -27,6 +27,7 @@ import time
 
 from .. import geometry as G
 from . import rules as R
+from . import tune
 from .grid import Grid, astar, mst_edges, simplify
 
 # A net whose name looks like this has a plane layer on a typical board. It is
@@ -274,6 +275,16 @@ class _Emitter(object):
         self.ops = [op for op in self.ops if op.get("net") not in nets]
         for n in nets:
             self.length[n] = 0.0
+        self.rebuild()
+
+    def rebuild(self):
+        """Re-derive the search map from the ops that are still standing.
+
+        The map has no per-op undo, and a post-pass that replaced copper (a
+        meander inserted for length matching) leaves the map describing a board
+        that no longer exists. Replaying the surviving ops is the only version
+        that cannot drift.
+        """
         self.grid = Grid(self.board, self.layers, self.pitch, self.bundle,
                          ignore_zone_areas=self.ignore_zone_areas)
         for op in self.ops:
@@ -330,7 +341,8 @@ class _Emitter(object):
 
 def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          track_mm=None, via_diameter_mm=None, via_drill_mm=None,
-         edge_clearance_mm=None,
+         edge_clearance_mm=None, creepage_mm=None, creepage_pairs=None,
+         diff_pairs=None, length_groups=None,
          rip_up_rounds=1, second_sweep=True, incremental=False,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          progress=None):
@@ -348,7 +360,9 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     t0 = time.time()
     bundle = R.resolve(board, clearance_mm=clearance_mm, track_mm=track_mm,
                        via_diameter_mm=via_diameter_mm, via_drill_mm=via_drill_mm,
-                       edge_clearance_mm=edge_clearance_mm)
+                       edge_clearance_mm=edge_clearance_mm,
+                       creepage_mm=creepage_mm, creepage_pairs=creepage_pairs,
+                       diff_pairs=diff_pairs)
     copper = _copper_layers(board)
     routing, planes = _split_layers(board, copper, explicit=layers)
 
@@ -699,6 +713,15 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                                   by_net.get(n) or []))
             pending = still
 
+    # Length matching and diff-pair bookkeeping run on the FINISHED copper: a
+    # meander changes a length, so it cannot happen before the path exists, and a
+    # pair's achieved gap is a property of both finished paths. Every meander
+    # segment goes back through the exact check, so this pass cannot introduce a
+    # violation the router would have refused.
+    tune_report = tune.finish(em, bundle, results, diff_pairs=bundle["diff_pairs"],
+                              length_groups=length_groups)
+    stats["tuning"] = tune_report
+
     out_nets = []
     for net, res in results.items():
         if not isinstance(res, dict):
@@ -728,8 +751,13 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                   "via_diameter_mm": bundle["via_diameter_mm"],
                   "via_drill_mm": bundle["via_drill_mm"],
                   "edge_clearance_mm": bundle["edge_clearance_mm"],
+                  "creepage_mm": bundle["creepage_mm"],
+                  "creepage_pairs": bundle["creepage_pairs"],
+                  "diff_pairs": bundle["diff_pairs"],
                   "sources": bundle["sources"],
                   "assumed": bundle["assumed"]},
+        "diff_pairs": tune_report["diff_pairs"],
+        "length_groups": tune_report["length_groups"],
         "nets": out_nets,
         "failed": [{"net": r["net"], "reason": r.get("reason")} for r in failed],
         "ops": em.ops,
