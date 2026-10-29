@@ -22,8 +22,10 @@
   （`needed 0.2 / actual 0.1601 mm`）——**同一对 `couple=false` 时读数一模一样**，所以那个
   `gap_achieved_mm` 从来不是耦合的证据。
 - **回流路径**（`route/return_path.py`）：换层的信号过孔配一颗地过孔（2 mm 内、0.6 mm 内已有则不加、
-  必须落在地铜上），`_GROUND_NAMES` 故意不含 `AGND`。真板只拿到 `nothing_to_stitch`（0 过孔），
-  换层场景的证据在单测 `TestALayerChangeGetsAGroundVia`，**真板 DRC 未取证**。
+  必须落在地铜上），`_GROUND_NAMES` 故意不含 `AGND`。真板整块板一轮：90 颗过孔 / 74 颗信号过孔，
+  **缝了 11 颗**（距离 0.93–1.97 mm，全部落在两侧都有地铜的位置），跳过 63 颗（`ground_not_on_two_layers`）；
+  apply 五道闸门全过、`kicad-cli pcb drc` 的 `new_blocking_total = 0`（新 advisory 24，其中一条
+  `via_dangling` —— 布通 41 网不等于都接上了，这条不藏）。单层网仍如实回 `nothing_to_stitch`。
 - **阻抗目标进搜索**（`calc/impedance.py` + `rules.impedance_targets`）：ohm → `track_mm`，
   叠层不明（`IMPEDANCE_NEEDS_STACKUP`）与不可达（`IMPEDANCE_UNREACHABLE`）两种拒绝。
   真板 50 Ω：叠层自动取 h=0.5100 ⇒ 0.92177 mm；给定 h=0.2 ⇒ 0.33488 mm；200 Ω ⇒ 不可达。
