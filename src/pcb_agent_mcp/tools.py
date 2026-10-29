@@ -35,6 +35,7 @@ from .calc import cavity as _cavity
 from .calc import electrothermal as _electro
 from .calc import filters as _filters
 from .calc import magnetics as _magnetics
+from .calc import filtermatrix as _filtermatrix
 from .calc import stackup as _stackup
 from .fidelity import fill as _fill
 from .calc import chain as _chain
@@ -2976,7 +2977,7 @@ def _capabilities(_args):
             "filter_prototype", "filter_lumped_bandpass",
             "filter_mc_yield",
             "filter_coupled_microstrip", "filter_coupled_resonator",
-            "filter_waveguide_cavity",
+            "filter_waveguide_cavity", "filter_coupling_matrix",
             "fullwave_solver",
             "board_fab_package", "board_export", "board_bom", "board_netlist",
             "board_graphics",
@@ -3205,7 +3206,7 @@ def _capabilities(_args):
             "point only - there is no stress map, no stress concentration at a hole "
             "or a stiffener, and no fatigue law applied to those numbers (Steinberg "
             "needs slope and allowable from you)",
-            "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives L/C values with its own S21 audited two ways; finite-Q dissipation and first-order parasitics (inductor cp, capacitor esl) are available but OFF unless asked for, and the loss model is a resistor per branch, not dielectric or conductor physics - no skin effect, no substrate loss, no temperature drift. filter_mc_yield does tolerance yield, but it is uniform and independent only (no correlation, no batch shift, no ageing), so it is a worst case whose confidence half-width grows as 1/sqrt(n_draws). filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity is TE101 only: no higher-order modes, no mode chart, no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no surface-roughness correction. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
+            "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives L/C values with its own S21 audited two ways; finite-Q dissipation and first-order parasitics (inductor cp, capacitor esl) are available but OFF unless asked for, and the loss model is a resistor per branch, not dielectric or conductor physics - no skin effect, no substrate loss, no temperature drift. filter_mc_yield does tolerance yield, but it is uniform and independent only (no correlation, no batch shift, no ageing), so it is a worst case whose confidence half-width grows as 1/sqrt(n_draws). filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity is TE101 only: no higher-order modes, no mode chart, no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no surface-roughness correction. filter_coupling_matrix evaluates the coupling matrix as a real network (finite zeros from a cross-coupling, finite-Qu loss), but it PERTURBS the inline matrix rather than running a full Cameron synthesis: the in-band ripple it reports is the perturbed one, so a cross-coupled filter whose mask matters still needs the synthesis run and then the EM run. It also has no dispersion, no iris or probe geometry, and no layout. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
                     "missing fact is refused or declared absent, never defaulted",
@@ -5113,6 +5114,59 @@ _tool(
         mu_r=(a["mu_r"] if a.get("mu_r") is not None else 1.0),
         er=(a["er"] if a.get("er") is not None else 1.0),
         mode=a.get("mode") or "TE101"),
+)
+
+_tool(
+    "filter_coupling_matrix",
+    "Coupling matrix of a bandpass filter, evaluated as a real network: finite "
+    "transmission zeros from a cross-coupling, and the in-band / stopband response that "
+    "finite unloaded Q actually delivers. The inline matrix is built from the prototype g "
+    "values, then PERTURBED by the cross-coupling you ask for - it is not a Cameron "
+    "synthesis, so ripple_actual_db is the ripple you get, not the one you asked for, and "
+    "the answer says so. Self-audited three ways before it answers: (1) the lossless "
+    "inline network must reproduce 1/(1+eps^2 Tn(Omega)^2) to 1e-6 dB with the ripple it "
+    "delivers held to the prototype's to 1e-3 dB; (2) with no loss, |S11|^2+|S21|^2 = 1 "
+    "to 1e-9; (3) for a third-order trisection the numeric null must sit at the analytic "
+    "Omega_z = m12^2/m13. S-parameters come from a nodal solve with exact admittance-"
+    "inverter Pi equivalents (not from inverting the matrix), so cross-couplings form "
+    "real loops. No layout, no EM, no dispersion, no iris geometry.",
+    {"type": "object", "properties": {
+        "order": _num("number of resonators (1..8)"),
+        "f0_hz": _num("centre frequency in Hz"),
+        "fbw": _num("fractional bandwidth, e.g. 0.05 for 5 percent"),
+        "ripple_db": _num("passband ripple for a chebyshev prototype; butterworth has none"),
+        "response": _str("prototype family", ["chebyshev", "butterworth"],
+                         default="chebyshev"),
+        "zero_hz": _num("place the single transmission zero of a third-order trisection "
+                        "here (order must be 3); give this OR couplings, never both"),
+        "couplings": {"type": "array",
+                      "items": {"type": "array", "items": {"type": "number"}},
+                      "description": "explicit extra couplings [i, j, m_ij] on top of the "
+                                     "inline matrix, resonator numbers 1..order - the "
+                                     "escape hatch for a matrix you synthesised yourself"},
+        "q_external": {"type": "array", "items": {"type": "number"},
+                       "description": "override the external Q pair [Qe_in, Qe_out] as "
+                                      "absolute Q (not Qe*FBW); default comes from the g "
+                                      "values"},
+        "q_unloaded": _num("unloaded Q of the resonators, to see the insertion loss and "
+                           "how far the nulls fill in (one number, or a list per "
+                           "resonator)"),
+        "points": _num("points in the displayed sweep (21..801; in-band numbers come from "
+                       "a separate 401-point grid over the band)", 41),
+        "span": _num("half-width of the sweep in units of FBW (1.5..20)", 3.0),
+        "probe_hz": _num("optional: return S11/S21 at exactly this frequency"),
+    }, "required": ["order", "f0_hz", "fbw"]},
+    lambda a: _filtermatrix.coupled_matrix_filter(
+        a.get("order"), a.get("f0_hz"), a.get("fbw"),
+        ripple_db=a.get("ripple_db"),
+        response=a.get("response") or "chebyshev",
+        zero_hz=a.get("zero_hz"),
+        couplings=a.get("couplings"),
+        q_external=a.get("q_external"),
+        q_unloaded=a.get("q_unloaded"),
+        points=(a["points"] if a.get("points") is not None else 41),
+        span=(a["span"] if a.get("span") is not None else 3.0),
+        probe_hz=a.get("probe_hz")),
 )
 
 _tool(

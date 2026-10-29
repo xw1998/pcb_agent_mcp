@@ -784,6 +784,47 @@ def selftest():
               "%.4g mm / Q %.6g" % (_v.get("length_mm", 0.0),
                                     _v.get("q_conductor", 0.0)))
 
+        # cross-coupled coupling matrix: three independent audits in one answer -
+        # the lossless inline network against the prototype polynomial, unitarity,
+        # and the trisection null against its cofactor formula.  A quarter-wave
+        # scaling error in any coupling breaks at least one of them.
+        r = handle({"jsonrpc": "2.0", "id": 119, "method": "tools/call",
+                    "params": {"name": "filter_coupling_matrix", "arguments": {
+                        "order": 3, "f0_hz": 2.6e9, "fbw": 0.05, "ripple_db": 0.1}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        _sc = _v.get("self_check") or {}
+        _in = _v.get("inband") or {}
+        check("filter_coupling_matrix: inline lossless reproduces the prototype "
+              "polynomial <1e-6 dB and is unitary <1e-9",
+              payload.get("status") == "ok"
+              and _sc.get("closed_form_max_deviation_db", 9.0) < 1e-6
+              and _sc.get("unitarity_max_error", 9.0) < 1e-9
+              and abs((_sc.get("effective_ripple_db") or 9.0) - 0.1) < 1e-3,
+              "dev %.3g dB / |S|^2-1 %.3g" % (_sc.get("closed_form_max_deviation_db", 9.0),
+                                              _sc.get("unitarity_max_error", 9.0)))
+        check("filter_coupling_matrix: the in-band ripple is read off its own 401-point "
+              "grid and comes back as the requested 0.1 dB",
+              _in.get("sampled_points_in_band", 0) == 401
+              and abs(_in.get("ripple_actual_db", 0.0) - 0.1) < 1e-3,
+              "%.4g dB over %d points" % (_in.get("ripple_actual_db", 0.0),
+                                          _in.get("sampled_points_in_band", 0) or 0))
+
+        r = handle({"jsonrpc": "2.0", "id": 120, "method": "tools/call",
+                    "params": {"name": "filter_coupling_matrix", "arguments": {
+                        "order": 3, "f0_hz": 2.6e9, "fbw": 0.05, "ripple_db": 0.1,
+                        "zero_hz": 2.86e9, "span": 4.0}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        _z = ((_v.get("transmission_zeros") or {}).get("zeros") or [{}])[0]
+        check("filter_coupling_matrix: the trisection null sits where the cofactor puts "
+              "it (Omega_z = m12^2/m13 = 3.818182) and is a true null",
+              payload.get("status") == "ok"
+              and abs(_z.get("measured_omega", 0.0) - 3.8181818181818183) < 1e-6
+              and _z.get("depth_db", 0.0) > 100.0,
+              "Omega %.9g / depth %.6g dB" % (_z.get("measured_omega", 0.0),
+                                              _z.get("depth_db", 0.0)))
+
         # --- IPC-2152, now a closed-form fit instead of an empty table. The gold
         # value is hand-computed from the published fit; the second check asserts a
         # physical property (internal is NOT derated 2x) that a wrong coefficient set

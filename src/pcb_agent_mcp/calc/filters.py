@@ -53,8 +53,13 @@ NOT_COMPUTED = [
     "Hammerstad open-end length correction used for the resonator length",
     "finite unloaded Q in the DISTRIBUTED filters: lumped_bandpass takes q_unloaded "
     "and reports the insertion loss it causes, but coupled_resonator and the cavity "
-    "still have Qe and R/Q only, no measured unloaded Q of the printed resonator",
-    "cross-coupling between non-adjacent resonators (folded or canonical topologies)",
+    "still have Qe and R/Q only, no measured unloaded Q of the printed resonator "
+    "(for the coupling-matrix view of a given Qu use filter_coupling_matrix, "
+    "docs/22 section on the coupling matrix)",
+    "cross-coupling between non-adjacent resonators (folded or canonical topologies): "
+    "this module has no matrix formulation, so nothing here can produce a stopband "
+    "null - filter_coupling_matrix does that, but it PERTURBS the inline matrix "
+    "instead of running a full Cameron synthesis, and it still dimensions no layout",
     "EM-simulated S-parameters: no full-wave engine is invoked anywhere in this module",
 ]
 

@@ -104,9 +104,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（144 个）
+## 工具（146 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -245,6 +245,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `filter_coupled_microstrip` | 耦合微带反解 w/s：截面解拉普拉斯（奇模电壁/偶模磁壁）+ Broyden 反解 | 准静态无色散；k<0.02 拒；k 误差 >3% 带 `k_resolution_note`（k 是两个相近数之差） |
 | `filter_coupled_resonator` | 边缘耦合半波谐振器带通：Qe/k_ij/λ_g−2Δl + 每段 `meets_target` | 不建模交叉耦合（因此没有带外零点）；不给馈电间隙几何 |
 | `filter_waveguide_cavity` | 矩形腔 TE101：长度、Rs、Qc（闭式 vs 六面数值积分）、R/Q | 两路 Qc 差 >2% 拒答；低于 TE10 截止拒；只做 TE101（iris 耦合必须全波） |
+| `filter_coupling_matrix` | 耦合矩阵当**真网络**算：交叉耦合的有限传输零点 + 有限无载 Q 的插损与零点深度；每个耦合贴成理想导纳逆变器的精确 Π 等效，节点法解 S 参数（矩阵只供代数，不倒它求 S） | 四条自检不过就**拒答**：无损 inline 必须复现 `1/(1+ε²Tn²)` <1e-6 dB、无损幺正性 <1e-9、三阶零点必须落在 `Ω_z=m12²/m13`、纹波幅度对原型 g 值 <1e-3 dB；trisection 是**对 inline 矩阵的微扰**，不是 Cameron 合成 ⇒ `ripple_actual_db` 是「你得到的」不是「你要的」（`couplings` 参数可传你自己合成的矩阵）；不生成版图、不做 EM、不建模色散 |
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
@@ -547,7 +548,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 144 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 146 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -602,6 +603,7 @@ pcb_agent_mcp/
 │       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）+ plane_q（Qc = h/δs）
 │       ├── em.py                 # 全波接缝：找出 openEMS/Meep/gprMAX、版本与 handoff（不生成几何）
 │       ├── filters.py            # 滤波器合成：原型 g 值/集总带通(两路对账 + 有限 Q + 寄生 + 蒙特卡洛)/耦合线反解/耦合谐振器/TE101 腔
+│       ├── filtermatrix.py       # 耦合矩阵：交叉耦合零点(余子式) + 有限 Qu 插损；节点法 + 精确导纳逆变器 Π 等效，无损时对原型闭式自检
 │       ├── electrothermal.py     # 电热耦合：R(T) 定点迭代 + 精确失控判据 + 板级 2-D 场（SOR）
 │       ├── magnetics.py          # 功率电感：CCM boost/buck/buck-boost 占空比/电感/峰值/CCM 边界
 │       ├── stackup.py           # 板材表 + 4/6 层叠 + 每层 50Ω 线宽 + λ_g/20 缝合孔
