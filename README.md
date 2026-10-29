@@ -123,8 +123,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `spacing_required` | 一次给出 clearance / creepage / 裁决值与 `governing` | 额外强制 `creepage >= clearance`（标准要求，`creepage_mm` 本身不夹） |
 | `safety_table_check` | 判定一张安规表能不能用；`which="iec60664"` 时走 8 条专属检查（含 F.8 与 PD 无关、线性段过原点、`not_covered` 不得被删） | 只能判“转录没法作弊 + 行为对拍过”，判不了“标准原文还有没有未覆盖的条款”；9 条变异用例保证它不是永真的 |
 | `diff_impedance` | 差分对几何 → Zdiff（边耦合微带/带状线） | s/h 超出 0.1..3.0 标 `validity_note` |
-| `coplanar_field` | 共面线（cpw/gcpw）→ Z0 + eps_eff，解真实截面上的 div(ε∇V)=0；**全板网格，不用对称面** | 场解在七个几何上一律比闭式**读低 1.19%~3.39%**（方向是结论的一部分）；铜厚只划网格不建模；零厚度 `∫g²ds` 对数发散，以 `mesh_drift_pct` 明示；共面差分对与有限宽地不做 |
-| `coplanar_pair_field` | 共面**差分对**（边耦合 cpw/gcpw）→ Zdiff + Z_odd/Z_even/Z_common + eps_eff；同一网格上两个驱动（不设对称面），`frequency_ghz` 一并给导体与介质损耗 | **没有闭式可对账**：给的不是「±x%」而是叠加恒等式（残差 1.9e-8）、奇模电荷平衡 −1.000000000、左右份额逐位相等、`s=w/6` 时共模落到 2w 单线 −0.87%；`Z_odd` 按物理发散到 0，大间距**不**收敛到单线；差分导体损耗是零厚度下界 + 网格漂移 8.79% 的不确定度；一次 `levels=2` 约 40 s |
+| `coplanar_field` | 共面线（cpw/gcpw）→ Z0 + eps_eff，解真实截面上的 div(ε∇V)=0；**全板网格，不用对称面** | 场解在七个几何上一律比闭式**读低 1.19%~3.39%**（方向是结论的一部分）；铜厚只划网格不建模；零厚度 `∫g²ds` 对数发散，以 `mesh_drift_pct` 明示；可选 `ground_mm` 把共面地做成**有限宽**（默认 0 = 无限，逐位零变化）：`g/2` 宽的地把 Z0 抬 +13.7%、eps 也抬 +7.8%，地外沿是电荷奇异边（节点 +16% 但 SOR 迭代 ×6） |
+| `coplanar_pair_field` | 共面**差分对**（边耦合 cpw/gcpw）→ Zdiff + Z_odd/Z_even/Z_common + eps_eff；同一网格上两个驱动（不设对称面），`frequency_ghz` 一并给导体与介质损耗 | **没有闭式可对账**：给的不是「±x%」而是叠加恒等式（残差 1.9e-8）、奇模电荷平衡 −1.000000000、左右份额逐位相等、`s=w/6` 时共模落到 2w 单线 −0.87%；`Z_odd` 按物理发散到 0，大间距**不**收敛到单线；差分导体损耗是零厚度下界 + 网格漂移 8.79% 的不确定度；可选 `ground_mm`（默认 0 = 无限）：窄地是**共模问题**——`g/2` 时 `z_odd` +1.1% 而 `z_even` +21.9%；一次 `levels=2` 约 40 s |
 | `diff_impedance_field` | 同一几何 → Zdiff，但解真实截面上的 div(ε∇V)=0（有限体积 + 红黑 SOR，纯 stdlib） | 参考解只覆盖零厚度带状线/孤立微带；紧间距耦合回 `reference_note`（求解器的意见，不是被核过的数）；不建模阻焊/蚀刻梯形/铜损 |
 | `diff_width` | Zdiff → 线宽（间距固定，二分） | 不可达 → `UNREACHABLE` + 可达带宽 |
 | `schematic_pcb_diff` | 原理图网表 ↔ 板：**逐脚**差集（哪个封装的哪个脚换了网 / 板上没网） | 两侧都用权威（KiCad 自己的网表器 + 板文件里的 pad net）；缺封装只报 `needs_placement`，**不发明位置** |
@@ -262,7 +262,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 ```bash
 python run_server.py --version       # 0.0.10
 python run_server.py --selftest      # 协议级自检，76/76（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问）
-python -m unittest discover -s tests # 1562 个用例（约 11 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python -m unittest discover -s tests # 1570 个用例（约 12 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -618,10 +618,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1562 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1570 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~30，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~31，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
@@ -632,7 +632,7 @@ pcb_agent_mcp/
   （`diff_impedance_field`），但紧间距耦合没有独立参考答案，那种几何下它会自己声明
   `reference_note`。共面线（cpw/gcpw）也有场解（`coplanar_field`），它在七个几何上都比共形映射
   **读低** 1.19%~3.39%，即共形映射是乐观的那一端；共面损耗现在由场解给出，但只有零厚度值
-  （真实铜箔更高约 10%，而那 10% 自己也没收敛）。定稿前请用场求解器或打样厂的阻抗报告复核。
+  （真实铜箔更高约 10%，而那 10% 自己也没收敛）。共面的地默认按**无限宽**算，真实版图地留窄时传 `ground_mm`——单线 `g/2` 宽的地会抬 13.7%，差分对则只动差模 1.1% 而动共模 21.9%。定稿前请用场求解器或打样厂的阻抗报告复核。
 - 仿真层是**子集**：SPICE 只有 R C L V I E G D Q M 与后向欧拉瞬态，没有自热、没有噪声/失真、
   没有器件电容随温度；热学是 1-D/2-D 稳态与单级或多级 RC，不含 TIM 压缩、辐照与空气流场；
   板级 IR drop 只算直流、只用叠层铜厚。逐条写在每次返回的 `not_computed` / `warnings` 里。

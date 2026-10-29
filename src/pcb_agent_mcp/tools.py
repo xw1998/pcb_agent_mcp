@@ -491,13 +491,19 @@ _tool(
                         2),
          "max_nodes": _num("refuse rather than grind if the mesh would exceed this",
                            40000),
+         "ground_mm": _num("0 = the coplanar wings run to the truncation box "
+                           "(effectively infinite, the historical behaviour); > 0 = "
+                           "each wing is finite and stops that far from its slot, "
+                           "which raises Z0 (13.7 %% at gap/2, 7.5 %% at gap, 1.1 %% at "
+                           "2.5*gap) and needs far more nodes", 0),
      },
      "required": ["width_mm", "gap_mm", "dielectric_mm"]},
     lambda a: _field2d.coplanar_field(
         a["width_mm"], a["gap_mm"], a["dielectric_mm"],
         copper_um=a.get("copper_um", 0.0), er=a.get("er", 4.3),
         kind=a.get("kind", "cpw"), levels=int(a.get("levels", 2)),
-        max_nodes=int(a.get("max_nodes", 40000))),
+        max_nodes=int(a.get("max_nodes", 40000)),
+        ground_mm=float(a.get("ground_mm", 0.0) or 0.0)),
 )
 
 _tool(
@@ -528,6 +534,11 @@ _tool(
                            0),
          "max_nodes": _num("refuse rather than grind if the mesh would exceed this",
                            60000),
+         "ground_mm": _num("0 = the two coplanar wings run to the truncation box "
+                           "(effectively infinite, the historical behaviour); > 0 = "
+                           "each wing is finite and stops that far from its slot. This "
+                           "is mostly a COMMON-mode effect: at gap/2 z_odd moves 1.1 %% "
+                           "while z_even moves 21.9 %%", 0),
      },
      "required": ["width_mm", "spacing_mm", "gap_mm", "dielectric_mm"]},
     lambda a: _field2d.coplanar_pair_field(
@@ -536,7 +547,8 @@ _tool(
         kind=a.get("kind", "cpw"), levels=int(a.get("levels", 2)),
         frequency_ghz=float(a.get("frequency_ghz", 0.0) or 0.0),
         tan_delta=float(a.get("tan_delta", 0.0) or 0.0),
-        max_nodes=int(a.get("max_nodes", 60000))),
+        max_nodes=int(a.get("max_nodes", 60000)),
+        ground_mm=float(a.get("ground_mm", 0.0) or 0.0)),
 )
 
 _tool(

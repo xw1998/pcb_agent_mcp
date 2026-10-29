@@ -509,14 +509,30 @@ class _Coplanar(object):
         have to look at the sign of y and not only at the substrate height.
     """
 
-    def __init__(self, kind, w, g, h, t, er, fine, far_span=8.0):
+    def __init__(self, kind, w, g, h, t, er, fine, far_span=8.0,
+                 ground_mm=None):
         self.kind = kind
         self.w, self.g, self.h, self.t, self.er = w, g, h, t, er
+        # ground_mm = the width of EACH coplanar wing, measured from the slot
+        # edge outwards. None keeps the historical behaviour: the wings run to
+        # the truncation box, i.e. they are "infinite". Both are needed - the
+        # infinite one is what the conformal map describes and what every
+        # number in VALIDATION was measured on, so it stays the default and
+        # costs exactly nothing when it is not asked for.
+        self.ground_w = None if ground_mm is None else float(ground_mm)
+        if self.ground_w is not None and not (self.ground_w > 0.0):
+            raise ValueError("coplanar section: ground width must be > 0")
         self.backed = (kind == "gcpw")
         near = max(3.0 * t, min(w, g) / 2.0)
         slow = max(fine * 8.0, near / 6.0)
         a, b = w / 2.0, w / 2.0 + g
         x_anchor = [(0.0, slow), (max(a - near, 0.0), slow), (a, fine), (b, fine)]
+        if self.ground_w is not None:
+            # the OUTER edge of the wing is where the return current stops, so it
+            # has to be a grid line: a wing that ends in the middle of a cell
+            # makes the answer depend on the cell size, and the whole point of
+            # this parameter is the edge
+            x_anchor.append((b + self.ground_w, fine))
         # The truncation scale is the IN-PLANE geometry, not the substrate
         # height. Measured on w=0.3 g=0.2: at h=0.2 the answer is still moving by
         # 0.3 % between 16h and 24h and settles around 6-7*(w+2g); at h=2.0 the
@@ -526,6 +542,11 @@ class _Coplanar(object):
         # a thick substrate take minutes.
         span = w + 2.0 * g
         far = max(far_span * span, span * 1.2)
+        if self.ground_w is not None:
+            # beyond the wing the copper is gone but the field is not: the
+            # truncation distance still has to be measured from the outermost
+            # copper, or a narrow wing would be truncated inside itself
+            far = max(far, self.ground_w + span)
         far_x = b + far
         half_x = _axis(x_anchor, far_x)
         # mirrored, so the two slots are discretised identically: an asymmetric
@@ -561,7 +582,8 @@ class _Coplanar(object):
                 elif on_plane:
                     if ax <= a + eps:
                         self.live.append(n)
-                    elif ax >= b - eps:
+                    elif ax >= b - eps and (self.ground_w is None
+                                            or ax <= b + self.ground_w + eps):
                         self.ground.append(n)
 
     def _eps_x(self, y):
@@ -603,20 +625,21 @@ class _Coplanar(object):
     energy = _Section.energy
 
 
-def _copl_solution(kind, w, g, h, t, er, fine, coarse=4.0, max_nodes=None):
+def _copl_solution(kind, w, g, h, t, er, fine, coarse=4.0, max_nodes=None,
+                   ground_mm=None):
     """Solve one coplanar cross-section, warm-starting from a coarser mesh."""
     init = None
     if coarse and fine * coarse < max(w, g, h):
-        csec = _Coplanar(kind, w, g, h, t, er, fine * coarse)
+        csec = _Coplanar(kind, w, g, h, t, er, fine * coarse, ground_mm=ground_mm)
         csec.build(odd=False)
         _check_nodes(csec, max_nodes)
         csec._V = csec.solve()
-        sec = _Coplanar(kind, w, g, h, t, er, fine)
+        sec = _Coplanar(kind, w, g, h, t, er, fine, ground_mm=ground_mm)
         sec.build(odd=False)
         _check_nodes(sec, max_nodes)
         init = _interp(csec, sec)
     else:
-        sec = _Coplanar(kind, w, g, h, t, er, fine)
+        sec = _Coplanar(kind, w, g, h, t, er, fine, ground_mm=ground_mm)
         sec.build(odd=False)
         _check_nodes(sec, max_nodes)
     sec._V = sec.solve(init=init)
@@ -627,18 +650,20 @@ def _check_nodes(sec, max_nodes):
         raise ValueError("section needs %d mesh nodes, over the %d-node limit"
                          % (sec.nx * sec.ny, int(max_nodes)))
 
-def _copl_caps(kind, w, g, h, t, er, fine, coarse=4.0, max_nodes=None):
+def _copl_caps(kind, w, g, h, t, er, fine, coarse=4.0, max_nodes=None,
+               ground_mm=None):
     """Dimensionless C/eps0 of the coplanar section, dielectric and vacuum."""
     sec = _copl_solution(kind, w, g, h, t, er, fine, coarse=coarse,
-                         max_nodes=max_nodes)
+                         max_nodes=max_nodes, ground_mm=ground_mm)
     c_d = sec.charge(sec._V)
     sea = _copl_solution(kind, w, g, h, t, 1.0, fine, coarse=coarse,
-                         max_nodes=max_nodes)
+                         max_nodes=max_nodes, ground_mm=ground_mm)
     c_a = sea.charge(sea._V)
     return c_d, c_a, sec
 
 def coplanar_solve_pair(kind, w_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
-                        levels=(1.0, 0.65), fine_div=10.0, max_nodes=None):
+                        levels=(1.0, 0.65), fine_div=10.0, max_nodes=None,
+                        ground_mm=None):
     """Z0 at two mesh densities, with the drift between them. Returns (z, drift, runs).
 
     Z0 = eta0/sqrt(C_d*C_a) with both C in eps0 units: the inductance of a TEM
@@ -657,13 +682,14 @@ def coplanar_solve_pair(kind, w_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
     for factor in levels:
         fine = fine0 * factor
         c_d, c_a, sec = _copl_caps(kind, w, g, h, t, er, fine,
-                                   max_nodes=max_nodes)
+                                   max_nodes=max_nodes, ground_mm=ground_mm)
         if c_d <= 0.0 or c_a <= 0.0:
             raise ValueError("coplanar_solve_pair: non-positive capacitance")
         runs.append({"fine_mm": fine, "c_dielectric": c_d, "c_air": c_a,
                      "z0": ETA0 / math.sqrt(c_d * c_a), "eps_eff": c_d / c_a,
                      "nodes": sec.nx * sec.ny, "sweeps": sec.sweeps,
-                     "residual": sec.last_delta})
+                     "residual": sec.last_delta,
+                     "ground_mm": sec.ground_w})
     main = runs[0]["z0"]
     drift = None
     if len(runs) > 1:
@@ -672,7 +698,8 @@ def coplanar_solve_pair(kind, w_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
     return main, drift, runs
 
 def coplanar_shape_factor(kind, w_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
-                          fine_div=8.0, refine=1.5, max_nodes=None):
+                          fine_div=8.0, refine=1.5, max_nodes=None,
+                          ground_mm=None):
     """INT g(s)^2 ds for a coplanar line: the geometry factor in alpha_c.
 
     Same quantity, same code path and the same normalisation as
@@ -706,7 +733,7 @@ def coplanar_shape_factor(kind, w_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
     meshes = []
     for factor in ((1.0, refine) if refine and refine > 1.0 else (1.0,)):
         sec = _copl_solution(kind, w, g, h, t, er, fine * factor,
-                             max_nodes=max_nodes)
+                             max_nodes=max_nodes, ground_mm=ground_mm)
         live = _surface_charge_faces(sec, set(sec.live))
         ground = _surface_charge_faces(sec, set(sec.ground))
         q_live = sum(q for q, _, _ in live)
@@ -806,9 +833,13 @@ class _CoplanarPair(_Coplanar):
     on Z0 with the error invisible in the drift). The price is 2x nodes.
     """
 
-    def __init__(self, kind, w, s, g, h, t, er, fine, far_span=8.0):
+    def __init__(self, kind, w, s, g, h, t, er, fine, far_span=8.0,
+                 ground_mm=None):
         self.kind = kind
         self.w, self.s, self.g, self.h, self.t, self.er = w, s, g, h, t, er
+        self.ground_w = None if ground_mm is None else float(ground_mm)
+        if self.ground_w is not None and not (self.ground_w > 0.0):
+            raise ValueError("coplanar pair: ground width must be > 0")
         self.backed = (kind == "gcpw")
         near = max(3.0 * t, min(w, s, g) / 2.0)
         slow = max(fine * 8.0, near / 6.0)
@@ -817,6 +848,8 @@ class _CoplanarPair(_Coplanar):
         a3 = a2 + g                     # near edge of the right ground
         x_anchor = [(0.0, slow), (max(a1 - near, 0.0), slow), (a1, fine),
                     (a2, fine), (a3, fine)]
+        if self.ground_w is not None:
+            x_anchor.append((a3 + self.ground_w, fine))
         # The truncation distance is measured from the OUTER edge of the ground
         # plane and from the strips themselves only, never from the spacing.
         # Scaling it with s was measured to break the one limit that makes this
@@ -825,6 +858,8 @@ class _CoplanarPair(_Coplanar):
         # line solved alone - the difference was boundary distance, not physics.
         span = w + 2.0 * g
         far = max(far_span * span, span * 1.2)
+        if self.ground_w is not None:
+            far = max(far, self.ground_w + span)
         half_x = _axis(x_anchor, a3 + far)
         # mirrored, not concatenated: an asymmetric mesh would make the two
         # strips disagree and both the antisymmetry invariant and the left/right
@@ -855,7 +890,8 @@ class _CoplanarPair(_Coplanar):
                 elif on_plane:
                     if a1 - eps <= ax <= a2 + eps:
                         (self.live_right if x > 0.0 else self.live_left).append(n)
-                    elif ax >= a3 - eps:
+                    elif ax >= a3 - eps and (self.ground_w is None
+                                             or ax <= a3 + self.ground_w + eps):
                         self.ground.append(n)
 
     def build(self, mode="odd"):
@@ -881,38 +917,42 @@ class _CoplanarPair(_Coplanar):
         return self
 
 def _copl_pair_solution(kind, w, s, g, h, t, er, fine, mode="odd", coarse=4.0,
-                        max_nodes=None):
+                        max_nodes=None, ground_mm=None):
     """Solve one edge-coupled coplanar cross-section, warm-started from a coarse mesh."""
     init = None
     if coarse and fine * coarse < max(w, s, g, h):
-        csec = _CoplanarPair(kind, w, s, g, h, t, er, fine * coarse)
+        csec = _CoplanarPair(kind, w, s, g, h, t, er, fine * coarse,
+                             ground_mm=ground_mm)
         csec.build(mode)
         _check_nodes(csec, max_nodes)
         csec._V = csec.solve()
-        sec = _CoplanarPair(kind, w, s, g, h, t, er, fine)
+        sec = _CoplanarPair(kind, w, s, g, h, t, er, fine, ground_mm=ground_mm)
         sec.build(mode)
         _check_nodes(sec, max_nodes)
         init = _interp(csec, sec)
     else:
-        sec = _CoplanarPair(kind, w, s, g, h, t, er, fine)
+        sec = _CoplanarPair(kind, w, s, g, h, t, er, fine, ground_mm=ground_mm)
         sec.build(mode)
         _check_nodes(sec, max_nodes)
     sec._V = sec.solve(init=init)
     return sec
 
 def _copl_pair_caps(kind, w, s, g, h, t, er, fine, mode="odd", coarse=4.0,
-                    max_nodes=None):
+                    max_nodes=None, ground_mm=None):
     """C/eps0 of the driven strip, dielectric and vacuum, plus the solved section."""
     sec = _copl_pair_solution(kind, w, s, g, h, t, er, fine, mode,
-                              coarse=coarse, max_nodes=max_nodes)
+                              coarse=coarse, max_nodes=max_nodes,
+                              ground_mm=ground_mm)
     c_d = sec.charge(sec._V)
     sea = _copl_pair_solution(kind, w, s, g, h, t, 1.0, fine, mode,
-                              coarse=coarse, max_nodes=max_nodes)
+                              coarse=coarse, max_nodes=max_nodes,
+                              ground_mm=ground_mm)
     c_a = sea.charge(sea._V)
     return c_d, c_a, sec
 
 def coplanar_pair_solve(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
-                        levels=(1.0, 0.65), fine_div=10.0, max_nodes=None):
+                        levels=(1.0, 0.65), fine_div=10.0, max_nodes=None,
+                        ground_mm=None):
     """Odd- and even-mode impedances of an edge-coupled coplanar pair.
 
     Conventions, spelled out because "Zdiff" means three different things
@@ -944,7 +984,8 @@ def coplanar_pair_solve(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
         entry = {"fine_mm": fine}
         for mode in COPLANAR_PAIR_MODES:
             c_d, c_a, sec = _copl_pair_caps(kind, w, s, g, h, t, er, fine, mode,
-                                            max_nodes=max_nodes)
+                                            max_nodes=max_nodes,
+                                            ground_mm=ground_mm)
             if c_d <= 0.0 or c_a <= 0.0:
                 raise ValueError("coplanar_pair_solve: non-positive capacitance")
             q_r = sum(q for q, _, _ in _surface_charge_faces(sec, set(sec.live_right)))
@@ -955,7 +996,7 @@ def coplanar_pair_solve(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
                 "q_right": q_r, "q_left": q_l,
                 "charge_balance": (q_l / q_r) if q_r else None,
                 "nodes": sec.nx * sec.ny, "sweeps": sec.sweeps,
-                "residual": sec.last_delta,
+                "residual": sec.last_delta, "ground_mm": sec.ground_w,
             }
         runs.append(entry)
     main = runs[0]
@@ -974,7 +1015,7 @@ def coplanar_pair_solve(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
             "runs": runs, "kind": kind}
 
 def coplanar_pair_mode_check(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
-                             fine_div=10.0, max_nodes=None):
+                             fine_div=10.0, max_nodes=None, ground_mm=None):
     """Solve all THREE drives and test the mode decomposition against itself.
 
     Linear superposition says, for two identical conductors 1 and 2:
@@ -1009,7 +1050,8 @@ def coplanar_pair_mode_check(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
     c = {}
     for mode in ("odd", "even", "grounded"):
         c_d, c_a, sec = _copl_pair_caps(kind, w, s, g, h, t, er, fine, mode,
-                                        max_nodes=max_nodes)
+                                        max_nodes=max_nodes,
+                                        ground_mm=ground_mm)
         c[mode] = {"c_dielectric": c_d, "c_air": c_a,
                    "nodes": sec.nx * sec.ny, "sweeps": sec.sweeps}
     out = {"kind": kind, "fine_mm": fine, "drives": c}
@@ -1020,8 +1062,9 @@ def coplanar_pair_mode_check(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
         out["residual_" + tag] = (mean - ref) / ref if ref else None
     return out
 
-def coplanar_pair_shape_factor(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
-                               fine_div=8.0, refine=1.5, max_nodes=None):
+def coplanar_pair_shape_factor(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0,
+                               er=4.3, fine_div=8.0, refine=1.5, max_nodes=None,
+                               ground_mm=None):
     """INT g(s)^2 ds of an edge-coupled coplanar pair in its ODD mode.
 
     The normalisation is the one the loss formula needs and the one that is easy
@@ -1052,7 +1095,7 @@ def coplanar_pair_shape_factor(kind, w_mm, s_mm, g_mm, h_mm, t_mm=0.0, er=4.3,
     meshes = []
     for factor in ((1.0, refine) if refine and refine > 1.0 else (1.0,)):
         sec = _copl_pair_solution(kind, w, s, g, h, t, er, fine * factor, "odd",
-                                  max_nodes=max_nodes)
+                                  max_nodes=max_nodes, ground_mm=ground_mm)
         faces = {
             "strip_right": _surface_charge_faces(sec, set(sec.live_right)),
             "strip_left": _surface_charge_faces(sec, set(sec.live_left)),
@@ -1320,6 +1363,56 @@ VALIDATION = {
                 "strip alone, because a widely spaced pair has a ground plane on one "
                 "side of each strip only",
     },
+    "coplanar_finite_ground": {
+        "case": "the coplanar wings are FINITE: each stops ground_mm from its slot "
+                "instead of running to the truncation box. Kept out of "
+                "coplanar_vs_conformal because the conformal map being compared "
+                "against has infinite grounds, so its gap is not an error bar here. "
+                "Measured with the shipped default mesh (levels=1, fine_div=10, "
+                "zero-thickness copper) on single line w=0.3/g=0.2/h=0.2/er=4.3 and "
+                "pair w=0.3/s=0.2/g=0.2/h=0.2/er=4.3, against the same geometry with "
+                "ground_mm = 0 (infinite). Nothing external exists to check this "
+                "against - these numbers are self-consistency, not accuracy",
+        "ground_mm_by_gap": [0.5, 1.0, 1.5, 2.5, 5.0, 10.0, 25.0],
+        "single_cpw_z0_ohm": {"infinite": 89.674, "0.1": 101.971, "0.2": 96.362,
+                              "0.3": 94.018, "0.5": 92.049, "1.0": 90.659,
+                              "2.0": 90.098, "5.0": 89.896},
+        "single_cpw_z0_error_pct": {"0.1": 13.71, "0.2": 7.46, "0.3": 4.84,
+                                    "0.5": 2.65, "1.0": 1.10, "2.0": 0.47,
+                                    "5.0": 0.25},
+        "single_cpw_eps_eff": {"infinite": 2.2925, "0.1": 2.4703, "5.0": 2.2915},
+        "single_gcpw_z0_ohm": {"infinite": 57.218, "0.1": 57.426, "1.0": 57.260,
+                               "5.0": 57.254},
+        "single_gcpw_z0_error_pct": {"0.1": 0.36, "1.0": 0.07, "5.0": 0.06},
+        "pair_cpw_z_odd_ohm": {"infinite": 64.930, "0.1": 65.616, "0.3": 65.109,
+                               "0.5": 65.022, "1.0": 64.984, "4.0": 64.974},
+        "pair_cpw_z_odd_error_pct": {"0.1": 1.06, "0.3": 0.28, "0.5": 0.14,
+                                     "1.0": 0.08, "4.0": 0.07},
+        "pair_cpw_z_even_ohm": {"infinite": 146.202, "0.1": 178.222, "0.3": 159.382,
+                                "0.5": 153.948, "1.0": 149.537, "4.0": 146.683},
+        "pair_cpw_z_even_error_pct": {"0.1": 21.90, "0.3": 9.02, "0.5": 5.30,
+                                      "1.0": 2.28, "4.0": 0.33},
+        "pair_gcpw_z_odd_error_pct": {"0.1": 0.08, "1.0": 0.02, "4.0": 0.02},
+        "pair_gcpw_z_even_error_pct": {"0.1": 0.36, "1.0": 0.07, "4.0": 0.05},
+        "note": "the single-line cpw is the sensitive topology (a wing of half a gap "
+                "is +13.7 %) and eps_eff rises with it (2.2925 -> 2.4703), because "
+                "the current is pushed under the strip where the substrate is. The "
+                "backed topology barely notices (+0.36 % at the same wing) since the "
+                "return current mostly uses the plane below. On the pair the split is "
+                "the design-relevant fact: at a wing of half a gap z_odd moves 1.1 % "
+                "while z_even moves 21.9 %, so a narrow ground is a COMMON-mode "
+                "problem far more than a differential one; both decay to under 0.4 % "
+                "by a wing of 20 gaps",
+        "cost_note": "a finite wing multiplies the node count (2257 -> 20313 at "
+                     "ground_mm = 5 mm on the single line) and, worse, the SOR sweep "
+                     "count (564 -> 3334 at ground_mm = 0.1): the wing edge is where "
+                     "the surface charge is singular, so it is the last thing to "
+                     "converge. Wall clock goes from 1.6 s to 12.5 s and 83 s",
+        "mesh_note": "the wing outer edge is forced onto a grid line. If it fell "
+                     "inside a cell the answer would depend on the cell size, because "
+                     "the whole physics of a finite ground is that the current stops "
+                     "at that edge",
+    },
     "worst_seen_pct": 3.39,
     "note": "all four checks land inside 3.4%. The stripline bias is positive and grows "
             "as the strip narrows (the edge singularity is under-resolved), the "
@@ -1474,7 +1567,7 @@ def field_impedance(width_mm, spacing_mm, dielectric_mm, copper_um=35.0, er=4.3,
 
 # ------------------------------------------------------------------ the tool
 def coplanar_field(width_mm, gap_mm, dielectric_mm, copper_um=0.0, er=4.3,
-                   kind="cpw", levels=2, max_nodes=40000):
+                   kind="cpw", levels=2, max_nodes=40000, ground_mm=0.0):
     """Coplanar (cpw / gcpw) impedance from an actual 2-D field solution.
 
     Same solver, same grid machinery and the same envelope as `field_impedance`;
@@ -1498,10 +1591,18 @@ def coplanar_field(width_mm, gap_mm, dielectric_mm, copper_um=0.0, er=4.3,
     if w <= 0 or g <= 0 or h <= 0 or t < 0 or er < 1.0:
         return err("width, gap and dielectric must be > 0; copper_um >= 0; er >= 1",
                    "ARG_RANGE")
+    try:
+        gw = float(ground_mm or 0.0)
+    except (TypeError, ValueError):
+        return err("ground_mm must be numeric", "ARG_INVALID")
+    if gw < 0:
+        return err("ground_mm must be >= 0 (0 means an effectively infinite wing)",
+                   "ARG_RANGE")
     spec = (1.0, 0.65) if int(levels or 2) > 1 else (1.0,)
     try:
         z, drift, runs = coplanar_solve_pair(kind, w, g, h, t, er, levels=spec,
-                                            max_nodes=max_nodes)
+                                            max_nodes=max_nodes,
+                                            ground_mm=(gw or None))
     except ValueError as exc:
         return err(str(exc), "OUT_OF_VALIDITY",
                    hint="lower fine_div, solve with copper_um = 0, or raise "
@@ -1521,6 +1622,7 @@ def coplanar_field(width_mm, gap_mm, dielectric_mm, copper_um=0.0, er=4.3,
         "closed_form_minus_solver_pct": None if gap_pct is None else round(gap_pct, 2),
         "slot_mm": g,
         "gap_over_substrate": round(g / h, 3),
+        "ground_width_mm": (None if not gw else gw),
         "validated_against": VALIDATION["coplanar_vs_conformal"],
         "method_note": "the drift between the two meshes is self-consistency, not a "
                        "total error bound; the number that IS independent is "
@@ -1540,6 +1642,16 @@ def coplanar_field(width_mm, gap_mm, dielectric_mm, copper_um=0.0, er=4.3,
             "gap/dielectric = %.3f: the slot is narrow compared with the substrate, "
             "which is where the coplanar agreement is worst (measured -3.4 %% at "
             "g/h = 0.1). Raise levels if the answer decides a stackup" % (g / h))
+    if gw:
+        extra["ground_note"] = (
+            "ground_mm = %g is FINITE: each coplanar wing stops at that distance from "
+            "its slot, instead of running to the truncation box. Nothing in "
+            "VALIDATION[coplanar_vs_conformal] applies to this geometry - the "
+            "conformal map has infinite grounds - so `closed_form_minus_solver_pct` "
+            "above is the map being compared with a different structure, not an "
+            "error bar. Measured on w=0.3/g=0.2/h=0.2/er=4.3: a wing of g/2 raises "
+            "Z0 by 13.7 %%, of g by 7.5 %%, of 2.5g by 1.1 %%, of 25g by 0.25 %%"
+            % gw)
 
     return ok(
         value=round(z, 2),
@@ -1575,7 +1687,7 @@ def coplanar_field(width_mm, gap_mm, dielectric_mm, copper_um=0.0, er=4.3,
 
 def coplanar_pair_field(width_mm, spacing_mm, gap_mm, dielectric_mm, copper_um=0.0,
                         er=4.3, kind="cpw", levels=2, frequency_ghz=0.0,
-                        tan_delta=0.0, max_nodes=60000):
+                        tan_delta=0.0, max_nodes=60000, ground_mm=0.0):
     """Edge-coupled coplanar pair (differential CPW / GCPW) from the 2-D field solver.
 
     Answer, in the order the schema asks for it: `value` is Zdiff = 2*Z_odd. The
@@ -1624,10 +1736,17 @@ def coplanar_pair_field(width_mm, spacing_mm, gap_mm, dielectric_mm, copper_um=0
                    "er >= 1", "ARG_RANGE")
     if f_ghz < 0 or tand < 0:
         return err("frequency_ghz and tan_delta must be >= 0", "ARG_RANGE")
+    try:
+        gw = float(ground_mm or 0.0)
+    except (TypeError, ValueError):
+        return err("ground_mm must be numeric", "ARG_INVALID")
+    if gw < 0:
+        return err("ground_mm must be >= 0 (0 means an effectively infinite wing)",
+                   "ARG_RANGE")
     spec = (1.0, 0.65) if int(levels or 2) > 1 else (1.0,)
     try:
         r = coplanar_pair_solve(kind, w, s, g, h, t, er, levels=spec,
-                                max_nodes=max_nodes)
+                                max_nodes=max_nodes, ground_mm=(gw or None))
     except ValueError as exc:
         return err(str(exc), "OUT_OF_VALIDITY",
                    hint="the fine step follows min(width, spacing, dielectric), so a "
@@ -1648,6 +1767,7 @@ def coplanar_pair_field(width_mm, spacing_mm, gap_mm, dielectric_mm, copper_um=0
         },
         "charge_balance_odd": (None if r["runs"][0]["odd"]["charge_balance"] is None
                                else round(r["runs"][0]["odd"]["charge_balance"], 9)),
+        "ground_width_mm": (None if not gw else gw),
         "mode_note": "odd = the strips driven at +V and -V (the differential mode, "
                      "Zdiff = 2*Z_odd); even = both driven at +V (Zcommon = "
                      "0.5*Z_even). The symmetry is not imposed, it is measured: the "
@@ -1681,7 +1801,8 @@ def coplanar_pair_field(width_mm, spacing_mm, gap_mm, dielectric_mm, copper_um=0
     if f_ghz > 0.0:
         from . import feedline as _fl
         shape = coplanar_pair_shape_factor(kind, w, s, g, h, t, er,
-                                          max_nodes=max_nodes)
+                                          max_nodes=max_nodes,
+                                          ground_mm=(gw or None))
         rs = _fl._surface_resistance(f_ghz)
         rs_eff = rs
         if shape["shape_factor_per_mm"]:
@@ -1729,6 +1850,16 @@ def coplanar_pair_field(width_mm, spacing_mm, gap_mm, dielectric_mm, copper_um=0
             "as many nodes as a much finer grid on the strips, and the odd-mode "
             "answer is dominated by the (log-divergent) capacitance between the two "
             "strips rather than by the ground" % (s / w))
+    if gw:
+        extra["ground_note"] = (
+            "ground_mm = %g is FINITE: the two coplanar wings stop that far from "
+            "their slots. Measured on w=0.3/s=0.2/g=0.2/h=0.2/er=4.3, a wing of g/2 "
+            "moves z_odd by +1.1 %% but z_even by +21.9 %%, of g by +0.28 %% / +9.0 %%, "
+            "of 2.5g by +0.14 %% / +5.3 %%: the odd-mode return hugs the slot while the "
+            "even-mode return spreads, so a narrow ground is a COMMON-mode problem "
+            "far more than a differential one. The truncation box grows to "
+            "max(8*(w+2g), ground + w + 2g), so a large ground_mm is the expensive "
+            "way to ask" % gw)
     if g / h < 0.2:
         extra["gap_note"] = (
             "gap/dielectric = %.3f puts the slot closer to the substrate thickness "

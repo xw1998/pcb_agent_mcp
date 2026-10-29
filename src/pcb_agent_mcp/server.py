@@ -1432,6 +1432,53 @@ def selftest():
           "%s dB/100mm, S=%s" % (_cq.get("conductor_db_per_100mm"),
                                  _sf.get("shape_factor_per_mm")))
 
+    # Coplanar with a FINITE ground: the historical default is an effectively
+    # infinite wing, so this is a different structure, not a mesh setting. The
+    # numbers are pinned because nothing external can check them - what CAN be
+    # checked is that a finite wing raises Z0 (the return current has further to
+    # spread), that ground_mm = 0 is bit-for-bit the old behaviour, and that the
+    # two tools disagree about how much it matters, which is the physics.
+    r = handle({"jsonrpc": "2.0", "id": 130, "method": "tools/call",
+                "params": {"name": "coplanar_field",
+                           "arguments": {"width_mm": 0.3, "gap_mm": 0.2,
+                                         "dielectric_mm": 0.2, "kind": "cpw",
+                                         "levels": 1, "ground_mm": 0.1}}})
+    _gf = json.loads(r["result"]["content"][0]["text"])
+    _ginf = json.loads(handle({"jsonrpc": "2.0", "id": 1300, "method": "tools/call",
+                               "params": {"name": "coplanar_field",
+                                          "arguments": {"width_mm": 0.3,
+                                                        "gap_mm": 0.2,
+                                                        "dielectric_mm": 0.2,
+                                                        "kind": "cpw",
+                                                        "levels": 1}}}
+                       )["result"]["content"][0]["text"])
+    check("a finite coplanar wing of gap/2 raises Z0 by 13.7 %, and ground_mm = 0 "
+          "is exactly the infinite-wing answer",
+          _gf.get("status") == "ok" and abs(_gf.get("value", 0.0) - 101.97) < 1.0
+          and _gf.get("ground_width_mm") == 0.1
+          and bool(_gf.get("ground_note"))
+          and abs(_ginf.get("value", 0.0) - 89.67) < 0.9
+          and _ginf.get("ground_width_mm") is None,
+          "%s with a wing, %s without" % (_gf.get("value"), _ginf.get("value")))
+
+    r = handle({"jsonrpc": "2.0", "id": 131, "method": "tools/call",
+                "params": {"name": "coplanar_pair_field",
+                           "arguments": {"width_mm": 0.3, "spacing_mm": 0.2,
+                                         "gap_mm": 0.2, "dielectric_mm": 0.2,
+                                         "kind": "cpw", "levels": 1,
+                                         "ground_mm": 0.1}}})
+    _gp = json.loads(r["result"]["content"][0]["text"])
+    _odd_d = 100.0 * (_gp.get("z_odd_ohm", 0.0) - 64.930) / 64.930
+    _even_d = 100.0 * (_gp.get("z_even_ohm", 0.0) - 146.202) / 146.202
+    check("the same narrow wing moves the pair's odd mode 1 % but its even mode "
+          "22 %: a narrow ground is a common-mode problem, and the two modes "
+          "disagreeing is what proves the wing is really finite",
+          _gp.get("status") == "ok"
+          and abs(_gp.get("z_odd_ohm", 0.0) - 65.616) < 0.3
+          and abs(_gp.get("z_even_ohm", 0.0) - 178.222) < 1.0
+          and 0.5 < _odd_d < 2.0 and 15.0 < _even_d < 30.0,
+          "odd %+0.2f %%, even %+0.2f %%" % (_odd_d, _even_d))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
