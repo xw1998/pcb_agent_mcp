@@ -31,6 +31,7 @@ from .calc import power as _power
 from .calc import spice as _spice
 from .calc import thermal as _thermal
 from .calc import vibration as _vib
+from .calc import reliability as _rel
 from .calc import cavity as _cavity
 from .calc import electrothermal as _electro
 from .calc import filters as _filters
@@ -2867,8 +2868,27 @@ def _capabilities(_args):
                          "degrees (curvature converges slower than frequency); von Mises "
                          "and the largest principal stress are reported at their own, "
                          "usually different, points. "
-                         "NOT done: assembly compliance, solder-joint creep, "
-                         "random+shock combined, drop, and any nonlinear contact",
+                         "NOT done here: assembly compliance, random+shock combined, "
+                         "and any nonlinear contact. The drop chain and the solder-joint "
+                         "fatigue live in the 'reliability' layer below, and they reuse "
+                         "these solvers rather than re-deriving them",
+            "reliability": "interface reliability at two time scales. Thermal cycling: "
+                           "the shear strain range from the CTE mismatch over the joint "
+                           "standoff, Engelmaier's strain-life form of Coffin-Manson, "
+                           "Miner for several environments, and Norris-Landzberg to move "
+                           "a test life into a use life. Drop/shock: a single-mode plate "
+                           "chain (first mode -> SDOF shock response -> curvature -> "
+                           "surface strain), plus a shock response spectrum so you can "
+                           "see where the board's f1 sits against the pulse. The rules "
+                           "this layer keeps: eps_f, the CTE presets, the "
+                           "Norris-Landzberg constants and any compliance factor are "
+                           "FITS and TYPICALS, named as such in the envelope; and the "
+                           "strain a joint survives (critical_strain_ue) is the "
+                           "CALLER's, never this server's - without it you get a strain "
+                           "and judged=false, not a verdict. NOT modelled: underfill, "
+                           "voids and IMC growth, crack propagation, drop "
+                           "directionality, component mass on the plate, or "
+                           "multi-mode response",
             "magnetics": "power-inductor sizing for boost / buck / buck-boost: the CCM "
                          "design point (duty, inductance from volt-seconds, peak / "
                          "valley / RMS current, the load at which CCM ends, winding "
@@ -2969,7 +2989,9 @@ def _capabilities(_args):
             "vibration_plate_modes", "vibration_plate_stress",
             "vibration_random_response",
             "vibration_fatigue", "vibration_shock", "vibration_isolator",
+            "vibration_shock_spectrum",
             "board_vibration",
+            "solder_joint_fatigue", "drop_board_strain",
             "cavity_resonance", "cavity_via_fence", "cavity_plane_q",
             "electrothermal_trace", "electrothermal_conductor",
             "board_electrothermal",
@@ -4720,6 +4742,132 @@ _tool(
     lambda a: _vib.transmissibility(
         a.get("f_n_hz"), zeta=a.get("zeta"), q_factor=a.get("q_factor"),
         freq_hz=a.get("freq_hz"), freq_range=a.get("freq_range")),
+)
+
+_tool(
+    "solder_joint_fatigue",
+    "Thermal-cycling life of a solder joint from the CTE mismatch. Shear strain range = "
+    "F*DNP*dalpha*delta_T/h (the mismatch displacement over the joint standoff), then "
+    "Engelmaier's strain-life form of Coffin-Manson: Nf = 0.5*(dg/(2*eps_f))**(1/c) with "
+    "c = -0.442 - 6e-4*Tbar_sj + 1.74e-2*ln(1+360/t_D). Several cyclic environments go "
+    "through Miner's rule; a test/use pair goes through the Norris-Landzberg acceleration "
+    "factor. eps_f (Engelmaier's SnPb fit, 0.325) and the CTE presets are fits and "
+    "typicals, not material truths, and whichever were used come back in the envelope. "
+    "NOT modelled: underfill, voids and IMC growth, crack propagation after initiation, "
+    "assembly bending, or a thermal gradient across the joint.",
+    {"type": "object", "properties": {
+        "joint_height_mm": _num("solder standoff / gap under the part (REQUIRED)"),
+        "dnp_mm": _num("distance from the neutral point to the joint judged"),
+        "body_a_mm": _num("package body side A; with body_b_mm DNP becomes the diagonal"),
+        "body_b_mm": _num("package body side B"),
+        "delta_t_k": _num("cycle temperature range, for a single environment"),
+        "mean_joint_temp_c": _num("mean cyclic JOINT temperature (not ambient)", 25),
+        "dwell_min": _num("half-cycle dwell", 15),
+        "cycles": _num("cycles per block, for the single environment"),
+        "alpha_component_ppm": _num("component CTE, ppm/K"),
+        "alpha_board_ppm": _num("board CTE, ppm/K"),
+        "alpha_component": _str("component CTE preset name"),
+        "alpha_board": _str("board CTE preset name", "fr4"),
+        "conditions": {"type": "array", "items": {"type": "object"},
+                       "description": "list of {name, delta_t_k, mean_joint_temp_c, "
+                                      "dwell_min, cycles, blocks_per_year}; only "
+                                      "delta_t_k is required in one"},
+        "fatigue_ductility": _num("eps_f; leave out for Engelmaier's 0.325"),
+        "compliance_factor": _num("F, 1.0 = the joint absorbs the whole mismatch", 1.0),
+        "nl_test": {"type": "object", "description":
+                    '{"delta_t_k":165,"frequency_cpd":2,"t_max_c":125}'},
+        "nl_use": {"type": "object", "description":
+                   '{"delta_t_k":100,"frequency_cpd":1,"t_max_c":55}'},
+        "nl_m": _num("Norris-Landzberg dT exponent", 1.75),
+        "nl_n": _num("Norris-Landzberg frequency exponent", 0.3333333333333333),
+        "nl_ea_ev": _num("activation energy in eV", 0.141),
+    }, "required": ["joint_height_mm"]},
+    lambda a: _rel.solder_joint_fatigue(
+        conditions=a.get("conditions"), joint_height_mm=a.get("joint_height_mm"),
+        delta_t_k=a.get("delta_t_k"),
+        mean_joint_temp_c=a.get("mean_joint_temp_c"),
+        dwell_min=a.get("dwell_min"), cycles=a.get("cycles"),
+        alpha_component_ppm=a.get("alpha_component_ppm"),
+        alpha_board_ppm=a.get("alpha_board_ppm"),
+        alpha_component=a.get("alpha_component"),
+        alpha_board=a.get("alpha_board"),
+        dnp_mm=a.get("dnp_mm"), body_a_mm=a.get("body_a_mm"),
+        body_b_mm=a.get("body_b_mm"),
+        fatigue_ductility=a.get("fatigue_ductility"),
+        compliance_factor=a.get("compliance_factor"),
+        nl_test=a.get("nl_test"), nl_use=a.get("nl_use"),
+        nl_m=a.get("nl_m"), nl_n=a.get("nl_n"), nl_ea_ev=a.get("nl_ea_ev")),
+)
+
+_tool(
+    "drop_board_strain",
+    "Board surface strain under a drop or shock pulse, built from three already-solved "
+    "pieces: the plate's first mode (vibration_plate_modes) gives f1, a single-DOF shock "
+    "response to the same pulse gives the peak deflection, and the plate curvature turns "
+    "that deflection into surface strain. Add dnp_mm + joint_height_mm and the joint shear "
+    "strain follows as eps*DNP/h. Pass critical_strain_ue to get a verdict - this tool "
+    "will not supply one, because the strain a joint survives belongs to the component and "
+    "its qualification report. Single mode, no component mass (so f1 is high and the "
+    "answer optimistic), linear plate theory.",
+    {"type": "object", "properties": {
+        "a_mm": _num("plate length"),
+        "b_mm": _num("plate width"),
+        "thickness_mm": _num("plate thickness"),
+        "pulse": {"type": "object", "description":
+                  '{"type":"half_sine"|"rect"|"step","amplitude_g":1500,'
+                  '"duration_ms":0.5}'},
+        "material": _str("preset: %s" % ", ".join(sorted(_vib.MATERIALS))),
+        "e_gpa": _num("Young's modulus in GPa (overrides the preset)"),
+        "nu": _num("Poisson ratio"),
+        "rho_kg_m3": _num("density in kg/m^3"),
+        "mount": _str("edges/ssss, clamped/cccc, free, cantilever, corners, custom"),
+        "bc_x": {"type": "array", "description":
+                 "for mount=custom: [left, right] each ss/cc/free", "items": {}},
+        "bc_y": {"type": "array", "description":
+                 "for mount=custom: [left, right] each ss/cc/free", "items": {}},
+        "zeta": _num("damping ratio"),
+        "q_factor": _num("Q = 1/(2 zeta); give this OR zeta"),
+        "mode": _num("which plate mode to drive", 1),
+        "poly_degree": _num("polynomial degree per axis", 7),
+        "critical_strain_ue": _num("strain the parts survive, in microstrain (YOURS)"),
+        "dnp_mm": _num("distance from the neutral point, for the joint strain"),
+        "joint_height_mm": _num("solder standoff, for the joint strain"),
+    }, "required": ["a_mm", "b_mm", "thickness_mm", "pulse"]},
+    lambda a: _rel.drop_board_strain(
+        a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"), a.get("pulse"),
+        material=a.get("material"), e_gpa=a.get("e_gpa"), nu=a.get("nu"),
+        rho_kg_m3=a.get("rho_kg_m3"), mount=(a.get("mount") or "corners"),
+        bc_x=a.get("bc_x"), bc_y=a.get("bc_y"), zeta=a.get("zeta"),
+        q_factor=a.get("q_factor"), mode=int(a.get("mode") or 1),
+        poly_degree=(int(a["poly_degree"]) if a.get("poly_degree") else None),
+        critical_strain_ue=a.get("critical_strain_ue"),
+        dnp_mm=a.get("dnp_mm"), joint_height_mm=a.get("joint_height_mm")),
+)
+
+_tool(
+    "vibration_shock_spectrum",
+    "Shock response spectrum: sweep single-DOF oscillators across frequency and record the "
+    "peak absolute acceleration, pseudo velocity and displacement at each. Read the board's "
+    "own f1 off the curve (vibration_plate_modes) to see how far it sits from the shock's "
+    "worst frequency. Defaults to 5 % damping, which is the SRS convention and is stated "
+    "rather than hidden. Verified against two limits: at zero damping a step gives exactly "
+    "2x the pulse peak at every frequency, and no point may exceed that bound.",
+    {"type": "object", "properties": {
+        "pulse": {"type": "object", "description":
+                  '{"type":"half_sine"|"rect"|"step","amplitude_g":1500,'
+                  '"duration_ms":0.5}'},
+        "f_n_hz": {"type": "array", "items": {},
+                   "description": "explicit frequencies (use this OR the range)"},
+        "f_start_hz": _num("range start"),
+        "f_stop_hz": _num("range stop"),
+        "n_points": _num("log-swept points in the range", 24),
+        "zeta": _num("damping ratio; default 5 % (the SRS convention)"),
+        "q_factor": _num("Q = 1/(2 zeta)"),
+    }, "required": ["pulse"]},
+    lambda a: _rel.shock_spectrum(
+        a.get("pulse"), f_n_hz=a.get("f_n_hz"), f_start_hz=a.get("f_start_hz"),
+        f_stop_hz=a.get("f_stop_hz"), n_points=a.get("n_points"),
+        zeta=a.get("zeta"), q_factor=a.get("q_factor")),
 )
 
 _tool(

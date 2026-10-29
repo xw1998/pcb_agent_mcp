@@ -1306,6 +1306,63 @@ def selftest():
         else:
             os.environ["PCB_AGENT_MEEP"] = _fw_env
 
+    # Reliability: the two things that must not be fudged. The Profil-Engelmaier
+    # identities have to close exactly, and a drop without a critical strain must
+    # come back as a strain with judged=false, never as a verdict.
+    r = handle({"jsonrpc": "2.0", "id": 123, "method": "tools/call",
+                "params": {"name": "solder_joint_fatigue",
+                           "arguments": {"joint_height_mm": 0.5, "body_a_mm": 15.0,
+                                         "body_b_mm": 15.0,
+                                         "alpha_component_ppm": 6.0,
+                                         "alpha_board_ppm": 16.0,
+                                         "delta_t_k": 100.0,
+                                         "mean_joint_temp_c": 50.0,
+                                         "dwell_min": 15.0}}})
+    _sj = (json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+    _sc = _sj.get("self_check") or {}
+    _row = (_sj.get("conditions") or [{}])[0]
+    _c_lim = _sc.get("c_at_zero_temp_infinite_dwell")
+    _slope = _sc.get("log_log_slope_minus_1_over_c")
+    check("Engelmaier's identities close exactly (c limit, Nf at unit strain, "
+          "log-log slope vs 1/c)",
+          _c_lim is not None and abs(_c_lim) < 1e-9
+          and abs((_sc.get("nf_at_unit_strain_ratio") or 0.0) - 0.5) < 1e-12
+          and _slope is not None and abs(_slope) < 1e-9,
+          str(_sc))
+    # DNP is the diagonal corner of the 15x15 body: hypot(7.5, 7.5) = 10.6066 mm,
+    # so the strain is 10.6066 * 10e-6 * 100 / 0.5, not 12.5 * ...
+    check("solder strain is the mismatch displacement over the standoff",
+          abs(_row.get("shear_strain_range") - 0.0212132) < 1e-6,
+          str(_row.get("shear_strain_range")))
+
+    r = handle({"jsonrpc": "2.0", "id": 124, "method": "tools/call",
+                "params": {"name": "vibration_shock_spectrum",
+                           "arguments": {"pulse": {"type": "step",
+                                                   "amplitude_g": 30.0},
+                                         "f_n_hz": [10.0, 100.0, 1000.0],
+                                         "zeta": 1e-9}}})
+    _ss = (json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+    _pts = _ss.get("points") or []
+    check("a step at near-zero damping gives exactly twice the pulse peak, at every "
+          "frequency",
+          len(_pts) == 3 and all(abs(p["zpa_g"] / 30.0 - 2.0) < 1e-3 for p in _pts),
+          str([p["zpa_g"] for p in _pts]))
+
+    r = handle({"jsonrpc": "2.0", "id": 125, "method": "tools/call",
+                "params": {"name": "drop_board_strain",
+                           "arguments": {"a_mm": 100.0, "b_mm": 80.0,
+                                         "thickness_mm": 1.6, "material": "fr4",
+                                         "mount": "corners", "q_factor": 15.0,
+                                         "pulse": {"type": "half_sine",
+                                                   "amplitude_g": 1500.0,
+                                                   "duration_ms": 0.5}}}})
+    _db = (json.loads(r["result"]["content"][0]["text"]).get("value") or {})
+    check("a drop with no critical strain is a strain, not a verdict",
+          _db.get("judged") is False and _db.get("verdict") is None
+          and (_db.get("surface_strain_ue") or 0.0) > 0.0
+          and any("no critical_strain_ue" in w for w in (_db.get("warnings") or [])),
+          str(_db.get("surface_strain_ue")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

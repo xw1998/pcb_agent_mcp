@@ -104,7 +104,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（146 个）
+## 工具（149 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
@@ -233,6 +233,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `vibration_fatigue` | Steinberg 三带（3σ/2σ/1σ）+ Miner 线性累积 → 循环数与小时寿命 | `z_allow_mm` **必填**（不内置「典型允许挠度」） |
 | `vibration_shock` | 半正弦冲击：SDOF Newmark（β=1/4、γ=1/2）→ 峰值位移/加速度、DLF | 单自由度；不算应力、不算二次冲击与接触碰撞 |
 | `vibration_isolator` | 隔振：传递率曲线、隔振起点 `f_n√2`、r=1 处 `Q√(1+1/Q²)` | 高频按 **1/r** 掉（分子含 (2ζr)²），不是 1/r²；不算隔振器非线性与蠕变 |
+| `vibration_shock_spectrum` | 冲击响应谱：一串单自由度振子逐频算峰值 |ZPA|、伪速度 2πf·z、峰值位移；对数扫频 | 默认 **5 % 阻尼是 SRS 惯例**并明示（不是你的板子的属性）；每条曲线自检「阶跃+近零阻尼恰为 2 倍」与「不超过 2×输入峰值」；SRS 本身不判失效 |
+| `solder_joint_fatigue` | 焊点热疲劳：`Δγ = F·DNP·Δα·ΔT/h` → Engelmaier `Nf = 0.5(Δγ/2ε_f)^(1/c)`、多环境 Miner、试验↔使用 Norris-Landzberg 加速因子 | `joint_height_mm` 必填（是分母）；ε_f **是拟合**（默认 0.325，SAC305 文献散布 0.2~0.35）；CTE 预设是典型值、FR-4 过 Tg 会从 16 跳到 ~60；不算 underfill/空洞/IMC/裂纹扩展 |
+| `drop_board_strain` | 跌落板面应变：一阶模态 → SDOF 冲击响应 → 曲率 → 应变，三段各自可复核；给 `dnp_mm`+`joint_height_mm` 再加焊点剪切应变 `ε·DNP/h` | 单模态、**不算器件质量**（f1 偏高 ⇒ 响应偏乐观）；`critical_strain_ue` 只能调用方给，不给就 `judged:false`（**没有 verdict**）；线性板理论，超过 h/2 高估 |
 | `board_vibration` | 按板上真实板框（bbox）+ 叠层厚度算 f₁/周期/热点，热点标 `near_antinode` | 派生量 `authoritative:false`；非矩形轮廓回 `outline_fill_fraction_of_bbox` 并说 f₁ 偏低 |
 | `cavity_resonance` | 平面腔体模 `f_mn = c/(2√εr)·√((m/a)²+(n/b)²)` + 每个模的 λ_g | **只给模频不给 Q**：无介损/铜损/辐射、无开放边缘失谐，所以是频率轴上的位置不是判决 |
 | `cavity_via_fence` | 过孔围栏：`pitch/λ_g`、每间距电长度、给定判据后的 `pass/fail` | **判据必须由调用方给**（λ_g/20 与 λ_g/10 差 2 倍，都不内置）；不给就 `indeterminate` 且不反推间距 |
@@ -548,7 +551,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 146 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 149 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -600,6 +603,7 @@ pcb_agent_mcp/
 │       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
 │       ├── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
 │       ├── vibration.py          # 振动：Ritz 模态 + Miles/Steinberg/冲击/传递率 + 应力（degree 阶梯误差棒）
+│       ├── reliability.py        # 可靠性：焊点热疲劳（Engelmaier/Miner/Norris-Landzberg）+ 跌落板面应变 + 冲击谱
 │       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）+ plane_q（Qc = h/δs）
 │       ├── em.py                 # 全波接缝：找出 openEMS/Meep/gprMAX、版本与 handoff（不生成几何）
 │       ├── filters.py            # 滤波器合成：原型 g 值/集总带通(两路对账 + 有限 Q + 寄生 + 蒙特卡洛)/耦合线反解/耦合谐振器/TE101 腔
