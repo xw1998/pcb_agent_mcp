@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这二十六篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这二十七篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 | # | 文档 | 它回答的问题 | 它推翻了什么 |
@@ -32,6 +32,7 @@
 | 24 | [立创进程内桥](24-立创进程内桥.md) | 怎么才能看见用户正开着的那张图？应用自己的命令空间长什么样，我们凭什么敢说"读过它"？ | 「要驱动立创就得写扩展或用 websocket 网关」——其实是它自己开的命名管道 `\\.\pipe\JLCEDAPro<8 hex>` 可枚举 + ping 确认；并推翻前两轮的「它起不来」（差别在父进程有没有控制台）。写路径**一次都没做过**，逐条列在 §24.9 |
 | 25 | [技能并入：八个技能里哪几条进了工具](25-技能并入清单.md) | 这八个技能里什么能变成工具、什么必须拒？一个技能的说法与它自己的公式不自洽时听谁？ | 「技能里的清单可以直接搬」——**清单是可搬的，建议不是**：规则进目录并标出处与证据等级，量不到一律 undetermined；技能 §3.5 那张 λ/20 表与 λ/20 公式差一倍，表被丢弃；两个付费 `gmai-*` 技能的内容串域（固件安全样板），整份拒收 |
 | 26 | [分步可见与铺铜闭环](26-分步可见与铺铜闭环.md) | 过程为什么必须看得见、打得断？器件从哪来？铺铜什么时候才算真的铜？ | 「apply 必须原子」（原子是给脚本的，不是给协作者的）；「有 violation 就挡」（真板 69 条全是 warning）；「栅格能回答 pad 出不出得去」（0.5 mm 间距下必假警）；「写了 `(general (thickness 1.6))` 就是 1.6 mm」（KiCad 只累加 stackup，实造 1.18）；「`add_zone` 之后那块铜就算有了」（没有 filled_polygon 就只是轮廓） |
+| 27 | [自动布线器](27-自动布线器.md) | 搜出来的线凭什么算数？50 网板上 23 个失败是几何还是争用？自己的闸门绿了算不算绿？ | 「栅格说能走就能走」——**搜索只是提议，精确多边形几何才是判决**；两套栅格（走线/过孔）不能合并；「预算耗尽」不等于「没有路」；「缺规则就不查」也不行——板边距留空等于往板边写非法铜；并抓出五个**能在 `status: ok` 下给出错答案**的真缺陷：越界下标在 Python 里回卷、keepout 只封了边框一条带、keepout 根本不进精确判定、焊盘逃逸那段铜从来没画过、板边距只管过孔不管走线（后者由 `kicad-cli DRC` 报 6 条 error 才现形） |
 | 07 §7 | 板框 / 开槽 / 机械层 | 待议，6 条议题 | —— |
 
 ## 三条贯穿全部文档的结论
@@ -81,4 +82,5 @@
 - `24` → `lceda_live.py`（命管道枚举 + ping 确认 / 一行一 JSON 帧 / 9 个 op / `invoke` 在编辑器 render 进程里跑 async 函数体）与 6 个 `lceda_pro_*` 工具、26 个测试（24 个假 transport 跑失败路径 + 2 个真机用例）。边界是**只证了读**：ping / open（849 ms）/ session.list / session.close / doc.api（378 类型、PCB_Document 21 方法）/ invoke（两块板名 + uuid、抛错回 EXECUTION_ERROR）都在真机上跑过，任何写、`open` 是否碰工程字节、`destroy` 是否丢未保存改动都未验证。
 - `25` → `calc/magnetics.py` / `calc/stackup.py` / `calc/chain.py` / `calc/rules.py` 与 8 个新工具（`magnetics_inductor` / `stackup_material` / `stackup_design` / `rf_chain` / `match_bandwidth` / `design_rules` / `layout_review` / `schematic_review`）+ `matching.bandwidth`，36 条规则（22 布局 + 14 原理图）。边界写在每条规则上：事实缺失即 `undetermined`（空事实集直接 `ARG_MISSING`），电流限值必须显式给标准，IEC 60664 隔离间距因表未验证而永远 fail-closed，电感饱和没有器件就是 undetermined。
 - `26` → `edit/plan.py` 的分步写（`steps_apply` / `step_events` / `step_control`）、`edit/drc_policy.py`、`parts.py`（离线 `lceda-std.elib` + 在线检索）、`fidelity/fill.py`（`pcbnew ZONE_FILLER` 委派 + 节点移植）、`oracle.routability` 的几何逃逸判据、叠层总厚的 `thickness_agrees` 闸门，以及 `board_progress` / `board_zones` / `board_fill_zones` / `part_*` 共 11 个新工具；边界是**立创 in-app 分步写真机未验证**（本机非交互会话起不了 `lceda-pro.exe`）、在线器件**只有元数据没有几何**、routability **不是布线器**。
-- 代码里的每条"拒绝回答"分支，都能在这二十六篇里找到对应的判据来源。
+- `27` → `route/rules.py`（三级来源 + 最严取胜 + `assumed` 公示）、`route/grid.py`（双栅格 / 精确 `seg_blockers`·`via_blockers` / keepout 环 / 事务化 `_Emitter` / A* 内联）、`route/router.py`（MST 降序、second sweep、按位置挑牺牲者的 rip-up、`incremental`）与 `board_route` 工具，16 条测试在 `tests/test_route.py`；边界是**没有差分对/等长/回流/爬电/拥塞协商**，`routed` 不等于 DRC 干净（但 keepout 与板边距已进精确判定，端到端 apply 后 `kicad-cli DRC` 新增阻断项 = 0，见 §27.9.7）。
+- 代码里的每条"拒绝回答"分支，都能在这二十七篇里找到对应的判据来源。

@@ -1,0 +1,762 @@
+"""The search itself: which pad connects to which, in what order, and what to do
+when a net loses.
+
+The shape of a run:
+
+1. resolve the rules (`rules.resolve`) - a router with invented rules draws
+   copper its own DRC rejects, so a board with no clearance is refused here;
+2. decide which layers are routing layers and which are planes (`_split_layers`);
+   a plane is a layer that a pour of a power net already covers, and a signal net
+   is not routed across it - it drops ONE via into it, the way a person does;
+3. per net, build a minimum spanning tree over its terminals and route the edges;
+   nets are ordered longest-first because on the F401 core board the four nets
+   that failed with shortest-first were exactly the four longest;
+4. nets that failed get a second sweep (same free space, new tree root) and then
+   a bounded **rip-up** round: the shortest nets already routed are pulled out and
+   re-routed together with the net that lost. Bounded, and every rip is counted;
+5. every emitted segment and via is re-checked with exact geometry. A segment the
+   exact check rejects takes its whole net down with it - copper is never kept on
+   the strength of a raster cell.
+
+Nothing here writes to a file. The result is ops in the standard shape, which the
+caller feeds to `edit.propose` + `edit.apply_plan`.
+"""
+
+import math
+import time
+
+from .. import geometry as G
+from . import rules as R
+from .grid import Grid, astar, mst_edges, simplify
+
+# A net whose name looks like this has a plane layer on a typical board. It is
+# only used to *guess which layers are planes*; the pour in the file has to agree,
+# and if it does not, the guess is dropped (see `_split_layers`).
+POWER_HINTS = ("GND", "AGND", "DGND", "PGND", "VSS", "VCC", "VDD", "VIN",
+               "VBAT", "VBUS", "+3V3", "+5V", "+12V", "3V3", "5V0", "VREF")
+
+# How far from a pad centre to look for a legal terminal cell when the centre
+# itself is buried in another net's halo.
+TERMINAL_SEARCH_MM = 1.6
+
+
+class RouteError(Exception):
+    def __init__(self, message, reason_code="ROUTE_FAILED", hint=None):
+        Exception.__init__(self, message)
+        self.message = message
+        self.reason_code = reason_code
+        self.hint = hint
+
+
+def _looks_power(net):
+    up = (net or "").upper()
+    return any(up == h or up.startswith(h) or up.endswith(h) for h in POWER_HINTS)
+
+
+def _copper_layers(board):
+    names = [str(s.get("name")) for s in (board.stackup or [])
+             if str(s.get("name") or "").endswith(".Cu")]
+    return names or ["F.Cu", "B.Cu"]
+
+
+def _split_layers(board, copper, explicit=None):
+    """Routing layers vs plane layers, and WHY each plane is a plane.
+
+    A layer counts as a plane only when a non-keepout zone with a power-looking
+    net covers it. Guessing "the inner layers are planes" would drop a signal
+    layer on a 4-layer board that routes on all four, so the pour has to be in the
+    file for the layer to be demoted.
+    """
+    if explicit:
+        routing = [l for l in explicit if l in copper]
+        if not routing:
+            raise RouteError("none of %s is a copper layer (board has %s)"
+                             % (list(explicit), ", ".join(copper)),
+                             "ARG_INVALID")
+        return routing, {}
+    planes = {}
+    for z in board.zones or []:
+        if z.get("is_keepout") or not z.get("net"):
+            continue
+        if not _looks_power(z.get("net")):
+            continue
+        ring = z.get("outline") or []
+        if len(ring) < 3:
+            continue
+        area = abs(G.polygon_area(ring))
+        for layer in (z.get("layers") or []):
+            if layer not in copper:
+                continue
+            got = planes.setdefault(layer, {"net": z.get("net"), "area_mm2": 0.0})
+            got["area_mm2"] = round(got["area_mm2"] + area, 2)
+    routing = [l for l in copper if l not in planes]
+    if not routing:
+        raise RouteError("every copper layer on this board is a plane, so there "
+                         "is nowhere to route a signal",
+                         "NO_ROUTING_LAYER")
+    return routing, planes
+
+
+def _pad_terminals(board, grid, layers):
+    """Every pad that carries a net, as a terminal the search can reach."""
+    from ..adapters.canonical import pad_points  # noqa: F401  (pad geometry)
+
+    out = []
+    for fp in board.footprints:
+        ref = fp.get("ref") or fp.get("reference")
+        for pad in fp.get("pads") or []:
+            net = pad.get("net")
+            if not net or pad.get("x") is None:
+                continue
+            hole = pad.get("hole_mm")
+            if (pad.get("type") == "np_thru_hole" and hole
+                    and float(pad.get("w") or 0) <= float(hole) + 1e-6
+                    and float(pad.get("h") or 0) <= float(hole) + 1e-6):
+                continue                       # no copper at all
+            raw = pad.get("layers") or []
+            if "*.Cu" in raw:
+                pad_layers = list(layers)
+            elif "F&B.Cu" in raw:
+                pad_layers = [l for l in layers if l in ("F.Cu", "B.Cu")]
+            else:
+                pad_layers = [l for l in layers if l in raw]
+            if hole is not None and not pad_layers:
+                pad_layers = list(layers)      # a drilled pad is on every copper
+            if not pad_layers:
+                continue
+            i, j = grid.node(float(pad["x"]), float(pad["y"]))
+            term = {"reference": ref, "pad": pad.get("number"), "net": net,
+                    "at": [round(float(pad["x"]), 4), round(float(pad["y"]), 4)],
+                    "layers": pad_layers, "node": (i, j),
+                    "half_mm": max(float(pad.get("w") or 0),
+                                   float(pad.get("h") or 0)) / 2.0}
+            out.append(term)
+    return out
+
+
+def _free_terminal(grid, term, net):
+    """Pad centre if it is reachable for its own net, else the nearest free cell.
+
+    The centre of a fine-pitch pad is inside its own copper, so it is free for its
+    own net by construction. It is only searched for when another net's halo has
+    grown over it (a pad inside another footprint's courtyard, a test point under
+    a connector), which is a real thing on crowded boards.
+    """
+    i, j = term["node"]
+    for layer in term["layers"]:
+        if grid.free(i, j, layer, net):
+            return (i, j, layer)
+    r_max = int(math.ceil(TERMINAL_SEARCH_MM / grid.pitch))
+    for r in range(1, r_max + 1):
+        best = None
+        for di in range(-r, r + 1):
+            for dj in range(-r, r + 1):
+                if max(abs(di), abs(dj)) != r:
+                    continue
+                ni, nj = i + di, j + dj
+                for layer in term["layers"]:
+                    if not grid.free(ni, nj, layer, net):
+                        continue
+                    d = math.hypot(di, dj)
+                    if best is None or d < best[0]:
+                        best = (d, (ni, nj, layer))
+        if best is not None:
+            return best[1]
+    return None
+
+
+def _existing_tree(board, grid, net, layers):
+    """Nodes already covered by this net's own copper (for incremental routing).
+
+    Every existing track segment and via of the net seeds the tree, so a second
+    run only routes what is actually missing instead of re-routing the net from
+    scratch and doubling its copper.
+    """
+    seed = set()
+    for tr in board.tracks:
+        if tr.get("net") != net or tr.get("layer") not in layers:
+            continue
+        pts = tr.get("_points") or [tr.get("start"), tr.get("end")]
+        for p in pts:
+            i, j = grid.node(float(p[0]), float(p[1]))
+            seed.add((i, j, tr.get("layer")))
+    for via in board.vias:
+        if via.get("net") != net:
+            continue
+        i, j = grid.node(float(via["x"]), float(via["y"]))
+        for layer in layers:
+            if grid.free(i, j, layer, net):
+                seed.add((i, j, layer))
+    return seed
+
+
+def _touches_own(board, net, x, y, half, slack=0.06):
+    """Is this pad already connected by its own net's copper?"""
+    for tr in board.tracks:
+        if tr.get("net") != net:
+            continue
+        pts = tr.get("_points") or [tr.get("start"), tr.get("end")]
+        w = float(tr.get("width") or 0.0)
+        for k in range(len(pts) - 1):
+            if G.dist_point_segment((x, y), tuple(pts[k]), tuple(pts[k + 1])) \
+                    <= half + w / 2.0 + slack:
+                return True
+    for via in board.vias:
+        if via.get("net") != net:
+            continue
+        dia = float(via.get("diameter") or via.get("drill") or 0.4)
+        if math.hypot(float(via["x"]) - x, float(via["y"]) - y) <= half + dia / 2.0 + slack:
+            return True
+    return False
+
+
+class _Emitter(object):
+    """Collects ops for ONE net at a time, and only lets it into the map on success.
+
+    Three states matter here and getting them wrong is how a router paints over
+    its own copper:
+
+    * **buffered** - an op has passed the exact check but the net is still being
+      routed. It is NOT in the search map: another net might still cause this one
+      to fail, and a failed net must leave nothing behind.
+    * **committed** - the net finished. Its copper goes into the map so every
+      later net has to route around it.
+    * **rolled back** - the net failed. Its buffer is dropped; the rejection
+      reasons are kept because they are the explanation of the failure.
+    """
+
+    def __init__(self, grid, bundle, board=None, layers=None, pitch=None,
+                 ignore_zone_areas=False):
+        self.grid = grid
+        self.bundle = bundle
+        self.board = board
+        self.layers = list(layers or grid.layers)
+        self.pitch = pitch if pitch is not None else grid.pitch
+        # Kept so a rebuilt map (rip-up) is the same map: dropping this flag made
+        # the second pass route around pour areas the first pass had been told to
+        # ignore, which is not a rip-up, it is a different board.
+        self.ignore_zone_areas = bool(ignore_zone_areas)
+        self.ops = []                 # committed ops, in emission order
+        self.bad = []                 # exact-check rejections, kept for the report
+        self.length = {}
+        self._buf = []
+        self._buf_net = None
+
+    # ------------------------------------------------------------ lifecycle
+    def mark(self, net):
+        self._buf = []
+        self._buf_net = net
+        return {"net": net, "n_bad": len(self.bad)}
+
+    def commit(self, mark):
+        """The net finished: its copper joins the map and the op list."""
+        net = mark["net"]
+        for item, op in self._buf:
+            self.grid.add_copper(item)
+            self.ops.append(op)
+        self._buf = []
+
+    def rollback(self, mark):
+        """The net failed: drop its buffer, keep the reasons it failed."""
+        net = mark["net"]
+        self._buf = []
+        # Emitted-but-uncommitted length must not leak into the answer.
+        self.length[net] = 0.0
+
+    def forget(self, nets):
+        """Rip nets out completely and rebuild the search map from what is left.
+
+        Used by the rip-up round. Rebuilding is the only honest way to do this:
+        the map's cells and its spatial hash have no per-net undo, and a map that
+        still remembers ripped copper is a map of a board that does not exist.
+        """
+        nets = set(nets)
+        self.ops = [op for op in self.ops if op.get("net") not in nets]
+        for n in nets:
+            self.length[n] = 0.0
+        self.grid = Grid(self.board, self.layers, self.pitch, self.bundle,
+                         ignore_zone_areas=self.ignore_zone_areas)
+        for op in self.ops:
+            self._replay(op)
+
+    def _replay(self, op):
+        if op["op"] == "add_track":
+            self.grid.add_track(op["net"], op["layer"],
+                                (op["x1"], op["y1"]), (op["x2"], op["y2"]),
+                                op["width"])
+        else:
+            self.grid.add_via(op["net"], op["x"], op["y"],
+                              op.get("size") or self.grid.via_dia)
+
+    def track(self, net, layer, a, b, width):
+        x1, y1 = a
+        x2, y2 = b
+        if abs(x1 - x2) < 1e-9 and abs(y1 - y2) < 1e-9:
+            return True
+        blockers = self.grid.seg_blockers((x1, y1), (x2, y2), layer, net, width)
+        if blockers:
+            self.bad.append({"net": net, "layer": layer,
+                             "from": [round(x1, 4), round(y1, 4)],
+                             "to": [round(x2, 4), round(y2, 4)],
+                             "why": blockers[0]})
+            return False
+        self._buf.append((
+            {"kind": "track", "net": net, "layer": layer, "layers": [layer],
+             "seg": ((x1, y1), (x2, y2), float(width)), "ref": "router"},
+            {"op": "add_track", "x1": round(x1, 6), "y1": round(y1, 6),
+             "x2": round(x2, 6), "y2": round(y2, 6),
+             "width": width, "layer": layer, "net": net}))
+        self.length[net] = self.length.get(net, 0.0) + math.hypot(x2 - x1, y2 - y1)
+        return True
+
+    def via(self, net, x, y, span=None):
+        blockers = self.grid.via_blockers(x, y, net, span)
+        if blockers:
+            self.bad.append({"net": net, "via_at": [round(x, 4), round(y, 4)],
+                             "why": blockers[0]})
+            return False
+        spec = R.for_net(self.bundle, net)
+        dia = float(spec["via_diameter_mm"])
+        op = {"op": "add_via", "x": round(x, 6), "y": round(y, 6), "net": net,
+              "size": spec["via_diameter_mm"], "drill": spec["via_drill_mm"]}
+        # The op has no `layers` key, so the via is a through via: it is copper
+        # on every layer in the stack and therefore blocks all of them.
+        self._buf.append((
+            {"kind": "via", "net": net, "layers": list(span or self.layers),
+             "poly": G.circle_points(x, y, dia / 2.0, 16), "ref": "router"},
+            op))
+        return True
+
+
+def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
+         track_mm=None, via_diameter_mm=None, via_drill_mm=None,
+         edge_clearance_mm=None,
+         rip_up_rounds=1, second_sweep=True, incremental=False,
+         allow_vias=True, max_nets=None, ignore_zone_areas=False,
+         progress=None):
+    """Route what can be routed and say plainly what cannot.
+
+    Returns a plain dict; the tool layer wraps it in an envelope. A net is only
+    reported `routed` when every one of its MST edges found a path AND every
+    emitted segment passed the exact clearance check.
+
+    `progress` is an optional callable that gets one dict per finished net
+    (`net`, `ok`, `status`, `s`). Routing a dense 50-net board takes minutes, and
+    a caller who cannot see which net it is on has no way to tell "working" from
+    "wedged".
+    """
+    t0 = time.time()
+    bundle = R.resolve(board, clearance_mm=clearance_mm, track_mm=track_mm,
+                       via_diameter_mm=via_diameter_mm, via_drill_mm=via_drill_mm,
+                       edge_clearance_mm=edge_clearance_mm)
+    copper = _copper_layers(board)
+    routing, planes = _split_layers(board, copper, explicit=layers)
+
+    grid_layers = list(routing) + [l for l in planes if l not in routing]
+    grid = Grid(board, grid_layers, float(pitch_mm), bundle,
+                ignore_zone_areas=ignore_zone_areas)
+    em = _Emitter(grid, bundle, board=board, layers=grid_layers,
+                  pitch=float(pitch_mm), ignore_zone_areas=ignore_zone_areas)
+
+    terms = _pad_terminals(board, grid, routing)
+    if nets:
+        wanted = set(nets)
+        terms = [t for t in terms if t["net"] in wanted]
+    if not terms:
+        raise RouteError("no pad with a net is on a routing layer, so there is "
+                         "nothing to connect", "NO_GEOMETRY",
+                         hint="pads with no net are not routed; a board whose only "
+                              "nets are planes needs no router")
+
+    plane_nets = {}
+    for layer, spec in planes.items():
+        plane_nets.setdefault(spec["net"], []).append(layer)
+
+    by_net = {}
+    for t in terms:
+        by_net.setdefault(t["net"], []).append(t)
+
+    if max_nets:
+        keep = sorted(by_net, key=lambda n: -len(by_net[n]))[:int(max_nets)]
+        by_net = dict((k, by_net[k]) for k in keep)
+
+    results = {}
+    work = []
+    for net, plist in by_net.items():
+        pts = [(p["at"][0], p["at"][1]) for p in plist]
+        edges = mst_edges(pts)
+        span = sum(math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1])
+                   for a, b in edges)
+        results[net] = {"net": net, "status": "pending", "pads": len(plist),
+                        "mst_mm": round(span, 3), "length_mm": 0.0, "vias": 0,
+                        "segments": 0, "edges": len(edges), "reason": None,
+                        "on_plane": plane_nets.get(net)}
+        work.append((span, net, plist))
+    work.sort(reverse=True)          # longest first - see the module docstring
+
+    def _route_plane_net(net, plist):
+        """A net with a plane does not get routed pad-to-pad: each pad drops one
+        via into the plane. Anything else would draw copper across the board to
+        duplicate a connection the pour already makes."""
+        plane_layer = plane_nets[net][0]
+        failed = []
+        for t in plist:
+            node = _free_terminal(grid, t, net)
+            if node is None:
+                failed.append({"pad": "%s.%s" % (t["reference"], t["pad"]),
+                               "why": {"reason": "no_terminal"}})
+                continue
+            i, j, layer = node
+            x, y = grid.xy(i, j)
+            if incremental and _touches_own(board, net, x, y, t["half_mm"]):
+                continue
+            span = [l for l in grid_layers
+                    if l in (layer, plane_layer)
+                    or _between(grid_layers, layer, plane_layer, l)]
+            if not em.via(net, x, y, span):
+                failed.append({"pad": "%s.%s" % (t["reference"], t["pad"]),
+                               "why": em.bad[-1]["why"]})
+                continue
+            results[net]["vias"] += 1
+            if layer != plane_layer:
+                # The via lands on the plane; a stub from the pad to the via is
+                # only needed when the terminal was not the pad centre.
+                px, py = t["at"]
+                if math.hypot(px - x, py - y) > grid.pitch / 2.0:
+                    if em.track(net, layer, (px, py), (x, y),
+                                R.for_net(bundle, net)["track_mm"]):
+                        results[net]["segments"] += 1
+        if failed:
+            results[net]["status"] = "failed"
+            results[net]["reason"] = {"code": "plane_via_failed",
+                                      "detail": failed[:6],
+                                      "failed_pads": len(failed)}
+        else:
+            results[net]["status"] = "routed"
+            results[net]["length_mm"] = round(em.length.get(net, 0.0), 3)
+        return results[net]["status"] == "routed"
+
+    def _route_signal_net(net, plist):
+        width = R.for_net(bundle, net)["track_mm"]
+        tree_nodes = set()
+        terminals = []
+        for t in plist:
+            node = _free_terminal(grid, t, net)
+            if node is None:
+                results[net]["status"] = "failed"
+                results[net]["reason"] = {
+                    "code": "no_terminal",
+                    "detail": [{"pad": "%s.%s" % (t["reference"], t["pad"]),
+                                "at": t["at"],
+                                "why": grid.blocked_reason(t["node"][0],
+                                                           t["node"][1],
+                                                           t["layers"][0], net)}]}
+                return False
+            terminals.append({"term": t, "node": node})
+        if incremental:
+            seed = _existing_tree(board, grid, net, grid_layers)
+            tree_nodes |= seed
+            kept = []
+            for item in terminals:
+                t = item["term"]
+                if _touches_own(board, net, t["at"][0], t["at"][1], t["half_mm"]):
+                    results.setdefault("_skipped", []).append(net)
+                    continue
+                kept.append(item)
+            if len(kept) != len(terminals):
+                results[net]["notes"] = "pads already connected were skipped"
+            terminals = kept
+            if len(terminals) <= 1 and tree_nodes:
+                results[net]["status"] = "routed"
+                results[net]["length_mm"] = round(em.length.get(net, 0.0), 3)
+                results[net]["reason"] = {"code": "already_connected"}
+                return True
+        # A pad whose own centre cell is blocked is still routed, from a nearby
+        # free cell - but the copper from the pad to that cell is a segment like
+        # any other and has to be drawn and checked. Without this the net came
+        # back `routed` while its first track began a millimetre away from the
+        # pad, touching nothing: a wrong answer, not a slow one.
+        escapes = []
+        for item in terminals:
+            t = item["term"]
+            i, j = t["node"]
+            ni, nj, layer = item["node"]
+            if (ni, nj) == (i, j):
+                continue
+            ex, ey = grid.xy(ni, nj)
+            if not em.track(net, layer, (t["at"][0], t["at"][1]), (ex, ey), width):
+                results[net]["status"] = "failed"
+                results[net]["reason"] = {
+                    "code": "terminal_unreachable",
+                    "detail": [{"pad": "%s.%s" % (t["reference"], t["pad"]),
+                                "at": t["at"],
+                                "escape_to": [round(ex, 4), round(ey, 4)],
+                                "why": em.bad[-1] if em.bad else None}]}
+                return False
+            results[net]["segments"] += 1
+            escapes.append("%s.%s" % (t["reference"], t["pad"]))
+        if escapes:
+            note = ("%d pad(s) had their centre cell blocked and were joined to "
+                    "the nearest free cell: %s" % (len(escapes),
+                                                   ", ".join(escapes)))
+            results[net]["notes"] = ((results[net]["notes"] + "; ") + note
+                                     if results[net].get("notes") else note)
+
+        pts = [(it["term"]["at"][0], it["term"]["at"][1]) for it in terminals]
+        edges = mst_edges(pts)
+        if not terminals:
+            results[net]["status"] = "failed"
+            results[net]["reason"] = {"code": "no_terminals"}
+            return False
+
+        def goals_of(k):
+            it = terminals[k]
+            i, j, layer = it["node"]
+            return ({(i, j)}, {(i, j): set(it["term"]["layers"]) | {layer}})
+
+        if not tree_nodes:
+            i, j, layer = terminals[0]["node"]
+            tree_nodes = {(i, j, layer)}
+        ok = True
+        for a, b in edges:
+            goals, glayers = goals_of(b)
+            ast_diag = {}
+            path = astar(grid, net, tree_nodes, goals, glayers,
+                         allow_vias=allow_vias,
+                         via_check=_via_gate(grid, net) if allow_vias else None,
+                         diag=ast_diag)
+            if path is None:
+                src = goals
+                back = {(s[0], s[1]) for s in tree_nodes}
+                bl = {}
+                for s in tree_nodes:
+                    bl.setdefault((s[0], s[1]), set()).add(s[2])
+                path = astar(grid, net, {(i, j, l) for (i, j) in src
+                                         for l in glayers[(i, j)]},
+                             back, bl, allow_vias=allow_vias,
+                             via_check=_via_gate(grid, net) if allow_vias else None,
+                             diag=ast_diag)
+            if path is None:
+                t = terminals[b]["term"]
+                results[net]["status"] = "failed"
+                # A search that ran out of budget has not shown there is no
+                # path, only that this router stopped looking. Saying "no_path"
+                # for that would be an answer the evidence does not support.
+                results[net]["reason"] = {
+                    "code": "search_budget" if ast_diag.get("budget_hit")
+                            else "no_path",
+                    "detail": [{"edge": "%s.%s -> %s.%s"
+                                % (terminals[a]["term"]["reference"],
+                                   terminals[a]["term"]["pad"],
+                                   t["reference"], t["pad"]),
+                                "target": t["at"],
+                                "why": grid.blocked_reason(
+                                    terminals[b]["node"][0],
+                                    terminals[b]["node"][1],
+                                    terminals[b]["node"][2], net)}]}
+                ok = False
+                break
+            simple = simplify(path)
+            for p1, p2 in zip(simple, simple[1:]):
+                x1, y1 = grid.xy(p1[0], p1[1])
+                x2, y2 = grid.xy(p2[0], p2[1])
+                if p1[2] != p2[2]:
+                    if not em.via(net, x1, y1):
+                        ok = False
+                        break
+                    results[net]["vias"] += 1
+                    continue
+                if em.track(net, p1[2], (x1, y1), (x2, y2), width):
+                    results[net]["segments"] += 1
+                else:
+                    ok = False
+                    break
+            if not ok:
+                results[net]["reason"] = {"code": "clearance",
+                                          "detail": [em.bad[-1]] if em.bad else []}
+                break
+            for s in path:
+                tree_nodes.add(s)
+        if ok:
+            results[net]["status"] = "routed"
+            results[net]["length_mm"] = round(em.length.get(net, 0.0), 3)
+        return ok
+
+    stats = {"rips": 0, "sweeps": 1, "elapsed_s": 0.0, "rule_bundle": bundle,
+             "rip_passes": 0,
+             "grid_notes": list(grid.notes), "grid_cells": grid.nx * grid.ny,
+             "pitch_mm": float(pitch_mm)}
+
+    def _attempt(net, plist):
+        """One net, one transaction: commit its copper only if it finished."""
+        t_net = time.time()
+        mark = em.mark(net)
+        ok = (_route_plane_net(net, plist) if net in plane_nets
+              else _route_signal_net(net, plist))
+        if ok:
+            em.commit(mark)
+        else:
+            em.rollback(mark)
+        results[net]["route_s"] = round(time.time() - t_net, 3)
+        if progress is not None:
+            progress({"net": net, "ok": ok,
+                      "status": results[net].get("status"),
+                      "s": results[net]["route_s"]})
+        return ok
+
+    pending = []
+    for span, net, plist in work:
+        results[net]["mst_mm"] = round(span, 3)
+        if not _attempt(net, plist):
+            pending.append((span, net, plist))
+
+    if pending and second_sweep:
+        # Same free space, different tree root: the first pass may have started
+        # from a pad that boxes the net in. Nothing is ripped up here.
+        stats["sweeps"] = 2
+        still = []
+        for span, net, plist in pending:
+            flist = list(reversed(plist))
+            if results[net]["status"] == "routed":
+                continue
+            if not _attempt(net, flist):
+                still.append((span, net, plist))
+        pending = still
+
+    def _blockers_of(net, plist):
+        """Routed nets whose copper physically sits where this net has to go.
+
+        Ripping the SHORTEST nets is easier to write and near useless: on the F401
+        core board every net that lost the first pass routed fine on the empty
+        board, so what stops them is somebody else's copper in the way, not
+        geometry. Ripping a net 20 mm away buys nothing. Victims are chosen by
+        overlap with the box this net spans, against copper that was really
+        emitted.
+        """
+        xs = [p["at"][0] for p in plist]
+        ys = [p["at"][1] for p in plist]
+        pad = 1.5
+        box = (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+        hits = {}
+        for op in em.ops:
+            other = op["net"]
+            if other == net or other in plane_nets:
+                continue
+            if op["op"] == "add_via":
+                ox0 = ox1 = op["x"]
+                oy0 = oy1 = op["y"]
+            elif op["op"] == "add_track":
+                ox0, ox1 = sorted((op["x1"], op["x2"]))
+                oy0, oy1 = sorted((op["y1"], op["y2"]))
+            else:
+                continue
+            if ox1 < box[0] or ox0 > box[2] or oy1 < box[1] or oy0 > box[3]:
+                continue
+            hits[other] = hits.get(other, 0) + 1
+        return [n for n, _c in sorted(hits.items(), key=lambda kv: -kv[1])[:3]]
+
+    if pending and rip_up_rounds:
+        # Bounded rip-up, one pass per `rip_up_rounds`: each net that lost gets
+        # the copper standing in its way moved out, then everyone who moved is
+        # re-routed. The rest of the board is untouched - its copper is still in
+        # the map, and re-routing it would only re-derive the same paths.
+        for _round in range(int(rip_up_rounds)):
+            if not pending:
+                break
+            stats["rip_passes"] = _round + 1
+            still = []
+            for span, net, plist in pending:
+                if results[net].get("status") == "routed":
+                    continue
+                rips = _blockers_of(net, plist)
+                if not rips:
+                    still.append((span, net, plist))
+                    continue
+                # Rip-out rebuilds the search map from the ops that remain; a map
+                # that still remembers ripped copper is a map of another board.
+                em.forget(rips)
+                grid = em.grid
+                em.bad[:] = [b for b in em.bad if b.get("net") not in rips]
+                for n in rips:
+                    results[n]["status"] = "pending"
+                    results[n]["rips"] = results[n].get("rips", 0) + 1
+                    results[n]["length_mm"] = 0.0
+                    results[n]["vias"] = 0
+                    results[n]["segments"] = 0
+                stats["rips"] += len(rips)
+                failed_now = []
+                for n in [net] + rips:
+                    pl = by_net.get(n) or []
+                    if not pl:
+                        continue
+                    results[n]["status"] = "pending"
+                    if not _attempt(n, pl):
+                        failed_now.append(n)
+                # Whatever lost again stays pending for the next pass; a net that
+                # only lost because it was ripped gets another chance there.
+                for n in failed_now:
+                    still.append((results[n].get("mst_mm") or 0.0, n,
+                                  by_net.get(n) or []))
+            pending = still
+
+    out_nets = []
+    for net, res in results.items():
+        if not isinstance(res, dict):
+            continue
+        if res["status"] == "pending":
+            res["status"] = "failed"
+            res.setdefault("reason", {"code": "not_attempted"})
+        res["segments"] = sum(1 for op in em.ops
+                              if op["op"] == "add_track" and op["net"] == net)
+        res["vias"] = sum(1 for op in em.ops
+                          if op["op"] == "add_via" and op["net"] == net)
+        out_nets.append(res)
+    out_nets.sort(key=lambda r: (r["status"] != "failed", -(r.get("mst_mm") or 0)))
+    routed_n = sum(1 for r in out_nets if r["status"] == "routed")
+    failed = [r for r in out_nets if r["status"] != "routed"]
+    stats["elapsed_s"] = round(time.time() - t0, 3)
+    stats["nets_total"] = len(out_nets)
+    stats["nets_routed"] = routed_n
+    stats["nets_failed"] = len(failed)
+    stats["ops"] = len(em.ops)
+    stats["rejected_ops"] = len(em.bad)
+    return {
+        "layers_routing": routing,
+        "layers_plane": planes,
+        "rules": {"clearance_mm": bundle["clearance_mm"],
+                  "track_mm": bundle["track_mm"],
+                  "via_diameter_mm": bundle["via_diameter_mm"],
+                  "via_drill_mm": bundle["via_drill_mm"],
+                  "edge_clearance_mm": bundle["edge_clearance_mm"],
+                  "sources": bundle["sources"],
+                  "assumed": bundle["assumed"]},
+        "nets": out_nets,
+        "failed": [{"net": r["net"], "reason": r.get("reason")} for r in failed],
+        "ops": em.ops,
+        "rejected": em.bad[:20],
+        "stats": stats,
+    }
+
+
+def _between(layers, a, b, cand):
+    """Is `cand` between `a` and `b` in stackup order (for a via's span)?"""
+    if a not in layers or b not in layers or cand not in layers:
+        return False
+    ia, ib, ic = layers.index(a), layers.index(b), layers.index(cand)
+    return min(ia, ib) < ic < max(ia, ib)
+
+
+def _via_gate(grid, net):
+    """A* asks this before paying for a via. Raster-only, on purpose: the exact
+    check runs once at emission (see `_Emitter.via`).
+
+    It asks the VIA raster, not the track raster: a via is 0.6 mm where a track
+    is 0.25 mm, and using one raster for both is exactly how seven nets on the
+    F401 core board ended up "routed" with a via the exact check rejected.
+    """
+    def check(i, j, _net):
+        for layer in grid.layers:
+            if not grid.free_via(i, j, layer, net):
+                return False
+        return True
+    return check

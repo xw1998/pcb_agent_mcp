@@ -9,6 +9,70 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.14] - 2026-10-29
+
+「布线器从 `_scratch/` 脚本收进 `src/`」：`board_route` 兑现 0.0.13 的欠账，兑现方式不是
+把脚本搬过去，而是**先把「栅格不是证据」这条信条真的落进判决层**——本轮因此抓出五个
+「在成功状态里给出错答案」的真缺陷（前四条写测试时自己发现，第五条是拿 `kicad-cli DRC`
+当裁判、跑完整条 apply 链路才现形的）。
+
+- **`route/` 三个模块 + `board_route`（第 127 个工具）**：
+  - `rules.py`：clearance / 边距**三级来源**（caller > 板内 `(net_class …)` > `.kicad_pro` 的
+    `net_classes` / `netclass_assignments` / `netclass_patterns` 通配，多源取最严），每个数字
+    在 `assumptions.where_the_numbers_came_from` 里点名是谁给的；**一个来源都没有就
+    `RULES_ABSENT` 拒绝开工**，不按经验取 0.2 mm。
+  - `grid.py`：**双栅格**（走线 `margin = clr + track/2`、过孔 `margin_via = clr + via_dia/2`）
+    ——合成一张图会在两头同时错：过孔能穿过本该挡它的缝，或走线绕开一块本来能走的空。
+    A* 8 向禁切角、`TURN_COST=0.55`、`VIA_COST=9.0`、`HEUR_W=1.25`、`MAX_BUDGET=400000`。
+    预算耗尽单独报 `search_budget`，**不混成 `no_path`**：我没走完 ≠ 没有路。
+  - `router.py`：Prim MST 按长度降序、失败网反向 second sweep、**按物理重叠** rip-up
+    （焊盘包围盒外扩 1.5 mm 与已发 ops 求交，取重叠最多的 3 个非平面网；旧写法按「短的最便宜」
+    挑牺牲者，实测站不住——挡路的网可能在板子另一头），只重跑 loser + 被撕的网。
+  - **事务化**：一个网的铜只在这个网成功之后才进图（`_Emitter` mark/commit/rollback/forget），
+    失败即整网不留痕。
+- **五个真缺陷**（`docs/27` §27.9）：
+  1. **越界下标在 Python 里回卷**：扁平 list 栅格，问板外 `i=-50` 的点会回卷到板上一个普通空格，
+     于是「板外」被回答成「可走」。修法 `index()` 越界返回 `None`。**改的是代码，不是断言。**
+  2. **keepout 只封了边框一条带**：第一版照铺铜的写法标「距环边 < margin」，keepout 内部完全
+     可走，搜索直接从框里穿过去。修法 `point_in_polygon` 命中即 `d = 0`，且这个判定必须放在
+     两个 margin 决定任何事**之前**（否则 `[m_track, m_via)` 那条带里走线图与过孔图互相矛盾）。
+  3. **精确判定里根本没有 keepout**：`seg_blockers` / `via_blockers` 只看铜 clearance，
+     于是「栅格说能走、精确判定说干净」可以同时成立，而铜实实在在横穿了一个 keepout。
+     修法 keepout 进精确判定（线段：端点在内 / 与环边相交 / 到环边 < width/2；过孔：圆心在内 /
+     圆环相碰），并**尊重 `(keepout (tracks allowed))` 这类标志**——只禁过孔的 keepout
+     不该把走线也封死，否则后面每个网都在绕一条板文件里不存在的规则。
+  4. **焊盘逃逸链路没画也没量**：焊盘中心格被别人铜的光环盖住时，起点退到最近空格，但
+     「从焊盘到那个空格」这段铜从没画过也没检查过 ⇒ 输出第一段线离焊盘 1~2 mm 什么都不挨着，
+     而 `status` 是 `routed`。修法把它当一段普通铜走 `em.track()`，失败整网拒绝（`terminal_unreachable`）。
+  5. **板边距只管过孔不管走线**：`via_blockers` 有 `too_close_to_edge`，`seg_blockers` 没有。
+     这块板没有 `min_copper_edge_clearance`、也没有 `.kicad_pro`，但 KiCad 照样按板设置默认
+     **0.5 mm** 查。于是 `LED1_A`/`LED2_A` 把铜贴在 y = −0.4（铜边距边 **0.275 mm**）被报成 `routed`，
+     `kicad-cli pcb drc` 报 **6 条 `copper_edge_clearance`（全部 error）**。修法三处：规则缺来源时
+     取 KiCad 默认 0.5 mm 并写进 `assumed`（不沿用「缺规则就拒」：板边距是**关于板**的规则，
+     留空等于假绿）；`_mark_edge()` 沿 Edge.Cuts 对每个网封一条 `edge + track/2` 宽的带；
+     `_edge_for_segment()` / `_edge_for_via()` 进精确判定。新增 `edge_clearance_mm` 参数供调用方覆盖。
+- **实测（同一块 F401 核心板，50 网 / 194 pad / 4 层 / 162 870 cells，出货代码）**：
+  baseline `27/50 · 461 ops · 102.9 s` → `sweep + rip 38/50 · 351 ops · 521.8 s`
+  （`rips=64 / rip_passes=1 / sweeps=2 / rejected_ops=0`）。**净赚 11 个网，铜反而更少**；代价是
+  撕图时要把 16 万格 × 4 层重建一遍并重放全部已发 ops。修板边距之前的 baseline 是 29/50，
+  多出来的两个正是贴边的 `LED1_A`/`LED2_A`——**非法铜不算布通**，所以真实起点是 27。
+- **端到端复核（自己的闸门绿不算绿）**：`board_route(apply=true)` → 四道闸门全绿、
+  `new_blocking_total=0`，再让 `kicad-cli pcb drc`（10.0.7）当裁判：69 条违规全是这块板既有的
+  silkscreen/text 告警，**shorting_items 0 / tracks_crossing 0 / clearance 0 / copper_edge_clearance 0**；
+  `unconnected_items` 71，对应的就是那 12 个没布通的网。修板边距前后就是这两行：
+  **6 条 error → 0 条，布通仍 38/50**——那 6 段贴边铜既没换来一个布通的网，又让整块板 DRC 变红。
+  性能另一条：12 网 `229 s → 41.4 s`（`free` 63.2 s、`dict.get` 53.3 s、via gate 33.5 s、
+  `_mark_cells` 23.1 s、`__init__` 21.2 s 逐条消掉）；板边距三处检查的代价是 sweep+rip 451.3 → 521.8 s。
+- **16 条测试**（`tests/test_route.py`，全部合成板）：规则三个来源与公示、空规则拒绝、双栅格真的
+  不同、板外真的不可走、**测试自己量间距不信路由器判决**、keepout 逐点量距离、焊盘落在 keepout 里
+  点名拒绝、有网布不通整体不写 / `allow_partial` 才写 / `incremental` 不叠加第二份铜，以及一组
+  **板边距的正臂 + 反假绿对照**（板边只剩 0.8 mm 缝时不许穿；同一几何把规则放宽到 0.1 mm 就能过）。
+- 工具数 126 → **127**；文档 `docs/27-自动布线器.md`。
+
+**仍然欠着**：差分对 / 等长 / 阻抗目标、回流路径、爬电距离、拥塞协商（negotiated congestion，
+这才是现代布线器的核心，也解释了 50 网板上为什么还能剩失败）、Steiner 拓扑、热焊盘重填、
+D 形 pad 圆角。`routed` 不等于 DRC 干净。
+
 ## [0.0.13] - 2026-10-29
 
 「把不可观察的地方改掉」：一次真按流程画板之后，用户点名两条 —— **过程在 EDA 窗口里看不见、
@@ -58,7 +122,7 @@
 
 **仍然欠着**：`lceda_pro_steps` 真机未验证（本机非交互会话起不了 `lceda-pro.exe`，
 `APP_NOT_RUNNING`）；在线器件只有元数据没有几何；`board_routability` 不是布线器；铺铜快照
-不会自动重铺；布线器本体仍在 `_scratch/` 脚本里、未收进 `src/`。
+不会自动重铺；~~布线器本体仍在 `_scratch/` 脚本里、未收进 `src/`~~（**0.0.14 已兑现**：`route/` 三模块 + `board_route`）。
 
 ## [0.0.12] - 2026-10-28
 

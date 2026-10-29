@@ -5,6 +5,7 @@ The schema is the only thing the model sees before calling, so descriptions
 must say what the tool will NOT do as clearly as what it does.
 """
 import json
+import math
 
 from . import desktop as _desktop
 from . import parts as _parts
@@ -1052,6 +1053,52 @@ _tool(
 )
 
 _tool(
+    "board_route",
+    "Connect the pads of each net with copper: A* maze search on a raster, longest "
+    "net first, a second sweep for the nets that lost, then a bounded rip-up round "
+    "that pulls out the nets whose copper physically OVERLAPS the loser's pads "
+    "(not 'the shortest ones' - the one in the way may sit on the far side of the "
+    "board) and re-routes them with the loser. A net whose name has a pour on the "
+    "board gets ONE via per pad into that plane instead of a track across the board. "
+    "Clearance/track/via come from the caller, else the board's net classes, else "
+    "the project file - no source at all is a refusal, not a 0.2 mm guess. Reports "
+    "per-net length/via/segment counts and, for every net it could not finish, why: "
+    "`no_path` (search exhausted), `search_budget` (the budget ran out - not the "
+    "same claim), `terminal_unreachable` (a pad has no way out). Returns a PLAN by "
+    "default; apply=true writes it through board_propose + board_apply (checkpoint, "
+    "atomic write, four gates, KiCad DRC). It does not do length matching, diff "
+    "pairs, return paths, creepage or negotiated congestion.",
+    {"type": "object",
+     "properties": dict({
+         "apply": _bool("write the copper (default false: plan only)"),
+         "pitch_mm": _num("search raster step", 0.1),
+         "layers": _str("comma separated routers layers (default: every copper layer "
+                        "that no power pour covers)"),
+         "nets": _str("comma separated nets to route (default: all)"),
+         "clearance_mm": _num("override the net-class clearance", None),
+         "track_mm": _num("override the net-class track width", None),
+         "via_diameter_mm": _num("override the via diameter", None),
+         "via_drill_mm": _num("override the via drill", None),
+         "edge_clearance_mm": _num("copper-to-board-edge rule (default: the "
+                                    "project's min_copper_edge_clearance, else "
+                                    "KiCad's 0.5 mm board-setup default, declared "
+                                    "as assumed)", None),
+         "rip_up_rounds": _num("how many bounded rip-up rounds (0 turns it off)", 1),
+         "incremental": _bool("treat the net's existing copper as already connected "
+                              "and route only what is missing", False),
+         "allow_vias": _bool("may the search change layers", True),
+         "second_sweep": _bool("retry the losers in reverse order", True),
+         "ignore_zone_areas": _bool("do not treat pour outlines as obstacles", False),
+         "max_nets": _num("only the N nets with the most pads", None),
+         "allow_partial": _bool("write even when some nets failed", False),
+         "allow_new_violations": _bool("accept newly introduced DRC violations"),
+         "strict_drc": _bool("let every new violation block, warnings included"),
+     }, **_COMMON),
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_route(a)),
+)
+
+_tool(
     "board_pour_connectivity",
     "Do the pads of the pour's net actually land inside the filled copper? A pour that "
     "looks connected in the file can be isolated in fact.",
@@ -1087,6 +1134,119 @@ _tool(
      }, **_COMMON, **{"required": ["path"]})},
     lambda a: _guarded(lambda: _fill.fill(a["path"], in_place=bool(a.get("in_place")))),
 )
+
+def _board_route(args):
+    """Plan (or plan+write) a routed board.
+
+    Two verb-free rules the whole project follows apply here too:
+
+    * a net is reported `routed` only when every one of its MST edges found a path
+      AND every emitted segment passed an exact clearance check - a raster cell is
+      never evidence;
+    * nothing is written unless `apply` is true, and when it is, the copper goes
+      through `board_propose` + `board_apply`, so it meets the same four gates and
+      the same KiCad DRC referee as a hand edit. A plan is refused outright when a
+      net could not be routed, unless `allow_partial` is set - half a board that
+      looks finished is the worst kind of answer.
+    """
+    from . import edit as _edit
+    from .route import router as _router
+    from .route.rules import RulesError
+    board, e = _load_board(args)
+    if e:
+        return e
+    kw = {}
+    for key in ("pitch_mm", "clearance_mm", "track_mm", "via_diameter_mm",
+                "via_drill_mm", "edge_clearance_mm", "rip_up_rounds", "max_nets"):
+        if args.get(key) is not None:
+            kw[key] = args[key]
+    for key in ("layers", "nets"):
+        val = args.get(key)
+        if isinstance(val, str):
+            val = [x.strip() for x in val.split(",") if x.strip()]
+        if val:
+            kw[key] = val
+    for key in ("incremental", "allow_vias", "ignore_zone_areas", "second_sweep"):
+        if args.get(key) is not None:
+            kw[key] = bool(args[key])
+    try:
+        res = _router.plan(board, **kw)
+    except RulesError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint)
+    except _router.RouteError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint)
+
+    stats = res["stats"]
+    failed = res["failed"]
+    segs = [o for o in res["ops"] if o["op"] == "add_track"]
+    out = ok(
+        value={"nets_total": stats["nets_total"], "nets_routed": stats["nets_routed"],
+               "nets_failed": stats["nets_failed"], "ops": len(res["ops"]),
+               "vias": sum(1 for o in res["ops"] if o["op"] == "add_via"),
+               "segments": len(segs),
+               "track_length_mm": round(sum(math.hypot(o["x2"] - o["x1"],
+                                                       o["y2"] - o["y1"])
+                                            for o in segs), 3)},
+        unit="nets/ops",
+        model="grid_maze_router",
+        basis="A* on a %.3f mm raster per copper layer, with every emitted segment "
+              "re-checked against exact polygon geometry and the per-net clearance"
+              % stats["pitch_mm"],
+        precision="routing is a search, not a proof: `routed` means this router "
+                  "found a legal path for every edge of the net's spanning tree and "
+                  "the exact check accepted every segment. It does NOT mean the board "
+                  "is DRC clean - run board_drc after writing - and it does not mean "
+                  "the layout is good: no length matching, no diff pair, no thermal "
+                  "or return-path reasoning is applied",
+        assumptions={
+            "clearance_mm": res["rules"]["clearance_mm"],
+            "track_mm": res["rules"]["track_mm"],
+            "via_mm": [res["rules"]["via_diameter_mm"],
+                       res["rules"]["via_drill_mm"]],
+            "where_the_numbers_came_from": res["rules"]["sources"],
+            "assumed_by_this_server": res["rules"]["assumed"],
+            "routing_layers": res["layers_routing"],
+            "plane_layers": res["layers_plane"],
+            "writes_nothing": args.get("apply") is not True,
+        },
+        extra={
+            "nets": res["nets"],
+            "failed": failed,
+            "rejected_segments": res["rejected"],
+            "stats": dict((k, v) for k, v in stats.items() if k != "rule_bundle"),
+            "grid_notes": stats["grid_notes"],
+            "ops_preview": res["ops"][:5],
+        })
+    if args.get("apply") is not True:
+        out["next_step"] = ("pass apply=true to write this copper (it goes through "
+                            "board_propose + board_apply and the four gates)")
+        return out
+
+    if failed and not args.get("allow_partial"):
+        out["status"] = "error"
+        out["value"] = {"nets_failed": stats["nets_failed"],
+                        "nets_routed": stats["nets_routed"]}
+        out["message"] = ("%d net(s) could not be routed, so nothing was written. "
+                          "Detach a path or pass allow_partial=true to write only "
+                          "what did route."
+                          % stats["nets_failed"])
+        out["reason_code"] = "ROUTE_INCOMPLETE"
+        out["hint"] = ("board_route with nets=[...] on one net at a time tells you "
+                       "which one is the problem; the `failed` list carries the "
+                       "blocking pad and how much clearance is missing")
+        return out
+    plan = _edit.propose(args["path"], res["ops"], {"engine": True})
+    try:
+        applied = _edit.apply_plan(plan["plan_id"], confirm=True,
+                                   options={"engine": True,
+                                            "allow_new_violations":
+                                                bool(args.get("allow_new_violations")),
+                                            "strict_drc": bool(args.get("strict_drc"))})
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+    out["value"]["plan_id"] = plan["plan_id"]
+    out["applied"] = applied
+    return out
 
 _tool(
     "board_cross_split",
@@ -1767,7 +1927,7 @@ def _capabilities(_args):
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "board_summary", "board_components", "board_nets", "board_clearance",
             "board_free_space", "board_routability", "board_pour_connectivity",
-            "board_zones", "board_fill_zones",
+            "board_zones", "board_fill_zones", "board_route",
             "board_cross_split",
             "board_loop_area", "board_fidelity", "board_view", "board_drc",
             "board_stats", "board_cross_check", "epro_inspect",
