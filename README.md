@@ -260,9 +260,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.27
-python run_server.py --selftest      # 协议级自检，114/114（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问）
-python -m unittest discover -s tests # 1610 个用例（约 11 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.28
+python run_server.py --selftest      # 协议级自检，115/115（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问）
+python -m unittest discover -s tests # 1632 个用例（约 11 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -418,6 +418,13 @@ MCP 客户端配置（stdio）：
   `UNSUPPORTED_CARD` 并点名，而不是跳过——**一半跑完的网表比拒答更危险**。瞬态是后向欧拉
   （不是梯形），AC 先解工作点再只覆盖雅可比。`not_computed` 每一条都写清：没有自热、没有器件
   电容/迁移率/击穿随温度、没有噪声/失真/傅里叶分析。
+- **`.param` 是整份 deck 的语言，不是子电路的私产。** `0.0.28` 起顶层与 `.subckt` 体内都能写
+  `.param`：只有一个数字读取器（数字或 `{+ - * / **}` 的 ast 白名单），作用域链是
+  **全局 → 子电路默认值 → 实例覆盖 → 体内 `.param`**，前向引用合法（按依赖轮次解析），
+  循环定义按名字报错。**本轮抓到一个真缺陷**：`_value("1k*2")` 会静默读成 **1000**（`*2` 被当垃圾
+  吃掉），所以 `.param` 与 `{…}` 位置现在要求整个 token 匹配数字+单位，错误里直接写出
+  `write {1k*2}`。源的 `dc` / `ac` / `pulse(...)` 三个数字槽也统一走这个读取器（此前各写一遍，
+  `0.0.26` 的间距参数正是这样掉过一次）。
 - **`.subckt` 归内置管了，而且是拍平不是新求解器。** `0.0.27` 起内置 `sim_spice` 自己展开
   `.subckt/.ends` 与 `X` 实例：内部节点名照抄 ngspice 的 `<实例>.<本地>` 小写（嵌套
   `x9.x1.m`），所以 `cross_check` 的节点配对是真的——不然「0 个共同节点」会被读成「一致」。
@@ -627,10 +634,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1610 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1632 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~33，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~34，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明

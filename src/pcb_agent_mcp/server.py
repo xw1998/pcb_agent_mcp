@@ -1568,7 +1568,7 @@ def selftest():
           and abs(_sn.get("x1.m", 0.0) - 5.0) < 1e-6
           and abs(_sn.get("1", 0.0) - 10.0) < 1e-9
           and "subcircuits (.subckt), hierarchical netlists" not in _nc
-          and ".param" in _nc,
+          and "parameters that need a function" in _nc,
           "x1.m %s" % _sn.get("x1.m"))
 
     # A parameter that is parsed but never reaches the element is the failure this
@@ -1589,8 +1589,8 @@ def selftest():
           and abs(_v1 - 4.5) < 1e-6 and abs(_v2 - 6.75) < 1e-6,
           "default %s, override %s" % (_v1, _v2))
 
-    # Refusals: a recursive definition and a top-level .param card are errors with
-    # the reason named - not a deck that "runs" with the card quietly skipped.
+    # Refusals: a recursive definition and a circular .param are errors with the
+    # reason named - not a deck that "runs" with the card quietly skipped.
     _cyc = ("* cycle\n.subckt a p q\nX1 p q b\n.ends\n.subckt b p q\nX1 p q a\n"
             ".ends\nV1 1 0 1\nX9 1 0 a\n.op\n.end\n")
     r = handle({"jsonrpc": "2.0", "id": 137, "method": "tools/call",
@@ -1598,17 +1598,38 @@ def selftest():
     _cy = json.loads(r["result"]["content"][0]["text"])
     r = handle({"jsonrpc": "2.0", "id": 138, "method": "tools/call",
                 "params": {"name": "sim_spice",
-                           "arguments": {"netlist": ".param r=1k\nV1 1 0 1\n"
-                                                   "R1 1 0 r\n.op\n.end\n"}}})
+                           "arguments": {"netlist": ".param a={b+1} b={a+1}\n"
+                                                   "V1 1 0 1\nR1 1 0 {a}\n"
+                                                   ".op\n.end\n"}}})
     _pp = json.loads(r["result"]["content"][0]["text"])
-    check("a recursive .subckt and a top-level .param are refused with the reason "
+    check("a recursive .subckt and a circular .param are refused with the reason "
           "named (NETLIST_INVALID), never run with the card skipped",
           _cy.get("status") == "error" and _cy.get("reason_code") == "NETLIST_INVALID"
           and "instantiates itself" in (_cy.get("message") or "")
           and _pp.get("status") == "error"
           and _pp.get("reason_code") == "NETLIST_INVALID"
-          and ".param is not implemented here" in (_pp.get("message") or ""),
+          and "circular" in (_pp.get("message") or ""),
           str(_pp.get("reason_code")))
+
+    # A .param card is a number that must reach the element: 9*3/4 lands on the
+    # tap, and the same deck with the value inlined must agree bit for bit.
+    _pc = ("* param divider\n.param r1=1k r2={3*r1}\nV1 1 0 9\nR1 1 2 {r1}\n"
+           "R2 2 0 {r2}\n.op\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 139, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _pc}}})
+    _pm = json.loads(r["result"]["content"][0]["text"])
+    _pn2 = (_pm.get("value") or {}).get("nodes_v") or {}
+    _inline = ("V1 1 0 9\nR1 1 2 1k\nR2 2 0 3k\n.op\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 140, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _inline}}})
+    _in = json.loads(r["result"]["content"][0]["text"])
+    _in_n = (_in.get("value") or {}).get("nodes_v") or {}
+    check("a top-level .param reaches the element (9*3/4 = 6.750 V on the tap) and "
+          "the same deck with the numbers inlined agrees bit for bit",
+          _pm.get("status") == "ok"
+          and abs(_pn2.get("2", 0.0) - 6.75) < 1e-6
+          and abs(_pn2.get("2", 0.0) - _in_n.get("2", -1.0)) < 1e-12,
+          "param %s, inline %s" % (_pn2.get("2"), _in_n.get("2")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

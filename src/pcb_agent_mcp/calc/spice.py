@@ -41,6 +41,7 @@ Honesty rules kept from the rest of this server:
 import ast
 import cmath
 import math
+import re
 
 from .result import ok, err
 
@@ -115,6 +116,20 @@ def _limit_junction(v, vt, IS):
 
 # --------------------------------------------------------------- value parsing
 
+_NUMERIC_TAIL = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)(e[+-]?\d+)?[a-z]*$")
+
+
+def _looks_numeric(text):
+    """True only if _value() would read the WHOLE token as a number.
+
+    _value() stops at the first character that cannot be part of a number, so
+    "1k*2" silently becomes 1000. For an element value that leniency has always
+    been there; in a .param or a {…} slot the same string is arithmetic the user
+    meant (#1: 2 kohm), so it is refused instead of guessed at.
+    """
+    return _NUMERIC_TAIL.match(str(text).strip().lower()) is not None
+
+
 def _value(text):
     """SPICE number: 1k, 4.7u, 2.2meg, 100n, 1e3, 0.5."""
     s = str(text).strip().lower()
@@ -159,9 +174,10 @@ def parse_netlist(text):
     """Parse the subset. Returns a spec dict; raises ValueError on anything it
     does not implement, with the line number, rather than skipping it."""
     spec = {"title": "", "elements": [], "models": {}, "analyses": [],
-            "options": {}, "subckts": {}}
+            "options": {}, "subckts": {}, "params": {}}
     lines = str(text or "").splitlines()
     sub = None
+    pending_params = []
     for lineno, raw in enumerate(lines, 1):
         line = raw.split(";")[0].split("$")[0].strip()
         if line.startswith("*") or line == "":
@@ -186,6 +202,9 @@ def parse_netlist(text):
                                  "implemented here (ngspice has no nested "
                                  "definitions either); move it to the top level"
                                  % lineno)
+            if low.startswith(".param"):
+                _parse_param_card(line, lineno, sub["locals"])
+                continue
             if low.startswith(".model"):
                 _parse_model(sub, line, lineno)
                 continue
@@ -207,10 +226,8 @@ def parse_netlist(text):
         if low.startswith(".end"):
             break
         if low.startswith(".param"):
-            raise ValueError("line %d: .param is not implemented here; parameters "
-                             "exist only on .subckt definitions and on their X "
-                             "instances, where the value is actually in scope"
-                             % lineno)
+            _parse_param_card(line, lineno, pending_params)
+            continue
         if low.startswith(".model"):
             _parse_model(spec, line, lineno)
             continue
@@ -247,6 +264,9 @@ def parse_netlist(text):
         spec["elements"].append(el)
     if sub is not None:
         raise ValueError(".subckt %r is never closed by .ends" % sub["name"])
+    # .param may be written after the element that uses it, and a parameter may
+    # refer to another one: resolve the whole set at the end, then flatten.
+    spec["params"] = _resolve_params(pending_params, {})
     # Subcircuit instances become plain elements here, before anything downstream
     # (model reference check, node table, solver) looks at the element list.
     _expand_instances(spec)
@@ -294,11 +314,24 @@ def _value_or_expr(tok, lineno):
     t = str(tok).strip()
     if len(t) > 2 and t.startswith("{") and t.endswith("}"):
         return ("expr", t[1:-1].strip())
-    try:
+    if _looks_numeric(t):
         return _value(t)
-    except ValueError:
-        raise ValueError("line %d: %r is neither a number nor a {…} expression"
-                         % (lineno, t))
+    raise ValueError("line %d: %r is neither a number nor a {…} expression (write "
+                     "{%s} if it is arithmetic)" % (lineno, t, t))
+
+
+class _MissingParam(ValueError):
+    """A name used in a {…} expression that is not in scope, with the name kept.
+
+    Two very different situations produce this: a typo, and a circular .param
+    definition where every name in the cycle is still waiting on the others.
+    _resolve_params tells them apart by asking whether the missing name is one of
+    the names it is still holding.
+    """
+
+    def __init__(self, message, name):
+        ValueError.__init__(self, message)
+        self.name = name
 
 
 def _eval_expr(text, env, where):
@@ -320,9 +353,10 @@ def _eval_expr(text, env, where):
         if isinstance(node, ast.Name):
             key = node.id.lower()
             if key not in env:
-                raise ValueError("%s: %r is not a parameter in scope here (%s)"
-                                 % (where, node.id,
-                                    ", ".join(sorted(env)) if env else "none"))
+                raise _MissingParam(
+                    "%s: %r is not a parameter in scope here (%s)"
+                    % (where, node.id,
+                       ", ".join(sorted(env)) if env else "none"), key)
             return env[key]
         if isinstance(node, ast.UnaryOp) and isinstance(node.op,
                                                        (ast.UAdd, ast.USub)):
@@ -358,6 +392,86 @@ def _resolve_value(val, env, where):
     return float(val)
 
 
+_PARAM_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)\s*=\s*(\{[^}]*\}|[^\s,]+)")
+
+
+def _parse_param_card(line, lineno, into):
+    """.param a=1k b={a/2} ... -> appended to *into* as (name, value, lineno).
+
+    Values are numbers or {…}. ngspice also accepts a bare expression ("1k*2"),
+    this build asks for the braces instead of growing a second grammar: one
+    parser for both .subckt parameters and .param cards, one set of error
+    messages. The entries are resolved later (see _resolve_params), because a
+    parameter may refer to one written after it.
+    """
+    text = line.strip()[len(".param"):].strip()
+    if not text:
+        raise ValueError("line %d: .param needs at least one name=value" % lineno)
+    pos, got = 0, 0
+    while pos < len(text):
+        m = _PARAM_ASSIGN.match(text, pos)
+        if m is None or m.start() != pos:
+            raise ValueError("line %d: cannot read .param from %r onward (expected "
+                             "name=value)" % (lineno, text[pos:]))
+        key = m.group(1).strip().lower()
+        raw = m.group(2).strip()
+        if raw.startswith("{"):
+            if not raw.endswith("}"):
+                raise ValueError("line %d: .param %s=%s: the {…} expression is "
+                                 "not closed" % (lineno, key, raw))
+            into.append((key, ("expr", raw[1:-1].strip()), lineno))
+        elif _looks_numeric(raw):
+            into.append((key, _value(raw), lineno))
+        else:
+            raise ValueError("line %d: .param %s=%s: %r is neither a number nor "
+                             "a {…} expression (write {%s} if it is arithmetic)"
+                             % (lineno, key, raw, raw, raw))
+        pos = m.end()
+        while pos < len(text) and text[pos] in " \t,":
+            pos += 1
+        got += 1
+    if not got:
+        raise ValueError("line %d: .param needs at least one name=value" % lineno)
+
+
+def _resolve_params(pending, base_env, where="param"):
+    """Resolve (name, value, lineno) triples, in dependency order.
+
+    Sources are not read in order, so a parameter may use one written later.
+    Resolution therefore runs in rounds until nothing moves; when a round makes
+    no progress at all, the remaining names are a circular definition and the
+    first one is reported with the reason it failed.
+    """
+    env = dict(base_env)
+    todo = list(pending)
+    while todo:
+        stuck = []
+        for name, val, lineno in todo:
+            try:
+                env[name] = _resolve_value(val, env, "line %d: %s %s"
+                                           % (lineno, where, name))
+            except ValueError:
+                stuck.append((name, val, lineno))
+        if len(stuck) == len(todo):
+            waiting = set(n for n, _v, _l in stuck)
+            name, val, lineno = stuck[0]
+            try:
+                _resolve_value(val, env, "line %d: %s %s" % (lineno, where, name))
+            except _MissingParam as exc:
+                if exc.name in waiting:
+                    raise ValueError(
+                        "line %d: %s %r refers to %r, which is itself unresolved "
+                        "(still waiting: %s) - a circular definition cannot be "
+                        "resolved"
+                        % (lineno, where, name, exc.name,
+                           ", ".join(sorted(waiting))))
+                raise
+            except ValueError:
+                raise
+        todo = stuck
+    return env
+
+
 def _parse_subckt(line, lineno):
     """.subckt NAME p1 p2 ... [PARAMS:] k=v ...
 
@@ -384,7 +498,7 @@ def _parse_subckt(line, lineno):
                              "%r; pins must come first" % (lineno, tok, name))
         pins.append(tok)
     return {"name": name, "pins": pins, "params": params, "elements": [],
-            "models": {}, "lineno": lineno}
+            "models": {}, "locals": [], "lineno": lineno}
 
 
 def _parse_instance(parts, name, lineno):
@@ -412,6 +526,25 @@ def _parse_instance(parts, name, lineno):
             "overrides": overrides}
 
 
+def _resolve_element(el, env, where):
+    """Replace every {…} left on this element by its number, in place.
+
+    Element values, gains, a source's dc / ac amplitude+phase and every PULSE /
+    SIN / PWL argument go through the same reader, so "which slot accepts a
+    parameter" does not have to be remembered card by card.
+    """
+    for key in ("value", "gain", "dc"):
+        if isinstance(el.get(key), tuple):
+            el[key] = _resolve_value(el[key], env, "%s (%s)" % (where, key))
+    ac = el.get("ac")
+    if isinstance(ac, list):
+        el["ac"] = [_resolve_value(x, env, "%s (ac)" % where) for x in ac]
+    wave = el.get("wave")
+    if isinstance(wave, dict):
+        wave["args"] = [_resolve_value(x, env, "%s (%s args)" % (where, wave["kind"]))
+                        for x in wave["args"]]
+
+
 def _expand_instances(spec):
     """Flatten every X instance into plain elements.
 
@@ -425,19 +558,17 @@ def _expand_instances(spec):
     nothing in common and calling it a day. Element names get the same prefix, so
     two instances of one subcircuit cannot collide.
     """
+    global_env = spec.get("params") or {}
     out = []
     for el in spec["elements"]:
         if el["type"] != "X":
             out.append(el)
             continue
-        out.extend(_instantiate(spec, el, el["name"].lower(), {}, (), 0))
+        out.extend(_instantiate(spec, el, el["name"].lower(), global_env, (), 0))
     spec["elements"] = out
     for el in spec["elements"]:
-        for key in ("value", "gain"):
-            if isinstance(el.get(key), tuple):
-                raise ValueError("line %d: %s has a {…} value with no subcircuit "
-                                 "parameter scope in effect"
-                                 % (el.get("lineno", 0), el["name"]))
+        _resolve_element(el, global_env,
+                         "line %d: %s" % (el.get("lineno", 0), el["name"]))
 
 
 def _instantiate(spec, el, path, caller_env, stack, depth):
@@ -461,19 +592,25 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
                          "pin(s) (%s)"
                          % (where, el["name"], len(el["nodes"]), el["sub"],
                             len(sub["pins"]), " ".join(sub["pins"]) or "none"))
-    env = {}
+    # a body may read a GLOBAL .param; local names shadow it
+    env = dict(spec.get("params") or {})
     for key, val in sub["params"].items():
         env[key] = _resolve_value(val, caller_env,
                                   "%s (.subckt %s default %s)"
                                   % (where, el["sub"], key))
     for key, val in el["overrides"].items():
         if key not in sub["params"]:
+            local_names = sorted(n for n, _v, _l in (sub.get("locals") or []))
+            declared = sorted(sub["params"]) + local_names
             raise ValueError("%s: %s sets parameter %r, which .subckt %r does not "
                              "declare (%s)"
                              % (where, el["name"], key, el["sub"],
-                                ", ".join(sorted(sub["params"])) or "none"))
+                                ", ".join(declared) or "none"))
         env[key] = _resolve_value(val, caller_env,
                                   "%s (%s %s)" % (where, el["name"], key))
+    if sub.get("locals"):
+        env.update(_resolve_params(sub["locals"], env,
+                                   ".subckt %s .param" % el["sub"]))
     pin_map = {}
     for pin, actual in zip(sub["pins"], el["nodes"]):
         # a pin tied to a ground name collapses to the one global ground, exactly
@@ -506,11 +643,7 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
             out.extend(_instantiate(spec, copy, copy["name"], env,
                                     tuple(stack) + (el["sub"],), depth + 1))
             continue
-        for key in ("value", "gain"):
-            if key in copy:
-                copy[key] = _resolve_value(copy[key], env,
-                                           "%s (%s %s)"
-                                           % (where, copy["name"], key))
+        _resolve_element(copy, env, "%s (%s)" % (where, copy["name"]))
         if "model" in copy:
             if copy["model"] in sub["models"]:
                 full = "%s.%s" % (path, copy["model"])
@@ -622,15 +755,19 @@ def _parse_source(parts, low, name, letter, lineno):
     while i < len(parts):
         p = low[i]
         if p.startswith("dc="):
-            dc = _value(p.split("=", 1)[1])
+            dc = _value_or_expr(p.split("=", 1)[1], lineno)
             i += 1
         elif p == "dc":
-            dc = _value(parts[i + 1])
+            if i + 1 >= len(parts):
+                raise ValueError("line %d: %s: 'dc' needs a value" % (lineno, name))
+            dc = _value_or_expr(parts[i + 1], lineno)
             i += 2
         elif p == "ac":
-            mag = _value(parts[i + 1]) if i + 1 < len(parts) else 1.0
-            phase = _value(parts[i + 2]) if i + 2 < len(parts) else 0.0
-            ac = (mag, phase)
+            mag = (_value_or_expr(parts[i + 1], lineno) if i + 1 < len(parts)
+                   else 1.0)
+            phase = (_value_or_expr(parts[i + 2], lineno) if i + 2 < len(parts)
+                     else 0.0)
+            ac = [mag, phase]
             i += 3
         elif p.split("(")[0] in ("pulse", "sin", "pwl"):
             # the parenthesis may be glued to the keyword ("pulse(0"), so the
@@ -649,13 +786,14 @@ def _parse_source(parts, low, name, letter, lineno):
                     break
             body = " ".join(buf)
             body = body[body.index("(") + 1:body.rindex(")")] if "(" in body else ""
-            nums = [_value(x) for x in body.replace(",", " ").split()
+            nums = [_value_or_expr(x, lineno)
+                    for x in body.replace(",", " ").split()
                     if x.strip() not in ("", ")")]
             wave = {"kind": kind, "args": nums}
             i = j
         else:
             # a bare number is the DC value
-            dc = _value(parts[i])
+            dc = _value_or_expr(parts[i], lineno)
             i += 1
     return {"type": letter, "name": name, "nodes": nodes, "dc": dc,
             "wave": wave, "ac": ac}
@@ -1229,9 +1367,10 @@ PRECISION = (
 )
 
 NOT_COMPUTED = [
-    "top-level .param, and .subckt parameters that are not plain numbers or "
-    "{+ - * / **} arithmetic on numbers and parameters (no functions, no node "
-    "references, no expressions in .model parameters)",
+    "parameters that need a function, a node reference or a self-referential "
+    "definition: .param and .subckt parameters take numbers and {+ - * / **} "
+    "arithmetic on numbers and other parameters only, and expressions are not "
+    "accepted inside .model parameters",
     "a .subckt nested inside another .subckt, and any directive other than "
     ".model inside a .subckt body",
     "current-controlled sources (F/H), switches (S/W), JFETs, coupled inductors (K)",

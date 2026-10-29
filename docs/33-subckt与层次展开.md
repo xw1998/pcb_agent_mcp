@@ -82,16 +82,17 @@ ground 语义，不是新发明。
 
 另外四条方向相反的纪律：
 
-- 顶层 `.param` 专门报「`.param is not implemented here; parameters exist only on .subckt
-  definitions and on their X instances`」——不假装支持，也不让它变成「未知指令」。
-- 体内嵌套 `.subckt` 拒绝；体内除 `.model` 以外的指令拒绝。
+- 顶层 `.param` 当时专门报「`.param is not implemented here; parameters exist only on
+  `.subckt` definitions and on their X instances`」——不假装支持，也不让它变成「未知指令」。
+  **这条在 `0.0.28` 被推翻**：顶层与体内 `.param` 都能用了，见 `34-参数与作用域.md`。
+- 体内嵌套 `.subckt` 拒绝；体内除 `.model`/`.param` 以外的指令拒绝。
 - 缺 `.ends` 时，若先遇到单行 `.end`，报 **`missing .ends, not a stray directive`**
   （`.end` 是 `.ends` 的前缀，判断顺序必须是先 `.ends` 后 `.end`）。
 - 文件结束仍未关闭的子电路，报 `never closed by .ends`。
 
 `NOT_IMPLEMENTED_CARDS` 里 `"X"` 已删除；`NOT_COMPUTED` 里原来那句「subcircuits (.subckt),
-hierarchical netlists」换成了两条**范围明确**的限制（顶层 `.param` 与非常数表达式；嵌套定义与
-体内的非 `.model` 指令）。
+hierarchical netlists」换成了两条**范围明确**的限制（当时是「顶层 `.param` 与非常数表达式」；
+嵌套定义与体内的非 `.model` 指令）。`0.0.28` 之后第一条改成只讲「需要函数的参数」。
 
 ## 33.7 与手写平铺逐位相同：这条自证为什么比「和 ngspice 一致」更硬
 
@@ -119,7 +120,8 @@ hierarchical netlists」换成了两条**范围明确**的限制（顶层 `.para
 ## 33.9 边界（`0.0.27` 之后仍然不做）
 
 - `.subckt` 里嵌 `.subckt`：拒绝。ngspice 允许，但作用域规则与命名会变成另一套设计问题，先不摊。
-- 顶层 `.param`：拒绝。参数只活在 `.subckt` 定义和 X 实例上。
+- ~~顶层 `.param`：拒绝。~~ **已实现（`0.0.28`）**，见 `34-参数与作用域.md`；仍然拒绝的是
+  参数里用函数 / 引用节点电压 / 引用 `.model` 参数。
 - `.model` 参数里的表达式：拒绝（拍平时模型参数还没经过表达式求值）。
 - 表达式函数（`sqrt`/`sin`/`if`…）与节点引用：拒绝。
 - 行为源 `B`、传输线 `T/O/U`、`.noise`：仍然不在内置里，仍走委派。

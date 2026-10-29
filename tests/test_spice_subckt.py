@@ -369,15 +369,22 @@ X1 1 0 div r2=5k
         self.assertEqual(r["status"], "error")
         self.assertIn("does not", r["message"])
 
-    def test_a_top_level_param_card_is_refused_by_name(self):
-        r = spice.simulate(""".param r=1k\nV1 1 0 1\nR1 1 0 r\n.op\n.end\n""")
+    def test_a_param_card_with_a_bare_expression_is_refused_by_name(self):
+        # ngspice reads ".param r=1k*2" as arithmetic; this build asks for the
+        # braces rather than keeping a second, silently-different number reader
+        r = spice.simulate(""".param r=1k*2
+V1 1 0 1
+R1 1 0 {r}
+.op
+.end
+""")
         self.assertEqual(r["status"], "error")
-        self.assertIn(".param is not implemented here", r["message"])
+        self.assertIn("write {1k*2}", r["message"])
 
-    def test_an_expression_outside_a_subcircuit_has_no_scope(self):
+    def test_an_expression_naming_an_undefined_parameter_is_refused(self):
         r = spice.simulate("V1 1 0 1\nR1 1 0 {r}\n.op\n.end\n")
         self.assertEqual(r["status"], "error")
-        self.assertIn("no subcircuit parameter scope", r["message"])
+        self.assertIn("'r' is not a parameter in scope here", r["message"])
 
     def test_a_function_in_an_expression_is_refused_by_name(self):
         r = spice.simulate("""
