@@ -102,9 +102,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（127 个）
+## 工具（129 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -321,8 +321,12 @@ MCP 客户端配置（stdio）：
   （32.5 MB 副本 849 ms）、session.list、session.close、doc.api（`eda` 378 个类型、`PCB_Document`
   21 个方法、带厂商中文注释）与 invoke（`await eda.dmt_Pcb.getAllPcbsInfo()` 回两块板的名字与
   uuid，抛错回 `EXECUTION_ERROR` + 应用原话）。协议与实测数字见 [docs/24](docs/24-立创进程内桥.md)。
-  **但写路径一次都没做过**：没有 save、没有 create、没有 move，`lceda_pro_run` 每次都在
-  assumptions 里写明"片段自己能写、本工具不担保"。
+  **写路径到 0.0.16 才有形状，而且形状是"纪律"不是"配方"**：新工具 `lceda_pcb_write` 不生成
+  snippet（vendor 的写方法名本机一步都没验过，生成就是 plausible wrong answer），它只做
+  「写前 probe → 你的 snippet → 写后 probe → 比较」：没有 probe 就**不发**（`ARG_REQUIRED`）、
+  前后一致就报 `WRITE_HAD_NO_EFFECT`、`save` 只能回 `expect=no_error`。每条答案
+  `verified_against_app: false`，`not_verified` 里明写"磁盘上的文件真的变了吗 / 重载后还在吗"。
+  `lceda_pro_run` 仍然在 assumptions 里写"片段自己能写、本工具不担保"。
 - **立创的"启动"曾经被判死，第三轮推翻了——差别只在父进程有没有控制台。** 前两轮记的是
   "0.5 s 退出、死在 Electron 之前"，那是**从 bash（继承控制台）启动**的现象；改成
   `explorer.exe "<exe>"`（等价双击）就稳定在三个进程上（203/36/289 MB），管道随即出现，
@@ -331,6 +335,12 @@ MCP 客户端配置（stdio）：
   `false`，`app_open_project` 只会回 `unconfirmed`；要开工程请用 `lceda_pro_open`。
   顺带查清：`--` 开头的选项（含厂商自带的 `--mcp stdio|http`）是被 **exe 里 node 自带的
   选项解析器**以 rc 9 拒掉的（`bad option: --mcp`），跟立创启动器无关。
+- **布线器的三条边界，0.0.16 之后仍然成立。** ① 拥塞协商（`congestion_rounds`）**默认关闭**：
+  在 4 层 50 网 F401 核心板上 38/50 → 41/50，代价是 61% 的时间，而且那是**一块板**的读数，
+  不是对所有板的承诺；默认开会替所有用户花掉这 61%。② 回流路径（换层配地过孔）**只有单测**
+  ——真板上拿到的是 `nothing_to_stitch`（单层布通、0 过孔，没有换层就没有回流问题），
+  「缝合后的板子 DRC 变干净」这条证据**没有**。③ 新铜让铺铜过期这件事**只报不重填**：
+  `pour.needs_refill` 与每块 zone 的 `segments_inside` 都给了，重填仍是 KiCad 自己的事。
 - **差分阻抗有两级：闭式近似与二维场解，两者差多少是实测的。** `diff_impedance` 仍是边耦合闭式（IPC-2141A 族），`diff_impedance_field` 解真实截面上的 div(ε∇V)=0（有限体积 + 梯度张量网格 + 红黑 SOR，纯 stdlib）。闭式在实测几何上系统性**偏低 8~11%**、方向一致，所以「调宽凑数」会把线先做窄。场解自己的误差对着两个共享零近似的参考答案量过：零厚度带状线对精确共形解（w/b 0.5..4）≤1.2%、孤立微带对 Hammerstad ≤2.8%、耦合通路在 s/h=8 处对 2×孤立精确解 ≤2.7%；这三张表由 `tests/test_field2d.py` 每次重算，不会悄悄过期。**没被独立参考答案覆盖的是紧间距耦合**——那种几何下工具自己吐 `reference_note`，说明「这是求解器的意见，不是被核过的数」。两者都不建模阻焊、蚀刻梯形与铜损/色散。
 - **两张读不到原文的表，改走两条不需要原文的路。** 标准是付费的、公开转述互相矛盾（IPC-2152
   与 IPC-2221 差可 >3×），所以不自已抄表：
@@ -507,7 +517,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 127 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 129 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 24 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）

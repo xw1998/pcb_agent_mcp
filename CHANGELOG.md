@@ -9,6 +9,55 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.16] - 2026-10-29
+
+「把 0.0.15 的 §27.10 那张欠账清单逐条做完」——九条加上一条新欠账。每一节都分开写**机制**与
+**证据**，凡是只有单测的就写明只有单测；「测试绿了」不等于「真板上量过」。逐条口径见
+`docs/27` §27.12。
+
+- **差分对真耦合**（`route/couple.py`）：第二条网变成第一条网链的逐段偏移副本（`gap + width`，
+  miter ≤ 3w），每段仍走一次 `seg_blockers` 精确复检；三条拒绝点名理由
+  （`pair_needs_two_pads_each` / `offset_blocked` / `fanout_too_long`），并新增 `coupled_fraction`
+  让 `coupled: true` 有数支撑。真板：`SWDIO/SWCLK` 各 3 焊盘被拒，`PA8/PA9` 因 `U1.41` 挡路被拒
+  （`needed 0.2 / actual 0.1601 mm`）——**同一对 `couple=false` 时读数一模一样**，所以那个
+  `gap_achieved_mm` 从来不是耦合的证据。
+- **回流路径**（`route/return_path.py`）：换层的信号过孔配一颗地过孔（2 mm 内、0.6 mm 内已有则不加、
+  必须落在地铜上），`_GROUND_NAMES` 故意不含 `AGND`。真板只拿到 `nothing_to_stitch`（0 过孔），
+  换层场景的证据在单测 `TestALayerChangeGetsAGroundVia`，**真板 DRC 未取证**。
+- **阻抗目标进搜索**（`calc/impedance.py` + `rules.impedance_targets`）：ohm → `track_mm`，
+  叠层不明（`IMPEDANCE_NEEDS_STACKUP`）与不可达（`IMPEDANCE_UNREACHABLE`）两种拒绝。
+  真板 50 Ω：叠层自动取 h=0.5100 ⇒ 0.92177 mm；给定 h=0.2 ⇒ 0.33488 mm；200 Ω ⇒ 不可达。
+- **爬电自动查表**（`calc/iec60664.py`，IEC 60664-1:2020-05 Table F.5）：`working_voltage_v` /
+  `pollution_degree` / `material_group` / `insulation` / `coating` / `altitude_m`，
+  与调用方给的 `creepage_mm` **取严**、两个来源都进 `sources["creepage"]`。PD4 / 超表尾 / 非整数污染
+  等级一律拒绝而不外推。真板 250 V / PD2 / IIIa / basic ⇒ 2.5 mm。
+- **拥塞协商**（`router._wish/_price/_negotiate/_reconcile` + `astar(soft=)`）：需求驱动 + 软代价
+  （`SOFT_BLOCK=0.5`、`WISH_BUDGET=40000`）+ 只收最好一轮（`best_round` / `reverted_to_best`）。
+  `board_route` 新增 `congestion_rounds`（默认 **0 = 关**）/ `congestion_max_rips` / `congestion_weight`。
+  真板：38/50 442.9 s → **41/50** 713.0 s（+61%），round 2 把 41 掉回 36 被 `best_round` 撤回。
+  **41 不是 38 的超集**（新通 8 条、新失败 5 条），所以只能主张「多了 3 条」。
+- **连接意图**（`route/intent.py` + 新工具 `board_intent`）：一份对象、三个消费者
+  （`board_route` / `board_routability` / `board_intent`），未知键 fail-closed 连词表一起报、
+  caller 赢但每个不一致的键进 `conflicts`、不发明数字。板级检查分两档：keepout 吞焊盘 / 区域出板 /
+  ref 不存在 = 拦，「footprint 还没搬进 region」= 只报。
+- **蛇形先挑宿主**（`route/tune.py`）：`_candidate_order` 按「能买多少长度」打分，端点过孔 ×0.25、
+  中点 2 mm 内有别人铜 ×0.25；`AMPLITUDE_LADDER` 把「配不上」变成「配上了，振幅 0.9 mm」，
+  报告新增 `amplitude_ladder_mm / narrowed / hosts_considered`。
+- **异形焊盘 = 全部图元**：`gr_poly/gr_rect/gr_circle/gr_line/gr_arc` 全收集，多图元取凸包
+  （`outline: convex_hull_of_primitives`），表达不了的 kind 进 `ignored_primitives`。
+  **单图元必须原样保留**——全量门禁抓到 `pic_programmer JP1.2` 是凹的五点多边形，凸包把缺口填成铜，
+  pcbnew `HitTest` 与我们在焊盘自己的铜里判反；修后 demo 板逐点比对零分歧。
+- **新铜让铺铜过期**（`router._pour_report`）：报 `needs_refill` 与每块 zone 的
+  `segments_inside / same_net_as_the_new_copper`，**不自己重填**。
+- **立创 Pro 写路径**（新工具 `lceda_pcb_write`，第 129 个）：probe 纪律而不是合成 snippet——
+  无 probe 不发（`ARG_REQUIRED`）、前后一致即 `WRITE_HAD_NO_EFFECT`、`save` 只回 `no_error`，
+  每条答案 `verified_against_app: false` 并列 `not_verified`。`_canon` 把整数与同值浮点视作同一读数，
+  但只对 `abs(int) <= 2**53` 生效（更大的 id 圆成 double 会把「变了」读成「没变」）。
+- **门禁**：全量 **1111 例全绿**（`Ran 1111 tests in 304.779s`, `OK (skipped=5)`；0.0.15 为 1061 例，
+  本轮 +50 例）。新增的类：意图 9 / 蛇形宿主 3 / 铺铜过期 3 / 异形焊盘 3 / 阻抗 7 / 爬电查表 5 /
+  真耦合 4 / 换层地过孔 1 / 立创写路径 11，另有若干落在既有类里的用例；逐类清单见
+  `docs/27` §27.12.11。
+
 ## [0.0.15] - 2026-10-29
 
 「把 `kicad-free` 与 `rf-circuit-design` 里那几条**走线规则**真的变成搜索里的约束」——

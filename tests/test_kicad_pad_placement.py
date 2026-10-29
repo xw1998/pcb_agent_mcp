@@ -288,5 +288,87 @@ class TestPadShapeAgainstPcbnew(unittest.TestCase):
         self.assertGreater(pads, 300, "the sweep compared suspiciously few pads")
 
 
+
+class TestACustomPadIsItsWholeOutline(unittest.TestCase):
+    """A custom pad is the UNION of its primitives, so it is measured as one.
+
+    Taking the first `gr_poly` measured a pad smaller than the copper on the board
+    - an optimistic error, the one direction a clearance check must never make.
+    The convex hull of every primitive is never smaller than their union, the
+    field `outline` says that is what happened, and a kind this build cannot
+    express is NAMED in `ignored_primitives` instead of vanishing.
+
+    ONE primitive is the exception and must stay one: a primitive can be concave
+    (pic_programmer JP1.2 is a notched rectangle), and hulling it would fill the
+    notch with copper that is not on the board.
+    """
+
+    TEXT = """(kicad_pcb (version 20221018)
+  (net 0 "") (net 1 "GND")
+  (footprint "T:Custom" (layer "F.Cu") (at 100 100)
+    (property "Reference" "U9" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd custom (at 0 0)
+      (size 0.3 0.3) (layers "F.Cu") (net 1 "GND")
+      (options (clearance outline) (anchor rect))
+      (primitives
+        (gr_rect (start -3 -1) (end -1 1) (width 0) (fill yes))
+        (gr_rect (start 1 -1) (end 3 1) (width 0) (fill yes))
+        (gr_curve (pts (xy 0 0) (xy 1 1) (xy 2 0)))))
+  )
+)"""
+
+    def test_the_hull_spans_every_primitive_and_the_unknown_kind_is_named(self):
+        board = kicad_pcb.parse_board_text(self.TEXT, path="<memory>")
+        pad = board.footprints[0]["pads"][0]
+        self.assertEqual(pad["shape"], "custom")
+        self.assertEqual(pad["primitives"], 2)
+        self.assertEqual(pad["outline"], "convex_hull_of_primitives")
+        self.assertEqual(pad["ignored_primitives"], ["gr_curve"])
+        # Both rectangles are inside the measured copper: the span is 6 mm, not the
+        # 2 mm one of them alone would have given.
+        self.assertAlmostEqual(pad["w"], 6.0, places=6)
+        self.assertAlmostEqual(pad["h"], 2.0, places=6)
+
+    NOTCHED = """(kicad_pcb (version 20221018)
+  (net 0 "") (net 1 "GND")
+  (footprint "T:Notched" (layer "F.Cu") (at 100 100)
+    (property "Reference" "JP1" (at 0 0) (layer "F.SilkS"))
+    (pad "2" smd custom (at 0.725 0)
+      (size 0.3 0.3) (layers "F.Cu") (net 1 "GND")
+      (options (clearance outline) (anchor rect))
+      (primitives
+        (gr_poly
+          (pts (xy 0.5 -0.75) (xy -0.65 -0.75) (xy -0.15 0)
+               (xy -0.65 0.75) (xy 0.5 0.75))
+          (width 0) (fill yes)))))
+)"""
+
+    def test_a_notched_primitive_keeps_its_notch(self):
+        """The notch is where the copper is NOT, so it must survive parsing."""
+        board = kicad_pcb.parse_board_text(self.NOTCHED, path="<memory>")
+        pad = board.footprints[0]["pads"][0]
+        self.assertEqual(pad["primitives"], 1)
+        self.assertEqual(pad["outline"], "primitive")
+        self.assertEqual(len(pad["polygon"]), 5)      # a rectangle would be 4
+        # The notch tip sits at (-0.15, 0) relative to the anchor: inside the
+        # bounding box, outside the copper.
+        self.assertFalse(_point_in_polygon(100.0 + 0.725 - 0.5, -100.0,
+                                          [(100.0 + 0.725 + px, -100.0 + py)
+                                           for px, py in pad["polygon"]]))
+        # ...while both arms of the shape still reach the full height.
+        self.assertAlmostEqual(pad["h"], 1.5, places=6)
+        self.assertAlmostEqual(pad["w"], 1.15, places=6)
+
+    def test_the_anchor_is_still_the_anchor(self):
+        """The outline is relative to the pad's `at`; that is what pcbnew reports."""
+        board = kicad_pcb.parse_board_text(self.TEXT, path="<memory>")
+        pad = board.footprints[0]["pads"][0]
+        self.assertAlmostEqual(pad["x"], 100.0, places=6)
+        self.assertAlmostEqual(pad["y"], -100.0, places=6)   # canonical y is mirrored
+        from pcb_agent_mcp.adapters.canonical import pad_points
+        xs = [p[0] for p in pad_points(pad)]
+        self.assertAlmostEqual(min(xs), 97.0, places=6)
+        self.assertAlmostEqual(max(xs), 103.0, places=6)
+
 if __name__ == "__main__":
     unittest.main()

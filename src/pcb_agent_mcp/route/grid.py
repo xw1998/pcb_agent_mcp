@@ -137,6 +137,11 @@ class Grid(object):
                 "electrical clearance here, so the raster keeps that distance "
                 "everywhere (the exact check uses each pair's own number)"
                 % self.spacing)
+        # Negotiated congestion (router._negotiate) puts a per-cell penalty here.
+        # None means "no penalty anywhere", which is the greedy router's world;
+        # A* allocates the flat list on first use so an unpriced run pays nothing
+        # for a feature it does not use.
+        self._pen = None
         self.keepouts = []           # exact rings, for the check that is the judge
 
         self._obs = {}               # layer -> (items, bboxes, buckets)
@@ -512,6 +517,39 @@ class Grid(object):
                          "ref": "router"})
 
     # -------------------------------------------------------------- queries
+    def cells_near(self, x, y, radius):
+        """Every flat cell index within `radius` mm of a point.
+
+        Used by the congestion measure, which asks "which cells can this copper
+        be seen from" - the barrier it casts is wider than the copper itself, so
+        two nets can be in conflict while never sharing a cell. Returns indices
+        in `j * nx + i` order, clipped to the raster.
+        """
+        if radius <= 0:
+            radius = self.pitch
+        nx, ny = self.nx, self.ny
+        i0 = int(math.floor((x - self.x0 - radius) / self.pitch - 1e-9))
+        i1 = int(math.ceil((x - self.x0 + radius) / self.pitch + 1e-9))
+        j0 = int(math.floor((y - self.y0 - radius) / self.pitch - 1e-9))
+        j1 = int(math.ceil((y - self.y0 + radius) / self.pitch + 1e-9))
+        i0, j0 = max(0, i0), max(0, j0)
+        i1, j1 = min(nx - 1, i1), min(ny - 1, j1)
+        out = []
+        for j in range(j0, j1 + 1):
+            base = j * nx
+            for i in range(i0, i1 + 1):
+                if math.hypot(self.x0 + i * self.pitch - x,
+                              self.y0 + j * self.pitch - y) <= radius + 1e-9:
+                    out.append(base + i)
+        return out
+
+    def pen_at(self, i, j):
+        """The congestion penalty on one cell (0.0 when no penalty map exists)."""
+        pen = self._pen
+        if pen is None:
+            return 0.0
+        return pen[j * self.nx + i]
+
     def index(self, i, j):
         """Flat index, or None when the node is off the raster.
 
@@ -820,6 +858,83 @@ class Grid(object):
     def via_ok(self, x, y, net, span=None):
         return self.via_blockers(x, y, net, span) == []
 
+    def copper_items_near(self, x, y, net, radius):
+        """Items of `net` whose copper is within `radius` of (x, y).
+
+        `[(item, layer), ...]`, plus one entry per pour of that net covering the
+        point (`item` is the zone, `layer` the layer it covers). Needed by the
+        ground-stitching pass, which has to land a via ON copper, and "on copper"
+        is a question about items, not about a raster cell.
+        """
+        out = []
+        if not net or radius < 0:
+            return out
+        for layer in self.layers:
+            got = self._obs.get(layer)
+            if got:
+                objs, boxes, _buckets = got
+                for k, it in enumerate(objs):
+                    if it.get("net") != net:
+                        continue
+                    b = boxes[k]
+                    if b[0] - radius > x or b[2] + radius < x:
+                        continue
+                    if b[1] - radius > y or b[3] + radius < y:
+                        continue
+                    if self._dist_point(it, x, y) <= radius:
+                        out.append((it, layer))
+            for z in (self.board.zones or []):
+                if z.get("is_keepout") or z.get("net") != net:
+                    continue
+                if layer not in (z.get("layers") or []):
+                    continue
+                ring = z.get("outline") or []
+                if len(ring) >= 3 and G.point_in_polygon((x, y), ring):
+                    out.append((z, layer))
+        return out
+
+    def copper_layers_near(self, x, y, net, radius):
+        """Layers on which `net` has copper within `radius` of (x, y).
+
+        "Copper" is a pad, a track, a via of that net, **or a pour of that net
+        covering the point**. The pour is the case that matters: on a board whose
+        ground IS a pour there is no ground track anywhere, and answering "no
+        ground here" would refuse to stitch the very boards that are stitched by
+        construction.
+        """
+        if not net or radius <= 0:
+            return []
+        out = []
+        for layer in self.layers:
+            hit = False
+            got = self._obs.get(layer)
+            if got:
+                objs, boxes, _buckets = got
+                for k, it in enumerate(objs):
+                    if it.get("net") != net:
+                        continue
+                    b = boxes[k]
+                    if b[0] - radius > x or b[2] + radius < x:
+                        continue
+                    if b[1] - radius > y or b[3] + radius < y:
+                        continue
+                    if self._dist_point(it, x, y) <= radius:
+                        hit = True
+                        break
+            if not hit:
+                for z in (self.board.zones or []):
+                    if z.get("is_keepout") or z.get("net") != net:
+                        continue
+                    if layer not in (z.get("layers") or []):
+                        continue
+                    ring = z.get("outline") or []
+                    if len(ring) >= 3 and G.point_in_polygon((x, y), ring):
+                        hit = True
+                        break
+            if hit:
+                out.append(layer)
+        return out
+
 
 # --------------------------------------------------------------------- search
 DIRS = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
@@ -828,7 +943,7 @@ DIRS_K = tuple((k, d[0], d[1], d[2]) for k, d in enumerate(DIRS))
 
 
 def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
-          allow_vias=True, via_check=None, diag=None):
+          allow_vias=True, via_check=None, diag=None, soft=0.0):
     # NOTE ON THE INLINING BELOW. The inner loop reads the rasters directly
     # (`grid._map[layer]` is a flat list indexed by `j * nx + i`) instead of
     # calling `grid.free()`, and goal lookup goes through an integer key instead
@@ -846,6 +961,14 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
     out as staircases. Vias are searched as a move between layers at the same
     node, and are only taken on a node that passes `via_check`.
 
+    `soft` turns a refusal into a price: when it is > 0, another net's copper
+    (and a keepout or the area off the board) may still be entered, at `soft`
+    extra per cell. That is not a routing mode - the path it returns is allowed
+    to cross other nets and is never emitted - it is how the congestion loop asks
+    "if everyone else were merely expensive, where would this net go?". The
+    answer is the corridor the net WANTS, and the cells it crosses name the nets
+    standing in it.
+
     Returns the path as `[(i, j, layer), ...]` or `None`.
     """
     goals = set(goals)
@@ -853,6 +976,12 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
         return None
     nx, ny = grid.nx, grid.ny
     maps, mapsv, sets = grid._map, grid._mapv, grid._sets
+    # Negotiated congestion: an all-zero list when nobody set a price, so the
+    # inner loop always pays one index and one add and never a branch. The list
+    # is owned by the grid so every net in a round sees the same prices.
+    pen = grid._pen
+    if pen is None:
+        pen = grid._pen = [0.0] * (nx * ny)
     layers = grid.layers
     nlayer = len(layers)
     li_of = dict((l, k) for k, l in enumerate(layers))
@@ -911,31 +1040,42 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
             if ni < 0 or nj < 0 or ni >= nx or nj >= ny:
                 continue
             val = mp[nj * nx + ni]
+            toll = 0.0
             if val:
                 if val < 0:
-                    continue
-                s = sets[val - 1]
-                if not (len(s) == 1 and s[0] == net):
-                    continue
+                    if not soft:
+                        continue
+                    toll = soft
+                else:
+                    s = sets[val - 1]
+                    if not (len(s) == 1 and s[0] == net):
+                        if not soft:
+                            continue
+                        toll = soft
             if di and dj:
                 # No corner cutting: both orthogonal neighbours must be free, or
                 # the diagonal shaves a corner off another net's copper.
                 val = mp[base + ni]
                 if val:
                     if val < 0:
-                        continue
-                    s = sets[val - 1]
-                    if not (len(s) == 1 and s[0] == net):
-                        continue
+                        if not soft:
+                            continue
+                    else:
+                        s = sets[val - 1]
+                        if not (len(s) == 1 and s[0] == net) and not soft:
+                            continue
                 val = mp[nj * nx + i]
                 if val:
                     if val < 0:
-                        continue
-                    s = sets[val - 1]
-                    if not (len(s) == 1 and s[0] == net):
-                        continue
-            nc = g + step + (0.0 if d == k else TURN_COST)
-            ns = ((nj * nx + ni) * nlayer + (rest % nlayer)) * 9 + k
+                        if not soft:
+                            continue
+                    else:
+                        s = sets[val - 1]
+                        if not (len(s) == 1 and s[0] == net) and not soft:
+                            continue
+            cell = nj * nx + ni
+            nc = g + step + (0.0 if d == k else TURN_COST) + pen[cell] + toll
+            ns = (cell * nlayer + (rest % nlayer)) * 9 + k
             if nc < best.get(ns, 1e18) - 1e-9:
                 best[ns] = nc
                 parent[ns] = st
@@ -953,13 +1093,19 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
             if l2 == l:
                 continue
             val = mapsv[l2][node]
+            vtoll = 0.0
             if val:
                 if val < 0:
-                    continue
-                s = sets[val - 1]
-                if not (len(s) == 1 and s[0] == net):
-                    continue
-            nc = g + VIA_COST + (0.0 if d == 8 else TURN_COST)
+                    if not soft:
+                        continue
+                    vtoll = soft
+                else:
+                    s = sets[val - 1]
+                    if not (len(s) == 1 and s[0] == net):
+                        if not soft:
+                            continue
+                        vtoll = soft
+            nc = g + VIA_COST + (0.0 if d == 8 else TURN_COST) + pen[node] + vtoll
             ns = (node * nlayer + li_of[l2]) * 9 + 8
             if nc < best.get(ns, 1e18) - 1e-9:
                 best[ns] = nc

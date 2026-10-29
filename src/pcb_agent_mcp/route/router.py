@@ -30,6 +30,21 @@ from . import rules as R
 from . import tune
 from .grid import Grid, astar, mst_edges, simplify
 
+# Negotiated congestion (see `_negotiate`). `SOFT_BLOCK` is what another net's
+# cell costs in a "where would I go" search. It is deliberately SMALL (five
+# cells): the question is "which corridor does this net want", and the honest
+# answer is the near-straight one. A large toll makes the search hunt for a far
+# detour that costs less than the crossing - that is the answer to a different
+# question, and on a 240k-cell board it also spends the whole budget doing it
+# (measured: 60.0 made one wish search on the 60x40 mm probe board run past a
+# minute without finishing). Five cells still biases the path away from
+# gratuitous crossings, which is enough to name who is in the way.
+SOFT_BLOCK = 0.5
+# The wish search is a diagnostic, not a route: it is allowed to give up early.
+# A near-straight corridor needs a few thousand expansions, so this is a
+# generous ceiling rather than a working limit.
+WISH_BUDGET = 40000
+
 # A net whose name looks like this has a plane layer on a typical board. It is
 # only used to *guess which layers are planes*; the pour in the file has to agree,
 # and if it does not, the guess is dropped (see `_split_layers`).
@@ -342,10 +357,13 @@ class _Emitter(object):
 def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          track_mm=None, via_diameter_mm=None, via_drill_mm=None,
          edge_clearance_mm=None, creepage_mm=None, creepage_pairs=None,
-         diff_pairs=None, length_groups=None,
+         diff_pairs=None, impedance_targets=None, working_voltage_v=None,
+         pollution_degree=2, material_group="IIIa", insulation="basic",
+         coating=False, altitude_m=0, length_groups=None,
          rip_up_rounds=1, second_sweep=True, incremental=False,
+         congestion_rounds=2, congestion_max_rips=12, congestion_weight=1.0,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
-         progress=None):
+         return_path=True, return_path_net=None, progress=None):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -362,7 +380,12 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                        via_diameter_mm=via_diameter_mm, via_drill_mm=via_drill_mm,
                        edge_clearance_mm=edge_clearance_mm,
                        creepage_mm=creepage_mm, creepage_pairs=creepage_pairs,
-                       diff_pairs=diff_pairs)
+                       diff_pairs=diff_pairs,
+                       impedance_targets=impedance_targets,
+                       working_voltage_v=working_voltage_v,
+                       pollution_degree=pollution_degree,
+                       material_group=material_group, insulation=insulation,
+                       coating=coating, altitude_m=altitude_m)
     copper = _copper_layers(board)
     routing, planes = _split_layers(board, copper, explicit=layers)
 
@@ -713,13 +736,199 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                                   by_net.get(n) or []))
             pending = still
 
+    def _routed_now():
+        return sum(1 for r in results.values()
+                   if isinstance(r, dict) and r.get("status") == "routed")
+
+    def _wish(net, plist):
+        """Where this net would go if everyone else's copper were merely expensive.
+
+        This is the question a negotiated router has to answer, and it cannot be
+        answered from occupancy: this raster makes a cell exclusive, so two nets
+        never *share* one and "overuse" never appears. Contention here is a net
+        that cannot move at all because somebody else's copper is in the only
+        corridor it has. So the search is re-run with `soft` - other nets'
+        copper (and keepouts) may be entered at a large price - and the resulting
+        path is the corridor the net WANTS. The nets whose copper those cells
+        belong to are, by name, the ones in the way.
+
+        The path is never emitted: it crosses other nets by construction.
+        """
+        # Pad centres, not `_free_terminal` cells: a pad whose own cell is
+        # covered by somebody else's clearance has no free terminal - that is
+        # exactly the situation this search exists to describe, so asking for a
+        # free node first would return "nothing to want" for the one net that
+        # most needs an answer.
+        nodes = []
+        for t in plist:
+            i, j = grid.node(t["at"][0], t["at"][1])
+            if 0 <= i < grid.nx and 0 <= j < grid.ny:
+                nodes.append((t, (i, j, t["layers"][0])))
+        if len(nodes) < 2:
+            return set(), {}
+        pts = [(it[0]["at"][0], it[0]["at"][1]) for it in nodes]
+        tree = {nodes[0][1]}
+        want, who = set(), {}
+        for _a, b in mst_edges(pts):
+            i, j, layer = nodes[b][1]
+            path = astar(grid, net, tree, {(i, j)},
+                         {(i, j): set(nodes[b][0]["layers"]) | {layer}},
+                         budget=WISH_BUDGET,
+                         allow_vias=allow_vias,
+                         via_check=_via_gate(grid, net) if allow_vias else None,
+                         soft=SOFT_BLOCK)
+            if path is None:
+                continue
+            for p in path:
+                cell = p[1] * grid.nx + p[0]
+                want.add(cell)
+                val = grid._map[p[2]][cell]
+                if val > 0:
+                    for other in grid._sets[val - 1]:
+                        if other != net:
+                            who[other] = who.get(other, 0) + 1
+            tree |= set(path)
+        return want, who
+    def _price(hist, weight):
+        """Install `weight * history` as this round's per-cell price."""
+        pen = grid._pen
+        if pen is None or len(pen) != grid.nx * grid.ny:
+            pen = grid._pen = [0.0] * (grid.nx * grid.ny)
+        else:
+            for k in range(len(pen)):
+                pen[k] = 0.0
+        for cell, v in hist.items():
+            if 0 <= cell < len(pen):
+                pen[cell] = weight * v
+
+    def _recompute_lengths():
+        em.length = {}
+        for op in em.ops:
+            if op["op"] == "add_track":
+                em.length[op["net"]] = em.length.get(op["net"], 0.0) + math.hypot(
+                    op["x2"] - op["x1"], op["y2"] - op["y1"])
+
+    def _reconcile():
+        """Make `results` describe the copper that is standing, and nothing else.
+
+        `_attempt` commits exactly when it succeeded, so "has copper" and "was
+        routed" are the same claim. After a restore the two have to be put back in
+        step by hand, or the answer would describe a round that no longer exists.
+        """
+        have = set(op["net"] for op in em.ops if op.get("net"))
+        for net, res in results.items():
+            if not isinstance(res, dict):
+                continue
+            if net in have:
+                res["status"] = "routed"
+                res["length_mm"] = round(em.length.get(net, 0.0), 3)
+                res.pop("reason", None)
+            else:
+                res["status"] = "failed"
+                res["length_mm"] = 0.0
+                res.setdefault("reason", {"code": "not_attempted"})
+
+    def _negotiate(rounds, weight, max_rips):
+        """Rip up and re-route with a price on the corridors the losers wanted.
+
+        Plain greedy routing has one shot: whoever goes first keeps the corridor
+        and every later net has to live with it. The second sweep only changes a
+        tree root, and one rip-up round only moves the copper that physically
+        overlaps a loser's pads - neither can move a net that is merely *in the
+        way*. This loop can, because it asks each loser where it would go if the
+        board were empty (`_wish`), prices those cells (history cost, accumulated
+        across rounds), and then rips up the nets named by the cells it had to
+        cross, so they can be re-routed somewhere else with those prices in the
+        search. A net that has an alternative detour takes it; a net that does
+        not keeps its copper and the price rises again next round.
+
+        The best round is kept, not the last: prices make late rounds willing to
+        take long detours, and a round that routed fewer nets must not be the
+        answer just because it ran later.
+        """
+        nonlocal grid, pending
+        hist = {}
+        log = []
+        best = {"routed": _routed_now(), "round": 0,
+                "ops": [dict(op) for op in em.ops], "length": dict(em.length)}
+        for rnd in range(1, rounds + 1):
+            if not pending:
+                break
+            demand, who = {}, {}
+            for _span, net, plist in pending:
+                if net in plane_nets:
+                    continue
+                cells, named = _wish(net, plist)
+                for cell in cells:
+                    demand[cell] = demand.get(cell, 0) + 1
+                for other, n in named.items():
+                    if other in by_net and other not in plane_nets:
+                        who[other] = who.get(other, 0) + n
+            for cell, n in demand.items():
+                hist[cell] = hist.get(cell, 0.0) + float(n)
+            losers = [net for _s, net, _pl in pending]
+            victims = [n for n in sorted(who, key=lambda n: -who[n])
+                       if n not in losers][:max_rips]
+            todo = losers + victims
+            log.append({"round": rnd, "demand_cells": len(demand),
+                        "in_the_way": len(who), "ripped": len(todo),
+                        "losers": len(losers), "before": _routed_now()})
+            em.forget(todo)
+            grid = em.grid
+            _price(hist, weight)         # forget() rebuilt the map, not the prices
+            ripped = set(todo)
+            em.bad[:] = [b for b in em.bad if b.get("net") not in ripped]
+            for n in todo:
+                results[n]["status"] = "pending"
+                results[n].pop("reason", None)
+                results[n]["length_mm"] = 0.0
+                results[n]["vias"] = 0
+                results[n]["segments"] = 0
+                results[n]["rips"] = results[n].get("rips", 0) + 1
+            for n in sorted(todo, key=lambda n: -(results[n].get("mst_mm") or 0.0)):
+                pl = by_net.get(n) or []
+                if pl:
+                    _attempt(n, pl)
+            pending = [(span, net, plist) for span, net, plist in work
+                       if results[net].get("status") != "routed"]
+            got = _routed_now()
+            log[-1]["after"] = got
+            if got > best["routed"]:
+                best = {"routed": got, "round": rnd,
+                        "ops": [dict(op) for op in em.ops],
+                        "length": dict(em.length)}
+            if not pending:
+                break
+        reverted = False
+        if best["round"] and _routed_now() < best["routed"]:
+            em.ops = [dict(op) for op in best["ops"]]
+            em.rebuild()
+            grid = em.grid
+            em.length = dict(best["length"])
+            _reconcile()
+            reverted = True
+        return {"rounds_asked": rounds, "rounds_run": len(log),
+                "weight": weight, "max_rips": max_rips,
+                "soft_block": SOFT_BLOCK,
+                "best_round": best["round"], "best_routed": best["routed"],
+                "reverted_to_best": reverted,
+                "history_cells": len(hist), "log": log}
+
+    congestion = None
+    if pending and congestion_rounds:
+        congestion = _negotiate(int(congestion_rounds), float(congestion_weight),
+                                int(congestion_max_rips))
+        stats["congestion"] = congestion
+
     # Length matching and diff-pair bookkeeping run on the FINISHED copper: a
     # meander changes a length, so it cannot happen before the path exists, and a
     # pair's achieved gap is a property of both finished paths. Every meander
     # segment goes back through the exact check, so this pass cannot introduce a
     # violation the router would have refused.
     tune_report = tune.finish(em, bundle, results, diff_pairs=bundle["diff_pairs"],
-                              length_groups=length_groups)
+                              length_groups=length_groups, terms_by_net=by_net,
+                              return_path=return_path,
+                              return_path_net=return_path_net)
     stats["tuning"] = tune_report
 
     out_nets = []
@@ -753,11 +962,16 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                   "edge_clearance_mm": bundle["edge_clearance_mm"],
                   "creepage_mm": bundle["creepage_mm"],
                   "creepage_pairs": bundle["creepage_pairs"],
+                  "creepage_lookup": bundle.get("creepage_lookup"),
                   "diff_pairs": bundle["diff_pairs"],
+                  "impedance_targets": bundle["impedance_targets"],
                   "sources": bundle["sources"],
                   "assumed": bundle["assumed"]},
         "diff_pairs": tune_report["diff_pairs"],
         "length_groups": tune_report["length_groups"],
+        "return_path": tune_report.get("return_path"),
+        "congestion": congestion,
+        "pour": _pour_report(board, em.ops, copper),
         "nets": out_nets,
         "failed": [{"net": r["net"], "reason": r.get("reason")} for r in failed],
         "ops": em.ops,
@@ -765,6 +979,65 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         "stats": stats,
     }
 
+
+def _pour_report(board, ops, copper_layers):
+    """Which pours the new copper lands in, and what that costs.
+
+    A track that crosses a pour of another net is not a short: the pour is
+    re-filled around it. What it IS is a stale snapshot - the copper in the file
+    no longer describes the same board - so the honest output is "these zones must
+    be refilled", with the number of segments inside each, instead of a silence
+    that lets a filled board look finished. Vias are through vias here (the op
+    carries no span), so they are copper on every layer in the stack.
+    """
+    pours = []
+    for z in board.zones or []:
+        if z.get("is_keepout") or not z.get("net"):
+            continue
+        ring = z.get("outline") or []
+        if len(ring) < 3:
+            continue
+        box = G.bbox_of(ring)
+        for layer in (z.get("layers") or []):
+            pours.append((layer, z.get("net"), box, ring))
+    if not pours:
+        return {"needs_refill": False, "zones": [], "why": "no pour on this board"}
+    hit = {}
+    for op in ops:
+        if op.get("op") == "add_track":
+            points = [(op["x1"], op["y1"]),
+                      ((op["x1"] + op["x2"]) / 2.0, (op["y1"] + op["y2"]) / 2.0),
+                      (op["x2"], op["y2"])]
+            layers = [op["layer"]]
+        elif op.get("op") == "add_via":
+            points = [(op["x"], op["y"])]
+            layers = list(copper_layers)
+        else:
+            continue
+        for layer, zone_net, box, ring in pours:
+            if layer not in layers:
+                continue
+            for px, py in points:
+                if not (box[0] - 1e-6 <= px <= box[2] + 1e-6
+                        and box[1] - 1e-6 <= py <= box[3] + 1e-6):
+                    continue
+                if not G.point_in_polygon((px, py), ring):
+                    continue
+                key = (layer, zone_net)
+                rec = hit.setdefault(key, {"layer": layer, "zone_net": zone_net,
+                                           "segments_inside": 0,
+                                           "same_net_as_the_new_copper": False})
+                rec["segments_inside"] += 1
+                if zone_net == op.get("net"):
+                    rec["same_net_as_the_new_copper"] = True
+                break
+    zones = sorted(hit.values(), key=lambda r: -r["segments_inside"])
+    return {"needs_refill": bool(zones),
+            "zones": zones,
+            "why": ("new copper sits inside %d pour(s): the filled polygons in the "
+                    "file describe the board before this routing and must be "
+                    "refilled (board_fill_zones) before the board reads as finished"
+                    % (len(zones),)) if zones else "no new copper inside a pour"}
 
 def _between(layers, a, b, cand):
     """Is `cand` between `a` and `b` in stackup order (for a via's span)?"""

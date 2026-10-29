@@ -296,6 +296,147 @@ class TheToolsSayWhatTheyCanDo(unittest.TestCase):
         out = T.call_tool("lceda_pro_run", {"session": "", "code": "return 1;"})
         self.assertEqual(out.get("reason_code"), "ARG_REQUIRED")
 
+class FakeEditor(object):
+    """Just enough of `lceda_live.Client` for the write path: invoke() + close()."""
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.calls = []
+        self.closed = False
+
+    def invoke(self, session, code, fn="run", args=None, timeout_ms=None):
+        self.calls.append({"session": session, "code": code,
+                           "timeout_ms": timeout_ms})
+        if not self.values:
+            raise AssertionError("unexpected invoke: %s" % (code,))
+        return {"value": self.values.pop(0), "logs": [], "duration_ms": 2}
+
+    def close(self):
+        self.closed = True
+
+class TheWriteIsConfirmedByAProbeNotByGoodIntentions(unittest.TestCase):
+    """`lceda_write.run` is the discipline: probe, write, the same probe again.
+
+    Every write claim here is about the snippet's OBSERVED EFFECT. No write has
+    been run against the real application in this build, and the report says so on
+    every answer rather than only where it is inconvenient.
+    """
+
+    def test_a_probe_that_changed_is_the_only_kind_of_success(self):
+        from pcb_agent_mcp import lceda_write as W
+        client = FakeEditor([0.0, "moved", 1.0])
+        res = W.run(client, "s1", "U1.y += 1;", probe="U1.y", label="U1 down 1mm")
+        self.assertEqual(res["status"], "ok")
+        rep = res["report"]
+        self.assertTrue(rep["changed"])
+        self.assertEqual((rep["before"], rep["after"]), (0.0, 1.0))
+        self.assertEqual(rep["label"], "U1 down 1mm")
+        self.assertFalse(rep["verified_against_app"])
+        # probe, write, probe - in that order, so the "after" reading cannot be
+        # taken before the snippet ran.
+        self.assertEqual([c["code"] for c in client.calls],
+                         ["U1.y", "U1.y += 1;", "U1.y"])
+
+    def test_a_probe_that_did_not_change_is_a_refusal(self):
+        from pcb_agent_mcp import lceda_write as W
+        client = FakeEditor([1.0, "no-op", 1.0])
+        res = W.run(client, "s1", "U1.y += 1;", probe="U1.y")
+        self.assertEqual(res["status"], "error")
+        self.assertEqual(res["reason_code"], "WRITE_HAD_NO_EFFECT")
+        self.assertEqual(res["report"]["before"], res["report"]["after"])
+        self.assertEqual(res["report"]["ran"]["value"], "no-op")
+
+    def test_an_integer_that_comes_back_as_a_float_is_not_a_change(self):
+        from pcb_agent_mcp import lceda_write as W
+        client = FakeEditor([1, "no-op", 1.0])
+        res = W.run(client, "s1", "x()", probe="count")
+        self.assertEqual(res["reason_code"], "WRITE_HAD_NO_EFFECT")
+
+    def test_change_without_a_probe_is_refused_before_anything_is_sent(self):
+        from pcb_agent_mcp import lceda_write as W
+        client = FakeEditor([])
+        with self.assertRaises(W.WriteError) as ctx:
+            W.run(client, "s1", "U1.y += 1;")
+        self.assertEqual(ctx.exception.reason_code, "ARG_REQUIRED")
+        self.assertEqual(client.calls, [])
+
+    def test_save_is_confirmed_only_by_no_error_and_says_so(self):
+        from pcb_agent_mcp import lceda_write as W
+        client = FakeEditor(["saved"])
+        res = W.run(client, "s1", "await api.save();", expect="no_error",
+                    label="save")
+        self.assertEqual(res["status"], "ok")
+        rep = res["report"]
+        self.assertIsNone(rep["changed"])
+        self.assertIn("nothing was read back", rep["verified_by"])
+        self.assertIn("that the file on disk changed", rep["not_verified"])
+
+    def test_a_snippet_that_raises_is_the_apps_error_not_a_pass(self):
+        from pcb_agent_mcp import lceda_write as W
+
+        class Boom(FakeEditor):
+            def invoke(self, session, code, **kw):
+                if code == "boom":
+                    raise L.LiveError("EXEC_ERROR", "the snippet threw")
+                return FakeEditor.invoke(self, session, code, **kw)
+
+        client = Boom([0.0, 1.0])
+        with self.assertRaises(L.LiveError):
+            W.run(client, "s1", "boom", probe="U1.y")
+
+class TheWriteToolCarriesThatDiscipline(unittest.TestCase):
+    """The tool layer must not soften it: no probe, no claim."""
+
+    def setUp(self):
+        from pcb_agent_mcp import tools as T
+        self.T = T
+        self._orig = T._live_client
+
+    def tearDown(self):
+        self.T._live_client = self._orig
+
+    def _stub(self, values):
+        client = FakeEditor(values)
+        self.T._live_client = lambda args: client
+        return client
+
+    def test_a_read_back_change_is_reported_as_observed_not_as_verified(self):
+        client = self._stub([0.0, "moved", 1.0])
+        out = self.T.call_tool("lceda_pcb_write", {
+            "session": "s", "code": "move()", "probe": "U1.y", "op": "move",
+            "label": "U1 down 1mm"})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertTrue(out["value"]["changed"])
+        self.assertFalse(out["assumptions"]["verified_against_app"])
+        self.assertTrue(client.closed, "the pipe must be closed again")
+
+    def test_a_no_op_write_is_never_reported_as_success(self):
+        self._stub([1.0, "no-op", 1.0])
+        out = self.T.call_tool("lceda_pcb_write", {
+            "session": "s", "code": "move()", "probe": "U1.y", "op": "move"})
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "WRITE_HAD_NO_EFFECT")
+        self.assertEqual(out["report"]["before"], out["report"]["after"])
+
+    def test_a_write_without_a_probe_is_refused_and_nothing_is_sent(self):
+        client = self._stub([])
+        out = self.T.call_tool("lceda_pcb_write", {
+            "session": "s", "code": "move()", "op": "move"})
+        self.assertEqual(out["reason_code"], "ARG_REQUIRED")
+        self.assertEqual(client.calls, [])
+
+    def test_an_unknown_op_names_the_ops_it_has(self):
+        self._stub([])
+        out = self.T.call_tool("lceda_pcb_write", {
+            "session": "s", "code": "x()", "op": "teleport"})
+        self.assertEqual(out["reason_code"], "ARG_INVALID")
+        self.assertIn("move", out["hint"])
+
+    def test_the_tool_says_it_has_never_written_to_the_application(self):
+        spec = self.T.TOOLS["lceda_pcb_write"]
+        self.assertEqual(sorted(spec["inputSchema"]["required"]), ["code", "session"])
+        self.assertIn("verified_against_app=false", spec["description"])
+
 LIVE_ENDPOINTS = L.available_endpoints()
 
 

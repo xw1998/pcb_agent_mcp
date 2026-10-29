@@ -334,12 +334,39 @@ def _pad_from_node(pad_node):
     # is exactly the difference between "violation" and "clean".
     rratio = num(child(pad_node, "roundrect_rratio"), 1, None)
     if shape in ("custom",):
+        # A custom pad is the UNION of its primitives, and taking only the first
+        # `gr_poly` measured a pad smaller than the copper on the board - an
+        # optimistic error, the one direction a clearance check must not make.
+        # Every primitive this file format can express is collected into ONE
+        # polygon. A single primitive is kept EXACTLY as drawn, has to be: a
+        # primitive may be concave (pic_programmer JP1.2 is a notched rectangle),
+        # and hulling it filled the notch with copper that is not on the board, so
+        # pcbnew's HitTest and this outline disagreed inside a pad.
+        # Several primitives are hulled, because their union need not be convex
+        # and the hull is never smaller than that union: too strict, never too
+        # loose. `outline` says which of the two happened. Kinds that cannot be
+        # represented at all are listed in `ignored_primitives` instead of
+        # vanishing.
         pts = None
+        polys = []
+        ignored = []
         opts = child(pad_node, "primitives") or child(pad_node, "options")
         for prim in (opts or []):
-            if isinstance(prim, list) and prim and prim[0] in ("gr_poly",):
-                pn = child(prim, "pts")
-                pts = [xy(p) for p in children(pn, "xy")] if pn else None
+            if not (isinstance(prim, list) and prim):
+                continue
+            if prim[0] in ("gr_poly", "gr_rect", "gr_circle", "gr_line", "gr_arc"):
+                poly = _graphic_poly(prim)
+                if poly:
+                    polys.append(poly)
+                else:
+                    ignored.append(prim[0])
+            elif prim[0] in ("gr_curve", "gr_bbox", "gr_vector",
+                             "gr_text", "gr_arc_ex", "gr_bezier"):
+                ignored.append(prim[0])
+        if len(polys) == 1:
+            pts = polys[0]
+        elif polys:
+            pts = _convex_hull([p for poly in polys for p in poly])
         if pts:
             # `x`/`y` stay the pad ANCHOR, the same point pcbnew reports; the outline
             # lives in `polygon` relative to that anchor. Reporting the polygon
@@ -351,7 +378,11 @@ def _pad_from_node(pad_node):
                    "h": (max(p[1] for p in pts) - min(p[1] for p in pts)),
                    "shape": "custom", "rotation": rot, "layers": layers,
                    "hole_mm": hole, "smd": kind == "smd", "type": kind,
-                   "polygon": list(pts)}
+                   "polygon": list(pts),
+                   "outline": ("convex_hull_of_primitives" if len(polys) > 1
+                               else "primitive"),
+                   "primitives": len(polys),
+                   "ignored_primitives": ignored}
             if off:
                 out["offset"] = off
             return out
@@ -371,6 +402,25 @@ def _pad_from_node(pad_node):
         out["offset"] = off
     return out
 
+
+def _convex_hull(points):
+    """Monotone-chain hull. `None` when there is nothing to hull."""
+    pts = sorted(set((round(x, 6), round(y, 6)) for x, y in points))
+    if len(pts) < 3:
+        return pts or None
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
 
 def _is_copper(name):
     n = str(name or "")

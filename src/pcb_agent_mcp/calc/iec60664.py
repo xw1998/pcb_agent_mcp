@@ -92,11 +92,21 @@ def reset_cache():
 
 
 def _pd(value):
+    # int(2.7) is 2, which would answer a question nobody asked: a fractional
+    # pollution degree is a typo (or a mis-scaled input), not a degree.
     try:
-        pd = int(value)
+        pd = float(value)
     except (TypeError, ValueError):
         return None, err("pollution_degree must be an integer 1..4", "ARG_INVALID",
                          extra={"got": value})
+    if pd != int(pd):
+        return None, err("pollution_degree must be a whole number 1..4",
+                         "ARG_INVALID",
+                         hint="the table is tabulated per degree; 2.5 is not a "
+                              "degree, so rounding it to 2 would answer a "
+                              "different question",
+                         extra={"got": value})
+    pd = int(pd)
     if pd < 1 or pd > 4:
         return None, err("pollution_degree must be 1..4", "ARG_INVALID",
                          extra={"got": value})

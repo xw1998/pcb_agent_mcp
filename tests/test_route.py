@@ -18,6 +18,7 @@ Every board here is synthetic and a few millimetres wide, because the point is a
 lane and a clearance, and a real library part brings 64 pads of noise to both.
 The real-board numbers live in docs/27-自动布线器.md, not here.
 """
+import json
 import math
 import os
 import shutil
@@ -28,10 +29,13 @@ from types import SimpleNamespace
 from pcb_agent_mcp import edit as E
 from pcb_agent_mcp import geometry as GEO
 from pcb_agent_mcp import tools
+from pcb_agent_mcp.calc import impedance as Z
 from pcb_agent_mcp.edit import plan as P
 from pcb_agent_mcp.route import grid as GRID
+from pcb_agent_mcp.route import intent as INTENT
 from pcb_agent_mcp.route import rules as R
 from pcb_agent_mcp.route import router
+from pcb_agent_mcp.route import tune as TUNE
 
 SPEC = {"width_mm": 60, "height_mm": 40, "copper_layers": 2, "engine": False,
         "title": "route"}
@@ -468,6 +472,193 @@ class TestCreepageIsNeverInvented(RouteBase):
             self.assertEqual(out["status"], "error", bad)
             self.assertEqual(out["reason_code"], "RULES_INVALID", bad)
 
+class TestAnImpedanceTargetBecomesAWidth(RouteBase):
+    """An impedance target is a design intent, and the search only knows widths.
+
+    The rule this class defends: "50 ohm" is honoured by reverse-solving a width
+    and using it as the net's track width, and when the stackup cannot pin the
+    dielectric down the answer is an error - an impedance target that quietly
+    lands on the net-class width would be a number nobody can build to.
+    """
+
+    def test_the_target_is_solved_and_the_width_is_what_the_net_gets(self):
+        bundle = R.resolve(self.load(),
+                           impedance_targets=[{"net": "SIG", "ohm": 50,
+                                               "dielectric_mm": 0.2}])
+        target = bundle["impedance_targets"][0]
+        self.assertAlmostEqual(target["dielectric_mm"], 0.2, places=9)
+        self.assertAlmostEqual(target["er"], 4.3, places=9)
+        self.assertAlmostEqual(R.for_net(bundle, "SIG")["track_mm"],
+                               target["width_mm"], places=9)
+        self.assertNotAlmostEqual(R.for_net(bundle, "SIG")["track_mm"],
+                                  bundle["track_mm"], places=3)
+        # the width really is 50 ohm going forward, not just a bisection artifact
+        back = Z.trace_impedance(target["width_mm"], 0.2)
+        self.assertEqual(back["status"], "ok", back)
+        self.assertAlmostEqual(back["value"], 50.0, delta=0.5)
+        self.assertIn("impedance", bundle["sources"])
+        self.assertIn("50 ohm", bundle["sources"]["impedance"][0])
+        self.assertIn("impedance", R.for_net(bundle, "SIG")["source"])
+        # er / copper were defaulted, and the answer says it defaulted them
+        self.assertEqual(len(target["derived"]), 2, target["derived"])
+
+    def test_the_stackup_is_used_when_it_pins_the_dielectric_down(self):
+        board = self.load()
+        bundle = R.resolve(board, impedance_targets=[{"net": "SIG", "ohm": 50}])
+        target = bundle["impedance_targets"][0]
+        self.assertAlmostEqual(target["dielectric_mm"], 1.51, places=9)
+        self.assertAlmostEqual(target["er"], 4.3, places=9)
+        self.assertAlmostEqual(target["copper_um"], 35.0, places=9)
+        self.assertTrue(any("stackup layer" in d for d in target["derived"]),
+                        target["derived"])
+
+    def test_a_stackup_that_cannot_pin_it_down_is_an_error_not_a_guess(self):
+        board = self.load()
+        board.stackup = []
+        for kwargs in ({"impedance_targets": [{"net": "SIG", "ohm": 50}]},
+                       {"impedance_targets": [{"net": "SIG", "ohm": 50}],
+                        "track_mm": 0.25}):
+            with self.assertRaises(R.RulesError) as ctx:
+                R.resolve(board, **kwargs)
+            self.assertEqual(ctx.exception.reason_code,
+                             "IMPEDANCE_NEEDS_STACKUP")
+            self.assertIn("dielectric_mm", ctx.exception.hint)
+        # two dielectric thicknesses are just as ambiguous as none
+        board.stackup = [
+            {"name": "core", "type": "core", "thickness_mm": 0.2, "er": 4.3,
+             "tand": None, "copper_um": None},
+            {"name": "prepreg", "type": "prepreg", "thickness_mm": 0.1,
+             "er": 4.1, "tand": None, "copper_um": None}]
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(board, impedance_targets=[{"net": "SIG", "ohm": 50}])
+        self.assertEqual(ctx.exception.reason_code, "IMPEDANCE_NEEDS_STACKUP")
+
+    def test_an_unreachable_target_is_refused_with_the_reachable_range(self):
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(self.load(), impedance_targets=[{"net": "SIG", "ohm": 190,
+                                                       "dielectric_mm": 1.51}])
+        self.assertEqual(ctx.exception.reason_code, "IMPEDANCE_UNREACHABLE")
+        self.assertIn("ohm", ctx.exception.hint)
+
+    def test_a_pair_target_gives_both_nets_the_same_width(self):
+        bundle = R.resolve(self.load(),
+                           impedance_targets=[{"p": "D+", "n": "D-", "ohm": 90,
+                                               "dielectric_mm": 0.2}])
+        w = bundle["impedance_targets"][0]["width_mm"]
+        self.assertAlmostEqual(R.for_net(bundle, "D+")["track_mm"], w, places=9)
+        self.assertAlmostEqual(R.for_net(bundle, "D-")["track_mm"], w, places=9)
+        self.assertAlmostEqual(bundle["track_mm"], 0.25, places=6)
+
+    def test_two_widths_for_one_net_is_a_contradiction(self):
+        bundle = R.resolve(self.load(),
+                           impedance_targets=[{"p": "D+", "n": "D-", "ohm": 90,
+                                               "dielectric_mm": 0.2}])
+        w = round(bundle["impedance_targets"][0]["width_mm"], 4)
+        # the same number in the diff-pairs entry is consistent, not a conflict
+        R.resolve(self.load(),
+                  impedance_targets=[{"p": "D+", "n": "D-", "ohm": 90,
+                                      "dielectric_mm": 0.2}],
+                  diff_pairs=[{"p": "D+", "n": "D-", "gap_mm": 0.2,
+                               "width_mm": w}])
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(self.load(),
+                      impedance_targets=[{"p": "D+", "n": "D-", "ohm": 90,
+                                          "dielectric_mm": 0.2}],
+                      diff_pairs=[{"p": "D+", "n": "D-", "gap_mm": 0.2,
+                                   "width_mm": 0.5}])
+        self.assertEqual(ctx.exception.reason_code, "RULES_INVALID")
+        self.assertIn("contradiction", ctx.exception.message)
+
+    def test_the_tool_carries_the_target_and_keeps_the_width(self):
+        self.apply(self.place("Pad", [("1", 0, 0, 1.0, 1.0)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "SIG"}),
+                   self.place("Pad", [("1", 0, 0, 1.0, 1.0)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "SIG"}))
+        out = self.call(nets=["SIG"],
+                        impedance_targets=[{"net": "SIG", "ohm": 50,
+                                            "dielectric_mm": 0.2}])
+        self.assertEqual(out["status"], "ok", out)
+        target = out["impedance_targets"][0]
+        widths = {op["width"] for op in out["ops_preview"]
+                  if op["op"] == "add_track"}
+        self.assertTrue(widths)
+        for w in widths:
+            self.assertAlmostEqual(w, target["width_mm"], places=4)
+        self.assertIn("impedance",
+                      out["assumptions"]["where_the_numbers_came_from"])
+
+class TestCreepageCanBeLookedUpNotJustGiven(RouteBase):
+    """The router can do the standard lookup itself - and refuses where the table does.
+
+    The number still never comes from the router's imagination: it comes from
+    `calc/iec60664.py`, whose table was recovered from a published transcription
+    and is documented as exactly that. What this class pins down is that the
+    lookup is reachable from the call, that the answer says which ladder it used,
+    and that an input past the end of a ladder is an error rather than a
+    straight-line extrapolation.
+    """
+
+    def test_the_working_voltage_produces_the_table_value(self):
+        bundle = R.resolve(self.load(), working_voltage_v=250)
+        self.assertAlmostEqual(bundle["creepage_mm"], 2.5, places=6)
+        self.assertIn("IEC 60664-1 Table F.5", bundle["sources"]["creepage"])
+        self.assertAlmostEqual(R.creepage(bundle, "A", "B"), 2.5, places=6)
+        lookup = bundle["creepage_lookup"]
+        self.assertEqual(lookup["status"], "ok")
+        self.assertEqual(lookup["ladder"], "PD2|MG_IIIa|pcb0")
+        self.assertEqual(lookup["unit"], "mm")
+
+    def test_the_lookup_parameters_change_the_ladder(self):
+        one = R.resolve(self.load(), working_voltage_v=250, pollution_degree=1,
+                        material_group="I")
+        two = R.resolve(self.load(), working_voltage_v=250, pollution_degree=3,
+                        material_group="I")
+        self.assertEqual(one["creepage_lookup"]["ladder"], "PD1|MG_I|pcb0")
+        self.assertEqual(two["creepage_lookup"]["ladder"], "PD3|MG_I|pcb0")
+        self.assertGreater(two["creepage_mm"], one["creepage_mm"])
+        rein = R.resolve(self.load(), working_voltage_v=250, insulation="reinforced")
+        self.assertAlmostEqual(rein["creepage_mm"], 5.0, places=6)
+
+    def test_the_stricter_of_the_two_numbers_wins_and_says_which(self):
+        wide = R.resolve(self.load(), working_voltage_v=250, creepage_mm=6.0)
+        self.assertAlmostEqual(wide["creepage_mm"], 6.0, places=6)
+        self.assertIn("stricter", wide["sources"]["creepage"])
+        self.assertIn("IEC 60664-1", wide["sources"].get("creepage_table", ""))
+        tight = R.resolve(self.load(), working_voltage_v=250, creepage_mm=0.1)
+        self.assertAlmostEqual(tight["creepage_mm"], 2.5, places=6)
+        self.assertIn("IEC table value", tight["sources"]["creepage"])
+
+    def test_an_input_the_table_does_not_cover_is_refused(self):
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(self.load(), working_voltage_v=1e9)
+        self.assertEqual(ctx.exception.reason_code, "OUT_OF_VALIDITY")
+        self.assertIn("ladder", ctx.exception.message + ctx.exception.hint)
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(self.load(), working_voltage_v=250, pollution_degree=4)
+        self.assertEqual(ctx.exception.reason_code, "STANDARD_SCOPE")
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(self.load(), working_voltage_v=250, pollution_degree=2.5)
+        self.assertEqual(ctx.exception.reason_code, "ARG_INVALID")
+        with self.assertRaises(R.RulesError) as ctx:
+            R.resolve(self.load(), working_voltage_v=250, material_group="IV")
+        self.assertEqual(ctx.exception.reason_code, "ARG_INVALID")
+
+    def test_the_tool_looks_it_up_and_reports_the_ladder(self):
+        self.apply(self.place("Pad", [("1", 0, 0, 1.0, 1.0)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "SIG"}),
+                   self.place("Pad", [("1", 0, 0, 1.0, 1.0)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "SIG"}))
+        out = self.call(nets=["SIG"], working_voltage_v=250)
+        self.assertEqual(out["status"], "ok", out)
+        self.assertAlmostEqual(out["assumptions"]["creepage_mm"], 2.5, places=6)
+        lookup = out["assumptions"]["creepage_lookup"]
+        self.assertEqual(lookup["ladder"], "PD2|MG_IIIa|pcb0")
+        self.assertIn("IEC 60664-1", out["assumptions"]
+                      ["where_the_numbers_came_from"]["creepage"])
+        bad = self.call(nets=["SIG"], working_voltage_v=1e9)
+        self.assertEqual(bad["status"], "error")
+        self.assertEqual(bad["reason_code"], "OUT_OF_VALIDITY")
+
 class TestCreepageReachesBothEnds(RouteBase):
     """A creepage rule is only real if it stops the search AND the judge.
 
@@ -636,11 +827,12 @@ class TestLengthMatchingChangesTheCopper(RouteBase):
 class TestDiffPairsEnterTheSearch(RouteBase):
     """A declared pair is a distance rule and a width, not a drawing.
 
-    The router does not couple the two nets; it routes them so they cannot come
-    closer than the declared gap, gives both the declared width, and then reports
-    the gap and the skew that came out. The report says `coupled: false`, because
-    "we kept them 0.15 mm apart" and "they run side by side at 0.15 mm" are
-    different claims and only the first one is true here.
+    As far as the SEARCH is concerned, a pair is a minimum distance: the two nets
+    are routed so they cannot come closer than the declared gap and both carry
+    the declared width. Whether they then run side by side is decided after the
+    search, by `TestAPairCanBeCoupled`; here the offset walk is blocked or out of
+    fanout range, so the pair keeps its independent routing and the report says
+    so with the reason rather than the old blanket "this router does not couple".
     """
 
     def test_the_declared_gap_is_the_distance_the_judge_uses(self):
@@ -686,7 +878,11 @@ class TestDiffPairsEnterTheSearch(RouteBase):
         self.assertAlmostEqual(rep["gap_declared_mm"], 0.5)
         self.assertGreater(rep["gap_achieved_mm"], 0.5 + 0.02)
         self.assertEqual(rep["status"], "pair_not_coupled")
-        self.assertIn("does not couple", rep["why"]["note"])
+        # 12 mm apart: joining the offset run to the pads would be a diagonal
+        # fanout nobody asked for, so coupling is refused and says why.
+        self.assertEqual(rep["why"]["reason"], "fanout_too_long")
+        self.assertIn("do not run side by side", rep["why"]["note"])
+        self.assertIn("fanout", rep["why"]["note"])
         # both nets really carry the declared width
         self.assertTrue(all(op["width"] == 0.2 for op in res["ops"]
                             if op["op"] == "add_track"))
@@ -711,6 +907,212 @@ class TestDiffPairsEnterTheSearch(RouteBase):
         self.assertLessEqual(grp["skew_after_mm"], 0.5 + 1e-6)
         self.assertLessEqual(res["diff_pairs"][0]["skew_mm"], 0.5 + 1e-6)
 
+LAYER_MOD = ('(footprint "SYN:%(name)s" (version 20221018) (generator pcbnew)\n'
+             '  (layer "F.Cu") (attr smd)\n'
+             '  (fp_text reference "%(ref)s" (at 0 -6) (layer "F.SilkS")\n'
+             '    (effects (font (size 0.7 0.7) (thickness 0.12))))\n'
+             '  (pad "1" smd rect (at 0 0) (size %(w).4f %(w).4f)\n'
+             '    (layers "%(l)s" "%(p)s" "%(m)s")\n'
+             '    (tstamp 5%(n)07d-1111-1111-1111-111111111111))\n'
+             ')\n')
+
+
+class TestALayerChangeGetsAGroundVia(RouteBase):
+    """A signal that changes layer needs a way back across, and gets one.
+
+    The signal pad is on F.Cu and the other is on B.Cu, so the only legal route
+    dives through a via. A ground via beside it is what makes the return current
+    able to follow; without one the return current detours or does not go.
+    """
+
+    def _pad_on(self, ref, x, y, net, layer, w=0.6, n=0):
+        if layer == "F.Cu":
+            layers = ("F.Cu", "F.Paste", "F.Mask")
+        else:
+            layers = ("B.Cu", "B.Paste", "B.Mask")
+        name = "P" + ref
+        with open(os.path.join(self.lib, name + ".kicad_mod"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(LAYER_MOD % {"name": name, "ref": ref, "w": w, "n": n,
+                                  "l": layers[0], "p": layers[1], "m": layers[2]})
+        return {"op": "add_footprint", "ref": ref, "x": x, "y": y,
+                "library": self.lib, "name": name,
+                "pad_nets": {"1": net}, "create_nets": True}
+
+    def _layer_change(self, ground_layers=("F.Cu", "B.Cu")):
+        ops = [self._pad_on("J1", 10.0, 10.0, "SIG", "F.Cu", n=1),
+               self._pad_on("J2", 30.0, 10.0, "SIG", "B.Cu", n=2)]
+        for k, layer in enumerate(ground_layers):
+            # The ground corridor runs past both pads, so the signal via always
+            # has ground copper on both sides of the layer change within reach.
+            ops.append({"op": "add_track", "x1": 8.0, "y1": 11.6, "x2": 34.0,
+                        "y2": 11.6, "width": 0.25, "layer": layer,
+                        "net": "GND", "create_net": True})
+        self.apply(*ops)
+
+    def test_the_signal_via_gets_a_ground_via_on_the_copper(self):
+        self._layer_change()
+        res = self.route(nets=["SIG"], layers=["F.Cu", "B.Cu"])
+        self.assertEqual(res["failed"], [], res["failed"])
+        rp = res["return_path"]
+        self.assertEqual(rp["status"], "stitched")
+        self.assertEqual(rp["ground_net"], "GND")
+        # One signal via, one ground via - not one per layer, not one per pad.
+        self.assertEqual(rp["attempted"], 1)
+        self.assertEqual(len(rp["added"]), 1)
+        got = rp["added"][0]
+        self.assertEqual(sorted(got["layers_with_ground"]), ["B.Cu", "F.Cu"])
+        # It landed ON the ground track, not near it: a via 1 mm short of the
+        # pour is a floating island, and DRC reports it as unconnected.
+        self.assertAlmostEqual(got["at"][1], 11.6, places=6)
+        self.assertLessEqual(got["distance_mm"], 2.0)
+        # ...and it is really written, as ground copper with a role a reader can
+        # tell apart from routed vias.
+        vias = [op for op in res["ops"] if op["op"] == "add_via"]
+        self.assertEqual(len(vias), 2)
+        gnd = [op for op in vias if op["net"] == "GND"]
+        self.assertEqual(len(gnd), 1)
+        self.assertEqual(gnd[0]["role"], "ground_stitch")
+        self.assertEqual(gnd[0]["for_net"], "SIG")
+
+    def test_ground_on_one_layer_only_is_refused_not_faked(self):
+        self._layer_change(ground_layers=("F.Cu",))
+        res = self.route(nets=["SIG"], layers=["F.Cu", "B.Cu"])
+        rp = res["return_path"]
+        self.assertEqual(rp["status"], "refused")
+        self.assertEqual(rp["added"], [])
+        self.assertEqual(rp["skipped"][0]["reason"], "ground_not_on_two_layers")
+        self.assertEqual(rp["skipped"][0]["layers_with_ground"], ["F.Cu"])
+        # Nothing was written for the ground net at all.
+        self.assertEqual([op for op in res["ops"]
+                          if op["op"] == "add_via" and op["net"] == "GND"], [])
+
+    def test_a_board_with_no_ground_net_is_refused_by_name(self):
+        self._layer_change(ground_layers=())
+        res = self.route(nets=["SIG"], layers=["F.Cu", "B.Cu"])
+        rp = res["return_path"]
+        self.assertEqual(rp["status"], "refused")
+        self.assertEqual(rp["why"]["reason"], "no_ground_net")
+        self.assertIsNone(rp["ground_net"])
+
+    def test_the_pass_can_be_turned_off(self):
+        self._layer_change()
+        res = self.route(nets=["SIG"], layers=["F.Cu", "B.Cu"],
+                         return_path=False)
+        self.assertIsNone(res["return_path"])
+        self.assertEqual([op for op in res["ops"]
+                          if op["op"] == "add_via" and op["net"] == "GND"], [])
+
+    def test_two_ground_nets_is_a_refusal_not_a_coin_flip(self):
+        self._layer_change(ground_layers=("F.Cu", "B.Cu"))
+        self.apply(self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J3", x=50.0,
+                              y=30.0, nets={"1": "VSS"}))
+        res = self.route(nets=["SIG"], layers=["F.Cu", "B.Cu"])
+        rp = res["return_path"]
+        self.assertEqual(rp["status"], "refused")
+        self.assertEqual(rp["why"]["reason"], "ambiguous_ground_net")
+        self.assertEqual(rp["why"]["candidates"], ["GND", "VSS"])
+
+    def test_the_ground_can_be_named_when_the_board_calls_it_something_else(self):
+        # AGND is a different return network, so it is not picked automatically -
+        # but the caller may say "this board's ground is AGND" and get it stitched.
+        self._layer_change(ground_layers=())
+        for layer in ("F.Cu", "B.Cu"):
+            self.apply({"op": "add_track", "x1": 8.0, "y1": 11.6, "x2": 34.0,
+                        "y2": 11.6, "width": 0.25, "layer": layer,
+                        "net": "AGND", "create_net": True})
+        res = self.route(nets=["SIG"], layers=["F.Cu", "B.Cu"],
+                         return_path_net="AGND")
+        rp = res["return_path"]
+        self.assertEqual(rp["status"], "stitched", rp.get("why"))
+        self.assertEqual(rp["ground_net"], "AGND")
+
+
+class TestAPairCanBeCoupled(RouteBase):
+    """The second net really becomes the first net's path, offset by the gap.
+
+    The pads are only slightly wider than the trace on purpose: a coupled run
+    comes out beside the other member's PAD at the ends, so a pad twice the trace
+    width would make the last millimetre of every coupled pair a clearance
+    violation. That is a property of coupling to the pad, not a bug here.
+    """
+
+    def _four_pads(self, pad_mm=0.25, y_n=10.0):
+        self.apply(self.place("Pad", [("1", 0, 0, pad_mm, pad_mm)], ref="J1",
+                              x=10.0, y=8.0, nets={"1": "D+"}),
+                   self.place("Pad", [("1", 0, 0, pad_mm, pad_mm)], ref="J2",
+                              x=40.0, y=8.0, nets={"1": "D+"}),
+                   self.place("Pad", [("1", 0, 0, pad_mm, pad_mm)], ref="J3",
+                              x=10.0, y=y_n, nets={"1": "D-"}),
+                   self.place("Pad", [("1", 0, 0, pad_mm, pad_mm)], ref="J4",
+                              x=40.0, y=y_n, nets={"1": "D-"}))
+
+    def test_the_second_net_becomes_the_first_net_offset_by_the_gap(self):
+        self._four_pads()
+        res = self.route(nets=["D+", "D-"], layers=["F.Cu"],
+                         diff_pairs=[{"p": "D+", "n": "D-", "gap_mm": 0.3,
+                                      "width_mm": 0.25}])
+        self.assertEqual(res["failed"], [], res["failed"])
+        rep = res["diff_pairs"][0]
+        self.assertTrue(rep["coupled"], rep.get("why"))
+        self.assertEqual(rep["status"], "pair_coupled")
+        # The declared gap is what came out, not "at least the gap".
+        self.assertAlmostEqual(rep["gap_achieved_mm"], 0.3, delta=0.02)
+        # ...and it holds along the whole run, not just at the closest point.
+        self.assertGreater(rep["coupled_fraction"], 0.8)
+        # `coupled: true` must be backed by copper that really looks like a pair:
+        # the second net has exactly one long run beside the first, parallel to it.
+        runs = [op for op in res["ops"]
+                if op["op"] == "add_track" and op["net"] == "D-"]
+        self.assertEqual(len(runs), 3)     # fanout, coupled run, fanout
+        long_run = max(runs, key=lambda o: math.hypot(o["x2"] - o["x1"],
+                                                      o["y2"] - o["y1"]))
+        self.assertAlmostEqual(long_run["y1"], 8.0 + 0.3 + 0.25, delta=0.01)
+        self.assertAlmostEqual(long_run["y2"], 8.0 + 0.3 + 0.25, delta=0.01)
+        # The fanouts are reported: a pair that coupled for 30 mm and needed a
+        # 20 mm detour to get there is a different board.
+        self.assertEqual(rep["coupling"]["segments"], 3)
+        self.assertAlmostEqual(rep["coupling"]["fanout_mm"][0], 1.45, delta=0.01)
+
+    def test_a_pair_whose_offset_is_blocked_keeps_its_own_copper(self):
+        self._four_pads()
+        # A third net's pad sits exactly where the offset run would go.
+        self.apply(self.place("Pad", [("1", 0, 0, 0.25, 0.25)], ref="J5",
+                              x=25.0, y=8.55, nets={"1": "GUARD"}))
+        res = self.route(nets=["D+", "D-"], layers=["F.Cu"],
+                         diff_pairs=[{"p": "D+", "n": "D-", "gap_mm": 0.3,
+                                      "width_mm": 0.25}])
+        self.assertEqual(res["failed"], [], res["failed"])
+        rep = res["diff_pairs"][0]
+        self.assertFalse(rep["coupled"])
+        self.assertEqual(rep["why"]["reason"], "offset_blocked")
+        # Both sides are named: "+1" is blocked by the guard, "-1" by the other
+        # member's own pad (its fanout would cross it). Naming only the last one
+        # would send the caller to move the wrong part.
+        sides = dict((s["side"], s) for s in rep["why"]["detail"]["sides"])
+        self.assertEqual(sides[1]["detail"]["reference"], "J5.1")
+        self.assertEqual(sides[-1]["detail"]["reference"], "J1.1")
+        # The second net's own copper is still there, byte for byte: a refused
+        # coupling must not delete a routed net.
+        self.assertEqual(rep["length_n_mm"], 30.0)
+        runs = [op for op in res["ops"]
+                if op["op"] == "add_track" and op["net"] == "D-"]
+        self.assertEqual(len(runs), 1)
+        self.assertAlmostEqual(runs[0]["y1"], 10.0, places=6)
+        self.assertAlmostEqual(runs[0]["y2"], 10.0, places=6)
+
+    def test_coupling_can_be_turned_off_per_pair(self):
+        self._four_pads()
+        res = self.route(nets=["D+", "D-"], layers=["F.Cu"],
+                         diff_pairs=[{"p": "D+", "n": "D-", "gap_mm": 0.3,
+                                      "width_mm": 0.25, "couple": False}])
+        rep = res["diff_pairs"][0]
+        self.assertFalse(rep["coupled"])
+        self.assertEqual(rep["coupling"]["reason"], "not_asked")
+        # Independent routing, as before: no gap claimed.
+        self.assertGreater(rep["gap_achieved_mm"], 0.3 + 0.02)
+        self.assertIn("couple=false", rep["why"]["note"])
+
     def test_bad_structures_are_refused_not_dropped(self):
         out = self.call(nets="D+", diff_pairs=[{"p": "D+", "n": "D-"}])
         self.assertEqual(out["status"], "error")
@@ -721,6 +1123,240 @@ class TestDiffPairsEnterTheSearch(RouteBase):
         out = self.call(nets="D+", length_groups="not json")
         self.assertEqual(out["status"], "error")
         self.assertEqual(out["reason_code"], "ARG_INVALID")
+
+
+class TestOneIntentObjectThreeConsumers(RouteBase):
+    """One intent object, three consumers - and every refusal named.
+
+    The failure this prevents is not untidiness: a board measured with the
+    net-class clearance and then routed with `clearance_mm=0.2` was measured about
+    a different board, and both answers were "right".
+    """
+
+    def _pair(self, net="A", x2=40.0):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": net}),
+                   self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J2", x=x2,
+                              y=8.0, nets={"1": net}))
+
+    def test_an_unknown_key_is_refused_rather_than_ignored(self):
+        out = tools.call_tool("board_intent", {
+            "path": self.board,
+            "intent": {"version": 1, "constraints": {"clearance": 0.2}}})
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "INTENT_INVALID")
+        # The typo is NAMED, and the vocabulary it should have used is spelled out:
+        # "clearance" silently becoming "no constraint requested" is the failure
+        # this refusal exists to prevent.
+        self.assertIn("clearance", out["message"])
+        self.assertIn("clearance_mm", out["hint"])
+
+    def test_a_version_this_build_does_not_know_is_refused(self):
+        out = tools.call_tool("board_intent", {"path": self.board,
+                                               "intent": {"version": 99}})
+        self.assertEqual(out["reason_code"], "INTENT_VERSION")
+
+    def test_a_missing_file_is_named_not_guessed_at(self):
+        out = tools.call_tool("board_intent", {
+            "path": self.board, "intent": os.path.join(self.tmp, "nope.json")})
+        self.assertEqual(out["reason_code"], "INTENT_FILE_MISSING")
+        self.assertIn("nope.json", out["message"])
+
+    def test_only_what_the_intent_declares_comes_out(self):
+        spec = INTENT.load({"version": 1,
+                            "constraints": {"clearance_mm": 0.2, "track_mm": 0.25},
+                            "nets": {"route": "A, B"}})
+        flat = INTENT.flatten(spec)
+        self.assertEqual(sorted(flat), ["clearance_mm", "nets", "track_mm"])
+        self.assertEqual(flat["nets"], ["A", "B"])
+        # "not declared" must not become "zero": a via diameter nobody asked about
+        # is not 0 mm.
+        self.assertNotIn("via_diameter_mm", flat)
+
+    def test_the_caller_wins_and_the_disagreement_is_named(self):
+        spec = INTENT.load({"version": 1, "constraints": {"clearance_mm": 0.2}})
+        kw, report = INTENT.resolve({"clearance_mm": 0.3}, spec)
+        self.assertEqual(kw["clearance_mm"], 0.3)
+        self.assertEqual(report["conflicts"],
+                         [{"key": "clearance_mm", "intent": 0.2,
+                           "caller": 0.3, "used": "caller"}])
+        self.assertEqual(report["from_caller"], ["clearance_mm"])
+
+    def test_a_keepout_over_a_pad_is_refused_before_ten_minutes_of_routing(self):
+        self._pair()
+        out = self.call(nets=["A"], layers=["F.Cu"], intent={
+            "version": 1,
+            "keepouts": [{"x0": 9.0, "y0": 7.0, "x1": 11.0, "y1": 9.0}]})
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "INTENT_INVALID")
+        self.assertIn("J1.1", json.dumps(out["intent_problems"]))
+
+    def test_a_footprint_outside_its_region_is_reported_not_refused(self):
+        self._pair()
+        out = tools.call_tool("board_intent", {"path": self.board, "intent": {
+            "version": 1,
+            "placement": {"regions": [{"ref": "J1",
+                                       "region": [30.0, 15.0, 45.0, 25.0],
+                                       "order": 2}]}}})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertEqual(out["value"]["blocking"], 0)
+        self.assertEqual(out["value"]["problems"], 1)
+        self.assertIn("outside its declared region", out["findings"][0]["problem"])
+
+    def test_a_region_off_the_board_is_refused(self):
+        self._pair()
+        out = tools.call_tool("board_intent", {"path": self.board, "intent": {
+            "version": 1,
+            "placement": {"regions": [{"ref": "J1",
+                                       "region": [0.0, 0.0, 70.0, 40.0]}]}}})
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "INTENT_INVALID")
+        self.assertIn("past the board edge", json.dumps(out["blocking_findings"]))
+
+    def test_the_intent_that_measures_is_the_intent_that_routes(self):
+        self._pair()
+        out = tools.call_tool("board_routability", {
+            "path": self.board,
+            "intent": {"version": 1, "constraints": {"clearance_mm": 0.45}}})
+        self.assertEqual(out["status"], "ok", out)
+        report = out["assumptions"]["intent"]
+        self.assertEqual(report["declared"], ["clearance_mm"])
+        self.assertIn("board", report)
+        # The measurement really used the file's number, not the net class.
+        self.assertIn(0.45, [float(v) for v in _numbers(out) if v is not None])
+
+
+def _numbers(obj, out=None):
+    """Every number anywhere in a reply, for "was this value used" assertions."""
+    if out is None:
+        out = []
+    if isinstance(obj, dict):
+        for val in obj.values():
+            _numbers(val, out)
+    elif isinstance(obj, (list, tuple)):
+        for val in obj:
+            _numbers(val, out)
+    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        out.append(obj)
+    return out
+
+
+class TestAMeanderChoosesItsHost(RouteBase):
+    """Which segment gets the serpentine is a decision, not a loop order.
+
+    Length alone is the wrong key twice: a shorter segment in open copper beats the
+    longest one squeezed between other nets, and a segment that ends at a via is
+    the worst host of all - a serpentine there is a stub.
+    """
+
+    def _em(self, ops, crowded=False):
+        class _Em(object):
+            pass
+        em = _Em()
+        em.ops = ops
+        em.grid = SimpleNamespace(
+            _map={"F.Cu": [1 if crowded else 0]},
+            _sets=[["GUARD"]],
+            cells_near=lambda x, y, r: [0])
+        return em
+
+    def test_a_host_that_ends_at_a_via_is_discounted_not_preferred(self):
+        open_seg = {"op": "add_track", "net": "L1", "layer": "F.Cu", "width": 0.25,
+                    "x1": 0.0, "y1": 0.0, "x2": 20.0, "y2": 0.0}
+        via_seg = {"op": "add_track", "net": "L1", "layer": "F.Cu", "width": 0.25,
+                   "x1": 0.0, "y1": 5.0, "x2": 20.0, "y2": 5.0}
+        via = {"op": "add_via", "net": "L1", "x": 0.0, "y": 5.0,
+               "size": 0.6, "drill": 0.3}
+        ranked = TUNE._candidate_order(self._em([open_seg, via_seg, via]), "L1",
+                                       [via_seg, open_seg])
+        self.assertIs(ranked[0][1], open_seg)
+        self.assertTrue(ranked[1][2]["ends_at_a_via"])
+        self.assertAlmostEqual(ranked[1][0], ranked[0][0] * 0.25, places=6)
+
+    def test_other_nets_copper_near_the_midpoint_discounts_the_host(self):
+        seg = {"op": "add_track", "net": "L1", "layer": "F.Cu", "width": 0.25,
+               "x1": 0.0, "y1": 0.0, "x2": 20.0, "y2": 0.0}
+        clean = TUNE._candidate_order(self._em([seg]), "L1", [seg])[0]
+        busy = TUNE._candidate_order(self._em([seg], crowded=True), "L1", [seg])[0]
+        self.assertAlmostEqual(busy[0], clean[0] * 0.25, places=6)
+        self.assertEqual(busy[2]["other_copper_within_mm"], 2.0)
+        self.assertIsNone(clean[2]["other_copper_within_mm"])
+
+    def test_the_report_carries_the_ladder_and_the_hosts_it_passed_over(self):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "L1"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "L1"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J3", x=10.0,
+                              y=20.0, nets={"1": "L2"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J4", x=44.0,
+                              y=20.0, nets={"1": "L2"}))
+        res = self.route(nets=["L1", "L2"], layers=["F.Cu"],
+                         length_groups=[{"name": "clk", "nets": ["L1", "L2"],
+                                         "max_skew_mm": 0.5}])
+        grp = res["length_groups"][0]
+        self.assertEqual(grp["status"], "matched", grp)
+        got = grp["detail"]["L1"]
+        ladder = got["amplitude_ladder_mm"]
+        # The widest amplitude is tried first and the ladder only ever narrows: a
+        # narrow meander is a fallback, never the shape that was asked for.
+        self.assertGreaterEqual(len(ladder), 2, ladder)
+        self.assertEqual(ladder, sorted(ladder, reverse=True))
+        self.assertGreater(ladder[-1], 0.0)
+        for part in got["meanders"]:
+            self.assertIn(part["amplitude_mm"], ladder)
+            self.assertEqual(part["narrowed"],
+                             part["amplitude_mm"] != ladder[0])
+        # Hosts are ranked, and the ranking is carried: `room_mm` is what the
+        # segment could buy, best first.
+        hosts = got["hosts_considered"]
+        self.assertTrue(hosts)
+        self.assertEqual([h["room_mm"] for h in hosts],
+                         sorted((h["room_mm"] for h in hosts), reverse=True))
+
+
+class TestNewCopperMakesThePourStale(RouteBase):
+    """A filled pour in the file describes the board BEFORE this routing.
+
+    A track crossing a pour is not a short - the pour is re-cut around it - but the
+    polygons in the file are now a snapshot of another board, and a board whose
+    fill is stale must not read as finished.
+    """
+
+    def _board_with_pour(self, net="A"):
+        self.apply(self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": net}),
+                   self.place("Pad", [("1", 0, 0, 0.6, 0.6)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": net}))
+        self.apply({"op": "add_zone", "layer": "F.Cu", "net": net,
+                    "x0": 0.0, "y0": 0.0, "x1": 60.0, "y1": 40.0})
+
+    def test_new_copper_in_a_pour_asks_for_a_refill(self):
+        self._board_with_pour()
+        res = self.route(nets=["A"], layers=["F.Cu"])
+        self.assertEqual(res["failed"], [], res["failed"])
+        pour = res["pour"]
+        self.assertTrue(pour["needs_refill"], pour)
+        self.assertEqual(pour["zones"][0]["zone_net"], "A")
+        self.assertGreaterEqual(pour["zones"][0]["segments_inside"], 1)
+        self.assertTrue(pour["zones"][0]["same_net_as_the_new_copper"])
+        self.assertIn("refill", pour["why"])
+
+    def test_copper_outside_the_pour_asks_for_nothing(self):
+        self._board_with_pour()
+        board = self.load()
+        outside = {"op": "add_track", "net": "A", "layer": "F.Cu", "width": 0.25,
+                   "x1": 100.0, "y1": 100.0, "x2": 110.0, "y2": 100.0}
+        rep = router._pour_report(board, [outside], ["F.Cu", "B.Cu"])
+        self.assertFalse(rep["needs_refill"])
+        self.assertEqual(rep["zones"], [])
+
+    def test_the_tool_carries_it(self):
+        self._board_with_pour()
+        out = self.call(nets="A", layers="F.Cu")
+        self.assertEqual(out["status"], "ok", out)
+        self.assertTrue(out["pour"]["needs_refill"])
+        self.assertTrue(out["assumptions"]["pour"]["needs_refill"])
 
 if __name__ == "__main__":
     unittest.main()

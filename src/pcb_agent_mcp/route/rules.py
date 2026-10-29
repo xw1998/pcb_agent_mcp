@@ -22,6 +22,9 @@ Where the numbers come from, in priority order:
 
 import fnmatch
 
+from ..calc import iec60664 as _iec
+from ..calc import impedance as _impedance
+
 # Values assumed when the file is silent. Kept as module constants so a test can
 # point at the exact number the answer claims.
 DEFAULT_CLEARANCE_MM = 0.2
@@ -123,9 +126,48 @@ def _pattern_hits(inner, net, classes_):
     return None
 
 
+_DIEL_TYPES = ("core", "prepreg", "dielectric")
+
+def _stackup_dielectric(board):
+    """`(thickness_mm, er, copper_um, name)` - only when the stackup is unambiguous.
+
+    A microstrip impedance depends on the dielectric between the trace and its
+    reference plane, and on the copper weight. A real 4-layer board has several
+    of each; picking one by guesswork would silently answer a different question,
+    so a value is only offered when the whole stackup holds exactly one
+    dielectric thickness and one copper thickness. Anything else returns `None`
+    and the caller has to say which stackup the target was computed against.
+    """
+    layers = [l for l in (board.stackup or []) if isinstance(l, dict)]
+    if not layers:
+        return None, None, None, None
+    diels = [l for l in layers
+             if str(l.get("type") or "").lower() in _DIEL_TYPES
+             and _f(l.get("thickness_mm"))]
+    coppers = []
+    for l in layers:
+        cu = _f(l.get("copper_um"))
+        if cu is None and str(l.get("type") or "").lower() == "copper":
+            th = _f(l.get("thickness_mm"))
+            cu = th * 1000.0 if th is not None else None
+        if cu:
+            coppers.append(cu)
+
+    def _one(vals):
+        uniq = sorted({round(v, 6) for v in vals})
+        return uniq[0] if len(uniq) == 1 else None
+
+    h = _one([_f(l["thickness_mm"]) for l in diels])
+    er = _one([_f(l["er"]) for l in diels if _f(l.get("er"))])
+    t = _one(coppers)
+    name = diels[0].get("name") if (h is not None and len(diels) == 1) else None
+    return h, er, t, name
+
 def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
             via_drill_mm=None, edge_clearance_mm=None, creepage_mm=None,
-            creepage_pairs=None, diff_pairs=None):
+            creepage_pairs=None, diff_pairs=None, impedance_targets=None,
+            working_voltage_v=None, pollution_degree=2, material_group="IIIa",
+            insulation="basic", coating=False, altitude_m=0):
     """Every rule the router needs, with where each number came from.
 
     Returns a dict; see the module docstring for the priority order. Numbers that
@@ -136,6 +178,12 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
     `creepage_mm` / `creepage_pairs` have no fallback on purpose: they are a
     standard lookup, not a property of the board file, so `creepage_mm is None`
     means "no creepage constraint was requested" and never "creepage is 0".
+
+    `impedance_targets` is the same kind of thing: "this net is 50 ohm" is a
+    design intent, not a board-file fact. Each target is reverse-solved to a
+    track width and then becomes that net's `track_mm` - which is the only way
+    an impedance requirement can reach the search at all, because the search
+    knows about widths and spacings, not about ohms.
     """
     rules = board.rules or {}
     cls = classes(board)
@@ -293,6 +341,45 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
         sources["creepage"] = (
             "not supplied: creepage comes from a standard table keyed to working "
             "voltage / pollution degree / coating and is never invented here")
+
+    # The lookup the sentence above is talking about, done on request. The table
+    # is IEC 60664-1 Table F.5 (see calc/iec60664.py for how it was obtained and
+    # what it is not); it is a table, so out-of-range inputs are a refusal, never
+    # a straight-line extension past the last step.
+    lookup = None
+    if working_voltage_v is not None:
+        got = _iec.creepage_mm(working_voltage_v,
+                               pollution_degree=pollution_degree,
+                               material_group=material_group,
+                               insulation=insulation, coating=coating,
+                               altitude_m=altitude_m)
+        if got.get("status") != "ok":
+            raise RulesError(
+                "cannot look up creepage for %r V rms: %s"
+                % (working_voltage_v, got.get("message")),
+                got.get("reason_code") or "SAFETY_TABLE_MISSING",
+                hint=got.get("hint") or (
+                    "the table has no step for this input; pass creepage_mm "
+                    "explicitly from the standard the board is built to - the "
+                    "router will not extrapolate a ladder"))
+        lookup = got
+        table_mm = float(got["value"])
+        how = ("IEC 60664-1 Table F.5: %g V rms, PD%s, material group %s, %s "
+               "insulation -> %.4f mm (ladder %s)"
+               % (float(working_voltage_v), pollution_degree, material_group,
+                  insulation, table_mm, got.get("ladder")))
+        if crp is None:
+            crp = table_mm
+            sources["creepage"] = how
+        elif crp >= table_mm:
+            sources["creepage"] = ("%s; the caller's %.4f mm is stricter and wins"
+                                   % ("caller", crp))
+            sources["creepage_table"] = how
+        else:
+            sources["creepage"] = ("%s; the IEC table value %.4f mm is stricter "
+                                   "and wins" % ("caller %.4f mm" % crp, table_mm))
+            sources["creepage_table"] = how
+            crp = table_mm
     pairs = []
     for item in (creepage_pairs or []):
         if not isinstance(item, dict):
@@ -337,8 +424,102 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
         if skew is not None and skew <= 0:
             raise RulesError("diff_pairs entry %r has a non-positive max_skew_mm"
                              % (item,), "RULES_INVALID")
+        # `couple` decides whether the pair is DRAWN as a pair (the second net
+        # built as the first's path offset by the gap) or only held apart. It is
+        # not a quality setting: a pair the caller wants routed independently is
+        # a different board, and which one was built has to be in the answer.
+        couple = item.get("couple", True)
+        if not isinstance(couple, bool):
+            raise RulesError("diff_pairs entry %r has a non-boolean couple"
+                             % (item,), "RULES_INVALID",
+                             hint="couple is true (draw them as a pair) or false "
+                                  "(route them independently, gap as a minimum)")
         dpairs.append({"p": str(pn), "n": str(nn), "gap_mm": gap,
-                       "width_mm": width, "max_skew_mm": skew})
+                       "width_mm": width, "max_skew_mm": skew,
+                       "couple": couple})
+
+    # ---- impedance targets --------------------------------------------
+    # "This net is 50 ohm" is a design intent, not a board-file fact. The search
+    # only knows widths and spacings, so the honest way to honour it is to
+    # reverse-solve the width and make that the net's track width - and to say
+    # which stackup the solve assumed. When the stackup does not pin the
+    # dielectric down, the answer is an error, not a plausible number.
+    imp = []
+    imp_nets = set()
+    for item in (impedance_targets or []):
+        if not isinstance(item, dict):
+            raise RulesError("impedance_targets entries must be {net|p/n, ohm} "
+                             "objects, got %r" % (item,), "RULES_INVALID")
+        names = []
+        if item.get("net"):
+            names = [str(item["net"])]
+        else:
+            pn, nn = item.get("p"), item.get("n")
+            if pn and nn and str(pn) != str(nn):
+                names = [str(pn), str(nn)]
+        if not names:
+            raise RulesError("impedance_targets entry %r names no net" % (item,),
+                             "RULES_INVALID",
+                             hint='e.g. {"net": "USB_DP", "ohm": 90} or '
+                                  '{"p": "USB_D+", "n": "USB_D-", "ohm": 90}')
+        ohm = _f(item.get("ohm"))
+        if ohm is None or ohm <= 0:
+            raise RulesError("impedance_targets entry %r needs a positive ohm"
+                             % (item,), "RULES_INVALID",
+                             hint="the target is a characteristic impedance in "
+                                  "ohm, e.g. 50 for a single-ended line")
+        kind = str(item.get("kind") or "microstrip").strip().lower()
+        h = _f(item.get("dielectric_mm"))
+        er = _f(item.get("er"))
+        t_um = _f(item.get("copper_um"))
+        derived = []
+        if h is None or er is None or t_um is None:
+            st_h, st_er, st_t, st_name = _stackup_dielectric(board)
+            if h is None and st_h is not None:
+                h = st_h
+                derived.append("dielectric_mm %.4f from stackup layer %r"
+                               % (h, st_name))
+            if er is None and st_er is not None:
+                er = st_er
+                derived.append("er %.2f from stackup layer %r" % (er, st_name))
+            if t_um is None and st_t is not None:
+                t_um = st_t
+                derived.append("copper_um %.1f from stackup" % (t_um,))
+        if h is None:
+            raise RulesError(
+                "impedance target for %s needs dielectric_mm: the board carries "
+                "no unambiguous dielectric thickness to derive it from"
+                % (" / ".join(names),),
+                "IMPEDANCE_NEEDS_STACKUP",
+                hint="pass dielectric_mm (and er / copper_um if they differ "
+                     "from 4.3 / 35) with the target; the router will not guess "
+                     "the stackup a 50 ohm line was computed against")
+        if er is None:
+            er = 4.3
+            derived.append("er 4.3 (formula default, not read from the board)")
+        if t_um is None:
+            t_um = 35.0
+            derived.append("copper_um 35 (1 oz, formula default, not read from "
+                           "the board)")
+        got = _impedance.width_for_impedance(ohm, h, t_um, er, kind)
+        if got.get("status") != "ok":
+            raise RulesError(
+                "cannot reach %g ohm on this stackup: %s"
+                % (ohm, got.get("message")),
+                "IMPEDANCE_UNREACHABLE",
+                hint=got.get("hint") or (
+                    "reachable range %s..%s ohm; change dielectric_mm / er / kind "
+                    "or pick another target"
+                    % (got.get("reachable_min_ohm"),
+                       got.get("reachable_max_ohm"))))
+        width = float(got["value"])
+        imp_nets.update(names)
+        imp.append({"nets": names, "ohm": ohm, "kind": kind,
+                    "dielectric_mm": h, "er": er, "copper_um": t_um,
+                    "width_mm": width, "basis": got["basis"],
+                    "precision": got["precision"],
+                    "z0_recomputed_ohm": got.get("z0_recomputed"),
+                    "derived": derived})
 
     per_net = {}
     for net, per in by_net_clr.items():
@@ -362,12 +543,42 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
             "source": "net class of %r" % net,
         }
 
+    # An impedance target outranks the class width: it is the number the board is
+    # built to, and the class only says what the fab can manufacture.
+    for target in imp:
+        for net in target["nets"]:
+            entry = per_net.get(net)
+            if entry is None:
+                entry = {"clearance_mm": clr,
+                         "via_diameter_mm": via_d,
+                         "via_drill_mm": via_drill,
+                         "source": "impedance target"}
+                per_net[net] = entry
+            entry["track_mm"] = target["width_mm"]
+            entry["source"] = ("impedance: %g ohm -> %.4f mm (%s)"
+                              % (target["ohm"], target["width_mm"],
+                                 target["kind"]))
+        sources.setdefault("impedance", []).append(
+            "%s: %g ohm -> %.4f mm (%s, h=%.4f mm, er=%.2f, t=%.0f um)"
+            % (" / ".join(target["nets"]), target["ohm"], target["width_mm"],
+               target["kind"], target["dielectric_mm"], target["er"],
+               target["copper_um"]))
+
     # Both members of a pair are the same width, declared or not.
     for pair in dpairs:
         w = pair.get("width_mm")
         if w is None:
             continue
         for net in (pair["p"], pair["n"]):
+            got = (per_net.get(net) or {}).get("track_mm")
+            if got is not None and abs(got - w) > 1e-4 and net in imp_nets:
+                raise RulesError(
+                    "net %r is declared %.4f mm wide by its diff_pairs entry but "
+                    "%.4f mm by its impedance target - two widths for one net is "
+                    "a contradiction, not a fallback" % (net, w, got),
+                    "RULES_INVALID",
+                    hint="drop width_mm from the diff_pairs entry and let the "
+                         "impedance target set it, or raise/lower the target")
             entry = per_net.get(net)
             if entry is None:
                 entry = {"clearance_mm": clr, "track_mm": w,
@@ -387,7 +598,9 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
         "edge_clearance_mm": edge,
         "creepage_mm": crp,
         "creepage_pairs": pairs,
+        "creepage_lookup": lookup,
         "diff_pairs": dpairs,
+        "impedance_targets": imp,
         "default": board_default,
         "per_net": per_net,
         "classes": cls,

@@ -707,6 +707,64 @@ def _lceda_pro_run(args):
                           "unverified - the snippet, not the tool, decides",
     }, verified=True, logs=out["logs"], duration_ms=out["duration_ms"])
 
+def _lceda_pcb_write(args):
+    """Run a write snippet inside the editor ONLY if its effect is read back.
+
+    Nothing here invents the vendor's write API: the snippet is the caller's, and
+    the discipline is this tool's - a probe before, the same probe after, and a
+    refusal (`WRITE_HAD_NO_EFFECT`) when the design did not move. Every answer
+    carries `verified_against_app: false`, because no write has been run against
+    the real application in this build.
+    """
+    from . import lceda_write as _write
+    op = args.get("op") or "write"
+    spec = _write.OPS.get(op)
+    if spec is None:
+        return err("unknown op %r" % (op,), "ARG_INVALID",
+                   hint="op is one of %s" % (", ".join(sorted(_write.OPS)),))
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    try:
+        res = _write.run(client, args.get("session"), args.get("code"),
+                         probe=args.get("probe"),
+                         expect=args.get("expect") or spec["expect"],
+                         timeout_ms=args.get("timeout_ms"),
+                         label=args.get("label") or op)
+    except _write.WriteError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    report = res["report"]
+    if res["status"] != "ok":
+        return err(res["message"], res["reason_code"], hint=res["hint"],
+                   extra={"report": report, "why_this_op_exists": spec["why"]})
+    return ok(
+        value={"op": op, "changed": report["changed"],
+               "expect": report["expect"], "probe_used": report["probe"]},
+        unit="bool",
+        model="lceda_pro_create_save_move",
+        basis="before/after probe comparison inside the running editor, with the "
+              "caller's own snippet in between",
+        precision="NOT VERIFIED AGAINST THE APPLICATION. No write has ever been "
+                  "performed on a real project by this build, so every claim here is "
+                  "about the snippet's OBSERVED EFFECT, not about the vendor API "
+                  "having the semantics the caller assumed. A save has no "
+                  "observable state and is confirmed only by 'the call returned "
+                  "without an error'",
+        assumptions={"verified_against_app": False,
+                     "not_verified": report["not_verified"],
+                     "why_this_op_exists": spec["why"],
+                     "the_snippet_is_yours":
+                         "this server never synthesises a write call; the vendor's "
+                         "method names and argument shapes are unverified in this "
+                         "build and a generated guess is exactly the plausible wrong "
+                         "answer this project refuses"},
+        extra={"report": report})
+
 def _lceda_pro_steps(args):
     """Run a list of snippets in the editor one at a time, watchable and stoppable.
 
@@ -896,6 +954,36 @@ _tool(
     _lceda_pro_steps,
 )
 
+_tool(
+    "lceda_pcb_write",
+    "Perform ONE write inside the running LCEDA Pro editor and READ IT BACK. op is "
+    "save | move | create | write (each only names what to expect); the code is YOUR "
+    "snippet (an async function body with the vendor's `eda` object in scope) and the "
+    "probe is a second snippet that returns the state you expect to change. The probe "
+    "runs before and after the write, and an identical value is a REFUSAL "
+    "(WRITE_HAD_NO_EFFECT) - a write that silently did nothing is the failure mode "
+    "that looks like success. `save` has nothing observable to compare and says so: "
+    "it is confirmed only by 'the call returned without an error'. Every answer "
+    "carries verified_against_app=false: no write has been run against the real "
+    "application in this build, so the snippet is yours and the claim is about its "
+    "observed effect, never about the vendor API's semantics.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "session": _str("session id from lceda_pro_open / lceda_pro_sessions"),
+         "op": _str("what you are doing: save | move | create | write", "write"),
+         "code": _str("the write snippet (async function body, `eda` in scope)"),
+         "probe": _str("snippet returning the state that must change (required for "
+                       "op=move/create/write with expect='change'), e.g. a count or "
+                       "an object's position"),
+         "expect": _str("'change' (default for move/create/write) or 'no_error'",
+                        ["change", "no_error"], "change"),
+         "label": _str("what this write is, for the report"),
+         "timeout_ms": _num("per-invoke budget passed to the app (max 60000)", None),
+     }),
+     "required": ["session", "code"]},
+    _lceda_pcb_write,
+)
+
 # ----------------------------------------------------------------- board
 def _guarded(fn):
     try:
@@ -1044,12 +1132,36 @@ _tool(
          "track_mm": _num("width of the track that has to get out", None),
          "escape_mm": _num("how far past the pad edge the lane must be free", 1.5),
          "worst": _num("how many pads to list", 20),
+         "intent": _str("design intent (same object board_route reads): its "
+                        "constraints.clearance_mm / constraints.track_mm and "
+                        "nets.layers are used here, so the board is MEASURED with "
+                        "the numbers it will later be ROUTED with. Caller "
+                        "arguments still win, and every disagreement is listed"),
      }, **_COMMON),
      "required": ["path"]},
-    _board_tool(lambda b, a: _oracle.routability(
-        b, layer=a.get("layer"), grid_mm=a.get("grid_mm", 0.2),
-        clearance_mm=a.get("clearance_mm"), track_mm=a.get("track_mm"),
-        escape_mm=a.get("escape_mm", 1.5), worst=a.get("worst", 20)), derived=True),
+    _board_tool(lambda b, a: _routability_with_intent(b, a), derived=True),
+)
+
+_tool(
+    "board_intent",
+    "Check a DESIGN INTENT against a board before anything is routed. The intent "
+    "is one JSON object (version 1): `nets.route`/`nets.layers`, a `constraints` "
+    "block holding exactly the arguments board_route takes (clearance/track/via/"
+    "creepage/impedance/diff-pair related numbers), `diff_pairs`, `length_groups`, "
+    "`impedance_targets`, `keepouts` and `placement.regions`. The same object is "
+    "read by board_route and board_routability, so what measured the board is "
+    "what routes it. This tool answers three things and nothing more: is the "
+    "object well formed (an unknown key is REFUSED - a typo must not quietly mean "
+    "'not requested'), can it be true on THIS board (a keepout that swallows a "
+    "pad, a region past the edge, a ref that does not exist), and what would "
+    "board_route read out of it (the flattened keyword set, with its source "
+    "named). It never writes copper and never moves a part.",
+    {"type": "object",
+     "properties": dict({
+         "intent": _str("intent JSON file path or inline JSON object"),
+     }, **_COMMON),
+     "required": ["path", "intent"]},
+    _board_tool(lambda b, a: _board_intent(b, a), derived=True),
 )
 
 _tool(
@@ -1070,17 +1182,52 @@ _tool(
     "when YOU declare them, and are never invented: creepage (`creepage_mm`, or "
     "per-pair `creepage_pairs` = 'A:B:1.0,C:D:0.8' - a standard table keyed to "
     "working voltage, so `rules.sources.creepage` says plainly when none was "
-    "applied), diff-pair spacing (`diff_pairs`: the gap and the common width both "
+    "applied - or let this tool do the lookup from `working_voltage_v` + "
+    "`pollution_degree` + `material_group` + `insulation` with the IEC 60664-1 "
+    "Table F.5 port in calc/, which refuses an input past the end of a ladder "
+    "instead of extrapolating), diff-pair spacing (`diff_pairs`: the gap and the common width both "
     "become search constraints) and equal length (`length_groups`: the shorter "
     "nets get a 45-degree serpentine, every new segment re-checked, and an "
     "unreachable target is reported as `length_not_matched` with the length it did "
-    "reach). What it does NOT do: couple a diff pair (the two nets are routed "
-    "independently at the declared spacing and the report carries "
-    "`coupled: false` plus the gap it achieved), return paths, or negotiated "
-    "congestion.",
+    "reach). A declared pair is COUPLED after the search (`couple`, default "
+    "true): the second net's copper is replaced by the first net's path offset by "
+    "gap+width with mitered corners, every offset segment re-checked exactly, and "
+    "the report carries `coupled`, the achieved gap and `coupled_fraction` - the "
+    "share of the second net's length that really runs at the declared gap, "
+    "because a pair that couples at its fanout only is not a coupled pair. The "
+    "offset is refused rather than guessed at when the reference path branches, "
+    "when the offset lands on other copper (both sides are reported, with the "
+    "blocker by name) or when the fanout would be longer than 5 mm. Return paths "
+    "are handled too (`return_path`, default true): every signal via gets a "
+    "ground via within 2 mm, placed only where the exact check accepts it and only "
+    "when ground copper already exists on both sides of the layer change - a via "
+    "into bare laminate is a stub, so the answer says `ground_not_on_two_layers` "
+    "instead. An impedance target is the one rule that reaches the search as a "
+    "WIDTH (`impedance_targets`: [{net|p+n, ohm, dielectric_mm?, er?, copper_um?, "
+    "kind?}]): each is reverse-solved with IPC-2141A, the width becomes that net's "
+    "track width, and when the stackup cannot pin the dielectric down the answer is "
+    "an error (`IMPEDANCE_NEEDS_STACKUP`) rather than a plausible number - an "
+    "unreachable ohm value is refused with the range that stackup can offer. "
+    "Negotiated congestion is opt-in (`congestion_rounds`, default 0): when asked "
+    "for, each round collects every pending net's wish, prices the cells that too "
+    "many of them want (soft cost, never a wall) and re-routes after ripping up "
+    "the cheapest of the losers - and only the BEST round is kept, because a late "
+    "round's inflated prices make detours longer rather than better. It is off by "
+    "default on measurement, not modesty: on the 4-layer 50-net board below it buys "
+    "+3 nets for +61% of the time, and that is one board. What it still does NOT "
+    "do: refill a pour it has just made stale (it reports "
+    "`pour.needs_refill` instead), or synthesise a thermal relief.",
     {"type": "object",
      "properties": dict({
          "apply": _bool("write the copper (default false: plan only)"),
+         "intent": _str("design intent: a JSON file path or inline JSON object "
+                        "({version:1, nets:{route,layers}, constraints:{...}, "
+                        "diff_pairs, length_groups, impedance_targets, keepouts, "
+                        "placement:{regions}}). This is the SAME object "
+                        "board_routability and board_intent read, so the intent "
+                        "that measured the board is the intent that routes it. "
+                        "Caller arguments win over the file and every disagreement "
+                        "is listed under assumptions.intent.conflicts"),
          "pitch_mm": _num("search raster step", 0.1),
          "layers": _str("comma separated routers layers (default: every copper layer "
                         "that no power pour covers)"),
@@ -1100,22 +1247,53 @@ _tool(
          "creepage_pairs": _str("per-pair creepage, 'A:B:1.0,C:D:0.8' (mm); "
                                 "takes precedence over creepage_mm where it is "
                                 "stricter"),
+         "working_voltage_v": _num("RMS working voltage across the gap: look the "
+                                   "creepage up in IEC 60664-1 Table F.5 instead "
+                                   "of being told it (a value you also pass in "
+                                   "creepage_mm wins when it is stricter)", None),
+         "pollution_degree": _num("for the creepage lookup (1, 2, 3; 4 is "
+                                  "refused: the standard does not tabulate it)", 2),
+         "material_group": _str("for the creepage lookup", ["I", "II", "IIIa",
+                                                           "IIIb"], "IIIa"),
+         "insulation": _str("for the creepage lookup: basic doubles to "
+                            "reinforced by the table's own multiplier",
+                            ["basic", "reinforced"], "basic"),
+         "coating": _bool("conformal coating was declared (the table value is "
+                          "NOT relaxed here; the answer carries the IEC 60664-3 "
+                          "caveat instead)", False),
+         "altitude_m": _num("for the creepage lookup (>2000 m notes that the "
+                            "altitude correction belongs to clearance)", 0),
          "diff_pairs": {"type": "array", "description":
                         "declared differential pairs: [{p, n, gap_mm, width_mm?, "
-                        "max_skew_mm?}]. gap_mm is the edge-to-edge spacing the two "
-                        "nets must keep - it enters the search as a required "
-                        "distance, so neither net is routed through the other. The "
-                        "two nets are routed INDEPENDENTLY at that spacing; this "
-                        "router does not couple them, and the report says so with "
-                        "the gap it actually achieved.",
+                        "max_skew_mm?, couple?}]. gap_mm is the edge-to-edge "
+                        "spacing: it enters the search as a required distance, so "
+                        "neither net is routed through the other, and after the "
+                        "search the pair is coupled by replacing the second net "
+                        "with the first net's path offset by gap+width. The report "
+                        "carries `coupled`, `gap_achieved_mm`, `coupled_fraction` "
+                        "and, when coupling was refused, the reason and the "
+                        "blocker.",
                         "items": {"type": "object", "properties": dict({
-                            "p": _str("one net of the pair"),
-                            "n": _str("the other net"),
+                            "p": _str("one net of the pair (the reference: its path "
+                                      "is kept and the other is offset from it)"),
+                            "n": _str("the other net (its copper is replaced)"),
                             "gap_mm": _num("required edge-to-edge spacing"),
                             "width_mm": _num("common track width for both"),
                             "max_skew_mm": _num("length-matching budget; adds the "
                                                 "pair to the length groups"),
+                            "couple": _bool("cut the second net as an offset copy of "
+                                            "the first (default true); false keeps "
+                                            "the two routed independently at the gap",
+                                            True),
                         }, **{"required": ["p", "n", "gap_mm"]})}},
+         "return_path": _bool("add a ground via beside every signal via so the "
+                              "return current has a way across the layer change "
+                              "(default true); refused by name when the board has "
+                              "no unambiguous ground net or no ground copper on "
+                              "both sides", True),
+         "return_path_net": _str("which net is the ground (default: the one net "
+                                 "named GND/GROUND/VSS/0V; more than one is a "
+                                 "refusal, not a coin flip)"),
          "length_groups": {"type": "array", "description":
                            "nets that must come out the same length: [{name, nets, "
                            "target_mm?, max_skew_mm?, amplitude_mm?}]. After "
@@ -1135,7 +1313,39 @@ _tool(
                                                     "3*sqrt(2)*width so the legs of "
                                                     "a tooth keep 3w apart)"),
                            }, **{"required": ["nets"]})}},
+         "impedance_targets": {"type": "array", "description":
+                               "single-ended impedance requirements: [{net|p+n, "
+                               "ohm, dielectric_mm?, er?, copper_um?, kind?}]. The "
+                               "target is reverse-solved to a track width, which "
+                               "becomes that net's width in the search (a pair "
+                               "gives both nets the same width). dielectric_mm is "
+                               "required unless the board's stackup holds exactly "
+                               "one dielectric thickness; er/copper_um default to "
+                               "4.3/35 and are declared as defaults. An "
+                               "unreachable target is refused with the reachable "
+                               "range.",
+                               "items": {"type": "object", "properties": dict({
+                                   "net": _str("the net that must hit the impedance"),
+                                   "p": _str("one net of a pair (alternative to net)"),
+                                   "n": _str("the other net of the pair"),
+                                   "ohm": _num("target characteristic impedance"),
+                                   "dielectric_mm": _num("dielectric thickness "
+                                                         "between the trace and its "
+                                                         "reference plane"),
+                                   "er": _num("relative permittivity (default 4.3)"),
+                                   "copper_um": _num("copper thickness (default 35 = "
+                                                     "1 oz)"),
+                                   "kind": _str("microstrip (default) or stripline"),
+                               }, **{"required": ["ohm"]})}},
          "rip_up_rounds": _num("how many bounded rip-up rounds (0 turns it off)", 1),
+         "congestion_rounds": _num("negotiated congestion passes AFTER the sweeps "
+                                    "(0 = off; default off because the real-board "
+                                    "measurement is in docs/27, not assumed here)",
+                                    0),
+         "congestion_max_rips": _num("how many nets one congestion round may pull "
+                                     "out (default 12)", 12),
+         "congestion_weight": _num("price per shared cell that a negotiation round "
+                                    "adds (higher = more willing to detour)", 1.0),
          "incremental": _bool("treat the net's existing copper as already connected "
                               "and route only what is missing", False),
          "allow_vias": _bool("may the search change layers", True),
@@ -1241,6 +1451,88 @@ def _parse_creepage_pairs(val):
         out.append({"a": a, "b": b, "mm": mm})
     return out
 
+def _board_intent(board, args):
+    """Validate an intent and say what the router would read out of it."""
+    from .route import intent as _intent
+    try:
+        spec = _intent.load(args.get("intent"))
+    except _intent.IntentError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint)
+    flat, report = _intent.resolve({}, spec)
+    checked = _intent.check_against_board(spec, board)
+    blocking = [p for p in checked["problems"]
+                if p.get("what") == "keepout" or "no such footprint" in
+                str(p.get("problem")) or "past the board edge" in
+                str(p.get("problem"))]
+    out = ok(
+        value={"version": spec["version"],
+               "declared": sorted(k for k in spec if not k.startswith("_")),
+               "router_keywords": sorted(flat),
+               "problems": len(checked["problems"]),
+               "blocking": len(blocking)},
+        unit="keys/findings",
+        model="design_intent",
+        basis="route/intent.py: one vocabulary, one merge rule (caller arguments "
+              "win, disagreements named), and a board check that reads the "
+              "outline and the footprint/pad geometry actually in the file",
+        precision="this is a CHECK, not a placement: 'footprint is outside its "
+                  "declared region' is reported as the fact it is, and nothing is "
+                  "moved. An intent that passes here can still fail to route - a "
+                  "keepout that leaves no corridor is geometry the router will "
+                  "answer with `no_path`",
+        assumptions={"intent": report,
+                     "board_rules_are_not_merged_here":
+                         "constraints that the intent does not declare keep the "
+                         "board's own net-class values (board_route reads those)",
+                     "rationale": spec.get("rationale")},
+        extra={"flattened": flat,
+               "keepouts": checked["keepouts"],
+               "placement": checked["placement"],
+               # `value.problems` is the COUNT; these are the findings themselves.
+               # Two keys that differ only by number-vs-list would read as a
+               # contradiction.
+               "findings": checked["problems"],
+               "blocking_findings": blocking})
+    if blocking:
+        out["status"] = "error"
+        out["reason_code"] = "INTENT_INVALID"
+        out["message"] = ("%d finding(s) make this intent impossible on this board"
+                          % (len(blocking),))
+        out["hint"] = ("a keepout over a pad or a ref that does not exist is "
+                       "refused here rather than routing for ten minutes against a "
+                       "constraint the board contradicts")
+    return out
+
+def _routability_with_intent(board, args):
+    """`board_routability` reads the same intent object `board_route` reads.
+
+    The point is not tidiness: a board measured with the net-class clearance and
+    then routed with `clearance_mm=0.2` was measured about a different board.
+    """
+    from .route import intent as _intent
+    kw = {"layer": args.get("layer"), "grid_mm": args.get("grid_mm", 0.2),
+          "clearance_mm": args.get("clearance_mm"), "track_mm": args.get("track_mm"),
+          "escape_mm": args.get("escape_mm", 1.5), "worst": args.get("worst", 20)}
+    report = None
+    if args.get("intent"):
+        try:
+            spec = _intent.load(args["intent"])
+        except _intent.IntentError as exc:
+            return err(exc.message, exc.reason_code, hint=exc.hint)
+        flat, report = _intent.resolve({}, spec)
+        if flat.get("clearance_mm") is not None and kw["clearance_mm"] is None:
+            kw["clearance_mm"] = flat["clearance_mm"]
+        if flat.get("track_mm") is not None and kw["track_mm"] is None:
+            kw["track_mm"] = flat["track_mm"]
+        layers = flat.get("layers") or []
+        if not kw["layer"] and len(layers) == 1:
+            kw["layer"] = layers[0]
+        report["board"] = _intent.check_against_board(spec, board)
+    out = _oracle.routability(board, **kw)
+    if report is not None and isinstance(out, dict):
+        out.setdefault("assumptions", {})["intent"] = report
+    return out
+
 def _board_route(args):
     """Plan (or plan+write) a routed board.
 
@@ -1264,7 +1556,9 @@ def _board_route(args):
     kw = {}
     for key in ("pitch_mm", "clearance_mm", "track_mm", "via_diameter_mm",
                 "via_drill_mm", "edge_clearance_mm", "creepage_mm",
-                "rip_up_rounds", "max_nets"):
+                "working_voltage_v", "pollution_degree", "altitude_m",
+                "rip_up_rounds", "max_nets", "congestion_rounds",
+                "congestion_max_rips", "congestion_weight"):
         if args.get(key) is not None:
             kw[key] = args[key]
     try:
@@ -1279,6 +1573,8 @@ def _board_route(args):
     try:
         dpairs = _parse_object_list(args.get("diff_pairs"), "diff_pairs")
         lgroups = _parse_object_list(args.get("length_groups"), "length_groups")
+        itargets = _parse_object_list(args.get("impedance_targets"),
+                                      "impedance_targets")
     except ValueError as exc:
         return err(str(exc), "ARG_INVALID",
                    hint='diff_pairs entries are {p, n, gap_mm} objects, '
@@ -1289,15 +1585,51 @@ def _board_route(args):
         kw["diff_pairs"] = dpairs
     if lgroups:
         kw["length_groups"] = lgroups
+    if itargets:
+        kw["impedance_targets"] = itargets
     for key in ("layers", "nets"):
         val = args.get(key)
         if isinstance(val, str):
             val = [x.strip() for x in val.split(",") if x.strip()]
         if val:
             kw[key] = val
-    for key in ("incremental", "allow_vias", "ignore_zone_areas", "second_sweep"):
+    for key in ("incremental", "allow_vias", "ignore_zone_areas", "second_sweep",
+                "return_path"):
         if args.get(key) is not None:
             kw[key] = bool(args[key])
+    for key in ("material_group", "insulation"):
+        if args.get(key) is not None:
+            kw[key] = str(args[key])
+    if args.get("coating") is not None:
+        kw["coating"] = bool(args["coating"])
+    if args.get("return_path_net"):
+        kw["return_path_net"] = str(args["return_path_net"])
+    intent_report = None
+    if args.get("intent"):
+        from .route import intent as _intent
+        try:
+            spec = _intent.load(args["intent"])
+        except _intent.IntentError as exc:
+            return err(exc.message, exc.reason_code, hint=exc.hint)
+        checked = _intent.check_against_board(spec, board)
+        # Two kinds of finding, deliberately not the same severity: "this keepout
+        # swallows a pad" and "there is no such footprint" mean the intent cannot
+        # be true on this board and are refused; "the footprint is not inside its
+        # region yet" is simply where the board is today, and is reported.
+        blocking = [p for p in checked["problems"]
+                    if p.get("what") == "keepout" or "no such footprint" in
+                    str(p.get("problem")) or "past the board edge" in
+                    str(p.get("problem"))]
+        if blocking:
+            return err("the intent cannot be true on this board: %d finding(s)"
+                       % (len(blocking),), "INTENT_INVALID",
+                       hint="a keepout that covers a pad, a region off the board or "
+                            "a ref that does not exist is refused before routing "
+                            "spends ten minutes failing for the declared reason",
+                       extra={"intent_problems": blocking[:12],
+                              "intent_source": checked.get("source")})
+        kw, intent_report = _intent.resolve(kw, spec)
+        intent_report["board"] = checked
     try:
         res = _router.plan(board, **kw)
     except RulesError as exc:
@@ -1326,9 +1658,11 @@ def _board_route(args):
                   "the exact check accepted every segment. It does NOT mean the board "
                   "is DRC clean - run board_drc after writing - and it does not mean "
                   "the layout is good: length matching only happens for the groups "
-                  "you declared, a diff pair is two independently routed nets held "
-                  "at the declared spacing (not coupled), and no thermal, return-path "
-                  "or impedance reasoning is applied",
+                  "you declared, a diff pair is only coupled when `couple` is true "
+                  "(and then `coupled_fraction` says how much of it really is a "
+                  "pair), ground stitching only places a via where ground copper "
+                  "already exists on both sides, and no thermal or impedance "
+                  "reasoning is applied",
         assumptions={
             "clearance_mm": res["rules"]["clearance_mm"],
             "track_mm": res["rules"]["track_mm"],
@@ -1336,23 +1670,39 @@ def _board_route(args):
                        res["rules"]["via_drill_mm"]],
             "creepage_mm": res["rules"]["creepage_mm"],
             "creepage_pairs": res["rules"]["creepage_pairs"],
+            "creepage_lookup": (None if res["rules"].get("creepage_lookup") is None
+                                else {k: res["rules"]["creepage_lookup"].get(k)
+                                      for k in ("value", "unit", "ladder",
+                                                "ladder_step_upper_v", "edition",
+                                                "basis", "precision")}),
             "diff_pairs": res["rules"]["diff_pairs"],
+            "impedance_targets": res["rules"]["impedance_targets"],
             "length_groups_asked": len(lgroups),
             "where_the_numbers_came_from": res["rules"]["sources"],
             "assumed_by_this_server": res["rules"]["assumed"],
             "routing_layers": res["layers_routing"],
             "plane_layers": res["layers_plane"],
+            "return_path": (None if res.get("return_path") is None
+                            else {"ground_net": res["return_path"]["ground_net"],
+                                  "status": res["return_path"]["status"],
+                                  "vias_added": len(res["return_path"]["added"]),
+                                  "skipped": len(res["return_path"]["skipped"])}),
             "writes_nothing": args.get("apply") is not True,
+            "intent": intent_report,
+            "pour": res.get("pour"),
         },
         extra={
             "diff_pairs": res["diff_pairs"],
+            "impedance_targets": res["rules"]["impedance_targets"],
             "length_groups": res["length_groups"],
+            "return_path": res.get("return_path"),
             "nets": res["nets"],
             "failed": failed,
             "rejected_segments": res["rejected"],
             "stats": dict((k, v) for k, v in stats.items() if k != "rule_bundle"),
             "grid_notes": stats["grid_notes"],
             "ops_preview": res["ops"][:5],
+            "pour": res.get("pour"),
         })
     if args.get("apply") is not True:
         out["next_step"] = ("pass apply=true to write this copper (it goes through "

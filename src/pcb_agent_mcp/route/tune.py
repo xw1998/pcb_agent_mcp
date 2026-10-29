@@ -35,6 +35,12 @@ from .. import geometry as G
 # (a 0.1 mm meander is not a meander, it is a wiggle nobody can fabricate).
 AMP_FACTOR = 3.0 * math.sqrt(2.0)
 AMP_FLOOR_MM = 0.5
+# A meander that does not fit at the declared amplitude is not the end of the
+# answer: a narrower one still adds length, it just needs a longer segment. The
+# ladder is what turns "cannot match this group" into "matched with a 0.9 mm
+# amplitude", and each step is re-checked exactly, so a narrow shape is never
+# written on the strength of the wide one having been close.
+AMPLITUDE_LADDER = (1.0, 0.75, 0.5, 0.35, 0.25)
 # Fabrication tolerance for "the gap is the gap". Measured on purpose: a mitered
 # corner is exactly `gap` from the leg it was offset from, and a straight run is
 # exact to floating point, so 0.02 mm is slack for the corner arc only.
@@ -205,6 +211,67 @@ def _emit_meander(em, op, pts):
                   "segments": len(new_ops)}
 
 
+def _candidate_order(em, net, cands, air_mm=2.0):
+    """Rank a net's straight segments by how well a meander would sit on them.
+
+    Length alone is the wrong key twice over: a shorter segment in open copper is
+    a better host than the longest one squeezed between two other nets, and a
+    segment that ends at a via is the worst host of all - a serpentine right at a
+    layer change is a stub, and every tooth of it is a reflection the board did
+    not have before. So the score is "how much length this segment can hold",
+    discounted by what surrounds it:
+
+    * `room_mm` - `max_extra` at the widest amplitude, i.e. the honest upper
+      bound on what this segment can buy;
+    * `ends_at_a_via` - quarter weight, from the net's own vias on that layer;
+    * `other_copper_within_air` - quarter weight when copper of ANOTHER net sits
+      within `air_mm` of the segment's midpoint, read from the router's own
+      raster (a coarse probe, and named as one).
+
+    Returns `[(score, op, why), ...]` best first, with `why` kept so the report
+    can say which segments were passed over and for what.
+    """
+    out = []
+    vias = [(o["x"], o["y"]) for o in em.ops if o.get("op") == "add_via"
+            and o.get("net") == net]
+    grid = em.grid
+    for op in cands:
+        a = (op["x1"], op["y1"])
+        b = (op["x2"], op["y2"])
+        seg_len = _seg_length(op)
+        widest = max(AMP_FLOOR_MM, AMP_FACTOR * float(op["width"]))
+        room = max_extra(seg_len, widest)
+        ends_at_a_via = any(
+            (abs(vx - a[0]) < 1e-6 and abs(vy - a[1]) < 1e-6)
+            or (abs(vx - b[0]) < 1e-6 and abs(vy - b[1]) < 1e-6)
+            for vx, vy in vias)
+        crowd = None
+        try:
+            layer_map = grid._map[op["layer"]]
+            for cell in grid.cells_near((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0,
+                                        air_mm):
+                val = layer_map[cell]
+                if not val:
+                    continue
+                names = grid._sets[val - 1]
+                if len(names) == 1 and names[0] == net:
+                    continue
+                crowd = True
+                break
+        except (KeyError, IndexError, AttributeError):   # noqa: BLE001
+            crowd = None
+        score = room
+        if ends_at_a_via:
+            score *= 0.25
+        if crowd:
+            score *= 0.25
+        out.append((score, op, {"length_mm": round(seg_len, 4),
+                                "room_mm": round(room, 4),
+                                "ends_at_a_via": bool(ends_at_a_via),
+                                "other_copper_within_mm": (air_mm if crowd else None)}))
+    out.sort(key=lambda it: -it[0])
+    return out
+
 def match_group(em, bundle, group, results, ops_of=None):
     """Bring one length group as close to equal as the finished copper allows."""
     from . import rules as R
@@ -238,7 +305,18 @@ def match_group(em, bundle, group, results, ops_of=None):
         width = float(spec["track_mm"])
         amp = float(amplitude) if amplitude else max(AMP_FLOOR_MM,
                                                      AMP_FACTOR * width)
-        cands = sorted(_tracks(em.ops, net), key=_seg_length, reverse=True)
+        # Length is not the best host criterion (see `_candidate_order`), and one
+        # amplitude is not the only shape: the ladder below is tried on each
+        # candidate before it is given up on.
+        ranked = _candidate_order(em, net, _tracks(em.ops, net))
+        cands = [op for _score, op, _why in ranked]
+        tried = [why for _score, _op, why in ranked]
+        ladder = [amp]
+        for factor in AMPLITUDE_LADDER:
+            narrow = amp * factor
+            if narrow >= max(AMP_FLOOR_MM / 4.0, 0.15) and \
+                    all(abs(narrow - x) > 1e-9 for x in ladder):
+                ladder.append(narrow)
         got = None
         why = None
         remaining = need
@@ -247,42 +325,56 @@ def match_group(em, bundle, group, results, ops_of=None):
             if remaining <= max(tol, 1e-6):
                 break
             seg_len = _seg_length(op)
-            room = max_extra(seg_len, amp)
-            if room <= 1e-6:
+            if max_extra(seg_len, ladder[0]) <= 1e-6:
                 why = {"reason": "no_segment_long_enough",
-                       "needed_mm": round(need, 4), "amplitude_mm": round(amp, 4),
+                       "needed_mm": round(need, 4),
+                       "amplitude_mm": round(ladder[0], 4),
                        "longest_segment_mm": round(seg_len, 4)}
                 continue
-            want = min(remaining, room)
             a = (op["x1"], op["y1"])
             b = (op["x2"], op["y2"])
-            for side in (1, -1):
-                pts = _serpentine(a, b, want, amp, side)
-                if pts is None:
-                    why = {"reason": "no_segment_long_enough",
-                           "needed_mm": round(need, 4),
-                           "amplitude_mm": round(amp, 4),
-                           "longest_segment_mm": round(seg_len, 4)}
+            placed = False
+            for this_amp in ladder:
+                room = max_extra(seg_len, this_amp)
+                if room <= 1e-6:
                     continue
-                ok, info = _emit_meander(em, op, pts)
-                if not ok:
-                    why = info
-                    continue
-                added = net_length(em.ops, net) - before[net] - sum(
-                    p["added_mm"] for p in parts)
-                parts.append({"replaced": info["replaced"],
-                              "segments": info["segments"],
-                              "amplitude_mm": round(amp, 4),
-                              "teeth": (len(pts) - 2) // 2,
-                              "side": side,
-                              "added_mm": round(added, 4)})
-                remaining -= added
-                break
+                want = min(remaining, room)
+                for side in (1, -1):
+                    pts = _serpentine(a, b, want, this_amp, side)
+                    if pts is None:
+                        why = {"reason": "no_segment_long_enough",
+                               "needed_mm": round(need, 4),
+                               "amplitude_mm": round(this_amp, 4),
+                               "longest_segment_mm": round(seg_len, 4)}
+                        continue
+                    ok, info = _emit_meander(em, op, pts)
+                    if not ok:
+                        why = dict(info)
+                        why["amplitude_mm"] = round(this_amp, 4)
+                        continue
+                    added = net_length(em.ops, net) - before[net] - sum(
+                        p["added_mm"] for p in parts)
+                    parts.append({"replaced": info["replaced"],
+                                  "segments": info["segments"],
+                                  "amplitude_mm": round(this_amp, 4),
+                                  "narrowed": abs(this_amp - amp) > 1e-9,
+                                  "teeth": (len(pts) - 2) // 2,
+                                  "side": side,
+                                  "added_mm": round(added, 4)})
+                    remaining -= added
+                    placed = True
+                    break
+                if placed:
+                    break
+            if placed:
+                continue
         got = None
         if parts:
             got = {"added_mm": round(net_length(em.ops, net) - before[net], 4),
-                   "amplitude_mm": round(amp, 4),
-                   "meanders": parts}
+                   "amplitude_mm": round(parts[0]["amplitude_mm"], 4),
+                   "amplitude_ladder_mm": [round(x, 4) for x in ladder],
+                   "meanders": parts,
+                   "hosts_considered": tried[:8]}
         if got is None:
             out["detail"].setdefault(net, {})["why"] = why or {
                 "reason": "no_segment_long_enough",
@@ -355,11 +447,57 @@ def pair_report(em, pair, bundle=None):
     return out
 
 
-def finish(em, bundle, results, diff_pairs=None, length_groups=None):
-    """Run the post-passes and rebuild the search map from what actually stands."""
-    pairs = list(diff_pairs or [])
+def finish(em, bundle, results, diff_pairs=None, length_groups=None,
+           terms_by_net=None, return_path=True, return_path_net=None):
+    """Run the post-passes and rebuild the search map from what actually stands.
+
+    Order matters and is not arbitrary: **coupling first**, because it REPLACES
+    the second net's copper (a meander written before it would be thrown away),
+    then length matching, because a meander changes a length, and **ground
+    stitching last**, because it reacts to whatever vias the board finally has -
+    a pair coupled after the stitching pass would leave its fanout vias
+    unserved.
+    """
+    from . import couple as C
+
+    pairs = [dict(p) for p in (diff_pairs or [])]
     groups = [dict(g) for g in (length_groups or [])]
+    coupling = _couple_pairs(em, bundle, results, pairs, terms_by_net)
     reports = [pair_report(em, p, bundle) for p in pairs]
+    for rep in reports:
+        key = tuple(sorted([rep.get("p"), rep.get("n")]))
+        info = coupling.get(key)
+        if not info:
+            continue
+        rep["coupled"] = bool(info.get("coupled"))
+        rep["coupling"] = info
+        # The measured gap is still reported even when coupling worked: a coupled
+        # pair whose copper is 0.05 mm off is a fact about the board, not a reason
+        # to stop reporting numbers.
+        if info.get("coupled_fraction") is not None:
+            rep["coupled_fraction"] = info["coupled_fraction"]
+        if not info.get("coupled"):
+            # The measured gap still stands, but "the pair kept its independent
+            # routing" now has a reason attached, and the reason is not "this
+            # router cannot couple" any more.
+            rep["why"] = _coupling_why(info, rep.get("gap_declared_mm"),
+                                       rep.get("gap_achieved_mm"))
+        if info.get("coupled"):
+            if rep.get("status") == "pair_not_coupled":
+                rep["status"] = "pair_coupled"
+            elif rep.get("status") == "reported":
+                rep["status"] = "pair_coupled"
+            if info.get("skew_over_budget"):
+                rep["status"] = "pair_skew_over_budget"
+                rep["why"] = info.get("why") or {
+                    "reason": "coupled_pair_cannot_be_meandered",
+                    "skew_mm": info.get("skew_mm"),
+                    "max_skew_mm": info.get("max_skew_mm"),
+                    "note": "a coupled pair has to be lengthened as a PAIR (both "
+                            "members accordion together); meandering one member "
+                            "would destroy the gap, so nothing was meandered and "
+                            "the skew is reported as it came out"}
+    coupled_keys = set(k for k, v in coupling.items() if v.get("coupled"))
     # A pair with a skew budget IS a length group with two members - writing the
     # meander code twice would be two places to get it wrong.
     have = set(tuple(sorted(g.get("nets") or [])) for g in groups)
@@ -369,6 +507,13 @@ def finish(em, bundle, results, diff_pairs=None, length_groups=None):
         key = tuple(sorted([p["p"], p["n"]]))
         if key in have:
             continue
+        # A coupled pair DOES get its skew budget turned into a length group.
+        # The meander then lands on the shorter member only, and the exact check
+        # forces it to the side AWAY from its partner (a tooth toward the partner
+        # would eat the gap and be refused). That is how a person tunes a coupled
+        # pair: the extra length lives outside the pair, not between the two
+        # traces. `coupled_fraction` is re-measured afterwards so the number that
+        # finally comes out already counts any length that left the pair.
         groups.append({"name": "pair %s/%s" % (p["p"], p["n"]),
                        "nets": [p["p"], p["n"]],
                        "max_skew_mm": p["max_skew_mm"]})
@@ -381,6 +526,159 @@ def finish(em, bundle, results, diff_pairs=None, length_groups=None):
                 results[net]["length_mm"] = round(net_length(em.ops, net), 3)
                 results[net]["segments"] = len(_tracks(em.ops, net))
         # The gap is only meaningful after the meanders: a changed length is
-        # changed copper, and the pair's achieved spacing has to be re-measured.
+        # changed copper, and every number about the pair has to be re-measured.
         reports = [pair_report(em, p, bundle) for p in pairs]
-    return {"diff_pairs": reports, "length_groups": length_reports}
+        _refresh_measures(em, pairs, coupling, reports)
+    rp = None
+    if return_path:
+        from . import return_path as RP
+        rp = RP.stitch(em, bundle, results, net=return_path_net or None)
+    return {"diff_pairs": reports, "length_groups": length_reports,
+            "return_path": rp}
+
+
+_COUPLING_TEXT = {
+    "not_asked": "the pair was declared with couple=false, so the two nets were "
+                 "routed independently",
+    "no_terminal_information": "the router was given no terminal table, so it "
+                               "cannot know which pads are the pair's ends and "
+                               "left the two nets independently routed",
+    "one_side_not_routed": "one side of the pair did not route, so there is no "
+                           "reference path to offset",
+    "pair_needs_two_pads_each": "coupling needs exactly two pads on each side: "
+                                "the offset walk has two ends and cannot guess "
+                                "which branch a third pad belongs to",
+    "reference_net_has_no_copper": "the first net has no copper to offset",
+    "reference_net_branches": "the first net's copper branches (or loops), so "
+                              "there is no single path to offset - a guess would "
+                              "put the second net in the wrong place",
+    "reference_net_has_a_zero_length_run": "a layer run of the first net has no "
+                                           "length, so its normal is undefined",
+    "offset_degenerate": "the offset path collapsed (a repeated point leaves no "
+                         "normal to offset along)",
+    "offset_blocked": "the offset path runs into other copper",
+    "fanout_too_long": "the offset path would start too far from a pad to be a "
+                       "fanout, and joining it would draw a diagonal nobody asked "
+                       "for",
+}
+
+
+def _coupling_why(info, declared, achieved):
+    """One sentence for "why is this pair not coupled", specific to the reason."""
+    reason = info.get("reason") or "not_coupled"
+    text = _COUPLING_TEXT.get(reason, "coupling was not applied (%s)" % reason)
+    out = {"reason": reason, "coupled": False,
+           "declared_mm": declared, "achieved_mm": achieved,
+           "note": "the two nets do not run side by side: %s" % text}
+    detail = info.get("detail")
+    if isinstance(detail, dict):
+        out["detail"] = detail
+    for key in ("gap_mm", "coupled_fraction", "skew_mm", "max_skew_mm"):
+        if info.get(key) is not None:
+            out[key] = info[key]
+    return out
+
+
+def _refresh_measures(em, pairs, coupling, reports):
+    """Re-measure every pair number against the copper that finally stands."""
+    from . import couple as C
+
+    for pair in pairs:
+        key = tuple(sorted([pair.get("p"), pair.get("n")]))
+        info = coupling.get(key)
+        if not info or not info.get("coupled"):
+            continue
+        p, n = pair.get("p"), pair.get("n")
+        gap = float(pair["gap_mm"])
+        info["coupled_fraction"] = C.coupled_fraction(em.ops, p, n, gap)
+        g = _gap_between([o for o in em.ops if o.get("net") == p],
+                         [o for o in em.ops if o.get("net") == n])
+        info["gap_achieved_mm"] = None if g is None else round(g, 4)
+        info["length_p_mm"] = round(net_length(em.ops, p), 4)
+        info["length_n_mm"] = round(net_length(em.ops, n), 4)
+        info["skew_mm"] = round(abs(info["length_p_mm"] - info["length_n_mm"]), 4)
+        for rep in reports:
+            if tuple(sorted([rep.get("p"), rep.get("n")])) != key:
+                continue
+            rep["coupled"] = True
+            rep["coupling"] = info
+            rep["coupled_fraction"] = info["coupled_fraction"]
+            rep["gap_achieved_mm"] = info["gap_achieved_mm"]
+            rep["length_p_mm"] = info["length_p_mm"]
+            rep["length_n_mm"] = info["length_n_mm"]
+            rep["skew_mm"] = info["skew_mm"]
+            # A meander outside the pair is copper that is not at the gap any
+            # more, so the pair status has to say "coupled, tuned outside" rather
+            # than pretend the whole run is a tight pair.
+            frac = info["coupled_fraction"]
+            if marry_ok(rep, frac):
+                rep["status"] = "pair_coupled"
+            else:
+                rep["status"] = "pair_coupled_partly"
+                rep.setdefault("why", {})["note"] = (
+                    "the pair is coupled but only %.0f%% of the second net's "
+                    "length runs at the declared gap; the rest is fanout and "
+                    "length-tuning copper outside the pair" % (100.0 * frac))
+
+
+def marry_ok(rep, frac):
+    """Is this pair coupled tightly enough to be called coupled without a caveat?"""
+    if rep.get("status") == "pair_skew_over_budget":
+        return False
+    return frac is not None and frac >= 0.8
+
+
+def _couple_pairs(em, bundle, results, pairs, terms_by_net):
+    """Make the second net of each pair the first's path, offset by the gap."""
+    from . import couple as C
+
+    out = {}
+    for pair in pairs:
+        p, n = pair.get("p"), pair.get("n")
+        key = tuple(sorted([p, n]))
+        if not p or not n:
+            continue
+        if pair.get("couple") is False:
+            out[key] = {"p": p, "n": n, "coupled": False,
+                        "reason": "not_asked",
+                        "note": "the pair was declared with couple=false, so the "
+                                "two nets were routed independently"}
+            continue
+        if terms_by_net is None:
+            out[key] = {"p": p, "n": n, "coupled": False,
+                        "reason": "no_terminal_information"}
+            continue
+        if (results.get(p) or {}).get("status") != "routed" \
+                or (results.get(n) or {}).get("status") != "routed":
+            out[key] = {"p": p, "n": n, "coupled": False,
+                        "reason": "one_side_not_routed",
+                        "status_p": (results.get(p) or {}).get("status"),
+                        "status_n": (results.get(n) or {}).get("status")}
+            continue
+        rep = C.coupled_route(em, bundle, pair, terms_by_net.get(p),
+                              terms_by_net.get(n))
+        gap = pair.get("gap_mm")
+        if rep.get("ok"):
+            rep["coupled_fraction"] = C.coupled_fraction(em.ops, p, n, float(gap))
+            ops_p = [o for o in em.ops if o.get("net") == p]
+            ops_n = [o for o in em.ops if o.get("net") == n]
+            g = _gap_between(ops_p, ops_n)
+            rep["gap_achieved_mm"] = None if g is None else round(g, 4)
+            rep["length_p_mm"] = round(net_length(em.ops, p), 4)
+            rep["length_n_mm"] = round(net_length(em.ops, n), 4)
+            rep["skew_mm"] = round(abs(rep["length_p_mm"] - rep["length_n_mm"]), 4)
+            if n in results:
+                results[n]["length_mm"] = round(rep["length_n_mm"], 3)
+                results[n]["segments"] = len(_tracks(em.ops, n))
+                results[n]["vias"] = len([o for o in em.ops
+                                          if o.get("op") == "add_via"
+                                          and o.get("net") == n])
+                results[n]["coupled_to"] = p
+            budget = pair.get("max_skew_mm")
+            if budget is not None and rep["skew_mm"] > float(budget) + 1e-9:
+                rep["skew_over_budget"] = True
+                rep["max_skew_mm"] = budget
+        out[key] = rep
+    if out:
+        em.rebuild()
+    return out
