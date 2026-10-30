@@ -114,12 +114,37 @@ class TestLookupRules(unittest.TestCase):
         self.assertEqual(r["engine_used"], "builtin")
         self.assertIn("no ngspice binary", r["engine_note"])
 
-    def test_builtin_still_refuses_the_a_card_by_name(self):
+    def test_builtin_solves_the_two_algebraic_code_models(self):
+        # 0.0.39: gain/limit left the "refused by name" table because they are pure
+        # algebra. The control that keeps this honest is the pair of tests below:
+        # a code model that carries STATE is still refused, and so is a parameter
+        # that changes the corner.
         r = spice.simulate(GAIN_OP, engine="builtin")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertAlmostEqual(r["value"]["nodes_v"]["10"], 2.0, delta=1e-9)
+        a = [e for e in r["value"]["elements"] if e["type"] == "A"]
+        self.assertEqual(len(a), 1)
+        self.assertEqual(a[0]["kind"], "GAIN")
+        self.assertEqual(a[0]["region"], "linear")
+        self.assertEqual(a[0]["gain"], 2.0)
+
+    def test_a_code_model_with_state_is_still_refused_by_name(self):
+        r = spice.simulate("* i\nV1 1 0 1\nA1 1 2 i1\n"
+                           ".model i1 integrator(gain=1)\nR1 2 0 1k\n.op\n",
+                           engine="builtin")
         self.assertEqual(r["status"], "error")
         self.assertEqual(r["reason_code"], "NETLIST_INVALID")
-        self.assertIn("XSPICE", r["message"])
-        self.assertIn("A1", r["message"])
+        self.assertIn("INTEGRATOR", r["message"])
+        self.assertIn("only gain and limit", r["message"])
+
+    def test_limit_range_is_refused_rather_than_clamped(self):
+        # measured: 0.9 V in with limit_range=0.5 settles at 0.82 V, not 0.9 V
+        r = spice.simulate("* q\nV1 1 0 0.9\nA1 1 2 q1\n"
+                           ".model q1 limit(gain=1 out_lower_limit=-1 "
+                           "out_upper_limit=1 limit_range=0.5)\nR1 2 0 1k\n.op\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "error")
+        self.assertIn("limit_range", r["message"])
 
 
 class TestLicenceHygiene(unittest.TestCase):
@@ -191,20 +216,24 @@ class TestBundledEngineRuns(unittest.TestCase):
         last = pts[-1]["nodes_v"]["2"]
         self.assertAlmostEqual(last, 3.0, delta=1e-6)
 
-    def test_the_envelope_says_the_deck_was_not_parsed_here(self):
+    def test_the_envelope_says_the_deck_was_parsed_here_now(self):
+        # 0.0.37: false, with a note naming XSPICE. 0.0.39: gain/limit are solved
+        # here, so this deck parses - the note belongs to the OTHER code models,
+        # which test_a_code_model_with_state_is_still_refused_by_name covers.
         r = self._ok(GAIN_OP)
-        self.assertFalse(r["netlist_parsed"])
-        self.assertIn("A", r["netlist_parse_note"])
-        self.assertIn("XSPICE", r["netlist_parse_note"])
+        self.assertTrue(r["netlist_parsed"])
+        self.assertNotIn("netlist_parse_note", r)
 
-    def test_the_builtin_subset_is_not_pretended_to_have_checked_it(self):
-        # cross_check asks both engines; the builtin one refuses this deck, so
-        # the cross-check must report "nothing to compare", never a difference.
+    def test_cross_check_now_really_compares_this_deck(self):
+        # 0.0.37 this deck was one-sided: the builtin refused it, so the
+        # cross-check had to say "nothing to compare". 0.0.39 solves gain/limit,
+        # so the honest state is a REAL comparison - and it has to be exact,
+        # because both sides are solving out = 2*v(in) with no approximation in
+        # between. A non-zero difference here would mean one of them is wrong.
         r = self._ok(GAIN_OP, cross_check=True)
         cross = r["cross_check"]
-        self.assertIsNone(cross["max_abs_diff_v"])
-        self.assertEqual(cross["compared_nodes"], 0)
-        self.assertIn("could not solve", cross["note"])
+        self.assertEqual(cross["max_abs_diff_v"], 0.0)
+        self.assertGreater(cross["compared_nodes"], 0)
 
     def test_a_pure_analog_deck_still_agrees_with_the_builtin_solver(self):
         # The bundle must not change the answer for decks the subset can do: this

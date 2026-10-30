@@ -59,9 +59,12 @@ GROUND_NAMES = ("0", "gnd", "ground", "gnd!", "vss")
 
 # Everything the language has that this module refuses by name instead of
 # silently ignoring (a silently ignored card is how a netlist "runs" and lies).
-NOT_IMPLEMENTED_CARDS = {
-    "A": "XSPICE analogue behavioural block",
-}
+# Cards the language has that are refused BY NAME (a silently ignored card is how
+# a netlist "runs" and lies). `A` left this table in 0.0.39: its two purely
+# algebraic code models (gain, limit) are now solved here, and every other code
+# model is still refused by name inside _parse_xspice - at the model, which is
+# where the refusal belongs, because an `A` card without its model says nothing.
+NOT_IMPLEMENTED_CARDS = {}
 
 SUFFIX = {
     "t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3,
@@ -1156,6 +1159,130 @@ def _parse_urc(parts, name, lineno):
     return {"type": "U", "name": name, "lineno": lineno, "nodes": nodes,
             "model": model}
 
+# XSPICE `A` cards take TWO nodes, not three: `A1 in out model`. That is not a
+# simplification, it is measured on ngspice-47 - the three-node form
+# (`A1 1 0 10 g1`) is rejected by the engine as an "incomplete or empty netlist",
+# and the two-node form drives v(out) = 2*v(in) for gain(gain=2).
+#
+# Two code models are algebraic, i.e. they carry no state and no sample clock, so
+# they can be solved here instead of delegated:
+#
+#   gain :  out = gain * (in + in_offset)
+#   limit:  out = gain * (in + in_offset), then clamped to
+#                 [out_lower_limit, out_upper_limit]
+#
+# `in_offset` sits INSIDE the gain, not outside it: measured - 2 V in with
+# gain(gain=2 in_offset=1) settles at 6.0 V, not 5.0 V.
+#
+# limit_range (XSPICE's polynomial corner smoothing) is refused by name rather
+# than approximated: with limit_range=0.5 an input of 0.9 V settles at 0.82 V
+# instead of 0.9 V (measured), and a hard clamp would report the wrong number
+# exactly where someone cared about the corner. `fraction` is refused the same
+# way. Both bounds must be given: the engine itself rejects `limit(gain=1
+# out_lower_limit=-1)` as incomplete, so there is no default to inherit.
+_XSPICE_KEYS = {
+    "GAIN": ("GAIN", "IN_OFFSET"),
+    "LIMIT": ("GAIN", "IN_OFFSET", "OUT_LOWER_LIMIT", "OUT_UPPER_LIMIT"),
+}
+
+def _parse_xspice(parts, name, lineno):
+    if len(parts) < 4:
+        raise ValueError("line %d: %s needs an input node, an output node and the "
+                         "name of a code model: Aname in out model. An XSPICE block "
+                         "takes TWO nodes (the output is referenced to ground), not "
+                         "the four of an E card" % (lineno, name))
+    if len(parts) > 4:
+        raise ValueError("line %d: %s has trailing %r. An A card is exactly three "
+                         "fields: in out model; every parameter of the block lives "
+                         "in the .model it names"
+                         % (lineno, name, " ".join(parts[4:])))
+    for tok in parts[1:3]:
+        if "=" in tok or tok.startswith("%") or tok.startswith("["):
+            raise ValueError("line %d: %s: %r is not a node. Array connections "
+                             "([1 2 3]) and %%v() references belong to code models "
+                             "with several ports, none of which is solved here"
+                             % (lineno, name, tok))
+    if parts[1] == parts[2]:
+        raise ValueError("line %d: %s has the input and the output on the same node "
+                         "%r, so the block drives its own input"
+                         % (lineno, name, parts[1]))
+    return {"type": "A", "name": name, "lineno": lineno,
+            "nodes": (_node(parts[1]), _node(parts[2])),
+            "model": parts[3]}
+
+def _xspice_model(spec, el):
+    """Resolve an A card's .model into numbers, or refuse it by name."""
+    where = "line %d: %s" % (el.get("lineno") or 0, el["name"])
+    name = el["model"]
+    models = spec["models"]
+    if name not in models:
+        raise ValueError("%s references .model %r which is not defined"
+                         % (where, name))
+    m = models[name]
+    kind = (m.get("type") or "").upper()
+    params = m["params"]
+    if kind not in _XSPICE_KEYS:
+        raise ValueError("%s names an XSPICE code model of type %r, and only gain "
+                         "and limit are solved here. Those two are pure algebra "
+                         "(out = gain*(in + in_offset), then optionally clamped); "
+                         "every other analogue code model carries state or a sample "
+                         "clock (integrator, ddt, s_xfer, ...) or several ports "
+                         "(summer, multiplier, ...), which is a different solver. "
+                         "Use engine=\"ngspice\" for those"
+                         % (where, kind or "untyped"))
+    allowed = _XSPICE_KEYS[kind]
+    for k in params:
+        if k not in allowed:
+            raise ValueError("%s: %s= in .model %r is refused by name, not ignored. "
+                             "limit_range= changes the corner (measured: 0.9 V in "
+                             "with limit_range=0.5 settles at 0.82 V, not 0.9 V) "
+                             "and fraction= changes where the polynomial starts; "
+                             "approximating either would report a number where the "
+                             "caller is asking about that very corner"
+                             % (where, k, name))
+    defaulted = []
+    gain = float(params.get("GAIN", 1.0))
+    if "GAIN" not in params:
+        defaulted.append("gain=1")
+    off = float(params.get("IN_OFFSET", 0.0))
+    if "IN_OFFSET" not in params:
+        defaulted.append("in_offset=0")
+    lo = hi = None
+    if kind == "LIMIT":
+        for key in ("OUT_LOWER_LIMIT", "OUT_UPPER_LIMIT"):
+            if key not in params:
+                raise ValueError("%s: .model %r is a limit block without %s. Both "
+                                 "bounds are REQUIRED here because the engine itself "
+                                 "refuses limit(gain=1 out_lower_limit=-1) as an "
+                                 "incomplete netlist - there is no default to "
+                                 "inherit, and a made-up one would silently pick "
+                                 "which side of the clip the answer falls on"
+                                 % (where, name, key.lower() + "="))
+        lo = float(params["OUT_LOWER_LIMIT"])
+        hi = float(params["OUT_UPPER_LIMIT"])
+        if lo > hi:
+            raise ValueError("%s: .model %r has out_lower_limit=%g above "
+                             "out_upper_limit=%g" % (where, name, lo, hi))
+    el["kind"] = kind
+    el["gain"] = gain
+    el["in_offset"] = off
+    el["lo"] = lo
+    el["hi"] = hi
+    el["defaulted"] = defaulted
+
+def _xspice_eval(el, vin):
+    """(f(vin), df/dvin). The clamp is examined at the CURRENT iterate, which is
+    what makes a clipped block Newton-convergent: inside the band the slope is the
+    gain, outside it the output is a constant and the slope is 0."""
+    raw = el["gain"] * (vin + el["in_offset"])
+    if el["lo"] is None:
+        return raw, el["gain"]
+    if raw < el["lo"]:
+        return el["lo"], 0.0
+    if raw > el["hi"]:
+        return el["hi"], 0.0
+    return raw, el["gain"]
+
 def _parse_element(spec, line, lineno):
     parts = line.split()
     name = parts[0]
@@ -1163,6 +1290,8 @@ def _parse_element(spec, line, lineno):
     if letter in NOT_IMPLEMENTED_CARDS:
         raise ValueError("line %d: %s (%s) is not implemented here: %s"
                          % (lineno, name, letter, NOT_IMPLEMENTED_CARDS[letter]))
+    if letter == "A":
+        return _parse_xspice(parts, name, lineno)
     low = [p.lower() for p in parts]
 
     def val(idx, what):
@@ -2012,6 +2141,12 @@ class _Circuit(object):
         self.vt = 0.025852 * (273.15 + self.temp_c) / 300.15
         self.elements = spec["elements"]
         self.models = spec["models"]
+        # An A card is only meaningful together with its .model, so the model is
+        # resolved here (after every card has been read, so the .model may come
+        # after the block) and its numbers are copied onto the element.
+        for el in self.elements:
+            if el["type"] == "A":
+                _xspice_model(spec, el)
         # node table
         nodes = []
         for el in self.elements:
@@ -2034,7 +2169,7 @@ class _Circuit(object):
                                      % (el.get("lineno") or "?", el["name"], dep))
         self.n = len(nodes)
         branches = [el for el in self.elements
-                    if el["type"] in ("V", "L", "E", "H", "BV")]
+                    if el["type"] in ("V", "L", "E", "H", "BV", "A")]
         self.branch_idx = {}
         for k, el in enumerate(branches):
             self.branch_idx[el["name"]] = self.n + 1 + k
@@ -2590,6 +2725,34 @@ class _Circuit(object):
                 self._add(A, row, cm, el["value"])
                 self._add(A, a, row, 1.0)
                 self._add(A, bb, row, -1.0)
+            elif T == "A":
+                # out = f(in) with the output referenced to ground, so the row is
+                # v(out) - f(v(in)) = 0 and needs its own branch current like V/E.
+                # The clamp is linearised at the previous iterate: inside the band
+                # the slope is the gain, outside it the output is constant (slope
+                # 0) - a piecewise-linear device, so Newton lands in one or two
+                # steps and a solved answer that sits on a bound is a real answer,
+                # not a stalled iterate.
+                row = self.branch_idx[el["name"]]
+                na_, nb_ = self.i(na), self.i(nb)
+                if mode == "ac":
+                    if el["kind"] == "LIMIT":
+                        raise ValueError(
+                            "%s: a limit block in an .ac sweep. The small-signal gain "
+                            "of a clipped block is the gain inside the band and zero "
+                            "outside it, i.e. it depends on where the operating point "
+                            "sits, and this module does not carry an operating point "
+                            "into the sweep. Run .dc/.tran, or use a gain() model"
+                            % el["name"])
+                    self._add(A, row, nb_, 1.0)
+                    self._add(A, row, na_, -el["gain"])
+                else:
+                    vin0 = x_prev[na_ - 1].real if na_ else 0.0
+                    f0, slope = _xspice_eval(el, vin0)
+                    self._add(A, row, nb_, 1.0)
+                    self._add(A, row, na_, -slope)
+                    self._rhs(b, row, f0 - slope * vin0)
+                self._add(A, nb_, row, 1.0)
             elif T == "G":
                 cp, cm = self.i(el["ctrl"][0]), self.i(el["ctrl"][1])
                 a, bb = self.i(na), self.i(nb)
@@ -3102,6 +3265,36 @@ def _element_report(circ, x, t=None, mode="dc"):
         v = (va - vb).real
         rec = {"name": el["name"], "type": T, "voltage_v": round(v, 9)}
         vv = lambda n: (x[circ.i(n) - 1] if circ.i(n) else 0j)  # noqa: E731
+        if T == "A":
+            # an A card's own report is the block, not a two-terminal voltage:
+            # v(nodes[0]) - v(nodes[1]) would be in - out, which is not a quantity
+            # anyone wants. Give the input, the output and which region it landed in.
+            vin_ = vv(na).real
+            vout_ = vv(nb).real
+            cur_ = x[circ.branch_idx[el["name"]] - 1].real
+            raw_ = el["gain"] * (vin_ + el["in_offset"])
+            if el["lo"] is None:
+                region = "linear"
+            elif raw_ < el["lo"]:
+                region = "clipped at out_lower_limit"
+            elif raw_ > el["hi"]:
+                region = "clipped at out_upper_limit"
+            else:
+                region = "linear"
+            rec = {"name": el["name"], "type": "A", "model": el["model"],
+                   "kind": el["kind"], "input_v": round(vin_, 12),
+                   "output_v": round(vout_, 12), "voltage_v": round(vout_, 12),
+                   "current_a": round(cur_, 12),
+                   "power_w": round(vout_ * cur_, 12),
+                   "gain": el["gain"], "in_offset": el["in_offset"],
+                   "region": region}
+            if el["lo"] is not None:
+                rec["out_lower_limit"] = el["lo"]
+                rec["out_upper_limit"] = el["hi"]
+            if el["defaulted"]:
+                rec["defaulted_model_params"] = list(el["defaulted"])
+            out.append(rec)
+            continue
         if T == "R":
             rec["current_a"] = round(v / el["value"], 12)
             rec["power_w"] = round(v * v / el["value"], 12)
@@ -3321,7 +3514,13 @@ NOT_COMPUTED = [
     "accepted inside .model parameters",
     "a .subckt nested inside another .subckt, and any directive other than "
     ".model inside a .subckt body",
-    "XSPICE blocks (A) are refused by name. JFETs (J), switches (S/W), controlled "
+    "only two XSPICE code models are solved: gain and limit, and only their "
+    "algebra (out = gain*(in + in_offset), optionally clamped to the two bounds). "
+    "Every other analogue code model carries state or a sample clock (integrator, "
+    "ddt, s_xfer) or several ports (summer, multiplier), and is refused by name "
+    "rather than approximated; a limit block is also refused inside .ac, because "
+    "its small-signal gain depends on which region the operating point sits in. "
+    "JFETs (J), switches (S/W), controlled "
     "sources (F/H) and mutual inductance (K) ARE solved, but not their second-order "
     "physics: a JFET has no gate-channel junction diode (the report says when a "
     "deck forward-biases it past 0.5 V), no RD/RS internal nodes, no device "

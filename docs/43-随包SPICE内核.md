@@ -202,5 +202,36 @@ env -u PYTHONHOME PYTHONPATH=src python -m unittest tests.test_spice_bundled -v
 - **不给 `auto` 加随包分支**。理由见 43.4：那会改变所有既有调用方的答案。
 - **不替引擎解释它自己的错误**。`ENGINE_FAILED` 只把引擎的日志尾巴交出去（`log_tail`），
   不翻译成「大概是某张卡」。
-- `A` 卡**不在内置**。随包只解决「能不能跑」，不解决「谁来解」——内置子集仍然按名字拒绝，
-  因为「跳过一张不认识的卡然后给出一个数字」正是这个模块一直在防的事。
+- `A` 卡**原先整体不在内置**。随包只解决「能不能跑」，不解决「谁来解」。`0.0.39` 把其中
+  **纯代数**的两种 code model（`gain`、`limit`）搬进了内置（见 [17 §17.11](17-仿真层.md) 与
+  下面 43.10）；剩下的仍然按名字拒绝，因为「跳过一张不认识的卡然后给出一个数字」正是这个模块
+  一直在防的事。
+
+## 43.10 `0.0.39`：两种 code model 进了内置（`gain` / `limit`）
+
+随包解决了「谁来跑」，没解决「谁来解」。`0.0.39` 把 `A` 卡里**没有状态、没有采样时钟、只有一个
+端口**的那两种搬进内置求解器——它们不是器件方程，是两行代数：
+
+    gain :  out = gain * (in + in_offset)
+    limit:  out = gain * (in + in_offset), 再夹到 [out_lower_limit, out_upper_limit]
+
+四条都先量后写：
+
+1. **`A` 卡是两节点**（`A1 in out model`），不是 E 卡的四节点。三节点写法 `A1 1 0 10 g1` 被引擎
+   直接拒成 `incomplete or empty netlist`；两节点写法 `gain(gain=2)` 读 2.000 V。
+2. **`in_offset` 在乘之前**：2 V 输入配 `gain(gain=2 in_offset=1)` 读 **6.0 V**，不是 5.0 V
+   （若是先乘后加，会是 5.0）。这一条决定表达式顺序，猜错就是系统性偏差。
+3. **`limit` 必须两个边界都给**：只写 `out_lower_limit=-1` 时引擎自己报 incomplete，所以内置
+   没有可继承的缺省——两个都缺就按名字拒绝，而不是自己编一个。
+4. **`limit_range` 拒绝而不近似**：0.9 V 输入、`limit_range=0.5` 实测落在 **0.82 V**，硬夹会写
+   0.9 V。问拐点的人恰恰在意这一处，所以按名字拒绝（`fraction=` 同理）。
+
+内部形态是一个「由代数表达式驱动的电压源」：行方程 `v(out) - f(v(in)) = 0`，夹紧段用上一次迭代
+的值线性化（带内斜率 `gain`，带外斜率 0），所以落在边界上的解是真解而不是卡住的迭代。`.ac` 下
+`limit` 一律拒绝——夹紧块的小信号增益取决于工作点落在哪一段，而这套求解器不带工作点进扫频。
+
+判据：`tests/test_spice_bundled.py` 的
+`test_builtin_solves_the_two_algebraic_code_models` / `test_a_code_model_with_state_is_still_refused_by_name` /
+`test_limit_range_is_refused_rather_than_clamped` / `test_cross_check_now_really_compares_this_deck`，
+selftest 157/158/159。负控制是后两条：**有状态的 code model 与会动拐点的参数仍然按名字拒绝**，
+所以「内置现在能跑 `A` 了」不等于「内置把不认识的卡当没写」。

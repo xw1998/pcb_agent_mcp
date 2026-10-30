@@ -969,12 +969,11 @@ def selftest():
         if _bundled:
             _n = (payload.get("value") or {}).get("nodes_v") or {}
             check("the bundled engine RUNS an XSPICE A card: gain(gain=2) on 1 V "
-                  "reads exactly 2 V, and the envelope says the deck was not parsed "
-                  "here (A is still refused by this module's own parser)",
+                  "reads exactly 2 V, and (0.0.39) this module parses that deck "
+                  "itself, so the envelope no longer needs the XSPICE excuse",
                   payload.get("status") == "ok"
                   and abs(_n.get("10", 0.0) - 2.0) < 1e-9
-                  and payload.get("netlist_parsed") is False
-                  and "XSPICE" in (payload.get("netlist_parse_note") or "")
+                  and payload.get("netlist_parsed") is True
                   and payload.get("verified_against_engine") is True,
                   "%r / %r" % (_n, payload.get("netlist_parsed")))
         else:
@@ -1003,17 +1002,56 @@ def selftest():
             check("no bundle: the limit deck is refused for the same reason",
                   payload.get("status") != "ok", str(payload.get("reason_code")))
 
-        # 0.0.37 negative control: the bundle must not make the SUBSET kinder.
+        # 0.0.39: gain/limit are algebra, so the builtin answers this deck itself.
+        # The control is now on the OTHER side: it must land on the same 2 V the
+        # engine lands on, and it must say which region it clamped in.
         r = handle({"jsonrpc": "2.0", "id": 157, "method": "tools/call",
                     "params": {"name": "sim_spice", "arguments": {
                         "netlist": _GAIN, "engine": "builtin"}}})
         payload = json.loads(r["result"]["content"][0]["text"])
-        check("the builtin subset still REFUSES the A card by name (running it "
-              "through the engine did not teach the parser to skip it)",
+        _v = (payload.get("value") or {}).get("nodes_v") or {}
+        _a = [e for e in ((payload.get("value") or {}).get("elements") or [])
+              if e.get("type") == "A"]
+        check("the builtin SOLVES gain(gain=2) itself and lands on the engine's "
+              "answer (2 V), reporting the block's own input/output/region instead "
+              "of pretending it is a two-terminal part",
+              payload.get("status") == "ok" and abs(_v.get("10", 0.0) - 2.0) < 1e-9
+              and len(_a) == 1 and _a[0].get("kind") == "GAIN"
+              and _a[0].get("region") == "linear"
+              and abs(_a[0].get("output_v", 0.0) - 2.0) < 1e-12,
+              str(_v) + str(_a)[:120])
+
+        # ... and the refusals that must survive: a code model with STATE is still
+        # refused by name, and so is a parameter that moves the corner.
+        r = handle({"jsonrpc": "2.0", "id": 158, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* i\nV1 1 0 1\nA1 1 2 i1\n"
+                                   ".model i1 integrator(gain=1)\nR1 2 0 1k\n.op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _m = payload.get("message") or ""
+        check("a code model that carries STATE is still refused by name, and the "
+              "refusal says which two models this solver does have (integrator is "
+              "not silently turned into a wire)",
               payload.get("status") == "error"
               and payload.get("reason_code") == "NETLIST_INVALID"
-              and "XSPICE" in (payload.get("message") or ""),
-              str(payload.get("message"))[:60])
+              and "INTEGRATOR" in _m and "only gain and limit" in _m,
+              _m[:80])
+
+        r = handle({"jsonrpc": "2.0", "id": 159, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* q\nV1 1 0 0.9\nA1 1 2 q1\n"
+                                   ".model q1 limit(gain=1 out_lower_limit=-1 "
+                                   "out_upper_limit=1 limit_range=0.5)\n"
+                                   "R1 2 0 1k\n.op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _m = payload.get("message") or ""
+        check("limit_range is refused instead of hard-clamped: the engine settles "
+              "0.9 V in at 0.82 V with limit_range=0.5, so a hard clamp would "
+              "report a number exactly where the caller is asking about the corner",
+              payload.get("status") == "error" and "limit_range" in _m,
+              _m[:80])
 
         # 0.0.30: the lossless line in the builtin. DC is a wire, so the matched
         # 3 V / 50 ohm divider must read 1.500 V at BOTH ports and +/-30 mA.

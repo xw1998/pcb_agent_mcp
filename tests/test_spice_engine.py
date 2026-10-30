@@ -315,9 +315,10 @@ class TestRefusals(EngineCase):
         # The stand-in has been reduced one card at a time as the builtin grew: a
         # LOSSLESS line until 0.0.30, its LOSSY cousin until 0.0.31, the voltage-
         # controlled switch S until 0.0.35 and the JFET J until 0.0.36. What is
-        # left is A, the XSPICE analogue behavioural block - and it is the honest
-        # last stand-in: it is not "not implemented yet", it is a second
-        # expression/code-model system (a second device description language).
+        # left was A, the XSPICE analogue behavioural block. 0.0.39 took the two
+        # purely algebraic code models (gain, limit) into the builtin; what remains
+        # delegated is the part that is genuinely a second device description
+        # language: state, sample clocks and multi-port array connections.
         #
         # 0.0.37 correction: the comment here used to claim that this build of
         # ngspice cannot load the code models either, and the stand-in deck used
@@ -334,12 +335,17 @@ class TestRefusals(EngineCase):
         r = spice.simulate(net, engine="ngspice")
         self.assertEqual(r["status"], "ok", r)
         self.assertEqual(r["engine_used"], "ngspice")
+        # this deck spells its terminals as %v(1) / %v(2) - the ARRAY/expression
+        # connection form of a multi-port code model - which the builtin still
+        # refuses: it is the syntax of the second device description language, not
+        # of gain/limit. So netlist_parsed is false here for a reason that 0.0.39
+        # did not change.
         self.assertFalse(r["netlist_parsed"])
         self.assertIn("A1", r["netlist_parse_note"])
         b = spice.simulate(net)
         self.assertEqual(b["status"], "error")
         self.assertEqual(b["reason_code"], "NETLIST_INVALID")
-        self.assertIn("XSPICE", b["message"])
+        self.assertIn("not a node", b["message"])
 
 
 class TestCrossCheck(EngineCase):

@@ -9,6 +9,49 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.39] - 2026-10-30
+
+`A` 卡（XSPICE 代码模型）里**纯代数**的两种搬进内置求解器：`gain` 与 `limit`。剩下的仍按名字拒绝。
+
+### 为什么是这两种
+
+`gain` 和 `limit` 没有状态、没有采样时钟、只有一个端口，方程就是两行：
+
+    gain :  out = gain * (in + in_offset)
+    limit:  out = gain * (in + in_offset), 再夹到 [out_lower_limit, out_upper_limit]
+
+`integrator`/`ddt`/`s_xfer` 带状态与采样时钟，`summer`/`multiplier` 是多端口（`%v()` 与 `[1 2 3]`
+数组连接）——那是第二套器件描述语言，不是加一个器件方程，仍然拒绝。
+
+### 四条先量后写的路径事实
+
+1. **`A` 卡是两节点**（`A1 in out model`），输出对地。三节点写法被引擎拒成 `incomplete or empty netlist`。
+2. **`in_offset` 在乘之前**：2 V 配 `gain(gain=2 in_offset=1)` 读 **6.0 V**（不是 5.0 V）。
+3. **`limit` 必须两个边界都给**：只给一个时引擎自己报 incomplete ⇒ 内置也没有可继承的默认值，
+   缺就按名字拒绝。
+4. **`limit_range` 拒绝而不近似**：0.9 V 配 `limit_range=0.5` 实测落在 **0.82 V**，硬夹会写 0.9 V。
+
+### 内部形态
+
+一个由代数表达式驱动的电压源：行方程 `v(out) - f(v(in)) = 0`，夹紧段按上一次迭代线性化（带内斜率
+`gain`、带外斜率 0），所以停在边界上的解是真解而不是卡住的迭代。`.ac` 遇 `limit` 一律拒绝（小信号
+增益取决于工作点落在哪一段）。
+
+### 判据
+
+- `tests/test_spice_bundled.py`：内置解 `gain` 读 2.0 V 且元件报告给 `input_v`/`output_v`/`region`；
+  **负控制**——带状态的 code model 与 `limit_range` 仍按名字拒绝；`cross_check` 对这个 deck 从
+  「无可比」变成**真的比**（差 0.0）。
+- selftest 157/158/159；`--selftest` **141/141**（原 139）。
+- `tests/test_spice_engine.py` 的委派用例保留 `%v(1)` 写法：那条 deck 仍被内置拒绝，`netlist_parsed`
+  仍为 `false` ——拒绝的理由从「A 一律不认」变成「数组连接写法不认」。
+
+### 文档
+
+`docs/43` 新增 §43.10（四条实测 + 负控制）；`docs/17` §17.11 更正「`netlist_parsed:false`、
+`cross_check` 报无可比」这两条诚实项；README 一页速查的 B2 行改成「`A` 卡的**其余** code model」，
+A 表与层表同步；`tools.py` 两处自述。
+
 ## [0.0.38] - 2026-10-30
 
 **只改文档**：把「做完了什么 / 没做完什么」写成一页速查（README 的 `## 一页速查`）。
