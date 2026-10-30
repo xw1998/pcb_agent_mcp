@@ -9,6 +9,117 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.48] - 2026-10-31
+
+`calc_capabilities` 的 `not_computed` 里一直写着那句没兑现的话：「Surge and fusing beyond
+one pulse: repetitive pulses with duty-cycle derating」。`fusing_current` 只答一发，而板上
+几乎没有一个电流是一发——短路保护动作前的几十微秒、继电器弹跳、电机启动、容性上电。这一版
+把那一列车补上：**一阶集中温度的一维 ODE，每段精确解，参数只有铜自己的物性和你给的 h**。
+
+### 模型（没有拟合常数）
+
+```
+C' dT/dt = I² ρ'(T) − h·P·(T − Ta)         每单位长度
+ρ'(T)    = ρ20 (234 + T)/(234 + 20)         与 Onderdonk 的 234 同一个
+C' = ρ_m c_p (w·t)     hP = h·2(w+t)
+
+d(ΔT)/dt = A + k·ΔT
+A  = I²ρ'(Ta)/(A·C')   β = 1/(234 + Ta)   k = Aβ − 1/τ   τ = C'/(hP)
+ΔT(t) = (ΔT₀ + A/k)e^{kt} − A/k            每段精确解，不是步进
+```
+
+ρ 对 T 线性 ⇒ 方程线性 ⇒ 关断段就是 `ΔT₀·e^{−t/τ}`。**模型里没有 dt**，精度不靠步长。
+
+### 失控判据是闭式的，而且不含热容
+
+```
+I² ≥ A·h·P/(D·β·ρ'(Ta))          D = t_on/(t_on+t_off)
+max_repetitive_current_a = √(A·h·P/(D·β·ρ'(Ta)))     ← 工具的 value
+max_duty_cycle_at_current = 1/(1 + k·τ)              （k > 0）
+```
+
+这是两个**速率**的比较（加热 vs 散热），不是能量比较，所以 `C'` 在里面根本不出现。
+
+### 发数与稳态也是闭式
+
+`e_on = e^{k t_on}`、`e_off = e^{−t_off/τ}`、`q = e_on·e_off`、`b = (A/k)(e_on−1)e_off`：
+
+```
+trough(m) = b(q^m − 1)/(q − 1)      steady_trough = b/(1 − q)   (q < 1)
+u   = (ΔT_melt + A/k)/e_on − A/k
+arg = 1 + u(q − 1)/b
+arg ≤ 0 → shots = None（永远不熔）
+否则   → m = ln(arg)/ln q , shots = ceil(m) + 1
+```
+
+`shots = None` 时输出 `survives_indefinitely: true` 与 `pulses_to_melt: null`——**"永远"不是
+一个计数**，不报一个大整数。
+
+### 实测锚点（1 mm / 1 oz / 1 ms / D=0.1 / h=10 / Ta=25）
+
+| 键 | 值 |
+|---|---|
+| `max_repetitive_current_a` | **10.313011** |
+| `single_pulse_fusing_current_a` | **317.727834** |
+| `derating_vs_single_pulse` | **0.032459** |
+| `thermal_time_constant_s` / `time_constant_over_period` | **5.800448396** / **580.04484** |
+| `adiabatic_limit_reproduced_pct` | **−0.6156** |
+| 5 A 时 `steady_peak_c / trough / ripple / mean_rise` | **104.648 / 104.525 / 0.123 / 79.586** |
+| 5 A 时 `dc_equivalent_current_a` | **1.581139**（`= 5·√0.1 = 1.5811388`） |
+| 5 A 时 `max_duty_cycle_at_current` | **0.425433**（手算 `1/(1+kτ)` = 0.4254327516…） |
+| 12 A（超临界）`pulses_to_melt / melt_after_s` | **1191 / 11.91**，`runs_away = true` |
+| `h = 0`（绝热）5 A `pulses_to_melt` | **4014**，总导通 4.014 s |
+| h/2 与 2h 的稳态峰值 | **254.869 / 59.547** °C，`h_sensitivity` 报 **245 %** |
+
+**「单发」从来不是「列车」的近似**：同一根线单发 318 A，占空比 10 % 的列车只许 10.3 A。
+
+### 三条内建闸门（失败即 `INTERNAL_CHECK_FAILED`）
+
+1. **绝热极限必须复现 Onderdonk**（差 >2 % 报错，实测 −0.6156 %）——两条互不共享常数的
+   路线（我们的 `ρ20/ρ_m/c_p` vs 它的 `33`）必须落在同一个熔断时间上；
+2. **3 圈逐圈映射 = 几何级数**（相对 1e-9）——挡住级数符号错；
+3. **熔化发数逐发回溯**（shots ≤ 2000）——挡住 off-by-one。
+
+第 2 条在临界点附近抓到一个**真缺陷**：`(q³−1)/(q−1)` 在 `q−1 ~ 1e-10` 时两个近乎相等的
+数相减、有效数字掉七八位，把一次正确计算判成了失败。改成代数分解 `1 + q + q²`（精确、无
+相消）。**闸门本身也要在它要判的边界上被验证**——这是本轮记下的一条方法论。
+
+### 独立真值
+
+`tests/test_pulse_fusing.py::_rk4_train` 是一个从头写的 RK4：直接积原始 ODE、`ρ(T)` 现写、
+导通段与关断段两个不同右端、不知道 `q`/`shots`/几何级数。它给出
+
+- 12 A → **1191 发**（闭式 1191）；5 A → 稳态峰值 **104.5246 °C**（闭式 104.525）；
+- 0.2 mm / 400 A → **1 发**（闭式 1）。
+
+（写这个 RK4 时自己也错过一次：关断段忘了把 `I²` 去掉，稳态温度错了 10 倍——正是它该抓
+的那类错。）
+
+### 零变化
+
+新函数 + 一个新工具，不碰任何老路径：`dependencies = []` 仍成立，`--selftest` 的三条新读数
+纯代数（不起场解、不起仿真）。`available` 自述清单顺手修掉四个**在 `TOOLS` 里根本不存在的
+名字**（`board_export` / `board_bom` / `board_netlist` / `board_graphics`——BOM 与网表是
+`schematic_export` 的格式，图是 `board_export_graphics`），并把 `part_export` 与
+`repetitive_pulse_rating` 补进去。现在是 `available 160 / TOOLS 160`，唯一不列的是
+`calc_capabilities` 自己。
+
+### 测试与文档
+
+- 新增 `src/pcb_agent_mcp/calc/current.py` 的 repetitive-pulse 段（约 434 行）与 1 个工具
+  `repetitive_pulse_rating`（第 **160** 个）；
+- 新增 `tests/test_pulse_fusing.py` **37 例**（含独立 RK4、绝热能量积分手推、17 条拒绝路径）；
+- `--selftest` 166 → **169/169**（第 865~867 三条读数）；
+- `docs/51-重复脉冲降额.md`；
+- 全量回归 **Ran 2270 tests / OK (skipped=5) / 实测 997.041 s**（0.0.47 是 2233 例 / 934.014 s）。
+
+### 仍然不算
+
+长度方向温度梯度（整根线一个温度）、板与铜面作为 `h` 之外的独立散热体、熔化潜热、脉冲内
+集肤效应、电迁移（Black 方程需要板厂认可的电流密度）、开铜后的电弧/等离子。精度声明
+**±40 %**，并写明由两个单向选择主导：`h` 是你的、铜是集中的。`h` 不给默认值（裸板静风
+~10 W/(m²·K) 到铜皮锁金属壳的数百，差 20 倍，猜一个就是给错答案）。
+
 ## [0.0.47] - 2026-10-30
 
 158 个工具里没有一个串扰。这是 SI 那块最大的空洞，也是 0.0.43 把铜补进 2-D 场之后

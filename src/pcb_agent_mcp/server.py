@@ -2775,6 +2775,64 @@ def selftest():
               _seeds["on0"].get("2"), _seeds["off5"].get("2"),
               _seeds["band_on"].get("2"), _seeds["band_none"].get("2")))
 
+    # --- repeating pulse trains: three readings, no field solver ---
+    # (a) with the cooling deleted the model must BE Onderdonk, not nearly it. The
+    #     two routes share no constant: ours is rho20/rho_m/c_p, its is the 33.
+    # (b) the train's DC equivalent is I*sqrt(D) by an energy balance, an identity
+    #     that fails the moment the mean temperature or the resistance law moves.
+    # (c) above the runaway threshold there is no fixed point; below it there is -
+    #     and "no fixed point" must not be reported as "a very hot fixed point".
+    def _pulse(**kw):
+        rr = handle({"jsonrpc": "2.0", "id": 159, "method": "tools/call",
+                     "params": {"name": "repetitive_pulse_rating", "arguments": kw}})
+        return json.loads(rr["result"]["content"][0]["text"])
+
+    _p_adi = _pulse(width_mm=1.0, t_on_s=1e-3, duty_cycle=0.1, h_w_m2k=0.0,
+                    current_a=5.0)
+    _p_dc = _pulse(width_mm=1.0, t_on_s=1e-3, duty_cycle=0.25, h_w_m2k=10.0,
+                   current_a=5.0)
+    _p_gate = _p_adi.get("adiabatic_limit_reproduced_pct")
+    # the total on-time the train takes to melt must equal the single-pulse fusing
+    # time for the same geometry at the same current
+    _p_total = (_p_adi.get("pulses_to_melt") or 0) * 1e-3
+    _p_single = json.loads(handle({
+        "jsonrpc": "2.0", "id": 1590, "method": "tools/call",
+        "params": {"name": "fusing_current",
+                   "arguments": {"width_mm": 1.0, "t_s": _p_total}}})["result"][
+        "content"][0]["text"])
+    check("a pulse train with no cooling melts in the same total on-time the "
+          "single-pulse fusing formula gives (4.01 s at 5 A), and the model's own "
+          "adiabatic gate reports it (<1 %)",
+          _p_adi.get("status") == "ok"
+          and _p_gate is not None and abs(_p_gate) < 1.0
+          and abs(_p_total - 4.01318) < 5e-3
+          and abs((_p_single.get("value") or 0) - 5.0) < 0.15,
+          "gate %s %%, total %s s, single %s A" % (_p_gate, _p_total,
+                                                   _p_single.get("value")))
+    check("the pulse train's DC equivalent is exactly I*sqrt(D) (5 A at 25 % = "
+          "2.5 A) - an energy identity, not a fitted correction",
+          _p_dc.get("status") == "ok"
+          and abs((_p_dc.get("dc_equivalent_current_a") or 0) - 2.5) < 1e-3,
+          str(_p_dc.get("dc_equivalent_current_a")))
+
+    # h = 10 W/(m^2K) on 1 oz / 1 mm puts the threshold at 10.313 A
+    _p_below = _pulse(width_mm=1.0, t_on_s=1e-3, duty_cycle=0.1, h_w_m2k=10.0,
+                      current_a=10.30)
+    _p_above = _pulse(width_mm=1.0, t_on_s=1e-3, duty_cycle=0.1, h_w_m2k=10.0,
+                      current_a=10.32)
+    check("the runaway boundary is an existence question: 10.30 A has a fixed "
+          "point (a very hot one), 10.32 A has none, and the threshold reported "
+          "for 0.1 duty is 10.313 A",
+          _p_below.get("status") == "ok" and _p_above.get("status") == "ok"
+          and _p_below.get("runs_away") is False
+          and "steady_peak_c" in _p_below
+          and _p_above.get("runs_away") is True
+          and "steady_peak_c" not in _p_above
+          and abs((_p_below.get("max_repetitive_current_a") or 0) - 10.313011) < 1e-4,
+          "below %s K, above %s, crit %s A" % (
+              _p_below.get("steady_peak_c"), _p_above.get("runs_away"),
+              _p_below.get("max_repetitive_current_a")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

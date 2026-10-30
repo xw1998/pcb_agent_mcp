@@ -242,6 +242,49 @@ _tool(
         standard=a.get("standard")),
 )
 
+_tool(
+    "repetitive_pulse_rating",
+    "Largest current a trace can carry as a REPEATING pulse train (one that never "
+    "melts), and - if you also pass current_a - whether those particular pulses "
+    "survive and for how many shots. One lumped first-order model solved exactly "
+    "per interval: C' dT/dt = I^2 rho(T) - h*P*(T-Ta), with copper's own resistance "
+    "law, so the adiabatic limit reproduces the single-pulse fusing time. Below the "
+    "returned current the peak settles; above it every cycle ends hotter and the "
+    "trace melts after a finite number of shots no matter how long you wait. "
+    "h_w_m2k is REQUIRED: cooling is the whole answer here and it can differ 20x "
+    "between a bare trace and a copper pour bolted to metal, so there is no default.",
+    {"type": "object", "properties": {
+        "width_mm": _num("trace width in mm"),
+        "t_on_s": _num("pulse length in seconds"),
+        "duty_cycle": _num("t_on/(t_on+t_off) in (0,1]; give this or period_s"),
+        "period_s": _num("t_on+t_off in seconds - the other spelling of duty_cycle"),
+        "copper_oz": _num("copper weight in oz (used unless thickness_um is given)", 1),
+        "thickness_um": _num("override the copper thickness in um"),
+        "t_ambient_c": _num("ambient temperature in Celsius", 25),
+        "h_w_m2k": _num("effective heat transfer coefficient W/(m^2*K): ~10 bare "
+                         "trace in still air, 30-60 with a board/pour, hundreds "
+                         "with forced air or a metal chassis; 0 = adiabatic limit"),
+        "current_a": _num("OPTIONAL: a specific pulse current, to get the shot "
+                          "count and the steady peak at that current"),
+        "delta_t_c": _num("temperature rise used for the continuous rating", 10),
+        "layer": _LAYER,
+        "standard": _CUR_STD_OPT,
+    }, "required": ["width_mm", "t_on_s", "h_w_m2k"]},
+    lambda a: _current.repetitive_pulse_rating(
+        a["width_mm"],
+        a["t_on_s"],
+        duty_cycle=a.get("duty_cycle"),
+        period_s=a.get("period_s"),
+        copper_oz=(a["copper_oz"] if a.get("copper_oz") is not None else 1),
+        thickness_um=a.get("thickness_um"),
+        t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
+        h_w_m2k=a.get("h_w_m2k"),
+        current_a=a.get("current_a"),
+        delta_t_c=(a["delta_t_c"] if a.get("delta_t_c") is not None else 10.0),
+        layer=a.get("layer", "external"),
+        standard=a.get("standard")),
+)
+
 # ----------------------------------------------------------- impedance
 _IMP_KIND = _str("transmission line type", ["microstrip", "stripline"])
 
@@ -3486,9 +3529,10 @@ def _capabilities(_args):
         },
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
-            "via_current_allowed", "fusing_current",
+            "via_current_allowed", "fusing_current", "repetitive_pulse_rating",
             "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
+            "coplanar_field", "coplanar_pair_field", "crosstalk_coupled_lines",
             "board_summary", "board_components", "board_nets", "board_clearance",
             "board_free_space", "board_routability", "board_pour_connectivity",
             "board_zones", "board_fill_zones", "board_route",
@@ -3544,10 +3588,11 @@ def _capabilities(_args):
             "filter_coupled_microstrip", "filter_coupled_resonator",
             "filter_waveguide_cavity", "filter_coupling_matrix",
             "fullwave_solver",
-            "board_fab_package", "board_export", "board_bom", "board_netlist",
-            "board_graphics",
-            "schematic_pcb_diff", "schematic_pcb_sync",
-            "board_blockers", "board_run_ledger", "board_fanout",
+            "board_fab_package", "board_export_graphics", "board_export_3d",
+            "part_export",
+            "schematic_pcb_diff", "schematic_pcb_sync", "schematic_export",
+            "board_blockers", "board_run_ledger", "board_fanout", "board_intent",
+            "lceda_pcb_write",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "only for safety_standard families other than "
@@ -3814,11 +3859,16 @@ def _capabilities(_args):
             "Surge and fusing beyond one pulse: fusing_current answers the single-pulse "
             "adiabatic question (Onderdonk 1928) and states its four one-sided "
             "assumptions (no cooling, no latent heat, equal-area rectangle, no skin "
-            "effect). Not done: repetitive pulses with duty-cycle derating, "
-            "electromigration (Black's equation needs a current density a fab will "
-            "qualify), arc/plasma behaviour after the copper opens, and board_ir_drop's "
-            "A/mm^2 verdict - that tool still reports density with no criterion "
-            "attached",
+            "effect); repetitive_pulse_rating answers the TRAIN - one lumped "
+            "temperature, cooling as h*P with h supplied by you (no default, because "
+            "it ranges 20x), copper's own resistance law solved exactly per interval, "
+            "and the melt boundary as a closed form. Still not done: the trace's "
+            "LENGTHWISE gradient (one temperature for the whole trace), board and "
+            "plane as separate sinks from h, latent heat at the melt, skin effect "
+            "inside a short pulse, electromigration (Black's equation needs a current "
+            "density a fab will qualify), arc/plasma behaviour after the copper opens, "
+            "and board_ir_drop's A/mm^2 verdict - that tool still reports density with "
+            "no criterion attached",
             "The plane impedance CURVE (as opposed to its mode peaks): pdn_impedance / "
             "decoupling_check are lumped RLC in parallel and can prove a bank is clearly "
             "insufficient but not that it is sufficient; pdn_plane_modes gives the peak "
