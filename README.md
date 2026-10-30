@@ -166,11 +166,13 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `lceda_pro_run` | 在编辑器进程里跑一段 JS（async 函数体，`eda` 在作用域） | **能写**：片段自己决定做什么，本工具不担保；实测只跑过只读片段 |
 | `app_launch` | 分离启动 EDA（不带工程） | 启动进程 ≠ 打开工程 |
 | `app_close` | WM_CLOSE 关窗（等同点 X，可能弹保存框） | `force` 才 TerminateProcess；不碰文件 |
-| `schematic_ops` | 原理图写路径的 op 目录（KiCad `.kicad_sch` 18 个）+ 每条用的坐标系 | 调 `schematic_propose` 前先看它 |
+| `schematic_ops` | 原理图写路径的 op 目录（KiCad `.kicad_sch` 22 个，含 4 个 sheet op）+ 每条用的坐标系 | 调 `schematic_propose` 前先看它 |
 | `schematic_propose` | 只算不写：plan_id、改前/改后 digest、**预测的网表与 ERC diff** | 立创 `.esch` 直接 `WRITE_UNSUPPORTED_FORMAT` |
-| `schematic_apply` | 落盘：checkpoint → 原子写 → 四道闸门（含 KiCad 网表 + ERC 双向对比）→ 不过就回滚 | 必须 `confirm=true`；plan 单次使用 |
+| `schematic_apply` | 落盘：checkpoint → 原子写 → **五道闸门**（含 KiCad 网表 + ERC 双向对比 + 整棵树）→ 不过就回滚 | 必须 `confirm=true`；plan 单次使用 |
 | `schematic_summary` | 只读：这张图**是**什么（每个符号的真 reference/value/footprint/引脚、计数、工程名）+ KiCad 网表与 ERC | 只读，不创建任何文件 |
 | `schematic_view` | 只读：summary / symbols / objects / netlist / erc / lib_symbols / raw | 每个返回都重复坐标系说明 |
+| `schematic_hierarchy` | 只读：整棵层级树——每页文件、实例路径、页号、深度、缺失/循环/重复页 | 页号报的是**工程全局**，不是本文件最大 +1 |
+| `schematic_new_file` | 建一张空白的 `.kicad_sch`（写完立刻 `from_text` 自检字节与 token 全等） | 只建文件不改树；接进工程请另调 `add_sheet` |
 | `app_open_project` | 打开 `.epro`/`.kicad_pro`/`.kicad_pcb` 并按标题确认 | 三态 `confirmed/unconfirmed`；缺文件拒绝且不创建 |
 
 ### 天线 / 馈线 / 匹配 / 链路（21 个，[docs/16](docs/16-天线与馈线.md)）
@@ -260,9 +262,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.32
-python run_server.py --selftest      # 协议级自检，124/124（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问）
-python -m unittest discover -s tests # 1785 个用例（约 10.7 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.33
+python run_server.py --selftest      # 协议级自检，126/126（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问）
+python -m unittest discover -s tests # 1832 个用例（约 12.7 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -326,12 +328,15 @@ MCP 客户端配置（stdio）：
   应用自己写这一行**，所以结果标 `verified_by_app: false`。
 - **SQLite 格式（`.eprj2`）只读。** 能打开、能算度量，但写路径直接拒绝（`WRITE_UNSUPPORTED_FORMAT`）：
   `history_data` 加密、`ticket` 单调，任何手改都可能让工程打不开。
-- **原理图：KiCad 能写，立创不写。** `.kicad_sch` 有 18 个 op、四道闸门，裁判换成 KiCad 的
+- **原理图：KiCad 能写，立创不写。** `.kicad_sch` 有 22 个 op、五道闸门，裁判换成 KiCad 的
   网表 + ERC（[docs/14](docs/14-原理图写路径.md)）——DRC 判铜，原理图的产品是连通性，两套闸门不能照搬。
   **立创 `.esch` 明确拒写**（`WRITE_UNSUPPORTED_FORMAT`，并按内容说出它是 zip 还是 SQLite），
   因为它的记录布局还没在真实保存上测过；这一条不是"以后做"，是"现在拒"。
-- **原理图只写单张图纸。** 本层不做跨页改动（改 `sheet` 引脚、改 `Sheetfile`）——那会牵动父图
-  的实例路径与页码，和"改一张图"不是一个风险等级。
+- **多页（层级）原理图已接上（0.0.33，[docs/39](docs/39-多页工程.md)）。** 4 个 sheet op 与 `schematic_hierarchy`
+  读整棵树；页号按**工程全局**分配，同一节点被实例化 N 次就写 N 条 `(path … (page …))`；
+  `apply` 多一道 `tree` 闸门，确保两个引擎看到的是同一棵树。**仍不做**跨多文件的一次原子改动
+  （建新页走 `schematic_new_file`，两步比假原子更诚实），也不做页面模板、搬文件、跨页批量重命名、
+  pin 与 label 形状一致性、KiCad 5 老格式与立创多页。
 - **两个闸门 bug 是被真图抓出来的**（docs/14 §5）：元件值改动曾被报成"网表变了"；同一条 ERC
   违规被 KiCad 重新指向不同 item 时曾被算成"新增+解决"。前者会把所有正常字段编辑拦死，
   后者会让人很快学会一按 `allow_new_violations` 了事。
@@ -621,7 +626,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 151 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 153 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -686,10 +691,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1785 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1832 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~38，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~39，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明

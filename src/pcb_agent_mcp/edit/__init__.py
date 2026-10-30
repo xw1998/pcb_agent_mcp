@@ -51,7 +51,8 @@ __all__ = [
     "apply_plan", "apply_steps", "checkpoint_root", "create_board", "describe_ops",
     "describe_epro_ops", "describe_sch_ops", "find_checkpoint",
     "list_checkpoints", "propose", "propose_schematic", "restore_checkpoint",
-    "save_checkpoint", "schematic_summary", "schematic_view",
+    "new_schematic_file", "save_checkpoint", "schematic_hierarchy",
+    "schematic_summary", "schematic_view",
     "step_control", "step_events", "steps_root",
 ]
 
@@ -78,6 +79,14 @@ def schematic_summary(path, engine=True):
 
 def schematic_view(path, kind="summary", limit=200):
     return sch_plan.view(path, kind=kind, limit=limit)
+
+def schematic_hierarchy(path, text=None):
+    """Read-only: the sheet tree this file belongs to (pages, files, issues)."""
+    return sch_plan.hierarchy(path, text=text)
+
+def new_schematic_file(path, paper="A4", title=None, confirm=False):
+    """Create an empty `.kicad_sch` page. Refuses to touch anything existing."""
+    return sch_plan.new_file(path, paper=paper, title=title, confirm=confirm)
 
 
 def detect_format(path):

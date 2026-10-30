@@ -472,6 +472,79 @@ def selftest():
               and eref.get("reason_code") == "WRITE_UNSUPPORTED_FORMAT",
               str(eref.get("reason_code")))
 
+        # ---- multi-page (hierarchical) schematic: the tree, and a dead sheet box
+        child_sch = os.path.join(tmp, "shelftest_child.kicad_sch")
+        root_sch = os.path.join(tmp, "shelftest_root.kicad_sch")
+        with open(child_sch, "wb") as fh:
+            fh.write(('(kicad_sch\n\t(version 20250114)\n'
+                      '\t(generator "eeschema")\n'
+                      '\t(uuid "22222222-2222-4222-8222-222222222222")\n'
+                      '\t(paper "A4")\n\t(lib_symbols)\n)\n').encode("utf-8"))
+        root_text = (
+            '(kicad_sch\n\t(version 20250114)\n\t(generator "eeschema")\n'
+            '\t(uuid "11111111-1111-4111-8111-111111111111")\n\t(paper "A4")\n'
+            '\t(lib_symbols)\n'
+            '\t(sheet\n\t\t(at 40 40)\n\t\t(size 40 25)\n'
+            '\t\t(uuid "33333333-3333-4333-8333-333333333333")\n'
+            '\t\t(property "Sheetname" "child"\n\t\t\t(at 40 39.2 0)\n'
+            '\t\t\t(effects\n\t\t\t\t(font\n\t\t\t\t\t(size 1.524 1.524)\n'
+            '\t\t\t\t)\n\t\t\t\t(justify left bottom)\n\t\t\t)\n\t\t)\n'
+            '\t\t(property "Sheetfile" "shelftest_child.kicad_sch"\n'
+            '\t\t\t(at 40 65.6 0)\n'
+            '\t\t\t(effects\n\t\t\t\t(font\n\t\t\t\t\t(size 1.524 1.524)\n'
+            '\t\t\t\t)\n\t\t\t\t(justify left top)\n\t\t\t)\n\t\t)\n'
+            '\t\t(pin "VCC" input\n\t\t\t(at 80 52.5 0)\n'
+            '\t\t\t(uuid "44444444-4444-4444-8444-444444444444")\n'
+            '\t\t\t(effects\n\t\t\t\t(font\n\t\t\t\t\t(size 1.27 1.27)\n'
+            '\t\t\t\t)\n\t\t\t\t(justify left)\n\t\t\t)\n\t\t)\n'
+            '\t\t(instances\n\t\t\t(project "selftest"\n'
+            '\t\t\t\t(path "/11111111-1111-4111-8111-111111111111"\n'
+            '\t\t\t\t\t(page "2")\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n'
+            '\t(sheet_instances\n\t\t(path "/"\n\t\t\t(page "1")\n\t\t)\n\t)\n'
+            '\t(embedded_fonts no)\n)\n')
+        with open(root_sch, "wb") as fh:
+            fh.write(root_text.encode("utf-8"))
+        r = handle({"jsonrpc": "2.0", "id": 151, "method": "tools/call",
+                    "params": {"name": "schematic_hierarchy",
+                               "arguments": {"path": root_sch}}})
+        hier = json.loads(r["result"]["content"][0]["text"])
+        hh = hier.get("hierarchy") or {}
+        check("schematic_hierarchy reads a two-file project as a tree",
+              hier.get("status") == "ok" and hh.get("sheets") == 1
+              and hh.get("file_count") == 2
+              and [p.get("page") for p in hh.get("pages") or []] == ["2"]
+              and hh.get("issues_total") == 0,
+              "sheets=%s files=%s pages=%s issues=%s"
+              % (hh.get("sheets"), hh.get("file_count"),
+                 [p.get("page") for p in hh.get("pages") or []],
+                 hh.get("issues_total")))
+
+        with open(root_sch, "rb") as fh:
+            root_before = fh.read()
+        r = handle({"jsonrpc": "2.0", "id": 152, "method": "tools/call",
+                    "params": {"name": "schematic_propose", "arguments": {
+                        "path": root_sch,
+                        "operations": [{"op": "add_sheet", "name": "ghost",
+                                        "file": "nowhere.kicad_sch",
+                                        "x": 40, "y": 150}],
+                        "options": {"engine": False}}}})
+        ghost = json.loads(r["result"]["content"][0]["text"])
+        blocked = bool(ghost.get("blocking")) and any(
+            "missing_file" in b for b in ghost.get("blocking") or [])
+        with open(root_sch, "rb") as fh:
+            root_same = fh.read() == root_before
+        refused = False
+        if ghost.get("plan_id"):
+            r = handle({"jsonrpc": "2.0", "id": 152, "method": "tools/call",
+                        "params": {"name": "schematic_apply", "arguments": {
+                            "plan_id": ghost.get("plan_id"), "confirm": True,
+                            "options": {"engine": False}}}})
+            ap = json.loads(r["result"]["content"][0]["text"])
+            refused = ap.get("status") == "error"
+        check("a sheet box pointing at a file that is not there is refused, not written",
+              blocked and refused and root_same,
+              "blocked=%s refused=%s untouched=%s" % (blocked, refused, root_same))
+
         junk = os.path.join(tmp, "not-a-project.epcb")
         with open(junk, "wb") as fh:
             fh.write(b"neither a zip nor kicad\n")

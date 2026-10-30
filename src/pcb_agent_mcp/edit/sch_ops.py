@@ -22,6 +22,7 @@ nothing is written until `sch_plan.apply_plan(confirm=True)`.
 import copy
 import os
 
+from ..fidelity import hierarchy as _hierarchy
 from ..fidelity import sexpr as S
 from . import build as B
 from .ops import OpError
@@ -1127,6 +1128,455 @@ op("set_field_position", ["symbols"],
     "x": "mm", "y": "mm", "rotation": "default 0"},
    _run_set_symbol_property_position, _verify_set_field_position)
 
+# ---------------------------------------------------------------- sheets
+# A `(sheet ...)` node is a *pointer to another file plus the pins it exposes*.
+# Everything below therefore does two things at once: it writes the pointer, and
+# it says out loud that the other end (the child file, and the hierarchical
+# labels inside it that the pins must land on) is a separate object that this
+# plan is not touching. The ERC gate is what turns "the pin has no label on the
+# other side" from a warning into a refusal, and that is the whole point: a sheet
+# pin with nothing behind it looks perfectly drawn.
+
+SHEET_SHAPES = SHAPES       # input/output/bidirectional/tri_state/passive
+SHEET_SIDES = ("left", "right", "top", "bottom")
+
+def _sheet_key(o):
+    return (_str(o, "sheet_uuid", required=False) or
+            _str(o, "sheet", required=False))
+
+def find_sheet(ed, key):
+    """(node, facts) for a `(sheet)` node named by uuid or by Sheetname."""
+    if not key:
+        raise OpError("pass `sheet` (the Sheetname shown on the page) or "
+                      "`sheet_uuid`", "ARG_MISSING")
+    nodes = ed.doc.items("sheet")
+    for node in nodes:
+        if _id(node) == key:
+            return node, sheet_facts(node)
+    hits = [n for n in nodes if sheet_facts(n)["name"] == key]
+    if len(hits) > 1:
+        raise OpError("%d sheets on this page are called %r; use sheet_uuid "
+                      "instead" % (len(hits), key), "SHEET_AMBIGUOUS")
+    if not hits:
+        names = [sheet_facts(n)["name"] for n in nodes]
+        raise OpError("no sheet called %r on this page (sheets here: %s)"
+                      % (key, ", ".join(repr(n) for n in names) or "none"),
+                      "SHEET_NOT_FOUND")
+    return hits[0], sheet_facts(hits[0])
+
+def sheet_facts(node):
+    return _hierarchy.sheet_facts(node)
+
+def _sheet_for_verify(ed, o):
+    """The sheet a checker should look at, after the plan may have renamed it.
+
+    Verification runs against the *finished* page, so an operation earlier in the
+    same plan can have changed this one's discoverable key (a rename makes
+    ``sheet="power"`` stale). The uuid assigned while the operation ran is
+    therefore tried first, and the name is only the fallback for a checker that
+    is handed an operation it never ran.
+    """
+    uid = o.get("assigned_sheet_uuid") or o.get("sheet_uuid")
+    nodes = ed.doc.items("sheet")
+    if uid:
+        for n in nodes:
+            if _id(n) == uid:
+                return n, sheet_facts(n)
+    return find_sheet(ed, _sheet_key(o))
+
+def _page_tree(ed):
+    """Where the page being edited sits inside its project, read from disk.
+
+    `None` means "do not know": the document is in memory, or the file is not
+    there yet. The caller then falls back to what the file itself says, which is
+    the right answer for a lone page and a guess for a reused one - so it is
+    never presented as the tree.
+    """
+    path = getattr(ed.doc, "path", None)
+    if not path or path == "<memory>" or not os.path.isfile(path):
+        return None
+    try:
+        info = _hierarchy.instance_paths(path)
+    except Exception:                                  # noqa: BLE001
+        return None
+    return info if info.get("instances") else None
+
+def _sheet_pages(ed):
+    """Every page number already used on this page's own `(sheet)` nodes."""
+    out = []
+    for node in ed.doc.items("sheet"):
+        page = sheet_facts(node)["page"]
+        if page:
+            out.append(page)
+    return out
+
+def _used_pages(ed, tree):
+    """Every page number in use: the project's on disk *and* this page's own.
+
+    The union matters inside one plan: a second `add_sheet` sees the first one
+    only in memory, while the project-wide numbers come from disk.
+    """
+    used = set(_sheet_pages(ed))
+    if tree:
+        used |= set(tree["pages"] or [])
+    return used
+
+def _next_page(ed, tree=None):
+    """The first page number after everything in use (project-wide if known)."""
+    tree = _page_tree(ed) if tree is None else tree
+    used = []
+    for p in _sheet_pages(ed):
+        try:
+            used.append(int(p))
+        except (TypeError, ValueError):
+            pass
+    if tree:
+        used.append(int(tree["max_page"] or 0))
+    si = S.child(ed.root, "sheet_instances")
+    if si is not None:
+        for path in S.children(si, "path"):
+            page = S.arg_text(S.child(path, "page"), 1)
+            try:
+                used.append(int(page))
+            except (TypeError, ValueError):
+                pass
+    return str(max(used) + 1 if used else 2)
+
+def _sheet_node(ed, o, seed):
+    name = _str(o, "name")
+    sheetfile = _str(o, "file")
+    if not sheetfile.lower().endswith(".kicad_sch"):
+        raise OpError("Sheetfile must name a .kicad_sch file (got %r): a sheet "
+                      "points at a schematic, and KiCad will refuse anything else"
+                      % sheetfile, "ARG_INVALID")
+    if os.path.basename(sheetfile) != sheetfile:
+        raise OpError("Sheetfile must be a bare file name such as 'power.kicad_sch' "
+                      "(got %r). A path with directories makes the sheet point "
+                      "outside the folder the project is saved in, which this "
+                      "server cannot verify - move the file or keep the tree flat"
+                      % sheetfile, "ARG_INVALID")
+    x, y = _xy(o)
+    w = _num(o, "width", required=False, default=40.64)
+    h = _num(o, "height", required=False, default=25.4)
+    if w <= 0 or h <= 0:
+        raise OpError("width/height must be positive (got %s x %s)" % (w, h),
+                      "ARG_RANGE")
+    # a page number is a label, not a quantity: KiCad stores "2", an agent will
+    # send 2, and both mean the same page - so an int is accepted rather than
+    # refused as "must be a string"
+    tree = _page_tree(ed)
+    proj = ed.proj
+    if tree:
+        # pages are numbered once per project and globally, and a sheet node
+        # carries one `(path ... (page ...))` entry per place its parent page is
+        # instantiated: the same node is read once per instance, so a single
+        # entry would give every instance the same page number
+        spots = [i["path"] for i in tree["instances"] if i["path"]] or [
+            proj["root_path"]]
+    else:
+        spots = [proj["root_path"]]
+    raw_page = o.get("page")
+    asked = None
+    if isinstance(raw_page, int) and not isinstance(raw_page, bool):
+        asked = str(raw_page)
+    elif raw_page is not None:
+        asked = _str(o, "page")
+    if asked is not None and len(spots) > 1:
+        raise OpError("this page is instantiated %d times, so a sheet added to it "
+                      "needs %d page numbers, not one - leave `page` out and the "
+                      "numbers after the highest one in use are assigned"
+                      % (len(spots), len(spots)), "ARG_INVALID")
+    start = int(asked) if asked is not None else int(_next_page(ed, tree))
+    pages = [str(start + i) for i in range(len(spots))]
+    used = _used_pages(ed, tree)
+    for p in pages:
+        if p in used:
+            raise OpError("page %r is already in use in this project (in use: %s)"
+                          % (p, ", ".join(sorted(used)) or "none"), "PAGE_EXISTS")
+    uid = ed.uid()
+    items = [A("sheet"),
+             at(x, y),
+             L(A("size"), A(num(w)), A(num(h))),
+             L(A("exclude_from_sim"), A("no")),
+             L(A("in_bom"), A("yes")),
+             L(A("on_board"), A("yes")),
+             L(A("dnp"), A("no")),
+             L(A("fields_autoplaced"), A("yes")),
+             stroke(0, "solid"),
+             L(A("fill"), L(A("color"), A("0"), A("0"), A("0"), A("0.0000"))),
+             ed.sp.id_node(uid),
+             prop("Sheetname", name, x, y - 0.7625, 0, size=1.524,
+                  justify="left bottom"),
+             prop("Sheetfile", sheetfile, x, y + h + 0.6099, 0, size=1.524,
+                  justify="left top")]
+    written_pins = []
+    pins = []
+    for pin in o.get("pins") or []:
+        node_pin, pin_name = _pin_node(ed, pin, x, y, w, h)
+        written_pins.append(node_pin)
+        pins.append(pin_name)
+    items.extend(written_pins)
+    items.append(L(A("instances"),
+                   L(A("project"), A(proj["project"] or "", True),
+                     *[L(A("path"), A(spot, True),
+                         L(A("page"), A(pg, True)))
+                       for spot, pg in zip(spots, pages)])))
+    node = L(*items)
+    ed.add_object(node)
+    o["assigned_sheet_uuid"] = uid
+    return node, {"uuid": uid, "name": name, "file": sheetfile,
+                  "page": pages[0], "pages": list(pages),
+                  "at": [x, y], "size": [w, h],
+                  "pins": pins,
+                  "instance_paths": list(spots),
+                  "instance_path": spots[0],
+                  "project": proj["project"]}
+
+def _pin_node(ed, pin, x, y, w, h):
+    if isinstance(pin, str):
+        pin = {"name": pin}
+    if not isinstance(pin, dict):
+        raise OpError("each pin must be a name or {\"name\": ..., \"shape\": ...}",
+                      "ARG_INVALID")
+    name = pin.get("name")
+    if not name:
+        raise OpError("a sheet pin needs a name", "ARG_MISSING")
+    shape = pin.get("shape") or "input"
+    if shape not in SHEET_SHAPES:
+        raise OpError("pin shape must be one of %s (got %r)"
+                      % (", ".join(SHEET_SHAPES), shape), "ARG_INVALID")
+    side = pin.get("side") or "right"
+    if side not in SHEET_SIDES:
+        raise OpError("pin side must be one of %s (got %r)"
+                      % (", ".join(SHEET_SIDES), side), "ARG_INVALID")
+    offset = pin.get("offset")
+    # KiCad puts pins on the box edge; which edge decides both the coordinate
+    # and the label justification, so the side is asked for rather than derived
+    # from a guessed coordinate.
+    span = w if side in ("left", "right") else h
+    if offset is None:
+        offset = span / 2.0
+    offset = float(offset)
+    if not (0 < offset < span):
+        raise OpError("pin offset %s is outside the %s edge (0..%s)"
+                      % (offset, side, span), "ARG_RANGE")
+    if side == "left":
+        px, py, rot, justify = x, y + offset, 180, "right"
+    elif side == "right":
+        px, py, rot, justify = x + w, y + offset, 0, "left"
+    elif side == "top":
+        px, py, rot, justify = x + offset, y, 90, "left"
+    else:
+        px, py, rot, justify = x + offset, y + h, 270, "left"
+    node = L(A("pin"), A(name, True), A(shape), at(px, py, rot),
+             ed.sp.id_node(ed.uid()),
+             effects(size=1.27, justify=justify))
+    return node, name
+
+def _run_add_sheet(ed, o, seed):
+    node, info = _sheet_node(ed, o, seed)
+    detail = dict(info)
+    detail["child_file_exists"] = os.path.isfile(
+        os.path.join(os.path.dirname(os.path.abspath(ed.doc.path or ".")),
+                     info["file"]))
+    detail["not_touched"] = ("the child file and its hierarchical labels are NOT "
+                             "part of this plan; a pin whose label is missing "
+                             "inside %r shows up as an ERC violation, and the ERC "
+                             "gate refuses the edit" % info["file"])
+    return detail
+
+def _later_sets(o, field):
+    """Does an operation *after* this one in the same plan rewrite `field`?
+
+    A postcondition is read off the finished page, so "add a sheet, then rename
+    it" and "add a sheet, forget to rename it" look identical at the end. Rather
+    than weaken the check, the checker is told which later operation is entitled
+    to override it - anything else still fails.
+    """
+    for later in o.get("_verify_later") or []:
+        if later.get("op") == "set_sheet_field" and later.get("field") == field:
+            return True
+    return False
+
+def _verify_add_sheet(ed, o):
+    name = _str(o, "name")
+    uid = o.get("assigned_sheet_uuid")
+    hits = [n for n in ed.doc.items("sheet") if _id(n) == uid] if uid else []
+    if not hits:
+        hits = [n for n in ed.doc.items("sheet") if sheet_facts(n)["name"] == name]
+    if not hits:
+        return {"ok": False, "error": "no sheet called %r after the edit" % name}
+    facts = sheet_facts(hits[0])
+    x, y = _xy(o)
+    name_ok = facts["name"] == name or _later_sets(o, "Sheetname")
+    file_ok = facts["file"] == _str(o, "file") or _later_sets(o, "Sheetfile")
+    placed = (facts["x"] is not None and abs(facts["x"] - x) < 1e-4
+              and facts["y"] is not None and abs(facts["y"] - y) < 1e-4)
+    return {"ok": bool(name_ok and file_ok and placed), "sheet": facts["name"],
+            "file": facts["file"], "page": facts["page"],
+            "at": [facts["x"], facts["y"]],
+            "name_changed_later": not name_ok or bool(_later_sets(o, "Sheetname")
+                                                     and facts["name"] != name),
+            "file_changed_later": not file_ok or bool(_later_sets(o, "Sheetfile")
+                                                      and facts["file"] != _str(o, "file"))}
+
+op("add_sheet",
+   ["sheets", "hierarchy"],
+   "Place a child sheet: a (sheet) box on this page that points at another "
+   ".kicad_sch file, with the pins this page exposes to it. The child file is "
+   "NOT created or edited here - if it does not exist KiCad's netlister will say "
+   "so, and if a pin has no matching hierarchical label inside it ERC will say "
+   "so (and the ERC gate will refuse the write).",
+   {"name": "Sheetname shown on this page",
+    "file": "bare .kicad_sch file name",
+    "x": "mm", "y": "mm",
+    "width": "default 40.64", "height": "default 25.4",
+    "page": "page number; default = highest in use + 1",
+    "pins": "[{\"name\": ..., \"shape\": input|output|bidirectional|tri_state|"
+            "passive, \"side\": left|right|top|bottom, \"offset\": mm}]"},
+   _run_add_sheet, _verify_add_sheet)
+
+def _run_add_sheet_pin(ed, o, seed):
+    key = _sheet_key(o)
+    node, facts = find_sheet(ed, key)
+    if facts["x"] is None or facts["width"] is None:
+        raise OpError("sheet %r has no (at ...)/(size ...) to put a pin on"
+                      % facts["name"], "SHEET_MALFORMED")
+    pin, _pin_name = _pin_node(ed, o, facts["x"], facts["y"],
+                               facts["width"], facts["height"])
+    o["assigned_sheet_uuid"] = facts["uuid"]
+    o["assigned_pin_uuid"] = _id(pin)
+    pins = S.child(node, "pin")
+    # pins live after the properties and before (instances ...); appending is
+    # what KiCad does when it adds one, and keeps (instances ...) last
+    idx = len(node.items)
+    for i, item in enumerate(node.items):
+        if isinstance(item, S.Seq) and S.head(item) == "instances":
+            idx = i
+            break
+    S.insert_child(node, idx, pin)
+    return {"sheet": facts["name"], "sheet_uuid": facts["uuid"],
+            "pin": S.arg_text(pin, 1), "shape": S.arg_text(pin, 2),
+            "at": [S.arg_num(S.child(pin, "at"), 1), S.arg_num(S.child(pin, "at"), 2)],
+            "uuid": _id(pin),
+            "not_touched": "the hierarchical label inside %r is what this pin must "
+                           "land on; adding the pin alone is an ERC violation"
+                           % facts["file"]}
+
+def _verify_add_sheet_pin(ed, o):
+    try:
+        node, facts = _sheet_for_verify(ed, o)
+    except OpError as exc:
+        return {"ok": False, "error": str(exc)}
+    pin_uuid = o.get("pin_uuid") or o.get("assigned_pin_uuid")
+    names = [S.arg_text(p, 1) for p in S.children(node, "pin")]
+    if pin_uuid:
+        return {"ok": pin_uuid in [_id(p) for p in S.children(node, "pin")],
+                "sheet": facts["name"], "pins": sorted(names)}
+    want = _str(o, "name", required=False)
+    return {"ok": want in names, "sheet": facts["name"], "pins": sorted(names)}
+
+op("add_sheet_pin",
+   ["sheets", "connectivity"],
+   "Add one pin to an existing sheet box. The pin is a promise that the child "
+   "file has a hierarchical label of the same name - this operation does not go "
+   "and add it",
+   {"sheet": "Sheetname on this page (or sheet_uuid)",
+    "name": "pin name, must match a hierarchical label in the child",
+    "shape": "input|output|bidirectional|tri_state|passive (default input)",
+    "side": "left|right|top|bottom (default right)",
+    "offset": "mm along that edge; default the middle"},
+   _run_add_sheet_pin, _verify_add_sheet_pin)
+
+def _run_set_sheet_field(ed, o, seed):
+    key = _sheet_key(o)
+    node, facts = find_sheet(ed, key)
+    field = _str(o, "field")
+    if field not in ("Sheetname", "Sheetfile"):
+        raise OpError("only Sheetname and Sheetfile are settable here (got %r); a "
+                      "sheet's other properties are geometry-owned" % field,
+                      "ARG_INVALID")
+    value = _str(o, "value")
+    if field == "Sheetfile":
+        if not value.lower().endswith(".kicad_sch"):
+            raise OpError("Sheetfile must name a .kicad_sch file (got %r)"
+                          % value, "ARG_INVALID")
+        if os.path.basename(value) != value:
+            raise OpError("Sheetfile must be a bare file name (got %r)" % value,
+                          "ARG_INVALID")
+        if value == facts["file"]:
+            raise OpError("sheet %r already points at %r - nothing to change"
+                          % (facts["name"], value), "OP_NOOP")
+    elif value == facts["name"]:
+        raise OpError("sheet is already called %r - nothing to change" % value,
+                      "OP_NOOP")
+    done = False
+    for p in S.children(node, "property"):
+        if S.arg_text(p, 1) != field:
+            continue
+        p.items[2].text = value
+        p.items[2].quoted = True
+        done = True
+    if not done:
+        raise OpError("sheet %r has no %s property to change"
+                      % (facts["name"], field), "FIELD_NOT_FOUND")
+    o["assigned_sheet_uuid"] = facts["uuid"]
+    out = {"sheet_uuid": facts["uuid"], "field": field, "value": value,
+           "was": facts["name"] if field == "Sheetname" else facts["file"]}
+    if field == "Sheetfile":
+        out["note"] = ("repointing a sheet means the project's netlist is now read "
+                       "from a different file; the netlist gate compares before and "
+                       "after, so a mismatch is visible rather than assumed")
+    return out
+
+def _verify_set_sheet_field(ed, o):
+    try:
+        node, facts = _sheet_for_verify(ed, o)
+    except OpError as exc:
+        return {"ok": False, "error": str(exc)}
+    field = _str(o, "field")
+    have = facts["name"] if field == "Sheetname" else facts["file"]
+    return {"ok": have == _str(o, "value"), "field": field, "value": have}
+
+op("set_sheet_field",
+   ["sheets", "hierarchy"],
+   "Rename a sheet box (Sheetname) or point it at a different child file "
+   "(Sheetfile). Changing Sheetfile changes what the whole project's netlist is "
+   "read from, so the netlist gate is what judges it",
+   {"sheet": "Sheetname on this page (or sheet_uuid)",
+    "field": "Sheetname | Sheetfile", "value": "new text"},
+   _run_set_sheet_field, _verify_set_sheet_field)
+
+def _run_delete_sheet(ed, o, seed):
+    key = _sheet_key(o)
+    node, facts = find_sheet(ed, key)
+    others = [sheet_facts(n) for n in ed.doc.items("sheet") if n is not node
+              and sheet_facts(n)["file"] == facts["file"]]
+    S.remove_child(ed.root, node)
+    o["assigned_sheet_uuid"] = facts["uuid"]
+    return {"sheet_uuid": facts["uuid"], "name": facts["name"],
+            "file": facts["file"], "page": facts["page"], "removed": True,
+            "file_kept": "the child file %r is still on disk - this operation never "
+                         "deletes a file" % facts["file"],
+            "other_sheets_using_it": [s["name"] for s in others],
+            "orphaned": not others}
+
+def _verify_delete_sheet(ed, o):
+    uid = o.get("assigned_sheet_uuid") or o.get("sheet_uuid") or _sheet_key(o)
+    nodes = ed.doc.items("sheet")
+    for node in nodes:
+        if _id(node) == uid:
+            return {"ok": False, "error": "the sheet is still there"}
+    return {"ok": True, "remaining": [sheet_facts(n)["name"] for n in nodes]}
+
+op("delete_sheet",
+   ["sheets", "hierarchy"],
+   "Remove a sheet box from this page. The child file stays on disk (this tool "
+   "never deletes files); if no other sheet points at it, the answer says the "
+   "file is now unreferenced",
+   {"sheet": "Sheetname on this page (or sheet_uuid)"},
+   _run_delete_sheet, _verify_delete_sheet)
+
 # ---------------------------------------------------------------- driver
 def validate(o):
     if not isinstance(o, dict):
@@ -1170,6 +1620,8 @@ def verify_all(doc, ops):
     ok = True
     for idx, o in enumerate(ops):
         name = validate(o)
+        if isinstance(o, dict):
+            o["_verify_later"] = ops[idx + 1:]
         try:
             res = OPS[name]["verify"](ed, o) or {"ok": False}
         except OpError as exc:

@@ -3039,10 +3039,21 @@ def _capabilities(_args):
                         "not installed is an ERROR, never a silent fallback to the "
                         "closed-form starting geometry",
             "write_schematic": "KiCad .kicad_sch only: propose (compute only) -> apply "
-                               "(checkpoint, atomic write, four gates). The referee is "
+                               "(checkpoint, atomic write, five gates). The referee is "
                                "the netlister + ERC, not DRC: a schematic's product is "
                                "connectivity, and two coordinates being right does not "
                                "prove two wires are joined",
+            "multipage_schematic": "a KiCad page that has children is a TREE, not a "
+                                   "file, so both sides of the engine gate are asked "
+                                   "about a temp copy of the whole tree (a lone file "
+                                   "in a temp directory is a different project with "
+                                   "the same name). Sheet boxes are written "
+                                   "(add_sheet/add_sheet_pin/set_sheet_field/"
+                                   "delete_sheet) and the child page can be created "
+                                   "empty (schematic_new_file), but the child's own "
+                                   "content is never part of the same plan: a pin with "
+                                   "no hierarchical label behind it is refused by ERC, "
+                                   "not silently accepted",
         },
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
@@ -3060,6 +3071,7 @@ def _capabilities(_args):
             "board_checkpoints", "board_restore", "board_progress",
             "schematic_ops", "schematic_propose", "schematic_apply",
             "schematic_summary", "schematic_view",
+            "schematic_hierarchy", "schematic_new_file",
             "part_library_status", "part_search", "part_get", "part_export",
             "part_footprint_pads", "part_cache_info",
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
@@ -4318,6 +4330,52 @@ _tool(
         "limit": _num("max rows per list", 200),
     }, "required": ["path"]},
     _sch_view,
+)
+
+def _sch_hierarchy(args):
+    from . import edit as _edit
+    try:
+        return _edit.schematic_hierarchy(args.get("path"))
+    except Exception as exc:                       # noqa: BLE001
+        return _schematic_error(exc)
+
+def _sch_new_file(args):
+    from . import edit as _edit
+    try:
+        return _edit.new_schematic_file(args.get("path"),
+                                        paper=args.get("paper") or "A4",
+                                        title=args.get("title"),
+                                        confirm=args.get("confirm") is True)
+    except Exception as exc:                       # noqa: BLE001
+        return _schematic_error(exc)
+
+_tool(
+    "schematic_hierarchy",
+    "Read-only. Which .kicad_sch files make up this schematic, and how: the root KTH "
+    "file (found by walking Sheetfile references, not guessed), every sheet box with "
+    "its page number and pins, a file used by two sheets reported as one file with two "
+    "instances, and the tree's problems (missing child, duplicate page, cycle). Run it "
+    "before adding or moving a sheet, and after an apply to see the tree that resulted.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to any .kicad_sch in the project"),
+    }, "required": ["path"]},
+    _sch_hierarchy,
+)
+
+_tool(
+    "schematic_new_file",
+    "Create an EMPTY .kicad_sch - a new page for a multi-page project. Refuses to "
+    "overwrite an existing file, refuses to create a directory, and refuses without "
+    "confirm=true. It does not draw the sheet box that makes the file part of a project "
+    "(that is schematic_ops op='add_sheet'), because a box pointing at a page with "
+    "nothing behind it is exactly what ERC refuses.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_sch to create (must not exist)"),
+        "paper": _str("A4 / A3 / A2 / A1 / A0 / A5 / USLetter ... (default A4)"),
+        "title": _str("optional title_block title"),
+        "confirm": _bool("must be true - this creates a file"),
+    }, "required": ["path"]},
+    _sch_new_file,
 )
 
 # ---------------------------------------------------------------- simulation

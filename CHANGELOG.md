@@ -9,6 +9,57 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.33] - 2026-10-30
+
+多页（层级）原理图接上了：`.kicad_sch` 能改 `sheet` 节点（增页 / 加 pin / 改字段 / 删页），
+`apply` 多一道 `tree` 闸门。这一版真正被推翻的是**上一版闸门问错了树**——不是"少做了一层"。
+
+- **假绿的根因：单文件闸门问的是另一个问题。** 0.0.32 的 `apply` 把**待测文件**复制进临时目录再让
+  kicad-cli 跑网表与 ERC。对单页图这是精确正确的；对层级工程，副本里没有子页，KiCad 要么报错、
+  要么当"这张图没有子页"答下去，两种结果都被当判据用了。实测（`complex_hierarchy` demo +
+  `ampli_ht.kicad_sch`，kicad-cli **10.0.7**）：问整棵树 **52 nets / 73 ERC**，问单文件副本只剩
+  那张图自己的 nets、子页违规一条看不见。而**改前与改后都错同一处，差值看起来是干净的**。
+- **修法不是再加一道闸门，而是让两边问同一组文件。** 新增 `fidelity/hierarchy.py` 的
+  `materialise()`：把树里每个可达 `.kicad_sch` 按同一相对布局复制进临时目录，只替换被编辑的那一个，
+  两个引擎调用都在副本里跑，`finally` 整个删掉。同一文件被两个 sheet 引用时**只复制一次**并在
+  `skipped` 说明（复制两遍等于改写工程布局）；复制不了的列进 `skipped`/`outside`，同时 `tree`
+  闸门把"引擎看到的是一棵残缺树"说出口。demo 实测 `before files 2 / after files 3`。
+- **`apply` 现在报 7 个 gate 字段**：`bytes_written` / `token_identity` / `postconditions` / `tree` /
+  `engine` / `netlist` / `erc`。加一个页不改变连通性：`nets_added 0`、ERC 新增 0（52/73 加页前后不变）。
+- **页号是工程全局的，而且一个节点可以有 N 条。** `vme-wren` demo 73 页 / 17 个 sheet 节点、页码
+  1..73 全局不重复；`io_driver_8x.kicad_sch` 一个文件 4 个实例 = 4 个页号，所以 `(instances (project
+  "P" (path "/<父实例路径>" (page "N"))))` 里要写 **N 条**。只写一条的失败形态是"每个实例同号"——
+  看着成功了。`_next_page` 取 `max(本页, 工程 max_page, sheet_instances) + 1`，`_used_pages` 合并
+  磁盘工程页与本页内存页（同一次 plan 里第二个 `add_sheet` 才看得见第一个）。
+- **4 个 sheet op**（op 表 18 → **22**）：`add_sheet` / `add_sheet_pin` / `set_sheet_field` /
+  `delete_sheet`。多实例 + 显式 `page` 直接 `ARG_INVALID`（不替调用方决定哪个实例是"第一条"）；
+  页号冲突判 `PAGE_EXISTS` 且按**工程全局**判；`set_sheet_field` 只许 `Sheetname`/`Sheetfile`，
+  同值 `OP_NOOP`；`Sheetfile` 只收裸文件名（`../x` 让本服务无法核验落点）；`delete_sheet` 返回
+  `file_kept` / `other_sheets_using_it` / `orphaned`，**从不删文件**。
+- **sheet pin 是承诺，ERC 才是判据。** 子图没有对应 `hierarchical_label` 时，加 pin 会让 ERC 新增
+  `hier_label_mismatch` + `pin_not_connected` → 拦截回滚；先在子图放 label 则 `hier_label_mismatch`
+  消失（正控制），证明拦截来自 label 本身而不是"我们不想让你加 pin"。
+- **两个新工具**：`schematic_hierarchy`（只读：每页文件 / 实例路径 / 页号 / 深度 / 缺失·循环·重复页，
+  页号报的是工程全局）、`schematic_new_file`（建空白 `.kicad_sch`，写完立刻 `from_text` 自检
+  `bytes_identical` + `token_identity`；200 字节空页）。**建新页不塞进 plan**：多文件原子写与回滚
+  没有诚实答案，拆成「先建页 → 再 `add_sheet`」两步比假原子更诚实。
+- **`blocking` 在 propose 阶段就落进 plan**：`FAILING_ISSUES = ("missing_file", "cycle", "too_deep",
+  "unreadable", "duplicate_page")`，其余只是 warning。`engine=False` 时层级闸门仍必须拦住——否则
+  关掉引擎就等于关掉整棵树。
+- **仍然只报*新增*的 issue**：工程本来就有问题不构成拒绝理由。
+- **七条能失败的对照**（每条都对应一次真实的假绿，都在 `tests/test_sch_sheets.py`）：`missing_file`、
+  `cycle`、`duplicate_page`、pin 无 label、多实例只写一条页号、`walk` 的 `text` 只对入口生效、
+  `blocking` 在 `engine:false` 时被忽略。
+- 新增 `tests/test_sch_sheets.py` **47 例**（读侧 10 / 根识别 4 / `materialise` 3 / sheet op 14 /
+  多实例分页 5 / 层级闸门 4 / `new_file` 5 / 真引擎 3——后 3 例只在装了 kicad-cli + demo 时跑，
+  否则 skip）。新增 selftest **151/152**（读两文件工程得 sheets 1 / file_count 2 / pages `["2"]`；
+  指向不存在的子图必须 `blocking` 非空且 `apply` 回 `status == "error"` 且根文件字节未变）。
+- 顺带把 `walk` 的 override 文本收窄到"只在该根同时是被编辑文件时"——否则根 uuid 变成被编辑
+  文件的 uuid，实例路径全错（proposed 得 4/4、磁盘得 4/5）。这是同一族的第三次假绿。
+- 验证：`--selftest` **126/126**；全量回归 **1832 例 / OK (skipped=5) / 760.223 s**
+  （0.0.32 是 1785 例 / 640.589 s，新增 47 例）。`docs/39-多页工程.md` 新写；`docs/14` §0/§4/§8
+  与 `docs/README.md` 同步。
+
 ## [0.0.32] - 2026-10-30
 
 `.noise` 进内置了，用的是**伴随法**——每个频点解一次 `Aᵀy = e_out`，全部噪声源的传函一次拿到，

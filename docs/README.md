@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这三十八篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这三十九篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 | # | 文档 | 它回答的问题 | 它推翻了什么 |
@@ -45,6 +45,7 @@
 | 07 §7 | 板框 / 开槽 / 机械层 | 待议，6 条议题 | —— |
 | 37 | [有损线 O 与分布 RC 线 U：把一条线换成一串 R/L/C](37-有损线与URC.md) | 有损线凭什么归内置管、段数为什么只许写在 `.model` 里、在没有引擎可对拍的地方凭什么信它？ | 「O/U 是分布线」——不是：解析期展开成 `lump` 段普通 R/L/C，段数与是否默认都随答案上报，DC 是模型的精确串联电阻、AC/瞬态随段数一阶收敛；「`lump=` 写在卡上也行」——ngspice 把它当 FATAL，而写在 `.model` 只是 warning，同一份 deck 要能两边跑就只能进 `.model`；「两个返回节点也能算」——梯形把返回当理想单节点，`n3 != n4` 拒绝而不是静默把串联电阻减半；「没有引擎对拍就等于没验过」——U 用 `Z0c·coth(γL)` 解析解做参照（ngspice 的 URC 数值不直观，与 `F` 卡同类判断）；「`G>0` 也能对拍」——ngspice-47 自己拒绝非零 G；顺手抓出 `.ac` 里没有 `AC` 关键字的源被当成 1 V 激励的真缺陷（旧读数满幅、ngspice 全是 0） |
 | 38 | [噪声分析 `.noise`：一次伴随求解，把「哪来的噪声」变成可对账的数](38-噪声分析.md) | 噪声凭什么归内置管、为什么是伴随法而不是「每个源解一次」、带内 rms 的积分规则凭什么跟着网格走？ | 「把各元件的噪声密度加起来」——不行：同一个 `4kT/R` 在短路旁边贡献 0、开路旁边贡献满，每个源都必须过传递；「一种积分规则够用」——`dec 10` 对闭式差 −0.0009 %，`lin 1000` 差 +47 %，规则只能由网格决定；「ngspice 能跑就一样」——它要求输入源带 `AC` 说明否则整份 deck 中止，而且它的 `inoise_total` 与逐点折算不是同一个量，交叉校验只比谱；「MOS 的 `W/L` 早就支持了」——没有，一直被静默忽略（器件弱 10~100 倍，噪声的 `gm` 直接继承这个错），本轮修掉并逐位对上前先由 `.op` 数值微分求出 `gm` |
+| 39 | [多页（层级）原理图：问哪一棵树、页号归谁、pin 谁说了算](39-多页工程.md) | 跨文件以后闸门还对不对、页号是工程全局还是本文件、引擎被问的是哪棵树、sheet pin 算不算接通、建新页为什么不塞进 plan？ | 「单文件闸门对层级也一样」——不，`walk` 把入口文件的 `text` 当成根，问的是**另一棵树**（proposed 4/4、磁盘 4/5）；「页号是本文件最大 +1」——是**工程全局**，`vme-wren` demo 73 页 / 17 个 sheet 节点、页码 1..73 不重复；「一个 sheet 节点写一条 `(path … (page …))` 就够」——同一节点被实例化 N 次就有 N 条，只写一条会让每个实例同号；「`set_sheet_field` 想改啥都行」——只许 `Sheetname` / `Sheetfile`，`Sheetfile` 还只收裸文件名；「pin 写了就等于接通」——子图没有对应 `hierarchical_label` 时 ERC 立刻多出 `hier_label_mismatch` + `pin_not_connected`，拦截来自 label 本身；「建新页顺手塞进 plan」——多文件原子写没有诚实答案，拆成 `schematic_new_file` 两步 |
 
 ## 三条贯穿全部文档的结论
 
@@ -69,7 +70,7 @@
   kicad-cli 实测的 DRC 事实。
 - `13` → `fidelity/lceda.py`（记录流 / 单位 / 逐字节往返）、`fidelity/eproj_doc.py`（SQLite 只读）、
   `edit/epro_edit.py`（六个 op + 六道闸门 + 行级 diff），以及 `adapters/epro.py` 里每条 `authoritative: false` 的成因。
-- `14` → `fidelity/kicad_sch.py`（整棵 `(kicad_sch)` 树）、`edit/sch_ops.py`（18 个 op）、
+- `14` → `fidelity/kicad_sch.py`（整棵 `(kicad_sch)` 树）、`edit/sch_ops.py`（22 个 op）、
   `edit/sch_plan.py`（propose / apply / netlist_diff / erc_diff）、`engine.sch_erc` 与
   `engine.sch_netlist`，以及 5 个 `schematic_*` 工具。
 - `15` → `fidelity/crosscheck.py`（`board_cross_check`：与厂商 DRC 双向对账、
@@ -119,4 +120,5 @@
 - `37` → `calc/spice.py` 的 `_parse_lossy_line` / `_parse_urc` / `_lossy_model` / `_ladder` / `_expand_lossy_lines` / `_lossy_report`（解析期把 O/U 展开成普通 R/L/C 梯形）、`DEFAULT_LUMP = 20`、`O`/`U` 从 `NOT_IMPLEMENTED_CARDS` 移除、内部节点不进 `nodes_v`、`.ac` 里没有 `AC` 关键字的源幅度为 0 并给出告警，1 个新测试文件（`tests/test_spice_oline.py` 34 例）与 3 条 selftest（96 换成 `S` 探针、147/148）；
 - `38` → `calc/spice.py` 的 `.noise` 解析（`V(out)` / `V(n1,n2)`，输出与输入源按名校验）、`_sweep_freqs`（`.ac` 与 `.noise` 共用同一套频率网格）、`_tline_guard`（从 `.ac` 里抽出的奇异点守卫，两处共用）、`_noise_sources`（四条机制，各带公式文本）/ `_noise_band`（按网格选 ln-f 或 f 梯形）/ `_noise_analysis`（伴随求解 `Aᵀy = e_out`，一次覆盖全部源）/ `_noise_owner`（阶梯元件的噪声归回原 `O`/`U` 卡名）、`KB_J_PER_K` / `E_CHARGE_C` / `_sig10`；委派侧 `_raw_plots` + `_parse_raw` 的 `bytes_used`（`.noise` rawfile 有两个 plot）、`_external_envelope` 的 noise 分支、`_cross_check` 的 noise 分支（只比输出谱）；顺带修 `_parse_element` 的 `M` 卡 `W=/L=/M=`（原先静默丢弃，`_mos_currents` 用 `KP·W/L`）；1 个新测试文件（`tests/test_spice_noise.py` 42 例）与 2 条 selftest（149/150）
   边界是**集总模型不是分布线**：`lump=` 只许在 `.model`（卡上是 ngspice 的 FATAL）、`LEN` 必须给、两个不同返回节点拒绝、皮肤效应/介质损耗/频变 `r`/`l` 与 `REL=`/`ABS=` 都不接，`g>0` 没有引擎可对拍。
-- 代码里的每条"拒绝回答"分支，都能在这三十七篇里找到对应的判据来源。
+- `39` → `fidelity/hierarchy.py`（读侧：`sheet_facts` / `sheets` / `walk` / `flat` / `instance_paths` / `parents_of` / `find_root`，加引擎用的 `materialise` / `cleanup`）、`edit/sch_ops.py` 的 4 个 sheet op（`add_sheet` / `add_sheet_pin` / `set_sheet_field` / `delete_sheet`，op 表 18 → 22）与 `_next_page` / `_used_pages` / `_page_tree`（工程全局页号）、`edit/sch_plan.py` 的 `hier_diff` / `hierarchy` / `blocking`（`FAILING_ISSUES`）/ `gates["tree"]` / `new_file`、2 个新工具（`schematic_hierarchy` / `schematic_new_file`）、1 个新测试文件（`tests/test_sch_sheets.py` 47 例）与 2 条 selftest（151/152）；边界是**只改一处文件**：页面模板、搬文件、跨页批量重命名、pin 与 label 形状一致性、KiCad 5 老格式、立创多页都不接。
+- 代码里的每条"拒绝回答"分支，都能在这三十九篇里找到对应的判据来源。
