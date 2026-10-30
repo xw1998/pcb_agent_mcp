@@ -796,28 +796,28 @@ def selftest():
                   str(payload.get("verified_against_engine")))
         # the point of having an engine at all: a card this module refuses by name
         # still runs, and the envelope says the deck was not parsed here. T (the
-        # LOSSLESS line) moved INTO the builtin set in 0.0.30, and O/U (the lossy
-        # ones) in 0.0.31, so the probe is now the voltage-controlled switch S -
-        # a card that still has no implementation here but that ngspice solves
-        # exactly: 1 V on the control node against VT=0.5 closes the switch, so the
-        # divider reads 0.500 V, not the 0.333 V an open switch would give.
+        # LOSSLESS line) moved INTO the builtin set in 0.0.30, O/U (the lossy ones)
+        # in 0.0.31 and S/W (the two switches) in 0.0.35, so the probe is now the
+        # JFET J - the last analogue device still refused by name, and one ngspice
+        # solves exactly: BETA=1m / VTO=-1 with VGS=0 sinks ~0.366 mA out of the
+        # 1 V / 1k divider tap, so it reads 0.268 V where a SKIPPED card reads the
+        # plain 0.500 V divider.
         r = handle({"jsonrpc": "2.0", "id": 96, "method": "tools/call",
                     "params": {"name": "sim_spice", "arguments": {
-                        "netlist": "* sw\nV1 1 0 1\nR1 1 2 1k\n"
-                                   "S1 2 0 1 0 sw\n"
-                                   ".model sw SW(VT=0.5 VH=0 RON=1k ROFF=10meg)\n"
-                                   ".op\n",
+                        "netlist": "* j\nV1 1 0 1\nR1 1 2 1k\nVg 3 0 0\n"
+                                   "J1 2 3 0 jm\nR2 2 0 1k\n"
+                                   ".model jm NJF(VTO=-1 BETA=1m)\n.op\n",
                         "engine": "ngspice"}}})
         payload = json.loads(r["result"]["content"][0]["text"])
         if _found:
             _n = (payload.get("value") or {}).get("nodes_v") or {}
-            check("a switch the builtin refuses by name does run under ngspice "
-                  "(1 V against VT=0.5 closes it, 0.500 V) and the envelope says "
-                  "this module did not parse the deck",
+            check("a card the builtin refuses by name (a JFET) does run under "
+                  "ngspice (0.268 V at the tap, not the 0.500 V a skipped card "
+                  "gives) and the envelope says this module did not parse the deck",
                   payload.get("status") == "ok"
                   and payload.get("netlist_parsed") is False
-                  and "S1" in (payload.get("netlist_parse_note") or "")
-                  and abs(_n.get("2", 0.0) - 0.5) < 1e-6,
+                  and "J1" in (payload.get("netlist_parse_note") or "")
+                  and abs(_n.get("2", 0.0) - 0.267949190) < 1e-6,
                   str(_n))
         else:
             check("engine='ngspice' refuses when no binary is installed instead of "
@@ -1985,6 +1985,116 @@ def selftest():
           and _bad.get("reason_code") == "NETLIST_INVALID"
           and "outside [-1, 1]" in (_bad.get("message") or ""),
           "ratio %s, bad %s" % (round(_ratio, 9), _bad.get("reason_code")))
+
+    # 0.0.35: the two switch cards. A switch is a conductance with TWO values and a
+    # state, so the two honest questions are "which state did it settle in" and
+    # "did the control pay for it". A card stamped as a plain wire answers 5.000 V
+    # to both; a card whose control pair is read as an element name reads 0 V
+    # forever. Neither shows up as a status error.
+    _sw = ("* s\nV1 1 0 5\nVc 3 0 %s\nS1 1 2 3 0 smod\nR1 2 0 1k\n"
+           ".model smod SW(VT=1 VH=0 RON=10 ROFF=1meg)\n.op\n.end\n")
+    _sw_on = json.loads(handle({"jsonrpc": "2.0", "id": 156,
+                                "method": "tools/call",
+                                "params": {"name": "sim_spice", "arguments": {
+                                    "netlist": _sw % "5"}}})["result"]["content"][0]["text"])
+    _sw_off = json.loads(handle({"jsonrpc": "2.0", "id": 1560,
+                                 "method": "tools/call",
+                                 "params": {"name": "sim_spice", "arguments": {
+                                     "netlist": _sw % "0"}}})["result"]["content"][0]["text"])
+    _sw_on_n = (_sw_on.get("value") or {}).get("nodes_v") or {}
+    _sw_off_n = (_sw_off.get("value") or {}).get("nodes_v") or {}
+    _sw_on_e = {e.get("name"): e for e in ((_sw_on.get("value") or {}).get("elements") or [])}
+    _sw_off_e = {e.get("name"): e for e in ((_sw_off.get("value") or {}).get("elements") or [])}
+    check("a voltage-controlled switch is two states, not a wire: 5 V of control "
+          "closes it (4.950 V at the load, state=on, 10 ohm) and 0 V opens it "
+          "(4.995 mV through 1 M, state=off) - while the control pair draws no "
+          "current at all",
+          _sw_on.get("status") == "ok" and _sw_off.get("status") == "ok"
+          and abs(_sw_on_n.get("2", 0.0) - 4.9504950495) < 1e-6
+          and abs(_sw_off_n.get("2", 0.0) - 0.004995004995) < 1e-9
+          and (_sw_on_e.get("S1") or {}).get("state") == "on"
+          and (_sw_off_e.get("S1") or {}).get("state") == "off"
+          and abs((_sw_on_e.get("S1") or {}).get("resistance_ohm", 0.0) - 10.0) < 1e-9
+          and abs((_sw_off_e.get("S1") or {}).get("resistance_ohm", 0.0) - 1e6) < 1e3
+          and abs((_sw_on_e.get("Vc") or {}).get("current_a", 1.0)) < 1e-9,
+          "on %s %s, off %s %s" % (_sw_on_n.get("2"),
+                                   (_sw_on_e.get("S1") or {}).get("state"),
+                                   _sw_off_n.get("2"),
+                                   (_sw_off_e.get("S1") or {}).get("state")))
+
+    # The negative control for hysteresis is the SAME ramp twice: it stops at
+    # 1.2 V, which is past VT=1.0 but short of VT+VH=1.5, so the no-hysteresis arm
+    # must close and the VH=0.5 arm must not. And a switch wired so that closing it
+    # removes its own control has no consistent state, which is an error with a
+    # cause, not "the state it happened to stop in".
+    _ramp = ("* ramp\nV1 1 0 5\nVc 3 0 PULSE(0 1.2 1m 2m 0 50m 60m)\n"
+             "S1 1 2 3 0 smod\nR1 2 0 1k\n"
+             ".model smod SW(VT=1 %s RON=10 ROFF=1meg)\n.tran 50u 5m\n.end\n")
+    _hy0 = json.loads(handle({"jsonrpc": "2.0", "id": 157,
+                              "method": "tools/call",
+                              "params": {"name": "sim_spice", "arguments": {
+                                  "netlist": _ramp % "VH=0"}}})["result"]["content"][0]["text"])
+    _hy5 = json.loads(handle({"jsonrpc": "2.0", "id": 1570,
+                              "method": "tools/call",
+                              "params": {"name": "sim_spice", "arguments": {
+                                  "netlist": _ramp % "VH=0.5"}}})["result"]["content"][0]["text"])
+    _hy0_v = _hy0.get("value") or {}
+    _hy5_v = _hy5.get("value") or {}
+    _hy0_pts = _hy0_v.get("points") or [{}]
+    _hy5_pts = _hy5_v.get("points") or [{}]
+    _bi = json.loads(handle({"jsonrpc": "2.0", "id": 1571,
+                             "method": "tools/call",
+                             "params": {"name": "sim_spice", "arguments": {
+                                 "netlist": "* bistable\nV1 1 0 5\nR1 1 3 10k\n"
+                                            "R2 3 0 1k\nS1 3 0 3 0 smod\n"
+                                            ".model smod SW(VT=0.4 VH=0 RON=1 ROFF=1meg)"
+                                            "\n.op\n.end\n"}}})["result"]["content"][0]["text"])
+    check("hysteresis is a band, not decoration: the SAME 1.2 V ramp closes the "
+          "VH=0 switch (flips>=1, 4.950 V) and leaves the VH=0.5 one untouched "
+          "(0 flips), because closing needs VT+VH=1.5 V; and a switch that shorts "
+          "its own control is NOT_CONVERGED with a bistable hint",
+          _hy0.get("status") == "ok" and _hy5.get("status") == "ok"
+          and _hy0_v.get("switch_flips", 0) >= 1
+          and _hy5_v.get("switch_flips", 1) == 0
+          and abs(_hy0_pts[-1]["nodes_v"]["2"] - 4.9504950495) < 1e-6
+          and abs(_hy5_pts[-1]["nodes_v"]["2"] - 0.004995004995) < 1e-9
+          and _bi.get("status") == "error"
+          and _bi.get("reason_code") == "NOT_CONVERGED"
+          and "bistable" in (_bi.get("hint") or ""),
+          "flips %s/%s, last %s/%s, bistable %s" % (
+              _hy0_v.get("switch_flips"), _hy5_v.get("switch_flips"),
+              _hy0_pts[-1]["nodes_v"].get("2"), _hy5_pts[-1]["nodes_v"].get("2"),
+              _bi.get("reason_code")))
+
+    # ON/OFF is the state the deck STARTS in, not a latch - the reading a reader
+    # would assume, and the one ngspice-47 contradicts. Three decks pin it: a seed
+    # the control contradicts is overthrown (0 V + ON settles open, 5 V + OFF
+    # settles closed), and a seed inside a hysteresis band IS the answer (1.2 V
+    # with VT=1 VH=0.5: closed with ON, open without).
+    def _seed_net(ctl, init, vh):
+        return ("* seed\nV1 1 0 5\nVc 3 0 %s\nS1 1 2 3 0 smod%s\nR1 2 0 1k\n"
+                ".model smod SW(VT=1 VH=%s RON=10 ROFF=1meg)\n.op\n.end\n"
+                % (ctl, init, vh))
+    _seeds = {}
+    for _key, _args in (("on0", ("0", " ON", "0")),
+                        ("off5", ("5", " OFF", "0")),
+                        ("band_on", ("1.2", " ON", "0.5")),
+                        ("band_none", ("1.2", "", "0.5"))):
+        _r = json.loads(handle({"jsonrpc": "2.0", "id": 158, "method": "tools/call",
+                                "params": {"name": "sim_spice", "arguments": {
+                                    "netlist": _seed_net(*_args)}}})["result"]["content"][0]["text"])
+        _seeds[_key] = (_r.get("value") or {}).get("nodes_v") or {}
+    check("ON/OFF only SEEDS the state (it is not a latch): 0 V + ON settles open "
+          "(4.995 mV) and 5 V + OFF settles closed (4.950 V), while inside a "
+          "VT=1/VH=0.5 band the seed is the whole answer (1.2 V: closed with ON, "
+          "open without) - three readings a 're-read the iterate' DC solve loses",
+          abs(_seeds["on0"].get("2", 0.0) - 0.004995004995) < 1e-9
+          and abs(_seeds["off5"].get("2", 0.0) - 4.9504950495) < 1e-6
+          and abs(_seeds["band_on"].get("2", 0.0) - 4.9504950495) < 1e-6
+          and abs(_seeds["band_none"].get("2", 0.0) - 0.004995004995) < 1e-9,
+          "on@0 %s, off@5 %s, band %s/%s" % (
+              _seeds["on0"].get("2"), _seeds["off5"].get("2"),
+              _seeds["band_on"].get("2"), _seeds["band_none"].get("2")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

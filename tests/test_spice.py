@@ -231,11 +231,12 @@ class TestRefusals(unittest.TestCase):
     def test_unimplemented_cards_are_named(self):
         # B is NOT in this list any more: 0.0.29 implements behavioural sources,
         # O and U left it in 0.0.31 (see docs/37), F/H/K left it in 0.0.34 (see
-        # docs/40); a card whose refusal would be a lie must not be listed. The
-        # cards here still have no implementation: J (JFET), S (switch), W
-        # (XSPICE lossy line) and A (XSPICE device) - each needs a model we do
-        # not have, not merely a stamp.
-        for card in ("S1 1 2 3 4 sw",
+        # docs/40), S/W left it in 0.0.35 (see docs/41); a card whose refusal
+        # would be a lie must not be listed. J (JFET) and A (XSPICE device) are
+        # still unimplemented - each needs a model we do not have, not a stamp -
+        # and the other two entries below are refused for a shape/definition
+        # reason (an undefined subcircuit, a T with nothing to go on).
+        for card in ("J1 1 2 3 jm",
                      "X1 1 0 sub", "T1 1 0 2 0 Z0=50"):
             r = spice.simulate("* x\nV1 1 0 1\nR1 1 2 1k\nR2 2 0 1k\n%s\n.op\n.end\n"
                                % card, analysis="op")

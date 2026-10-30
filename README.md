@@ -214,7 +214,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `link_far_field` | 远场距离：`max(2D²/λ, 5D, λ/2π)` 并说明哪个机制主导 | 三段都要给，只给一段会误导 |
 | `link_fresnel` | 第一菲涅耳区半径 + 60% 净空 | — |
 | `board_antenna_keepout` | 板级净空：某矩形内的铜与 **zone** | 派生量 `authoritative:false`；pad/track/via 与 zone **分开计数**（DRC 看不见铺铜失谐） |
-| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`） | 内置子集认 R C L V I E F H K D Q M B T O U、子电路 `X` 与 `.noise`，**S/W/J/A 逐条点名拒绝**（`engine="ngspice"` 下直通引擎）；`engine="ngspice"` 找不到二进制**报错不回退**；默认 `builtin` |
+| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`） | 内置子集认 R C L V I E F H K S W D Q M B T O U、子电路 `X` 与 `.noise`，**J/A 逐条点名拒绝**（`engine="ngspice"` 下直通引擎）；开关是**两个电导 + 一个状态**（`VT±VH` 是整宽、`VH=0` 时恰好 `VT` 就闭合、DC 也走滞回带，全部对 ngspice 逐点校准）；`engine="ngspice"` 找不到二进制**报错不回退**；默认 `builtin` |
 | `trace_resistance` | 铜线直流电阻 `rho(T)·L/(w·t)` | 只管这一段；过孔/扩展/端子不在这个数里 |
 | `via_resistance` | 过孔桶壁电阻（截面是**铜环**不是钻孔圆） | 载流是另一码事，要温升判据 |
 | `trace_inductance` | 直线走线自感（Grover 带公式，±20%） | 只用于比两种布局；地平面像项**明确未计入** |
@@ -263,8 +263,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 ```bash
 python run_server.py --version       # 0.0.34
-python run_server.py --selftest      # 协议级自检，128/128（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问）
-python -m unittest discover -s tests # 1877 个用例（约 15.6 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --selftest      # 协议级自检，131/131（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问）
+python -m unittest discover -s tests # 1914 个用例（约 15 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -420,8 +420,8 @@ MCP 客户端配置（stdio）：
 
 - **SPICE 只做子集，而且是按名字拒绝的。** `sim_spice` 真解非线性方程（MNA + 牛顿 + pnjlim +
   gmin 向下步进），器件卡认 `R C L V I E G F H K D Q M` 加行为源 `B`（编译成树，不是 `eval`）、
-  子电路 `X`、无损线 `T`、有损线 `O` 与 URC `U`；`J S W A` 四类一律 `UNSUPPORTED_CARD` 并点名，
-  而不是跳过——**一半跑完的网表比拒答更危险**。瞬态是后向欧拉
+  子电路 `X`、无损线 `T`、有损线 `O` 与 URC `U`、压控/流控开关 `S`/`W`（分段线性电导，见
+  `docs/41`）；`J A` 两类一律按名字拒绝并点名，而不是跳过——**一半跑完的网表比拒答更危险**。瞬态是后向欧拉
   （不是梯形），AC 先解工作点再只覆盖雅可比。`not_computed` 每一条都写清：没有自热、没有器件
   电容/迁移率/击穿随温度、没有噪声/失真/傅里叶分析。
 - **`.param` 是整份 deck 的语言，不是子电路的私产。** `0.0.28` 起顶层与 `.subckt` 体内都能写
@@ -501,7 +501,7 @@ MCP 客户端配置（stdio）：
   ngspice-47**（MSYS2 构建解包到 `%LOCALAPPDATA%\ngspice-47\`，外部二进制不是仓库依赖）并对着
   金标网表实测：分压 5e-9 V、二极管 0.35 mV、BJT 17.8 mV（模型差异）、RC 阶跃与 RLC AC 逐位相同，
   所以 `verified_against_engine` **按版本**给 true（`VERIFIED_ENGINES`，别的版本回落 false）。
-  装了引擎才拿到的能力是**未解析 deck 直通**：`S`、`W`、`J`、`A` 等内置按名字拒绝的卡在（`.subckt/X` 自 `0.0.27` 起内置自己拍平就能跑、`B` 自 `0.0.29`、**无损线 `T`** 自 `0.0.30`、**有损线 `O` 与 URC `U`** 自 `0.0.31`、**噪声分析 `.noise`** 自 `0.0.32`、**受控源 `F`/`H` 与互感 `K`** 自 `0.0.34`，都不再需要引擎）
+  装了引擎才拿到的能力是**未解析 deck 直通**：`J`、`A` 等内置按名字拒绝的卡在（`.subckt/X` 自 `0.0.27` 起内置自己拍平就能跑、`B` 自 `0.0.29`、**无损线 `T`** 自 `0.0.30`、**有损线 `O` 与 URC `U`** 自 `0.0.31`、**噪声分析 `.noise`** 自 `0.0.32`、**受控源 `F`/`H` 与互感 `K`** 自 `0.0.34`、**开关 `S`/`W`** 自 `0.0.35`，都不再需要引擎）
   `engine="ngspice"` 下照跑，节点表从 rawfile 读，信封带 `netlist_parsed:false` 而**不假装**
   这是一次完整解析；同一 deck 走 `builtin` 仍然拒绝。`simulate()` 默认引擎是 `builtin`
   （`engine="auto"` 才用引擎）——默认值不能让同一网表在两台机器给出不同答案。
@@ -692,10 +692,10 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1877 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1914 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~40，建议按编号顺序读（索引见 docs/README.md）
+└── docs/                         # 设计文档 00~41，建议按编号顺序读（索引见 docs/README.md）
 ```
 
 ## 免责声明
@@ -707,8 +707,8 @@ pcb_agent_mcp/
   `reference_note`。共面线（cpw/gcpw）也有场解（`coplanar_field`），它在七个几何上都比共形映射
   **读低** 1.19%~3.39%，即共形映射是乐观的那一端；共面损耗现在由场解给出，但只有零厚度值
   （真实铜箔更高约 10%，而那 10% 自己也没收敛）。共面的地默认按**无限宽**算，真实版图地留窄时传 `ground_mm`——单线 `g/2` 宽的地会抬 13.7%，差分对则只动差模 1.1% 而动共模 21.9%。差分对同理，且**差分对的数一律是 Zdiff = 2·Z_odd**；要拿宽度而不是阻抗时用 `feedline_width`，它在差分对上会把残差一起报出来。定稿前请用场求解器或打样厂的阻抗报告复核。
-- 仿真层是**子集**：SPICE 只有 R C L V I E G D Q M 与后向欧拉瞬态，没有自热、没有噪声/失真、
-  没有器件电容随温度；热学是 1-D/2-D 稳态与单级或多级 RC，不含 TIM 压缩、辐照与空气流场；
+- 仿真层是**子集**：SPICE 的子集见上（R C L V I E G F H K S W D Q M B T O U X 与 `.noise`），
+  瞬态是后向欧拉，没有自热、没有失真、没有器件电容随温度、开关没有电荷注入与先断后合；热学是 1-D/2-D 稳态与单级或多级 RC，不含 TIM 压缩、辐照与空气流场；
   板级 IR drop 只算直流、只用叠层铜厚。逐条写在每次返回的 `not_computed` / `warnings` 里。
 - DFM 校验是**工艺能力核对**，不是板厂签核。它只回答「给定这份能力文档，板上哪几条越界了」；
   蚀刻公差、阻焊桥、丝印可读性、拼板与基准点、铜到成品孔壁这 8 类静态文件里没有可比事实，

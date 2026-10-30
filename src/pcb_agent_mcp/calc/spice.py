@@ -58,8 +58,6 @@ GROUND_NAMES = ("0", "gnd", "ground", "gnd!", "vss")
 # silently ignoring (a silently ignored card is how a netlist "runs" and lies).
 NOT_IMPLEMENTED_CARDS = {
     "J": "JFET",
-    "S": "voltage-controlled switch",
-    "W": "current-controlled switch",
     "A": "XSPICE analogue behavioural block",
 }
 
@@ -307,14 +305,15 @@ def parse_netlist(text):
     # .model cards may come after the instances that use them, so the reference
     # check is deferred to the end (a netlist is not read in order)
     for el in spec["elements"]:
-        if el["type"] not in ("D", "Q", "M"):
+        if el["type"] not in ("D", "Q", "M", "S", "W"):
             continue
         model = el["model"]
         if model not in spec["models"]:
             raise ValueError("line %d: %s references .model %r which is not defined"
                              % (el.get("lineno", 0), el["name"], model))
         kind = spec["models"][model]["type"]
-        want = {"D": ("D",), "Q": ("NPN", "PNP"), "M": ("NMOS", "PMOS")}[el["type"]]
+        want = {"D": ("D",), "Q": ("NPN", "PNP"), "M": ("NMOS", "PMOS"),
+                "S": ("SW",), "W": ("CSW",)}[el["type"]]
         if kind not in want:
             raise ValueError("line %d: %s needs a %s model, %r is %s"
                              % (el.get("lineno", 0), el["name"],
@@ -910,7 +909,7 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
         copy["nodes"] = tuple(mapped(n) for n in body["nodes"])
         if body.get("ctrl"):
             copy["ctrl"] = tuple(mapped(n) for n in body["ctrl"])
-        if copy["type"] in ("F", "H"):
+        if copy["type"] in ("F", "H", "W"):
             copy["ctrl_name"] = scoped_ref(copy["ctrl_name"])
         elif copy["type"] == "K":
             copy["l1"] = scoped_ref(copy["l1"])
@@ -1236,6 +1235,48 @@ def _parse_element(spec, line, lineno):
                              "got %r" % (lineno, name, " ".join(parts[1:])))
         return {"type": "K", "name": name, "lineno": lineno, "nodes": (),
                 "l1": parts[1], "l2": parts[2], "value": _value_or_expr(parts[3], lineno)}
+    if letter in ("S", "W"):
+        # S: Sname n+ n- nc+ nc- model   - the control is a VOLTAGE between two
+        #                                 nodes, so the card has four terminals
+        # W: Wname n+ n- vname model     - the control is the CURRENT through a
+        #                                 named element, spelled as a name
+        # Neither owns a branch unknown: a switch is a conductance that changes
+        # between two values, not a source.
+        need = 6 if letter == "S" else 5
+        shape = ("Sname n+ n- nc+ nc- model [ON|OFF]" if letter == "S"
+                 else "Wname n+ n- vname model [ON|OFF]")
+        if len(parts) < need:
+            raise ValueError("line %d: %s: a %s card is `%s`; got %r"
+                             % (lineno, name, letter, shape,
+                                " ".join(parts[1:])))
+        el = {"type": letter, "name": name, "lineno": lineno,
+              "nodes": (_node(parts[1]), _node(parts[2]))}
+        if letter == "S":
+            el["ctrl"] = (_node(parts[3]), _node(parts[4]))
+            el["model"] = parts[5].lower()
+            tail = low[6:]
+        else:
+            ctrl = parts[3]
+            if "=" in ctrl or _looks_numeric(ctrl):
+                raise ValueError("line %d: %s: the controlling element comes "
+                                 "before the model name and %r is not an element "
+                                 "name. A W card is switched by the CURRENT "
+                                 "through another card, so that card is named"
+                                 % (lineno, name, ctrl))
+            el["ctrl_name"] = ctrl
+            el["model"] = parts[4].lower()
+            tail = low[5:]
+        el["_init"] = None
+        for tok in tail:
+            if tok == "on":
+                el["_init"] = True
+            elif tok == "off":
+                el["_init"] = False
+            else:
+                raise ValueError("line %d: %s: %r is not a field of a %s card "
+                                 "(only an initial state, ON or OFF, may follow "
+                                 "the model name)" % (lineno, name, tok, letter))
+        return el
     if letter == "D":
         model = val(3, "model name").lower()
         return {"type": "D", "name": name, "lineno": lineno,
@@ -2036,6 +2077,15 @@ class _Circuit(object):
         self.disabled = list(spec.get("warnings") or [])
         self.defaulted = {}       # model params that fell back to a default
         self.lossy = spec.get("lossy") or []   # O/U cards, for the report only
+        # Switches (S/W) are piecewise-linear: which of TWO resistances is in
+        # circuit depends on a state, so the answer is only as good as the state
+        # it settled in. Models, parameters and a W card's control row are
+        # resolved here, where a bad card still knows its own line number.
+        self.switches = []
+        for el in self.elements:
+            if el["type"] in ("S", "W"):
+                self._resolve_switch(el)
+                self.switches.append(el)
         # Nodes that exist only inside a ladder: reported nowhere, because they
         # are not the caller's nodes (the O/U card is, with its section count).
         ext, inn = set(), set()
@@ -2061,7 +2111,7 @@ class _Circuit(object):
     def is_linear(self):
         # a constant B source is an ordinary source: calling it nonlinear would
         # add damping to a circuit that solves exactly in one step
-        return not any(el["type"] in ("D", "Q", "M")
+        return not any(el["type"] in ("D", "Q", "M", "S", "W")
                        or (el["type"] in ("BV", "BI") and el["deps"])
                        for el in self.elements)
 
@@ -2090,6 +2140,116 @@ class _Circuit(object):
         """Current `amps` flowing from na to nb inside the source."""
         self._rhs(b, self.i(na), -amps)
         self._rhs(b, self.i(nb), amps)
+
+    # -- switches (S/W)
+    def _resolve_switch(self, el):
+        where = "line %s" % (el.get("lineno") or "?")
+        kind, th_key, hys_key = {"S": ("SW", "VT", "VH"),
+                                 "W": ("CSW", "IT", "IH")}[el["type"]]
+        model = self.models.get(el["model"])
+        if model is None:
+            raise ValueError("%s: %s references .model %r which is not defined"
+                             % (where, el["name"], el["model"]))
+        if model["type"] != kind:
+            raise ValueError("%s: %s needs a %s model and %r is %s"
+                             % (where, el["name"], kind, el["model"],
+                                model["type"]))
+        params = dict(model["params"])
+        allowed = (th_key, hys_key, "RON", "ROFF")
+        unknown = sorted(k for k in params if k not in allowed)
+        if unknown:
+            raise ValueError("%s: .model %r has %s=, which is not a parameter of a "
+                             "%s switch here (implemented: %s)"
+                             % (where, el["model"], ", ".join(unknown), kind,
+                                ", ".join(allowed)))
+        defaults = {th_key: 0.0, hys_key: 0.0, "RON": 1.0, "ROFF": 1e6}
+        vals = {}
+        for key, dflt in defaults.items():
+            if key in params:
+                vals[key] = float(params[key])
+            else:
+                vals[key] = dflt
+                # a defaulted switch resistance is exactly the kind of number
+                # that turns into a plausible wrong curve, so it is said out
+                # loud instead of being assumed away
+                self.defaulted["%s.%s" % (el["model"], key.lower())] = dflt
+        if vals["RON"] <= 0.0:
+            raise ValueError("%s: .model %r has RON=%g. A closed switch of zero "
+                             "resistance is an ideal short, which this solver "
+                             "cannot stamp as a conductance; give RON > 0"
+                             % (where, el["model"], vals["RON"]))
+        if vals["ROFF"] <= 0.0:
+            raise ValueError("%s: .model %r has ROFF=%g; an open switch is a "
+                             "positive (large) resistance, not a zero or negative "
+                             "one" % (where, el["model"], vals["ROFF"]))
+        if vals["ROFF"] < vals["RON"]:
+            raise ValueError("%s: .model %r has ROFF=%g below RON=%g, so the "
+                             "switch conducts BETTER when open: the two states are "
+                             "not the two states of a switch"
+                             % (where, el["model"], vals["ROFF"], vals["RON"]))
+        if vals[hys_key] < 0.0:
+            raise ValueError("%s: .model %r has %s=%g; a hysteresis width cannot be "
+                             "negative (0 means none)"
+                             % (where, el["model"], hys_key, vals[hys_key]))
+        el["_ron"] = vals["RON"]
+        el["_roff"] = vals["ROFF"]
+        el["_th"] = vals[th_key]
+        el["_hys"] = vals[hys_key]
+        el["_model_params"] = vals
+        el["_on"] = True if el.get("_init") else False
+        if el["type"] == "W":
+            key = str(el["ctrl_name"]).lower()
+            if key not in self.by_name:
+                raise ValueError("%s: %s is switched by the current through %r, "
+                                 "which no card in this deck defines"
+                                 % (where, el["name"], el["ctrl_name"]))
+            if key not in self.branch_name:
+                raise ValueError("%s: %s is switched by %r, a %s card with no "
+                                 "branch current. Only a source or an inductor "
+                                 "(V, E, H, L, BV) carries a current that can be "
+                                 "named"
+                                 % (where, el["name"], el["ctrl_name"],
+                                    self.by_name[key]["type"]))
+            el["_ctrl_row"] = self.branch_idx[self.branch_name[key]]
+            el["_ctrl_resolved"] = self.by_name[key]["name"]
+
+    def _switch_control(self, el, x):
+        """What the switch compares against its threshold."""
+        if el["type"] == "S":
+            a, b = el["ctrl"]
+            va = x[self.i(a) - 1] if self.i(a) else 0j
+            vb = x[self.i(b) - 1] if self.i(b) else 0j
+            return (va - vb).real
+        return x[el["_ctrl_row"] - 1].real
+
+    def switch_wanted(self, el, value):
+        """The state the control quantity asks for, given the state it is in.
+
+        The hysteresis width is VT -/+ VH - the FULL VH on each side, not half of
+        it - and it applies in a DC solve as well as in a transient. Both of
+        those are ngspice's own rules (sw.c: off->on when the control exceeds
+        VT+VH, on->off when it falls below VT-VH, from an initial state that is
+        open unless the card says otherwise), and both were MEASURED against the
+        engine here rather than assumed:
+
+        * with VT=1 VH=0.5 the engine is still open at a control of 1.5 V and
+          closed at 1.6 V - no +/-VH/2 rule reproduces that;
+        * with VT=1 VH=0.5 at DC and a control of 1.0 V the engine is OPEN, so
+          "at DC there is no memory, compare instantly" is not the engine's
+          behaviour either. It starts open and needs the band crossed.
+
+        Without a width the engine closes AT the threshold (control exactly
+        1.0 V with VT=1 closes it), so that boundary is inclusive.
+        """
+        th, width = el["_th"], el["_hys"]
+        if width <= 0.0:
+            return value >= th
+        if el["_on"]:
+            return value >= th - width
+        return value > th + width
+
+    def switch_conductance(self, el):
+        return 1.0 / (el["_ron"] if el["_on"] else el["_roff"])
 
     # -- device models
     def diode_current(self, el, v):
@@ -2274,6 +2434,16 @@ class _Circuit(object):
                 self._stamp_bjt(A, b, el, x_prev, mode)
             elif T == "M":
                 self._stamp_mos(A, b, el, x_prev, mode)
+            elif T in ("S", "W"):
+                # Piecewise linear, not nonlinear: one of two conductances is
+                # stamped, picked by a state - and the state is NOT re-read here.
+                # It is latched for the whole solve, and the driver asks the
+                # CONVERGED answer whether it agrees (then re-solves if it does
+                # not). Reading it from the iterate instead would silently depend
+                # on the iteration path and would throw away the ON/OFF seed:
+                # with VT=1 VH=0.5 and a 1.2 V control ngspice answers CLOSED for
+                # `ON` and OPEN without it, which only a latched state can hold.
+                self._conductance(A, na, nb, self.switch_conductance(el))
             elif T == "T":
                 self._stamp_tline(A, b, el, x_prev, t, mode)
             elif T in ("O", "U"):
@@ -2611,8 +2781,40 @@ def _newton(circ, x0, t=None, mode="dc", max_iter=DEFAULT_MAX_ITER,
 
 
 def _dc(circ, t=None, uic_x=None, mode="dc"):
-    """DC operating point with two recoveries, in the order SPICE uses them."""
+    """DC operating point, then the switch states made self-consistent.
+
+    A switch is a STATE, and the state a card starts in (ON/OFF, else open) is
+    still a real input at DC: ngspice answers OPEN for `ON` with a 0 V control
+    (0 V is past VT-VH=1) and CLOSED for `ON` with a 1.2 V control inside a
+    VT=1/VH=0.5 band - measured, both. So the solve is repeated until the answer
+    agrees with the state it was solved under, exactly like the transient step
+    loop, and bounded exactly like it: a control parked on a band edge makes the
+    circuit bistable, and picking a side would be this solver's choice.
+    """
     x0 = uic_x if uic_x is not None else [0j] * circ.size
+    x, iters, why = _dc_solve(circ, x0, t, mode)
+    if x is None or not circ.switches:
+        return x, iters, why
+    total = iters
+    for _attempt in range(9):
+        moved = False
+        for el in circ.switches:
+            want = circ.switch_wanted(el, circ._switch_control(el, x))
+            if want != el["_on"]:
+                el["_on"] = want
+                moved = True
+        if not moved:
+            return x, total, None
+        x2, i2, why2 = _dc_solve(circ, x, t, mode)
+        if x2 is None:
+            return None, total, why2
+        x = x2
+        total += i2
+    return None, total, ("the switch state did not settle in 8 flips")
+
+
+def _dc_solve(circ, x0, t, mode):
+    """One DC solve from x0: plain Newton, then gmin stepping DOWN."""
     vlimit = None if circ.is_linear() else 1.0
     sol, iters, why = _newton(circ, x0, t=t, mode=mode, vlimit=vlimit)
     if sol is not None:
@@ -2730,6 +2932,24 @@ def _element_report(circ, x, t=None, mode="dc"):
                 rec["power_w"] = round(-val * v, 12)
         elif T == "C":
             rec["charge_c"] = round(el["value"] * v, 15)
+        elif T in ("S", "W"):
+            g = circ.switch_conductance(el)
+            rec["state"] = "on" if el["_on"] else "off"
+            rec["resistance_ohm"] = round(1.0 / g, 12)
+            rec["conductance_s"] = round(g, 15)
+            rec["current_a"] = round(v * g, 15)
+            rec["power_w"] = round(v * v * g, 15)
+            ctl = circ._switch_control(el, x)
+            if T == "S":
+                rec["control_voltage_v"] = round(ctl, 12)
+            else:
+                rec["control_current_a"] = round(ctl, 12)
+                rec["controlled_element"] = el["_ctrl_resolved"]
+            rec["threshold"] = round(el["_th"], 12)
+            rec["hysteresis"] = round(el["_hys"], 12)
+            rec["initial_state"] = (None if el.get("_init") is None
+                                    else ("on" if el["_init"] else "off"))
+            rec["model_params"] = dict(el["_model_params"])
         elif T == "D":
             # report the CURRENT, not just the voltage: "the diode sits at 0.69 V"
             # is not checkable by the caller, "it carries 4.3 mA" is.
@@ -2851,10 +3071,12 @@ NOT_COMPUTED = [
     "accepted inside .model parameters",
     "a .subckt nested inside another .subckt, and any directive other than "
     ".model inside a .subckt body",
-    "switches (S/W), JFETs (J) and XSPICE blocks (A); controlled sources F/H and "
-    "mutual inductance K ARE solved, but not their second-order physics: K has no "
-    "loss terms, no frequency-dependent core and no saturation, and an F/H gain is a "
-    "constant, not a table",
+    "JFETs (J) and XSPICE blocks (A) are refused by name. Switches (S/W), "
+    "controlled sources (F/H) and mutual inductance (K) ARE solved, but not their "
+    "second-order physics: a switch has two resistance states, no charge injection, "
+    "no capacitance and no break-before-make, K has no loss terms, no "
+    "frequency-dependent core and no saturation, and an F/H gain is a constant, not "
+    "a table",
     "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss; W= "
     "L= and M= scale KP*(W/L)*m (level 1), while AD= AS= PD= PS= and the rest are "
     "read and reported as ignored, because junction capacitance and leakage are "
@@ -2882,6 +3104,26 @@ NOT_COMPUTED = [
     "convergence for circuits that need continuation beyond gmin/source stepping",
 ]
 
+
+def _switch_hint(circ):
+    """Extra cause to check when a deck WITH switches will not settle at DC.
+
+    A switch can be wired so that closing it removes the very voltage that holds
+    it closed. Then no state is self-consistent, and the honest answer is an
+    error with this sentence attached - the alternative is a plausible operating
+    point that is simply one of the two states the solver happened to stop in.
+    """
+    switches = getattr(circ, "switches", None) or ()
+    if not switches:
+        return None
+    return ("this deck has %s, and a switch can remove its own control (closing it "
+            "shorts the node that switches it): then NO state is self-consistent - the "
+            "circuit is bistable rather than solved, and "
+            "any answer here would be the state the solver happened to stop in. "
+            "Hysteresis (VH=/IH=) and ON/OFF decide which state the deck STARTS in, "
+            "not whether a self-consistent state exists - so break the loop, or ask "
+            "for the transient from an explicit state"
+            % ", ".join(e["name"] for e in switches))
 
 def _expression_failure(why):
     """A B-source expression with no value is not a convergence failure."""
@@ -2938,6 +3180,12 @@ def _noise_sources(circ, x):
             out.append((el["name"], "thermal", el["nodes"][0], el["nodes"][1],
                         4.0 * kT / el["value"], "4kT/R (Nyquist, a current source "
                         "across the resistor)"))
+        elif T in ("S", "W"):
+            out.append((el["name"], "thermal_switch", el["nodes"][0],
+                        el["nodes"][1],
+                        4.0 * kT * circ.switch_conductance(el),
+                        "4kT/R at the resistance of the state the switch settled "
+                        "in (RON when on, ROFF when off)"))
         elif T == "D":
             na, nk = el["nodes"]
             i_d, _p = circ.diode_current(el, volt(na) - volt(nk))
@@ -3265,9 +3513,11 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
             bad = _expression_failure(why)
             if bad is not None:
                 return bad
-            return err("DC operating point did not converge: %s" % why, "NOT_CONVERGED",
-                       hint="check for a floating node, a voltage source loop or a "
-                            "device with no DC path to ground")
+            return err("DC operating point did not converge: %s" % why,
+                       "NOT_CONVERGED",
+                       hint=_switch_hint(circ) or
+                       "check for a floating node, a voltage source loop or a "
+                       "device with no DC path to ground")
         return ok(value={"analysis": "op",
                          "nodes_v": _node_dict(circ, x),
                          "elements": _element_report(circ, x),
@@ -3334,7 +3584,8 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
             if bad is not None:
                 return bad
             return err("transient could not start: the t=0 operating point did not "
-                       "converge (%s)" % why, "NOT_CONVERGED")
+                       "converge (%s)" % why, "NOT_CONVERGED",
+                       hint=_switch_hint(circ))
         for el in circ.elements:
             if el["type"] == "C":
                 a, b = el["nodes"]
@@ -3353,6 +3604,10 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                 # is the only state the line can be in before it has carried
                 # anything, so it is what every t < TD reads.
                 el["_hist"] = [(0.0, va(n1) - va(n2), i1, va(n3) - va(n4), -i1)]
+        # The state parked in `_on` came out of the DC solve, which already
+        # applied the hysteresis band from the card's initial state; from here on
+        # it simply carries from step to step.
+        flips = 0
         points = []
         x = x0
         t = 0.0
@@ -3374,6 +3629,46 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                                 "model/convergence problem, not a timestep problem")
             total_iter += it2
             x = xn
+            # The latched state can be one step stale: ask the new solution
+            # whether it agrees, and if it does not, flip and re-solve THIS step.
+            # Bounded on purpose - a switch whose control sits on its threshold
+            # makes the circuit bistable, and drawing a curve through that point
+            # would be this solver's choice rather than the deck's answer.
+            if circ.switches:
+                settled = False
+                for _attempt in range(9):
+                    moved = False
+                    for el in circ.switches:
+                        want = circ.switch_wanted(
+                            el, circ._switch_control(el, x))
+                        if want != el["_on"]:
+                            el["_on"] = want
+                            moved = True
+                    if not moved:
+                        settled = True
+                        break
+                    flips += 1
+                    xn, it3, why3 = _newton(circ, x, t=t, mode="tran")
+                    if xn is None:
+                        bad = _expression_failure(why3)
+                        if bad is not None:
+                            return bad
+                        return err("transient failed at t=%g s while settling %s: %s"
+                                   % (t, ", ".join(e["name"]
+                                                   for e in circ.switches), why3),
+                                   "NOT_CONVERGED")
+                    total_iter += it3
+                    x = xn
+                if not settled:
+                    return err("the switch state at t=%g s did not settle in 8 "
+                               "flips (%s). A control sitting on its threshold "
+                               "makes the circuit bistable, and a curve drawn "
+                               "across that point would be this solver's choice, "
+                               "not the deck's answer"
+                               % (t, ", ".join(e["name"] for e in circ.switches)),
+                               "NOT_CONVERGED",
+                               hint="give the model a hysteresis (VH= or IH=) or "
+                                    "move the control away from the threshold")
             for el in circ.elements:
                 if el["type"] == "C":
                     a, b = el["nodes"]
@@ -3386,10 +3681,16 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                     el["_hist"].append((t,) + _tline_ports(circ, el, x, t))
             if k % stride == 0 or k == steps:
                 points.append({"t": round(t, 12), "nodes_v": _node_dict(circ, x)})
-        return ok(value={"analysis": "tran", "points": points,
-                         "timestep_s": h, "steps": steps,
-                         "elements_final": _element_report(circ, x, t, mode="tran"),
-                         "iterations": total_iter},
+        value = {"analysis": "tran", "points": points,
+                 "timestep_s": h, "steps": steps,
+                 "elements_final": _element_report(circ, x, t, mode="tran"),
+                 "iterations": total_iter}
+        if circ.switches:
+            # how often a latched state had to be flipped mid-step: zero is the
+            # normal case (the control moved less than a step's worth) and a big
+            # number is the deck telling you the edge is faster than the step
+            value["switch_flips"] = flips
+        return ok(value=value,
                   unit="mixed", model="mna_backward_euler",
                   basis="backward Euler companion models (C -> G=C/h in parallel with "
                         "I=C/h*v_prev, L -> R=L/h in series with V=L/h*i_prev) with "
