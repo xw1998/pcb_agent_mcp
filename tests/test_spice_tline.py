@@ -330,11 +330,15 @@ class Refusals(unittest.TestCase):
         self.assertEqual(r["reason_code"], "SINGULAR")
         self.assertIn("multiple of pi", r["message"])
 
-    def test_a_lossy_line_is_still_refused_by_name(self):
-        # the T work must not have quietly opened up O cards
+    def test_a_lossy_line_without_a_model_is_refused_by_name(self):
+        # 0.0.31 does implement O cards (docs/37), so the refusal here can no
+        # longer be "O is not implemented": what is still refused is an O card
+        # with no model to take its parameters from, and the message has to name
+        # the model rather than the card.
         r = _err("* t\nV1 1 0 dc 1\nO1 2 0 3 0 ltramod\nR2 3 0 50\n.op\n.end\n")
         self.assertEqual(r["reason_code"], "NETLIST_INVALID")
-        self.assertIn("not implemented here", r["message"])
+        self.assertIn("ltramod", r["message"])
+        self.assertNotIn("not implemented here", r["message"])
 
 class Warnings(unittest.TestCase):
     def test_near_the_half_wave_point_the_answer_comes_with_a_warning(self):

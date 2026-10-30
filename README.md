@@ -260,9 +260,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.30
-python run_server.py --selftest      # 协议级自检，120/120（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问）
-python -m unittest discover -s tests # 1708 个用例（约 11 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.31
+python run_server.py --selftest      # 协议级自检，122/122（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问）
+python -m unittest discover -s tests # 1742 个用例（约 12.5 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -447,7 +447,21 @@ MCP 客户端配置（stdio）：
   巨大数看起来像答案；`TD` 缺失或为 0 拒绝（ngspice 会静默当导线）、`TD < tstep` 拒绝
   （钳到一步会把每次反射整体挪一步，第一版实测晚约 2 步）。同一轮修掉一个真缺陷：`PULSE` 的宽度
   缺省原来是 0，`PULSE(0 3 0 1p)` 变成零宽尖峰——SPICE 的缺省是 `tstop`。有损线 `O` 与 URC `U`
-  仍然按名拒绝（损耗怎么分配是模型选择，不是语法），要损耗就用 `engine="ngspice"`。
+  在这一版仍然按名拒绝（损耗怎么分配是模型选择，不是语法），要损耗就用 `engine="ngspice"`。
+- **有损线 `O` 与分布 RC 线 `U` 接上了，但接的方式是把线换成一串 R/L/C。** `0.0.31` 起
+  `Oname n1 n2 n3 n4 m`（`LTRA` 模型）与 `Uname n1 n2 n3 m`（`URC` 模型）在**解析期**展开成
+  `lump` 段普通 R/L/C，求解器见到的是那串梯形——方程层一行没改。所以每一步都写清楚这件事：
+  每个答案报 `segments` 与 `segments_from`，默认段数（20）进 `defaulted_model_params`，
+  `not_computed` 里写明皮肤效应、介质损耗、频变 `r`/`l` 都不在模型里。**DC 是精确的**：
+  没有 `g` 时梯形就是电阻链，1 Ω 在 3 V/50 Ω 分压里读 `1.514851/1.485149`（`lump=1/2/8/20/50`
+  逐位相同，与 ngspice 的 `LTRA` 一致到 1e-6）；**AC/瞬态收敛到分布解**：`g=1` 的 DC 误差
+  `lump=1→100` 从 −1.4e-1 单调降到 −2.4e-3，无耗梯形与 `T` 在三频点幅值一致、相位差 < 0.02°，
+  `r=1` 时 1 MHz 正是 `0.5·e^-0.01 = 0.4950`（与 ngspice 差 1.6e-7 V），`U` 与解析
+  `Z0c·coth(γL)` 差 1.1e-3。`lump=` **只许写在 `.model`**：写在卡上对 ngspice 是 FATAL，
+  写在 `.model` 只是 warning——同一份 deck 要两边都能跑就只能这样。`LEN` 必须给（ngspice 也
+  拒绝没有长度的 `LTRA`）；两个不同的返回节点拒绝（梯形把返回当理想单节点，那意味着返回导体
+  自己有延迟，本梯形表达不了）。同一轮抓出一个真缺陷：`.ac` 里没有 `AC` 关键字的源原来被当成
+  1 V 激励（内置满幅、ngspice 全是 0），改成 0 并在整份 deck 无人驱动时告警。
 - **`.subckt` 归内置管了，而且是拍平不是新求解器。** `0.0.27` 起内置 `sim_spice` 自己展开
   `.subckt/.ends` 与 `X` 实例：内部节点名照抄 ngspice 的 `<实例>.<本地>` 小写（嵌套
   `x9.x1.m`），所以 `cross_check` 的节点配对是真的——不然「0 个共同节点」会被读成「一致」。
@@ -466,7 +480,7 @@ MCP 客户端配置（stdio）：
   ngspice-47**（MSYS2 构建解包到 `%LOCALAPPDATA%\ngspice-47\`，外部二进制不是仓库依赖）并对着
   金标网表实测：分压 5e-9 V、二极管 0.35 mV、BJT 17.8 mV（模型差异）、RC 阶跃与 RLC AC 逐位相同，
   所以 `verified_against_engine` **按版本**给 true（`VERIFIED_ENGINES`，别的版本回落 false）。
-  装了引擎才拿到的能力是**未解析 deck 直通**：`O`、`U`、`F`、`H`、`K`、`S`、`W`、`A` 等内置按名字拒绝的卡在（`.subckt/X` 自 `0.0.27` 起内置自己拍平就能跑、`B` 自 `0.0.29`、**无损线 `T`** 自 `0.0.30`，都不再需要引擎）
+  装了引擎才拿到的能力是**未解析 deck 直通**：`F`、`H`、`K`、`S`、`W`、`A` 等内置按名字拒绝的卡在（`.subckt/X` 自 `0.0.27` 起内置自己拍平就能跑、`B` 自 `0.0.29`、**无损线 `T`** 自 `0.0.30`、**有损线 `O` 与 URC `U`** 自 `0.0.31`，都不再需要引擎）
   `engine="ngspice"` 下照跑，节点表从 rawfile 读，信封带 `netlist_parsed:false` 而**不假装**
   这是一次完整解析；同一 deck 走 `builtin` 仍然拒绝。`simulate()` 默认引擎是 `builtin`
   （`engine="auto"` 才用引擎）——默认值不能让同一网表在两台机器给出不同答案。
@@ -657,7 +671,7 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1708 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1742 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 └── docs/                         # 设计文档 00~34，建议按编号顺序读（索引见 docs/README.md）

@@ -63,8 +63,6 @@ NOT_IMPLEMENTED_CARDS = {
     "K": "coupled inductors / mutual inductance",
     "S": "voltage-controlled switch",
     "W": "current-controlled switch",
-    "O": "lossy transmission line",
-    "U": "uniform distributed RC line",
     "A": "XSPICE analogue behavioural block",
 }
 
@@ -74,6 +72,13 @@ SUFFIX = {
 }
 
 DEFAULT_MAX_ITER = 200
+
+# Sections in the lumped ladder a lossy line (O) or a distributed RC line (U) is
+# turned into. This is a MODEL parameter, not a numerical tolerance: it is the
+# only thing standing between the card and a plausible-looking answer, so it is
+# reported with every answer (elements[].segments / segments_from) and defaulted
+# out loud in defaulted_model_params rather than silently.
+DEFAULT_LUMP = 20
 
 
 def _is_at_temp(IS, temp_c, tnom_c=27.0, n=1.0, xti=3.0, eg=1.11):
@@ -287,8 +292,234 @@ def parse_netlist(text):
             raise ValueError("line %d: %s needs a %s model, %r is %s"
                              % (el.get("lineno", 0), el["name"],
                                 "/".join(want), model, kind))
+    # Last step, once models are known and subcircuits are flattened: a line
+    # becomes a ladder of plain elements and nothing downstream sees it again.
+    _expand_lossy_lines(spec)
     return spec
 
+
+# ------------------------------------------------------------ lossy lines (O/U)
+# An O card (LTRA) and a U card (URC) are the two DISTRIBUTED cards in this
+# subset. Neither has a single MNA row: the card carries per-length parameters
+# and a length, not a component value. So both are turned, once the whole file is
+# in hand, into an N-section ladder of ordinary R/L/C - at which point the node
+# table, the solver and the report need to know nothing about them.
+#
+# That is a MODEL CHOICE and it is stated rather than hidden: the section count
+# (lump=, default DEFAULT_LUMP) is the model's only knob, the ladder is what the
+# answer is the answer TO, and no r/l/g/c here is frequency dependent. What the
+# lumped model does NOT contain -skin effect, dielectric loss, dispersion of a
+# real trace- is refused in words in NOT_COMPUTED instead of being approximated
+# silently.
+
+_LTRA_KEYS = ("R", "L", "G", "C", "LEN", "LUMP")
+_URC_KEYS = ("R", "RPERL", "C", "CPERL", "LEN", "LUMP")
+
+_LTRA_REFUSED = {
+    "Z0": "a lossless line's characteristic impedance. That is the T card "
+          "(Tname n1 n2 n3 n4 Z0=... TD=...), which is solved exactly; an O model "
+          "takes r/l/g/c/len and derives Z0 = sqrt(l/c) from them",
+    "TD": "a lossless line's delay. Give r/l/g/c/len here (the delay is then "
+          "sqrt(l*c)*len), or use the T card for an ideal line",
+    "REL": "a truncation-error tolerance of a variable-step engine; this solver is "
+           "fixed-step, so the tolerance could not be honoured",
+    "ABS": "a truncation-error tolerance of a variable-step engine; this solver is "
+           "fixed-step, so the tolerance could not be honoured",
+}
+
+_URC_REFUSED = {
+    "ISPERL": "a per-length saturation current, i.e. a nonlinear (diode-like) RC "
+              "line; only the linear distributed RC is implemented",
+    "RSPERL": "a per-length series resistance of the saturation path; no nonlinear "
+              "RC line is implemented",
+    "FMAX": "the frequency at which the URC stops behaving like a distributed line; "
+            "the ladder here has no such cutoff - its own dispersion IS the model",
+    "REL": "a truncation-error tolerance of a variable-step engine; this solver is "
+           "fixed-step",
+    "ABS": "a truncation-error tolerance of a variable-step engine; this solver is "
+           "fixed-step",
+}
+
+def _lossy_model(spec, el):
+    """Resolve and validate an O/U card's .model. Returns a dict of lengths."""
+    where = "line %d: %s" % (el.get("lineno") or 0, el["name"])
+    name = el["model"]
+    models = spec["models"]
+    if name not in models:
+        raise ValueError("%s references .model %r which is not defined"
+                         % (where, name))
+    m = models[name]
+    kind = (m.get("type") or "").upper()
+    params = m["params"]
+    if el["type"] == "O":
+        if kind != "LTRA":
+            raise ValueError("%s needs an LTRA model, and %r is %s. An LTRA model "
+                             "carries r/l/g/c/len: Oname n1 n2 n3 n4 model"
+                             % (where, name, kind or "untyped"))
+        allowed, refused = _LTRA_KEYS, _LTRA_REFUSED
+    else:
+        if kind != "URC":
+            raise ValueError("%s needs a URC model, and %r is %s. A URC model "
+                             "carries r (or rperl), c (or cperl) and len: Uname n1 "
+                             "n2 n3 model" % (where, name, kind or "untyped"))
+        allowed, refused = _URC_KEYS, _URC_REFUSED
+    for k in params:
+        if k in allowed:
+            continue
+        if k in refused:
+            raise ValueError("%s: %s= in .model %r is %s; it is refused by name "
+                             "instead of being ignored (an ignored parameter is a "
+                             "netlist that runs and lies)" % (where, k, name, refused[k]))
+        raise ValueError("%s: .model %r has %s=, which is not a parameter of a %s "
+                         "model here (implemented: %s)"
+                         % (where, name, k, kind, ", ".join(allowed)))
+    if "LEN" not in params:
+        raise ValueError("%s: .model %r has no LEN= (the line's length). ngspice "
+                         "refuses an LTRA without a length, and defaulting it to 1 "
+                         "would scale every total the caller sees by a factor "
+                         "nobody stated" % (where, name))
+    length = params["LEN"]
+    if length <= 0:
+        raise ValueError("%s: .model %r has LEN=%g; a line's length must be positive"
+                         % (where, name, length))
+    if el["type"] == "O":
+        r = params.get("R", 0.0)
+        l = params.get("L", 0.0)
+        g = params.get("G", 0.0)
+        c = params.get("C", 0.0)
+        if not (r or l or g or c):
+            raise ValueError("%s: .model %r gives no R, L, G or C, so the card is a "
+                             "chain of nothing: delete it and join the nodes"
+                             % (where, name))
+    else:
+        if "R" in params and "RPERL" in params:
+            raise ValueError("%s: .model %r gives both R= and RPERL= (the same "
+                             "per-length resistance under two names); give one"
+                             % (where, name))
+        if "C" in params and "CPERL" in params:
+            raise ValueError("%s: .model %r gives both C= and CPERL= (the same "
+                             "per-length capacitance under two names); give one"
+                             % (where, name))
+        r = params.get("R", params.get("RPERL"))
+        c = params.get("C", params.get("CPERL"))
+        l = g = 0.0
+        if not r:
+            raise ValueError("%s: .model %r has no R= (or RPERL=); a uniform RC line "
+                             "with no series resistance is a short" % (where, name))
+        if not c:
+            raise ValueError("%s: .model %r has no C= (or CPERL=); without the "
+                             "distributed capacitance the card is a resistor, so "
+                             "delete it and use an R" % (where, name))
+    for key, val in (("R", r), ("L", l), ("G", g), ("C", c)):
+        if val < 0:
+            raise ValueError("%s: .model %r has %s=%g; a per-length parameter cannot "
+                             "be negative" % (where, name, key, val))
+    lump = params.get("LUMP")
+    if lump is not None and (lump != int(lump) or lump < 1):
+        raise ValueError("%s: .model %r has LUMP=%g; the number of ladder sections "
+                         "must be a whole number of at least 1" % (where, name, lump))
+    return {"length": length, "r": r, "l": l, "g": g, "c": c,
+            "lump": int(lump) if lump is not None else None}
+
+def _ladder(el, spec, taken, lossy):
+    """One O/U card -> its sections, as ordinary R/L/C elements."""
+    name = el["name"]
+    where = "line %d: %s" % (el.get("lineno") or 0, name)
+    v = _lossy_model(spec, el)
+    base = name.lower()
+    segs = v["lump"] or DEFAULT_LUMP
+    from_lump = ("lump=%d" % v["lump"] if v["lump"]
+                 else "default %d (lump= not given)" % DEFAULT_LUMP)
+    if el["type"] == "O":
+        n1, ref, far = el["nodes"][0], el["nodes"][1], el["nodes"][2]
+        ports = ((n1, ref), (far, ref))
+    else:
+        n1, far, ref = el["nodes"][0], el["nodes"][1], el["nodes"][2]
+        ports = ((n1, ref), (far, ref))
+    r_s = v["r"] * v["length"] / segs
+    l_s = v["l"] * v["length"] / segs
+    g_s = v["g"] * v["length"] / segs
+    c_s = v["c"] * v["length"] / segs
+    node_names = ["%s#n%d" % (base, k) for k in range(1, segs)]
+    mid_names = ["%s#a%d" % (base, k) for k in range(1, segs + 1)]
+    elem_names = []
+    for k in range(1, segs + 1):
+        elem_names.extend(["%s#r%d" % (base, k), "%s#l%d" % (base, k),
+                           "%s#g%d" % (base, k), "%s#c%d" % (base, k)])
+    for nm in node_names + mid_names + elem_names:
+        if nm.lower() in taken:
+            raise ValueError("%s: the ladder needs the internal name %r, which the "
+                             "netlist already uses; rename the line so the expanded "
+                             "nodes cannot collide with a real node" % (where, nm))
+        taken.add(nm.lower())
+    sig = [n1] + node_names + [far]
+    elems = []
+    first = None
+    for k in range(1, segs + 1):
+        a, bb = sig[k - 1], sig[k]
+        if r_s > 0 and l_s > 0:
+            mid = mid_names[k - 1]
+            er = {"type": "R", "name": "%s#r%d" % (base, k), "nodes": (a, mid),
+                  "value": r_s, "_internal": True}
+            el_ = {"type": "L", "name": "%s#l%d" % (base, k), "nodes": (mid, bb),
+                   "value": l_s, "ic": None, "_internal": True}
+            elems.extend([er, el_])
+            if first is None:
+                first = {"kind": "R", "a": a, "b": mid, "value": r_s}
+        elif l_s > 0:
+            el_ = {"type": "L", "name": "%s#l%d" % (base, k), "nodes": (a, bb),
+                   "value": l_s, "ic": None, "_internal": True}
+            elems.append(el_)
+            if first is None:
+                first = {"kind": "L", "name": el_["name"]}
+        elif r_s > 0:
+            er = {"type": "R", "name": "%s#r%d" % (base, k), "nodes": (a, bb),
+                  "value": r_s, "_internal": True}
+            elems.append(er)
+            if first is None:
+                first = {"kind": "R", "a": a, "b": bb, "value": r_s}
+        if g_s > 0:
+            elems.append({"type": "R", "name": "%s#g%d" % (base, k), "nodes": (bb, ref),
+                          "value": 1.0 / g_s, "_internal": True})
+        if c_s > 0:
+            elems.append({"type": "C", "name": "%s#c%d" % (base, k), "nodes": (bb, ref),
+                          "value": c_s, "ic": None, "_internal": True})
+    def sig(x):
+        return float("%.12g" % x)
+
+    per_length = {"r_ohm_per_m": sig(v["r"]), "l_h_per_m": sig(v["l"]),
+                  "g_s_per_m": sig(v["g"]), "c_f_per_m": sig(v["c"])}
+    rec = {"name": name, "type": el["type"], "model": el["model"],
+           "nodes": el["nodes"], "ports": ports,
+           "segments": segs, "segments_from": from_lump,
+           "length_m": v["length"], "per_length": per_length,
+           "totals": {"series_r_ohm": sig(v["r"] * v["length"]),
+                      "series_l_h": sig(v["l"] * v["length"]),
+                      "shunt_g_s": sig(v["g"] * v["length"]),
+                      "shunt_c_f": sig(v["c"] * v["length"])},
+           "first": first}
+    lossy.append(rec)
+    return elems
+
+def _expand_lossy_lines(spec):
+    """Replace every O/U card with its ladder, after models and .subckt are settled."""
+    if not any(el["type"] in ("O", "U") for el in spec["elements"]):
+        return
+    taken = set()
+    for el in spec["elements"]:
+        taken.add(el["name"].lower())
+        for n in el["nodes"]:
+            if n is not None:
+                taken.add(n.lower())
+    out = []
+    lossy = spec.get("lossy") or []
+    for el in spec["elements"]:
+        if el["type"] not in ("O", "U"):
+            out.append(el)
+            continue
+        out.extend(_ladder(el, spec, taken, lossy))
+    spec["elements"] = out
+    spec["lossy"] = lossy
 
 # ------------------------------------------------------------------ subcircuits
 
@@ -785,6 +1016,100 @@ def _parse_tline(parts, name, lineno):
                            if "f" in params else "TD=%g" % td)}
 
 
+_LUMP_HINT = (
+    " Put lump=<sections> in the .model instead of on the card: an unknown token "
+    "on an O/U card is FATAL to ngspice (measured: \"Error on line 4 or its "
+    "substitute\"), while an unknown .model parameter is only a warning, so the "
+    "same deck still runs when it is delegated to the engine")
+
+def _parse_lossy_line(parts, name, lineno):
+    """`Oname n1 n2 n3 n4 model [lump=N]` - a lossy line (LTRA model).
+
+    Four nodes, positionally: port 1 is (n1, n2) and port 2 is (n3, n4), the same
+    order the T card uses. The per-length r/l/g/c and the length come from the
+    .model, which is why a bare O card cannot be solved: a line with no
+    per-length parameters is a wire with extra steps.
+
+    The two RETURN nodes (n2 and n4) must be the same node. The ladder built for
+    this card puts the whole series r+jw*l in the signal conductor and treats the
+    return as one ideal node - that is what a single-ended trace is drawn as. Two
+    different returns would make the return a second conductor with its own
+    delay, which this ladder cannot represent; saying so is better than quietly
+    halving the series resistance.
+    """
+    if len(parts) < 6:
+        raise ValueError("line %d: %s needs four nodes and a model: Oname n1 n2 n3 "
+                         "n4 model [lump=N] (port 1 is n1,n2 and port 2 is n3,n4); "
+                         "got %r" % (lineno, name, " ".join(parts[1:])))
+    if any("=" in p for p in parts[1:5]):
+        raise ValueError("line %d: %s needs four node names before any parameter: "
+                         "Oname n1 n2 n3 n4 model [lump=N]; got %r"
+                         % (lineno, name, " ".join(parts[1:5])))
+    nodes = tuple(_node(parts[k]) for k in (1, 2, 3, 4))
+    model = parts[5].strip().lower()
+    if "=" in model:
+        raise ValueError("line %d: %s: the model name comes before any parameter, "
+                         "and %r is not a name" % (lineno, name, parts[5]))
+    if len(parts) > 6:
+        raise ValueError("line %d: %s has trailing %r. An O card is four nodes and "
+                         "a model; the r/l/g/c, len and lump= all live in the .model "
+                         "that is named there.%s"
+                         % (lineno, name, " ".join(parts[6:]), _LUMP_HINT))
+    if all(n is None for n in nodes):
+        raise ValueError("line %d: %s has every terminal on ground, so the card "
+                         "constrains nothing" % (lineno, name))
+    if nodes[0] == nodes[2] and nodes[1] == nodes[3]:
+        raise ValueError("line %d: %s connects a port to itself (n1==n3 and "
+                         "n2==n4): the line would be its own load" % (lineno, name))
+    for k, (a, c) in enumerate(((nodes[0], nodes[1]), (nodes[2], nodes[3])), 1):
+        if a == c:
+            raise ValueError("line %d: %s has port %d shorted (both of its terminals "
+                             "are node %r), so that port carries no voltage"
+                             % (lineno, name, k, a))
+    if nodes[1] != nodes[3]:
+        raise ValueError("line %d: %s has two different return nodes (%r and %r). "
+                         "The lumped ladder here puts the whole series r+jw*l in the "
+                         "signal conductor and treats the return as ONE ideal node, "
+                         "which is how a single-ended trace is drawn; two returns "
+                         "would make the return a second conductor with its own "
+                         "delay. Tie them to the same node, or use engine='ngspice' "
+                         "for the distributed model"
+                         % (lineno, name, nodes[1], nodes[3]))
+    return {"type": "O", "name": name, "lineno": lineno, "nodes": nodes,
+            "model": model}
+
+def _parse_urc(parts, name, lineno):
+    """`Uname n1 n2 n3 model [lump=N]` - a uniform distributed RC line.
+
+    Three nodes: n1 is the input, n2 the output, and n3 the node the distributed
+    capacitance returns to (SPICE's URC order; normally ground). r and c are per
+    unit length, so the card needs a model with them and a length.
+    """
+    if len(parts) < 5:
+        raise ValueError("line %d: %s needs three nodes and a model: Uname n1 n2 n3 "
+                         "model [lump=N] (n3 is the node the line's capacitance "
+                         "returns to); got %r" % (lineno, name, " ".join(parts[1:])))
+    if any("=" in p for p in parts[1:4]):
+        raise ValueError("line %d: %s needs three node names before any parameter: "
+                         "Uname n1 n2 n3 model [lump=N]; got %r"
+                         % (lineno, name, " ".join(parts[1:4])))
+    nodes = tuple(_node(parts[k]) for k in (1, 2, 3))
+    model = parts[4].strip().lower()
+    if "=" in model:
+        raise ValueError("line %d: %s: the model name comes before any parameter, "
+                         "and %r is not a name" % (lineno, name, parts[4]))
+    if len(parts) > 5:
+        raise ValueError("line %d: %s has trailing %r. A U card is three nodes and a "
+                         "model; r, c, len and lump= all live in the .model that is "
+                         "named there.%s" % (lineno, name, " ".join(parts[5:]),
+                                             _LUMP_HINT))
+    if nodes[0] == nodes[1]:
+        raise ValueError("line %d: %s has both signal terminals on node %r, so there "
+                         "is nothing for the line to drive"
+                         % (lineno, name, nodes[0]))
+    return {"type": "U", "name": name, "lineno": lineno, "nodes": nodes,
+            "model": model}
+
 def _parse_element(spec, line, lineno):
     parts = line.split()
     name = parts[0]
@@ -822,6 +1147,10 @@ def _parse_element(spec, line, lineno):
         return _parse_b_source(parts, line, name, lineno)
     if letter == "T":
         return _parse_tline(parts, name, lineno)
+    if letter == "O":
+        return _parse_lossy_line(parts, name, lineno)
+    if letter == "U":
+        return _parse_urc(parts, name, lineno)
     if letter == "X":
         return _parse_instance(parts, name, lineno)
     if letter in ("E", "G"):
@@ -1524,6 +1853,27 @@ class _Circuit(object):
         self.size = self.n + len(branches) + extra
         self.disabled = []        # non-ideal effects that were switched off
         self.defaulted = {}       # model params that fell back to a default
+        self.lossy = spec.get("lossy") or []   # O/U cards, for the report only
+        # Nodes that exist only inside a ladder: reported nowhere, because they
+        # are not the caller's nodes (the O/U card is, with its section count).
+        ext, inn = set(), set()
+        for el in self.elements:
+            for n in el["nodes"]:
+                if n is None:
+                    continue
+                (inn if el.get("_internal") else ext).add(n)
+        self.internal_nodes = inn - ext
+        # ... except a line's own terminals: a far end with nothing hung on it is
+        # connected only by ladder sections, and it is still the caller's node
+        for rec in self.lossy:
+            for pair in rec["ports"]:
+                for n in pair:
+                    self.internal_nodes.discard(n)
+        for rec in self.lossy:
+            if "default" in rec["segments_from"]:
+                # a defaulted section count is a defaulted model, and it is the
+                # one number that decides how good the ladder is: said out loud
+                self.defaulted["%s.lump" % rec["name"]] = rec["segments"]
 
     # -- helpers
     def is_linear(self):
@@ -1670,13 +2020,20 @@ class _Circuit(object):
                 self._add(A, a, row, 1.0)
                 self._add(A, bb, row, -1.0)
                 if mode == "ac":
-                    mag, phase = el.get("ac") or (1.0, 0.0)
+                    # SPICE's own rule: the AC keyword is what makes a source an
+                    # excitation. A source written without it (V1 1 0 3) has an AC
+                    # magnitude of ZERO, not 1 - "3" is its DC value. Inventing a
+                    # 1 V excitation here would produce a full-looking AC answer
+                    # for a circuit that is not being driven, and ngspice-47
+                    # returns 0 for exactly this deck (measured).
+                    mag, phase = el.get("ac") or (0.0, 0.0)
                     self._rhs(b, row, cmath.rect(mag, math.radians(phase)))
                 else:
                     self._rhs(b, row, _source_value(el, t if t is not None else 0.0))
             elif T == "I":
                 if mode == "ac":
-                    mag, phase = el.get("ac") or (1.0, 0.0)
+                    # see the V branch: no AC keyword means no excitation
+                    mag, phase = el.get("ac") or (0.0, 0.0)
                     self._current(b, na, nb, -cmath.rect(mag, math.radians(phase)))
                 else:
                     self._current(b, na, nb, -_source_value(el, t if t is not None else 0.0))
@@ -1710,6 +2067,12 @@ class _Circuit(object):
                 self._stamp_mos(A, b, el, x_prev, mode)
             elif T == "T":
                 self._stamp_tline(A, b, el, x_prev, t, mode)
+            elif T in ("O", "U"):
+                # unreachable through parse_netlist (the card is expanded there);
+                # raising rather than stamping nothing keeps a future refactor
+                # from turning a lossy line into a silent wire
+                raise ValueError("%s (a %s card) reached the solver unexpanded"
+                                 % (el["name"], T))
         # gmin to ground on every node: the standard "no floating node" crutch
         if mode != "ac" and gmin:
             for k in range(self.n):
@@ -2048,9 +2411,44 @@ def _dc(circ, t=None, uic_x=None, mode="dc"):
     return None, total, last
 
 
+def _lossy_report(circ, rec, x):
+    """One record per O/U card: its ports, and the model it stands for."""
+    def v(n):
+        idx = circ.i(n)
+        return x[idx - 1].real if idx else 0.0
+
+    (a1, a2), (b1, b2) = rec["ports"]
+    v1 = v(a1) - v(a2)
+    v2 = v(b1) - v(b2)
+    first = rec["first"]
+    if first is None:
+        i1 = 0.0
+    elif first["kind"] == "R":
+        i1 = (v(first["a"]) - v(first["b"])) / first["value"]
+    else:
+        i1 = x[circ.branch_idx[first["name"]] - 1].real
+    return {"name": rec["name"], "type": rec["type"], "model": rec["model"],
+            "voltage_v": round(v1, 9),
+            "segments": rec["segments"], "segments_from": rec["segments_from"],
+            "length_m": rec["length_m"], "per_length": rec["per_length"],
+            "totals": rec["totals"],
+            "port1": {"voltage_v": round(v1, 9), "current_a": round(i1, 12)},
+            "port2": {"voltage_v": round(v2, 9)},
+            "current_convention": ("port 1 current is positive INTO n1 (the first "
+                                   "terminal); a lumped line has no single current "
+                                   "along it, so port 2's is not reported"),
+            "lumped_model": ("%d-section ladder of R/L/C - the ladder IS the model, "
+                             "and its section count sets the dispersion. Skin "
+                             "effect, dielectric loss and frequency-dependent r/l "
+                             "are not in it" % rec["segments"])}
+
 def _element_report(circ, x, t=None, mode="dc"):
     out = []
     for el in circ.elements:
+        if el.get("_internal"):
+            # a ladder section is an implementation detail of the line above it;
+            # reporting 20 unnamed R/L/C per O card would bury the answer
+            continue
         T = el["type"]
         na, nb = el["nodes"][0], el["nodes"][1]
         va = x[circ.i(na) - 1] if circ.i(na) else 0j
@@ -2170,12 +2568,20 @@ def _element_report(circ, x, t=None, mode="dc"):
                                          "(n1 and n3); the two currents sum to zero")
             rec["power_w"] = round(v1t * i1t + v2t * i2t, 12)
         out.append(rec)
+    for lossy_rec in getattr(circ, "lossy", ()) or ():
+        out.append(_lossy_report(circ, lossy_rec, x))
     return out
 
 
 def _node_dict(circ, x, complex_ok=False):
     d = {}
+    hidden = getattr(circ, "internal_nodes", ()) or ()
     for name in circ.node_list:
+        if name in hidden:
+            # a ladder's internal node is an implementation detail of the line
+            # above it: reporting 40 of them per O card buries the answer, and
+            # nothing a caller can act on lives there
+            continue
         v = x[circ.i(name) - 1]
         if complex_ok:
             d[name] = {"re": round(v.real, 9), "im": round(v.imag, 9),
@@ -2205,11 +2611,15 @@ NOT_COMPUTED = [
     "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss",
     "Laplace blocks (laplace(...)), the current of another element (I(Vname)), "
     "B-source noise, and derivative/ddt/idt operators",
-    "LOSSY transmission lines (O cards) and the frequency-dependent loss that "
-    "makes a real trace dispersive: only an IDEAL lossless line (T) is solved "
-    "here, so the attenuation and the rise-time degradation of a real PCB "
-    "trace are not in the answer; a uniform distributed RC line (U) is not "
-    "implemented either",
+    "a DISTRIBUTED line: an O card (LTRA) and a U card (URC) are turned into a "
+    "lumped ladder of R/L/C, so the answer is the answer to that ladder - the "
+    "section count (lump=, default %d) sets the dispersion and the answer only "
+    "converges to the distributed one as the sections increase. Skin effect, "
+    "dielectric loss, frequency-dependent r/l and the rise-time degradation of a "
+    "real trace are NOT in it (an ideal lossless line, T, is solved exactly). "
+    "ngspice-47 itself refuses an O card with nonzero G (\"Nonzero G (except RG) "
+    "line not supported yet\"), so a g>0 deck cannot be cross-checked against it"
+    % DEFAULT_LUMP,
     "noise (.noise), distortion (.disto), Monte Carlo / worst-case",
     "temperature SWEEP (one temperature per run: `.temp` / temp_c), and junction "
     "self-heating - the junction sits at the temperature you state, it does not "
@@ -2265,7 +2675,9 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
     if circ.size > 400:
         return err("circuit has %d unknowns; the dense solver here is meant for "
                    "board-level circuits (<= 400)" % circ.size, "TOO_LARGE",
-                   hint="split the netlist, or use ngspice for a full-size design")
+                   hint="split the netlist, lower lump= on a lossy line (each "
+                        "section costs a node and, with series inductance, a branch "
+                        "unknown), or use ngspice for a full-size design")
     want = (analysis or (spec["analyses"][-1]["kind"] if spec["analyses"] else "op")).lower()
     if want not in ("op", "tran", "ac"):
         return err("analysis must be op, tran or ac", "ARG_INVALID")
@@ -2443,6 +2855,11 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
             "(up to %.6g Hz, not fstop %.6g Hz) - raise max_points or lower the "
             "sweep density" % (asked, max_points, freqs[max_points - 1], f1))
         freqs = freqs[:max_points]
+    if not any(el.get("ac") for el in circ.elements if el["type"] in ("V", "I")):
+        circ.disabled.append(
+            "no V/I source carries an AC specification, so nothing drives the .ac "
+            "sweep and every node reads 0 (this is SPICE's own rule: write "
+            "'V1 1 0 AC 1' - the bare 'V1 1 0 3' is a DC value only)")
     x0, iters, why = _dc(circ)
     if x0 is None:
         bad = _expression_failure(why)

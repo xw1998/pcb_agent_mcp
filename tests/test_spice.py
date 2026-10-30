@@ -230,10 +230,10 @@ class TestAC(unittest.TestCase):
 class TestRefusals(unittest.TestCase):
     def test_unimplemented_cards_are_named(self):
         # B is NOT in this list any more: 0.0.29 implements behavioural sources,
-        # so its refusal would be a lie. The cards here are the ones that still
-        # have no implementation at all.
+        # O and U left it in 0.0.31 (see docs/37); a card whose refusal would be a
+        # lie must not be listed. The cards here still have no implementation.
         for card in ("F1 1 0 V1 1", "K1 L1 L2 0.9", "S1 1 2 3 4 sw",
-                     "X1 1 0 sub", "T1 1 0 2 0 Z0=50", "O1 1 0 2 0 lmod"):
+                     "X1 1 0 sub", "T1 1 0 2 0 Z0=50", "H1 1 0 V1 1"):
             r = spice.simulate("* x\nV1 1 0 1\nR1 1 2 1k\nR2 2 0 1k\n%s\n.op\n.end\n"
                                % card, analysis="op")
             self.assertEqual(r["status"], "error", card)

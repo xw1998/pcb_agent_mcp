@@ -306,21 +306,21 @@ class TestRefusals(EngineCase):
         self.assertEqual(r["reason_code"], "ARG_REQUIRED")
 
     def test_unparsed_card_goes_to_the_engine_but_stops_the_builtin(self):
-        # A card this module cannot model (a LOSSLESS line was the example until
-        # 0.0.30 implemented it, so the stand-in is now its LOSSY cousin) is the
-        # reason to have an engine:
+        # A card this module cannot model (a LOSSLESS line was the stand-in until
+        # 0.0.30 implemented it, its LOSSY cousin until 0.0.31 did, so the card is
+        # now the voltage-controlled switch S) is the reason to have an engine:
         # on the delegation path the deck is handed over unchanged and the answer is
         # the engine's own rawfile, so the refusal would only hide the capability.
         # It is still a refusal for engine='builtin', and the envelope says so with
         # netlist_parsed:false instead of pretending a full parse.
         self.spec(kind="op", nodes={"1": 1.0})
-        net = ("* x\nV1 1 0 1\nR1 1 0 1k\nO1 2 0 3 0 ltra1\n"
-               ".model ltra1 LTRA(r=1 l=250n g=0 c=100p len=1)\n.op\n")
+        net = ("* x\nV1 1 0 1\nR1 1 2 1k\nS1 2 0 1 0 sw\n"
+               ".model sw SW(VT=0.5 VH=0 RON=1k ROFF=10meg)\n.op\n")
         r = spice.simulate(net, engine="ngspice")
         self.assertEqual(r["status"], "ok", r)
         self.assertEqual(r["engine_used"], "ngspice")
         self.assertFalse(r["netlist_parsed"])
-        self.assertIn("O1", r["netlist_parse_note"])
+        self.assertIn("S1", r["netlist_parse_note"])
         b = spice.simulate(net)
         self.assertEqual(b["status"], "error")
         self.assertEqual(b["reason_code"], "NETLIST_INVALID")

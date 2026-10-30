@@ -722,28 +722,28 @@ def selftest():
                   str(payload.get("verified_against_engine")))
         # the point of having an engine at all: a card this module refuses by name
         # still runs, and the envelope says the deck was not parsed here. T (the
-        # LOSSLESS line) moved INTO the builtin set in 0.0.30, so the probe is
-        # its LOSSY cousin O, which the builtin still refuses by name. The answer
-        # is also the honest contrast: 1 ohm of series resistance drops 15 mV,
-        # where the ideal T drops nothing at DC.
+        # LOSSLESS line) moved INTO the builtin set in 0.0.30, and O/U (the lossy
+        # ones) in 0.0.31, so the probe is now the voltage-controlled switch S -
+        # a card that still has no implementation here but that ngspice solves
+        # exactly: 1 V on the control node against VT=0.5 closes the switch, so the
+        # divider reads 0.500 V, not the 0.333 V an open switch would give.
         r = handle({"jsonrpc": "2.0", "id": 96, "method": "tools/call",
                     "params": {"name": "sim_spice", "arguments": {
-                        "netlist": "* o\nV1 1 0 3\nR1 1 2 50\n"
-                                   "O1 2 0 3 0 ltra1\nR2 3 0 50\n"
-                                   ".model ltra1 LTRA(r=1 l=250n g=0 c=100p len=1)\n"
+                        "netlist": "* sw\nV1 1 0 1\nR1 1 2 1k\n"
+                                   "S1 2 0 1 0 sw\n"
+                                   ".model sw SW(VT=0.5 VH=0 RON=1k ROFF=10meg)\n"
                                    ".op\n",
                         "engine": "ngspice"}}})
         payload = json.loads(r["result"]["content"][0]["text"])
         if _found:
             _n = (payload.get("value") or {}).get("nodes_v") or {}
-            check("a lossy line the builtin refuses by name does run under ngspice "
-                  "(1 ohm of series resistance reads 1.5149/1.4851 V) and the "
-                  "envelope says this module did not parse the deck",
+            check("a switch the builtin refuses by name does run under ngspice "
+                  "(1 V against VT=0.5 closes it, 0.500 V) and the envelope says "
+                  "this module did not parse the deck",
                   payload.get("status") == "ok"
                   and payload.get("netlist_parsed") is False
-                  and "O1" in (payload.get("netlist_parse_note") or "")
-                  and abs(_n.get("2", 0.0) - 1.514851) < 1e-4
-                  and abs(_n.get("3", 0.0) - 1.485149) < 1e-4,
+                  and "S1" in (payload.get("netlist_parse_note") or "")
+                  and abs(_n.get("2", 0.0) - 0.5) < 1e-6,
                   str(_n))
         else:
             check("engine='ngspice' refuses when no binary is installed instead of "
@@ -794,6 +794,55 @@ def selftest():
               and abs(_pts[-1]["nodes_v"]["3"] - 1.5) < 1e-6,
               "before=%r after=%r" % (_before[-1] if _before else None,
                                       _pts[-1]["nodes_v"]["3"] if _pts else None))
+
+        # 0.0.31: the lossy line O becomes a lumped ladder of the model's own
+        # r/l/g/c at parse time, so the section count is a MODEL parameter and it
+        # is disclosed. With no shunt conductance at DC the ladder IS a chain of
+        # resistors: 1 ohm inside the same 3 V / 50 ohm divider reads the exact
+        # divider (3*51/101, 3*50/101), independently of the section count - a
+        # ladder built with r*len per SECTION would scale with it instead.
+        r = handle({"jsonrpc": "2.0", "id": 147, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* o\nV1 1 0 3\nR1 1 2 50\nO1 2 0 3 0 ltra1\n"
+                                   "R2 3 0 50\n"
+                                   ".model ltra1 LTRA(r=1 l=250n g=0 c=100p len=1)\n"
+                                   ".op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _n = (payload.get("value") or {}).get("nodes_v") or {}
+        _el = [e for e in ((payload.get("value") or {}).get("elements") or [])
+               if e.get("name") == "O1"]
+        _dflt = (payload.get("assumptions") or {}).get("defaulted_model_params") or {}
+        check("builtin O at DC is its series resistance: 1 ohm in the 3 V/50 ohm "
+              "divider reads 1.514851/1.485149 V, the defaulted 20 sections are "
+              "disclosed, and the ladder's own nodes are not reported as nodes",
+              payload.get("status") == "ok"
+              and abs(_n.get("2", 0.0) - 3.0 * 51.0 / 101.0) < 1e-6
+              and abs(_n.get("3", 0.0) - 3.0 * 50.0 / 101.0) < 1e-6
+              and sorted(_n) == ["1", "2", "3"]
+              and _dflt.get("O1.lump") == 20
+              and bool(_el) and _el[0].get("segments") == 20
+              and abs(_el[0]["port1"]["current_a"] - 3.0 / 101.0) < 1e-9,
+              "%r / lump %r" % (_n, _dflt))
+
+        # 0.0.31: the uniform distributed RC line U. Its ladder must converge to
+        # the DISTRIBUTED answer, not to a resistor: r=1 kohm/m, c=1 nF/m, 1 m,
+        # far end open, 50 ohm source. Z_in = Z0c*coth(gL) gives |V(2)| =
+        # 0.909627 at 1 MHz; 60 sections read 0.909951 (measured).
+        r = handle({"jsonrpc": "2.0", "id": 148, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* u\nV1 1 0 AC 1\nR1 1 2 50\nU1 2 3 0 urc1\n"
+                                   ".model urc1 URC(r=1000 c=1n len=1 lump=60)\n"
+                                   ".ac lin 2 1meg 2meg\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _pts = (payload.get("value") or {}).get("points") or []
+        _m = ((_pts[0]["nodes_v"] if _pts else {}) or {}).get("2", {}).get("mag")
+        check("builtin U (distributed RC) at 1 MHz reads 0.909951 V on a 1 V source, "
+              "i.e. the distributed Z0c*coth(gL) divider 0.909627 to 0.04 %",
+              payload.get("status") == "ok"
+              and _m is not None and abs(_m - 0.909627) < 1e-3,
+              str(_m))
 
         # filter synthesis: the prototype table is a textbook value, and the
         # lumped bandpass is scored against the closed form it must agree with.
