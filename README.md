@@ -214,7 +214,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `link_far_field` | 远场距离：`max(2D²/λ, 5D, λ/2π)` 并说明哪个机制主导 | 三段都要给，只给一段会误导 |
 | `link_fresnel` | 第一菲涅耳区半径 + 60% 净空 | — |
 | `board_antenna_keepout` | 板级净空：某矩形内的铜与 **zone** | 派生量 `authoritative:false`；pad/track/via 与 zone **分开计数**（DRC 看不见铺铜失谐） |
-| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`） | 内置子集认 R C L V I E F H K S W D Q M J B T O U、子电路 `X` 与 `.noise`，**只有 `A` 逐条点名拒绝**（`engine="ngspice"` 下直通引擎），`J` 是 **level-1 JFET**（平方律无 `1/2`、`AREA` 卡覆盖模型、不 stamp 栅结但报 `gate_junction_forward_v`，见 `docs/42`）；开关是**两个电导 + 一个状态**（`VT±VH` 是整宽、`VH=0` 时恰好 `VT` 就闭合、DC 也走滞回带，全部对 ngspice 逐点校准）；`engine="ngspice"` 找不到二进制**报错不回退**；默认 `builtin` |
+| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`）；`0.0.37` 起**最小 ngspice-47 随包**（`vendor/ngspice/`，14 MB，独立进程、混搭许可见 `vendor/ngspice/NOTICE.md`），只有 `engine="ngspice"` 会在本机一个都没装时用它，`engine="auto"` 刻意不看 | 内置子集认 R C L V I E F H K S W D Q M J B T O U、子电路 `X` 与 `.noise`，**只有 `A` 逐条点名拒绝**（内置解析器不认第二套器件描述语言；`engine="ngspice"` 下直通引擎，`0.0.37` 起引擎本身随包，见 `docs/43`），`J` 是 **level-1 JFET**（平方律无 `1/2`、`AREA` 卡覆盖模型、不 stamp 栅结但报 `gate_junction_forward_v`，见 `docs/42`）；开关是**两个电导 + 一个状态**（`VT±VH` 是整宽、`VH=0` 时恰好 `VT` 就闭合、DC 也走滞回带，全部对 ngspice 逐点校准）；`engine="ngspice"` 找不到二进制**报错不回退**；默认 `builtin` |
 | `trace_resistance` | 铜线直流电阻 `rho(T)·L/(w·t)` | 只管这一段；过孔/扩展/端子不在这个数里 |
 | `via_resistance` | 过孔桶壁电阻（截面是**铜环**不是钻孔圆） | 载流是另一码事，要温升判据 |
 | `trace_inductance` | 直线走线自感（Grover 带公式，±20%） | 只用于比两种布局；地平面像项**明确未计入** |
@@ -263,8 +263,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 ```bash
 python run_server.py --version       # 0.0.34
-python run_server.py --selftest      # 协议级自检，135/135（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问）
-python -m unittest discover -s tests # 1970 个用例（约 13 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --selftest      # 协议级自检，139/139（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问）
+python -m unittest discover -s tests # 1990 个用例（约 13 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -282,7 +282,7 @@ MCP 客户端配置（stdio）：
 ```
 
 协议实现是 stdlib 手写的 JSON-RPC 2.0 换行分隔流（`2025-06-18`，向后兼容 `2025-03-26` / `2024-11-05`），
-`dependencies = []`。日志只写 stderr —— stdout 承载协议。
+`dependencies = []`（`0.0.37` 起 `vendor/ngspice/` 是一个随包的**外部程序**，不是一个 Python 依赖，删掉它不影响任何 import，见下文「最小内核随包」）。日志只写 stderr —— stdout 承载协议。
 
 ## 路线图
 
@@ -505,6 +505,17 @@ MCP 客户端配置（stdio）：
   `engine="ngspice"` 下照跑，节点表从 rawfile 读，信封带 `netlist_parsed:false` 而**不假装**
   这是一次完整解析；同一 deck 走 `builtin` 仍然拒绝。`simulate()` 默认引擎是 `builtin`
   （`engine="auto"` 才用引擎）——默认值不能让同一网表在两台机器给出不同答案。
+- **`0.0.37`：最小内核随包，不是自己重写一个 SPICE。** `vendor/ngspice/`（14 MB）是官方
+  `ngspice-47` Windows 构建的**未改动**子集（`bin/ngspice_con.exe` + 三个硬依赖 DLL +
+  `lib/ngspice/*.cm` + `share/ngspice/scripts/spinit` + `COPYING`），只被 `engine="ngspice"`
+  在「本机一个都没装」时兜底，`engine="auto"` **刻意不看它**（仓库长出 14 MB 不该改变既有
+  安装的答案）。它是**独立进程**（只 `subprocess.run`，不 link 不 include），所以 MIT 与上游的
+  混搭许可（Modified BSD / XSPICE 公有领域 / `table.cm` GPLv2+ / LGPL 组件）能共存——
+  `vendor/ngspice/NOTICE.md` 逐项写明，`tests/test_spice_bundled.py` 里有断言盯着这份声明。
+  与"零依赖"的关系是**改写而不是打脸**：`dependencies = []` 仍然成立（Python 包没有任何
+  import 依赖），多出来的是一个可删的二进制目录，删掉只影响 `engine="ngspice"` 的兜底。
+  三条只能量出来的路径事实（`spinit` 按 exe 自己找、`.cm` 真被用到、`SPICE_LIB_DIR` 会顶掉
+  `spinit` 的查找基准）与两次误读的回收都记在 [`docs/43`](docs/43-随包SPICE内核.md)。
 - **AC 截断会出声。** 扫频点数超过 `max_points` 时返回 `warnings`：只解了前 N 点、末点不是 `fstop`。
   一个还在上升的曲线被静默截断，会被读成"电路在这里谐振"。
 - **温度必须给符号正确的答案。** IS 按 SPICE 实现随温度缩放（XTI/EG/TNOM）：27 ℃ 二极管 0.6925 V，
@@ -692,10 +703,13 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1970 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 1990 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
-└── docs/                         # 设计文档 00~41，建议按编号顺序读（索引见 docs/README.md）
+├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
+├── docs/                         # 设计文档 00~43，建议按编号顺序读（索引见 docs/README.md）
+├── CHANGELOG.md
+└── LICENSE
 ```
 
 ## 免责声明

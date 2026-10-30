@@ -4102,12 +4102,32 @@ ENGINE_NOTE = (
     "engine='auto' uses ngspice when a binary is found (PCB_AGENT_NGSPICE or PATH) "
     "and the builtin stdlib solver otherwise; engine='ngspice' REFUSES rather than "
     "fall back, because a caller who asked for the reference implementation must not "
-    "get a level-1 MOSFET answer in its place"
+    "get a level-1 MOSFET answer in its place. engine='ngspice' also accepts the "
+    "engine shipped in vendor/ngspice (GPL, called as a separate process) when no "
+    "system install is found; engine='auto' deliberately does NOT consider it, so "
+    "what 'auto' means on a given machine does not change when the bundle is added"
+)
+
+BUNDLED_NOTE = (
+    "vendor/ngspice/ holds an unmodified ngspice-47 Windows build (GPL-2.0, see "
+    "vendor/ngspice/NOTICE.md) as a SEPARATE PROGRAM: it is spawned as a subprocess "
+    "and never linked, so this module stays MIT and stays import-free. It is reached "
+    "by engine='ngspice' only after PCB_AGENT_NGSPICE, PATH and an installed copy "
+    "have all come up empty"
 )
 
 
-def find_ngspice():
-    """Return an argv prefix for ngspice, or None. Never raises."""
+def find_ngspice(allow_bundled=False):
+    """Return an argv prefix for ngspice, or None. Never raises.
+
+    `allow_bundled` adds vendor/ngspice as a candidate between PATH and the
+    install-directory scan. It is OFF by default so that the answer to "what does
+    this machine have installed" does not change, and so that engine='auto' keeps
+    meaning exactly what it meant before the bundle existed. The bundle ranks
+    above the install scan because a hand-unpacked copy routinely has no spinit
+    (the one on this machine does not), i.e. a lookup heuristic must not shadow
+    the copy this repository can vouch for.
+    """
     if NGSPICE_CMD:
         return list(NGSPICE_CMD)
     import os
@@ -4127,6 +4147,10 @@ def find_ngspice():
         found = shutil.which(name)
         if found:
             return [found]
+    if allow_bundled:
+        bundled = find_bundled_ngspice()
+        if bundled:
+            return bundled
     # A binary unpacked by hand (as on this machine) is not on PATH. Look in the
     # two places a Windows install actually ends up, newest version first, so an
     # install does not silently need an environment variable to be seen.
@@ -4149,6 +4173,27 @@ def find_ngspice():
                 return [os.path.join(d, name)]
     return None
 
+
+def bundled_ngspice_dir():
+    """Absolute path of vendor/ngspice (whether or not it holds anything)."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    up3 = os.path.join(here, os.pardir, os.pardir, os.pardir)
+    return os.path.normpath(os.path.join(up3, "vendor", "ngspice"))
+
+def find_bundled_ngspice():
+    """Return an argv prefix for the engine in vendor/ngspice, or None.
+
+    Never raises, never consults PATH: this is only the copy that ships with the
+    repository. Absent - or a platform where a Windows .exe cannot run, which is
+    how "the bundle is not part of this installation" looks - returns None.
+    """
+    import os
+    import sys
+    if not sys.platform.startswith("win"):
+        return None
+    path = os.path.join(bundled_ngspice_dir(), "bin", "ngspice_con.exe")
+    return [path] if os.path.isfile(path) else None
 
 def _engine_version(argv):
     import subprocess
@@ -4241,8 +4286,38 @@ def _parse_raw(data):
                 row = [(row[2 * i], row[2 * i + 1]) for i in range(nvar)]
             points.append(row)
     else:
-        toks = body.decode("utf-8", "replace").split()
-        per_point = 1 + nvar * mult      # the point index comes first
+        # ASCII rawfile, measured on ngspice-47 (docs/43): one variable per LINE,
+        # the point index prepended to the first line of each record, and a
+        # complex value written "re,im" - two numbers in one cell. Splitting on
+        # whitespace alone therefore merged "1.0,0.0" into a single token, which
+        # read as "1 record but the header says 3 points" for every AC plot; both
+        # "," and whitespace separate cells, and a record is 1 + nvar*mult of them.
+        # The body also runs to the end of the file on a multi-plot rawfile
+        # (.noise writes two plots), so the scan stops at the first line that is
+        # not a value line and reports that offset as bytes_used - otherwise the
+        # NEXT plot's "No. Points" would be compared against this plot's tokens.
+        per_point = 1 + nvar * mult   # the point index comes first
+        # An ASCII rawfile is pure ASCII, so a character offset IS a byte offset;
+        # that is what lets bytes_used stay meaningful for the plot walk.
+        text = body.decode("utf-8", "replace")
+        toks = []
+        stop = None
+        pos = 0
+        for line in text.splitlines(True):
+            cells = [c for c in re.split(r"[,\s]+", line) if c]
+            if cells:
+                try:
+                    for c in cells:
+                        float(c)
+                except ValueError:
+                    stop = pos
+                    break
+                toks.extend(cells)
+            pos += len(line)
+        if stop is None:
+            used = idx + len(cand) + len(body)
+        else:
+            used = idx + len(cand) + stop
         if len(toks) < per_point:
             raise ValueError("ASCII rawfile has %d numbers, need at least %d"
                              % (len(toks), per_point))
@@ -4409,10 +4484,18 @@ def _run_ngspice(argv, netlist, want, timeout_s=NGSPICE_TIMEOUT_S):
         # machine. Without them T (transmission line) cards and every XSPICE
         # device fail to load - a run that "works" but cannot parse half the
         # deck is exactly the kind of partial answer this module refuses.
+        # Measured on ngspice-47 (docs/43): SPICE_LIB_DIR REPLACES the base the
+        # start-up file is looked up from, so setting it on a tree that ships its
+        # own share/ngspice/scripts/spinit turns a working engine into "can't find
+        # the initialization file spinit" + MIF-ERROR on every A card. A tree with
+        # an init file therefore needs nothing from us; only a tree without one
+        # gets the pointer.
         if not os.environ.get("SPICE_LIB_DIR"):
             here = os.path.dirname(os.path.abspath(argv[0]))
-            lib = os.path.normpath(os.path.join(here, os.pardir, "lib", "ngspice"))
-            if os.path.isdir(lib):
+            root = os.path.normpath(os.path.join(here, os.pardir))
+            lib = os.path.join(root, "lib", "ngspice")
+            init = os.path.join(root, "share", "ngspice", "scripts", "spinit")
+            if os.path.isdir(lib) and not os.path.isfile(init):
                 env = dict(os.environ)
                 env["SPICE_LIB_DIR"] = lib
         try:
@@ -4725,7 +4808,11 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
         return _builtin("engine='builtin' was asked for, so the stdlib subset solver "
                         "ran and no external engine was consulted")
 
-    argv = find_ngspice()
+    # Only on explicit request: reaching the bundle from 'auto' would change what
+    # every existing caller gets just because this repository grew a 14 MB
+    # directory, and "the same netlist answers differently after an upgrade" is
+    # exactly what the DEFAULT IS THE BUILTIN rule forbids.
+    argv = find_ngspice(allow_bundled=(choice == "ngspice"))
     if argv is None:
         if choice == "ngspice":
             return err("engine='ngspice' was requested but no ngspice binary was found",
@@ -4735,7 +4822,10 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
                             "answering with the subset, because those are different "
                             "device models" % NGSPICE_ENV,
                        extra={"tried": ["%s env var" % NGSPICE_ENV,
-                                        "PATH: ngspice, ngspice_con"]})
+                                        "PATH: ngspice, ngspice_con",
+                                        "bundled: %s"
+                                        % (bundled_ngspice_dir()
+                                           + "/bin/ngspice_con.exe")]})
         return _builtin("engine='auto' found no ngspice binary (%s or PATH), so the "
                         "stdlib subset solver ran; the answer is that subset's, not "
                         "the reference engine's" % NGSPICE_ENV)
@@ -4784,6 +4874,16 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
 
     raw_log, problem = _run_ngspice(argv, netlist, want)
     if problem is not None:
+        # 'auto' deliberately does not reach the bundled engine (see ENGINE_NOTE),
+        # so a failure there must at least say the bundle exists and how to ask for
+        # it - otherwise the only working engine on the machine is undiscoverable.
+        if choice == "auto":
+            bundled = find_bundled_ngspice()
+            if bundled:
+                problem["bundled_engine"] = bundled[0]
+                problem["hint"] = ((problem.get("hint") or "") +
+                                   "; engine='ngspice' would run the copy bundled at %s"
+                                   % bundled[0])
         return problem
     raw, log = raw_log
     cross = None

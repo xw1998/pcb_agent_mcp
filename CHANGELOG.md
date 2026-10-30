@@ -9,6 +9,58 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.37] - 2026-10-30
+
+最小 SPICE 内核**随工具打包**，`A`（XSPICE 代码模型）从此有了真实载体——**不自己实现**。这一版
+改的不是求解器，而是一条口径：`0.0.30` 起一直写着「外部二进制只作一次性证据、不是仓库依赖」，
+现在多出一个**随包的外部程序**（`vendor/ngspice/`，14 MB）。口径改写是显式的，不是被顺手带过去的。
+
+- **随包什么**：官方 `ngspice-47`（`ngspice-47_64.7z`，13 814 879 B，sha256 `59225971…518f5a`）
+  **未改动**的最小可运行子集——`bin/ngspice_con.exe` + 三个硬依赖 DLL（`libomp140.x86_64.dll`、
+  `samplerate.dll`、`sndfile.dll`；**缺任一个直接退出码 127、无任何提示**）、`lib/ngspice/*.cm`（7 个）、
+  `share/ngspice/scripts/spinit`、`COPYING`。丢弃：GUI `ngspice.exe`（8.6 MB）、`*.osdi`（5.6 MB，MPLv2）、
+  examples/docs/scripts 的其余部分。布局必须是 `bin/` + `lib/` + `share/` 同级——上游形状，不是我们的发明。
+- **只由 `engine="ngspice"` 使用，`engine="auto"` 刻意不看它**。查找顺序：`PCB_AGENT_NGSPICE` →
+  `PATH` → **随包** → 目录扫描；`find_ngspice()` 默认 `allow_bundled=False`，所以仓库长出 14 MB 目录
+  不改变任何既有安装上 `auto` 的答案。撞不到时要能看出来：`ENGINE_NOT_FOUND.tried` 里有一行
+  `bundled: …/vendor/ngspice/bin/ngspice_con.exe`；`auto` 失败时信封多一个 `bundled_engine` 字段 +
+  `hint` 指路（不静默换引擎，只告诉调用方还有这条路）。
+- **三条路径事实，全部有负控制**：① `spinit` 按**可执行文件所在目录**找（与 cwd 无关）；② `lib/ngspice/*.cm`
+  **真被用到**（把 `analog.cm` 写成垃圾文本 → `MIF-ERROR - unable to find definition of model gain1`）；
+  ③ **`SPICE_LIB_DIR` 会顶掉 `spinit` 的查找基准**——对有 `spinit` 的树设它，引擎报
+  `Warning: can't find the initialization file spinit.` 并让每张 `A` 卡 `MIF-ERROR`。第 ③ 条是本轮最贵的坑，
+  修法是 `_run_ngspice` 只在「有 `lib/ngspice` 且**没有** `spinit`」的树上设这个变量。
+- **`A` 卡真的能跑**：`A1 1 10 g1` + `.model g1 gain(gain=2.0)` 读 **2.000 V**；`limit(in_offset=0 gain=1
+  out_lower_limit=-1 out_upper_limit=1)` 对 5 V 读 **1.000 V**；`gain(gain=3)` 的 `.tran 10u 100u` 末点
+  **3.000 V**。诚实项照旧：`netlist_parsed:false`、`netlist_parse_note` 点名 XSPICE、`cross_check` 报「无可比」。
+  试过但不通、未采纳：`integrator`（`MIF-ERROR … model integ1`）、`summer`（`Missing [, an array connection
+  was expected`）、`multiplier`（`MIF-ERROR`）。
+- **数值风险为零（量出来的，不是推的）**：系统手工解包副本与随包官方副本对 divider/diode/bjt/tran/ac/tline
+  六类 deck 逐点对拍，`maxdiff` 全 **0.0 到 1 ulp**（`tran` 2045 点、`ac` 21 点、`tline` 97 点；复测同一张 AC deck 3 点全同、最大差 5.6e-17）。所以「随包优先」
+  不改动任何既有期望值。
+- **许可证是混搭，不是单一 GPL**：`COPYING` 的默认是 **Modified BSD（3 条款）**，XSPICE code model 是
+  **公有领域**（Georgia Tech），`xspice/icm/table`（`table.cm`）是 **GPLv2 or newer**，KLU/numparam 是
+  LGPLv2/+，OSDI 是 MPLv2.0（**未随包**）。MIT 与它们共存靠的是**独立程序**：只 `subprocess.run`，
+  不 link、不 include、不 import。`vendor/ngspice/NOTICE.md` 逐项列明，测试里有断言盯着这份声明
+  （先写的「GPL」版本被 `COPYING` 打回来一次——按事实写，不按印象写）。
+- **顺带修掉一个真缺陷：ASCII rawfile 读不了。** 官方 `spinit` 里有 `set filetype=ascii`，所以随包引擎
+  写的是 **ASCII** rawfile，而手工解包树（没有 `spinit`）写的是二进制——同一份二进制，换棵树，编码就变了。
+  全量回归里 16 个「真引擎对拍」用例因此一起报 `ENGINE_OUTPUT_INVALID`（`ASCII rawfile has 1 records
+  but the header says 3 points`），而错在 `_parse_raw` 而不是引擎：① 复杂值写成 `re,im` 是**一个空白
+  token、两个数**，旧分支按空白切只数到 `1+nvar`；② ASCII 的 `Values:` 一直到**文件尾**，第二张 plot
+  （`.noise`）的表头也被当成数值 token，旧 `bytes_used` 取「整个文件剩余」⇒ `_raw_plots` 永远只走第一张。
+  修法：按行扫、`,` 与空白都算分隔符、遇到第一行非数值即停并回报偏移（ASCII 的字符偏移即字节偏移）。
+  这条会被 `TestAsciiRawfile` 的三个用例钉住（复杂值、两张 plot、表头点数说谎必须报错）。
+- **测试**：`tests/test_spice_bundled.py` **20 例**（查找规则 6 / 许可卫生 3 / 真跑 8 / ASCII rawfile 3，
+  无随包时真跑那一组 skip）；`--selftest` 135 → **139/139**（新增：随包只按需出现、`gain` 2 V 且
+  `netlist_parsed:false`、`limit` 削顶、负控制 `builtin` 仍 `NETLIST_INVALID`）；全量回归 1990 例全绿（skipped=5）。
+- **文档**：新增 [`docs/43-随包SPICE内核.md`](docs/43-随包SPICE内核.md)（九节，含两条误读的回收记录）。
+
+**修订（`0.0.37`）**：本版上一条 `[0.0.36]` 里「但 `A` 在本机 ngspice-47 上连 code model 都加载不了
+（`code_model:` 命令不存在）」**是错的**。那条读数出自两个错误前提——模型名写成 `amp`（XSPICE 没有这个
+模型，正确的是 `gain(gain=2.0)`）、以及手工解包树缺 `spinit`。同一份二进制补齐 `.cm` + `spinit` 后 `A` 卡
+正常。原文保留，回收过程见 `docs/43` §43.7、`docs/17` §17.4/§17.5 与 `docs/42` §42.9 的修订块。
+
 ## [0.0.36] - 2026-10-30
 
 JFET `J` 进内置求解器，`NOT_IMPLEMENTED_CARDS` 缩到只剩 `A`。这一版**新增一条器件方程**，和前面几版

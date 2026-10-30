@@ -317,12 +317,20 @@ class TestRefusals(EngineCase):
         # controlled switch S until 0.0.35 and the JFET J until 0.0.36. What is
         # left is A, the XSPICE analogue behavioural block - and it is the honest
         # last stand-in: it is not "not implemented yet", it is a second
-        # expression/code-model system, and this build of ngspice does not load
-        # the code models either, so the fake engine below is the only way to
-        # exercise the pass-through path at all.
+        # expression/code-model system (a second device description language).
+        #
+        # 0.0.37 correction: the comment here used to claim that this build of
+        # ngspice cannot load the code models either, and the stand-in deck used
+        # ".model amp amp(in_gain=2)" - a model name XSPICE does not have. Both
+        # were wrong: the real card is "gain(gain=2)" and the shipped engine loads
+        # it (tests/test_spice_bundled.py runs the real thing and reads 2.000 V).
+        # This test keeps the FAKE engine on purpose - what it exercises is the
+        # delegation plumbing (deck handed over unchanged, netlist_parsed:false,
+        # builtin still refusing by name), which is independent of whether a real
+        # engine is installed - but the deck is now a real, runnable one.
         self.spec(kind="op", nodes={"1": 1.0})
-        net = ("* a\nV1 1 0 1\nA1 %v(2) %v(1) amp\nR1 2 0 1k\n"
-               ".model amp amp(in_gain=2)\n.op\n")
+        net = ("* a\nV1 1 0 1\nA1 %v(1) %v(2) gain1\nR1 2 0 1k\n"
+               ".model gain1 gain(gain=2)\n.op\n")
         r = spice.simulate(net, engine="ngspice")
         self.assertEqual(r["status"], "ok", r)
         self.assertEqual(r["engine_used"], "ngspice")

@@ -798,8 +798,11 @@ def selftest():
         # refused by name. T (the LOSSLESS line) moved INTO the builtin set in
         # 0.0.30, O/U (the lossy ones) in 0.0.31, S/W (the two switches) in 0.0.35
         # and J (the JFET) in 0.0.36, so no analogue card is left that only the
-        # engine can run (the one remaining refusal, A, is an XSPICE code model
-        # that this ngspice build does not even load). What still has teeth is the
+        # engine can run for ANALOGUE reasons - the one remaining refusal, A, is an
+        # XSPICE code model, and 0.0.37 ships an engine that runs it (see id 155).
+        # (0.0.36 claimed here that this ngspice build could not even load the code
+        # models; that was wrong - the file ngspice needed was missing, not the
+        # feature. docs/43 records the correction.) What still has teeth is the
         # migration itself: the same JFET deck must now be PARSED HERE, read
         # 0.267949 V at the divider tap (BETA=1m / VTO=-1 with VGS=0 sinks
         # 0.366 mA out of the 1 V / 1k tap, where a skipped card reads 0.500 V),
@@ -932,6 +935,85 @@ def selftest():
         check("builtin J refuses RD/RS/B/CGS/KF by name (every one of them changes "
               "the answer, measured) instead of stamping a number nobody chose",
               all(_msgs), str(_msgs))
+
+        # 0.0.37: the engine this repository ships (vendor/ngspice, an unmodified
+        # upstream build called as a separate process) is reachable ONLY by asking
+        # for engine='ngspice'. If it leaked into find_ngspice() the meaning of
+        # engine='auto' would change on every existing installation, so the two
+        # lookups are asserted apart.
+        _bundled = _spice_mod.find_bundled_ngspice()
+        _default = _spice_mod.find_ngspice()
+        _asked = _spice_mod.find_ngspice(allow_bundled=True)
+        if _bundled:
+            check("the bundled engine is found only when asked for: find_ngspice() "
+                  "still reports the machine's own copy (%s), "
+                  "find_ngspice(allow_bundled=True) reports the bundle"
+                  % (_default[0] if _default else "none"),
+                  _bundled[0] not in (_default or [])
+                  and _asked == _bundled
+                  and _bundled[0].endswith("ngspice_con.exe"),
+                  str(_asked))
+        else:
+            check("no bundle in this checkout, so allow_bundled changes nothing",
+                  _asked == _default, str(_asked))
+
+        # 0.0.37: the A card is the whole reason for the bundle. This is an
+        # XSPICE `gain` block: 1 V in, gain=2, so node 10 must read exactly 2 V -
+        # and the envelope must admit that the deck was NOT parsed here.
+        _GAIN = ("* xspice\nV1 1 0 1\nA1 1 10 g1\n.model g1 gain(gain=2.0)\n"
+                 "R1 10 0 1k\n.op\n")
+        r = handle({"jsonrpc": "2.0", "id": 155, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": _GAIN, "engine": "ngspice"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        if _bundled:
+            _n = (payload.get("value") or {}).get("nodes_v") or {}
+            check("the bundled engine RUNS an XSPICE A card: gain(gain=2) on 1 V "
+                  "reads exactly 2 V, and the envelope says the deck was not parsed "
+                  "here (A is still refused by this module's own parser)",
+                  payload.get("status") == "ok"
+                  and abs(_n.get("10", 0.0) - 2.0) < 1e-9
+                  and payload.get("netlist_parsed") is False
+                  and "XSPICE" in (payload.get("netlist_parse_note") or "")
+                  and payload.get("verified_against_engine") is True,
+                  "%r / %r" % (_n, payload.get("netlist_parsed")))
+        else:
+            check("with no bundle, engine='ngspice' still refuses the A deck and "
+                  "names the bundle among the places it looked",
+                  payload.get("status") in ("error", None),
+                  str(payload.get("reason_code")))
+
+        # 0.0.37: a SECOND code model, because one lucky model proves nothing -
+        # limit() clips 5 V to out_upper_limit=1 and reads 1.0 V.
+        _LIMIT = ("* lim\nV1 1 0 5\nA1 1 2 lim1\n"
+                  ".model lim1 limit(in_offset=0 gain=1 out_lower_limit=-1 "
+                  "out_upper_limit=1)\nR1 2 0 1k\n.op\n")
+        r = handle({"jsonrpc": "2.0", "id": 156, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": _LIMIT, "engine": "ngspice"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        if _bundled:
+            _n = (payload.get("value") or {}).get("nodes_v") or {}
+            check("a second code model behaves: limit(out_upper_limit=1) on 5 V "
+                  "reads 1.0 V, so the bundle loaded the model set rather than one "
+                  "model that happened to work",
+                  payload.get("status") == "ok" and abs(_n.get("2", 0.0) - 1.0) < 1e-9,
+                  str(_n))
+        else:
+            check("no bundle: the limit deck is refused for the same reason",
+                  payload.get("status") != "ok", str(payload.get("reason_code")))
+
+        # 0.0.37 negative control: the bundle must not make the SUBSET kinder.
+        r = handle({"jsonrpc": "2.0", "id": 157, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": _GAIN, "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("the builtin subset still REFUSES the A card by name (running it "
+              "through the engine did not teach the parser to skip it)",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "NETLIST_INVALID"
+              and "XSPICE" in (payload.get("message") or ""),
+              str(payload.get("message"))[:60])
 
         # 0.0.30: the lossless line in the builtin. DC is a wire, so the matched
         # 3 V / 50 ohm divider must read 1.500 V at BOTH ports and +/-30 mA.
