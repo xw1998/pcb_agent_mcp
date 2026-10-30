@@ -2163,12 +2163,65 @@ def board_vibration(board, mount="corners", material="fr4", thickness_mm=None,
         modes.append(m2)
 
     warnings = list(val.get("warnings") or [])
+    # ---- the same plate on the REAL outline (the bbox answer stays the primary
+    # one so nothing that already worked changes); this is where the bbox bias
+    # stops being an unquantified worry and becomes a second number.
+    on_ring = None
+    ring_hot = []
     if fill < 0.99:
-        warnings.append(
-            "the outline fills only %.1f %% of its bounding box, so the plate "
-            "model is bigger and softer than the real board: f1 is biased LOW "
-            "(the bias is not computed - it needs a real 2-D mesh)"
-            % (100.0 * fill))
+        from .calc import vibration_poly as _vpb
+        try:
+            pr = _vpb.plate_modes_polygon(
+                ring, th, material=material, mount=mount,
+                poly_degree=max(8, int(poly_degree)), n_modes=n_modes,
+                probe_points=([{"name": p["name"], "x_mm": p["x_mm"] + x0,
+                                "y_mm": p["y_mm"] + y0} for p in probes]
+                              or None))
+        except Exception as exc:            # never lose the bbox answer
+            pr = {"status": "error", "reason_code": "INTERNAL",
+                  "message": str(exc)}
+        if pr.get("status") == "ok":
+            pv = pr["value"]
+            f_bbox = val["modes"][0]["freq_hz"] if val["modes"] else None
+            f_ring = pv["modes"][0]["freq_hz"] if pv["modes"] else None
+            ratio = (f_ring / f_bbox) if (f_bbox and f_ring) else None
+            on_ring = {
+                "f1_hz": f_ring,
+                "ratio_to_bbox": (_sig2(ratio) if ratio is not None else None),
+                "modes": pv["modes"],
+                "alpha_spread_pct": pv["basis"]["alpha_spread_pct"],
+                "alpha_converged": pv["basis"]["alpha_converged"],
+                "boundary_rms_mm": pv["basis"]["boundary_rms_mm"],
+                "poly_degree": pv["basis"]["poly_degree"],
+                "area_mm2": pv["area_mm2"],
+                "perimeter_mm": pv["perimeter_mm"],
+                "model": pr.get("model"),
+                "warnings": pv.get("warnings") or [],
+            }
+            first = (pv["modes"][0] if pv["modes"] else {})
+            for d in first.get("deflection_at_probes") or []:
+                ring_hot.append({"ref": d["name"],
+                                 "normalised_deflection":
+                                     d["normalised_deflection"],
+                                 "near_antinode":
+                                     abs(d["normalised_deflection"]) >= 0.5})
+            ring_hot.sort(key=lambda d: -abs(d["normalised_deflection"]))
+            if ratio is not None:
+                warnings.append(
+                    "the outline fills only %.1f %% of its bounding box, so the "
+                    "bbox plate is bigger and softer: its f1 is biased LOW. On "
+                    "the real outline f1 = %.1f Hz, which is %+.1f %% of the "
+                    "bbox number (penalty-ladder spread %.2f %%, %s)"
+                    % (100.0 * fill, f_ring, 100.0 * (ratio - 1.0),
+                       pv["basis"]["alpha_spread_pct"],
+                       "converged" if pv["basis"]["alpha_converged"]
+                       else "NOT converged - indicative only"))
+        else:
+            warnings.append(
+                "the outline fills only %.1f %% of its bounding box, so the "
+                "bbox plate is bigger and softer and f1 is biased LOW; the "
+                "polygon solve that would quantify the bias failed (%s: %s)"
+                % (100.0 * fill, pr.get("reason_code"), pr.get("message")))
     warnings.append("component mass is not added; a heavy part lowers f1 and "
                     "moves the mode")
 
@@ -2192,6 +2245,8 @@ def board_vibration(board, mount="corners", material="fr4", thickness_mm=None,
             "mount": mount,
             "modes": modes,
             "hotspots": hot[:12],
+            "plate_on_outline": on_ring,
+            "hotspots_on_outline": ring_hot[:12],
             "probe_count": len(probes),
             "warnings": warnings,
         },
@@ -2199,8 +2254,11 @@ def board_vibration(board, mount="corners", material="fr4", thickness_mm=None,
         res["model"],
         "Kirchhoff thin plate over the outline bounding box, mount=%r" % mount,
         "mode frequencies inherit the plate model's accuracy (exact for a "
-        "rectangular SSSS/CCCC plate, 0.15 % for free edges) plus the two "
-        "outline/mass approximations named in warnings",
+        "rectangular SSSS/CCCC plate, 0.15 % for free edges) plus the mass "
+        "approximation named in warnings; when the outline is not rectangular "
+        "`plate_on_outline` re-solves the same plate on the real polygon, so "
+        "the bbox bias is a number instead of a warning (its own penalty-ladder "
+        "spread is reported next to it)",
         {"note": "use vibration_random_response / vibration_fatigue with modes[0]"
                  "['freq_hz'] and a PSD and an allowable deflection to get from "
                  "'it rings at N Hz' to 'it survives M hours'",

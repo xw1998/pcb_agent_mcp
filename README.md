@@ -96,7 +96,8 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 
 - **阻抗**：闭式系统性**偏低 8~11%**（方向一致），所以「调宽凑数」会先把线做窄；要紧的几何用二维场解。
 - **共面**：铜厚不建模，真实铜箔损耗高约 10%，而那 10% 自己也没收敛；地默认按无限宽算，窄地是**共模**问题（`g/2` 时 `z_even` +21.9%）。
-- **振动**：薄板 Kirchhoff、单模态；`board_vibration` 用板框 bbox 而非真实轮廓（非矩形会**偏软**，同时回 `outline_fill_fraction_of_bbox`）；应力是三个极值，不是场。
+- **振动**：薄板 Kirchhoff、单模态；`board_vibration` 的主答案仍是板框 bbox（非矩形会**偏软**，回 `outline_fill_fraction_of_bbox`），0.0.42 起另给 `plate_on_outline`＝**真实外轮廓**的解（L 形实测差 3.13×）；应力是三个极值，不是场。
+- **轮廓振动**：只解外轮廓（孔不网格化），`alpha_spread_pct` 是罚阶梯最平一档的步长（>3 % 只作指示），凹角与高边数**经常不收敛**，`modes[i].physical=false` 的阶是伪刚度不是模态。
 - **平面谐振**：只给模频与 λ_g 比例，不给 Q、不做边界失谐；「要不要紧」交给你用 `pdn_plane_modes` 的峰值对阻抗目标。
 - **电热**：只闭合「铜 `R(T)` ↔ 一个集中 `Rth`」；2-D 板场只沿**你给的层压板 k** 扩散，不沿真实铜面。
 - **滤波器**：是**合成器**不是仿真器——给几何与电学零点，不给 EM 结果、色散、版图；集总带通的蒙特卡洛是 uniform 独立（最坏情况）。
@@ -107,9 +108,9 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.41
-python run_server.py --selftest         # 146/146
-python -m unittest discover -s tests    # 2007 例（实测 842 s，约 14 分钟）
+python run_server.py --version          # 0.0.42
+python run_server.py --selftest         # 149/149
+python -m unittest discover -s tests    # 2033 例（实测 978 s，约 16 分钟）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -313,6 +314,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `dfm_capability` | 只校验一份**工艺能力文档**：11 条规则键、单位、方向、出处 | 未知键 / 没有 `source` / 空文档**整份拒收**；不内置任何板厂表 |
 | `dfm_check` | 拿能力文档去量板上真实几何，逐条给 `pass/fail/not_checked/not_applicable` + 余量 + `where` | 文档里没写的规则列进 `missing_known_rules`（不是 pass）；有界搜索窗外只给 `lower_bound` |
 | `vibration_plate_modes` | 矩形薄板自由振动：频率/模态形状（Rayleigh–Ritz 单轴单项式基 + 边界零空间 + 质量白化 + Jacobi）；四边简支/固支/自由/悬臂/四角点支撑 | 只有 Kirchhoff 薄板；不算阻尼、不算预紧/大变形、不算开孔与加强筋 |
+| `vibration_plate_outline` | **真实外轮廓**（任意简单多边形）的薄板自由振动：Green 定理在环上精确积内部矩 + 质量内积 GMS 白化 + 罚阶梯取**最平一档**（该档步长即 `alpha_spread_pct` 误差棒）；逐边 `ss`/`cc`/`free`、`free` 板、点支撑；每阶带 `penalty_share`/`physical`，撑不住的阶自己承认 | 只解**外轮廓**：孔/挖空不网格化、不加元件质量与铜厚、不算应力与疲劳；凹角与高边数不保证收敛（`alpha_converged=false` + `boundary_rms_mm` 明说）；`poly_degree<8` 带固支时空间里可能没有合法解 |
 | `vibration_plate_stress` | 振型 → 表面应力：同一模态在多个多项式阶上各解一次，**误差棒是量出来的**（`degree_sensitivity_pct`）；von Mises 与最大主应力**各报各的点** | `amplitude_mm` **必填**（振型没有幅值）；点支承下阶梯塌成一档 ⇒ `converged=None`（没有误差棒，而不是误差棒很小） |
 | `vibration_random_response` | 随机振动：Miles 等效（平坦闭式 + 实测谱积分互证）→ g_rms / 位移 rms | 单模态；非平坦谱逐段积分只在足迹内，谱外不计 |
 | `vibration_fatigue` | Steinberg 三带（3σ/2σ/1σ）+ Miner 线性累积 → 循环数与小时寿命 | `z_allow_mm` **必填**（不内置「典型允许挠度」） |
@@ -321,7 +323,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `vibration_shock_spectrum` | 冲击响应谱：一串单自由度振子逐频算峰值 |ZPA|、伪速度 2πf·z、峰值位移；对数扫频 | 默认 **5 % 阻尼是 SRS 惯例**并明示（不是你的板子的属性）；每条曲线自检「阶跃+近零阻尼恰为 2 倍」与「不超过 2×输入峰值」；SRS 本身不判失效 |
 | `solder_joint_fatigue` | 焊点热疲劳：`Δγ = F·DNP·Δα·ΔT/h` → Engelmaier `Nf = 0.5(Δγ/2ε_f)^(1/c)`、多环境 Miner、试验↔使用 Norris-Landzberg 加速因子 | `joint_height_mm` 必填（是分母）；ε_f **是拟合**（默认 0.325，SAC305 文献散布 0.2~0.35）；CTE 预设是典型值、FR-4 过 Tg 会从 16 跳到 ~60；不算 underfill/空洞/IMC/裂纹扩展 |
 | `drop_board_strain` | 跌落板面应变：一阶模态 → SDOF 冲击响应 → 曲率 → 应变，三段各自可复核；给 `dnp_mm`+`joint_height_mm` 再加焊点剪切应变 `ε·DNP/h` | 单模态、**不算器件质量**（f1 偏高 ⇒ 响应偏乐观）；`critical_strain_ue` 只能调用方给，不给就 `judged:false`（**没有 verdict**）；线性板理论，超过 h/2 高估 |
-| `board_vibration` | 按板上真实板框（bbox）+ 叠层厚度算 f₁/周期/热点，热点标 `near_antinode` | 派生量 `authoritative:false`；非矩形轮廓回 `outline_fill_fraction_of_bbox` 并说 f₁ 偏低 |
+| `board_vibration` | 按板上真实板框（bbox）+ 叠层厚度算 f₁/周期/热点，热点标 `near_antinode`；`fill < 0.99` 时另给 `plate_on_outline`（真实轮廓的 f₁ + `ratio_to_bbox` + 误差棒） | 派生量 `authoritative:false`；bbox 答案不变、方向仍明说（非矩形 bbox 偏软）；轮廓解只在 `fill < 0.99` 时出现，矩形板零成本 |
 | `cavity_resonance` | 平面腔体模 `f_mn = c/(2√εr)·√((m/a)²+(n/b)²)` + 每个模的 λ_g | **只给模频不给 Q**：无介损/铜损/辐射、无开放边缘失谐，所以是频率轴上的位置不是判决 |
 | `cavity_via_fence` | 过孔围栏：`pitch/λ_g`、每间距电长度、给定判据后的 `pass/fail` | **判据必须由调用方给**（λ_g/20 与 λ_g/10 差 2 倍，都不内置）；不给就 `indeterminate` 且不反推间距 |
 | `electrothermal_trace` | 走线自洽温升：R(T) → I²R → ΔT → R(T) 的定点迭代 + 精确失控判据 `dP/dT·Rth < 1` | `rth_c_per_w` **必填**；G≥1 回 `THERMAL_RUNAWAY` 而不是最后一次迭代；只算直流 |
@@ -344,8 +346,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 ```bash
 python run_server.py --version       # 0.0.41
-python run_server.py --selftest      # 协议级自检，146/146（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问）
-python -m unittest discover -s tests # 2007 个用例（实测 842 s，约 14 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --selftest      # 协议级自检，149/149（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问）
+python -m unittest discover -s tests # 2033 个用例（实测 978 s，约 16 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -657,8 +659,15 @@ MCP 客户端配置（stdio）：
   张量分量只在 `sigma_max` 点给出，**没有任何应力云图**，也没有孔边/加强筋的应力集中，
   更没有把这三个数再套一个疲劳律（Steinberg 的斜率与允许值仍要你给）。
   误差棒是 degree 阶梯的实测（K=5/7/9 时频率 0.04%、曲率 3.6%），点支承阶梯塌成一级时给 `None`。
-- **`board_vibration` 用板框 bbox 而不是真实轮廓**，并明说方向：非矩形轮廓会**偏软**（f₁ 偏低），
+- **`board_vibration` 的主答案仍是板框 bbox**，并明说方向：非矩形轮廓会**偏软**（f₁ 偏低），
   同时回 `outline_fill_fraction_of_bbox` 让人自己判程度。不算元件质量、不算安装点刚度、不算板内开孔。
+  0.0.42 补了第二条路（[docs/44](docs/44-非矩形板振动.md)）：`plate_on_outline` 与工具
+  `vibration_plate_outline` 直接拿真实外轮廓多边形当边界，同一块 L 形板（fill = 0.75）
+  实测 f₁ 从 553.651 Hz 变成 1734.760 Hz（**3.13×**）。精度与诚实度都靠两个读数：
+  `alpha_spread_pct`（罚阶梯最平一档的步长＝误差棒）与每阶的 `penalty_share`/`physical`
+  （固支方板第 2~4 阶的 21~28 kHz 里 >90 % 是罚项，被标成非模态）。
+  仍不算孔/挖空、不加元件质量与铜厚、不算应力；凹角（L 形 spread 14.7 %）与高边数
+  （8 边形 vs 圆板 +26 %）直接报"没收敛"，不给一个看起来很准的数字。
 
 ### 平面谐振与电热耦合：一个只给模频，一个只给一个 Rth（[docs/20](docs/20-平面谐振与电热耦合.md)）
 
@@ -778,6 +787,7 @@ pcb_agent_mcp/
 │       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
 │       ├── dfm.py                # DFM：11 条规则目录 + 能力文档体检 + 五态判定（无内置表）
 │       ├── vibration.py          # 振动：Ritz 模态 + Miles/Steinberg/冲击/传递率 + 应力（degree 阶梯误差棒）
+│       ├── vibration_poly.py     # 非矩形外轮廓：Green 定理精确矩 + GMS 白化 + 罚阶梯（spread/penalty_share 自述局限）
 │       ├── reliability.py        # 可靠性：焊点热疲劳（Engelmaier/Miner/Norris-Landzberg）+ 跌落板面应变 + 冲击谱
 │       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）+ plane_q（Qc = h/δs）
 │       ├── em.py                 # 全波接缝：找出 openEMS/Meep/gprMAX、版本与 handoff（不生成几何）

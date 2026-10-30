@@ -662,6 +662,44 @@ def selftest():
               and payload.get("reason_code") == "ARG_REQUIRED",
               str(payload.get("reason_code")))
 
+        # --- a polygonal outline must reduce to the rectangular answer when the
+        # polygon IS a rectangle, and must be stiffer than the bbox plate when it
+        # is not. Both are cross-path checks, not the polygon agreeing with itself.
+        _sq_ring = [[0, 0], [100, 0], [100, 100], [0, 100]]
+        r = handle({"jsonrpc": "2.0", "id": 851, "method": "tools/call",
+                    "params": {"name": "vibration_plate_outline", "arguments": {
+                        "ring_mm": _sq_ring, "thickness_mm": 1.6,
+                        "e_gpa": 24, "nu": 0.33, "rho_kg_m3": 1850,
+                        "mount": "edges", "n_modes": 1}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _pf = ((payload.get("value") or {}).get("modes") or [{}])[0].get("freq_hz", 0)
+        _pb = (payload.get("value") or {}).get("basis") or {}
+        check("polygon outline reduces to the rectangle on a square (SSSS 553.65 Hz)",
+              payload.get("status") == "ok" and abs(_pf - 553.65) < 1.0
+              and _pb.get("alpha_converged") is True, str(_pf))
+
+        r = handle({"jsonrpc": "2.0", "id": 852, "method": "tools/call",
+                    "params": {"name": "vibration_plate_outline", "arguments": {
+                        "ring_mm": _sq_ring, "thickness_mm": 1.6,
+                        "e_gpa": 24, "nu": 0.33, "rho_kg_m3": 1850,
+                        "mount": "clamped", "n_modes": 1, "poly_degree": 6}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _pf6 = ((payload.get("value") or {}).get("modes") or [{}])[0].get("freq_hz", 0)
+        _ws = " ".join(((payload.get("value") or {}).get("warnings") or []))
+        check("polygon degree 6 + clamped is wildly high AND says so",
+              payload.get("status") == "ok" and _pf6 > 1500.0
+              and "may contain no function" in _ws, str(_pf6))
+
+        r = handle({"jsonrpc": "2.0", "id": 853, "method": "tools/call",
+                    "params": {"name": "vibration_plate_outline", "arguments": {
+                        "ring_mm": [[0, 0], [100, 100], [100, 0], [0, 100]],
+                        "thickness_mm": 1.6}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("a self-crossing outline is refused, not solved",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "OUTLINE_INVALID",
+              str(payload.get("reason_code")))
+
         # --- cavity / electro-thermal. Again only closed forms and hand
         # arithmetic: f10 for a 100 mm plane at er=4.3 is c/(2 sqrt(er) * 0.1 m),
         # which is also the definition of a half guided wavelength.

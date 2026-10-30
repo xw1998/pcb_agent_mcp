@@ -31,6 +31,7 @@ from .calc import power as _power
 from .calc import spice as _spice
 from .calc import thermal as _thermal
 from .calc import vibration as _vib
+from .calc import vibration_poly as _vib_poly
 from .calc import reliability as _rel
 from .calc import cavity as _cavity
 from .calc import electrothermal as _electro
@@ -68,6 +69,22 @@ def _str(desc, enum=None, default=None):
 
 def _bool(desc, default=False):
     return {"type": "boolean", "description": desc, "default": default}
+
+def _ring_arg(v):
+    """Accept [[x, y], ...] or [{"x_mm":, "y_mm":}, ...] and return pairs.
+
+    Absent stays None so the callee can refuse on its own terms - an empty ring is
+    a different mistake from a missing one.
+    """
+    if v is None:
+        return None
+    out = []
+    for p in v:
+        if isinstance(p, dict):
+            out.append((p.get("x_mm"), p.get("y_mm")))
+        else:
+            out.append((p[0], p[1]))
+    return out
 
 def _parasitics_args(a):
     """Build the parasitics dict for the filter tools, or None when nothing was asked.
@@ -2970,7 +2987,14 @@ def _capabilities(_args):
                          "NOT done here: assembly compliance, random+shock combined, "
                          "and any nonlinear contact. The drop chain and the solder-joint "
                          "fatigue live in the 'reliability' layer below, and they reuse "
-                         "these solvers rather than re-deriving them",
+                         "these solvers rather than re-deriving them. "
+                         "vibration_plate_outline drops the rectangle: any polygon (the "
+                         "real board edge), per-edge ss/cc/free, point supports - interior "
+                         "integrals exact by Green's theorem on the ring, the boundary "
+                         "condition imposed weakly by a penalty whose strength is swept, "
+                         "so the flattest step of that sweep is a measured error bar. "
+                         "Holes are not meshed and stress is not computed on a polygonal "
+                         "outline",
             "reliability": "interface reliability at two time scales. Thermal cycling: "
                            "the shear strain range from the CTE mismatch over the joint "
                            "standoff, Engelmaier's strain-life form of Coffin-Manson, "
@@ -3097,7 +3121,8 @@ def _capabilities(_args):
             "thermal_transient", "thermal_heatsink", "thermal_convection",
             "board_ir_drop",
             "dfm_capability", "dfm_check",
-            "vibration_plate_modes", "vibration_plate_stress",
+            "vibration_plate_modes", "vibration_plate_outline",
+            "vibration_plate_stress",
             "vibration_random_response",
             "vibration_fatigue", "vibration_shock", "vibration_isolator",
             "vibration_shock_spectrum",
@@ -4885,6 +4910,62 @@ _tool(
 )
 
 _tool(
+    "vibration_plate_outline",
+    "Natural frequencies of a thin plate whose outline is an ARBITRARY polygon - the "
+    "real board edge instead of its bounding box. Same Kirchhoff model and the same "
+    "unit basis as vibration_plate_modes, but the interior integrals are done exactly "
+    "by Green's theorem on the polygon ring (no mesh, no quadrature error) and the "
+    "boundary condition is imposed weakly by a penalty integral, so any vertex list, "
+    "any number of edges, per-edge ss/cc/free, and point supports all work. The "
+    "penalty strength is swept and the alpha where the ladder flattens is reported "
+    "together with the step size there - that step IS the error bar, so a finely "
+    "faceted or re-entrant outline says so instead of quoting a fake 0.1 %. Verified "
+    "against the rectangular path on a square (ss -0.01 %, clamped +0.01 %, corners "
+    "-0.01 %, free mode 4 +0.001 %, cantilever -0.4 %) and within 1.1 % of the "
+    "circular plate eigenvalues. Holes are not meshed and stress is not computed on "
+    "a polygonal outline.",
+    {"type": "object", "properties": {
+        "ring_mm": {"type": "array", "description":
+                    "outline vertices in order, each [x_mm, y_mm] or "
+                    "{x_mm, y_mm}; any winding, any start, no repeated last point",
+                    "items": {}},
+        "thickness_mm": _num("plate thickness"),
+        "material": _str("preset: %s" % ", ".join(sorted(_vib.MATERIALS))),
+        "e_gpa": _num("Young's modulus in GPa (overrides the preset)"),
+        "nu": _num("Poisson ratio (overrides the preset)"),
+        "rho_kg_m3": _num("density in kg/m^3 (overrides the preset)"),
+        "mount": _str("edges/ssss, clamped/cccc, free, cantilever, corners; "
+                       "ignored when edges_bc is given", "ssss"),
+        "edges_bc": {"type": "array", "description":
+                     "one \"ss\"/\"cc\"/\"free\" per edge, in ring order - "
+                     "this is how a mixed mount is expressed", "items": {}},
+        "poly_degree": _num("monomial total degree 2..10 (8 by default; a clamped "
+                            "edge needs >= 8 before the basis can satisfy "
+                            "w = dw/dn = 0)", 8),
+        "n_modes": _num("how many modes to report (1..12)", 4),
+        "penalty_alphas": {"type": "array", "description":
+                           "explicit penalty ladder to sweep instead of (1e3..1e7)",
+                           "items": {}},
+        "probe_points": {"type": "array", "description":
+                         "list of {name, x_mm, y_mm} to sample each mode at",
+                         "items": {}},
+        "supports": {"type": "array", "description":
+                     "extra point supports, each [x_mm, y_mm] or {x_mm, y_mm}",
+                     "items": {}},
+    }, "required": ["ring_mm", "thickness_mm"]},
+    lambda a: _vib_poly.plate_modes_polygon(
+        _ring_arg(a.get("ring_mm")), a.get("thickness_mm"),
+        material=a.get("material"), e_gpa=a.get("e_gpa"), nu=a.get("nu"),
+        rho_kg_m3=a.get("rho_kg_m3"),
+        mount=(a.get("mount") or "ssss"), edges_bc=a.get("edges_bc"),
+        poly_degree=int(a.get("poly_degree") or 8),
+        n_modes=int(a.get("n_modes") or 4),
+        penalty_alphas=a.get("penalty_alphas"),
+        probe_points=a.get("probe_points"),
+        supports=_ring_arg(a.get("supports"))),
+)
+
+_tool(
     "vibration_plate_stress",
     "Surface stress in a vibrating plate, with a MEASURED error bar. Solves the same "
     "Rayleigh-Ritz eigenproblem at several polynomial degrees, takes the surface "
@@ -5142,10 +5223,12 @@ _tool(
     "board_vibration",
     "Natural frequencies of THIS board from its own outline and stackup, with every "
     "component sampled against the first mode shape so you get a ranked list of which "
-    "references sit on an antinode. Uses the outline bounding box as the plate, so a "
-    "non-rectangular board comes out SOFTER (f1 biased low) - the fill fraction is "
-    "reported so you can see how much. Component mass and copper stiffening are not "
-    "modelled.",
+    "references sit on an antinode. The primary plate is the outline bounding box, "
+    "so nothing that already worked changes; when the outline fills less than 99 % of "
+    "that box the same plate is ALSO solved on the real polygon and comes back as "
+    "`plate_on_outline` with its ratio to the bbox number and its own measured "
+    "penalty-ladder spread - the bbox bias is then a number, not a caveat. Component "
+    "mass and copper stiffening are not modelled in either.",
     {"type": "object", "properties": dict({
         "mount": _str("edges/ssss, clamped/cccc, free, cantilever, corners", "corners"),
         "material": _str("plate material preset", "fr4"),
