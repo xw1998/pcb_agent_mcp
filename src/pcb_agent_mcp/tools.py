@@ -3299,8 +3299,11 @@ def _capabilities(_args):
                               "the matrix diagonal and the steady solve is exact; the "
                               "transient is backward Euler. Runaway is refused before the "
                               "solve when a diagonal goes non-positive, and a field that "
-                              "comes out below ambient is refused as non-physical. DC only, "
-                              "no skin effect, no AC loss",
+                              "comes out below ambient is refused as non-physical. "
+                              "copper_pours (a plane, a pour, a very wide track) is added "
+                              "as an exact per-cell area overlap into the sheet "
+                              "conductance, so copper has to be WHERE the heat is to "
+                              "help. DC only, no skin effect, no AC loss",
             "vibration": "mechanical vibration: natural frequencies and mode shapes of "
                          "a thin plate (Rayleigh-Ritz, monomial basis, exact for SSSS "
                          "and CCCC and needs no mode table), single-mode random response "
@@ -3712,15 +3715,20 @@ def _capabilities(_args):
             "does: temperature sweeps (one temperature per run), distortion, Monte "
             "Carlo; the builtin solver also uses dense LU and refuses above ~400 "
             "unknowns",
-            "Electrothermal coupling stops at a 2-D laminate plate: "
+            "Electrothermal coupling stops at a 2-D plate: "
             "electrothermal_trace / electrothermal_conductor close the loop against one "
-            "caller-supplied Rth; board_electrothermal closes it against a 2-D field, "
-            "but that field spreads heat through the laminate k the caller gives, NOT "
-            "through the real copper pours and planes. Not done: 3-D, radiation, "
-            "thermal vias, component thermal mass and contact resistance, AC loss "
-            "(skin/proximity), device self-heating inside sim_spice, and reading the "
-            "conductors straight off a board file - board_electrothermal takes geometry, "
-            "it does not open the .kicad_pcb for you",
+            "caller-supplied Rth; board_electrothermal closes it against a 2-D field. "
+            "That field spreads heat through the laminate k you pass PLUS whatever "
+            "copper you list in copper_pours, which is smeared into one sheet "
+            "conductance per cell (area fraction x thickness x layers x k_cu, faces by "
+            "harmonic mean) - so the copper shape inside a cell, the copper-to-laminate "
+            "interface and any copper you did not list are still missing, and that "
+            "smearing is in-plane only (the vertical path stays inside h). Not done: "
+            "3-D, radiation, thermal vias, component thermal mass and contact "
+            "resistance, AC loss (skin/proximity), device self-heating inside "
+            "sim_spice, reading the conductors or the zones straight off a board file - "
+            "board_electrothermal takes geometry, it does not open the .kicad_pcb for "
+            "you",
             "Surge and fusing beyond one pulse: fusing_current answers the single-pulse "
             "adiabatic question (Onderdonk 1928) and states its four one-sided "
             "assumptions (no cooling, no latent heat, equal-area rectangle, no skin "
@@ -5850,9 +5858,12 @@ _tool(
     "rho(T) is linear, alpha*T sits on the matrix diagonal and the steady problem is "
     "EXACTLY linear (SOR); the transient is backward Euler (unconditionally stable). "
     "Runaway is refused before the solve when any diagonal goes non-positive - on a "
-    "uniform plate that reduces to the 1-D rule P*alpha < 2hA. Spreading is through the "
-    "laminate k you pass, NOT through the real copper pours, so a design with a plane "
-    "under the trace runs cooler than this says.",
+    "uniform plate that reduces to the 1-D rule P*alpha < 2hA. Spreading is through "
+    "the laminate k you pass, plus any copper you list in copper_pours (a plane, a "
+    "pour, a wide track): each rectangle's exact area overlap with a cell becomes that "
+    "cell's sheet conductance and the faces take the harmonic mean, so copper only "
+    "helps where it actually is. A plane you did not list still reads hotter than the "
+    "real board.",
     {"type": "object", "properties": {
         "width_mm": _num("plate width"),
         "height_mm": _num("plate height"),
@@ -5877,6 +5888,16 @@ _tool(
         "transient": {"type": "object", "description":
             "optional: {t_end_s, points, cp_j_kg_k, rho_kg_m3, initial_c?}, "
             "FR4 is about cp 1150 J/(kg*K), rho 1850 kg/m^3"},
+        "copper_pours": {"type": "array", "items": {"type": "object"},
+            "description":
+            "optional: the copper that actually spreads the heat - a plane, a "
+            "pour, a very wide track. Each {x1_mm,y1_mm,x2_mm,y2_mm,thickness_um,"
+            "layers?}: exact area overlap with each cell becomes that cell's sheet "
+            "conductance (k_lam*t_board + frac*t_cu*layers*k_cu), faces use the "
+            "harmonic mean. Without it the medium is the laminate k alone, which "
+            "is why a board with a plane under the hot part reads hotter than it "
+            "is"},
+        "k_copper_w_mk": _num("copper conductivity used by copper_pours", 400.0),
     }, "required": ["width_mm", "height_mm", "thickness_mm", "k_w_mk", "h_w_m2k"]},
     lambda a: _electro.board_electrothermal(
         a.get("width_mm"), a.get("height_mm"), a.get("thickness_mm"),
@@ -5884,6 +5905,8 @@ _tool(
         t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
         cell_mm=a.get("cell_mm"), edge_temp_c=a.get("edge_temp_c"),
         uniform_power_w=a.get("uniform_power_w"),
+        copper_pours=a.get("copper_pours"),
+        k_copper_w_mk=a.get("k_copper_w_mk"),
         alpha_per_k=(a["alpha_per_k"] if a.get("alpha_per_k") is not None else 0.00393),
         rho20_ohm_m=(a["rho20_ohm_m"] if a.get("rho20_ohm_m") is not None else 1.724e-8),
         tol_k=(a["tol_k"] if a.get("tol_k") is not None else 1e-4),

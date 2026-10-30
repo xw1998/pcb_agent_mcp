@@ -754,6 +754,69 @@ def selftest():
               and payload.get("reason_code") == "JOB_NOT_FOUND",
               str(payload.get("reason_code")))
 
+        # --- copper as the heat spreader. The anchor is hand arithmetic: one
+        # 35 um layer at 400 W/(m*K) on a 1.6 mm board adds
+        # 35e-6/1.6e-3*400 = 8.75 W/(m*K) to the sheet, so a pour that covers
+        # the whole board must equal running with k = 0.3 + 8.75 = 9.05.
+        _et = {"width_mm": 100, "height_mm": 80, "thickness_mm": 1.6,
+               "k_w_mk": 0.3, "h_w_m2k": 10, "uniform_power_w": 3.0,
+               "cell_mm": 4.0}
+        r = handle({"jsonrpc": "2.0", "id": 858, "method": "tools/call",
+                    "params": {"name": "board_electrothermal", "arguments":
+                               dict(_et, copper_pours=[
+                                   {"x1_mm": 0, "y1_mm": 0, "x2_mm": 100,
+                                    "y2_mm": 80, "thickness_um": 35}])}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _cs = payload.get("copper_spreading") or {}
+        r2 = handle({"jsonrpc": "2.0", "id": 858, "method": "tools/call",
+                     "params": {"name": "board_electrothermal",
+                                "arguments": dict(_et, k_w_mk=9.05)}})
+        _direct = json.loads(r2["result"]["content"][0]["text"])
+        check("a full-board pour equals the same k passed as a scalar (9.05)",
+              payload.get("status") == "ok"
+              and abs((_cs.get("k_eff_w_mk") or {}).get("area_avg", 0) - 9.05)
+              < 1e-9
+              and abs(payload.get("t_max_c", 0) - _direct.get("t_max_c", -1))
+              < 1e-6,
+              "%s vs %s" % (payload.get("t_max_c"), _direct.get("t_max_c")))
+
+        # The copper has to be WHERE THE HEAT IS: same area, same thickness,
+        # moved off the trace, must stop mattering.
+        _trace = {"x1_mm": 10, "y1_mm": 40, "x2_mm": 90, "y2_mm": 40,
+                  "width_mm": 3.0, "thickness_um": 35.0, "current_a": 4.0}
+        _base = {"width_mm": 100, "height_mm": 80, "thickness_mm": 1.6,
+                 "k_w_mk": 0.3, "h_w_m2k": 10, "cell_mm": 2.0,
+                 "conductors": [_trace]}
+        def _tmax(pours):
+            args = dict(_base)
+            if pours is not None:
+                args["copper_pours"] = pours
+            rr = handle({"jsonrpc": "2.0", "id": 859, "method": "tools/call",
+                         "params": {"name": "board_electrothermal",
+                                    "arguments": args}})
+            return json.loads(rr["result"]["content"][0]["text"]).get("t_max_c")
+        _bare = _tmax(None)
+        _under = _tmax([{"x1_mm": 0, "y1_mm": 35, "x2_mm": 100, "y2_mm": 45,
+                         "thickness_um": 35}])
+        _away = _tmax([{"x1_mm": 0, "y1_mm": 0, "x2_mm": 100, "y2_mm": 10,
+                        "thickness_um": 35}])
+        check("copper under the hot trace cools it; the same copper elsewhere "
+              "does not",
+              _bare is not None and _under is not None and _away is not None
+              and _bare - _under > 5.0 and 0.0 <= _bare - _away < 0.1,
+              "bare %s under %s away %s" % (_bare, _under, _away))
+
+        r = handle({"jsonrpc": "2.0", "id": 860, "method": "tools/call",
+                    "params": {"name": "board_electrothermal", "arguments":
+                               dict(_base, copper_pours=[
+                                   {"x1_mm": 0, "y1_mm": 0, "x2_mm": 200,
+                                    "y2_mm": 80, "thickness_um": 35}])}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("a pour that leaves the board is refused, not clipped",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "ARG_RANGE",
+              str(payload.get("reason_code")))
+
         # --- cavity / electro-thermal. Again only closed forms and hand
         # arithmetic: f10 for a 100 mm plane at er=4.3 is c/(2 sqrt(er) * 0.1 m),
         # which is also the definition of a half guided wavelength.

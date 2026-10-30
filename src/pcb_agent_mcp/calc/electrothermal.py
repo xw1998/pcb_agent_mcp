@@ -31,6 +31,9 @@ from .result import ok, err
 RHO20_CU = 1.724e-8      # ohm*m, IACS copper at 20 C
 ALPHA_CU = 0.00393       # 1/K, linear region 0..100 C
 T20 = 20.0               # C, the reference temperature of both constants
+K_CU = 400.0             # W/(m*K), bulk copper. 401 at 300 K, 393 at 373 K;
+                         # this module is a screening estimate, so one number in
+                         # the middle of that range, stated rather than tuned.
 
 
 def _num(x):
@@ -367,9 +370,119 @@ def _sor_plate(nx, ny, gx, gy, hc, ta, qc, qs, capdt, prev, edge,
             return temp, it, dmax, True, diag_min
     return temp, it, dmax, False, diag_min
 
+def _rect_cover(nx, ny, dx, dy, x1, y1, x2, y2):
+    """Per-cell area overlap fraction of an axis-aligned rectangle (mm in).
+
+    Exact area overlap, not "cell centre inside": a pour edge that falls in the
+    middle of a cell has to show up as 0.5 in that cell, otherwise the sheet
+    conductance of a partly covered cell is a coin flip on where the grid lands.
+    """
+    cov = [[0.0] * ny for _ in range(nx)]
+    xlo, xhi = (x1, x2) if x1 <= x2 else (x2, x1)
+    ylo, yhi = (y1, y2) if y1 <= y2 else (y2, y1)
+    cw = dx * 1e3
+    ch = dy * 1e3
+    i0 = max(0, int(math.floor(xlo / cw)))
+    i1 = min(nx - 1, int(math.floor(xhi / cw)))
+    j0 = max(0, int(math.floor(ylo / ch)))
+    j1 = min(ny - 1, int(math.floor(yhi / ch)))
+    for i in range(i0, i1 + 1):
+        ox = min(xhi, (i + 1) * cw) - max(xlo, i * cw)
+        if ox <= 0.0:
+            continue
+        for j in range(j0, j1 + 1):
+            oy = min(yhi, (j + 1) * ch) - max(ylo, j * ch)
+            if oy <= 0.0:
+                continue
+            cov[i][j] = (ox / cw) * (oy / ch)
+    return cov
+
+def _sor_plate_map(nx, ny, fx, fy, hc, ta, qc, qs, capdt, prev, edge,
+                   tol_k, max_iter):
+    """Same SOR as `_sor_plate`, but the face conductance varies per cell.
+
+    `fx[i][j]` is the conductance (W/K) of the face between (i, j) and
+    (i+1, j); `fy[i][j]` between (i, j) and (i, j+1). Kept as a separate
+    function on purpose: the uniform-k path must stay bit-for-bit what it was,
+    and a per-cell `isinstance` inside the innermost loop would tax every sweep
+    for a feature that is usually off.
+    """
+    temp = [row[:] for row in prev]
+    fixed = edge is not None
+    if fixed:
+        for i in range(nx):
+            temp[i][0] = edge
+            temp[i][ny - 1] = edge
+        for j in range(ny):
+            temp[0][j] = edge
+            temp[nx - 1][j] = edge
+    omega = 1.85
+    it = 0
+    dmax = float("inf")
+    diag_min = float("inf")
+    while it < max_iter:
+        it += 1
+        dmax = 0.0
+        for i in range(nx):
+            for j in range(ny):
+                if fixed and (i == 0 or j == 0 or i == nx - 1 or j == ny - 1):
+                    continue
+                num = hc * ta + qc[i][j] + capdt[i][j] * prev[i][j]
+                den = hc + capdt[i][j] - qs[i][j]
+                if i > 0:
+                    g = fx[i - 1][j]
+                    num += g * temp[i - 1][j]
+                    den += g
+                if i < nx - 1:
+                    g = fx[i][j]
+                    num += g * temp[i + 1][j]
+                    den += g
+                if j > 0:
+                    g = fy[i][j - 1]
+                    num += g * temp[i][j - 1]
+                    den += g
+                if j < ny - 1:
+                    g = fy[i][j]
+                    num += g * temp[i][j + 1]
+                    den += g
+                if den < diag_min:
+                    diag_min = den
+                new = num / den
+                old = temp[i][j]
+                dd = omega * (new - old)
+                temp[i][j] = old + dd
+                ad = abs(dd)
+                if ad > dmax:
+                    dmax = ad
+        if dmax < tol_k:
+            return temp, it, dmax, True, diag_min
+    return temp, it, dmax, False, diag_min
+
+def _sheet_faces(nx, ny, dx, dy, S):
+    """Face conductances (W/K) from a per-cell sheet conductance S (W/K).
+
+    Harmonic mean across the face = two half-cells in series, which is the
+    finite-volume answer for a material discontinuity. With a uniform S it
+    reduces to S*dy/dx, i.e. exactly the uniform-k operator.
+    """
+    fx = [[0.0] * ny for _ in range(nx - 1)]
+    fy = [[0.0] * (ny - 1) for _ in range(nx)]
+    for i in range(nx - 1):
+        for j in range(ny):
+            a = S[i][j]
+            b = S[i + 1][j]
+            fx[i][j] = (2.0 * a * b / (a + b)) * dy / dx if (a + b) > 0 else 0.0
+    for i in range(nx):
+        for j in range(ny - 1):
+            a = S[i][j]
+            b = S[i][j + 1]
+            fy[i][j] = (2.0 * a * b / (a + b)) * dx / dy if (a + b) > 0 else 0.0
+    return fx, fy
+
 def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
                          conductors, t_ambient_c=25.0, cell_mm=None,
                          edge_temp_c=None, uniform_power_w=None,
+                         copper_pours=None, k_copper_w_mk=None,
                          alpha_per_k=ALPHA_CU, rho20_ohm_m=RHO20_CU,
                          tol_k=1e-4, max_iter=200, sor_max_iter=60000,
                          max_cells=20000, transient=None):
@@ -399,6 +512,23 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
 
     `transient` = {"t_end_s", "points", "cp_j_kg_k", "rho_kg_m3",
     "initial_c" (optional)} steps the same field with backward Euler.
+
+    `copper_pours` (optional) is how a plane or a pour gets into the answer.
+    Without it the spreading medium is the laminate k alone, which understates
+    every board that has copper under the hot part. Each pour is
+
+        {"x1_mm", "y1_mm", "x2_mm", "y2_mm", "thickness_um", "layers" (default 1)}
+
+    and is turned into a per-cell sheet conductance
+
+        S[i][j] = k_laminate*t_board + sum_over_pours(frac[i][j]*t_cu*N)*k_cu
+
+    where frac is the EXACT area overlap of the rectangle with that cell (a pour
+    edge in the middle of a cell is 0.5, not 0 or 1). Faces then use the
+    harmonic mean of the two cell conductances. This is the standard smeared-
+    copper model: it is *in-plane* sheet conduction only, so it adds copper
+    where copper actually is, and it says nothing about the vertical path (that
+    stays inside h). `k_copper_w_mk` defaults to K_CU = 400.
     """
     W = _num(width_mm)
     H = _num(height_mm)
@@ -467,6 +597,81 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     gy = gp * dx / dy
     ac = dx * dy
     hc = 2.0 * h * ac
+
+    # ---- optional copper: a per-cell sheet conductance, off unless pours given
+    pours = []
+    t_cu = None
+    kcu = None
+    tof_cu = 0.0
+    if copper_pours is not None:
+        if not isinstance(copper_pours, (list, tuple)):
+            return err("copper_pours must be a list of rectangles",
+                       "ARG_INVALID",
+                       hint='each pour is {"x1_mm","y1_mm","x2_mm","y2_mm",'
+                            '"thickness_um","layers"?}')
+        kcu = K_CU if k_copper_w_mk is None else _num(k_copper_w_mk)
+        if kcu is None or kcu <= 0:
+            return err("k_copper_w_mk must be > 0", "ARG_RANGE")
+        t_cu = [[0.0] * ny for _ in range(nx)]
+        covered_cells = set()
+        for idx, pz in enumerate(copper_pours):
+            if not isinstance(pz, dict):
+                return err("copper pour #%d is not an object" % idx,
+                           "ARG_INVALID")
+            try:
+                px1 = float(pz["x1_mm"]); py1 = float(pz["y1_mm"])
+                px2 = float(pz["x2_mm"]); py2 = float(pz["y2_mm"])
+                ptu = float(pz["thickness_um"])
+            except (KeyError, TypeError, ValueError):
+                return err("copper pour #%d needs numeric x1_mm, y1_mm, x2_mm, "
+                           "y2_mm, thickness_um" % idx, "ARG_INVALID")
+            pl = pz.get("layers", 1)
+            try:
+                pl = int(pl)
+            except (TypeError, ValueError):
+                return err("copper pour #%d: layers must be an integer" % idx,
+                           "ARG_INVALID")
+            if pl < 1:
+                return err("copper pour #%d: layers must be >= 1" % idx,
+                           "ARG_RANGE")
+            if ptu < 0:
+                return err("copper pour #%d: thickness_um must be >= 0 "
+                           "(0 is allowed and must change nothing)" % idx,
+                           "ARG_RANGE")
+            if not (0.0 <= px1 <= W and 0.0 <= px2 <= W and
+                    0.0 <= py1 <= H and 0.0 <= py2 <= H):
+                return err("copper pour #%d runs outside the plate %.6g x %.6g mm"
+                           % (idx, W, H), "ARG_RANGE")
+            if abs(px2 - px1) <= 0.0 or abs(py2 - py1) <= 0.0:
+                return err("copper pour #%d has zero area" % idx, "ARG_RANGE")
+            cov = _rect_cover(nx, ny, dx, dy, px1, py1, px2, py2)
+            cells = 0
+            area = 0.0
+            t_here = ptu * 1e-6 * pl
+            for i in range(nx):
+                for j in range(ny):
+                    f = cov[i][j]
+                    if f <= 0.0:
+                        continue
+                    t_cu[i][j] += f * t_here
+                    cells += 1
+                    area += f
+                    covered_cells.add((i, j))
+            if cells <= 0:
+                return err("copper pour #%d is thinner than the grid: no cell is "
+                           "overlapped at all. Lower cell_mm." % idx, "ARG_RANGE")
+            tof_cu += t_here
+            pours.append({"index": idx,
+                          "x1_mm": _sig(px1), "y1_mm": _sig(py1),
+                          "x2_mm": _sig(px2), "y2_mm": _sig(py2),
+                          "thickness_um": _sig(ptu), "layers": pl,
+                          "cells": cells,
+                          "area_fraction_of_board": _sig(area / (nx * ny))})
+    S = None
+    fx = fy = None
+    if pours:
+        S = [[gp + kcu * t_cu[i][j] for j in range(ny)] for i in range(nx)]
+        fx, fy = _sheet_faces(nx, ny, dx, dy, S)
 
     # q_ref = the I^2R each cell would dissipate at 20 C (W)
     q_ref = [[0.0] * ny for _ in range(nx)]
@@ -625,13 +830,20 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
         guess = ta + total_p20 / (hc * nx * ny)
         field = [[guess] * ny for _ in range(nx)]
 
+    if pours:
+        def _solve(prev_):
+            return _sor_plate_map(nx, ny, fx, fy, hc, ta, q_const, q_slope,
+                                  capdt, prev_, edge, tol_k, sor_max_iter)
+    else:
+        def _solve(prev_):
+            return _sor_plate(nx, ny, gx, gy, hc, ta, q_const, q_slope,
+                              capdt, prev_, edge, tol_k, sor_max_iter)
+
     iters_total = 0
     prev = field
     final = None
     for s in range(steps):
-        cur_field, it, dmax, conv, diag_min = _sor_plate(
-            nx, ny, gx, gy, hc, ta, q_const, q_slope, capdt, prev, edge,
-            tol_k, sor_max_iter)
+        cur_field, it, dmax, conv, diag_min = _solve(prev)
         iters_total += it
         if diag_min <= 0.0:
             return err(
@@ -698,13 +910,17 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
                     continue
                 sv = 0.0
                 if i > 0:
-                    sv += gx * (temp[i][j] - temp[i - 1][j])
+                    sv += (fx[i - 1][j] if pours else gx) * (
+                        temp[i][j] - temp[i - 1][j])
                 if i < nx - 1:
-                    sv += gx * (temp[i][j] - temp[i + 1][j])
+                    sv += (fx[i][j] if pours else gx) * (
+                        temp[i][j] - temp[i + 1][j])
                 if j > 0:
-                    sv += gy * (temp[i][j] - temp[i][j - 1])
+                    sv += (fy[i][j - 1] if pours else gy) * (
+                        temp[i][j] - temp[i][j - 1])
                 if j < ny - 1:
-                    sv += gy * (temp[i][j] - temp[i][j + 1])
+                    sv += (fy[i][j] if pours else gy) * (
+                        temp[i][j] - temp[i][j + 1])
                 out_edge -= sv
     p_in = 0.0
     for i in range(nx):
@@ -748,6 +964,46 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
             line += " .:-=+*#%@"[max(0, min(9, int(f * 9.999)))]
         rows.append(line)
 
+    nc_list = list(_PLATE_NOT_COMPUTED)
+    copper_report = None
+    if pours:
+        k_eff = [[(gp + kcu * t_cu[i][j]) / t_m for j in range(ny)]
+                 for i in range(nx)]
+        flat = [v for row in k_eff for v in row]
+        k_avg = sum(flat) / len(flat)
+        ratio_max = max(flat) / k if k > 0 else None
+        nc_list[0] = ("the copper is smeared into ONE in-plane sheet conductance "
+                      "per cell (area fraction x thickness x layers x k_cu): the "
+                      "shape inside a cell, the copper-to-laminate interface, "
+                      "thermal vias and any copper you did not list are not "
+                      "resolved")
+        copper_report = {
+            "modelled": True,
+            "k_copper_w_mk": _sig(kcu),
+            "pours": pours,
+            "total_copper_thickness_um": _sig(tof_cu * 1e6),
+            "k_eff_w_mk": {"area_avg": _sig(k_avg),
+                           "min": _sig(min(flat)),
+                           "max": _sig(max(flat))},
+            "k_eff_over_laminate_max": _sig(ratio_max),
+            "sheet_conductance_w_per_k": {
+                "laminate_only": _sig(gp),
+                "area_avg": _sig(gp + kcu * sum(sum(r) for r in t_cu) /
+                                 float(nx * ny))},
+            "faces": "harmonic mean of the two cell sheet conductances",
+            "assumption": ("in-plane sheet conduction only; the vertical path "
+                           "stays inside h, so copper does not change how much "
+                           "heat leaves the two surfaces, only how far it "
+                           "spreads before it leaves"),
+        }
+    else:
+        copper_report = {
+            "modelled": False,
+            "why": ("no copper_pours given, so the spreading medium is the "
+                    "laminate k alone - a board with a plane under the hot part "
+                    "is cooler than this says"),
+        }
+
     extra = {
         "t_max_c": round(tmax, 6),
         "t_min_c": round(tmin, 6),
@@ -769,7 +1025,8 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
         "effective_rth_k_per_w": _sig((tmax - ta) / p_in) if p_in else None,
         "map": rows,
         "map_legend": "row 0 is y=0; '@' is the hottest cell",
-        "not_computed": list(_PLATE_NOT_COMPUTED),
+        "copper_spreading": copper_report,
+        "not_computed": nc_list,
         "authoritative": False,
     }
     if tr is not None:
@@ -789,10 +1046,15 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
                "delta_t_max_k": round(tmax - ta, 6)},
               "C", model,
               _BASIS_TRACE,
-              "as good as k and h, and the hot spot is grid dependent: compare "
-              "two layouts only at the same cell_mm. The spreading medium here is "
-              "the laminate k you passed, not the real copper pours, so a design "
-              "with a plane under the trace is cooler than this says",
+              ("as good as k and h, and the hot spot is grid dependent: compare "
+               "two layouts only at the same cell_mm. The spreading medium is "
+               "your k plus the pours you listed, smeared per cell; a plane you "
+               "did not list is still missing"
+               if pours else
+               "as good as k and h, and the hot spot is grid dependent: compare "
+               "two layouts only at the same cell_mm. The spreading medium here "
+               "is the laminate k you passed, not the real copper pours, so a "
+               "design with a plane under the trace is cooler than this says"),
               {"rth_source": "emerging from the 2-D field, not supplied",
                "copper_layers": "parallel copper assumed stitched at both ends",
                "heat_capacity": ("plate volume only (%s)"

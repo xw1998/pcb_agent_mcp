@@ -138,4 +138,6 @@
   边界是**只三个 op、不生成参数、不知道方法可写**：名字与接收者来自应用的 `doc.api`（含 `callPath`，绝不把类名小写化），参数是调用者的，效果归 probe；无匹配 / 两个同等匹配 / 接收者解析不出分别回 `SNIPPET_NO_API` / `SNIPPET_AMBIGUOUS` / `SNIPPET_NO_RECEIVER`，`verified_against_app` 恒 false。
 - `46` → `lceda_steps.py`（`make_script` / `save` / `load` / `replay`）、`jobs.py`（`submit` / `get` / `wait` / `list` / `cancel`）、`fidelity/engine.py` 的 `DRC_TIMEOUT_S=900`、`tools.py` 的 `lceda_step_record` / `lceda_step_replay` / `board_job` 与 `board_drc(background=true)`，2 个新测试文件（`tests/test_lceda_steps.py` 23 例 + `tests/test_jobs.py` 15 例）与 2 条 selftest（856/857）；
   边界是**复放只比每步自己的返回值**（`matches_recording` 三态，缺记录不算通过，幂等性恒 `unknown`，没有状态前置）、**作业只在内存里**（不持久、不续跑、取消不杀子进程），运行中的作业没有结果，也没有任何近似。
-- 代码里的每条"拒绝回答"分支，都能在这四十六篇里找到对应的判据来源。
+- `47` → `calc/electrothermal.py` 的 `K_CU` / `_rect_cover`（精确面积重叠）/ `_sheet_faces`（调和平均）/ `_sor_plate_map`，`board_electrothermal(..., copper_pours, k_copper_w_mk)` 与答案里的 `copper_spreading`，`tools.py` 的两项 schema 与能力自述改口，1 个新测试文件（`tests/test_electrothermal_pours.py` 26 例）与 3 条 selftest（858/859/860）；
+  边界是**面内片电导的涂抹**：铜按「面积重叠 × 厚度 × 层数 × k_cu」并进每格的 S、面上取调和平均，竖向路径仍在 `h` 里；单元内铜形状、铜-层压板界面热阻、热过孔、以及**没有列进 `copper_pours` 的铜**（不会自己去读 zone）都不算 —— 判据是「整板满铺 = 等效标量 k」与「同面积换位置就失效」（−6.7 K vs −0.002 K）。
+- 代码里的每条"拒绝回答"分支，都能在这四十七篇里找到对应的判据来源。
