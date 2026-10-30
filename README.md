@@ -99,7 +99,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 - **振动**：薄板 Kirchhoff、单模态；`board_vibration` 的主答案仍是板框 bbox（非矩形会**偏软**，回 `outline_fill_fraction_of_bbox`），0.0.42 起另给 `plate_on_outline`＝**真实外轮廓**的解（L 形实测差 3.13×）；应力是三个极值，不是场。
 - **轮廓振动**：只解外轮廓（孔不网格化），`alpha_spread_pct` 是罚阶梯最平一档的步长（>3 % 只作指示），凹角与高边数**经常不收敛**，`modes[i].physical=false` 的阶是伪刚度不是模态。
 - **平面谐振**：只给模频与 λ_g 比例，另给**导体 + 介质损耗**的 Q 上界（`cavity_plane_q`：`Qc = h/δs`、`Qd = 1/tanδ`，两项之和是 Q 的上界）；辐射 Q、表面粗糙度、真实开边失谐、平面阻抗都不算；「要不要紧」交给你用 `pdn_plane_modes` 的峰值对阻抗目标。
-- **电热**：只闭合「铜 `R(T)` ↔ 一个集中 `Rth`」；2-D 板场的散热介质是**你给的层压板 k + 你列进 `copper_pours` 的铜**（0.0.44：精确面积重叠 → 每格一个面内片电导，面上取调和平均）。铜只帮忙它**在的地方**（同面积条带压在走线上降 6.7 K，挪到无热区降 0.002 K）；但单元内的铜形状、铜-层压板界面热阻、热过孔、**没列进来的铜**（不会自己去读 zone）都不算，且竖向路径仍在 `h` 里。
+- **电热**：只闭合「铜 `R(T)` ↔ 一个集中 `Rth`」；2-D 板场的散热介质是**你给的层压板 k + 你列进 `copper_pours` 的铜**（0.0.44：精确面积重叠 → 每格一个面内片电导，面上取调和平均）。铜只帮忙它**在的地方**（同面积条带压在走线上降 6.7 K，挪到无热区降 0.002 K）。0.0.45 又补了两条真缺口：`emissivity` 打开**双面辐射**（`ε·σ·(T⁴−Ta⁴)` 精确改写成 `h_rad·(T−Ta)`，`h_rad` 滞后一迭代、整场重解到不动点；ε=0.9 降 2.72 K、辐射占散热 35.7 %，ε=0 逐位等于不传），`thermal_vias` 加**环形截面铜管到指定 sink**（`k_cu·π(r²−r_in²)/span`，落在中心所在的那一格，点载荷；同数量挪到无热区只动 1.9e-4 K）。仍然不算：3-D、层间内部辐射、温度相关发射率、元件热质量与接触热阻、**没列进来的铜**（不会自己去读 zone）、中段镀层减薄与两端铺开；竖向路径仍在 `h` 里。
 - **滤波器**：是**合成器**不是仿真器——给几何与电学零点，不给 EM 结果、色散、版图；集总带通的蒙特卡洛是 uniform 独立（最坏情况）。
 - **布线**：`routed` 不等于 DRC 干净；拥塞协商默认关（一块板 +3 网 / +61% 时间）；默认拓扑 `mst` 报的是 Manhattan 树干长。
 - **立创**：单位**恒 mil**（标签只是显示单位）；焊盘位置来自库封装推导（54.1% 命中）。
@@ -108,9 +108,9 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.44
-python run_server.py --selftest         # 156/156
-python -m unittest discover -s tests    # 2116 例（实测 1014 s，约 17 分钟）
+python run_server.py --version          # 0.0.45
+python run_server.py --selftest         # 160/160
+python -m unittest discover -s tests    # 2155 例（实测 785 s，约 13 分钟）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -332,7 +332,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `cavity_via_fence` | 过孔围栏：`pitch/λ_g`、每间距电长度、给定判据后的 `pass/fail` | **判据必须由调用方给**（λ_g/20 与 λ_g/10 差 2 倍，都不内置）；不给就 `indeterminate` 且不反推间距 |
 | `electrothermal_trace` | 走线自洽温升：R(T) → I²R → ΔT → R(T) 的定点迭代 + 精确失控判据 `dP/dT·Rth < 1` | `rth_c_per_w` **必填**；G≥1 回 `THERMAL_RUNAWAY` 而不是最后一次迭代；只算直流 |
 | `electrothermal_conductor` | 同一环，R₂₀ 由调用方给（过孔桶壁 / 分段串联 / 分流器 / 针脚） | 回 R_hot、电阻增幅、迭代次数、稳定性余量 `1−G`；Rth 仍是调用方的 |
-| `board_electrothermal` | 板级 **2-D** 电热：均匀网格 + SOR，`rho(T)` 线性 ⇒ `alpha*T` 落在矩阵对角线上，稳态是**严格线性**的一次求解；瞬态后向 Euler；失控在**求解前**按对角判 | `h_w_m2k` **必填**；只铺介质 k，不穿真实铺铜/热过孔；DC，无趋肤/邻近损耗；不替你开 `.kicad_pcb` |
+| `board_electrothermal` | 板级 **2-D** 电热：均匀网格 + SOR，`rho(T)` 线性 ⇒ `alpha*T` 落在矩阵对角线上，稳态是**严格线性**的一次求解；瞬态后向 Euler；失控在**求解前**按对角判；可选 `copper_pours`（面内片电导）、`emissivity`（双面辐射，`h_rad` 外层不动点）、`thermal_vias`（到 sink 的铜管） | `h_w_m2k` **必填**；真实铺铜要自己列（不会读 zone），过孔是点载荷（网格相关）；DC，无趋肤/邻近损耗；不替你开 `.kicad_pcb` |
 | `filter_prototype` | 原型 g 值（Chebyshev / Butterworth），滤波器设计的起点 | Butterworth 传非零 ripple 直接 `ARG_CONFLICT`；order ∉ [1,20] 拒 |
 | `filter_lumped_bandpass` | LP→BP：每段 L/C + 两路 S21（ABCD 级联 vs 闭式 `1/(1+ε²Tn²)`）+ 可选有限 Q 与一阶寄生（L 并 cp / C 串 esl）+ 功率审计 | 两路差 >0.02 dB **拒答**（`INTERNAL_CHECK_FAILED`）；偶数阶不是 50Ω 网络——串联起始 + `1:√g(n+1)` 理想变压器，写在 `value.termination`；损耗是每段一只电阻（`ω0L/Q`、`ω0C/G`），不是介质/导体物理：无趋肤、无介质损耗、无温漂 |
 | `filter_mc_yield` | 容差良率：每个 L/C 各自独立抽样，跑同一条 ABCD 级联，带二项 95 % 半宽 | 只有 uniform/gaussian **独立**分布（无相关性、无批次偏移、无老化）⇒ 最坏情况；零容差报**退化**（构造上 100 %）；标称已不达标时明说，不给容差良率 |
@@ -349,9 +349,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.44
-python run_server.py --selftest      # 协议级自检，156/156（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问）
-python -m unittest discover -s tests # 2116 个用例（实测 1014 s，约 17 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.45
+python run_server.py --selftest      # 协议级自检，160/160（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问）
+python -m unittest discover -s tests # 2155 个用例（实测 785 s，约 13 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -703,9 +703,9 @@ MCP 客户端配置（stdio）：
   关键是**把 q 的温升斜率放到对角线上**（稳态严格线性、瞬态是后向 Euler），并且
   **失控在求解之前判**（任一格 `hc + capdt − q_ref·α <= 0` ⇒ `THERMAL_RUNAWAY`）。
   金标 50×50×1.6 mm / k=0.3 / h=10 / 2 W / cell 2 mm ⇒ 73.393487 ℃（闭式 73.39345）。
-  仍然没有的：3-D、辐射、热过孔、组件热容与接触热阻、交流损耗（趋肤/邻近）、
+  仍然没有的：3-D、层间内部辐射、温度相关发射率、组件热容与接触热阻、交流损耗（趋肤/邻近）、
   `sim_spice` 里的器件不发热、`board_ir_drop` 也不把自己的 I²R 反哺进温度场；
-  而且这个 2-D 场只沿**你给的层压板 k** 与你**列进 `copper_pours` 的铜**（`0.0.44`，且只走面内片电导）扩散；真实铜面/平面、`.kicad_pcb` 的 zone 不会被自动读进来，也不读板文件。
+  而且这个 2-D 场只沿**你给的层压板 k** 与你**列进 `copper_pours` 的铜**（`0.0.44`，且只走面内片电导）扩散，外加你自己给的 `emissivity`（双面辐射）与 `thermal_vias`（到指定 sink 的铜管，`0.0.45`）；真实铜面/平面、`.kicad_pcb` 的 zone 不会被自动读进来，也不读板文件。
 
 ### 滤波器合成：给几何，不给 EM 结果（[docs/22](docs/22-微带与腔体滤波器.md)）
 
@@ -810,11 +810,11 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 2116 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 2155 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
-├── docs/                         # 设计文档 00~47，建议按编号顺序读（索引见 docs/README.md）
+├── docs/                         # 设计文档 00~48，建议按编号顺序读（索引见 docs/README.md）
 ├── CHANGELOG.md
 └── LICENSE
 ```

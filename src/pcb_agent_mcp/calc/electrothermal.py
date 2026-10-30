@@ -34,6 +34,9 @@ T20 = 20.0               # C, the reference temperature of both constants
 K_CU = 400.0             # W/(m*K), bulk copper. 401 at 300 K, 393 at 373 K;
                          # this module is a screening estimate, so one number in
                          # the middle of that range, stated rather than tuned.
+SIGMA_SB = 5.670374419e-8  # W/(m^2*K^4), Stefan-Boltzmann (CODATA). Radiation
+                           # is the one loss that does not need a material table:
+                           # it needs an emissivity, and that one is yours.
 
 
 def _num(x):
@@ -479,10 +482,115 @@ def _sheet_faces(nx, ny, dx, dy, S):
             fy[i][j] = (2.0 * a * b / (a + b)) * dx / dy if (a + b) > 0 else 0.0
     return fx, fy
 
+def _h_rad_w_m2k(t_c, t_amb_c, emissivity):
+    """Linearised grey-body coefficient, W/(m^2*K), at the film temperature.
+
+    q_rad = eps*sigma*(T^4 - Ta^4) = h_rad*(T - Ta) with
+    h_rad = eps*sigma*(T + Ta)*(T^2 + Ta^2) in kelvin - an EXACT identity, no
+    small-dT expansion. It is still temperature dependent, so the plate solve
+    lags it on the previous iterate and repeats the whole field until it stops
+    moving (see `emissivity` in `board_electrothermal`).
+    """
+    t1 = t_c + 273.15
+    t2 = t_amb_c + 273.15
+    return emissivity * SIGMA_SB * (t1 + t2) * (t1 * t1 + t2 * t2)
+
+def _via_centres(nx, ny, dx, dy, x1, y1, x2, y2, pitch):
+    """Cell indices of an axis-aligned via array; centres start at (x1, y1).
+
+    Returns (cells, n_x, n_y). Unlike a pour, a via is a POINT: its whole
+    conductance lands in the one cell that contains its centre, which is why a
+    half-cell shift can move it to a neighbouring cell. That grid dependence is
+    stated in the answer instead of being smeared away - smearing a point into
+    four cells would make 100 vias in one cell look like 25 in each of four.
+    """
+    def axis(lo, hi, p, n, d):
+        span = hi - lo
+        if span < 0:
+            lo, hi, span = hi, lo, -span
+        k = int(math.floor(span / p + 1e-9))
+        return [int(math.floor((lo + m * p) * 1e-3 / d)) for m in range(k + 1)]
+    xs = axis(x1, x2, pitch, nx, dx)
+    ys = axis(y1, y2, pitch, ny, dy)
+    cells = []
+    for i in xs:
+        if i < 0 or i >= nx:
+            continue
+        for j in ys:
+            if j < 0 or j >= ny:
+                continue
+            cells.append((i, j))
+    return cells, len(xs), len(ys)
+
+def _sor_plate_add(nx, ny, fx, fy, gadd, gt, hc, ta, qc, qs, capdt, prev,
+                   edge, tol_k, max_iter):
+    """`_sor_plate_map` plus a per-cell conductance to a node we do not solve.
+
+    `gadd[i][j]` is that conductance (W/K) and `gt[i][j]` is the same conductance
+    already multiplied by the node temperature (W, i.e. gadd*T_node). Radiation
+    and a thermal via are BOTH exactly this shape - a linear link to a temperature
+    outside the field - so one loop serves both. Its own function for the same
+    reason as `_sor_plate_map`: the laminate-only and pours-only paths have to
+    stay bit-for-bit what they were, and both of the additions above are off by
+    default.
+    """
+    temp = [row[:] for row in prev]
+    fixed = edge is not None
+    if fixed:
+        for i in range(nx):
+            temp[i][0] = edge
+            temp[i][ny - 1] = edge
+        for j in range(ny):
+            temp[0][j] = edge
+            temp[nx - 1][j] = edge
+    omega = 1.85
+    it = 0
+    dmax = float("inf")
+    diag_min = float("inf")
+    while it < max_iter:
+        it += 1
+        dmax = 0.0
+        for i in range(nx):
+            for j in range(ny):
+                if fixed and (i == 0 or j == 0 or i == nx - 1 or j == ny - 1):
+                    continue
+                num = (hc * ta + qc[i][j] + capdt[i][j] * prev[i][j]
+                       + gt[i][j])
+                den = hc + capdt[i][j] - qs[i][j] + gadd[i][j]
+                if i > 0:
+                    g = fx[i - 1][j]
+                    num += g * temp[i - 1][j]
+                    den += g
+                if i < nx - 1:
+                    g = fx[i][j]
+                    num += g * temp[i + 1][j]
+                    den += g
+                if j > 0:
+                    g = fy[i][j - 1]
+                    num += g * temp[i][j - 1]
+                    den += g
+                if j < ny - 1:
+                    g = fy[i][j]
+                    num += g * temp[i][j + 1]
+                    den += g
+                if den < diag_min:
+                    diag_min = den
+                new = num / den
+                old = temp[i][j]
+                dd = omega * (new - old)
+                temp[i][j] = old + dd
+                ad = abs(dd)
+                if ad > dmax:
+                    dmax = ad
+        if dmax < tol_k:
+            return temp, it, dmax, True, diag_min
+    return temp, it, dmax, False, diag_min
+
 def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
                          conductors, t_ambient_c=25.0, cell_mm=None,
                          edge_temp_c=None, uniform_power_w=None,
                          copper_pours=None, k_copper_w_mk=None,
+                         emissivity=None, thermal_vias=None,
                          alpha_per_k=ALPHA_CU, rho20_ohm_m=RHO20_CU,
                          tol_k=1e-4, max_iter=200, sor_max_iter=60000,
                          max_cells=20000, transient=None):
@@ -529,6 +637,31 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     copper model: it is *in-plane* sheet conduction only, so it adds copper
     where copper actually is, and it says nothing about the vertical path (that
     stays inside h). `k_copper_w_mk` defaults to K_CU = 400.
+
+    `emissivity` (optional, 0..1) turns on radiation. It is NOT a fudge factor on
+    h: q_rad = eps*sigma*(T^4 - Ta^4) is rewritten exactly as h_rad*(T - Ta) with
+    h_rad = eps*sigma*(T+Ta)*(T^2+Ta^2) in kelvin, applied to both faces. Because
+    h_rad depends on T, the field is solved with h_rad lagged on the previous
+    iterate and the whole solve repeats until the field stops moving - the answer
+    is the fixed point, not one pass. Leaving it out is the same as eps = 0 and
+    changes nothing, bit for bit.
+
+    `thermal_vias` (optional) is how a via field gets into the answer: each array
+    is
+
+        {"x1_mm", "y1_mm", "x2_mm", "y2_mm", "pitch_mm", "d_mm",
+         "plating_um", "span_mm" (default = plate thickness), "sink_c"}
+
+    and every via becomes ONE conductance to the sink node you name,
+
+        G = k_cu * pi*((d/2)^2 - (d/2 - plating)^2) / span        [W/K]
+
+    i.e. the annulus of the barrel (the drill area is the classic factor-of-10
+    exaggeration), landing in the cell that contains the via centre. `sink_c`
+    defaults to the ambient and the answer says which one it used - a via to a
+    heatsink at 60 C and a via to 25 C are different boards. The laminate's own
+    vertical conduction is already lumped inside h, so it is not added in
+    parallel here.
     """
     W = _num(width_mm)
     H = _num(height_mm)
@@ -601,17 +734,16 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     # ---- optional copper: a per-cell sheet conductance, off unless pours given
     pours = []
     t_cu = None
-    kcu = None
     tof_cu = 0.0
+    kcu = K_CU if k_copper_w_mk is None else _num(k_copper_w_mk)
+    if kcu is None or kcu <= 0:
+        return err("k_copper_w_mk must be a number > 0", "ARG_RANGE")
     if copper_pours is not None:
         if not isinstance(copper_pours, (list, tuple)):
             return err("copper_pours must be a list of rectangles",
                        "ARG_INVALID",
                        hint='each pour is {"x1_mm","y1_mm","x2_mm","y2_mm",'
                             '"thickness_um","layers"?}')
-        kcu = K_CU if k_copper_w_mk is None else _num(k_copper_w_mk)
-        if kcu is None or kcu <= 0:
-            return err("k_copper_w_mk must be > 0", "ARG_RANGE")
         t_cu = [[0.0] * ny for _ in range(nx)]
         covered_cells = set()
         for idx, pz in enumerate(copper_pours):
@@ -672,6 +804,110 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     if pours:
         S = [[gp + kcu * t_cu[i][j] for j in range(ny)] for i in range(nx)]
         fx, fy = _sheet_faces(nx, ny, dx, dy, S)
+
+    # ---- optional radiation: a linearised grey body on both faces
+    emis = None
+    if emissivity is not None:
+        emis = _num(emissivity)
+        if emis is None:
+            return err("emissivity must be a number", "ARG_INVALID")
+        if emis < 0.0 or emis > 1.0:
+            return err("emissivity must be between 0 and 1 (black-body = 1; a "
+                       "solder-mask surface is ~0.9, bare copper ~0.05..0.1 but "
+                       "that spread is real, so it is your number, not mine)",
+                       "ARG_RANGE")
+        if emis == 0.0:
+            emis = None          # eps = 0 is exactly "no radiation"
+
+    # ---- optional thermal vias: point conductances to a sink node
+    g_via = None
+    gt_via = None
+    via_arrays = []
+    if thermal_vias is not None:
+        if not isinstance(thermal_vias, (list, tuple)):
+            return err("thermal_vias must be a list of via arrays",
+                       "ARG_INVALID",
+                       hint='each array is {"x1_mm","y1_mm","x2_mm","y2_mm",'
+                            '"pitch_mm","d_mm","plating_um","sink_c"?,'
+                            '"span_mm"?}; centres start at (x1_mm, y1_mm)')
+        g_via = [[0.0] * ny for _ in range(nx)]
+        gt_via = [[0.0] * ny for _ in range(nx)]
+        for idx, va in enumerate(thermal_vias):
+            if not isinstance(va, dict):
+                return err("thermal via array #%d is not an object" % idx,
+                           "ARG_INVALID")
+            try:
+                vx1 = float(va["x1_mm"]); vy1 = float(va["y1_mm"])
+                vx2 = float(va["x2_mm"]); vy2 = float(va["y2_mm"])
+                vpitch = float(va["pitch_mm"]); vd = float(va["d_mm"])
+                vpl = float(va["plating_um"])
+            except (KeyError, TypeError, ValueError):
+                return err("thermal via array #%d needs numeric x1_mm, y1_mm, "
+                           "x2_mm, y2_mm, pitch_mm, d_mm, plating_um" % idx,
+                           "ARG_INVALID")
+            for nm, v in (("pitch_mm", vpitch), ("d_mm", vd),
+                          ("plating_um", vpl)):
+                if v <= 0:
+                    return err("thermal via array #%d: %s must be > 0" %
+                               (idx, nm), "ARG_RANGE")
+            if not (0.0 <= vx1 <= W and 0.0 <= vx2 <= W and
+                    0.0 <= vy1 <= H and 0.0 <= vy2 <= H):
+                return err("thermal via array #%d runs outside the plate "
+                           "%.6g x %.6g mm" % (idx, W, H), "ARG_RANGE")
+            vpl_mm = vpl / 1000.0
+            if 2.0 * vpl_mm >= vd:
+                return err("thermal via array #%d: plating_um is not smaller "
+                           "than the drill radius, so the barrel would be solid "
+                           "and the annulus stops meaning anything" % idx,
+                           "ARG_RANGE")
+            span_mm = th
+            if va.get("span_mm") is not None:
+                span_mm = _num(va.get("span_mm"))
+                if span_mm is None or span_mm <= 0:
+                    return err("thermal via array #%d: span_mm must be > 0" % idx,
+                               "ARG_RANGE")
+            sink = ta
+            sink_src = "ambient"
+            if va.get("sink_c") is not None:
+                sink = _num(va.get("sink_c"))
+                if sink is None:
+                    return err("thermal via array #%d: sink_c must be a number"
+                               % idx, "ARG_INVALID")
+                sink_src = "caller"
+            r_out = vd / 2.0
+            r_in = r_out - vpl_mm
+            a_mm2 = math.pi * (r_out ** 2 - r_in ** 2)
+            g_one = kcu * (a_mm2 * 1e-6) / (span_mm * 1e-3)
+            cells, n_x, n_y = _via_centres(nx, ny, dx, dy, vx1, vy1, vx2, vy2,
+                                           vpitch)
+            on_grid = len(cells)
+            asked = n_x * n_y
+            if on_grid <= 0:
+                return err("thermal via array #%d puts no via centre inside the "
+                           "plate: check that (x1_mm, y1_mm) is on the board and "
+                           "pitch_mm <= the span" % idx, "ARG_RANGE")
+            for (i, j) in cells:
+                g_via[i][j] += g_one
+                gt_via[i][j] += g_one * sink
+            via_arrays.append({
+                "index": idx,
+                "x1_mm": _sig(vx1), "y1_mm": _sig(vy1),
+                "x2_mm": _sig(vx2), "y2_mm": _sig(vy2),
+                "pitch_mm": _sig(vpitch), "d_mm": _sig(vd),
+                "plating_um": _sig(vpl),
+                "drill_mm": _sig(vd),
+                "span_mm": _sig(span_mm),
+                "sink_c": sink, "sink_c_source": sink_src,
+                "vias_per_axis": [n_x, n_y],
+                "vias_counted": on_grid,
+                "vias_asked": asked,
+                "vias_off_grid": asked - on_grid,
+                "barrel_area_mm2": _sig(a_mm2),
+                "barrel_area_over_drill_area_pct": _sig(
+                    100.0 * a_mm2 / (math.pi * r_out ** 2)),
+                "conductance_per_via_w_per_k": _sig(g_one),
+                "total_conductance_w_per_k": _sig(g_one * on_grid),
+            })
 
     # q_ref = the I^2R each cell would dissipate at 20 C (W)
     q_ref = [[0.0] * ny for _ in range(nx)]
@@ -799,10 +1035,19 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     # be refused BEFORE the SOR dives to infinity. This is the 2-D face of the
     # 1-D rule dP/dT*Rth < 1, and on a uniform plate it reduces to exactly it
     # (P*alpha < 2hA).
+    # Radiation and vias both ADD to that diagonal, so the pre-check must know
+    # about them or it would refuse boards that are perfectly stable: vias are a
+    # constant conductance, and radiation is floored at its value at the ambient
+    # (h_rad rises with T, so the ambient value is the smallest it can be).
+    h_rad_floor = 0.0
+    if emis is not None:
+        h_rad_floor = 2.0 * ac * _h_rad_w_m2k(ta, ta, emis)
     diag_worst = None
     for i in range(nx):
         for j in range(ny):
-            dv = hc + capdt[i][j] - q_slope[i][j]
+            dv = hc + capdt[i][j] - q_slope[i][j] + h_rad_floor
+            if g_via is not None:
+                dv += g_via[i][j]
             if diag_worst is None or dv < diag_worst:
                 diag_worst = dv
     if diag_worst <= 0.0:
@@ -830,14 +1075,70 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
         guess = ta + total_p20 / (hc * nx * ny)
         field = [[guess] * ny for _ in range(nx)]
 
-    if pours:
-        def _solve(prev_):
+    # Three numeric paths, chosen once here and never inside the sweep: the
+    # laminate-only loop, the pours-only loop, and the loop that carries an
+    # extra per-cell conductance (vias and/or radiation). The first two are the
+    # exact code that shipped before vias and radiation existed.
+    need_add = (g_via is not None) or (emis is not None)
+    if need_add and g_via is None:
+        g_via = [[0.0] * ny for _ in range(nx)]
+        gt_via = [[0.0] * ny for _ in range(nx)]
+    fx_a = fy_a = None
+    if need_add:
+        if fx is not None:
+            fx_a, fy_a = fx, fy
+        else:
+            fx_a = [[gx] * ny for _ in range(nx - 1)]
+            fy_a = [[gy] * (ny - 1) for _ in range(nx)]
+
+    rad_outer_total = [0]
+
+    def _hrad_field(fld):
+        return [[_h_rad_w_m2k(fld[i][j], ta, emis) for j in range(ny)]
+                for i in range(nx)]
+
+    def _solve(prev_):
+        if need_add:
+            hf = _hrad_field(prev_) if emis is not None else None
+            base = prev_
+            last = None
+            sw = 0
+            out = None
+            for _outer in range(80):
+                if hf is None:
+                    gadd, gt = g_via, gt_via
+                else:
+                    gadd = [[g_via[i][j] + 2.0 * ac * hf[i][j]
+                             for j in range(ny)] for i in range(nx)]
+                    gt = [[gt_via[i][j] + 2.0 * ac * hf[i][j] * ta
+                           for j in range(ny)] for i in range(nx)]
+                cur, it, dmax, conv, diag_min = _sor_plate_add(
+                    nx, ny, fx_a, fy_a, gadd, gt, hc, ta, q_const, q_slope,
+                    capdt, base, edge, tol_k, sor_max_iter)
+                sw += it
+                rad_outer_total[0] += 1
+                out = (cur, sw, dmax, conv, diag_min)
+                if not conv or hf is None:
+                    return out
+                if last is not None:
+                    moved = 0.0
+                    for i in range(nx):
+                        for j in range(ny):
+                            d = abs(cur[i][j] - last[i][j])
+                            if d > moved:
+                                moved = d
+                    if moved < tol_k:
+                        return out
+                last = cur
+                base = cur
+                hf = _hrad_field(cur)
+            # the radiation linearisation itself did not settle
+            return (out[0], sw, float("inf"), False, out[4])
+        if pours:
             return _sor_plate_map(nx, ny, fx, fy, hc, ta, q_const, q_slope,
                                   capdt, prev_, edge, tol_k, sor_max_iter)
-    else:
-        def _solve(prev_):
-            return _sor_plate(nx, ny, gx, gy, hc, ta, q_const, q_slope,
-                              capdt, prev_, edge, tol_k, sor_max_iter)
+        return _sor_plate(nx, ny, gx, gy, hc, ta, q_const, q_slope,
+                          capdt, prev_, edge, tol_k, sor_max_iter)
 
     iters_total = 0
     prev = field
@@ -888,10 +1189,23 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     # A solution of this system with all sources >= 0 and a fixed ambient must
     # never sit below the ambient it is dumping heat into. If it does, the matrix
     # inverted to something non-physical, which is the other face of runaway.
-    if tmin < ta - 1e-6:
+    # The slack is the solver's own tolerance, not a fudge: a field that stopped
+    # moving at tol_k can sit that far under the ambient in a cell whose only job
+    # is to drain heat, and a gate that fires on its own residual rejects correct
+    # answers. A genuinely non-physical field is off by degrees, not by 1e-5.
+    # The floor is the coldest node the field is pinned to: the ambient, or a
+    # sink you named that is colder than the ambient - a via to a 0 C cold plate
+    # legitimately drags cells below Ta, and that is not runaway.
+    floor_ref = ta
+    floor_why = "the ambient %.6g C" % ta
+    for a in via_arrays:
+        if a["sink_c"] < floor_ref - 1e-9:
+            floor_ref = a["sink_c"]
+            floor_why = "the coldest sink you gave (%.6g C)" % floor_ref
+    if tmin < floor_ref - max(1e-6, 10.0 * tol_k):
         return err(
             "the solved field is not physical: minimum temperature %.6g C is "
-            "below the ambient %.6g C while every source is a heater" % (tmin, ta),
+            "below %s while every source is a heater" % (tmin, floor_why),
             "THERMAL_RUNAWAY",
             hint="this is what a not-diagonally-dominant electro-thermal matrix "
                  "looks like when it still factorises. Treat it as runaway, not as "
@@ -899,9 +1213,16 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
 
     # energy balance, computed rather than assumed
     out_conv = 0.0
+    out_rad = 0.0
+    out_via = 0.0
     for i in range(nx):
         for j in range(ny):
-            out_conv += hc * (temp[i][j] - ta)
+            d = temp[i][j] - ta
+            out_conv += hc * d
+            if emis is not None:
+                out_rad += 2.0 * ac * _h_rad_w_m2k(temp[i][j], ta, emis) * d
+            if g_via is not None:
+                out_via += g_via[i][j] * temp[i][j] - gt_via[i][j]
     out_edge = 0.0
     if edge is not None:
         for i in range(nx):
@@ -926,7 +1247,7 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     for i in range(nx):
         for j in range(ny):
             p_in += q_ref[i][j] * (1.0 + alpha * (temp[i][j] - T20))
-    residual = p_in - out_conv - out_edge
+    residual = p_in - out_conv - out_rad - out_via - out_edge
     resid_pct = 100.0 * residual / p_in if p_in else 0.0
     if tr is None and abs(resid_pct) > 0.5:
         return err("energy does not balance: %.3f%% of the input power is "
@@ -974,9 +1295,10 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
         ratio_max = max(flat) / k if k > 0 else None
         nc_list[0] = ("the copper is smeared into ONE in-plane sheet conductance "
                       "per cell (area fraction x thickness x layers x k_cu): the "
-                      "shape inside a cell, the copper-to-laminate interface, "
-                      "thermal vias and any copper you did not list are not "
-                      "resolved")
+                      "shape inside a cell, the copper-to-laminate interface "
+                      "and any copper you did not list are not resolved" +
+                      ("" if via_arrays else
+                       ", and thermal vias are not in it"))
         copper_report = {
             "modelled": True,
             "k_copper_w_mk": _sig(kcu),
@@ -1003,6 +1325,78 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
                     "laminate k alone - a board with a plane under the hot part "
                     "is cooler than this says"),
         }
+    if emis is not None:
+        nc_list[1] = ("radiation is a linearised grey body with ONE emissivity "
+                      "for both faces and the cell temperature as the surface "
+                      "temperature: no view factors, no enclosure correction "
+                      "(a plate in a box sees itself), no wavelength or "
+                      "angle dependence, no solar or other external flux")
+    if via_arrays:
+        nc_list[2] = ("each via is one barrel with uniform plating conducting "
+                      "to the sink you named: no plating thinning mid-barrel, "
+                      "no pad/plane spreading at either end, no copper barrel "
+                      "resistance variation with temperature (k_cu is one "
+                      "number), and no interaction with the neighbouring "
+                      "barrels")
+
+    rad_report = None
+    if emis is not None:
+        h_at_ta = _h_rad_w_m2k(ta, ta, emis)
+        h_at_max = _h_rad_w_m2k(tmax, ta, emis)
+        rad_report = {
+            "modelled": True,
+            "emissivity": _sig(emis),
+            "stefan_boltzmann_w_m2_k4": SIGMA_SB,
+            "h_rad_w_m2k": {"at_t_ambient": _sig(h_at_ta),
+                            "at_t_max": _sig(h_at_max)},
+            "faces": 2,
+            "heat_out_w": _sig(out_rad),
+            "share_of_heat_out_pct": _sig(100.0 * out_rad /
+                                          (out_conv + out_rad + out_via
+                                           + out_edge)) if
+            (out_conv + out_rad + out_via + out_edge) else None,
+            "linearisation": ("h_rad lagged on the previous iterate; the whole "
+                              "field is re-solved until it stops moving, so the "
+                              "answer is the fixed point of T^4, not one pass"),
+            "outer_iterations": rad_outer_total[0],
+            "assumption": ("one emissivity for both faces, and the surface is "
+                           "at the cell temperature (no coating on top of a "
+                           "copper plane, no view factors to nearby objects - "
+                           "in an enclosure a plate really does see itself)"),
+        }
+    else:
+        rad_report = {
+            "modelled": False,
+            "why": ("no emissivity given, so only convection removes heat from "
+                    "the two surfaces - past ~60 C that understates the "
+                    "cooling, maybe by a factor of 1.5 in still air"),
+        }
+    via_report = None
+    if g_via is not None:
+        g_total = sum(sum(r) for r in g_via)
+        via_report = {
+            "modelled": True,
+            "k_copper_w_mk": _sig(kcu),
+            "arrays": via_arrays,
+            "vias_counted": sum(a["vias_counted"] for a in via_arrays),
+            "total_conductance_w_per_k": _sig(g_total),
+            "heat_out_w": _sig(out_via),
+            "equivalent_h_w_m2k": _sig(g_total / (2.0 * ac * nx * ny)),
+            "assumption": ("each via is ONE copper barrel from its cell to the "
+                           "sink you named (G = k_cu*annulus/span), radial "
+                           "isothermal, no plating thinning mid-barrel, no pad "
+                           "or plane spreading at either end; the laminate's own "
+                           "vertical path is already inside h and is NOT added in "
+                           "parallel, and a via lands in the single cell that "
+                           "contains its centre"),
+        }
+    else:
+        via_report = {
+            "modelled": False,
+            "why": ("no thermal_vias given, so the only path between the two "
+                    "surfaces is h - a via field under a hot part is far cooler "
+                    "than this says"),
+        }
 
     extra = {
         "t_max_c": round(tmax, 6),
@@ -1020,12 +1414,16 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
         "sor_sweeps": iters_total,
         "energy_balance": {"power_in_w": _sig(p_in),
                            "power_out_convection_w": _sig(out_conv),
+                           "power_out_radiation_w": _sig(out_rad),
+                           "power_out_vias_w": _sig(out_via),
                            "power_out_fixed_edges_w": _sig(out_edge),
                            "residual_pct": _sig(resid_pct)},
         "effective_rth_k_per_w": _sig((tmax - ta) / p_in) if p_in else None,
         "map": rows,
         "map_legend": "row 0 is y=0; '@' is the hottest cell",
         "copper_spreading": copper_report,
+        "radiation": rad_report,
+        "thermal_vias": via_report,
         "not_computed": nc_list,
         "authoritative": False,
     }
@@ -1039,22 +1437,33 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
 
     model = ("board 2-D electro-thermal: " + _PLATE_MODEL +
              (" + backward Euler (dt = %.4g s, %d steps)" % (dt, steps)
-              if tr is not None else ""))
+              if tr is not None else "") +
+             (" + radiation (eps = %.3g, h_rad from T^4)" % emis
+              if emis is not None else "") +
+             (" + thermal vias (%d arrays)" % len(via_arrays)
+              if via_arrays else ""))
+    prec = ("as good as k and h, and the hot spot is grid dependent: compare "
+            "two layouts only at the same cell_mm. The spreading medium is "
+            "your k plus the pours you listed, smeared per cell; a plane you "
+            "did not list is still missing"
+            if pours else
+            "as good as k and h, and the hot spot is grid dependent: compare "
+            "two layouts only at the same cell_mm. The spreading medium here "
+            "is the laminate k you passed, not the real copper pours, so a "
+            "design with a plane under the trace is cooler than this says")
+    if emis is not None:
+        prec += ("; radiation is one grey body per face at the cell temperature, "
+                 "so the answer is the fixed point of a T^4 loop, not one pass")
+    if via_arrays:
+        prec += ("; each via is a uniform-plating copper barrel between the cell "
+                 "and the sink you named, and that sink temperature is an input "
+                 "- it is not solved for")
     return ok({"t_max_c": round(tmax, 6),
                "t_min_c": round(tmin, 6),
                "t_avg_c": round(tavg, 6),
                "delta_t_max_k": round(tmax - ta, 6)},
               "C", model,
-              _BASIS_TRACE,
-              ("as good as k and h, and the hot spot is grid dependent: compare "
-               "two layouts only at the same cell_mm. The spreading medium is "
-               "your k plus the pours you listed, smeared per cell; a plane you "
-               "did not list is still missing"
-               if pours else
-               "as good as k and h, and the hot spot is grid dependent: compare "
-               "two layouts only at the same cell_mm. The spreading medium here "
-               "is the laminate k you passed, not the real copper pours, so a "
-               "design with a plane under the trace is cooler than this says"),
+              _BASIS_TRACE, prec,
               {"rth_source": "emerging from the 2-D field, not supplied",
                "copper_layers": "parallel copper assumed stitched at both ends",
                "heat_capacity": ("plate volume only (%s)"

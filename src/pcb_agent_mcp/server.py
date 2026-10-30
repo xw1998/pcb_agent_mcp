@@ -817,6 +817,94 @@ def selftest():
               and payload.get("reason_code") == "ARG_RANGE",
               str(payload.get("reason_code")))
 
+        # Radiation is Stefan-Boltzmann with an EXACT rewrite, so it is
+        # checkable two ways: h_rad has a hand formula, and eps = 0 must be the
+        # run that never mentioned radiation, bit for bit.
+        def _tel(**kw):
+            args = dict(_base)
+            args.update(kw)
+            rr = handle({"jsonrpc": "2.0", "id": 861, "method": "tools/call",
+                         "params": {"name": "board_electrothermal",
+                                    "arguments": args}})
+            return json.loads(rr["result"]["content"][0]["text"])
+        _bare_p = _tel()
+        _rad = _tel(emissivity=0.9)
+        _rad0 = _tel(emissivity=0.0)
+        # h_rad = eps*sigma*(T+Ta)*(T^2+Ta^2) in kelvin, hand-computed at t_max
+        _tm = _rad.get("t_max_c") or 0.0
+        _t1 = _tm + 273.15
+        _t2 = 25.0 + 273.15
+        _h_want = 0.9 * 5.670374419e-8 * (_t1 + _t2) * (_t1 * _t1 + _t2 * _t2)
+        _h_got = ((_rad.get("radiation") or {}).get("h_rad_w_m2k") or {}).get(
+            "at_t_max")
+        check("radiation cools the plate and h_rad is the hand identity",
+              _bare_p.get("t_max_c") is not None and _rad.get("t_max_c") is not None
+              and _bare_p["t_max_c"] - _rad["t_max_c"] > 2.5
+              and _h_got is not None and abs(_h_got - _h_want) < 1e-4,
+              "bare %s rad %s h %s vs %s" % (_bare_p.get("t_max_c"),
+                                             _rad.get("t_max_c"), _h_got,
+                                             round(_h_want, 6)))
+
+        check("emissivity 0 is bit-identical to asking for no radiation",
+              _rad0.get("t_max_c") == _bare_p.get("t_max_c")
+              and _rad0.get("t_avg_c") == _bare_p.get("t_avg_c")
+              and not (_rad0.get("radiation") or {}).get("modelled"),
+              "%s vs %s" % (_rad0.get("t_max_c"), _bare_p.get("t_max_c")))
+
+        # A via array is a total conductance, so it must equal the run with h
+        # raised by G/(2*A_cell*N_cell). Hand arithmetic, not one pass twice.
+        _vb = {"width_mm": 20, "height_mm": 20, "thickness_mm": 1.6,
+               "k_w_mk": 0.3, "h_w_m2k": 10, "cell_mm": 2.0,
+               "uniform_power_w": 0.02, "conductors": None}
+        _vias = [{"x1_mm": 1, "y1_mm": 1, "x2_mm": 19, "y2_mm": 19,
+                  "pitch_mm": 2.0, "d_mm": 0.3, "plating_um": 25.0}]
+        def _vt(**kw):
+            args = dict(_vb)
+            args.update(kw)
+            rr = handle({"jsonrpc": "2.0", "id": 862, "method": "tools/call",
+                         "params": {"name": "board_electrothermal",
+                                    "arguments": args}})
+            return json.loads(rr["result"]["content"][0]["text"])
+        _vn = _vt(thermal_vias=_vias)
+        _g1 = ((_vn.get("thermal_vias") or {}).get("arrays") or [{}])[0].get(
+            "conductance_per_via_w_per_k") or 0.0
+        _gt = (_vn.get("thermal_vias") or {}).get(
+            "total_conductance_w_per_k") or 0.0
+        _ac = (2e-3) ** 2
+        _h_eq = 10.0 + _gt / (2.0 * _ac * 100.0)
+        _ve = _vt(h_w_m2k=_h_eq)
+        # one barrel: k_cu*pi*(r_out^2-r_in^2)/span, hand arithmetic
+        _g_want = 400.0 * (3.141592653589793 * (0.15 ** 2 - 0.125 ** 2)
+                           * 1e-6) / 1.6e-3
+        check("a 100-barrel via field equals h + G/(2*A*N), and G is the annulus",
+              (_vn.get("thermal_vias") or {}).get("vias_counted") == 100
+              and _ve.get("t_max_c") is not None
+              and abs(_ve["t_max_c"] - _vn["t_max_c"]) < 1e-4
+              and abs(_g1 - _g_want) < 1e-7,
+              "via %s eq %s G %s vs %s" % (_vn.get("t_max_c"),
+                                           _ve.get("t_max_c"), _g1,
+                                           round(_g_want, 9)))
+
+        check("a via field under the hot trace cools it; the same one elsewhere "
+              "does not",
+              _tel(thermal_vias=[{"x1_mm": 0, "y1_mm": 34, "x2_mm": 100,
+                                  "y2_mm": 46, "pitch_mm": 2.0,
+                                  "d_mm": 0.3, "plating_um": 25.0}
+                                 ]).get("t_max_c") is not None
+              and _bare_p.get("t_max_c") is not None
+              and (_bare_p["t_max_c"]
+                   - _tel(thermal_vias=[{"x1_mm": 0, "y1_mm": 34,
+                                         "x2_mm": 100, "y2_mm": 46,
+                                         "pitch_mm": 2.0, "d_mm": 0.3,
+                                         "plating_um": 25.0}])["t_max_c"]) > 5.0
+              and 0.0 <= (_bare_p["t_max_c"]
+                          - _tel(thermal_vias=[{"x1_mm": 0, "y1_mm": 0,
+                                                "x2_mm": 100, "y2_mm": 12,
+                                                "pitch_mm": 2.0, "d_mm": 0.3,
+                                                "plating_um": 25.0}
+                                               ])["t_max_c"]) < 0.01,
+              "bare %s" % (_bare_p.get("t_max_c"),))
+
         # --- cavity / electro-thermal. Again only closed forms and hand
         # arithmetic: f10 for a 100 mm plane at er=4.3 is c/(2 sqrt(er) * 0.1 m),
         # which is also the definition of a half guided wavelength.

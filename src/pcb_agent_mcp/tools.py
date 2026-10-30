@@ -3274,7 +3274,11 @@ def _capabilities(_args):
                           "thermal (1-D stacks, via arrays, a real 2-D plate solve "
                           "with an energy-balance check, RC transients, heatsink "
                           "budget). Every model is lumped or closed-form: no "
-                          "full-wave, no thermal radiation, no convection field solve",
+                          "full-wave, no convection field solve. Radiation IS modelled on "
+                          "the 2-D plate when you pass emissivity (both faces, one grey-"
+                          "body epsilon, exact T^4 rewritten as a lagged h_rad with the "
+                          "field re-solved to a fixed point), and copper barrels that "
+                          "carry heat to a sink are modelled through thermal_vias",
             "dfm": "manufacturability against a capability document YOU supply: narrowest "
                    "track, copper gap, via drill and rings, hole-to-hole web, "
                    "copper-to-edge, narrowest cut-out, board size, layer count. This "
@@ -3303,7 +3307,19 @@ def _capabilities(_args):
                               "copper_pours (a plane, a pour, a very wide track) is added "
                               "as an exact per-cell area overlap into the sheet "
                               "conductance, so copper has to be WHERE the heat is to "
-                              "help. DC only, no skin effect, no AC loss",
+                              "help. emissivity adds radiation from both faces: "
+                              "sigma*eps*(T^4-Tamb^4) is rewritten exactly as a linear "
+                              "h_rad*2A*(T-Tamb) and h_rad is lagged one iteration while "
+                              "the whole field is re-solved until it stops moving, so "
+                              "the answer is the T^4 fixed point rather than an eps "
+                              "folded into h. thermal_vias adds one annular-section "
+                              "copper barrel per pitch cell as a conductance to a sink "
+                              "(default: ambient, and the report says so); it lands in "
+                              "the single cell holding its centre, so it is a point "
+                              "load and the answer is grid-dependent - reported, not "
+                              "hidden. Neither is on by default. DC only, no skin "
+                              "effect, no AC loss, no 3-D, no component thermal mass "
+                              "or contact resistance",
             "vibration": "mechanical vibration: natural frequencies and mode shapes of "
                          "a thin plate (Rayleigh-Ritz, monomial basis, exact for SSSS "
                          "and CCCC and needs no mode table), single-mode random response "
@@ -3723,11 +3739,18 @@ def _capabilities(_args):
             "conductance per cell (area fraction x thickness x layers x k_cu, faces by "
             "harmonic mean) - so the copper shape inside a cell, the copper-to-laminate "
             "interface and any copper you did not list are still missing, and that "
-            "smearing is in-plane only (the vertical path stays inside h). Not done: "
-            "3-D, radiation, thermal vias, component thermal mass and contact "
+            "smearing is in-plane only (the vertical path stays inside h). Radiation "
+            "(emissivity: both faces, one grey-body epsilon, exact T^4 as a lagged "
+            "h_rad re-solved to a fixed point) and thermal_vias (one annular-section "
+            "copper barrel per pitch cell as a conductance to a sink, landing in the "
+            "cell holding its centre) are modelled when asked for, and are OFF by "
+            "default so the numbers are bit-identical without them. Still not done: "
+            "3-D, internal plane-to-plane radiation through the laminate, "
+            "temperature-dependent emissivity, component thermal mass and contact "
             "resistance, AC loss (skin/proximity), device self-heating inside "
-            "sim_spice, reading the conductors or the zones straight off a board file - "
-            "board_electrothermal takes geometry, it does not open the .kicad_pcb for "
+            "sim_spice, reading the conductors or the zones straight off a board "
+            "file - board_electrothermal takes geometry, it does not open the "
+            ".kicad_pcb for "
             "you",
             "Surge and fusing beyond one pulse: fusing_current answers the single-pulse "
             "adiabatic question (Onderdonk 1928) and states its four one-sided "
@@ -5863,7 +5886,13 @@ _tool(
     "pour, a wide track): each rectangle's exact area overlap with a cell becomes that "
     "cell's sheet conductance and the faces take the harmonic mean, so copper only "
     "helps where it actually is. A plane you did not list still reads hotter than the "
-    "real board.",
+    "real board. Two more loss paths are modelled: emissivity adds radiation from "
+    "both faces as sigma*eps*(T^4 - Tamb^4), rewritten exactly as a linear "
+    "h_rad(T)*A*(T-Tamb) with h_rad lagged one iteration and the whole field "
+    "re-solved until it stops moving, so the answer is the T^4 solution and not an "
+    "eps folded into h; thermal_vias adds copper barrels as a conductance to a sink "
+    "per cell. Neither is on unless you ask for it, and with neither the numbers are "
+    "bit-identical to 0.0.44.",
     {"type": "object", "properties": {
         "width_mm": _num("plate width"),
         "height_mm": _num("plate height"),
@@ -5898,6 +5927,18 @@ _tool(
             "is why a board with a plane under the hot part reads hotter than it "
             "is"},
         "k_copper_w_mk": _num("copper conductivity used by copper_pours", 400.0),
+        "emissivity": _num("optional 0..1 grey-body emissivity of BOTH faces; omit or "
+                            "0 to leave radiation out entirely. Adding it lowers t_max "
+                            "and never raises it", None),
+        "thermal_vias": {"type": "array", "items": {"type": "object"},
+            "description":
+            "optional: copper barrels that carry heat DOWN the board to a sink. "
+            "Each {x1_mm,y1_mm,x2_mm,y2_mm,pitch_mm,d_mm,plating_um,span_mm?,sink_c?}: "
+            "centres are laid out on a pitch grid inside the rectangle, each barrel "
+            "is ONE lumped conductance k_cu*pi*(r_out^2 - r_in^2)/span (annular "
+            "section, not the drill area) landing in the cell that contains its "
+            "centre, so a point load stays a point load. sink_c defaults to the "
+            "ambient and is reported as such"},
     }, "required": ["width_mm", "height_mm", "thickness_mm", "k_w_mk", "h_w_m2k"]},
     lambda a: _electro.board_electrothermal(
         a.get("width_mm"), a.get("height_mm"), a.get("thickness_mm"),
@@ -5907,6 +5948,8 @@ _tool(
         uniform_power_w=a.get("uniform_power_w"),
         copper_pours=a.get("copper_pours"),
         k_copper_w_mk=a.get("k_copper_w_mk"),
+        emissivity=a.get("emissivity"),
+        thermal_vias=a.get("thermal_vias"),
         alpha_per_k=(a["alpha_per_k"] if a.get("alpha_per_k") is not None else 0.00393),
         rho20_ohm_m=(a["rho20_ohm_m"] if a.get("rho20_ohm_m") is not None else 1.724e-8),
         tol_k=(a["tol_k"] if a.get("tol_k") is not None else 1e-4),
