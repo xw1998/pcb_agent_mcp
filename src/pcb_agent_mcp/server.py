@@ -794,37 +794,144 @@ def selftest():
                   and "cross_check" not in payload
                   and payload.get("verified_against_engine") is False,
                   str(payload.get("verified_against_engine")))
-        # the point of having an engine at all: a card this module refuses by name
-        # still runs, and the envelope says the deck was not parsed here. T (the
-        # LOSSLESS line) moved INTO the builtin set in 0.0.30, O/U (the lossy ones)
-        # in 0.0.31 and S/W (the two switches) in 0.0.35, so the probe is now the
-        # JFET J - the last analogue device still refused by name, and one ngspice
-        # solves exactly: BETA=1m / VTO=-1 with VGS=0 sinks ~0.366 mA out of the
-        # 1 V / 1k divider tap, so it reads 0.268 V where a SKIPPED card reads the
-        # plain 0.500 V divider.
+        # The engine used to be the only thing that could solve a card this module
+        # refused by name. T (the LOSSLESS line) moved INTO the builtin set in
+        # 0.0.30, O/U (the lossy ones) in 0.0.31, S/W (the two switches) in 0.0.35
+        # and J (the JFET) in 0.0.36, so no analogue card is left that only the
+        # engine can run (the one remaining refusal, A, is an XSPICE code model
+        # that this ngspice build does not even load). What still has teeth is the
+        # migration itself: the same JFET deck must now be PARSED HERE, read
+        # 0.267949 V at the divider tap (BETA=1m / VTO=-1 with VGS=0 sinks
+        # 0.366 mA out of the 1 V / 1k tap, where a skipped card reads 0.500 V),
+        # and agree with the engine.
+        _JFET_DIV = ("* j\nV1 1 0 1\nR1 1 2 1k\nVg 3 0 0\nJ1 2 3 0 jm\n"
+                     "R2 2 0 1k\n.model jm NJF(VTO=-1 BETA=1m)\n.op\n")
         r = handle({"jsonrpc": "2.0", "id": 96, "method": "tools/call",
                     "params": {"name": "sim_spice", "arguments": {
-                        "netlist": "* j\nV1 1 0 1\nR1 1 2 1k\nVg 3 0 0\n"
-                                   "J1 2 3 0 jm\nR2 2 0 1k\n"
-                                   ".model jm NJF(VTO=-1 BETA=1m)\n.op\n",
-                        "engine": "ngspice"}}})
+                        "netlist": _JFET_DIV, "engine": "builtin"}}})
         payload = json.loads(r["result"]["content"][0]["text"])
+        _n = (payload.get("value") or {}).get("nodes_v") or {}
+        # 2 - sqrt(3) = 0.2679491924: the tap solves (2*Vd - Vd^2) = 1 - 2*Vd,
+        # i.e. the device is in its LINEAR region here, which is why the answer is
+        # not the 0.500 V of a divider with the card skipped
+        _j1 = [e for e in ((payload.get("value") or {}).get("elements") or [])
+               if e.get("name") == "J1"]
+        check("builtin J (a JFET) reads 0.267949 V at the divider tap, not the "
+              "0.500 V a skipped card gives, and reports the device in its linear "
+              "region at 0.464102 mA",
+              payload.get("status") == "ok"
+              and payload.get("engine_used") == "builtin"
+              and abs(_n.get("2", 0.0) - 0.267949192) < 1e-8
+              and bool(_j1)
+              and abs(_j1[0].get("current_a", {}).get("id", 9.9)
+                      - 0.464101615e-3) < 1e-9
+              and _j1[0].get("region") == "linear",
+              "%r / %r" % (_n, _j1 and _j1[0].get("current_a")))
         if _found:
-            _n = (payload.get("value") or {}).get("nodes_v") or {}
-            check("a card the builtin refuses by name (a JFET) does run under "
-                  "ngspice (0.268 V at the tap, not the 0.500 V a skipped card "
-                  "gives) and the envelope says this module did not parse the deck",
+            r = handle({"jsonrpc": "2.0", "id": 96, "method": "tools/call",
+                        "params": {"name": "sim_spice", "arguments": {
+                            "netlist": _JFET_DIV, "engine": "ngspice",
+                            "cross_check": True}}})
+            payload = json.loads(r["result"]["content"][0]["text"])
+            _cc = payload.get("cross_check") or {}
+            _d = abs(_cc.get("max_abs_diff_v") or 0.0)
+            check("the engine agrees with the builtin on that same JFET deck "
+                  "(<1e-6 V), so the square law is the engine's equation and not "
+                  "this module's own arithmetic",
                   payload.get("status") == "ok"
-                  and payload.get("netlist_parsed") is False
-                  and "J1" in (payload.get("netlist_parse_note") or "")
-                  and abs(_n.get("2", 0.0) - 0.267949190) < 1e-6,
-                  str(_n))
+                  and payload.get("verified_against_engine") is True
+                  and _d < 1e-6,
+                  "%.3g V" % _d)
         else:
             check("engine='ngspice' refuses when no binary is installed instead of "
                   "quietly answering with the subset",
                   payload.get("status") == "error"
                   and payload.get("reason_code") == "ENGINE_NOT_FOUND",
                   str(payload.get("reason_code")))
+
+        # 0.0.36: the JFET square law is NOT the MOSFET's. BETA=1m at Vov=1 must
+        # read 1.000 mA - the 1/2 everybody expects here reads 0.500 mA - and
+        # below the knee at Vds=0.3 the linear form reads BETA*(2*Vov*Vds - Vds^2)
+        # = 0.510 mA, with gm = 2*BETA*Vds = 0.600 mA/V (which is how the report
+        # shows the two REGIONS apart without a smoothing term).
+        for _vd, _want_id, _want_gm, _want_region in (
+                (5.0, 1.0e-3, 2.0e-3, "saturation"),
+                (0.3, 0.51e-3, 0.6e-3, "linear")):
+            r = handle({"jsonrpc": "2.0", "id": 151, "method": "tools/call",
+                        "params": {"name": "sim_spice", "arguments": {
+                            "netlist": "* jf\nVd 1 0 %g\nVg 2 0 0\n"
+                                       "J1 1 2 0 jm\n"
+                                       ".model jm NJF(VTO=-1 BETA=1m)\n.op\n" % _vd,
+                            "engine": "builtin"}}})
+            payload = json.loads(r["result"]["content"][0]["text"])
+            _e = [e for e in ((payload.get("value") or {}).get("elements") or [])
+                  if e.get("name") == "J1"]
+            _ok = (payload.get("status") == "ok" and bool(_e)
+                   and abs(_e[0].get("current_a", {}).get("id", 9.9)
+                           - _want_id) < 1e-12
+                   and abs(_e[0].get("gm_s", 9.9) - _want_gm) < 1e-9
+                   and _e[0].get("region") == _want_region)
+            if _vd < 1.0:
+                _lin_ok = _ok
+            else:
+                _sat_ok = _ok
+        check("builtin J: BETA=1m at Vov=1 reads 1.000 mA in saturation (a MOSFET "
+              "1/2 would read 0.500 mA) and 0.510 mA at Vds=0.3 in the linear "
+              "region, with the two gm values 2*BETA*Vov and 2*BETA*Vds",
+              _sat_ok and _lin_ok, "%r / %r" % (_sat_ok, _lin_ok))
+
+        # 0.0.36: AREA on the card REPLACES the model's AREA (measured: model 2
+        # with card 3 reads 3x, not 6x), and the gate junction this subset does
+        # not stamp is flagged instead of being silently assumed away.
+        r = handle({"jsonrpc": "2.0", "id": 152, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* jf\nVd 1 0 9\nVg 2 0 0\n"
+                                   "J1 1 2 0 jm AREA=3\n"
+                                   ".model jm NJF(VTO=-1 BETA=1m AREA=2)\n.op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _e = [e for e in ((payload.get("value") or {}).get("elements") or [])
+              if e.get("name") == "J1"]
+        _area_ok = (payload.get("status") == "ok" and bool(_e)
+                    and abs(_e[0].get("current_a", {}).get("id", 9.9) - 3e-3) < 1e-12
+                    and abs(_e[0].get("model_params", {}).get("BETA_eff", 9.9)
+                            - 3e-3) < 1e-15)
+        r = handle({"jsonrpc": "2.0", "id": 152, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* jf\nVd 1 0 5\nVg 2 0 1\n"
+                                   "J1 1 2 0 jm\n"
+                                   ".model jm NJF(VTO=-1 BETA=1m)\n.op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _e = [e for e in ((payload.get("value") or {}).get("elements") or [])
+              if e.get("name") == "J1"]
+        _fwd = _e[0].get("gate_junction_forward_v", 0.0) if _e else 0.0
+        check("builtin J: AREA on the card replaces the model's (3x, not 6x) and a "
+              "gate forward-biased by 1 V is reported as outside_model instead of "
+              "being modelled as an open circuit",
+              _area_ok
+              and bool(_e) and abs(_fwd - 1.0) < 1e-9
+              and "outside_model" in _e[0]
+              and bool(payload.get("warnings")),
+              "%r / %r" % (_area_ok, _fwd))
+
+        # 0.0.36: the parameters that would change the answer are refused BY NAME
+        # (RD/RS are internal nodes, B is a different equation) - an ignored
+        # parameter is a netlist that runs and lies.
+        _msgs = []
+        for _m in ("RD=100", "RS=100", "B=2", "CGS=1p", "KF=1e-16"):
+            r = handle({"jsonrpc": "2.0", "id": 153, "method": "tools/call",
+                        "params": {"name": "sim_spice", "arguments": {
+                            "netlist": "* jf\nVd 1 0 5\nVg 2 0 0\n"
+                                       "J1 1 2 0 jm\n.model jm NJF(VTO=-1 BETA=1m "
+                                       "%s)\n.op\n" % _m,
+                            "engine": "builtin"}}})
+            _p = json.loads(r["result"]["content"][0]["text"])
+            _msgs.append((_p.get("reason_code") == "NETLIST_INVALID"
+                          and _m.split("=")[0] in (_p.get("message") or "")))
+        check("builtin J refuses RD/RS/B/CGS/KF by name (every one of them changes "
+              "the answer, measured) instead of stamping a number nobody chose",
+              all(_msgs), str(_msgs))
 
         # 0.0.30: the lossless line in the builtin. DC is a wire, so the matched
         # 3 V / 50 ohm divider must read 1.500 V at BOTH ports and +/-30 mA.

@@ -306,25 +306,32 @@ class TestRefusals(EngineCase):
         self.assertEqual(r["reason_code"], "ARG_REQUIRED")
 
     def test_unparsed_card_goes_to_the_engine_but_stops_the_builtin(self):
-        # A card this module cannot model (a LOSSLESS line was the stand-in until
-        # 0.0.30 implemented it, its LOSSY cousin until 0.0.31 did, the voltage-
-        # controlled switch S until 0.0.35 did, so the card is now the JFET J) is
-        # the reason to have an engine:
-        # on the delegation path the deck is handed over unchanged and the answer is
-        # the engine's own rawfile, so the refusal would only hide the capability.
-        # It is still a refusal for engine='builtin', and the envelope says so with
+        # A card this module cannot model is the reason to have an engine: on the
+        # delegation path the deck is handed over unchanged and the answer is the
+        # engine's own rawfile, so the refusal would only hide the capability. It
+        # is still a refusal for engine='builtin', and the envelope says so with
         # netlist_parsed:false instead of pretending a full parse.
+        #
+        # The stand-in has been reduced one card at a time as the builtin grew: a
+        # LOSSLESS line until 0.0.30, its LOSSY cousin until 0.0.31, the voltage-
+        # controlled switch S until 0.0.35 and the JFET J until 0.0.36. What is
+        # left is A, the XSPICE analogue behavioural block - and it is the honest
+        # last stand-in: it is not "not implemented yet", it is a second
+        # expression/code-model system, and this build of ngspice does not load
+        # the code models either, so the fake engine below is the only way to
+        # exercise the pass-through path at all.
         self.spec(kind="op", nodes={"1": 1.0})
-        net = ("* j\nV1 1 0 1\nR1 1 2 1k\nVg 3 0 0\nJ1 2 3 0 jm\n"
-               "R2 2 0 1k\n.model jm NJF(VTO=-1 BETA=1m)\n.op\n")
+        net = ("* a\nV1 1 0 1\nA1 %v(2) %v(1) amp\nR1 2 0 1k\n"
+               ".model amp amp(in_gain=2)\n.op\n")
         r = spice.simulate(net, engine="ngspice")
         self.assertEqual(r["status"], "ok", r)
         self.assertEqual(r["engine_used"], "ngspice")
         self.assertFalse(r["netlist_parsed"])
-        self.assertIn("J1", r["netlist_parse_note"])
+        self.assertIn("A1", r["netlist_parse_note"])
         b = spice.simulate(net)
         self.assertEqual(b["status"], "error")
         self.assertEqual(b["reason_code"], "NETLIST_INVALID")
+        self.assertIn("XSPICE", b["message"])
 
 
 class TestCrossCheck(EngineCase):

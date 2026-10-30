@@ -20,8 +20,11 @@ What is solved
 
 Devices: R, C, L, V, I (DC / PULSE / SIN / PWL / AC), E (VCVS), G (VCCS),
 D (Shockley), Q (Ebers-Moll injection), M (Shichman-Hodges level 1),
-T (lossless transmission line: a pair of wires at DC, exact Y parameters in
-AC, the method of characteristics in transient).
+J (JFET level 1: the same square law as M without the 1/2 factor, three
+terminals, AREA as the only geometry knob), F/H/K (controlled sources and
+mutual inductance), S/W (switches), T (lossless transmission line: a pair of
+wires at DC, exact Y parameters in AC, the method of characteristics in
+transient), O/U (distributed lines as lumped ladders).
 
 Hierarchy: `.subckt` / `.ends` with X instances, numeric parameters and `{...}`
 arithmetic on them. Instances are FLATTENED before the solver sees them, and the
@@ -57,7 +60,6 @@ GROUND_NAMES = ("0", "gnd", "ground", "gnd!", "vss")
 # Everything the language has that this module refuses by name instead of
 # silently ignoring (a silently ignored card is how a netlist "runs" and lies).
 NOT_IMPLEMENTED_CARDS = {
-    "J": "JFET",
     "A": "XSPICE analogue behavioural block",
 }
 
@@ -305,7 +307,7 @@ def parse_netlist(text):
     # .model cards may come after the instances that use them, so the reference
     # check is deferred to the end (a netlist is not read in order)
     for el in spec["elements"]:
-        if el["type"] not in ("D", "Q", "M", "S", "W"):
+        if el["type"] not in ("D", "Q", "M", "J", "S", "W"):
             continue
         model = el["model"]
         if model not in spec["models"]:
@@ -313,6 +315,7 @@ def parse_netlist(text):
                              % (el.get("lineno", 0), el["name"], model))
         kind = spec["models"][model]["type"]
         want = {"D": ("D",), "Q": ("NPN", "PNP"), "M": ("NMOS", "PMOS"),
+                "J": ("NJF", "PJF"),
                 "S": ("SW",), "W": ("CSW",)}[el["type"]]
         if kind not in want:
             raise ValueError("line %d: %s needs a %s model, %r is %s"
@@ -1277,6 +1280,49 @@ def _parse_element(spec, line, lineno):
                                  "(only an initial state, ON or OFF, may follow "
                                  "the model name)" % (lineno, name, tok, letter))
         return el
+    if letter == "J":
+        # J: Jname nd ng ns model [AREA=<x>] [OFF]
+        # THREE terminals, not four: a JFET's gate is a junction to the channel,
+        # and level-1 SPICE has no separate bulk terminal. It is not a mistake to
+        # read the third node as the drain and the fourth as a model name - the
+        # card has no fourth node at all.
+        if len(parts) < 5:
+            raise ValueError("line %d: %s: a J card is `Jname nd ng ns model "
+                             "[AREA=<x>]`; got %r"
+                             % (lineno, name, " ".join(parts[1:])))
+        if "=" in parts[4]:
+            raise ValueError("line %d: %s: the model name comes before any "
+                             "parameter and %r is not a model name; a J card has "
+                             "three nodes (drain, gate, source), then the model"
+                             % (lineno, name, parts[4]))
+        el = {"type": "J", "name": name, "lineno": lineno,
+              "nodes": (_node(parts[1]), _node(parts[2]), _node(parts[3])),
+              "model": parts[4].lower(), "_area": None, "_off": False}
+        for tok in parts[5:]:
+            if "=" not in tok:
+                if tok.lower() == "off":
+                    # an initial guess, not a state: the operating point is
+                    # solved, so OFF cannot change a converged answer (measured:
+                    # ngspice returns the same current with and without it)
+                    el["_off"] = True
+                    continue
+                raise ValueError("line %d: %s: %r is not a field of a J card "
+                                 "(only AREA=<x> and the OFF flag may follow the "
+                                 "model name)" % (lineno, name, tok))
+            key, raw = tok.split("=", 1)
+            if key.strip().lower() != "area":
+                raise ValueError("line %d: %s: %s= is not a J card field here "
+                                 "(implemented: AREA=, plus the OFF flag). W= and "
+                                 "L= are refused by ngspice itself on a J card - a "
+                                 "junction FET's geometry scales through AREA"
+                                 % (lineno, name, key.strip()))
+            area = _value(raw)
+            if area <= 0.0:
+                raise ValueError("line %d: %s has AREA=%g; an area factor scales "
+                                 "the transconductance and cannot be zero or "
+                                 "negative" % (lineno, name, area))
+            el["_area"] = area
+        return el
     if letter == "D":
         model = val(3, "model name").lower()
         return {"type": "D", "name": name, "lineno": lineno,
@@ -2086,6 +2132,14 @@ class _Circuit(object):
             if el["type"] in ("S", "W"):
                 self._resolve_switch(el)
                 self.switches.append(el)
+        # JFETs: level-1 (Shichman-Hodges). Resolved here for the same reason the
+        # switches are - a model parameter this subset does not stamp has to fail
+        # on the card's own line number, not turn into a number nobody chose.
+        self.jfets = []
+        for el in self.elements:
+            if el["type"] == "J":
+                self._resolve_jfet(el)
+                self.jfets.append(el)
         # Nodes that exist only inside a ladder: reported nowhere, because they
         # are not the caller's nodes (the O/U card is, with its section count).
         ext, inn = set(), set()
@@ -2111,7 +2165,7 @@ class _Circuit(object):
     def is_linear(self):
         # a constant B source is an ordinary source: calling it nonlinear would
         # add damping to a circuit that solves exactly in one step
-        return not any(el["type"] in ("D", "Q", "M", "S", "W")
+        return not any(el["type"] in ("D", "Q", "M", "J", "S", "W")
                        or (el["type"] in ("BV", "BI") and el["deps"])
                        for el in self.elements)
 
@@ -2212,6 +2266,110 @@ class _Circuit(object):
                                     self.by_name[key]["type"]))
             el["_ctrl_row"] = self.branch_idx[self.branch_name[key]]
             el["_ctrl_resolved"] = self.by_name[key]["name"]
+
+    # -- JFETs (J)
+    _JFET_IMPL = ("VTO", "BETA", "LAMBDA", "AREA")
+
+    _JFET_REFUSED = {
+        "RD": "a drain series resistance. It is an INTERNAL node between the drain "
+              "terminal and the channel - it shifts the operating point and the "
+              "transconductance - so it is not a number that can be added to the "
+              "answer afterwards (measured: RD=100 with a 0.2 V drain moves the "
+              "current by 14%)",
+        "RS": "a source series resistance, an internal node for the same reason as "
+              "RD= (measured: RS=100 with a 0.2 V drain moves the current by 16%)",
+        "B": "the doping-tail parameter of the level-1 model. It is not the "
+             "Shichman-Hodges square law this subset stamps: B=2 reads 1.5x and "
+             "B=0.5 reads 0.75x the current (measured), i.e. a different equation",
+        "IS": "a gate-junction saturation current, i.e. a gate-channel diode. This "
+              "subset stamps no gate junction at all (the gate draws no current, "
+              "which is exact below ~0.5 V of forward gate bias and wrong above it "
+              "- the element report says when a deck crosses that line)",
+        "CGS": "a gate-source capacitance. AC analysis here has no device "
+               "capacitances - only C cards charge - so a nonzero CGS= would be "
+               "missing from every AC answer with nothing on the page to say so",
+        "CGD": "a gate-drain capacitance (same reason as CGS=)",
+        "PB": "a gate-junction potential barrier; there is no gate junction here "
+              "(see IS=)",
+        "MJ": "a gate-junction grading coefficient; there is no gate junction here "
+              "(see IS=)",
+        "FC": "a gate-junction forward-bias coefficient; there is no gate junction "
+              "here (see IS=)",
+        "KF": "a flicker-noise coefficient. The noise report here carries channel "
+              "thermal noise only, so a nonzero KF= would be a silently quiet "
+              "answer",
+        "AF": "a flicker-noise exponent; no flicker noise is modelled (see KF=)",
+        "TCV": "a threshold temperature coefficient; this subset solves at one "
+               "temperature (27 C) and does not scale VTO",
+        "BEX": "a transconductance temperature exponent; this subset solves at one "
+               "temperature (27 C) and does not scale BETA",
+        "BETA1": "a second transconductance parameter of the level-2 JFET model; "
+                 "only the level-1 square law is implemented",
+        "LAMBDA1": "a second channel-length modulation parameter of the level-2 "
+                   "model; only level 1 is implemented",
+    }
+
+    def _resolve_jfet(self, el):
+        where = "line %s" % (el.get("lineno") or "?")
+        model = self.models.get(el["model"])
+        if model is None:
+            raise ValueError("%s: %s references .model %r which is not defined"
+                             % (where, el["name"], el["model"]))
+        kind = model["type"]
+        if kind not in ("NJF", "PJF"):
+            raise ValueError("%s: %s needs an NJF or PJF model and %r is %s"
+                             % (where, el["name"], el["model"], kind))
+        params = dict(model["params"])
+        for k in sorted(params):
+            if k in self._JFET_IMPL:
+                continue
+            if k in ("RD", "RS") and float(params[k]) == 0.0:
+                continue          # zero is the engine's own default: no internal node
+            if k == "B" and float(params[k]) == 1.0:
+                continue          # 1.0 is the engine's default: the square law itself
+            why = self._JFET_REFUSED.get(k)
+            if why is not None:
+                raise ValueError("%s: .model %r: %s= is %s; it is refused by name "
+                                 "instead of being ignored (an ignored parameter is "
+                                 "a netlist that runs and lies)"
+                                 % (where, el["model"], k, why))
+            raise ValueError("%s: .model %r has %s=, which is not a parameter of a "
+                             "%s JFET here (implemented: %s)"
+                             % (where, el["model"], k, kind,
+                                ", ".join(self._JFET_IMPL)))
+        defaults = {"VTO": -2.0, "BETA": 1e-4, "LAMBDA": 0.0, "AREA": 1.0}
+        vals = {}
+        for key, dflt in defaults.items():
+            if key == "AREA":
+                # the card's AREA= wins over the model's (measured: model AREA=2
+                # with card AREA=3 gives 3x, not 6x - the card REPLACES it)
+                if el.get("_area") is not None:
+                    vals[key] = float(el["_area"])
+                    continue
+            if key in params:
+                vals[key] = float(params[key])
+            else:
+                vals[key] = dflt
+                # a defaulted threshold or transconductance is exactly the kind of
+                # number that turns into a plausible wrong curve against a real
+                # part's model card, so it is said out loud
+                self.defaulted["%s.%s" % (el["model"], key.lower())] = dflt
+        if vals["BETA"] <= 0.0:
+            raise ValueError("%s: .model %r has BETA=%g; a transconductance "
+                             "parameter cannot be zero or negative (it scales Id in "
+                             "both the linear and the saturation region)"
+                             % (where, el["model"], vals["BETA"]))
+        if vals["LAMBDA"] < 0.0:
+            raise ValueError("%s: .model %r has LAMBDA=%g; a negative channel-length "
+                             "modulation would make the saturation current FALL as "
+                             "Vds rises" % (where, el["model"], vals["LAMBDA"]))
+        if vals["AREA"] <= 0.0:
+            raise ValueError("%s: %r gives AREA=%g; an area factor scales the "
+                             "transconductance and cannot be zero or negative"
+                             % (where, el["model"], vals["AREA"]))
+        vals["POLARITY"] = kind
+        vals["BETA_eff"] = vals["BETA"] * vals["AREA"]
+        el["_jf"] = vals
 
     def _switch_control(self, el, x):
         """What the switch compares against its threshold."""
@@ -2327,6 +2485,41 @@ class _Circuit(object):
         ids *= s            # back to the polarity of the real terminals
         return ids, 0.0, -ids, 0.0
 
+    def _jfet_currents(self, el, vd, vg, vs):
+        """Level-1 (Shichman-Hodges) drain current: (id, ig, is).
+
+        The two forms are MEASURED against ngspice-47, not copied from a
+        textbook, and they are not the MOSFET's:
+
+            saturation (Vds >= Vov):  Id = BETA*(Vov)^2*(1 + LAMBDA*Vds)
+            linear     (Vds <  Vov):  Id = BETA*(2*Vov*Vds - Vds^2)*(1 + LAMBDA*Vds)
+
+        i.e. twice the MOSFET's saturation current for the same BETA and no
+        factor of 1/2 anywhere: BETA=1m with Vgs-Vto=1 reads 1 mA, not 0.5 mA
+        (measured, docs/42). The two forms meet exactly at Vds = Vov, so the
+        region boundary needs no smoothing term.
+
+        The gate draws nothing: this subset stamps no gate-channel junction, and
+        the element report raises `gate_junction_forward_v` when a deck actually
+        forward-biases that junction (measured effect: nil below ~0.5 V, 1 mA at
+        5 V on a 36 mA device - above that the engine itself starts to struggle).
+        """
+        jf = el["_jf"]
+        s = 1.0 if jf["POLARITY"] == "NJF" else -1.0
+        vgs = s * (vg - vs)
+        vds = s * (vd - vs)
+        vov = vgs - jf["VTO"]
+        if vov <= 0.0:
+            idr = 0.0
+        elif vds < vov:
+            idr = (jf["BETA_eff"] * (2.0 * vov * vds - vds * vds)
+                   * (1.0 + jf["LAMBDA"] * vds))
+        else:
+            idr = (jf["BETA_eff"] * vov * vov
+                   * (1.0 + jf["LAMBDA"] * vds))
+        ids = s * idr
+        return ids, 0.0, -ids
+
     # -- assembly
     def assemble(self, x_prev, t=None, mode="dc", gmin=1e-12, caps=None):
         """Build A, b. `x_prev` is the previous solution (for Newton and for the
@@ -2434,6 +2627,8 @@ class _Circuit(object):
                 self._stamp_bjt(A, b, el, x_prev, mode)
             elif T == "M":
                 self._stamp_mos(A, b, el, x_prev, mode)
+            elif T == "J":
+                self._stamp_jfet(A, b, el, x_prev, mode)
             elif T in ("S", "W"):
                 # Piecewise linear, not nonlinear: one of two conductances is
                 # stamped, picked by a state - and the state is NOT re-read here.
@@ -2600,6 +2795,17 @@ class _Circuit(object):
         jac = _numeric_jac(lambda v: list(self._mos_currents(el, v[0], v[1], v[2], v[3])),
                            volts)
         self._stamp_generic(A, b, [nd, ng, ns, nbb], cur, jac, volts, mode)
+
+    def _stamp_jfet(self, A, b, el, x_prev, mode="dc"):
+        nd, ng, ns = el["nodes"]
+        vd = self._x(x_prev, nd).real
+        vg = self._x(x_prev, ng).real
+        vs = self._x(x_prev, ns).real
+        cur = list(self._jfet_currents(el, vd, vg, vs))
+        volts = [vd, vg, vs]
+        jac = _numeric_jac(lambda v: list(self._jfet_currents(el, v[0], v[1], v[2])),
+                           volts)
+        self._stamp_generic(A, b, [nd, ng, ns], cur, jac, volts, mode)
 
     def b_value(self, el, x, t=None):
         """Evaluate a B source's expression at the solution `x`."""
@@ -3012,6 +3218,49 @@ def _element_report(circ, x, t=None, mode="dc"):
             rec["power_w"] = round((vd - vs) * cur[0], 15)
             rec["region"] = ("saturation" if abs(sg * (vd - vs)) >
                              abs(rec["vov_v"]) else "linear/triode")
+        elif T == "J":
+            nd, ng, ns = el["nodes"]
+            g = lambda n: (x[circ.i(n) - 1].real if circ.i(n) else 0.0)  # noqa: E731
+            vd, vg, vs = g(nd), g(ng), g(ns)
+            jf = el["_jf"]
+            sg = 1.0 if jf["POLARITY"] == "NJF" else -1.0
+            cur = circ._jfet_currents(el, vd, vg, vs)
+            h = 1e-6
+            idp = circ._jfet_currents(el, vd, vg + h, vs)[0]
+            idm = circ._jfet_currents(el, vd, vg - h, vs)[0]
+            vgs = sg * (vg - vs)
+            vds = sg * (vd - vs)
+            vov = vgs - jf["VTO"]
+            rec["vgs_v"] = round(vgs, 9)
+            rec["vds_v"] = round(vds, 9)
+            rec["vov_v"] = round(vov, 9)
+            rec["current_a"] = {"id": round(cur[0], 15)}
+            rec["current_convention"] = "positive INTO the drain terminal"
+            rec["gm_s"] = round((idp - idm) / (2.0 * h), 9)
+            rec["power_w"] = round((vd - vs) * cur[0], 15)
+            rec["region"] = ("cutoff" if vov <= 0.0 else
+                             ("saturation" if vds >= vov else "linear"))
+            rec["polarity"] = jf["POLARITY"]
+            rec["model_params"] = {"VTO": jf["VTO"], "BETA": jf["BETA"],
+                                   "LAMBDA": jf["LAMBDA"], "AREA": jf["AREA"],
+                                   "BETA_eff": jf["BETA_eff"]}
+            # This subset stamps no gate-channel junction, and that is exact until
+            # the junction forward-biases: measured, the engine's own extra gate
+            # current is below 1 uA until ~0.5 V of forward gate bias and 1 mA on a
+            # 36 mA device at 5 V. So the number is reported, not assumed away.
+            if jf["POLARITY"] == "NJF":
+                fwd = max(vg - vd, vg - vs)
+            else:
+                fwd = max(vd - vg, vs - vg)
+            rec["gate_junction_forward_v"] = round(fwd, 9)
+            if fwd > 0.5:
+                note = ("%s gate junction is forward biased by %g V; this subset "
+                        "stamps no gate-channel diode, so the gate current here is "
+                        "0 A by construction and the answer above is outside the "
+                        "model" % (el["name"], fwd))
+                rec["outside_model"] = note
+                if note not in circ.disabled:
+                    circ.disabled.append(note)
         elif T == "T":
             n1, n2, n3, n4 = el["nodes"]
             if mode == "tran":
@@ -3058,7 +3307,8 @@ def _node_dict(circ, x, complex_ok=False):
 PRECISION = (
     "linear solves are dense LU in double precision, so a well-conditioned "
     "circuit is good to ~1e-9 relative; the error that matters is the MODEL: "
-    "level-1 MOSFET with KP*(W/L)*m, Ebers-Moll BJT and an ideal Shockley diode "
+    "level-1 MOSFET with KP*(W/L)*m, level-1 JFET with BETA*AREA (no gate "
+    "junction, no RD/RS), Ebers-Moll BJT and an ideal Shockley diode "
     "with no series resistance, no junction capacitance and no temperature beyond "
     "the one stated. Noise is thermal 4kT/R and shot 2q*I only (.noise, since "
     "0.0.32). A converged answer is the answer to this netlist, not to the board"
@@ -3071,12 +3321,14 @@ NOT_COMPUTED = [
     "accepted inside .model parameters",
     "a .subckt nested inside another .subckt, and any directive other than "
     ".model inside a .subckt body",
-    "JFETs (J) and XSPICE blocks (A) are refused by name. Switches (S/W), "
-    "controlled sources (F/H) and mutual inductance (K) ARE solved, but not their "
-    "second-order physics: a switch has two resistance states, no charge injection, "
-    "no capacitance and no break-before-make, K has no loss terms, no "
-    "frequency-dependent core and no saturation, and an F/H gain is a constant, not "
-    "a table",
+    "XSPICE blocks (A) are refused by name. JFETs (J), switches (S/W), controlled "
+    "sources (F/H) and mutual inductance (K) ARE solved, but not their second-order "
+    "physics: a JFET has no gate-channel junction diode (the report says when a "
+    "deck forward-biases it past 0.5 V), no RD/RS internal nodes, no device "
+    "capacitance and no flicker noise; a switch has two resistance states, no "
+    "charge injection, no capacitance and no break-before-make; K has no loss "
+    "terms, no frequency-dependent core and no saturation; and an F/H gain is a "
+    "constant, not a table",
     "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss; W= "
     "L= and M= scale KP*(W/L)*m (level 1), while AD= AS= PD= PS= and the rest are "
     "read and reported as ignored, because junction capacitance and leakage are "
@@ -3211,6 +3463,17 @@ def _noise_sources(circ, x):
                         4.0 * kT * (2.0 / 3.0) * abs(gm),
                         "4kT*(2/3)*gm (channel thermal, saturation form; no flicker, "
                         "no induced gate noise)"))
+        elif T == "J":
+            nd, ng, ns = el["nodes"]
+            v = [volt(nd), volt(ng), volt(ns)]
+            jac = _numeric_jac(lambda vv: list(circ._jfet_currents(el, vv[0], vv[1],
+                                                                 vv[2])), v)
+            gm = jac[0][1]
+            out.append((el["name"], "channel_thermal", nd, ns,
+                        4.0 * kT * (2.0 / 3.0) * abs(gm),
+                        "4kT*(2/3)*gm (channel thermal, saturation form; the gate "
+                        "junction's shot noise and flicker are not modelled, and "
+                        "there is no gate current to make shot noise from)"))
     return out
 
 def _noise_band(points, key, geometric=False):
