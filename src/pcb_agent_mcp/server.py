@@ -954,6 +954,54 @@ def selftest():
               < 1e-9,
               "%s vs %s" % (_vv.get("rth_interface_k_per_w"), round(_r_tim, 9)))
 
+        # Crosstalk: the modal algebra and the time loop, on synthetic
+        # capacitances. No field solve here on purpose - one microstrip pair
+        # costs 30 s to 76 s, and what has to be checked at start-up is the
+        # algebra around it. The two structural facts that must hold for ANY
+        # per-unit-length numbers are (1) no coupling means a silent victim, and
+        # (2) a homogeneous dielectric means the two modal velocities are equal,
+        # so far-end crosstalk cancels arithmetically and not by assumption.
+        from .calc import crosstalk as _xt
+
+        def _xt_modes(c_even, c_odd, er):
+            return _xt.modal_from_caps(c_odd * er, c_even * er, c_odd, c_even)
+
+        def _xt_peaks(m):
+            wf, _bad = _xt._waveforms(m, 50.0, 0.2e-9, 1.0,
+                                      m["z_isolated_ohm"], m["z_isolated_ohm"])
+            assert _bad is None, _bad
+            return (_xt._peak(wf["t"], wf["victim_near"])[0],
+                    _xt._peak(wf["t"], wf["victim_far"])[0],
+                    wf["aggressor_far"][-1])
+
+        _xt_flat = _xt_peaks(_xt_modes(5.0, 5.0, 4.3))
+        check("a pair with no coupling leaks nothing onto its neighbour",
+              _xt_flat[0] == 0.0 and _xt_flat[1] == 0.0
+              and abs(_xt_flat[2] - 0.5) < 1e-12,
+              "%s %s %s" % (_xt_flat[0], _xt_flat[1], _xt_flat[2]))
+
+        # k_c == k_l == 0.0476 here: er_eff is 4.3 on BOTH modes, the two
+        # velocities agree to 1e-16, and the far end is exactly zero while the
+        # near end is not (otherwise this would pass by being trivially dead).
+        _xt_hom = _xt_peaks(_xt_modes(5.0, 5.5, 4.3))
+        _xt_hom_m = _xt_modes(5.0, 5.5, 4.3)
+        check("a homogeneous dielectric has no far-end crosstalk at all",
+              abs(_xt_hom[1]) < 1e-12 and abs(_xt_hom[0]) > 1e-2
+              and abs(_xt_hom_m["er_eff_odd"] - 4.3) < 1e-12
+              and abs(_xt_hom_m["er_eff_even"] - 4.3) < 1e-12
+              and abs(_xt_hom_m["v_odd_m_s"] - _xt_hom_m["v_even_m_s"])
+              / _xt_hom_m["v_even_m_s"] < 1e-14,
+              "%s %s" % (_xt_hom[0], _xt_hom[1]))
+
+        # Weak coupling: NEXT is a quarter of the coupling coefficients times the
+        # wave that ARRIVES (amp/2 into a matched pair), not times the source.
+        _xt_weak = _xt_modes(5.0, 5.02, 4.3)
+        _xt_n = _xt_peaks(_xt_weak)[0]
+        _xt_want = 0.25 * (_xt_weak["k_l"] + _xt_weak["k_c"]) * 0.5
+        check("near-end crosstalk is Kb times the incident wave, not the source",
+              abs(_xt_n / _xt_want - 1.0) < 2e-5,
+              "%s vs %s" % (round(_xt_n, 9), round(_xt_want, 9)))
+
         # --- cavity / electro-thermal. Again only closed forms and hand
         # arithmetic: f10 for a 100 mm plane at er=4.3 is c/(2 sqrt(er) * 0.1 m),
         # which is also the definition of a half guided wavelength.

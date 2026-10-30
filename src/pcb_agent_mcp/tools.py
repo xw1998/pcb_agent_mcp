@@ -39,6 +39,7 @@ from .calc import filters as _filters
 from .calc import magnetics as _magnetics
 from .calc import filtermatrix as _filtermatrix
 from .calc import stackup as _stackup
+from .calc import crosstalk as _crosstalk
 from .fidelity import fill as _fill
 from .calc import chain as _chain
 from .calc import rules as _rules
@@ -566,6 +567,60 @@ _tool(
         tan_delta=float(a.get("tan_delta", 0.0) or 0.0),
         max_nodes=int(a.get("max_nodes", 60000)),
         ground_mm=float(a.get("ground_mm", 0.0) or 0.0)),
+)
+
+_tool(
+    "crosstalk_coupled_lines",
+    "How much of an edge lands on the trace next to it: near-end (NEXT) and far-end "
+    "(FEXT) crosstalk between two parallel microstrips or striplines, from a 2-D field "
+    "solution of the pair (odd and even modes, dielectric AND vacuum) feeding an exact "
+    "time-domain solution of the coupled telegrapher's equations. No weak-coupling and "
+    "no long-line assumption; any rise time, any length, strong coupling included. "
+    "Returns both waveforms, the modal impedances/velocities, Cm and Lm, and the "
+    "first-order Kb beside the simulated peak so you can see the two disagree as the "
+    "coupling grows. FEXT comes out zero for a homogeneous dielectric because the two "
+    "modal velocities are equal - that is arithmetic here, not an assumption, and on "
+    "stripline the measured residue is 2e-5 %% of the source. One real cost: the four "
+    "cross-sections are solved, so this takes 30 s (stripline) to 2 min (microstrip). "
+    "Requires the SAME termination at each end of both lines (a mixed pair breaks the "
+    "modal decoupling) and no third conductor.",
+    {"type": "object",
+     "properties": {
+         "kind": _str("trace geometry", ["microstrip", "stripline"], "microstrip"),
+         "width_mm": _num("width of EACH of the two traces (they are symmetric)"),
+         "spacing_mm": _num("edge-to-edge gap between the two traces"),
+         "dielectric_mm": _num("height from the trace to its reference plane; "
+                               "stripline: half the plane-to-plane separation"),
+         "length_mm": _num("length the two traces run side by side (the ports are at "
+                           "the ends of this run)"),
+         "rise_time_ns": _num("10-90 %% rise time of the aggressor's trapezoid. FEXT is "
+                              "proportional to 1/rise_time in this model, so this "
+                              "number is the single most sensitive input"),
+         "copper_um": _num("copper thickness in um; 0 = zero-thickness", 35),
+         "er": _num("relative permittivity", 4.3),
+         "amplitude_v": _num("open-circuit step amplitude of the aggressor's source", 1),
+         "termination_ohm": _num("the resistor at EACH of the four ports; leave out to "
+                                 "use the isolated-line impedance (what a driver into "
+                                 "a receiver usually looks like)", None),
+         "mesh_div": _num("cells across the smallest feature of the cross-section: "
+                          "12 = default; 8 measured 2.6x faster on w=s=h=0.2 microstrip "
+                         "and moved Z by 0.06 %, NEXT by 0.4 %",
+                          12),
+         "samples_per_delay": _num("time steps per modal delay in the transient", 60),
+         "waveform_points": _num("points in each returned waveform", 101),
+     },
+     "required": ["width_mm", "spacing_mm", "dielectric_mm", "length_mm",
+                  "rise_time_ns"]},
+    lambda a: _crosstalk.coupled_lines(
+        a.get("kind", "microstrip"), a["width_mm"], a["spacing_mm"],
+        a["dielectric_mm"], a["length_mm"], a["rise_time_ns"],
+        copper_um=float(a.get("copper_um", 35.0)), er=float(a.get("er", 4.3)),
+        amplitude_v=float(a.get("amplitude_v", 1.0)),
+        termination_ohm=(None if a.get("termination_ohm") is None
+                         else float(a["termination_ohm"])),
+        mesh_div=int(a.get("mesh_div", 12)),
+        samples_per_delay=int(a.get("samples_per_delay", 60)),
+        waveform_points=int(a.get("waveform_points", 101))),
 )
 
 _tool(
