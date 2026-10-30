@@ -1114,6 +1114,57 @@ def selftest():
               and "3 value(s) for 2 input node(s)" in _m,
               _m[:90])
 
+        # 0.0.41: the two bias-dependent models in .ac. Until 0.0.40 a limit or
+        # mult block was REFUSED in a sweep because its small-signal gain depends on
+        # the operating point; now the sweep linearises at that point, and the pair
+        # below is the whole point - the SAME block passes its gain inside the band
+        # and nothing outside it, both numbers measured on the bundled engine first.
+        _LIM = (".model lim1 limit(gain=2 out_lower_limit=-1 out_upper_limit=1)"
+                "\nR1 10 0 1k\n.ac dec 1 1k 2k\n")
+        _reads = []
+        for _dc in (0.2, 2.0):
+            r = handle({"jsonrpc": "2.0", "id": 163, "method": "tools/call",
+                        "params": {"name": "sim_spice", "arguments": {
+                            "netlist": ("* l\nV1 1 0 DC %g AC 1\nA1 1 10 lim1\n"
+                                        % _dc) + _LIM,
+                            "engine": "builtin"}}})
+            payload = json.loads(r["result"]["content"][0]["text"])
+            _pts = ((payload.get("value") or {}).get("points") or [{}])
+            _reads.append((payload.get("status"),
+                           (_pts[0].get("nodes_v") or {}).get("10") or {}))
+            if _dc == 2.0:
+                _warn = " ".join(payload.get("warnings") or [])
+        check("0.0.41: a limit block IS swept, linearised at its bias point - 0.2 V "
+              "in (0.4 V out, inside the band) passes the full gain 2.0, while 2 V "
+              "in is clipped and passes 0.0; the clipped case says so instead of "
+              "looking like a broken deck",
+              _reads[0][0] == "ok" and abs(_reads[0][1].get("re", 0.0) - 2.0) < 1e-9
+              and _reads[1][0] == "ok"
+              and abs(_reads[1][1].get("re", 9.0)) < 1e-12
+              and "small-signal gain is 0" in _warn,
+              str(_reads) + _warn[:80])
+
+        # ... and a multiplier's small-signal gain is the OTHER input's bias value,
+        # which no constant could reproduce: 2*2 * 3*(4+1) = 60, then *2 + 7's bias
+        # is a DC offset and contributes nothing to the slope.
+        r = handle({"jsonrpc": "2.0", "id": 164, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* m\nV1 1 0 DC 2 AC 1\nV2 2 0 DC 4\n"
+                                   "A1 [1 2] 10 mul1\n"
+                                   ".model mul1 mult(in_gain=[2 3] "
+                                   "in_offset=[1 1] out_gain=2 out_offset=7)\n"
+                                   "R1 10 0 1k\n.ac dec 1 1k 2k\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _pts = ((payload.get("value") or {}).get("points") or [{}])
+        _v10 = (_pts[0].get("nodes_v") or {}).get("10") or {}
+        check("0.0.41: a mult block is swept at its bias too - the slope is the "
+              "other input's value (2*2 * 3*(4+1) = 60 V per volt on node 1), not a "
+              "gain somebody picked",
+              payload.get("status") == "ok"
+              and abs(_v10.get("re", 0.0) - 60.0) < 1e-9,
+              str(_v10))
+
         # 0.0.30: the lossless line in the builtin. DC is a wire, so the matched
         # 3 V / 50 ohm divider must read 1.500 V at BOTH ports and +/-30 mA.
         r = handle({"jsonrpc": "2.0", "id": 145, "method": "tools/call",

@@ -293,10 +293,12 @@ selftest 157/158/159。负控制是后两条：**有状态的 code model 与会�
 - `mult` 的偏导是**真偏导**（双线性 ⇒ 每一步残差对某个输入是线性的），Newton 一两步收敛，
   不需要阻尼。
 - `mult` 因此进 `is_linear()` 的非线性判定（要电压限幅），`summer`/`gain` 不进。
-- `.ac` 下 `limit`/`mult` 拒绝、`summer`/`gain` 放行：乘积块的**小信号增益依赖工作点**
+- `.ac` 下 `limit`/`mult` 当时一律拒绝、`summer`/`gain` 放行：乘积块的**小信号增益依赖工作点**
   （`df/dv_k = out_gain * in_gain_k * Π_{j≠k}`），而这套求解器不带工作点进扫频。拒绝走的是
   `NETLIST_INVALID` 信封（带 `hint` 指向 `summer`/`gain`），**不是**让 `ValueError` 穿过
   `simulate()`——这条是 `0.0.40` 里唯一一处「先写了 raise、再补信封」的返工。
+  **`0.0.41` 把这句拒绝改成了真解**：扫频本来就有工作点（`_dc` 先跑，`x_prev` 就是 `x0`），
+  于是按偏置点线性化即可，见下面 §43.12。
 
 元素内部字段（`el["in_gain"]`/`el["in_offset"]` 是 list，`el["out_gain"]`/`el["out_offset"]`
 是标量，旧的标量 `el["gain"]` **已不存在**）与节点表（外部节点要含所有 `inputs`）一起改了，
@@ -323,3 +325,71 @@ selftest 侧是 id 160（summer 53 V）、161（mult 247 V）、162（`in_gain=[
 
 仍然按名字拒绝的：有状态/带时钟/除法类的 code model，以及 `%v()` 端口写法。理由没变——
 「跳过一张不认识的卡然后给出一个数字」正是这个模块一直在防的事。
+
+## 43.12 `0.0.41`：`limit` / `mult` 进了 `.ac`（按偏置点线性化）
+
+`0.0.40` 里这两张卡在 `.ac` 下一律 `NETLIST_INVALID`，理由写得很直白：「它的增益取决于工作点，
+而扫频不带工作点」。这句话其实**站不住**：`.ac` 分支本来就是先 `_dc(circ)` 拿到 `x0`、再把 `x0`
+当 `x_prev` 交给 `assemble()` 的——二极管、BJT、MOSFET、开关全都在那一点上线性化，`A` 卡没有
+任何理由享受例外。所以这一版把拒绝删掉，按同一条规则处理：
+
+    limit（带内） : df/dv = gain          （与 gain() 同）
+    limit（带外） : df/dv = 0             （输出被夹住，小信号进不来）
+    mult         : df/dv_k = out_gain * in_gain_k * PROD_{j≠k} in_gain_j*(v_j + in_offset_j)
+
+### 先量后写：参考引擎自己怎么算
+
+写代码之前先用随包 `ngspice-47` 跑了六张 deck（`.ac dec 1 1k 2k`）：
+
+| deck | `v(10)` |
+| --- | --- |
+| `limit(gain=2, hi=1)`，偏置 0.2 V（输出 0.4 V 在带内） | **2.0** |
+| 同上，偏置 2 V（输出被夹到 1 V） | **0.0** |
+| 同上，偏置 0.5 V（输出**恰好** 1.0 V = 上限） | **1.0** |
+| `mult()`，3 V / 4 V，只在第一个输入上驱动 AC | **4.0** |
+| `mult(in_gain=[2 3] in_offset=[1 1] out_gain=2 out_offset=7)`，2 V / 4 V | **60.0** |
+
+前两条正好是「带内给增益、带外给 0」，中间那条是这一轮唯一需要额外约定的事：
+
+**偏置正好落在边界上时，参考引擎报的是带内斜率的**一半（gain=2 报 1.0；换成 gain=4 同一个 tie 报
+2.0；偏一个 ulp 就变回整斜率或 0）。这是测出来的约定，不是推导出来的——典型的「正好卡在比较边上
+取了两侧平均」的实现痕迹。内置照抄（`_xspice_ac_slopes()` 里一个 `0.5` 分支），理由只有一个：
+**对拍要在能精确的地方精确**，否则每次扫到这条边界都会平白差一个增益。它是测度零的巧合，
+`0.0.41` 之后依然存在，所以这里写死而不是忽略。
+
+### 内部形态
+
+`assemble()` 的 `A` 分支在 `mode == "ac"` 时不再 raise，而是把 `x_prev`（就是 `x0`）里的输入电压
+取出来、交给 `_xspice_ac_slopes()` 算斜率，然后照常 stamp `row = v(out)` 与每输入 `-df/dv_i`。
+`x_prev is None` 仍然 raise（没有偏置点就没有可线性化的地方，这时候编一个增益才是错的）。
+
+`is_linear()` 里 `MULT` 仍算非线性——那是给 DC 的电压限幅用的（乘积块 Newton 需要阻尼），与
+`.ac` 无关。
+
+### 两条「平线要说明白」的告警
+
+线性化之后有两个输出会是彻底的 0，而 0 很容易被误读成 deck 写坏了，所以 `_ac` 出口**主动说**：
+
+- `limit` 的偏置在边界上或越过边界 ⇒ `this limit block is on or past its upper limit at the bias
+  point (in=2 V, out=1 V), so its small-signal gain is 0 …`；
+- `mult` 的某个输入在偏置点是 0 ⇒ `a multiplier has no gain around zero`。
+
+这两条是判据的一部分：**拒绝没了，但「为什么是 0」不能变成静默**。
+
+### 判据与负控制
+
+`tests/test_spice_bundled.py`（原 32 例 → 37 例）：
+
+- `test_a_limit_block_is_swept_at_its_bias_point`：带内 2.0 / 夹住 0.0，且夹住那条**必须带告警**；
+- `test_a_limit_block_exactly_on_a_bound_reports_half_the_slope`：tie 读 1.0；
+- `test_a_mult_block_is_swept_at_its_bias_point`：4.0 与 60.0；
+- `test_a_mult_with_a_zero_factor_has_no_small_signal_at_all`：0.0 + 告警（负控制：不是「碰巧算成 0」）；
+- `test_summer_is_still_swept_as_before`：线性多端口块不受影响（5.0），防「一起改坏」；
+- `test_cross_check_agrees_exactly_on_swept_limit_and_mult_blocks`：五张 deck 两引擎 `max_abs_diff_v`
+  全是 **0.0**——包括那条 tie。
+
+selftest 新增 id 163（limit：带内 2.0 / 夹住 0.0 + 告警文案）与 164（mult：60.0），`--selftest`
+实测 **146/146**。
+
+`0.0.40` 那条「`.ac` 遇 `mult` 必拒」的用例因此被上面五条替换——**这是唯一一处被撤销的判据**，
+撤销的理由写在用例注释里：拒绝的前提（「扫频不带工作点」）本来就是错的。

@@ -1473,6 +1473,23 @@ def _xspice_eval(el, vins):
     return raw, [el["out_gain"] * g for g in el["in_gain"]]
 
 
+def _xspice_ac_slopes(el, vins):
+    """Small-signal slopes of an A block at the bias point (the `.ac` linearisation).
+
+    This is `_xspice_eval` plus one convention that had to be MEASURED rather than
+    guessed: a `limit` block whose bias sits EXACTLY on a bound reports **half**
+    the inside slope in ngspice-47 (0.5 V in, gain=2, hi=1 => 1.0; gain=4 at the
+    same tie => 2.0; one ulp either side gives the full slope or zero). Reproduced
+    here so a cross-check against the engine is exact instead of differing on a
+    measure-zero tie. A mult block needs no special case: its partials are already
+    the bias-point values of the other inputs.
+    """
+    f0, slopes = _xspice_eval(el, vins)
+    if el["kind"] == "LIMIT" and el["lo"] is not None:
+        if f0 == el["lo"] or f0 == el["hi"]:
+            return f0, [s * 0.5 for s in slopes]
+    return f0, slopes
+
 def _parse_element(spec, line, lineno):
     parts = line.split()
     name = parts[0]
@@ -2933,18 +2950,25 @@ class _Circuit(object):
                 nb_ = self.i(nb)
                 ins_ = [self.i(n) for n in el["inputs"]]
                 if mode == "ac":
-                    if el["kind"] in ("LIMIT", "MULT"):
+                    # A clip and a multiplier are linearised AT THE BIAS POINT: the
+                    # sweep hands this function the DC operating point as x_prev, so
+                    # the slopes are the bias-point ones (gain inside the band and 0
+                    # outside it for a limit; the other inputs' bias values for a
+                    # mult). Measured against ngspice-47 before it was written: 2.0
+                    # inside the band and 0.0 clipped for a limit, 4.0 for
+                    # mult(A=3 V, B=4 V) driven on A. Without a bias point there is
+                    # nothing to linearise, and that stays an error rather than a
+                    # made-up gain.
+                    if x_prev is None:
                         raise ValueError(
-                            "%s: a %s block in an .ac sweep. The small-signal gain of "
-                            "a clipped block is the gain inside the band and zero "
-                            "outside it, and a mult block's gain is the other input's "
-                            "value, i.e. both depend on where the operating point "
-                            "sits, and this module does not carry an operating point "
-                            "into the sweep. Run .dc/.tran, or use a gain()/summer() "
-                            "model" % (el["name"], el["kind"].lower()))
+                            "%s: a %s block in an .ac sweep needs a DC operating "
+                            "point to be linearised at, and none was passed in"
+                            % (el["name"], el["kind"].lower()))
+                    vins0 = [x_prev[n - 1].real if n else 0.0 for n in ins_]
+                    f0, slopes = _xspice_ac_slopes(el, vins0)
                     self._add(A, row, nb_, 1.0)
                     for k_, n_in in enumerate(ins_):
-                        self._add(A, row, n_in, -el["out_gain"] * el["in_gain"][k_])
+                        self._add(A, row, n_in, -slopes[k_])
                 else:
                     vins0 = [x_prev[n - 1].real if n else 0.0 for n in ins_]
                     f0, slopes = _xspice_eval(el, vins0)
@@ -4418,18 +4442,11 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
             "'V1 1 0 AC 1' - the bare 'V1 1 0 3' is a DC value only)")
     # A clipped block's small-signal gain is the gain inside the band and zero
     # outside it, and a mult block's is the OTHER input's value: both are decided
-    # by where the operating point sits, and the sweep does not carry one into the
-    # matrix (assemble() would raise). Said here instead, as an envelope, so a
-    # caller sees a refusal rather than a traceback.
-    for el in circ.elements:
-        if el["type"] == "A" and el.get("kind") in ("LIMIT", "MULT"):
-            return err(
-                "%s: a %s block in an .ac sweep. Its small-signal gain depends on "
-                "where the operating point sits, and this sweep does not carry the "
-                "bias into the matrix. Run .dc/.tran, or use a gain()/summer() model"
-                % (el["name"], el["kind"].lower()), "NETLIST_INVALID",
-                hint="summer() is linear, so it IS swept; gain() is a constant. Only "
-                     "the two models whose gain moves with the bias are refused")
+    # by where the operating point sits. 0.0.41 linearises them AT that point
+    # (assemble() reads the bias out of x_prev, the same way it already does for a
+    # diode), so the sweep is real - but an output that sits on a bound carries no
+    # small signal at all, and a caller who sees a flat 0 deserves to be told why
+    # instead of guessing that the deck is broken.
     x0, iters, why = _dc(circ)
     if x0 is None:
         bad = _expression_failure(why)
@@ -4439,6 +4456,25 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                    "NOT_CONVERGED",
                    hint="AC is a small-signal linearisation AT the bias point; without "
                         "a bias there is no AC answer")
+    for el in circ.elements:
+        if el["type"] != "A" or el.get("kind") not in ("LIMIT", "MULT"):
+            continue
+        idxs = [circ.i(n) for n in el["inputs"]]
+        vins0 = [x0[k - 1].real if k else 0.0 for k in idxs]
+        f0, slopes = _xspice_ac_slopes(el, vins0)
+        if el["kind"] == "LIMIT" and all(s == 0.0 for s in slopes):
+            circ.disabled.append(
+                "%s: this limit block is on or past its %s limit at the bias "
+                "point (in=%g V, out=%g V), so its small-signal gain is 0 and its "
+                "output carries no AC at any frequency - a flat trace is the bias "
+                "showing through, not a broken deck"
+                % (el["name"], "upper" if f0 == el["hi"] else "lower",
+                   vins0[0], f0))
+        elif el["kind"] == "MULT" and any(s == 0.0 for s in slopes):
+            circ.disabled.append(
+                "%s: at the bias point one of this mult block's factors is 0, so "
+                "the small-signal gain of the whole product is 0 in every direction "
+                "(a multiplier has no gain around zero)" % el["name"])
     points = []
     tline_warned = set()
     for f in freqs:
@@ -4471,7 +4507,10 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                      "bias_point_v": _node_dict(circ, x0)},
               unit="mixed", model="mna_complex_ac",
               basis="complex MNA at each frequency, small-signal linearised at the DC "
-                    "operating point (the standard SPICE .ac definition); capacitors "
+                    "operating point (the standard SPICE .ac definition); an XSPICE "
+                    "limit block contributes the gain inside its band and 0 outside "
+                    "it, a mult block contributes the other inputs' bias values "
+                    "(0.0.41, measured against ngspice-47); capacitors "
                     "j*w*C, inductors solved as a branch with v - j*w*L*i = 0",
               precision="linear and exact in double precision for the linearised "
                         "circuit; for a nonlinear device the answer is only as good as "

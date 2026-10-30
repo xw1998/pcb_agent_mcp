@@ -255,19 +255,81 @@ class TestLookupRules(unittest.TestCase):
         self.assertEqual(r["status"], "error")
         self.assertEqual(r["reason_code"], "NETLIST_INVALID")
 
-    def test_a_mult_block_is_refused_in_ac_like_limit(self):
-        # a mult's small-signal gain IS the other input's value, so it depends on
-        # the operating point; sweeping without one would report a gain nobody
-        # chose. summer() is linear and is allowed - the pair keeps this honest.
-        bad = spice.simulate("* m\nV1 1 0 ac 1\nV2 2 0 ac 1\nA1 [1 2] 10 m1\n"
-                             ".model m1 mult()\nR1 10 0 1k\n.ac dec 1 1 10\n",
-                             engine="builtin")
-        self.assertEqual(bad["status"], "error")
-        self.assertIn("in an .ac sweep", bad["message"])
+    def test_a_limit_block_is_swept_at_its_bias_point(self):
+        # 0.0.39/0.0.40 refused a limit/mult block in .ac because its small-signal
+        # gain depends on the bias. 0.0.41 linearises at the bias instead, and the
+        # two readings below are the engine's own (measured, not chosen): inside
+        # the band the block passes its gain, outside it passes nothing.
+        def ac(dc):
+            r = spice.simulate("* l\nV1 1 0 DC %g AC 1\nA1 1 10 lim1\n"
+                               ".model lim1 limit(gain=2 out_lower_limit=-1 "
+                               "out_upper_limit=1)\nR1 10 0 1k\n.ac dec 1 1k 2k\n" % dc,
+                               engine="builtin")
+            self.assertEqual(r["status"], "ok", r.get("message"))
+            v = r["value"]["points"][0]["nodes_v"]["10"]
+            return complex(v["re"], v["im"]), r
+        inside, _ = ac(0.2)          # 0.4 V out, well inside [-1, 1]
+        self.assertAlmostEqual(inside.real, 2.0, delta=1e-12)
+        self.assertAlmostEqual(inside.imag, 0.0, delta=1e-12)
+        clipped, r = ac(2.0)         # 4 V unclipped, so the bias sits on +1 V
+        self.assertAlmostEqual(abs(clipped), 0.0, delta=1e-12)
+        # a flat 0 is the honest answer here, but it must not look like a broken
+        # deck: the warning names the block and the bound it is stuck on
+        joined = " ".join(r.get("warnings") or [])
+        self.assertIn("limit", joined)
+        self.assertIn("small-signal gain is 0", joined)
+
+    def test_a_limit_block_exactly_on_a_bound_reports_half_the_slope(self):
+        # Measured tie convention (ngspice-47): a bias that lands EXACTLY on a
+        # bound reports half the inside slope - 0.5 V in, gain=2, hi=1 reads 1.0,
+        # not 2.0 and not 0.0, and gain=4 at the same tie reads 2.0. One ulp either
+        # side gives the full slope or zero, so this is a measure-zero case that is
+        # reproduced only because a cross-check has to be exact where it can be.
+        r = spice.simulate("* l\nV1 1 0 DC 0.5 AC 1\nA1 1 10 lim1\n"
+                           ".model lim1 limit(gain=2 out_lower_limit=-1 "
+                           "out_upper_limit=1)\nR1 10 0 1k\n.ac dec 1 1k 2k\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "ok", r.get("message"))
+        v = r["value"]["points"][0]["nodes_v"]["10"]
+        self.assertAlmostEqual(v["re"], 1.0, delta=1e-12)
+
+    def test_a_mult_block_is_swept_at_its_bias_point(self):
+        # mult(3 V, 4 V) driven on the first input: the small-signal gain IS the
+        # other input's bias value, 4.0 - the number the engine reports too.
+        r = spice.simulate("* m\nV1 1 0 DC 3 AC 1\nV2 2 0 DC 4\nA1 [1 2] 10 mul1\n"
+                           ".model mul1 mult()\nR1 10 0 1k\n.ac dec 1 1k 2k\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "ok", r.get("message"))
+        v = r["value"]["points"][0]["nodes_v"]["10"]
+        self.assertAlmostEqual(v["re"], 4.0, delta=1e-12)
+        # with gains and offsets: out_gain*in_gain_1*(in_gain_2*(4+1)) = 2*2*15
+        r = spice.simulate("* m\nV1 1 0 DC 2 AC 1\nV2 2 0 DC 4\nA1 [1 2] 10 mul1\n"
+                           ".model mul1 mult(in_gain=[2 3] in_offset=[1 1] "
+                           "out_gain=2 out_offset=7)\nR1 10 0 1k\n.ac dec 1 1k 2k\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "ok", r.get("message"))
+        v = r["value"]["points"][0]["nodes_v"]["10"]
+        self.assertAlmostEqual(v["re"], 60.0, delta=1e-12)
+
+    def test_a_mult_with_a_zero_factor_has_no_small_signal_at_all(self):
+        # a multiplier has no gain around zero: with the second input at 0 V the
+        # product's slope in BOTH directions is 0, and the caller is told why
+        r = spice.simulate("* m\nV1 1 0 DC 3 AC 1\nV2 2 0 DC 0\nA1 [1 2] 10 mul1\n"
+                           ".model mul1 mult()\nR1 10 0 1k\n.ac dec 1 1k 2k\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "ok", r.get("message"))
+        v = r["value"]["points"][0]["nodes_v"]["10"]
+        self.assertAlmostEqual(abs(complex(v["re"], v["im"])), 0.0, delta=1e-12)
+        self.assertIn("mult", " ".join(r.get("warnings") or []))
+
+    def test_summer_is_still_swept_as_before(self):
+        # the linear multi-port block never needed a bias point; it still does not
         good = spice.simulate("* s\nV1 1 0 ac 1\nV2 2 0 ac 1\nA1 [1 2] 10 s1\n"
                               ".model s1 summer(in_gain=[2 3])\nR1 10 0 1k\n"
                               ".ac dec 1 1 10\n", engine="builtin")
         self.assertEqual(good["status"], "ok", good)
+        v = good["value"]["points"][0]["nodes_v"]["10"]
+        self.assertAlmostEqual(v["re"], 5.0, delta=1e-12)
 
 class TestLicenceHygiene(unittest.TestCase):
     """A GPL binary in an MIT tree is only legal as a separate, documented prog."""
@@ -366,6 +428,33 @@ class TestBundledEngineRuns(unittest.TestCase):
             self.assertAlmostEqual(r["value"]["nodes_v"]["10"], want, delta=1e-9)
             self.assertEqual(r["cross_check"]["max_abs_diff_v"], 0.0, r["cross_check"])
             self.assertGreater(r["cross_check"]["compared_nodes"], 0)
+
+    def test_cross_check_agrees_exactly_on_swept_limit_and_mult_blocks(self):
+        # 0.0.41 linearises these two in .ac at the DC operating point. Every deck
+        # below was measured on THIS engine first (2.0 inside the band, 0.0 clipped,
+        # 1.0 on the tie, 4.0 and 60.0 for the multipliers) and the builtin has to
+        # reproduce them, not merely come close.
+        decks = (
+            (2.0, "V1 1 0 DC 0.2 AC 1\nA1 1 10 lim1\n"
+                  ".model lim1 limit(gain=2 out_lower_limit=-1 out_upper_limit=1)\n"),
+            (0.0, "V1 1 0 DC 2 AC 1\nA1 1 10 lim1\n"
+                  ".model lim1 limit(gain=2 out_lower_limit=-1 out_upper_limit=1)\n"),
+            (1.0, "V1 1 0 DC 0.5 AC 1\nA1 1 10 lim1\n"
+                  ".model lim1 limit(gain=2 out_lower_limit=-1 out_upper_limit=1)\n"),
+            (4.0, "V1 1 0 DC 3 AC 1\nV2 2 0 DC 4\nA1 [1 2] 10 mul1\n"
+                  ".model mul1 mult()\n"),
+            (60.0, "V1 1 0 DC 2 AC 1\nV2 2 0 DC 4\nA1 [1 2] 10 mul1\n"
+                   ".model mul1 mult(in_gain=[2 3] in_offset=[1 1] out_gain=2 "
+                   "out_offset=7)\n"),
+        )
+        for want, block in decks:
+            deck = "* ac\n" + block + "R1 10 0 1k\n.ac dec 1 1k 2k\n"
+            r = self._ok(deck, cross_check=True)
+            v = r["value"]["points"][0]["nodes_v"]["10"]
+            self.assertAlmostEqual(v["re"], want, delta=1e-9, msg=block)
+            self.assertAlmostEqual(v["im"], 0.0, delta=1e-9, msg=block)
+            self.assertEqual(r["cross_check"]["max_abs_diff_v"], 0.0,
+                             (block, r["cross_check"]))
 
     def test_a_pure_analog_deck_still_agrees_with_the_builtin_solver(self):
         # The bundle must not change the answer for decks the subset can do: this

@@ -107,9 +107,9 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.40
-python run_server.py --selftest         # 144/144
-python -m unittest discover -s tests    # 2002 例（实测 760 s，约 13 分钟）
+python run_server.py --version          # 0.0.41
+python run_server.py --selftest         # 146/146
+python -m unittest discover -s tests    # 2007 例（实测 842 s，约 14 分钟）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -295,7 +295,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `link_far_field` | 远场距离：`max(2D²/λ, 5D, λ/2π)` 并说明哪个机制主导 | 三段都要给，只给一段会误导 |
 | `link_fresnel` | 第一菲涅耳区半径 + 60% 净空 | — |
 | `board_antenna_keepout` | 板级净空：某矩形内的铜与 **zone** | 派生量 `authoritative:false`；pad/track/via 与 zone **分开计数**（DRC 看不见铺铜失谐） |
-| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`）；`0.0.37` 起**最小 ngspice-47 随包**（`vendor/ngspice/`，14 MB，独立进程、混搭许可见 `vendor/ngspice/NOTICE.md`），只有 `engine="ngspice"` 会在本机一个都没装时用它，`engine="auto"` 刻意不看 | 内置子集认 R C L V I E F H K S W D Q M J B T O U、子电路 `X` 与 `.noise`，**只有 `A` 逐条点名拒绝**（内置解析器不认第二套器件描述语言；`engine="ngspice"` 下直通引擎，`0.0.37` 起引擎本身随包，见 `docs/43`），`J` 是 **level-1 JFET**（平方律无 `1/2`、`AREA` 卡覆盖模型、不 stamp 栅结但报 `gate_junction_forward_v`，见 `docs/42`）；开关是**两个电导 + 一个状态**（`VT±VH` 是整宽、`VH=0` 时恰好 `VT` 就闭合、DC 也走滞回带，全部对 ngspice 逐点校准）；`engine="ngspice"` 找不到二进制**报错不回退**；默认 `builtin` |
+| `sim_spice` | 真解电路：`.op` / `.tran` / `.ac`，MNA + 牛顿 + pnjlim + gmin 步进；装了 ngspice 可委派（`engine`）或双引擎对账（`cross_check`）；`0.0.37` 起**最小 ngspice-47 随包**（`vendor/ngspice/`，14 MB，独立进程、混搭许可见 `vendor/ngspice/NOTICE.md`），只有 `engine="ngspice"` 会在本机一个都没装时用它，`engine="auto"` 刻意不看 | 内置子集认 R C L V I E F H K S W D Q M J B T O U、子电路 `X` 与 `.noise`，`A` 只认**四种纯代数 code model**（`gain`/`limit`/`summer`/`mult`），其余逐条点名拒绝（第二套器件描述语言；`engine="ngspice"` 下直通引擎，`0.0.37` 起引擎本身随包，见 `docs/43`），`J` 是 **level-1 JFET**（平方律无 `1/2`、`AREA` 卡覆盖模型、不 stamp 栅结但报 `gate_junction_forward_v`，见 `docs/42`）；开关是**两个电导 + 一个状态**（`VT±VH` 是整宽、`VH=0` 时恰好 `VT` 就闭合、DC 也走滞回带，全部对 ngspice 逐点校准）；`engine="ngspice"` 找不到二进制**报错不回退**；默认 `builtin` |
 | `trace_resistance` | 铜线直流电阻 `rho(T)·L/(w·t)` | 只管这一段；过孔/扩展/端子不在这个数里 |
 | `via_resistance` | 过孔桶壁电阻（截面是**铜环**不是钻孔圆） | 载流是另一码事，要温升判据 |
 | `trace_inductance` | 直线走线自感（Grover 带公式，±20%） | 只用于比两种布局；地平面像项**明确未计入** |
@@ -343,9 +343,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.40
-python run_server.py --selftest      # 协议级自检，144/144（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问）
-python -m unittest discover -s tests # 2002 个用例（实测 760 s，约 13 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.41
+python run_server.py --selftest      # 协议级自检，146/146（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问）
+python -m unittest discover -s tests # 2007 个用例（实测 842 s，约 14 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
