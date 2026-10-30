@@ -19,7 +19,9 @@ What is solved
             answer is only as good as its bias)
 
 Devices: R, C, L, V, I (DC / PULSE / SIN / PWL / AC), E (VCVS), G (VCCS),
-D (Shockley), Q (Ebers-Moll injection), M (Shichman-Hodges level 1).
+D (Shockley), Q (Ebers-Moll injection), M (Shichman-Hodges level 1),
+T (lossless transmission line: a pair of wires at DC, exact Y parameters in
+AC, the method of characteristics in transient).
 
 Hierarchy: `.subckt` / `.ends` with X instances, numeric parameters and `{...}`
 arithmetic on them. Instances are FLATTENED before the solver sees them, and the
@@ -61,7 +63,6 @@ NOT_IMPLEMENTED_CARDS = {
     "K": "coupled inductors / mutual inductance",
     "S": "voltage-controlled switch",
     "W": "current-controlled switch",
-    "T": "lossless transmission line",
     "O": "lossy transmission line",
     "U": "uniform distributed RC line",
     "A": "XSPICE analogue behavioural block",
@@ -689,6 +690,101 @@ def _parse_model(spec, line, lineno):
     spec["models"][name] = {"type": kind, "params": params}
 
 
+def _parse_tline(parts, name, lineno):
+    """`Tname n1 n2 n3 n4 Z0=<ohm> TD=<s>` (or F=/NL=, which is the same delay).
+
+    Port 1 is (n1, n2) and port 2 is (n3, n4), which is ngspice's order and the
+    reason the four nodes are read positionally instead of by keyword: the card
+    carries no other structure to read them from.
+
+    Z0 is REQUIRED here, not defaulted to 50 ohm: ngspice-47 itself refuses the
+    card without it ("transmission line z0 must be given", measured), and a
+    silently assumed 50 ohm would silently set every reflection coefficient in
+    the deck. TD is required for the same reason - ngspice defaults a missing TD
+    to 0, which quietly turns the line into a wire.
+    """
+    if len(parts) < 5:
+        raise ValueError("line %d: %s needs four nodes: Tname n1 n2 n3 n4 "
+                         "Z0=<ohm> TD=<s> (port 1 is n1,n2 and port 2 is n3,n4); "
+                         "got %r" % (lineno, name, " ".join(parts[1:])))
+    if any("=" in p for p in parts[1:5]):
+        raise ValueError("line %d: %s needs four node names before any "
+                         "parameter: Tname n1 n2 n3 n4 Z0=... TD=...; got %r"
+                         % (lineno, name, " ".join(parts[1:5])))
+    nodes = tuple(_node(parts[k]) for k in (1, 2, 3, 4))
+    params = {}
+    for p in parts[5:]:
+        if "=" not in p:
+            raise ValueError("line %d: %s: %r is not a parameter; a lossless line "
+                             "takes Z0=<ohm> and TD=<s> (or F=<Hz> NL=<n>)"
+                             % (lineno, name, p))
+        key, _, val = p.partition("=")
+        key = key.strip().lower()
+        if key not in ("z0", "td", "f", "nl"):
+            raise ValueError("line %d: %s: %s= is not implemented here; this card "
+                             "takes Z0, TD, F and NL. IC= (the line's initial "
+                             "voltages/currents), REL= and ABS= (truncation-error "
+                             "tolerances this fixed-step solver cannot honour) are "
+                             "refused by name instead of being ignored"
+                             % (lineno, name, key))
+        try:
+            params[key] = _value(val.strip())
+        except ValueError as exc:
+            raise ValueError("line %d: %s: %s= %s" % (lineno, name, key, exc))
+    if all(n is None for n in nodes):
+        # checked before the port-to-port case below, which a four-way ground
+        # card also satisfies: "both ports on ground" says what is wrong with
+        # the deck, "connects a port to itself" would send the reader looking
+        # for a duplicated node name that is not there
+        raise ValueError("line %d: %s has both ports on ground, so the card "
+                         "constrains nothing and leaves the solver with a free "
+                         "unknown" % (lineno, name))
+    if nodes[0] == nodes[2] and nodes[1] == nodes[3]:
+        raise ValueError("line %d: %s connects a port to itself (n1==n3 and "
+                         "n2==n4); the DC constraint would read 0 = 0, so the "
+                         "circuit has no solution. A line joins two different "
+                         "port pairs" % (lineno, name))
+    if "z0" not in params:
+        raise ValueError("line %d: %s needs Z0= (the characteristic impedance); "
+                         "assuming 50 ohm here would silently set every "
+                         "reflection coefficient in the deck" % (lineno, name))
+    z0 = params["z0"]
+    if z0 <= 0:
+        raise ValueError("line %d: %s has Z0=%g; a characteristic impedance must "
+                         "be positive" % (lineno, name, z0))
+    if "td" in params and "f" in params:
+        raise ValueError("line %d: %s gives both TD= and F=; give one of them "
+                         "(TD=<seconds>, or F=<Hz> with NL=<normalised length>, "
+                         "which is TD = 1/(F*NL))" % (lineno, name))
+    if "nl" in params and "f" not in params:
+        raise ValueError("line %d: %s gives NL= without F=; NL is the normalised "
+                         "length AT F, so it only means something together with "
+                         "F=<Hz>" % (lineno, name))
+    if "f" in params:
+        freq = params["f"]
+        nl = params.get("nl", 1.0)
+        if freq <= 0 or nl <= 0:
+            raise ValueError("line %d: %s has F=%g NL=%g; both must be positive"
+                             % (lineno, name, freq, nl))
+        td = 1.0 / (freq * nl)
+    else:
+        td = params.get("td")
+    if td is None:
+        raise ValueError("line %d: %s has no delay: give TD=<seconds> (or F=<Hz> "
+                         "with NL=<n>). ngspice silently defaults a missing TD to "
+                         "0, which turns the line into a wire - a netlist that "
+                         "loses this number is a netlist whose delay nobody knows"
+                         % (lineno, name))
+    if td <= 0:
+        raise ValueError("line %d: %s has TD=%g; a zero-delay line is a wire, so "
+                         "delete the card and join the nodes"
+                         % (lineno, name, td))
+    return {"type": "T", "name": name, "lineno": lineno, "nodes": nodes,
+            "z0": z0, "td": td,
+            "delay_from": ("F=%g NL=%g" % (params["f"], params.get("nl", 1.0))
+                           if "f" in params else "TD=%g" % td)}
+
+
 def _parse_element(spec, line, lineno):
     parts = line.split()
     name = parts[0]
@@ -724,6 +820,8 @@ def _parse_element(spec, line, lineno):
         return _parse_source(parts, low, name, letter, lineno)
     if letter == "B":
         return _parse_b_source(parts, line, name, lineno)
+    if letter == "T":
+        return _parse_tline(parts, name, lineno)
     if letter == "X":
         return _parse_instance(parts, name, lineno)
     if letter in ("E", "G"):
@@ -1242,7 +1340,14 @@ def _source_value(el, t):
         td = a[2] if len(a) > 2 else 0.0
         tr = a[3] if len(a) > 3 else 0.0
         tf = a[4] if len(a) > 4 else tr
-        pw = a[5] if len(a) > 5 else 0.0
+        # PW omitted means "the pulse lasts for the rest of the run" in
+        # SPICE (ngspice defaults PW to tstop, measured on PULSE(0 3 0 1p)).
+        # Defaulting it to 0 instead made the source a zero-width spike that
+        # then sat at v1 for the whole transient - a plausible flat answer that
+        # was simply not the deck's waveform. The stop time is attached to the
+        # element by the transient driver (a DC run has no stop time, and there
+        # the width cannot matter: t = 0 is inside the rise).
+        pw = a[5] if len(a) > 5 else (el.get("_tstop") or 0.0)
         per = a[6] if len(a) > 6 else 0.0
         if t < td:
             return v1
@@ -1315,6 +1420,60 @@ def _solve_dense(A, b):
     return x
 
 
+# --------------------------------------------------------- lossless line history
+# The delayed values a lossless line needs live in a table of (t, v1, i1, v2, i2)
+# once per step. Two things keep it honest:
+#   * before the first entry (t < TD) nothing has arrived yet, so the answer is
+#     the t=0 state - which is the DC operating point, where v1 = v2;
+#   * between two entries the value is INTERPOLATED, because a delay that is not
+#     a whole number of steps still has to land somewhere. A delay SHORTER than
+#     one step cannot be interpolated at all (the value would be in the future),
+#     so the transient driver rounds it up to one step and says so.
+
+def _tline_history(el, tq):
+    """(v1, i1, v2, i2) that left the far end at time `tq`."""
+    hist = el["_hist"]
+    if tq <= hist[0][0]:
+        return hist[0][1], hist[0][2], hist[0][3], hist[0][4]
+    if tq >= hist[-1][0]:
+        # the driver refuses TD < h, so this is only the endpoint of an exact
+        # grid match; keeping the last value is also what a query between the last
+        # two steps would get, and extrapolating a wave would invent a front that
+        # has not been solved for
+        return hist[-1][1], hist[-1][2], hist[-1][3], hist[-1][4]
+    lo, hi = 0, len(hist) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if hist[mid][0] <= tq:
+            lo = mid
+        else:
+            hi = mid
+    t0, t1 = hist[lo][0], hist[hi][0]
+    f = (tq - t0) / (t1 - t0) if t1 > t0 else 1.0
+    a, b = hist[lo], hist[hi]
+    return tuple(a[k + 1] + (b[k + 1] - a[k + 1]) * f for k in range(4))
+
+
+def _tline_ports(circ, el, x, t):
+    """Port voltages and currents of a lossless line in the solution `x`.
+
+    The currents are NOT read out of the branch unknown (in transient that row is
+    parked at zero): they come out of the same companion model the matrix was
+    built from, so a reported current cannot disagree with the solved voltages.
+    """
+    n1, n2, n3, n4 = el["nodes"]
+
+    def vv(n):
+        idx = circ.i(n)
+        return x[idx - 1].real if idx else 0.0
+
+    v1 = vv(n1) - vv(n2)
+    v2 = vv(n3) - vv(n4)
+    g = 1.0 / el["z0"]
+    v1h, i1h, v2h, i2h = _tline_history(el, t - el["td"])
+    return (v1, g * v1 - (g * v2h + i2h), v2, g * v2 - (g * v1h + i1h))
+
+
 # ------------------------------------------------------------------ MNA assembly
 
 class _Circuit(object):
@@ -1350,7 +1509,19 @@ class _Circuit(object):
         self.branch_idx = {}
         for k, el in enumerate(branches):
             self.branch_idx[el["name"]] = self.n + 1 + k
-        self.size = self.n + len(branches)
+        # A lossless line adds ONE unknown, not two: at DC it is a pair of
+        # wires, and "v1 = v2" is a single constraint whose current flows in
+        # at one port and out of the other (i2 = -i1), so the second current
+        # is not independent and must not get a row of its own - two rows
+        # make the matrix singular the moment both ports return to ground,
+        # which is how a single-ended line is normally drawn.
+        extra = 0
+        for el in self.elements:
+            if el["type"] == "T":
+                el["_row"] = self.n + 1 + len(branches) + extra
+                self.branch_idx[el["name"] + "#i1"] = el["_row"]
+                extra += 1
+        self.size = self.n + len(branches) + extra
         self.disabled = []        # non-ideal effects that were switched off
         self.defaulted = {}       # model params that fell back to a default
 
@@ -1537,6 +1708,8 @@ class _Circuit(object):
                 self._stamp_bjt(A, b, el, x_prev, mode)
             elif T == "M":
                 self._stamp_mos(A, b, el, x_prev, mode)
+            elif T == "T":
+                self._stamp_tline(A, b, el, x_prev, t, mode)
         # gmin to ground on every node: the standard "no floating node" crutch
         if mode != "ac" and gmin:
             for k in range(self.n):
@@ -1546,6 +1719,84 @@ class _Circuit(object):
     def _x(self, x_prev, name):
         idx = self.i(name)
         return x_prev[idx - 1] if idx else 0j
+
+    def _stamp_tline(self, A, b, el, x_prev, t, mode):
+        """A lossless line, solved as the analysis needs it.
+
+        DC: a pair of wires. v(n1) = v(n3) and v(n2) = v(n4), one constraint row
+        and one current unknown that enters at n1, leaves at n3, enters at n4 and
+        leaves at n2. A lossless line has no DC drop, so this is the model, not an
+        approximation of it.
+
+        AC: the exact Y parameters of a lossless line,
+        Y11 = Y22 = -j*Y0*cot(theta), Y12 = Y21 = +j*Y0*csc(theta),
+        theta = 2*pi*f*TD. Checked against the definition it comes from: a line
+        terminated in Z0 must present exactly Z0 at its input and delay the
+        output by theta.
+
+        tran: the method of characteristics (Bergeron) - a conductance 1/Z0 at
+        each port plus a current source holding that port's value from one delay
+        ago. For an IDEAL line this is the solution, not a discretisation of it:
+        the only error is where the delayed value is interpolated, and the only
+        assumption is that nothing happened in between.
+        """
+        n1, n2, n3, n4 = el["nodes"]
+        row = el["_row"]
+        if mode == "tran":
+            g = 1.0 / el["z0"]
+            self._conductance(A, n1, n2, g)
+            self._conductance(A, n3, n4, g)
+            # the DC constraint unknown does not exist in time: no real quantity
+            # is being solved for it, so it is parked at zero and disconnected
+            self._add(A, row, row, 1.0)
+            v1h, i1h, v2h, i2h = _tline_history(el, (t or 0.0) - el["td"])
+            # i1(t) = g*v1(t) - (g*v2(t-TD) + i2(t-TD))
+            self._current(b, n1, n2, -(g * v2h + i2h))
+            # i2(t) = g*v2(t) - (g*v1(t-TD) + i1(t-TD))
+            self._current(b, n3, n4, -(g * v1h + i1h))
+            return
+        if mode == "ac":
+            theta = 2.0 * math.pi * el["_f"] * el["td"]
+            s = math.sin(theta)
+            # the driver refuses the singular frequencies before we get here; a
+            # guard that raises would turn a netlist problem into a traceback
+            if abs(s) < 1e-12:
+                s = 1e-12 if s >= 0.0 else -1e-12
+            y0 = 1.0 / el["z0"]
+            y11 = complex(0.0, -y0 * math.cos(theta) / s)
+            y12 = complex(0.0, y0 / s)
+            a1, b1 = self.i(n1), self.i(n2)
+            a2, b2 = self.i(n3), self.i(n4)
+            # port 1: i1 = y11*v1 + y12*v2, current leaving n1 and entering n2
+            self._add(A, a1, a1, y11)
+            self._add(A, a1, b1, -y11)
+            self._add(A, b1, a1, -y11)
+            self._add(A, b1, b1, y11)
+            self._add(A, a1, a2, y12)
+            self._add(A, a1, b2, -y12)
+            self._add(A, b1, a2, -y12)
+            self._add(A, b1, b2, y12)
+            # port 2: i2 = y12*v1 + y11*v2 (y12 is symmetric: reciprocal line)
+            self._add(A, a2, a2, y11)
+            self._add(A, a2, b2, -y11)
+            self._add(A, b2, a2, -y11)
+            self._add(A, b2, b2, y11)
+            self._add(A, a2, a1, y12)
+            self._add(A, a2, b1, -y12)
+            self._add(A, b2, a1, -y12)
+            self._add(A, b2, b1, y12)
+            self._add(A, row, row, 1.0)
+            return
+        # DC (and the t=0 bias point of tran and ac): the line is a wire
+        i1, i2, i3, i4 = self.i(n1), self.i(n2), self.i(n3), self.i(n4)
+        self._add(A, row, i1, 1.0)
+        self._add(A, row, i2, -1.0)
+        self._add(A, row, i3, -1.0)
+        self._add(A, row, i4, 1.0)
+        self._add(A, i1, row, 1.0)
+        self._add(A, i2, row, -1.0)
+        self._add(A, i3, row, -1.0)
+        self._add(A, i4, row, 1.0)
 
     def _stamp_diode(self, A, b, el, x_prev, mode="dc"):
         na, nk = el["nodes"]
@@ -1797,7 +2048,7 @@ def _dc(circ, t=None, uic_x=None, mode="dc"):
     return None, total, last
 
 
-def _element_report(circ, x, t=None):
+def _element_report(circ, x, t=None, mode="dc"):
     out = []
     for el in circ.elements:
         T = el["type"]
@@ -1806,6 +2057,7 @@ def _element_report(circ, x, t=None):
         vb = x[circ.i(nb) - 1] if circ.i(nb) else 0j
         v = (va - vb).real
         rec = {"name": el["name"], "type": T, "voltage_v": round(v, 9)}
+        vv = lambda n: (x[circ.i(n) - 1] if circ.i(n) else 0j)  # noqa: E731
         if T == "R":
             rec["current_a"] = round(v / el["value"], 12)
             rec["power_w"] = round(v * v / el["value"], 12)
@@ -1899,6 +2151,24 @@ def _element_report(circ, x, t=None):
             rec["power_w"] = round((vd - vs) * cur[0], 15)
             rec["region"] = ("saturation" if abs(sg * (vd - vs)) >
                              abs(rec["vov_v"]) else "linear/triode")
+        elif T == "T":
+            n1, n2, n3, n4 = el["nodes"]
+            if mode == "tran":
+                v1t, i1t, v2t, i2t = _tline_ports(circ, el, x, t or 0.0)
+            else:
+                # DC: the row unknown is the current in at n1 / out at n3, and the
+                # second current is its negative by construction
+                v1t = (vv(n1) - vv(n2)).real
+                v2t = (vv(n3) - vv(n4)).real
+                i1t = x[el["_row"] - 1].real
+                i2t = -i1t
+            rec["z0_ohm"] = el["z0"]
+            rec["delay_s"] = el["td"]
+            rec["port1"] = {"voltage_v": round(v1t, 9), "current_a": round(i1t, 12)}
+            rec["port2"] = {"voltage_v": round(v2t, 9), "current_a": round(i2t, 12)}
+            rec["current_convention"] = ("positive INTO the + terminal of each port "
+                                         "(n1 and n3); the two currents sum to zero")
+            rec["power_w"] = round(v1t * i1t + v2t * i2t, 12)
         out.append(rec)
     return out
 
@@ -1935,7 +2205,11 @@ NOT_COMPUTED = [
     "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss",
     "Laplace blocks (laplace(...)), the current of another element (I(Vname)), "
     "B-source noise, and derivative/ddt/idt operators",
-    "transmission lines and distributed RC",
+    "LOSSY transmission lines (O cards) and the frequency-dependent loss that "
+    "makes a real trace dispersive: only an IDEAL lossless line (T) is solved "
+    "here, so the attenuation and the rise-time degradation of a real PCB "
+    "trace are not in the answer; a uniform distributed RC line (U) is not "
+    "implemented either",
     "noise (.noise), distortion (.disto), Monte Carlo / worst-case",
     "temperature SWEEP (one temperature per run: `.temp` / temp_c), and junction "
     "self-heating - the junction sits at the temperature you state, it does not "
@@ -2040,12 +2314,31 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
         if steps > 200000:
             return err("%d timesteps is too many for this solver" % steps, "TOO_LARGE",
                        hint="raise tstep or lower tstop")
+        for el in circ.elements:
+            if el["type"] in ("V", "I"):
+                el["_tstop"] = tstop
         # initial conditions
         for el in circ.elements:
             if el["type"] == "C":
                 el["_vprev"] = el.get("ic") if card.get("uic") and el.get("ic") else 0.0
             if el["type"] == "L":
                 el["_iprev"] = el.get("ic") if card.get("uic") and el.get("ic") else 0.0
+            if el["type"] == "T" and el["td"] < h:
+                # The history table is indexed by step, so a delay shorter than
+                # one step cannot be represented at all: the far end would have to
+                # be read from a time that has not been solved yet. Rounding it to
+                # one step is what a lumped approximation does, and it moves every
+                # reflected edge (hence the ringing frequency) by a whole step, so
+                # it is refused rather than warned about.
+                return err("%s has TD=%g s, shorter than the timestep %g s: the "
+                           "solver reads the far end from a time between two "
+                           "steps, which does not exist yet. A delay the "
+                           "transient cannot resolve would round to one step and "
+                           "move every reflection, so it is refused"
+                           % (el["name"], el["td"], h), "ARG_RANGE",
+                           hint="use a tstep at or below TD (e.g. tstep=%g), or "
+                                "drop the card if the line's delay does not matter "
+                                "to the question" % (el["td"] / 10.0))
         x0, iters, why = _dc(circ)
         if x0 is None:
             bad = _expression_failure(why)
@@ -2062,6 +2355,15 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                     el["_vprev"] = (va - vb).real
             if el["type"] == "L":
                 el["_iprev"] = x0[circ.branch_idx[el["name"]] - 1].real
+            if el["type"] == "T":
+                n1, n2, n3, n4 = el["nodes"]
+                va = lambda n: (x0[circ.i(n) - 1].real if circ.i(n) else 0.0)  # noqa: E731
+                i1 = x0[el["_row"] - 1].real
+                # t=0 is the DC point, where a lossless line is a wire: the two
+                # port voltages are equal and the two currents are opposite. That
+                # is the only state the line can be in before it has carried
+                # anything, so it is what every t < TD reads.
+                el["_hist"] = [(0.0, va(n1) - va(n2), i1, va(n3) - va(n4), -i1)]
         points = []
         x = x0
         t = 0.0
@@ -2091,11 +2393,13 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                     el["_vprev"] = (va - vb).real
                 if el["type"] == "L":
                     el["_iprev"] = x[circ.branch_idx[el["name"]] - 1].real
+                if el["type"] == "T":
+                    el["_hist"].append((t,) + _tline_ports(circ, el, x, t))
             if k % stride == 0 or k == steps:
                 points.append({"t": round(t, 12), "nodes_v": _node_dict(circ, x)})
         return ok(value={"analysis": "tran", "points": points,
                          "timestep_s": h, "steps": steps,
-                         "elements_final": _element_report(circ, x, t),
+                         "elements_final": _element_report(circ, x, t, mode="tran"),
                          "iterations": total_iter},
                   unit="mixed", model="mna_backward_euler",
                   basis="backward Euler companion models (C -> G=C/h in parallel with "
@@ -2149,10 +2453,38 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                    hint="AC is a small-signal linearisation AT the bias point; without "
                         "a bias there is no AC answer")
     points = []
+    tline_warned = set()
     for f in freqs:
         for el in circ.elements:
-            if el["type"] in ("C", "L"):
+            if el["type"] in ("C", "L", "T"):
                 el["_f"] = f
+        for el in circ.elements:
+            if el["type"] != "T":
+                continue
+            theta = 2.0 * math.pi * f * el["td"]
+            s = abs(math.sin(theta))
+            if s < 1e-9:
+                # cot(theta) is infinite here: the lossless line is a short at
+                # every multiple of pi, and an ideal short has no finite answer.
+                # Returning the huge number the matrix would produce is exactly
+                # the plausible-looking wrong answer this module exists to not
+                # produce.
+                return err("AC sweep stopped at %g Hz: %s is at theta = 2*pi*f*TD "
+                           "= %g rad, a multiple of pi, where a LOSSLESS line's "
+                           "admittance is infinite. The ideal model has no "
+                           "finite answer there; sweep off the resonance, or use "
+                           "an engine that models the line's loss"
+                           % (f, el["name"], theta), "SINGULAR",
+                           hint="a real line has loss, which is what makes this "
+                                "frequency finite; O cards (lossy lines) are not "
+                                "implemented here")
+            if s < 1e-3 and el["name"] not in tline_warned:
+                tline_warned.add(el["name"])
+                circ.disabled.append(
+                    "%s: at %g Hz the phase is %.3g rad from a multiple of pi, "
+                    "where the lossless admittance goes to infinity; the numbers "
+                    "near that frequency are ill-conditioned (the loss of a real "
+                    "line is what keeps them finite)" % (el["name"], f, s))
         A, b = circ.assemble(x0, mode="ac", gmin=0.0)
         try:
             x = _solve_dense(A, b)

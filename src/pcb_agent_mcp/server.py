@@ -721,31 +721,79 @@ def selftest():
                   and payload.get("verified_against_engine") is False,
                   str(payload.get("verified_against_engine")))
         # the point of having an engine at all: a card this module refuses by name
-        # still runs, and the envelope says the deck was not parsed here. B sources
-        # moved INTO the builtin set in 0.0.29, so the probe is a lossless line,
-        # which the builtin still refuses by name.
+        # still runs, and the envelope says the deck was not parsed here. T (the
+        # LOSSLESS line) moved INTO the builtin set in 0.0.30, so the probe is
+        # its LOSSY cousin O, which the builtin still refuses by name. The answer
+        # is also the honest contrast: 1 ohm of series resistance drops 15 mV,
+        # where the ideal T drops nothing at DC.
         r = handle({"jsonrpc": "2.0", "id": 96, "method": "tools/call",
                     "params": {"name": "sim_spice", "arguments": {
-                        "netlist": "* t\nV1 1 0 3\nR1 1 2 50\n"
-                                   "T1 2 0 3 0 Z0=50 TD=1n\nR2 3 0 50\n.op\n",
+                        "netlist": "* o\nV1 1 0 3\nR1 1 2 50\n"
+                                   "O1 2 0 3 0 ltra1\nR2 3 0 50\n"
+                                   ".model ltra1 LTRA(r=1 l=250n g=0 c=100p len=1)\n"
+                                   ".op\n",
                         "engine": "ngspice"}}})
         payload = json.loads(r["result"]["content"][0]["text"])
         if _found:
-            check("a lossless line the builtin refuses by name does run under "
-                  "ngspice (T shorts the net at DC: the 50/50 divider reads 1.500 V) "
-                  "and the envelope says this module did not parse the deck",
+            _n = (payload.get("value") or {}).get("nodes_v") or {}
+            check("a lossy line the builtin refuses by name does run under ngspice "
+                  "(1 ohm of series resistance reads 1.5149/1.4851 V) and the "
+                  "envelope says this module did not parse the deck",
                   payload.get("status") == "ok"
                   and payload.get("netlist_parsed") is False
-                  and "T1" in (payload.get("netlist_parse_note") or "")
-                  and abs(((payload.get("value") or {}).get("nodes_v") or {})
-                          .get("3", 0.0) - 1.5) < 1e-6,
-                  str((payload.get("value") or {}).get("nodes_v")))
+                  and "O1" in (payload.get("netlist_parse_note") or "")
+                  and abs(_n.get("2", 0.0) - 1.514851) < 1e-4
+                  and abs(_n.get("3", 0.0) - 1.485149) < 1e-4,
+                  str(_n))
         else:
             check("engine='ngspice' refuses when no binary is installed instead of "
                   "quietly answering with the subset",
                   payload.get("status") == "error"
                   and payload.get("reason_code") == "ENGINE_NOT_FOUND",
                   str(payload.get("reason_code")))
+
+        # 0.0.30: the lossless line in the builtin. DC is a wire, so the matched
+        # 3 V / 50 ohm divider must read 1.500 V at BOTH ports and +/-30 mA.
+        r = handle({"jsonrpc": "2.0", "id": 145, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* t\nV1 1 0 3\nR1 1 2 50\n"
+                                   "T1 2 0 3 0 Z0=50 TD=1n\nR2 3 0 50\n.op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _n = (payload.get("value") or {}).get("nodes_v") or {}
+        _el = [e for e in ((payload.get("value") or {}).get("elements") or [])
+               if e.get("name") == "T1"]
+        check("builtin T at DC is a wire: the far port reads the same 1.500 V as "
+              "the near one, and the card reports +/-30 mA",
+              payload.get("status") == "ok"
+              and abs(_n.get("2", 0.0) - 1.5) < 1e-6
+              and abs(_n.get("3", 0.0) - 1.5) < 1e-6
+              and bool(_el)
+              and abs(_el[0]["port1"]["current_a"] - 0.03) < 1e-9
+              and abs(_el[0]["port2"]["current_a"] + 0.03) < 1e-9,
+              str(_n))
+
+        # 0.0.30: and the delay is an observable. Before TD the far end has not
+        # seen the step; after it, it has - which a line implemented as a plain
+        # wire could not show.
+        r = handle({"jsonrpc": "2.0", "id": 146, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* t\nV1 1 0 PULSE(0 3 0 1p)\nR1 1 2 50\n"
+                                   "T1 2 0 3 0 Z0=50 TD=1n\nR2 3 0 50\n"
+                                   ".tran 0.1n 5n\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _pts = (payload.get("value") or {}).get("points") or []
+        _before = [p["nodes_v"]["3"] for p in _pts if p["t"] <= 0.9e-9]
+        check("builtin T in .tran delays the step: the far end is 0 V before TD "
+              "and 1.500 V after it",
+              payload.get("status") == "ok"
+              and bool(_pts)
+              and bool(_before)
+              and max(abs(v) for v in _before) < 1e-6
+              and abs(_pts[-1]["nodes_v"]["3"] - 1.5) < 1e-6,
+              "before=%r after=%r" % (_before[-1] if _before else None,
+                                      _pts[-1]["nodes_v"]["3"] if _pts else None))
 
         # filter synthesis: the prototype table is a textbook value, and the
         # lumped bandpass is scored against the closed form it must agree with.
