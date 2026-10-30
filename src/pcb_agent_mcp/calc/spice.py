@@ -61,7 +61,6 @@ NOT_IMPLEMENTED_CARDS = {
     "K": "coupled inductors / mutual inductance",
     "S": "voltage-controlled switch",
     "W": "current-controlled switch",
-    "B": "behavioural source (arbitrary expressions)",
     "T": "lossless transmission line",
     "O": "lossy transmission line",
     "U": "uniform distributed RC line",
@@ -543,6 +542,11 @@ def _resolve_element(el, env, where):
     if isinstance(wave, dict):
         wave["args"] = [_resolve_value(x, env, "%s (%s args)" % (where, wave["kind"]))
                         for x in wave["args"]]
+    if el.get("ir") is not None:
+        # a name inside a B expression is a parameter like any other; folding it
+        # into a number now is what makes "not in scope" a build error rather
+        # than a convergence failure
+        el["ir"] = _b_fold(el["ir"], env, "%s (%s=)" % (where, el["text"]))
 
 
 def _expand_instances(spec):
@@ -643,6 +647,9 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
             out.extend(_instantiate(spec, copy, copy["name"], env,
                                     tuple(stack) + (el["sub"],), depth + 1))
             continue
+        if copy["type"] in ("BV", "BI"):
+            copy["ir"] = _b_remap(copy["ir"], mapped)
+            copy["deps"] = tuple(mapped(n) for n in copy["deps"])
         _resolve_element(copy, env, "%s (%s)" % (where, copy["name"]))
         if "model" in copy:
             if copy["model"] in sub["models"]:
@@ -715,6 +722,8 @@ def _parse_element(spec, line, lineno):
         return el
     if letter in ("V", "I"):
         return _parse_source(parts, low, name, letter, lineno)
+    if letter == "B":
+        return _parse_b_source(parts, line, name, lineno)
     if letter == "X":
         return _parse_instance(parts, name, lineno)
     if letter in ("E", "G"):
@@ -798,6 +807,424 @@ def _parse_source(parts, low, name, letter, lineno):
     return {"type": letter, "name": name, "nodes": nodes, "dc": dc,
             "wave": wave, "ac": ac}
 
+
+
+# ------------------------------------------------------------------ B sources
+# A behavioural source is the one card where the netlist carries a *program*. It
+# is compiled to a small tree when the card is read - so a syntax error is a
+# syntax error, reported once, with the line number - and evaluated while Newton
+# iterates. Everything the tree can say is listed in _B_FUNCS; nothing else is
+# guessed at.
+
+_B_FUNCS = {
+    "abs": (abs, 1, 1), "sqrt": (math.sqrt, 1, 1), "exp": (math.exp, 1, 1),
+    "ln": (math.log, 1, 1), "log": (math.log, 1, 1), "log10": (math.log10, 1, 1),
+    "sin": (math.sin, 1, 1), "cos": (math.cos, 1, 1), "tan": (math.tan, 1, 1),
+    "asin": (math.asin, 1, 1), "acos": (math.acos, 1, 1), "atan": (math.atan, 1, 1),
+    "atan2": (math.atan2, 2, 2),
+    "sinh": (math.sinh, 1, 1), "cosh": (math.cosh, 1, 1), "tanh": (math.tanh, 1, 1),
+    "floor": (math.floor, 1, 1), "ceil": (math.ceil, 1, 1),
+    "int": (math.trunc, 1, 1), "pow": (pow, 2, 2),
+    "min": (min, 1, None), "max": (max, 1, None),
+    "uramp": (lambda a: a if a > 0.0 else 0.0, 1, 1),
+    "u": (lambda a: 1.0 if a > 0.0 else 0.0, 1, 1),
+    "sgn": (lambda a: 1.0 if a > 0.0 else (-1.0 if a < 0.0 else 0.0), 1, 1),
+}
+
+# A caller who writes one of these should read why it is not there, not "unknown
+# function": the two are different kinds of answer.
+_B_REFUSED_FUNCS = {
+    "laplace": "a Laplace transfer function is a function of the complex frequency, "
+               "and this module only linearises B sources about the DC point",
+    "white": "a noise source is a stochastic quantity; nothing here does noise",
+    "limit": "the pnjlim-style limiter is not exposed; write if(cond, a, b) instead",
+}
+
+# "1k*2" is a number expression here (there is no second slot to be ambiguous
+# with), so engineering suffixes are translated rather than refused.
+_B_NUM_SUFFIX = re.compile(
+    r"(?<![A-Za-z0-9_.])(\d+(?:\.\d*)?|\.\d+)(meg|t|g|k|m|u|n|p|f)(?![A-Za-z0-9_])")
+
+# the V= / I= marker after the two nodes; the expression may follow with or
+# without spaces around the "=" ("V=5", "V = 5")
+_B_MARKER = re.compile(r"(?<![A-Za-z0-9_.])([VvIi])\s*=")
+
+# V(n) / V(a,b) / I(...) - the argument is taken from the TEXT, because V(1) has
+# a number as its argument, V(n-1) is a subtraction as far as Python is
+# concerned, and V(in) has a Python keyword as its argument. All three are node
+# names here, so the call is replaced by a placeholder before parsing.
+_B_NODE_CALL = re.compile(r"(?<![A-Za-z0-9_.])([VvIi])\s*\(\s*([^()]*?)\s*\)")
+
+def _b_split_top(text, want, start=0):
+    """Index of `want` at bracket depth 0, or None."""
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == want and depth == 0:
+            return i
+    return None
+
+def _b_ternary(text, where):
+    """``cond ? a : b`` -> ``(a if (cond) else b)``, innermost-first by recursion.
+
+    The same shape ngspice's B sources use (`? :`). Python has the ternary with
+    the condition in the middle, so this is a reordering and not a new operator -
+    but it is the one spelling that let the answer be compared with the reference
+    engine on a real conditional deck.
+    """
+    q = _b_split_top(text, "?")
+    if q is None:
+        return text
+    colon = _b_split_top(text, ":", q + 1)
+    if colon is None:
+        raise ValueError("%s: %r has a '?' with no matching ':'" % (where, text))
+    cond = _b_ternary(text[:q], where)
+    yes = _b_ternary(text[q + 1:colon], where)
+    no = _b_ternary(text[colon + 1:], where)
+    return "((%s) if (%s) else (%s))" % (yes, cond, no)
+
+def _b_translate(text, where):
+    """SPICE spelling -> something the Python AST parser can read.
+
+    Returns (python_source, node_pairs). Only spelling changes: && || ! ^ <> and
+    if(...) are renames, 1k/2.2u become numbers, `{...}` becomes `(...)`, `? :`
+    is reordered, and every V(...) becomes a placeholder bound to a node pair.
+    """
+    refs = []
+
+    def grab(m):
+        kind = m.group(1).lower()
+        args = [a.strip() for a in m.group(2).split(",") if a.strip() != ""]
+        if kind == "i":
+            raise ValueError("%s: %r: I(...) is not implemented here (the current "
+                             "through another element is not a variable of this "
+                             "solver; write the expression in node voltages)"
+                             % (where, text))
+        if len(args) == 1:
+            pair = (args[0].lower(), None)
+        elif len(args) == 2:
+            pair = (args[0].lower(), args[1].lower())
+        else:
+            raise ValueError("%s: %r: V() takes one or two nodes, got %d"
+                             % (where, text, len(args)))
+        refs.append(pair)
+        return "_vbnode%d_" % (len(refs) - 1)
+
+    t = _B_NODE_CALL.sub(grab, text)
+    t = t.replace("&&", " and ").replace("||", " or ")
+    t = t.replace("<>", " != ")
+    t = t.replace("^", "**")
+    t = re.sub(r"!(?!=)", " not ", t)
+    # if(...) first: a user-written call is a rename. Only then is ``? :``
+    # expanded, because its output contains Python's own ``if`` keyword and
+    # would otherwise be renamed to ``_if_`` and rejected by the parser.
+    t = re.sub(r"\bif(?=\s*\()", "_if_", t)
+    t = _b_ternary(t, where)
+
+    def num(m):
+        return "(%s*%r)" % (m.group(1), SUFFIX[m.group(2)])
+    t = _B_NUM_SUFFIX.sub(num, t)
+    # "{k}*V(2)" is how a parameter is written in some decks; the braces only
+    # group here (a parameter is a Name either way), so dropping them is a
+    # translation and not a reinterpretation
+    t = t.replace("{", "(").replace("}", ")")
+    return t, refs
+
+def _b_walk(node, text, refs, where):
+    """One AST node -> one tuple of the expression tree."""
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("%s: only numbers may appear in %r" % (where, text))
+        return ("num", float(v))
+    if isinstance(node, ast.Name):
+        key = node.id.lower()
+        if key == "time":
+            return ("time",)
+        if key == "pi":
+            return ("num", math.pi)
+        if key.startswith("_vbnode"):
+            pair = refs[int(key[len("_vbnode"):-1])]
+            return ("v", _node(pair[0]), _node(pair[1]))
+        return ("param", key)
+    if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.USub):
+            return ("un", "-", _b_walk(node.operand, text, refs, where))
+        if isinstance(node.op, ast.UAdd):
+            return _b_walk(node.operand, text, refs, where)
+        if isinstance(node.op, ast.Not):
+            return ("not", _b_walk(node.operand, text, refs, where))
+        raise ValueError("%s: %r: %s is not implemented here"
+                         % (where, text, type(node.op).__name__))
+    if isinstance(node, ast.BoolOp):
+        seq = [_b_walk(v, text, refs, where) for v in node.values]
+        tag = "and" if isinstance(node.op, ast.And) else "or"
+        acc = seq[0]
+        for nxt in seq[1:]:
+            acc = (tag, acc, nxt)
+        return acc
+    if isinstance(node, ast.BinOp):
+        tag = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+               ast.Pow: "**"}.get(type(node.op))
+        if tag is None:
+            raise ValueError("%s: %r uses %s; only + - * / ** are implemented"
+                             % (where, text, type(node.op).__name__))
+        return ("bin", tag, _b_walk(node.left, text, refs, where),
+                _b_walk(node.right, text, refs, where))
+    if isinstance(node, ast.Compare):
+        left = _b_walk(node.left, text, refs, where)
+        tests = []
+        for op, comp in zip(node.ops, node.comparators):
+            tag = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
+                   ast.Eq: "==", ast.NotEq: "!="}.get(type(op))
+            if tag is None:
+                raise ValueError("%s: %r uses %s, which is not a comparison here"
+                                 % (where, text, type(op).__name__))
+            right = _b_walk(comp, text, refs, where)
+            tests.append(("cmp", tag, left, right))
+            left = right
+        acc = tests[0]
+        for nxt in tests[1:]:
+            acc = ("and", acc, nxt)
+        return acc
+    if isinstance(node, ast.IfExp):
+        return ("if", _b_walk(node.test, text, refs, where),
+                _b_walk(node.body, text, refs, where),
+                _b_walk(node.orelse, text, refs, where))
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("%s: %r calls something that is not a function name"
+                             % (where, text))
+        fname = node.func.id.lower()
+        if node.keywords:
+            raise ValueError("%s: %r: keyword arguments are not implemented"
+                             % (where, text))
+        if fname == "_if_":
+            if len(node.args) != 3:
+                raise ValueError("%s: %r: if() takes three arguments "
+                                 "(condition, then, else), got %d"
+                                 % (where, text, len(node.args)))
+            return ("if", _b_walk(node.args[0], text, refs, where),
+                    _b_walk(node.args[1], text, refs, where),
+                    _b_walk(node.args[2], text, refs, where))
+        if fname in _B_REFUSED_FUNCS:
+            raise ValueError("%s: %r: %s() is not implemented here: %s"
+                             % (where, text, fname, _B_REFUSED_FUNCS[fname]))
+        if fname not in _B_FUNCS:
+            raise ValueError("%s: %r: function %r is not implemented here "
+                             "(implemented: %s)"
+                             % (where, text, node.func.id,
+                                ", ".join(sorted(list(_B_FUNCS) + ["if", "V"]))))
+        lo, hi = _B_FUNCS[fname][1], _B_FUNCS[fname][2]
+        if len(node.args) < lo or (hi is not None and len(node.args) > hi):
+            raise ValueError("%s: %r: %s() takes %s argument(s), got %d"
+                             % (where, text, fname,
+                                ("%d" % lo) if lo == hi else
+                                ("at least %d" % lo if hi is None else
+                                 "%d..%d" % (lo, hi)), len(node.args)))
+        return ("call", fname,
+                [_b_walk(a, text, refs, where) for a in node.args])
+    raise ValueError("%s: %r uses %s, which is not part of an expression here"
+                     % (where, text, type(node).__name__))
+
+def _compile_b_expr(text, where):
+    """Expression text -> tree. Raises ValueError with the line and the name."""
+    src, refs = _b_translate(text, where)
+    try:
+        tree = ast.parse(src, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("%s: cannot read the expression %r (%s)"
+                         % (where, text, exc.msg or "syntax error"))
+    return _b_walk(tree.body, text, refs, where)
+
+def _b_nodes(ir, out=None):
+    """The nodes an expression reads, in first-appearance order.
+
+    Ground is left out: it is not a variable, so it needs no derivative column.
+    """
+    if out is None:
+        out = []
+    op = ir[0]
+    if op == "v":
+        for n in (ir[1], ir[2]):
+            if n is not None and n not in out:
+                out.append(n)
+    elif op == "call":
+        for a in ir[2]:
+            _b_nodes(a, out)
+    elif op == "un":
+        _b_nodes(ir[2], out)
+    elif op == "not":
+        _b_nodes(ir[1], out)
+    elif op in ("bin", "cmp"):
+        _b_nodes(ir[2], out)
+        _b_nodes(ir[3], out)
+    elif op in ("and", "or"):
+        _b_nodes(ir[1], out)
+        _b_nodes(ir[2], out)
+    elif op == "if":
+        _b_nodes(ir[1], out)
+        _b_nodes(ir[2], out)
+        _b_nodes(ir[3], out)
+    return out
+
+def _b_remap(ir, mapped):
+    """Rename the nodes of an expression, for an instance of a subcircuit."""
+    op = ir[0]
+    if op == "v":
+        return ("v", mapped(ir[1]), mapped(ir[2]))
+    if op == "call":
+        return ("call", ir[1], [_b_remap(a, mapped) for a in ir[2]])
+    if op == "un":
+        return ("un", ir[1], _b_remap(ir[2], mapped))
+    if op == "not":
+        return ("not", _b_remap(ir[1], mapped))
+    if op in ("bin", "cmp"):
+        return (op, ir[1], _b_remap(ir[2], mapped), _b_remap(ir[3], mapped))
+    if op in ("and", "or"):
+        return (op, _b_remap(ir[1], mapped), _b_remap(ir[2], mapped))
+    if op == "if":
+        return ("if", _b_remap(ir[1], mapped), _b_remap(ir[2], mapped),
+                _b_remap(ir[3], mapped))
+    return ir
+
+def _b_fold(ir, env, where):
+    """Replace every parameter by its number, at build time.
+
+    A name that is not in scope is an error here - once, with the line - instead
+    of on the first Newton iteration, where it would read as "did not converge".
+    """
+    op = ir[0]
+    if op in ("num", "time", "v"):
+        return ir
+    if op == "param":
+        key = ir[1]
+        if key not in env:
+            raise ValueError("%s: %r is not a parameter in scope here (%s)"
+                             % (where, key,
+                                ", ".join(sorted(env)) if env else "none"))
+        return ("num", float(env[key]))
+    if op == "call":
+        return ("call", ir[1], [_b_fold(a, env, where) for a in ir[2]])
+    if op == "un":
+        return ("un", ir[1], _b_fold(ir[2], env, where))
+    if op == "not":
+        return ("not", _b_fold(ir[1], env, where))
+    if op in ("bin", "cmp"):
+        return (op, ir[1], _b_fold(ir[2], env, where), _b_fold(ir[3], env, where))
+    if op in ("and", "or"):
+        return (op, _b_fold(ir[1], env, where), _b_fold(ir[2], env, where))
+    if op == "if":
+        return ("if", _b_fold(ir[1], env, where), _b_fold(ir[2], env, where),
+                _b_fold(ir[3], env, where))
+    raise ValueError("%s: internal: unknown expression node %r" % (where, op))
+
+def _b_run(ir, vals, t):
+    op = ir[0]
+    if op == "num":
+        return ir[1]
+    if op == "time":
+        return t
+    if op == "v":
+        return vals.get(ir[1], 0.0) - vals.get(ir[2], 0.0)
+    if op == "call":
+        name = ir[1]
+        args = [_b_run(a, vals, t) for a in ir[2]]
+        try:
+            return float(_B_FUNCS[name][0](*args))
+        except (ValueError, ZeroDivisionError) as exc:
+            raise ValueError("%s(%s) has no value here (%s)"
+                             % (name, ", ".join("%g" % a for a in args), exc))
+    if op == "un":
+        v = _b_run(ir[2], vals, t)
+        return -v if ir[1] == "-" else v
+    if op == "not":
+        return 0.0 if _b_run(ir[1], vals, t) else 1.0
+    if op == "bin":
+        a = _b_run(ir[2], vals, t)
+        b = _b_run(ir[3], vals, t)
+        o = ir[1]
+        if o == "+":
+            return a + b
+        if o == "-":
+            return a - b
+        if o == "*":
+            return a * b
+        if o == "/":
+            if b == 0.0:
+                raise ValueError("division by zero")
+            return a / b
+        if o == "**":
+            try:
+                return a ** b
+            except OverflowError:
+                raise ValueError("%g ** %g overflows" % (a, b))
+        raise ValueError("unknown operator %r" % (o,))
+    if op == "cmp":
+        a = _b_run(ir[2], vals, t)
+        b = _b_run(ir[3], vals, t)
+        o = ir[1]
+        hit = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b,
+               "==": a == b, "!=": a != b}[o]
+        return 1.0 if hit else 0.0
+    if op == "and":
+        return 1.0 if (_b_run(ir[1], vals, t) and _b_run(ir[2], vals, t)) else 0.0
+    if op == "or":
+        return 1.0 if (_b_run(ir[1], vals, t) or _b_run(ir[2], vals, t)) else 0.0
+    if op == "if":
+        return _b_run(ir[2] if _b_run(ir[1], vals, t) else ir[3], vals, t)
+    raise ValueError("unknown expression node %r" % (op,))
+
+def _b_eval(ir, vals, t, where):
+    """Value of the expression at the node voltages in `vals`.
+
+    The "expression: " prefix is what tells a caller (and _simulate_builtin) that
+    this is not a convergence failure: the netlist is fine, the expression has no
+    value at a voltage the solver had to try.
+    """
+    try:
+        value = _b_run(ir, vals, t)
+    except ValueError as exc:
+        raise ValueError("expression: %s: %s" % (where, exc))
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError("expression: %s: the value is not a finite number" % where)
+    return value
+
+def _parse_b_source(parts, line, name, lineno):
+    """B<name> n+ n- V=<expr>  |  I=<expr>"""
+    if len(parts) < 4:
+        raise ValueError("line %d: %s needs two nodes and V=<expr> or I=<expr>"
+                         % (lineno, name))
+    nodes = (_node(parts[1]), _node(parts[2]))
+    body = " ".join(parts[1:])
+    m = _B_MARKER.search(body)
+    if m is None:
+        raise ValueError("line %d: %s has no V=<expr> or I=<expr> after the two "
+                         "nodes" % (lineno, name))
+    kind = m.group(1).lower()
+    rest = body[m.end():]
+    # a B source is ONE equation; "V=2 I=3" has no meaning, and the parser would
+    # otherwise hand "2 I=3" to the expression compiler and report a syntax error
+    # about a deck that is actually ambiguous
+    second = _B_MARKER.search(rest)
+    if second is not None:
+        raise ValueError("line %d: %s gives both V= and I=: a behaviour source is one "
+                         "equation, so drop one of them"
+                         % (lineno, name))
+    expr = rest.strip()
+    if not expr:
+        raise ValueError("line %d: %s: %s= needs an expression"
+                         % (lineno, name, m.group(1)))
+    where = "line %d: %s" % (lineno, name)
+    ir = _compile_b_expr(expr, where)
+    return {"type": "BV" if kind == "v" else "BI", "name": name,
+            "lineno": lineno, "nodes": nodes, "text": expr, "ir": ir,
+            "deps": tuple(_b_nodes(ir)), "where": where}
 
 # ------------------------------------------------------------------ source form
 
@@ -908,8 +1335,18 @@ class _Circuit(object):
             n is None for el in self.elements
             for n in list(el["nodes"]) + list(el.get("ctrl") or ()))
         self.node_idx = {n: i + 1 for i, n in enumerate(nodes)}
+        for el in self.elements:
+            for dep in el.get("deps") or ():
+                if dep not in self.node_idx:
+                    # a node nothing connects reads as 0 V, so a typo in V(...)
+                    # would become a silent constant instead of an error
+                    raise ValueError("line %s: %s reads node %r, which no other "
+                                     "card connects; a node that does not exist "
+                                     "would read as 0 V"
+                                     % (el.get("lineno") or "?", el["name"], dep))
         self.n = len(nodes)
-        branches = [el for el in self.elements if el["type"] in ("V", "L", "E")]
+        branches = [el for el in self.elements
+                    if el["type"] in ("V", "L", "E", "BV")]
         self.branch_idx = {}
         for k, el in enumerate(branches):
             self.branch_idx[el["name"]] = self.n + 1 + k
@@ -919,7 +1356,11 @@ class _Circuit(object):
 
     # -- helpers
     def is_linear(self):
-        return not any(el["type"] in ("D", "Q", "M") for el in self.elements)
+        # a constant B source is an ordinary source: calling it nonlinear would
+        # add damping to a circuit that solves exactly in one step
+        return not any(el["type"] in ("D", "Q", "M")
+                       or (el["type"] in ("BV", "BI") and el["deps"])
+                       for el in self.elements)
 
     def i(self, name):
         return self.node_idx.get(name, 0) if name is not None else 0
@@ -1086,6 +1527,10 @@ class _Circuit(object):
                 self._add(A, a, cm, -g)
                 self._add(A, bb, cp, -g)
                 self._add(A, bb, cm, g)
+            elif T == "BV":
+                self._stamp_b_voltage(A, b, el, x_prev, t, mode)
+            elif T == "BI":
+                self._stamp_b_current(A, b, el, x_prev, t, mode)
             elif T == "D":
                 self._stamp_diode(A, b, el, x_prev, mode)
             elif T == "Q":
@@ -1145,6 +1590,94 @@ class _Circuit(object):
                            volts)
         self._stamp_generic(A, b, [nd, ng, ns, nbb], cur, jac, volts, mode)
 
+    def b_value(self, el, x, t=None):
+        """Evaluate a B source's expression at the solution `x`."""
+        vals = {}
+        for dep in el["deps"]:
+            idx = self.i(dep)
+            vals[dep] = x[idx - 1].real if idx else 0.0
+        return _b_eval(el["ir"], vals, 0.0 if t is None else t, el["where"])
+
+    def _b_partials(self, el, volts, t):
+        """df/dV_j for every node the expression reads (central differences).
+
+        The same estimator as the device Jacobian on purpose: one derivative
+        estimate shared with the solver is one place less for the answer and its
+        derivative to disagree.
+        """
+        deps = el["deps"]
+        base = _b_eval(el["ir"], dict(zip(deps, volts)), t, el["where"])
+        out = []
+        for j in range(len(deps)):
+            h = max(1e-6, 1e-5 * abs(volts[j]))
+            up = list(volts)
+            dn = list(volts)
+            up[j] += h
+            dn[j] -= h
+            # sqrt(V) at V=0 has a derivative of +inf, and the CENTRED difference
+            # steps into -1e-6 and takes the whole run down with a maths error.
+            # Stepping to one side only is the honest fallback: it is a real
+            # slope of the expression, just not a centred one, so the answer near
+            # a domain edge is the expression's problem and not a silent one.
+            fu = fd = None
+            try:
+                fu = _b_eval(el["ir"], dict(zip(deps, up)), t, el["where"])
+            except ValueError:
+                fu = None
+            try:
+                fd = _b_eval(el["ir"], dict(zip(deps, dn)), t, el["where"])
+            except ValueError:
+                fd = None
+            if fu is not None and fd is not None:
+                out.append((fu - fd) / (2.0 * h))
+            elif fu is not None:
+                out.append((fu - base) / h)
+            elif fd is not None:
+                out.append((base - fd) / h)
+            else:
+                raise ValueError("expression: %s: no value on either side of the "
+                                 "operating point for this derivative"
+                                 % el["where"])
+        return out
+
+    def _stamp_b_voltage(self, A, b, el, x_prev, t, mode="dc"):
+        """V(na) - V(nb) = f(V), linearised: the row carries -df/dV in each
+        column the expression reads, and the constant part on the right."""
+        row = self.branch_idx[el["name"]]
+        na, nb = el["nodes"]
+        a, bb = self.i(na), self.i(nb)
+        self._add(A, row, a, 1.0)
+        self._add(A, row, bb, -1.0)
+        self._add(A, a, row, 1.0)
+        self._add(A, bb, row, -1.0)
+        f0 = self.b_value(el, x_prev, t)
+        if not el["deps"]:
+            if mode != "ac":
+                self._rhs(b, row, f0)
+            return
+        volts = [self._x(x_prev, dep).real for dep in el["deps"]]
+        jac = self._b_partials(el, volts, t)
+        for j, dep in enumerate(el["deps"]):
+            self._add(A, row, self.i(dep), -jac[j])
+        if mode != "ac":
+            self._rhs(b, row, f0 - sum(jac[j] * volts[j]
+                                       for j in range(len(volts))))
+
+    def _stamp_b_current(self, A, b, el, x_prev, t, mode="dc"):
+        """I from n+ to n- = f(V), stamped exactly like the diode's I(V)."""
+        na, nb = el["nodes"]
+        a, bb = self.i(na), self.i(nb)
+        f0 = self.b_value(el, x_prev, t)
+        volts = [self._x(x_prev, dep).real for dep in el["deps"]]
+        jac = self._b_partials(el, volts, t) if el["deps"] else []
+        for j, dep in enumerate(el["deps"]):
+            ci = self.i(dep)
+            self._add(A, a, ci, jac[j])
+            self._add(A, bb, ci, -jac[j])
+        if mode != "ac":
+            self._current(b, na, nb, f0 - sum(jac[j] * volts[j]
+                                              for j in range(len(volts))))
+
     def _stamp_generic(self, A, b, nodes, currents, jac, volts, mode="dc"):
         idx = [self.i(n) for n in nodes]
         for i, ri in enumerate(idx):
@@ -1192,7 +1725,10 @@ def _newton(circ, x0, t=None, mode="dc", max_iter=DEFAULT_MAX_ITER,
     """
     x = list(x0)
     for it in range(1, max_iter + 1):
-        A, b = circ.assemble(x, t=t, mode=mode, gmin=gmin)
+        try:
+            A, b = circ.assemble(x, t=t, mode=mode, gmin=gmin)
+        except ValueError as exc:
+            return None, it, str(exc)
         try:
             xn = _solve_dense(A, b)
         except ZeroDivisionError as exc:
@@ -1213,11 +1749,22 @@ def _newton(circ, x0, t=None, mode="dc", max_iter=DEFAULT_MAX_ITER,
             res = 0.0
             for r in range(circ.size):
                 acc = b2[r]
+                biggest = 0.0
                 for c in range(circ.size):
-                    acc -= A2[r][c] * x[c]
-                res = max(res, abs(acc))
-            scale = 1e-9 + 1e-6 * max([abs(v) for v in x] or [0.0])
-            if res <= scale:
+                    term = A2[r][c] * x[c]
+                    acc -= term
+                    if abs(term) > biggest:
+                        biggest = abs(term)
+                # PER ROW, not one scale for the whole solution. One global
+                # scale set by the largest node voltage let a 1 mA residual in a
+                # 1k branch pass as converged, because the same circuit also had
+                # a 4000 V node: the row was judged "close enough" against
+                # somebody else's volts. A row is converged when its own residual
+                # is 1e-6 of its own biggest term.
+                denom = 1e-9 + 1e-6 * biggest
+                if abs(acc) > denom:
+                    res = max(res, abs(acc) / denom)
+            if res <= 1.0:
                 return x, it, None
     return None, max_iter, "no convergence in %d iterations" % max_iter
 
@@ -1277,6 +1824,17 @@ def _element_report(circ, x, t=None):
             cur = x[circ.branch_idx[el["name"]] - 1].real
             rec["current_a"] = round(cur, 12)
             rec["power_w"] = round(v * cur, 12)
+        elif T in ("BV", "BI"):
+            val = circ.b_value(el, x, t)
+            rec["expression"] = el["text"]
+            rec["value"] = round(val, 9)
+            if T == "BV":
+                ib = x[circ.branch_idx[el["name"]] - 1].real
+                rec["current_a"] = round(-ib, 12)
+                rec["power_w"] = round(-ib * val, 12)
+            else:
+                rec["current_a"] = round(-val, 12)
+                rec["power_w"] = round(-val * v, 12)
         elif T == "C":
             rec["charge_c"] = round(el["value"] * v, 15)
         elif T == "D":
@@ -1375,7 +1933,8 @@ NOT_COMPUTED = [
     ".model inside a .subckt body",
     "current-controlled sources (F/H), switches (S/W), JFETs, coupled inductors (K)",
     "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss",
-    "BEHAVIOURAL sources (B), Laplace blocks, arbitrary expressions",
+    "Laplace blocks (laplace(...)), the current of another element (I(Vname)), "
+    "B-source noise, and derivative/ddt/idt operators",
     "transmission lines and distributed RC",
     "noise (.noise), distortion (.disto), Monte Carlo / worst-case",
     "temperature SWEEP (one temperature per run: `.temp` / temp_c), and junction "
@@ -1386,6 +1945,16 @@ NOT_COMPUTED = [
     "convergence for circuits that need continuation beyond gmin/source stepping",
 ]
 
+
+def _expression_failure(why):
+    """A B-source expression with no value is not a convergence failure."""
+    text = str(why or "")
+    if text.startswith("expression:"):
+        return err(text[len("expression: "):], "EXPRESSION_INVALID",
+                   hint="a B source's expression was evaluated at a voltage where it "
+                        "has no value (division by zero, sqrt or log of a negative, "
+                        "an overflow). The netlist is not wrong; the expression is")
+    return None
 
 def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
                        temp_c=None):
@@ -1405,7 +1974,10 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
             spec["options"]["temp_c"] = float(temp_c)
         except (TypeError, ValueError):
             return err("temp_c must be a number", "ARG_INVALID")
-    circ = _Circuit(spec)
+    try:
+        circ = _Circuit(spec)
+    except ValueError as exc:
+        return err(str(exc), "NETLIST_INVALID")
     if circ.n == 0:
         return err("the netlist has no nodes besides ground", "NETLIST_INVALID")
     if not circ.has_ground:
@@ -1427,6 +1999,9 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
     if want == "op":
         x, iters, why = _dc(circ)
         if x is None:
+            bad = _expression_failure(why)
+            if bad is not None:
+                return bad
             return err("DC operating point did not converge: %s" % why, "NOT_CONVERGED",
                        hint="check for a floating node, a voltage source loop or a "
                             "device with no DC path to ground")
@@ -1473,6 +2048,9 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                 el["_iprev"] = el.get("ic") if card.get("uic") and el.get("ic") else 0.0
         x0, iters, why = _dc(circ)
         if x0 is None:
+            bad = _expression_failure(why)
+            if bad is not None:
+                return bad
             return err("transient could not start: the t=0 operating point did not "
                        "converge (%s)" % why, "NOT_CONVERGED")
         for el in circ.elements:
@@ -1497,6 +2075,9 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                     el["_h"] = h
             xn, it2, why2 = _newton(circ, x, t=t, mode="tran")
             if xn is None:
+                bad = _expression_failure(why2)
+                if bad is not None:
+                    return bad
                 return err("transient failed at t=%g s: %s" % (t, why2), "NOT_CONVERGED",
                            hint="backward Euler is unconditionally stable, so this is a "
                                 "model/convergence problem, not a timestep problem")
@@ -1560,6 +2141,9 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
         freqs = freqs[:max_points]
     x0, iters, why = _dc(circ)
     if x0 is None:
+        bad = _expression_failure(why)
+        if bad is not None:
+            return bad
         return err("AC needs a DC operating point and it did not converge (%s)" % why,
                    "NOT_CONVERGED",
                    hint="AC is a small-signal linearisation AT the bias point; without "

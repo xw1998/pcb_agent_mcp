@@ -721,21 +721,28 @@ def selftest():
                   and payload.get("verified_against_engine") is False,
                   str(payload.get("verified_against_engine")))
         # the point of having an engine at all: a card this module refuses by name
-        # still runs, and the envelope says the deck was not parsed here.
+        # still runs, and the envelope says the deck was not parsed here. B sources
+        # moved INTO the builtin set in 0.0.29, so the probe is a lossless line,
+        # which the builtin still refuses by name.
         r = handle({"jsonrpc": "2.0", "id": 96, "method": "tools/call",
                     "params": {"name": "sim_spice", "arguments": {
-                        "netlist": "* b\nV1 1 0 3\nB1 2 0 V = 2 * V(1) + 1\n.op\n",
+                        "netlist": "* t\nV1 1 0 3\nR1 1 2 50\n"
+                                   "T1 2 0 3 0 Z0=50 TD=1n\nR2 3 0 50\n.op\n",
                         "engine": "ngspice"}}})
         payload = json.loads(r["result"]["content"][0]["text"])
         if _found:
-            check("a B source the builtin refuses does run under ngspice (7 V)",
+            check("a lossless line the builtin refuses by name does run under "
+                  "ngspice (T shorts the net at DC: the 50/50 divider reads 1.500 V) "
+                  "and the envelope says this module did not parse the deck",
                   payload.get("status") == "ok"
                   and payload.get("netlist_parsed") is False
+                  and "T1" in (payload.get("netlist_parse_note") or "")
                   and abs(((payload.get("value") or {}).get("nodes_v") or {})
-                          .get("2", 0.0) - 7.0) < 1e-6,
+                          .get("3", 0.0) - 1.5) < 1e-6,
                   str((payload.get("value") or {}).get("nodes_v")))
         else:
-            check("a B source is refused by the builtin when no engine is installed",
+            check("engine='ngspice' refuses when no binary is installed instead of "
+                  "quietly answering with the subset",
                   payload.get("status") == "error"
                   and payload.get("reason_code") == "ENGINE_NOT_FOUND",
                   str(payload.get("reason_code")))
@@ -1630,6 +1637,69 @@ def selftest():
           and abs(_pn2.get("2", 0.0) - 6.75) < 1e-6
           and abs(_pn2.get("2", 0.0) - _in_n.get("2", -1.0)) < 1e-12,
           "param %s, inline %s" % (_pn2.get("2"), _in_n.get("2")))
+
+    # B sources (0.0.29): the expression is compiled into a tree at parse time, so a
+    # deck that reads a node nobody connects is refused with the line number instead
+    # of turning a typo into a silent 0 V - and the card is no longer in the
+    # unsupported list that the honesty half of this selftest checks.
+    _bsrc = ("* bsrc\nV1 1 0 10\nB1 2 0 V=V(1)*0.5\nR1 2 0 1k\n.op\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 141, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _bsrc}}})
+    _bsrc_out = json.loads(r["result"]["content"][0]["text"])
+    _bsrc_n = (_bsrc_out.get("value") or {}).get("nodes_v") or {}
+    _bsrc_nc = " ".join(_bsrc_out.get("not_computed") or [])
+    check("a behaviour source is solved by the builtin solver: V(2) = 0.5*V(1) lands "
+          "on 5.000 V, and the honesty list no longer claims behaviour sources are "
+          "delegation-only",
+          _bsrc_out.get("status") == "ok"
+          and abs(_bsrc_n.get("2", 0.0) - 5.0) < 1e-6
+          and abs(_bsrc_n.get("1", 0.0) - 10.0) < 1e-9
+          and "behavioural sources" not in _bsrc_nc
+          and "Laplace blocks" in _bsrc_nc,
+          "node2 %s" % _bsrc_n.get("2"))
+
+    # The two failures that must not be confused: a deck-level refusal (the card
+    # names something this solver will not do) and an expression with no value
+    # (the netlist is fine, the arithmetic is not).
+    r = handle({"jsonrpc": "2.0", "id": 142, "method": "tools/call",
+                "params": {"name": "sim_spice",
+                           "arguments": {"netlist": "* b\nB1 2 0 V=laplace(1/(1+s))\n"
+                                                   "R1 2 0 1k\n.op\n.end\n"}}})
+    _lap = json.loads(r["result"]["content"][0]["text"])
+    r = handle({"jsonrpc": "2.0", "id": 143, "method": "tools/call",
+                "params": {"name": "sim_spice",
+                           "arguments": {"netlist": "* b\nB1 1 0 V=1/0\n"
+                                                   "R1 1 0 1k\n.op\n.end\n"}}})
+    _zdiv = json.loads(r["result"]["content"][0]["text"])
+    check("laplace() is refused by name (NETLIST_INVALID) and an expression with no "
+          "value is EXPRESSION_INVALID rather than NOT_CONVERGED - the caller must "
+          "not be sent looking for a floating node",
+          _lap.get("status") == "error"
+          and _lap.get("reason_code") == "NETLIST_INVALID"
+          and "laplace() is not implemented here" in (_lap.get("message") or "")
+          and _zdiv.get("status") == "error"
+          and _zdiv.get("reason_code") == "EXPRESSION_INVALID"
+          and "division by zero" in (_zdiv.get("message") or ""),
+          "%s / %s" % (_lap.get("reason_code"), _zdiv.get("reason_code")))
+
+    # Per-row Newton residual: with a 4000 V node in the same circuit, a GLOBAL
+    # scale let a 1 mA error on the 1k branch read as converged (node 1 came back
+    # as -3998.999996 instead of -4000). The divider must still be right to 1e-6.
+    r = handle({"jsonrpc": "2.0", "id": 144, "method": "tools/call",
+                "params": {"name": "sim_spice",
+                           "arguments": {"netlist": "V1 1 0 4000\nR1 1 2 1k\n"
+                                                   "R2 2 0 1k\n.op\n.end\n"}}})
+    _big = json.loads(r["result"]["content"][0]["text"])
+    _big_n = (_big.get("value") or {}).get("nodes_v") or {}
+    check("a 4000 V rail does not loosen the convergence test on a 1k branch: the "
+          "divider reads 2000.000 V and the rail 4000.000 V to 10 mV on a 4 kV "
+          "rail (a GLOBAL "
+          "residual scale accepts a 1 mA error on the 1k branch as converged, which "
+          "is a plausible-looking answer that is off by volts)",
+          _big.get("status") == "ok"
+          and abs(_big_n.get("2", 0.0) - 2000.0) < 1e-2
+          and abs(_big_n.get("1", 0.0) - 4000.0) < 1e-9,
+          "node1 %s node2 %s" % (_big_n.get("1"), _big_n.get("2")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

@@ -306,18 +306,20 @@ class TestRefusals(EngineCase):
         self.assertEqual(r["reason_code"], "ARG_REQUIRED")
 
     def test_unparsed_card_goes_to_the_engine_but_stops_the_builtin(self):
-        # A card this module cannot model (B here) is the reason to have an engine:
+        # A card this module cannot model (a transmission line here; B sources
+        # were the example until 0.0.29 implemented them) is the reason to have
+        # an engine:
         # on the delegation path the deck is handed over unchanged and the answer is
         # the engine's own rawfile, so the refusal would only hide the capability.
         # It is still a refusal for engine='builtin', and the envelope says so with
         # netlist_parsed:false instead of pretending a full parse.
         self.spec(kind="op", nodes={"1": 1.0})
-        net = "* x\nV1 1 0 1\nR1 1 0 1k\nB1 2 0 V=1\n.op\n"
+        net = "* x\nV1 1 0 1\nR1 1 0 1k\nT1 2 0 3 0 Z0=50 TD=1n\n.op\n"
         r = spice.simulate(net, engine="ngspice")
         self.assertEqual(r["status"], "ok", r)
         self.assertEqual(r["engine_used"], "ngspice")
         self.assertFalse(r["netlist_parsed"])
-        self.assertIn("B1", r["netlist_parse_note"])
+        self.assertIn("T1", r["netlist_parse_note"])
         b = spice.simulate(net)
         self.assertEqual(b["status"], "error")
         self.assertEqual(b["reason_code"], "NETLIST_INVALID")
@@ -465,13 +467,17 @@ class TestRealEngine(unittest.TestCase):
         self.assertGreaterEqual(cross["compared_nodes"], 2, cross)
         self.assertLess(cross["max_abs_diff_v"], 1e-6, cross)
 
-    def test_behavioural_source_that_the_builtin_refuses_does_run(self):
+    def test_behavioural_source_runs_on_both_engines(self):
+        # 0.0.29 parses B cards, so this deck is no longer "pass-through only":
+        # both engines now solve it on their own, which makes the agreement a
+        # real measurement instead of two different questions
         b = spice.simulate(BSOURCE)
-        self.assertEqual(b["status"], "error")
-        self.assertEqual(b["reason_code"], "NETLIST_INVALID")
+        self.assertEqual(b["status"], "ok", b)
+        nb = (b.get("value") or {}).get("nodes_v") or {}
+        self.assertLess(abs(nb.get("2", 0.0) - 7.0), 1e-6, nb)
         r = spice.simulate(BSOURCE, engine="ngspice")
         self.assertEqual(r["status"], "ok", r)
-        self.assertFalse(r["netlist_parsed"])
+        self.assertTrue(r["netlist_parsed"])
         n = (r.get("value") or {}).get("nodes_v") or {}
         self.assertLess(abs(n.get("2", 0.0) - 7.0), 1e-6, n)
 
