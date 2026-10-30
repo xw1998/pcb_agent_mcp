@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这三十七篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这三十八篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 | # | 文档 | 它回答的问题 | 它推翻了什么 |
@@ -44,6 +44,7 @@
 | 36 | [无损传输线 T：一条延迟从卡面走到三个分析](36-无损传输线.md) | 传输线凭什么归内置管、三个分析各用哪一套式子、为什么半波点宁可拒绝也不给数？ | 「两条线各一个支路未知量」——不行：`T1 2 0 3 0` 两端口共地时第二行退化成 `0 = 0`，矩阵奇异，改成一个未知量 + 一行 `v1-v2-v3+v4=0`；「缺 TD 就当 0」——ngspice 正是这么静默默认的（线变导线），所以缺 TD 与 `TD=0` 都拒绝；「延迟比步长短就钳到一步」——实测波形整体晚约 2 步、与告警文案不符，改判 `ARG_RANGE`；「半波点返回矩阵算出来的大数」——理想线在那里导纳无穷，返回巨大数正是本模块要消灭的假答案，改判 `SINGULAR` 并指向 `O` 卡；顺带抓出 `PULSE` 宽度缺省写 0 的真缺陷（SPICE 的缺省是 `tstop`） |
 | 07 §7 | 板框 / 开槽 / 机械层 | 待议，6 条议题 | —— |
 | 37 | [有损线 O 与分布 RC 线 U：把一条线换成一串 R/L/C](37-有损线与URC.md) | 有损线凭什么归内置管、段数为什么只许写在 `.model` 里、在没有引擎可对拍的地方凭什么信它？ | 「O/U 是分布线」——不是：解析期展开成 `lump` 段普通 R/L/C，段数与是否默认都随答案上报，DC 是模型的精确串联电阻、AC/瞬态随段数一阶收敛；「`lump=` 写在卡上也行」——ngspice 把它当 FATAL，而写在 `.model` 只是 warning，同一份 deck 要能两边跑就只能进 `.model`；「两个返回节点也能算」——梯形把返回当理想单节点，`n3 != n4` 拒绝而不是静默把串联电阻减半；「没有引擎对拍就等于没验过」——U 用 `Z0c·coth(γL)` 解析解做参照（ngspice 的 URC 数值不直观，与 `F` 卡同类判断）；「`G>0` 也能对拍」——ngspice-47 自己拒绝非零 G；顺手抓出 `.ac` 里没有 `AC` 关键字的源被当成 1 V 激励的真缺陷（旧读数满幅、ngspice 全是 0） |
+| 38 | [噪声分析 `.noise`：一次伴随求解，把「哪来的噪声」变成可对账的数](38-噪声分析.md) | 噪声凭什么归内置管、为什么是伴随法而不是「每个源解一次」、带内 rms 的积分规则凭什么跟着网格走？ | 「把各元件的噪声密度加起来」——不行：同一个 `4kT/R` 在短路旁边贡献 0、开路旁边贡献满，每个源都必须过传递；「一种积分规则够用」——`dec 10` 对闭式差 −0.0009 %，`lin 1000` 差 +47 %，规则只能由网格决定；「ngspice 能跑就一样」——它要求输入源带 `AC` 说明否则整份 deck 中止，而且它的 `inoise_total` 与逐点折算不是同一个量，交叉校验只比谱；「MOS 的 `W/L` 早就支持了」——没有，一直被静默忽略（器件弱 10~100 倍，噪声的 `gm` 直接继承这个错），本轮修掉并逐位对上前先由 `.op` 数值微分求出 `gm` |
 
 ## 三条贯穿全部文档的结论
 
@@ -116,5 +117,6 @@
 - `35` → `calc/spice.py` 的 `_parse_b_source` / `_b_translate` / `_b_ternary` / `_b_walk` / `_b_fold` / `_b_run` / `_b_eval` / `_b_partials` / `_stamp_b_voltage` / `_stamp_b_current`，`B` 从 `NOT_IMPLEMENTED_CARDS` 移除、`BV`/`BI` 成为支路未知量、AC 走偏置点线性化，1 个新测试文件（`tests/test_spice_b.py` 39 例）与 4 条 selftest（141~144）；边界是**一个表达式、一套差分**：`laplace()` / `I(Vname)` / `ddt` / `idt` / B 源噪声按名拒绝，无第二表达式（`V=` 与 `I=` 不能同时给），差分步长固定不给调，单侧差分退化处是一阶精度。
 - `36` → `calc/spice.py` 的 `_parse_tline` / `_stamp_tline`（DC 一行约束 / AC 精确 Y 参数 / 瞬态特征线法）/ `_tline_history`（二分 + 插值）/ `_tline_ports`（报告电流按 companion 重算，不读被钉零的支路行）、`T` 从 `NOT_IMPLEMENTED_CARDS` 移除、AC 半波点 `SINGULAR` 与近共振只告警一次，1 个新测试文件（`tests/test_spice_tline.py` 37 例）与 3 条 selftest（96 换成 `O` 探针、145/146）；边界是**理想无损、单 Z0、单延迟**：`O`/`U` 仍按名拒绝，`IC=`/`REL=`/`ABS=` 不接，半波点的有限答案需要损耗，所以没有——它被写进 `NOT_COMPUTED`。
 - `37` → `calc/spice.py` 的 `_parse_lossy_line` / `_parse_urc` / `_lossy_model` / `_ladder` / `_expand_lossy_lines` / `_lossy_report`（解析期把 O/U 展开成普通 R/L/C 梯形）、`DEFAULT_LUMP = 20`、`O`/`U` 从 `NOT_IMPLEMENTED_CARDS` 移除、内部节点不进 `nodes_v`、`.ac` 里没有 `AC` 关键字的源幅度为 0 并给出告警，1 个新测试文件（`tests/test_spice_oline.py` 34 例）与 3 条 selftest（96 换成 `S` 探针、147/148）；
+- `38` → `calc/spice.py` 的 `.noise` 解析（`V(out)` / `V(n1,n2)`，输出与输入源按名校验）、`_sweep_freqs`（`.ac` 与 `.noise` 共用同一套频率网格）、`_tline_guard`（从 `.ac` 里抽出的奇异点守卫，两处共用）、`_noise_sources`（四条机制，各带公式文本）/ `_noise_band`（按网格选 ln-f 或 f 梯形）/ `_noise_analysis`（伴随求解 `Aᵀy = e_out`，一次覆盖全部源）/ `_noise_owner`（阶梯元件的噪声归回原 `O`/`U` 卡名）、`KB_J_PER_K` / `E_CHARGE_C` / `_sig10`；委派侧 `_raw_plots` + `_parse_raw` 的 `bytes_used`（`.noise` rawfile 有两个 plot）、`_external_envelope` 的 noise 分支、`_cross_check` 的 noise 分支（只比输出谱）；顺带修 `_parse_element` 的 `M` 卡 `W=/L=/M=`（原先静默丢弃，`_mos_currents` 用 `KP·W/L`）；1 个新测试文件（`tests/test_spice_noise.py` 42 例）与 2 条 selftest（149/150）
   边界是**集总模型不是分布线**：`lump=` 只许在 `.model`（卡上是 ngspice 的 FATAL）、`LEN` 必须给、两个不同返回节点拒绝、皮肤效应/介质损耗/频变 `r`/`l` 与 `REL=`/`ABS=` 都不接，`g>0` 没有引擎可对拍。
 - 代码里的每条"拒绝回答"分支，都能在这三十七篇里找到对应的判据来源。

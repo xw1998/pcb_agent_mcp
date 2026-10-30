@@ -3267,7 +3267,7 @@ def _capabilities(_args):
             "The BUILTIN SPICE solver is a subset, by name: it handles R C L V I E G "
             "D Q M B, the LOSSLESS transmission line T and the two DISTRIBUTED cards "
             "O (an LTRA model) and U (a URC model), with "
-            ".op/.tran/.ac/.model/.temp, expands .subckt/X instances itself "
+            ".op/.tran/.ac/.noise/.model/.temp, expands .subckt/X instances itself "
             "(flattened before solving; numeric parameters and {+ - * / **} arithmetic, "
             "subcircuit-local .model, nested instances, <=32 deep and no recursion), and "
             "rejects F H J K S W A cards with the card named in the error. T "
@@ -3287,6 +3287,17 @@ def _capabilities(_args):
             "grows (first order, measured), so a disagreement with a real line is the "
             "ladder, not an error. Skin effect, dielectric loss and frequency-dependent "
             "r/l are not in the model at all. "
+            ".noise V(out) <source> dec|oct|lin n fstart fstop is solved adjointly at the "
+            "DC bias - one transpose solve per frequency covers every noise source, and "
+            "the transfer it uses is the .ac matrix, so the two cannot disagree. It "
+            "reports a density per swept point, the rms over the swept band (the band IS "
+            "the sweep, and the grid picks ln-f or f trapezoid, both stated), each "
+            "element's share, and the input-referred density. Mechanisms: 4kT/R, "
+            "2q*|I| on junctions and transistors, (2/3)gm on a level-1 MOSFET. NOT "
+            "there: flicker (1/f), burst, induced gate noise, avalanche, and any "
+            "capacitor's ESR (that is an R card you either wrote or did not). It does "
+            "NOT require an AC value on the input source (ngspice refuses the deck "
+            "without one) and it refuses a card naming a node nothing connects. "
             ".param works at the top level and inside a body (numbers and {+ - * / **} "
             "arithmetic; a parameter may be written after the element that uses it, and "
             "a circular definition is refused by name), one scope chain "
@@ -3312,9 +3323,9 @@ def _capabilities(_args):
             "versions in this "
             "build's VERIFIED_ENGINES list, and false for any other version - a "
             "different binary is not a verified engine. What neither path "
-            "does: temperature sweeps (one temperature per run), noise (.noise), "
-            "distortion, Monte Carlo; the builtin solver also uses dense LU and "
-            "refuses above ~400 unknowns",
+            "does: temperature sweeps (one temperature per run), distortion, Monte "
+            "Carlo; the builtin solver also uses dense LU and refuses above ~400 "
+            "unknowns",
             "Electrothermal coupling stops at a 2-D laminate plate: "
             "electrothermal_trace / electrothermal_conductor close the loop against one "
             "caller-supplied Rth; board_electrothermal closes it against a 2-D field, "
@@ -4313,7 +4324,8 @@ _tool(
 _tool(
     "sim_spice",
     "Run a real circuit simulation on a SPICE netlist: DC operating point (.op), transient "
-    "(.tran) and small-signal AC (.ac). The answer comes from the BUILTIN stdlib solver "
+    "(.tran), small-signal AC (.ac) and small-signal noise (.noise). The answer comes from "
+    "the BUILTIN stdlib solver "
     "(Newton + junction voltage limiting + gmin stepping, per-element voltage/current/"
     "power reported back) or, if an ngspice binary is installed, from ngspice itself - "
     "see the engine parameter. The builtin solver takes R C L V I E G D Q M plus "
@@ -4326,7 +4338,8 @@ _tool(
     "a URC .model with r/c/len) - both expanded at parse time into lump= sections of "
     "ordinary R/L/C (default 20, and the count is reported with the answer), so DC is "
     "the model's exact series resistance and .ac/.tran converge to the distributed "
-    "answer as lump grows, plus "
+    "answer as lump grows, plus .noise V(out[,ref]) <source> dec|oct|lin n fstart "
+    "fstop (see the noise paragraph below), plus "
     ".subckt/ends with X instances (FLATTENED before solving: numeric parameters, "
     "{+ - * / **} arithmetic on them, subcircuit-local .model, nested instances), and "
     "REJECTS F/H/K/S/W/A BY NAME, never silently; with ngspice the deck is passed "
@@ -4337,15 +4350,29 @@ _tool(
     "Expanded instances keep the internal node name ngspice prints (x1.m), so "
     "cross_check compares internal nodes too. .param is supported at the top level "
     "and inside subcircuit bodies (numbers or {+ - * / **} arithmetic on parameters; "
-    "forward references are fine, a circular definition is refused by name). Not "
+    "forward references are fine, a circular definition is refused by name). "
+    ".noise is solved ADJOINTLY: at the DC bias, one complex-MNA transpose solve per "
+    "frequency gives the transfer from every noise current to the output, so all "
+    "sources cost one solve and the gain cannot disagree with the .ac answer (it IS "
+    "the .ac matrix read backwards). Mechanisms are thermal 4kT/R, shot 2q*|Id| / "
+    "2q*|Ic| / 2q*|Ib| and a level-1 MOSFET's (2/3)gm channel thermal; there is no "
+    "1/f, burst or induced-gate noise, and an ideal source, C or L is silent BY "
+    "CONSTRUCTION (a capacitor's ESR is the R card you did not write). Each answer "
+    "carries the density per swept point, the rms integrated over the swept band, "
+    "the contributions per element, and the input-referred density (null with a "
+    "warning when the source cannot reach the output, rather than inf). The band IS "
+    "the sweep and the grid picks the integration rule (dec/oct in ln f, lin in f), "
+    "all stated in the answer. Unlike ngspice it does NOT require an AC value on "
+    "the input source, and it refuses a card naming a node nothing connects. Not "
     "implemented: expression functions, expressions in .model parameters, a .subckt "
-    "nested in another .subckt.",
+    "nested in another .subckt, .print.",
     {"type": "object", "properties": {
         "netlist": _str("SPICE netlist text, one card per line; a leading * is a comment. "
                         "The first line is not skipped unless it starts with * - write "
                         "a title line beginning with * to be safe"),
-        "analysis": _str("override or omit the .op/.tran/.ac) card: e.g. "
-                         "'.tran 0.1m 5m' or '.ac dec 20 1 1meg'"),
+        "analysis": _str("override or omit the .op/.tran/.ac/.noise card: e.g. "
+                         "'.tran 0.1m 5m', '.ac dec 20 1 1meg' or "
+                         "'.noise V(2) V1 dec 10 1 1meg'"),
         "temp_c": _num("simulation temperature, 27 C default unless a .temp card is "
                        "present", 27),
         "max_iter": _num("Newton iteration budget per solve", 200),

@@ -250,9 +250,20 @@ class TestRefusals(unittest.TestCase):
         self.assertEqual(r["reason_code"], "TOO_LARGE")
 
     def test_bad_analysis_name(self):
-        r = spice.simulate("* d\nV1 1 0 1\nR1 1 0 1k\n.end\n", analysis="noise")
+        # "noise" was the example of an illegal name until 0.0.32 implemented it;
+        # a name nobody implements still has to be refused, and refused by name
+        r = spice.simulate("* d\nV1 1 0 1\nR1 1 0 1k\n.end\n", analysis="disto")
         self.assertEqual(r["status"], "error")
         self.assertEqual(r["reason_code"], "ARG_INVALID")
+        self.assertIn("noise", r["message"])
+
+    def test_a_legal_analysis_that_the_deck_does_not_ask_for(self):
+        # legal name, no card: that is a missing card (ARG_REQUIRED), not a
+        # misspelled name - the two refusals mean different things
+        r = spice.simulate("* d\nV1 1 0 1\nR1 1 0 1k\n.end\n", analysis="noise")
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason_code"], "ARG_REQUIRED")
+        self.assertIn(".noise", r["hint"])
 
     def test_no_ground_node(self):
         r = spice.simulate("* n\nV1 1 2 1\nR1 1 2 1k\n.op\n.end\n", analysis="op")

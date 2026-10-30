@@ -179,7 +179,7 @@ def parse_netlist(text):
     """Parse the subset. Returns a spec dict; raises ValueError on anything it
     does not implement, with the line number, rather than skipping it."""
     spec = {"title": "", "elements": [], "models": {}, "analyses": [],
-            "options": {}, "subckts": {}, "params": {}}
+            "options": {}, "subckts": {}, "params": {}, "warnings": []}
     lines = str(text or "").splitlines()
     sub = None
     pending_params = []
@@ -258,6 +258,36 @@ def parse_netlist(text):
                                      "n": int(float(parts[2])),
                                      "fstart": _value(parts[3]),
                                      "fstop": _value(parts[4])})
+            continue
+        if low.startswith(".noise"):
+            # .noise V(out) <input source> dec|oct|lin n fstart fstop
+            # SPICE's own signature; the sweep belongs to the noise card, so
+            # this analysis does not need a .ac card to borrow a sweep from.
+            parts = line.split()
+            if len(parts) < 7:
+                raise ValueError("line %d: .noise needs V(out) <input source> "
+                                 "dec|oct|lin n fstart fstop (got %d tokens)"
+                                 % (lineno, len(parts)))
+            m = re.match(r"^\s*[vV]\(\s*([^,()]+?)\s*(?:,\s*([^()]+?)\s*)?\)\s*$",
+                         parts[1])
+            if m is None:
+                raise ValueError("line %d: .noise output must be written V(node) or "
+                                 "V(node1,node2), not %r" % (lineno, parts[1]))
+            pos = _node(m.group(1))
+            neg = _node(m.group(2)) if m.group(2) is not None else None
+            if pos is None and neg is None:
+                raise ValueError("line %d: .noise %s refers only to ground, so the "
+                                 "output is zero by construction"
+                                 % (lineno, parts[1]))
+            if parts[3].lower() not in ("dec", "oct", "lin"):
+                raise ValueError("line %d: .noise sweep must be dec, oct or lin, "
+                                 "not %r" % (lineno, parts[3]))
+            spec["analyses"].append({"kind": "noise", "out": (pos, neg),
+                                     "out_text": parts[1], "src": parts[2],
+                                     "sweep": parts[3].lower(),
+                                     "n": int(float(parts[4])),
+                                     "fstart": _value(parts[5]),
+                                     "fstop": _value(parts[6])})
             continue
         if low.startswith(".temp"):
             spec["options"]["temp_c"] = _value(line.split()[1])
@@ -1169,9 +1199,44 @@ def _parse_element(spec, line, lineno):
                 "model": model}
     if letter == "M":
         model = val(5, "model name").lower()
-        return {"type": "M", "name": name, "lineno": lineno,
-                "nodes": (_node(parts[1]), _node(parts[2]), _node(parts[3]),
-                          _node(parts[4])), "model": model}
+        el = {"type": "M", "name": name, "lineno": lineno,
+              "nodes": (_node(parts[1]), _node(parts[2]), _node(parts[3]),
+                        _node(parts[4])), "model": model}
+        geometry = {}
+        ignored = []
+        for p in low[6:]:
+            if "=" not in p:
+                raise ValueError("line %d: %s: %r is not a name=value parameter"
+                                 % (lineno, name, p))
+            key, raw = p.split("=", 1)
+            if key in ("w", "l", "m"):
+                geometry[key] = _value_or_expr(raw, lineno)
+            else:
+                ignored.append(key)
+        if ("w" in geometry) != ("l" in geometry):
+            raise ValueError("line %d: %s gives only %s=, so the channel's width "
+                             "over length is undefined; give both W= and L="
+                             % (lineno, name, "W" if "w" in geometry else "L"))
+        if geometry:
+            w = geometry["w"]
+            l_ = geometry["l"]
+            if w <= 0 or l_ <= 0:
+                raise ValueError("line %d: %s has W=%g L=%g; a channel dimension "
+                                 "cannot be zero or negative"
+                                 % (lineno, name, w, l_))
+            if "m" in geometry and geometry["m"] <= 0:
+                raise ValueError("line %d: %s has M=%g; a device multiplicity "
+                                 "cannot be zero or negative"
+                                 % (lineno, name, geometry["m"]))
+            el["wl"] = (w / l_) * geometry.get("m", 1.0)
+            el["geometry"] = {"w_m": w, "l_m": l_,
+                              "m": geometry.get("m", 1.0), "w_over_l": w / l_}
+        if ignored:
+            # Junction areas only feed junction capacitance and leakage scaling,
+            # neither of which this subset models. Saying so is the difference
+            # between a documented limit and a silent "we used what we liked".
+            el["_ignored_params"] = ignored
+        return el
     raise ValueError("line %d: unknown element type %r (element %s)"
                      % (lineno, letter, name))
 
@@ -1851,7 +1916,9 @@ class _Circuit(object):
                 self.branch_idx[el["name"] + "#i1"] = el["_row"]
                 extra += 1
         self.size = self.n + len(branches) + extra
-        self.disabled = []        # non-ideal effects that were switched off
+        # the parser's own "this was read but is not modelled" notes come first,
+        # so a deck-level surprise and a solve-time surprise land in one list
+        self.disabled = list(spec.get("warnings") or [])
         self.defaulted = {}       # model params that fell back to a default
         self.lossy = spec.get("lossy") or []   # O/U cards, for the report only
         # Nodes that exist only inside a ladder: reported nowhere, because they
@@ -1962,7 +2029,11 @@ class _Circuit(object):
         vds = s * (vd - vs)
         vbs = s * (vb - vs)
         VTO = pr.get("VTO", 0.0 if nmos else -0.0)
-        KP = pr.get("KP", 2e-5)
+        # KP alone is "the whole transconductance parameter" only when the card
+        # states no geometry; with W= and L= the level-1 form is KP*(W/L)*m, and
+        # ignoring it made every real deck's device 10x or 100x too weak with
+        # nothing on the page to say so.
+        KP = pr.get("KP", 2e-5) * el.get("wl", 1.0)
         LAMBDA = pr.get("LAMBDA", 0.0)
         GAMMA = pr.get("GAMMA", 0.0)
         PHI = pr.get("PHI", 0.6)
@@ -2595,9 +2666,10 @@ def _node_dict(circ, x, complex_ok=False):
 PRECISION = (
     "linear solves are dense LU in double precision, so a well-conditioned "
     "circuit is good to ~1e-9 relative; the error that matters is the MODEL: "
-    "level-1 MOSFET, Ebers-Moll BJT and an ideal Shockley diode with no series "
-    "resistance, no junction capacitance, no temperature beyond a fixed 27 C and "
-    "no noise. A converged answer is the answer to this netlist, not to the board"
+    "level-1 MOSFET with KP*(W/L)*m, Ebers-Moll BJT and an ideal Shockley diode "
+    "with no series resistance, no junction capacitance and no temperature beyond "
+    "the one stated. Noise is thermal 4kT/R and shot 2q*I only (.noise, since "
+    "0.0.32). A converged answer is the answer to this netlist, not to the board"
 )
 
 NOT_COMPUTED = [
@@ -2608,7 +2680,10 @@ NOT_COMPUTED = [
     "a .subckt nested inside another .subckt, and any directive other than "
     ".model inside a .subckt body",
     "current-controlled sources (F/H), switches (S/W), JFETs, coupled inductors (K)",
-    "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss",
+    "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss; W= "
+    "L= and M= scale KP*(W/L)*m (level 1), while AD= AS= PD= PS= and the rest are "
+    "read and reported as ignored, because junction capacitance and leakage are "
+    "not modelled",
     "Laplace blocks (laplace(...)), the current of another element (I(Vname)), "
     "B-source noise, and derivative/ddt/idt operators",
     "a DISTRIBUTED line: an O card (LTRA) and a U card (URC) are turned into a "
@@ -2620,7 +2695,10 @@ NOT_COMPUTED = [
     "ngspice-47 itself refuses an O card with nonzero G (\"Nonzero G (except RG) "
     "line not supported yet\"), so a g>0 deck cannot be cross-checked against it"
     % DEFAULT_LUMP,
-    "noise (.noise), distortion (.disto), Monte Carlo / worst-case",
+    "distortion (.disto), Monte Carlo / worst-case, and the noise mechanisms this "
+    "subset does not model: flicker (1/f), burst, avalanche, induced gate noise, "
+    "the noise of a B source, and the thermal noise of anything not written as an "
+    "R card (a capacitor's ESR is the ESR's)",
     "temperature SWEEP (one temperature per run: `.temp` / temp_c), and junction "
     "self-heating - the junction sits at the temperature you state, it does not "
     "rise with dissipation. IS(T) and Vt(T) are modelled (XTI/EG/TNOM), so a "
@@ -2638,6 +2716,330 @@ def _expression_failure(why):
                    hint="a B source's expression was evaluated at a voltage where it "
                         "has no value (division by zero, sqrt or log of a negative, "
                         "an overflow). The netlist is not wrong; the expression is")
+    return None
+
+# Boltzmann and the elementary charge, CODATA-2018 exact values (the SI
+# redefinition fixed them). A noise number whose constants were "about right"
+# would be wrong in the fourth digit with nothing on the page to show it.
+KB_J_PER_K = 1.380649e-23
+E_CHARGE_C = 1.602176634e-19
+
+def _sig10(x):
+    """Ten significant digits: a 1e-19 V^2/Hz density is unreadable as 19 zeros."""
+    return float("%.10g" % x)
+
+def _noise_owner(circ, name):
+    """The card a noise source belongs to.
+
+    A ladder section's name is internal ("oline#r3"); the contribution belongs to
+    the O card the caller wrote ("O1"), under its own spelling.
+    """
+    base = name.split("#", 1)[0]
+    if base == name:
+        return name
+    for rec in getattr(circ, "lossy", ()) or ():
+        if rec["name"].lower() == base.lower():
+            return rec["name"]
+    return base
+
+def _noise_sources(circ, x):
+    """What makes noise, at the bias point: [(name, mechanism, a, b, psd, text)].
+
+    Only mechanisms this subset actually models are listed, and each one names
+    its formula. A device that contributes nothing here (an ideal source, a C or
+    an L) is silent by construction, not by omission - the noise of a real
+    capacitor's ESR is the ESR's, which is an R card you either wrote or did not.
+    """
+    kT = KB_J_PER_K * (circ.temp_c + 273.15)
+    out = []
+
+    def volt(n):
+        idx = circ.i(n)
+        return x[idx - 1].real if idx else 0.0
+
+    for el in circ.elements:
+        T = el["type"]
+        if T == "R":
+            out.append((el["name"], "thermal", el["nodes"][0], el["nodes"][1],
+                        4.0 * kT / el["value"], "4kT/R (Nyquist, a current source "
+                        "across the resistor)"))
+        elif T == "D":
+            na, nk = el["nodes"]
+            i_d, _p = circ.diode_current(el, volt(na) - volt(nk))
+            out.append((el["name"], "shot", na, nk,
+                        2.0 * E_CHARGE_C * abs(i_d),
+                        "2q*|Id| (shot, a current source across the junction)"))
+        elif T == "Q":
+            nc, nb, ne = el["nodes"]
+            ic, ib, _ie = circ._bjt_currents(el, volt(nb), volt(nc), volt(ne))
+            out.append((el["name"], "shot_collector", nc, ne,
+                        2.0 * E_CHARGE_C * abs(ic),
+                        "2q*|Ic| (shot, collector to emitter)"))
+            out.append((el["name"], "shot_base", nb, ne,
+                        2.0 * E_CHARGE_C * abs(ib),
+                        "2q*|Ib| (shot, base to emitter, independent of Ic's)"))
+        elif T == "M":
+            nd, ng, ns, nbb = el["nodes"]
+            v = [volt(nd), volt(ng), volt(ns), volt(nbb)]
+            jac = _numeric_jac(lambda vv: list(circ._mos_currents(el, vv[0], vv[1],
+                                                                 vv[2], vv[3])), v)
+            gm = jac[0][1]
+            out.append((el["name"], "channel_thermal", nd, ns,
+                        4.0 * kT * (2.0 / 3.0) * abs(gm),
+                        "4kT*(2/3)*gm (channel thermal, saturation form; no flicker, "
+                        "no induced gate noise)"))
+    return out
+
+def _noise_band(points, key, geometric=False):
+    """Integrate a density over the swept band. The band IS the sweep.
+
+    The rule follows the sweep: a dec/oct sweep is uniform in ln(f), so the
+    integral is taken in ln(f) (int PSD df = int PSD*f d(ln f)), and a lin sweep
+    in f. Measured on an RC low-pass (docs/38), integrating a dec-10 sweep in f
+    instead overstates the band noise by 0.44% while the geometric rule is
+    within 0.001% - and a lin sweep does the opposite. One rule cannot be right
+    for both grids, so the grid decides.
+    """
+    total = 0.0
+    for k in range(1, len(points)):
+        f0, f1 = points[k - 1]["freq_hz"], points[k]["freq_hz"]
+        a, b = points[k - 1][key], points[k][key]
+        if geometric and f0 > 0.0 and f1 > 0.0:
+            total += 0.5 * (math.log(f1) - math.log(f0)) * (a * f0 + b * f1)
+        else:
+            total += 0.5 * (f1 - f0) * (a + b)
+    return total
+
+def _noise_analysis(circ, card, max_points):
+    """Small-signal noise at the DC bias: one ADJOINT solve per frequency.
+
+    Why an adjoint and not one solve per noise source: the output response to a
+    current injected between two nodes is (y[a] - y[b]) where A^T y = e_out, and
+    A is the same complex MNA matrix the AC analysis already builds. So one
+    linear solve gives every source at once, exactly (this is a linear circuit
+    once the bias point is fixed), and it cannot disagree with the AC answer
+    because it IS the AC answer, read backwards.
+
+    What is reported is a spectral density (V/sqrt(Hz)) per frequency plus the
+    rms noise integrated over the swept band. Both are needed: a density at one
+    frequency says nothing about what a receiver sees, and an integrated number
+    alone hides which band produced it.
+    """
+    f0, f1 = card["fstart"], card["fstop"]
+    if f0 <= 0 or f1 <= f0:
+        return err("noise sweep needs 0 < fstart < fstop", "ARG_RANGE")
+    pos, neg = card["out"]
+    for node, which in ((pos, "first"), (neg, "second")):
+        if node is not None and node not in circ.node_idx:
+            return err("the .noise output %s names node %r, which no card connects"
+                       % (which, node), "NETLIST_INVALID",
+                       hint="a node nothing connects reads 0 V, so a typo would come "
+                            "back as a beautifully quiet answer")
+    src = None
+    for el in circ.elements:
+        if el["name"].lower() == str(card["src"]).lower():
+            src = el
+            break
+    if src is None:
+        return err("the .noise input source %r is not in the netlist" % card["src"],
+                   "NETLIST_INVALID")
+    if src["type"] not in ("V", "I"):
+        return err("the .noise input source must be a V or I source; %s is a %s card"
+                   % (src["name"], src["type"]), "ARG_INVALID")
+    freqs = _sweep_freqs(card["sweep"], card["n"], f0, f1)
+    asked = len(freqs)
+    if asked > max_points:
+        circ.disabled.append(
+            "the .noise sweep asked for %d points but only the first %d were solved "
+            "(up to %.6g Hz, not fstop %.6g Hz) - the integrated noise below covers "
+            "the solved band only" % (asked, max_points, freqs[max_points - 1], f1))
+        freqs = freqs[:max_points]
+    x0, iters, why = _dc(circ)
+    if x0 is None:
+        bad = _expression_failure(why)
+        if bad is not None:
+            return bad
+        return err("noise needs a DC operating point and it did not converge (%s)"
+                   % why, "NOT_CONVERGED",
+                   hint="every noise density here is evaluated AT the bias point "
+                        "(4kT/R, 2q*Id, gm), so without a bias there is no noise")
+    sources = _noise_sources(circ, x0)
+    e = [0j] * circ.size
+    if pos is not None:
+        e[circ.i(pos) - 1] += 1.0
+    if neg is not None:
+        e[circ.i(neg) - 1] -= 1.0
+    # Unit excitation of the input source: only |gain| is used, so its phase and
+    # magnitude are irrelevant - and requiring an AC keyword on the card would
+    # make ".noise V(2) V1 ..." refuse a deck SPICE accepts.
+    bu = [0j] * circ.size
+    if src["type"] == "V":
+        bu[circ.branch_idx[src["name"]] - 1] = 1.0
+    else:
+        a_node, b_node = src["nodes"][0], src["nodes"][1]
+        if circ.i(a_node):
+            bu[circ.i(a_node) - 1] += 1.0
+        if circ.i(b_node):
+            bu[circ.i(b_node) - 1] -= 1.0
+    points = []
+    gain_flat = None
+    for f in freqs:
+        for el in circ.elements:
+            if el["type"] in ("C", "L", "T"):
+                el["_f"] = f
+        bad = _tline_guard(circ, f)
+        if bad is not None:
+            return bad
+        A, _b = circ.assemble(x0, mode="ac", gmin=0.0)
+        At = [[A[r][c] for r in range(circ.size)] for c in range(circ.size)]
+        try:
+            y = _solve_dense(At, e)
+        except ZeroDivisionError as exc:
+            return err("the noise matrix is singular at %g Hz: %s" % (f, exc),
+                       "SINGULAR",
+                       hint="a floating node or a voltage-source loop has no AC "
+                            "definition, and a noise density through it would be "
+                            "infinite; fix the DC netlist first")
+        gain = abs(sum(y[k] * bu[k] for k in range(circ.size)))
+        if gain > 0.0 and gain_flat is None:
+            gain_flat = gain
+        per = {}
+        for (name, _mech, a_node, b_node, psd, _text) in sources:
+            ia, ib = circ.i(a_node), circ.i(b_node)
+            h = ((y[ia - 1] if ia else 0j) - (y[ib - 1] if ib else 0j))
+            owner = _noise_owner(circ, name)
+            per[owner] = per.get(owner, 0.0) + abs(h) ** 2 * psd
+        onoise2 = sum(per.values())
+        rec = {"freq_hz": round(f, 6),
+               "onoise_v_per_sqrt_hz": _sig10(math.sqrt(onoise2)),
+               "onoise_v2_per_hz": _sig10(onoise2),
+               "gain_mag": _sig10(gain),
+               "inoise_v_per_sqrt_hz": (_sig10(math.sqrt(onoise2 / (gain * gain)))
+                                        if gain > 0.0 else None),
+               "contributions_v2_per_hz": dict((k, _sig10(v))
+                                              for k, v in sorted(per.items()))}
+        points.append(rec)
+    if not points:
+        return err("the .noise sweep produced no frequency", "ARG_RANGE")
+    if len(points) < 2:
+        circ.disabled.append(
+            "the sweep holds one frequency, so the integrated noise is 0 by "
+            "construction: an integral needs a band, and one point has none "
+            "(the spectral density at that point is still the answer)")
+    # A density the input cannot reach has no input-referred value: dividing by
+    # a gain of zero would print "inf" and look like a finding.
+    if all(p["inoise_v_per_sqrt_hz"] is None for p in points):
+        circ.disabled.append(
+            "%s drives nothing that reaches %s at any swept frequency, so the input-"
+            "referred noise is not defined and is reported as null (the output "
+            "noise is still the answer)" % (src["name"], card["out_text"]))
+    geometric = card["sweep"] in ("dec", "oct")
+    onoise_rms = math.sqrt(max(0.0, _noise_band(points, "onoise_v2_per_hz",
+                                                geometric)))
+    if all(p["inoise_v_per_sqrt_hz"] is None for p in points):
+        inoise_rms = None
+    else:
+        inoise2 = []
+        for p in points:
+            g = p["gain_mag"]
+            inoise2.append(p["onoise_v2_per_hz"] / (g * g) if g > 0.0 else 0.0)
+        inoise_rms = math.sqrt(max(0.0, _noise_band(
+            [{"freq_hz": p["freq_hz"], "x": v} for p, v in zip(points, inoise2)],
+            "x", geometric)))
+    mech = {}
+    for (name, mechanism, _a, _b, psd, text) in sources:
+        owner = _noise_owner(circ, name)
+        key = (owner, mechanism)
+        cur = mech.get(key)
+        if cur is None:
+            mech[key] = {"element": owner, "mechanism": mechanism,
+                         "elements": 1, "psd_a2_per_hz": psd, "formula": text}
+        else:
+            cur["elements"] += 1
+            cur["psd_a2_per_hz"] += psd
+    return ok(value={"analysis": "noise",
+                     "output": card["out_text"],
+                     "input_source": src["name"],
+                     "points": points,
+                     "integrated": {
+                         "onoise_v_rms": _sig10(onoise_rms),
+                         "inoise_v_rms": (_sig10(inoise_rms)
+                                          if inoise_rms is not None else None),
+                         "band_hz": [round(freqs[0], 6), round(freqs[-1], 6)],
+                         "method": (("trapezoid in ln(f) over the swept points (a "
+                                     "%s sweep is uniform in ln f)" % card["sweep"])
+                                    if geometric else
+                                    ("trapezoid in f over the swept points (a lin "
+                                     "sweep is uniform in f)")),
+                         "note": "the band is the sweep: noise outside it is not in "
+                                 "this number, and a coarse sweep can miss a narrow "
+                                 "peak"},
+                     "bias_point_v": _node_dict(circ, x0),
+                     "sources": [mech[k] for k in sorted(mech)],
+                     "iterations": iters},
+              unit="V/sqrt(Hz) and V rms",
+              model="mna_complex_ac_adjoint",
+              basis=("the complex MNA matrix of the .ac analysis is solved adjointly "
+                     "(A^T y = e_out) once per frequency, so the output response to "
+                     "any current injected between two nodes is y[a] - y[b] and every "
+                     "source is accounted for in the same solve; densities are "
+                     "Nyquist 4kT/R and shot 2q*I"),
+              precision=("exact for the linearised circuit in double precision, so the "
+                         "error that matters is the MODEL: thermal 4kT/R and shot 2q*I "
+                         "only - no flicker (1/f), no burst, no induced gate noise, no "
+                         "avalanche, and a level-1 MOSFET's (2/3)gm channel noise. The "
+                         "integral is a trapezoid over the swept points in the "
+                         "sweep's own variable, so it is a band-limited number and "
+                         "any sweep under-resolves a peak narrower than its spacing"),
+              assumptions={"temp_c": circ.temp_c,
+                           "points": len(points),
+                           "band_hz": [round(freqs[0], 6), round(freqs[-1], 6)],
+                           "output": card["out_text"],
+                           "input_source": src["name"],
+                           "noiseless_by_construction": ("every V and I source, every "
+                                                         "C and every L card"),
+                           "defaulted_model_params": circ.defaulted},
+              extra={"not_computed": NOT_COMPUTED, "warnings": circ.disabled})
+
+def _sweep_freqs(sweep, npts, f0, f1):
+    """The sweep's own frequencies. dec/oct are geometric, lin is uniform.
+
+    One implementation for .ac and .noise on purpose: the same "dec 10" has to
+    mean the same 61 points in both, or the two analyses would disagree about
+    where the circuit was sampled.
+    """
+    npts = max(1, int(npts))
+    if sweep == "dec":
+        count = int(math.ceil(math.log10(f1 / f0) * npts)) + 1
+        return [f0 * (f1 / f0) ** (i / max(1.0, (count - 1))) for i in range(count)]
+    if sweep == "oct":
+        count = int(math.ceil(math.log(f1 / f0, 2) * npts)) + 1
+        return [f0 * (f1 / f0) ** (i / max(1.0, (count - 1))) for i in range(count)]
+    return [f0 + (f1 - f0) * i / max(1.0, npts - 1) for i in range(npts)]
+
+def _tline_guard(circ, f):
+    """Refuse the frequency where a LOSSLESS line's admittance is infinite.
+
+    cot(theta) diverges at every multiple of pi: the ideal line is a perfect
+    short there and has no finite answer. Returning the huge number the matrix
+    would produce is exactly the plausible-looking wrong answer this module
+    exists to not produce. Shared by .ac and .noise, which solve the same
+    matrix.
+    """
+    for el in circ.elements:
+        if el["type"] != "T":
+            continue
+        theta = 2.0 * math.pi * f * el["td"]
+        if abs(math.sin(theta)) < 1e-9:
+            return err("sweep stopped at %g Hz: %s is at theta = 2*pi*f*TD = %g rad, "
+                       "a multiple of pi, where a LOSSLESS line's admittance is "
+                       "infinite. The ideal model has no finite answer there; sweep "
+                       "off the resonance, or use an engine that models the line's "
+                       "loss" % (f, el["name"], theta), "SINGULAR",
+                       hint="a real line has loss, which is what makes this frequency "
+                            "finite: an O card (a lossy line, implemented here since "
+                            "0.0.31) or ngspice are the two ways to get a number "
+                            "there")
     return None
 
 def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
@@ -2679,8 +3081,8 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                         "section costs a node and, with series inductance, a branch "
                         "unknown), or use ngspice for a full-size design")
     want = (analysis or (spec["analyses"][-1]["kind"] if spec["analyses"] else "op")).lower()
-    if want not in ("op", "tran", "ac"):
-        return err("analysis must be op, tran or ac", "ARG_INVALID")
+    if want not in ("op", "tran", "ac", "noise"):
+        return err("analysis must be op, tran, ac or noise", "ARG_INVALID")
 
     if want == "op":
         x, iters, why = _dc(circ)
@@ -2828,6 +3230,13 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
                                "defaulted_model_params": circ.defaulted},
                   extra={"not_computed": NOT_COMPUTED, "warnings": circ.disabled})
 
+    if want == "noise":
+        card = next((a for a in spec["analyses"] if a["kind"] == "noise"), None)
+        if card is None:
+            return err("no .noise card in the netlist", "ARG_REQUIRED",
+                       hint="add '.noise V(out) <source> dec <n> <fstart> <fstop>'")
+        return _noise_analysis(circ, card, max_points)
+
     # AC
     card = next((a for a in spec["analyses"] if a["kind"] == "ac"), None)
     if card is None:
@@ -2836,15 +3245,7 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
     f0, f1 = card["fstart"], card["fstop"]
     if f0 <= 0 or f1 <= f0:
         return err("ac sweep needs 0 < fstart < fstop", "ARG_RANGE")
-    npts = max(1, int(card["n"]))
-    if card["sweep"] == "dec":
-        count = int(math.ceil(math.log10(f1 / f0) * npts)) + 1
-        freqs = [f0 * (f1 / f0) ** (i / max(1.0, (count - 1))) for i in range(count)]
-    elif card["sweep"] == "oct":
-        count = int(math.ceil(math.log(f1 / f0, 2) * npts)) + 1
-        freqs = [f0 * (f1 / f0) ** (i / max(1.0, (count - 1))) for i in range(count)]
-    else:
-        freqs = [f0 + (f1 - f0) * i / max(1.0, npts - 1) for i in range(npts)]
+    freqs = _sweep_freqs(card["sweep"], card["n"], f0, f1)
     asked = len(freqs)
     if asked > max_points:
         # Truncating a sweep is a silent lie unless it is said out loud: the last
@@ -2875,26 +3276,13 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
         for el in circ.elements:
             if el["type"] in ("C", "L", "T"):
                 el["_f"] = f
+        bad = _tline_guard(circ, f)
+        if bad is not None:
+            return bad
         for el in circ.elements:
             if el["type"] != "T":
                 continue
-            theta = 2.0 * math.pi * f * el["td"]
-            s = abs(math.sin(theta))
-            if s < 1e-9:
-                # cot(theta) is infinite here: the lossless line is a short at
-                # every multiple of pi, and an ideal short has no finite answer.
-                # Returning the huge number the matrix would produce is exactly
-                # the plausible-looking wrong answer this module exists to not
-                # produce.
-                return err("AC sweep stopped at %g Hz: %s is at theta = 2*pi*f*TD "
-                           "= %g rad, a multiple of pi, where a LOSSLESS line's "
-                           "admittance is infinite. The ideal model has no "
-                           "finite answer there; sweep off the resonance, or use "
-                           "an engine that models the line's loss"
-                           % (f, el["name"], theta), "SINGULAR",
-                           hint="a real line has loss, which is what makes this "
-                                "frequency finite; O cards (lossy lines) are not "
-                                "implemented here")
+            s = abs(math.sin(2.0 * math.pi * f * el["td"]))
             if s < 1e-3 and el["name"] not in tline_warned:
                 tline_warned.add(el["name"])
                 circ.disabled.append(
@@ -3096,6 +3484,7 @@ def _parse_raw(data):
     mult = 2 if is_complex else 1
 
     points = []
+    used = len(data)          # ASCII: the token stream cannot be counted exactly
     if cand.startswith(b"Binary"):
         need = npt_unused = None
         size = 8 * nvar * mult
@@ -3104,6 +3493,7 @@ def _parse_raw(data):
         if len(body) < size * npts:
             raise ValueError("binary rawfile truncated: %d bytes for %d points x %d "
                              "variables" % (len(body), npts, nvar))
+        used = idx + len(cand) + size * npts
         vals = struct.unpack("<%dd" % (nvar * mult * npts), body[:size * npts])
         step = nvar * mult
         for p in range(npts):
@@ -3130,11 +3520,36 @@ def _parse_raw(data):
 
     return {"plotname": meta.get("plotname") or "", "flags": flags,
             "complex": is_complex, "vars": names, "types": types,
-            "points": points}
+            "points": points, "bytes_used": used}
 
 
 _NODE_PREFIXES = ("v(", "V(")
 
+
+def _raw_plots(data):
+    """Every plot in one ngspice rawfile, oldest first.
+
+    A .noise run writes TWO plots back to back (the spectral densities, then the
+    integrated totals), and _parse_raw reads one plot at a time - so the file is
+    walked plot by plot using the byte count each parse reports. An ASCII
+    rawfile reports "the whole file", which ends the walk after one plot: an
+    untrustworthy split is not attempted, and the caller says so.
+    """
+    if isinstance(data, str):
+        data = data.encode("utf-8", "replace")
+    out = []
+    off = 0
+    while off < len(data):
+        try:
+            p = _parse_raw(data[off:])
+        except ValueError:
+            break
+        out.append(p)
+        used = p.get("bytes_used") or 0
+        if used <= 0 or off + used >= len(data):
+            break
+        off += used
+    return out
 
 def _raw_nodes(raw):
     """Pull v(node) vectors out of a parsed rawfile.
@@ -3178,6 +3593,8 @@ def _last_analysis_card(netlist):
             found = "tran"
         elif low.startswith(".ac"):
             found = "ac"
+        elif low.startswith(".noise"):
+            found = "noise"
     return found
 
 
@@ -3215,10 +3632,10 @@ def _deck_for_ngspice(netlist, want):
         if low == ".end" or low.startswith(".end "):
             continue
         if low.startswith((".op", ".tran", ".ac", ".dc", ".four", ".noise")):
-            continue
+            continue      # re-added below, once, in the order that was asked for
         keep.append(ln)
     analyses = [ln.strip() for ln in lines
-                if ln.strip().lower().startswith((".op", ".tran", ".ac"))]
+                if ln.strip().lower().startswith((".op", ".tran", ".ac", ".noise"))]
     picked = [a for a in analyses if a.lower().startswith("." + want)]
     if not picked:
         picked = [a for a in analyses if a.lower().startswith("." + want[:2])]
@@ -3300,6 +3717,10 @@ def _run_ngspice(argv, netlist, want, timeout_s=NGSPICE_TIMEOUT_S):
                                   "refused",
                              extra={"engine": "ngspice",
                                     "raw_bytes": len(data)})
+        if want == "noise":
+            # the spectra are in the first plot, the integrated totals in the
+            # second; both are the engine's own numbers
+            raw["all_plots"] = _raw_plots(data)
         return (raw, log), None
     finally:
         import shutil as _shutil
@@ -3378,6 +3799,54 @@ def _external_envelope(raw, want, argv, tstep_hint=None, cross=None,
                   basis=basis, precision=precision, assumptions=assumptions,
                   extra=extra)
 
+    if want == "noise":
+        names = [str(x).lower() for x in raw["vars"]]
+        for need in ("frequency", "onoise_spectrum"):
+            if need not in names:
+                return err("ngspice's noise rawfile carries no %r vector" % need,
+                           "ENGINE_OUTPUT_INVALID",
+                           hint="the plot names are documented (frequency, "
+                                "onoise_spectrum, inoise_spectrum); a rename means "
+                                "the parse below would be reading the wrong column")
+        fi, oi = names.index("frequency"), names.index("onoise_spectrum")
+        ii = names.index("inoise_spectrum") if "inoise_spectrum" in names else None
+        pts = []
+        for row in raw["points"]:
+            def real(v):
+                return float(v[0]) if isinstance(v, tuple) else float(v)
+            pts.append({"freq_hz": round(real(row[fi]), 6),
+                        "onoise_v_per_sqrt_hz": abs(real(row[oi])),
+                        "inoise_v_per_sqrt_hz": (abs(real(row[ii]))
+                                                 if ii is not None else None)})
+        if not pts:
+            return err("ngspice's noise rawfile has no frequency points",
+                       "ENGINE_OUTPUT_INVALID")
+        totals = {}
+        for p in (raw.get("all_plots") or [])[1:]:
+            lower = [str(x).lower() for x in p["vars"]]
+            if not p["points"]:
+                continue
+            row = p["points"][0]
+            for k, nm in enumerate(lower):
+                if nm.startswith("v(") and nm.endswith("_total)"):
+                    val = row[k]
+                    totals[nm[2:-1]] = abs(float(val[0]) if isinstance(val, tuple)
+                                           else float(val))
+        return ok(value={"analysis": "noise", "points": pts,
+                         "integrated": ({"onoise_v_rms": totals.get("onoise_total"),
+                                         "inoise_v_rms": totals.get("inoise_total"),
+                                         "method": "ngspice's own integration over "
+                                                   "its sweep",
+                                         "note": "these are the engine's numbers; its "
+                                                 "input-referred total is not defined "
+                                                 "the same way as the builtin's (it "
+                                                 "divides the output integral by one "
+                                                 "gain), so compare the spectra"
+                                         } if totals else None)},
+                  unit="V/sqrt(Hz) and V rms", model="external_ngspice",
+                  basis=basis, precision=precision, assumptions=assumptions,
+                  extra=extra)
+
     # ac
     f = scales.get("frequency") or []
     pts = []
@@ -3422,6 +3891,32 @@ def _cross_check(builtin, external, want):
             if isinstance(bv, (int, float)) and isinstance(ev, (int, float)):
                 out.append((node, abs(float(bv) - float(ev))))
         return out
+
+    if want == "noise":
+        bp = bval.get("points") or []
+        ep = eval_.get("points") or []
+        n = min(len(bp), len(ep))
+        worst = 0.0
+        for k in range(n):
+            b = bp[k].get("onoise_v_per_sqrt_hz")
+            e = ep[k].get("onoise_v_per_sqrt_hz")
+            if isinstance(b, (int, float)) and isinstance(e, (int, float)):
+                scale = max(abs(b), abs(e))
+                if scale > 0.0:
+                    worst = max(worst, abs(b - e) / scale)
+        if n == 0:
+            return {"compared_points": 0, "max_rel_diff_onoise": None,
+                    "note": "no noise points in common between the two engines, so "
+                            "nothing was compared - this is NOT a pass"}
+        note = ("relative difference of the OUTPUT noise spectral density at every "
+                "frequency both engines report; the mechanisms are the same "
+                "(4kT/R, 2q*I) but the bias point is each engine's own, so a small "
+                "number corroborates the transfer, not the device model. The "
+                "input-referred totals are NOT compared: ngspice's integral divides "
+                "by a single gain while the builtin divides per frequency")
+        return {"compared_points": n,
+                "max_rel_diff_onoise": round(worst, 12),
+                "note": note}
 
     if want == "op":
         diffs = pairs(bval.get("nodes_v"), eval_.get("nodes_v"))
@@ -3525,8 +4020,8 @@ def simulate(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
     else:
         want = (analysis
                 or (spec["analyses"][-1]["kind"] if spec["analyses"] else "op")).lower()
-    if want not in ("op", "tran", "ac"):
-        return err("analysis must be op, tran or ac", "ARG_INVALID")
+    if want not in ("op", "tran", "ac", "noise"):
+        return err("analysis must be op, tran, ac or noise", "ARG_INVALID")
     if temp_c is not None:
         try:
             temp_c = float(temp_c)

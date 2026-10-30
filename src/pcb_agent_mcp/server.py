@@ -6,6 +6,7 @@ what the MCP stdio transport is. Handlers live in tools.py, so swapping in the
 official SDK later is a thin adapter, not a rewrite.
 """
 import json
+import math as _math
 import os
 import sys
 import zipfile
@@ -843,6 +844,71 @@ def selftest():
               payload.get("status") == "ok"
               and _m is not None and abs(_m - 0.909627) < 1e-3,
               str(_m))
+
+        # 0.0.32: .noise at the DC bias, one adjoint solve per frequency. The
+        # numbers below are the closed forms, not the solver's own output: at 1 Hz
+        # a 1 kohm / 1 uF low-pass must read 4kT*R/(1+(2*pi*f*R*C)^2) and the band
+        # integral 1 Hz..1 MHz must read the arctan form. sqrt(kT/C) is the whole
+        # band, so the swept band has to come in under it.
+        r = handle({"jsonrpc": "2.0", "id": 149, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* rc\nV1 1 0 AC 1\nR1 1 2 1k\nC1 2 0 1u\n"
+                                   ".noise V(2) V1 dec 10 1 1meg\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        _p0 = (_v.get("points") or [{}])[0]
+        _int = _v.get("integrated") or {}
+        _src = _v.get("sources") or []
+        _kT = 1.380649e-23 * 300.15
+        _want1 = (4.0 * _kT * 1000.0 / (1.0 + (2.0 * 3.141592653589793 * 1.0
+                                              * 1000.0 * 1e-6) ** 2)) ** 0.5
+        _RC = 1000.0 * 1e-6
+        _k = 4.0 * _kT * 1000.0 / (2.0 * 3.141592653589793 * _RC)
+        _atan = lambda f: _math.atan(2.0 * 3.141592653589793 * f * _RC)
+        _band = (_k * (_atan(1e6) - _atan(1.0))) ** 0.5
+        _total = (1.380649e-23 * 300.15 / 1e-6) ** 0.5
+        check("builtin .noise: a 1 k / 1 uF low-pass reads 4.071291874e-09 V/sqrt(Hz) "
+              "at 1 Hz and 6.424132e-08 V rms over 1 Hz..1 MHz, i.e. the arctan band "
+              "integral to 0.01 % and under sqrt(kT/C)=6.437405e-08",
+              payload.get("status") == "ok"
+              and len(_v.get("points") or []) == 61
+              and abs(_p0.get("onoise_v_per_sqrt_hz", 0.0) / _want1 - 1.0) < 1e-6
+              and abs(_int.get("onoise_v_rms", 0.0) / _band - 1.0) < 1e-4
+              and 0.0 < _int.get("onoise_v_rms", 0.0) < _total
+              and _int.get("band_hz") == [1.0, 1000000.0]
+              and len(_src) == 1 and _src[0].get("element") == "R1"
+              and abs(_src[0].get("psd_a2_per_hz", 0.0) / (4.0 * _kT / 1000.0)
+                      - 1.0) < 1e-12,
+              "%r / %r / %r" % (_p0.get("onoise_v_per_sqrt_hz"),
+                                _int.get("onoise_v_rms"), _src))
+
+        # 0.0.32: the two refusals that keep the number above from being an
+        # accident - a node nothing connects (a typo would come back beautifully
+        # quiet) and a circuit with no noise source at all (which must read 0 with
+        # an empty source list, not a default density).
+        r = handle({"jsonrpc": "2.0", "id": 150, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* bad\nV1 1 0 AC 1\nR1 1 0 1k\n"
+                                   ".noise V(9) V1 dec 2 1 10\n",
+                        "engine": "builtin"}}})
+        _bad = json.loads(r["result"]["content"][0]["text"])
+        r = handle({"jsonrpc": "2.0", "id": 150, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* silent\nV1 1 0 AC 1\nC1 1 0 1u\n"
+                                   ".noise V(1) V1 dec 10 1 100\n",
+                        "engine": "builtin"}}})
+        _sil = json.loads(r["result"]["content"][0]["text"])
+        _sv = _sil.get("value") or {}
+        check("builtin .noise refuses an unconnected output node by name and reports "
+              "0 V with an empty source list when nothing makes noise",
+              _bad.get("status") == "error"
+              and _bad.get("reason_code") == "NETLIST_INVALID"
+              and "'9'" in (_bad.get("message") or "")
+              and _sil.get("status") == "ok"
+              and (_sv.get("sources") or []) == []
+              and (_sv.get("integrated") or {}).get("onoise_v_rms") == 0.0,
+              "%r / %r" % (_bad.get("reason_code"), _sv.get("sources")))
 
         # filter synthesis: the prototype table is a textbook value, and the
         # lumped bandpass is scored against the closed form it must agree with.
