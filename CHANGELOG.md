@@ -9,6 +9,102 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.43] - 2026-10-30
+
+三件互相独立的事，共同点是**都拒绝用「自己看着像」代替证据**：写 snippet 的方法名从应用
+自己的表里问、步骤复放不把「跑完没报错」当「复现」、跑不完的 DRC 交出 id 而不是给一个更大的
+超时或一个截断的答案。
+
+### 1. `lceda_write_snippet`：从应用 API 表生成写 snippet
+
+`lceda_pcb_write`（0.0.38）一直是可检查的写路径（`probe → code → probe → 比较`，探针没动就
+拒绝 `WRITE_HAD_NO_EFFECT`），但它不生成 snippet——因为厂商写方法名一个都没在真机上验证过。
+`doc.api` 把这个洞补上：编辑器会把自己有什么报出来，带厂商中文注释，每个类还带 `callPath`
+（运行期接收者：`PCB_Document`，不是 `pcb_Document`）。
+
+于是把一件事拆成三份，每份只由能负责的一方回答：
+
+| 要素 | 谁回答 |
+|---|---|
+| 方法**名字** | 应用（`doc.api`） |
+| **参数** | 调用者（`argsv`，原样传入——应用不报签名） |
+| **效果** | 探针（`lceda_pcb_write`） |
+
+打分只有三档：**3 = 精确名**（`save` → `save`）、**2 = 名字含操作词**（`moveComponent` 含
+`move`）、**1 = 只有厂商注释**（`applyEdit` 注释「移动器件」）。精确必须压过包含，否则
+`save` / `saveAs` 会算成「一样好」，把判断题推给用户。最高档多于一个 → `SNIPPET_AMBIGUOUS`
+并列出候选；一个都没有 → `SNIPPET_NO_API` 并给出路（自己写 snippet 交给 `lceda_pcb_write`）；
+`move` / `create` 缺参数 → `SNIPPET_NO_ARGS`，不发一个空参调用让编辑器在运行期炸。
+
+`evidence` 字段写清这一条是靠哪一档来的（`exact_name` / `name_contains_operation` /
+`vendor_comment_only`），`verified_against_app` **恒 false**——生成的名字还没在真机上跑过。
+
+接收者解析顺序：调用者显式 `property` → dump 的 `callPath` → dump 的 `classToProperty`，
+**绝不把类名小写化成属性名**（`DMT_Pcb → dmt_Pcb` 没有任何缩写规律）。
+
+非字符串参数记进 `json_encoded_args`（1-based 下标），因为 JSON 传进来的对象已经丢掉了
+原本的字面写法。
+
+### 2. `lceda_step_record` / `lceda_step_replay`：步骤脚本的录制与复放
+
+`lceda_pro_steps` 一次跑一串 snippet 并能逐步看值，但那是一次性读数：换一块板、换一个人，
+同样 8 步就得凭记忆重写。录制把**已经发生的那一次**留下来（每步的 `value` 变成脚本里的
+`expected`）。
+
+复放逐步比较，每步四种结果：`match` / `differs`（两个值都贴出来）/ `no_recorded_value`
+（这一步没有记录可比 → **不是通过**）/ `failed`（抛错，复放停在这里）。整体
+`status_verdict` 三态：`reproduced` / `differs` / `inconclusive`。
+
+三个「不冒充」的决定：
+
+1. **没有 `value` 的步骤不带 `expected` 键**，而不是 `expected: null`——后者会和「返回了
+   null」判等，把缺记录读成巧合通过。
+2. **失败就停**并列出 `not_run`：在第 3 步抛错之后继续跑第 4 步，是在一个与脚本假设不符的
+   设计上继续动手。
+3. **`idempotent` 恒为 `"unknown"`**：幂等性是 snippet 作者的属性，不是本服务能推出来的。
+   同理不判「末态全等」——末态一样可能来自一条完全不同的路径。
+
+脚本自带 sha256，`load` 重算并给 `sha256_matches`；对不上不拒（可能是有意改过），但会说明
+它不该被当成记录的那一份。默认目录是 `~/.pcb_agent_mcp/step-scripts/`（或 `PCB_AGENT_HOME`），
+**绝不写在工程旁边**；不给 `save=true` 也不给 `path` 时一个字节都不落盘。
+
+### 3. 后台作业：大板 DRC 交出 id
+
+88.7 MB 的板子跑一次 DRC 会超过默认超时。原来的收场只有两种，都是错的：把超时调大（把
+超时伪装成判决）、或者返回一个截断的答案。
+
+`board_drc(background=true)` 交回一个 `jid`，`board_job(action=list|get|wait|cancel)` 取回。
+四条规矩：
+
+- **运行中没有结果**：`get` 返回 `state: running` 且**不带结果**，不近似、不填上一次的判决；
+- **失败留存** `error{type, message}`，不是静默变回 `null`；
+- **`cancel` 只丢弃结果，不杀子进程**——`_run` 用 `subprocess.run`，没有句柄可杀，写清而不是
+  假装停掉了；
+- 作业只在内存，未知 id 是 `JOB_NOT_FOUND`；每类并发上限 2（`MAX_RUNNING`），超出 `JOB_BUSY`。
+
+`submit` 返回的是**提交时刻**的快照并带 `state_is_as_of_submission: True`——不这样做，一个
+极快的作业会让「提交」这个动作的返回值取决于调度。
+
+同时把 `fidelity/engine.py` 的 DRC 默认超时从 300 s 提到 `DRC_TIMEOUT_S = 900`：300 s 对这
+个体量等于不给机会（可被 `timeout_s` 覆盖）。
+
+### 测试
+
+- 新增 `tests/test_lceda_snippet.py`（19 例）、`tests/test_lceda_steps.py`（23 例）、
+  `tests/test_jobs.py`（15 例），共 **57 例**；
+- `--selftest` 从 149 增至 **153/153**（新增 854~857：snippet 名字与接收者来自应用、表里没有
+  就拒绝、脚本 sha256 长 64 且 `idempotent == "unknown"`、`board_job` 未知 id 的拒绝码）；
+- 全量回归实测 **Ran 2090 tests / OK (skipped=5)，1025.96 s**（本机，约 17 分钟）。
+
+### 文档
+
+`docs/45-立创写snippet生成.md`、`docs/46-步骤脚本复放与后台作业.md`。
+
+### 未做（保持拒绝，不伪造）
+
+全波电磁、3-D 热、内置板厂工艺表、付费标准（IEC 62368-1 / 61010-1 / UL 60950 / IPC-2221）
+的默认值、元件库几何、立创 DRC 判决——仍属「结构上不做」，给的是替代方案的理由，不是近似值。
+
 ## [0.0.42] - 2026-10-30
 
 板框不是矩形的时候，`board_vibration` 一直在答"同样大小的矩形板"。这一版把它

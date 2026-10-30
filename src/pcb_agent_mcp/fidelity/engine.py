@@ -86,8 +86,15 @@ def _run(args, cwd, timeout=180):
 
 
 # --------------------------------------------------------------- DRC
-def drc(path, severity="all", timeout=300):
+# One number for the whole DRC path: an 88.7 MB board needed more than fifteen
+# minutes here, so a 300 s default would have been a timeout dressed up as a
+# verdict. It is overridable per call, and `board_drc(background=true)` exists
+# because the right answer to a slow call is an id, not a longer wait.
+DRC_TIMEOUT_S = 900
+
+def drc(path, severity="all", timeout=None):
     """Authoritative DRC. Reports only; never writes beside the input."""
+    timeout = DRC_TIMEOUT_S if timeout is None else timeout
     exe = find_kicad_cli()
     if not exe:
         return {"status": "error", "reason_code": "KICAD_CLI_NOT_FOUND",

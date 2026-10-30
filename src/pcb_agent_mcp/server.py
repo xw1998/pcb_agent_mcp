@@ -700,6 +700,60 @@ def selftest():
               and payload.get("reason_code") == "OUTLINE_INVALID",
               str(payload.get("reason_code")))
 
+        # --- the write snippet is built from the APP's OWN table: the method name
+        # and the receiver both come out of a document that the editor itself
+        # produces, and the class name is never lower-cased into a property name.
+        _dump = {"title": "PCB_Document", "callPath": "eda.pcb_Document.",
+                 "methods": [{"name": "save", "comment": "保存文档"},
+                             {"name": "saveAs", "comment": "另存为"},
+                             {"name": "refresh", "comment": "刷新"}]}
+        r = handle({"jsonrpc": "2.0", "id": 854, "method": "tools/call",
+                    "params": {"name": "lceda_write_snippet", "arguments": {
+                        "op": "save", "api_dump": _dump}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        check("write snippet names the app's own method and its own receiver",
+              payload.get("status") == "ok"
+              and _v.get("code") == "return await eda.pcb_Document.save();"
+              and _v.get("receiver_from") == "callPath"
+              and _v.get("evidence") == "exact_name",
+              str(_v.get("code")))
+
+        r = handle({"jsonrpc": "2.0", "id": 855, "method": "tools/call",
+                    "params": {"name": "lceda_write_snippet", "arguments": {
+                        "op": "move", "api_dump": _dump,
+                        "argsv": ["'U1'"]}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("a table with no matching method is refused, not approximated",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "SNIPPET_NO_API",
+              str(payload.get("reason_code")))
+
+        # --- a run becomes a script whose digest is recomputable, and the replay
+        # tool refuses to invent what to replay.
+        r = handle({"jsonrpc": "2.0", "id": 856, "method": "tools/call",
+                    "params": {"name": "lceda_step_record", "arguments": {
+                        "steps": [{"label": "save",
+                                   "code": "return await eda.pcb_Document.save();",
+                                   "value": True}]}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        check("a recorded run keeps its values and never claims idempotence",
+              payload.get("status") == "ok"
+              and len(_v.get("sha256") or "") == 64
+              and _v.get("recorded_values") == 1
+              and (_v.get("script") or {}).get("idempotent") == "unknown",
+              str(_v.get("recorded_values")))
+
+        r = handle({"jsonrpc": "2.0", "id": 857, "method": "tools/call",
+                    "params": {"name": "board_job", "arguments": {
+                        "action": "get", "id": "drc-selftest-none"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        check("an unknown job id is JOB_NOT_FOUND, not an empty verdict",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "JOB_NOT_FOUND",
+              str(payload.get("reason_code")))
+
         # --- cavity / electro-thermal. Again only closed forms and hand
         # arithmetic: f10 for a 100 mm plane at er=4.3 is c/(2 sqrt(er) * 0.1 m),
         # which is also the definition of a half guided wavelength.

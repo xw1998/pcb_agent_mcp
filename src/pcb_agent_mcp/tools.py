@@ -1137,6 +1137,334 @@ _tool(
     _lceda_pcb_write,
 )
 
+def _lceda_write_snippet(args):
+    """Build a save/move/create snippet from the app's own method table.
+
+    Reads only: the method NAMES come from the editor (``lceda_pro_api``), the
+    ARGUMENTS come from the caller, and nothing is run. The answer is a
+    candidate snippet plus the evidence behind its name (the vendor's comment)
+    and the list of what that evidence does not cover.
+    """
+    from . import lceda_snippet as _snip
+    op = args.get("op")
+    if not op:
+        return err("op is required", "ARG_MISSING",
+                   hint="op is one of %s" % (", ".join(sorted(_snip.OPS)),))
+    dump = args.get("api_dump")
+    client = None
+    close_after = False
+    try:
+        if dump is None:
+            session = args.get("session")
+            class_name = args.get("class_name")
+            if not class_name:
+                return err("class_name is required when api_dump is not given",
+                           "ARG_MISSING",
+                           hint="ask the app about ONE class (e.g. PCB_Document, "
+                                "DMT_Pcb); a namespace table lists no methods")
+            try:
+                client = _live_client(args)
+                close_after = True
+                dump = client.api(args.get("namespace") or "eda",
+                                  class_name=class_name,
+                                  timeout_s=float(args.get("api_timeout_s") or 30.0))
+            except _live.LiveError as exc:
+                return _live_error(exc)
+        try:
+            rep = _snip.build(op, dump,
+                              argsv=args.get("argsv"),
+                              pick=args.get("pick") or None,
+                              prop=args.get("property") or None,
+                              class_name=args.get("class_name") or None,
+                              name_tokens=args.get("name_tokens") or None,
+                              comment_tokens=args.get("comment_tokens") or None)
+        except _snip.SnippetError as exc:
+            return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
+        probe = None
+        if args.get("want_probe", True):
+            try:
+                probe = _snip.suggest_probe(dump,
+                                            prop=args.get("property") or None,
+                                            class_name=args.get("class_name") or None,
+                                            pick=args.get("probe_pick") or None)
+            except _snip.SnippetError as exc:
+                probe = {"status": "error", "reason_code": exc.reason_code,
+                         "message": exc.message, "hint": exc.hint}
+        if rep.get("status") != "ok":
+            return err(rep.get("message"), rep.get("reason_code"),
+                       hint=rep.get("hint"), extra={"report": rep, "probe": probe})
+        return ok(
+            value={"op": rep["op"], "code": rep["code"], "method": rep["method"],
+                   "method_comment": rep["method_comment"],
+                   "receiver": rep["receiver"],
+                   "receiver_from": rep["receiver_from"],
+                   "confidence": rep["confidence"],
+                   "evidence": rep.get("evidence"),
+                   "args_from_caller": True,
+                   "json_encoded_args": rep.get("json_encoded_args") or [],
+                   "probe": (probe or {}).get("code"),
+                   "probable_probe_method": (probe or {}).get("method"),
+                   "probe_basis": (probe or {}).get("confidence"),
+                   "ranked": rep["ranked"]},
+            unit="str",
+            model="lceda_pro_snippet_from_vendor_api",
+            basis="method name + vendor comment taken from the editor's own "
+                  "doc.api table; the receiver comes from its callPath "
+                  "(%s); the arguments are yours" % rep["receiver_from"],
+            precision="NOT VERIFIED AGAINST THE APPLICATION. The method exists "
+                      "(the app listed it) but its signature, return value and "
+                      "effect are unproven, and this server never ran the "
+                      "snippet. Run it with lceda_pcb_write plus a probe if you "
+                      "want the effect read back",
+            assumptions={"verified_against_app": False,
+                         "not_verified": rep["not_verified"],
+                         "why_this_op_exists": rep["why_this_op_exists"],
+                         "arguments_are_not_derived": "the app reports names "
+                             "and comments, not signatures, so argsv is passed "
+                             "through verbatim and never inferred",
+                         "json_encoded_args": "1-based positions of argsv entries "
+                             "that were JSON-encoded (numbers, true/false/null, "
+                             "objects/arrays) instead of inserted as written "
+                             "(strings are inserted verbatim as JavaScript)"},
+            extra={"report": rep, "probe_report": probe})
+    finally:
+        if close_after and client is not None:
+            client.close()
+
+_tool(
+    "lceda_write_snippet",
+    "Build a save / move / create snippet for `lceda_pcb_write` out of the method "
+    "table the running editor reports about itself (doc.api), instead of guessing "
+    "method names. The NAMES come from the app (with the vendor's Chinese comment as "
+    "evidence), the ARGUMENTS come from you (argsv), and nothing is run here. It "
+    "refuses rather than picks: a class whose table has no matching method is "
+    "SNIPPET_NO_API, two equally good matches are SNIPPET_AMBIGUOUS (with the names "
+    "so you can `pick`), and a receiver that cannot be resolved is "
+    "SNIPPET_NO_RECEIVER (the class name is not the runtime property name and this "
+    "tool will not lower-case it into one). Every answer is "
+    "verified_against_app=false with the unverified parts listed: the method exists, "
+    "its signature and its effect are still unproven.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "op": _str("what you want done: save | move | create",
+                    ["save", "move", "create"]),
+         "api_dump": {"type": "object", "description":
+                      "the class-level answer of lceda_pro_api "
+                      "({title, remarks, methods:[{name, comment}], callPath}); "
+                      "leave it out to query the app with session+class_name"},
+         "session": _str("session id, used only when api_dump is absent"),
+         "class_name": _str("class to ask about, e.g. PCB_Document / DMT_Pcb"),
+         "property": _str("runtime property name if the dump has no usable "
+                           "callPath, e.g. pcb_Document (never guessed)"),
+         "argsv": {"type": "array", "description":
+                   "positional JavaScript arguments, passed verbatim (strings) or "
+                   "JSON-encoded (numbers/objects). Never inferred",
+                   "items": {}},
+         "pick": _str("exact method name to use when several match"),
+         "name_tokens": {"type": "array", "description":
+                         "override the name keywords for this op",
+                         "items": {"type": "string"}},
+         "comment_tokens": {"type": "array", "description":
+                            "override the vendor-comment keywords for this op",
+                            "items": {"type": "string"}},
+         "want_probe": _bool("also suggest a read-only snippet as the probe", True),
+         "probe_pick": _str("exact read method to use as the probe"),
+         "namespace": _str("API namespace", default="eda"),
+         "api_timeout_s": _num("budget for the doc.api query", 30),
+     }),
+     "required": ["op"]},
+    _lceda_write_snippet,
+)
+
+def _lceda_step_record(args):
+    """Turn a run that already happened into a replayable, comparable script.
+
+    Touches no application: the values it records are the ones the caller passes in
+    (usually `lceda_pro_steps`' own answer), so this is usable offline and writes
+    nothing unless `save` is asked for.
+    """
+    from . import lceda_steps as _steps
+    raw = args.get("steps")
+    if not raw:
+        return err("steps is required", "ARG_MISSING",
+                   hint="pass the steps you ran, each optionally with the `value` it "
+                        "returned - a step with a value becomes comparable on "
+                        "replay, a step without one is recorded as uncomparable")
+    try:
+        script = _steps.make_script(raw, note=args.get("note"),
+                                    source=args.get("source"),
+                                    session=args.get("session"))
+        written = None
+        if args.get("save") or args.get("path"):
+            written = _steps.save(script, path=args.get("path"),
+                                  overwrite=bool(args.get("overwrite")))
+    except _steps.StepError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
+    return ok(
+        value={"script": script, "saved": written,
+               "steps": len(script["steps"]),
+               "recorded_values": script["recorded_values"],
+               "steps_without_a_recorded_value":
+                   script["steps_without_a_recorded_value"],
+               "sha256": script["sha256"]},
+        unit="str",
+        model="step_script_from_a_run_that_already_happened",
+        basis="the steps you ran plus the value each one returned (the app's own "
+              "reply); nothing here re-runs or inspects anything",
+        precision="This is a RECORD, not a proof: it says what the run you gave me "
+                  "returned, and it cannot know whether that run was the one you "
+                  "meant. A step recorded without a value is reported as "
+                  "uncomparable rather than compared against null",
+        assumptions={"idempotent": script["idempotent"],
+                     "why_idempotence_is_unknown":
+                         script["why_idempotence_is_unknown"],
+                     "default_location": _steps.home(),
+                     "never_beside_a_project": "a script is written under the "
+                         "server's own directory (or the exact path you pass), "
+                         "never next to the board",
+                     "writes_only_when_asked": "save defaults to false; without "
+                         "save/path the script is returned in the answer and "
+                         "nothing is written"},
+        extra={"report": script})
+
+_tool(
+    "lceda_step_record",
+    "Freeze a run of editor steps into a replayable script. Pass the steps (label + "
+    "code, the same shape lceda_pro_steps takes) plus the `value` each one returned, "
+    "and you get back a script carrying those values as its EXPECTED results, with a "
+    "sha256 over the canonical form. Runs nothing, contacts nothing, and writes "
+    "nothing unless save=true or path= is given (default location is the server's own "
+    "~/.pcb_agent_mcp/step-scripts, never beside the board). A step recorded without a "
+    "value is kept but marked uncomparable - the replay will not silently treat "
+    "'nothing recorded' as 'expect null'.",
+    {"type": "object",
+     "properties": {
+         "steps": {"type": "array", "description":
+                   "the steps that ran: [{label, code, fn, js_args, timeout_ms, "
+                   "value}]; value is what that step returned and is what a replay "
+                   "will be compared against", "items": {"type": "object"}},
+         "note": _str("what this run was for, kept in the script"),
+         "source": {"type": "object", "description":
+                    "free-form provenance (board, project, run id) kept with the "
+                    "script; this tool does not interpret it"},
+         "session": _str("session id the run used, recorded as a label only"),
+         "save": _bool("write the script to disk", False),
+         "path": _str("exact file to write (implies save)"),
+         "overwrite": _bool("allow replacing an existing script file", False),
+     },
+     "required": ["steps"]},
+    _lceda_step_record,
+)
+
+def _lceda_step_replay(args):
+    """Run a recorded script again inside the editor and compare step by step."""
+    from . import lceda_steps as _steps
+    from . import edit as _edit
+    session = args.get("session")
+    if not session:
+        return err("session is required", "ARG_MISSING",
+                   hint="a replay runs snippets inside the editor, so it needs one "
+                        "(lceda_pro_open / lceda_pro_sessions)")
+    script = args.get("script")
+    if script is None:
+        path = args.get("path")
+        if not path:
+            return err("pass `path` or `script`", "ARG_MISSING",
+                       hint="lceda_step_replay runs a script that was recorded "
+                            "before; it does not invent one")
+        try:
+            script = _steps.load(path)
+        except _steps.StepError as exc:
+            return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
+    elif not isinstance(script, dict):
+        return err("script must be the object lceda_step_record returned",
+                   "ARG_INVALID")
+    client = None
+    try:
+        client = _live_client(args)
+        rep = _steps.replay(
+            client, session, script,
+            compare=args.get("compare", True) is not False,
+            timeout_ms=args.get("run_timeout_ms"),
+            should_stop=lambda: os.path.isfile(_edit.plan.stop_file()))
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    except _steps.StepError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
+    finally:
+        if client is not None:
+            client.close()
+    counts = rep["counts"]
+    out = ok(
+        value={"status_verdict": rep["status"],
+               "steps_planned": rep["steps_planned"],
+               "steps_run": rep["steps_run"],
+               "matched": counts.get("match", 0),
+               "differed": counts.get("differs", 0),
+               "uncomparable": counts.get("no_recorded_value", 0),
+               "failed": counts.get("failed", 0),
+               "stopped_before_step": rep["stopped_before_step"],
+               "failed_at_step": rep["failed_at_step"],
+               "not_run": rep.get("not_run"),
+               "rows": rep["rows"],
+               "script_sha256": script.get("sha256"),
+               "script_sha256_matches": script.get("sha256_matches")},
+        unit="str",
+        model="replay_with_per_step_value_comparison",
+        basis="each step ran inside the editor and its reply was compared with the "
+              "value stored in the script; 'reproduced' means every comparable step "
+              "returned the recorded value",
+        precision="NOT VERIFIED AGAINST THE APPLICATION as a reproduction claim. A "
+                  "matching value does not prove the same edit happened (it can "
+                  "match for the wrong reason), a differing value is a measurement "
+                  "rather than a failure (re-running a create does exactly this), "
+                  "and no step is proven to have saved anything to disk",
+        assumptions={"idempotent": "unknown",
+                     "why_idempotence_is_unknown":
+                         "whether these snippets are safe to run twice is a "
+                         "property of the snippets, so a replay compares values "
+                         "instead of assuming they will match",
+                     "starts_from_the_same_state": "NOT established - the "
+                         "recorded run and this one may have started from "
+                         "different designs, which is the most common honest "
+                         "reason for a differing value",
+                     "stopping": "board_progress(action='stop') stops before the "
+                         "next step; board_progress() reads the log",
+                     "verified_against_app": rep["verified_against_app"],
+                     "not_verified": rep["not_verified"]},
+        extra={"status_kind": "replay_verdict",
+               "note": "the business field is status_verdict so it can never be "
+                       "confused with the envelope's own status"})
+    out["report"] = rep
+    return out
+
+_tool(
+    "lceda_step_replay",
+    "Replay a recorded step script inside the running editor and COMPARE each step's "
+    "reply with the value that was recorded, one row per step: match / differs / "
+    "uncomparable / failed. This is the difference between running and "
+    "reproducing: a move onto its existing position, a create that no-ops and a "
+    "snippet on a stale id all return without an error. A differing value is reported, "
+    "not thrown away, and a step that fails stops the replay there instead of running "
+    "the rest against a design that is not in the assumed state. board_progress"
+    "(action='stop') interrupts it between steps. Idempotence is reported as unknown: "
+    "whether these snippets are safe to run twice is their author's fact, not this "
+    "server's.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "session": _str("session id from lceda_pro_open / lceda_pro_sessions"),
+         "path": _str("script file written by lceda_step_record"),
+         "script": {"type": "object", "description":
+                    "the script object itself, when you have it in hand"},
+         "compare": _bool("compare each value with the recording (default true)",
+                           True),
+         "run_timeout_ms": _num("per-step budget passed to the app (max 60000)",
+                                60000),
+     }),
+     "required": ["session"]},
+    _lceda_step_replay,
+)
+
 # ----------------------------------------------------------------- board
 def _guarded(fn):
     try:
@@ -3091,6 +3419,7 @@ def _capabilities(_args):
             "board_loop_area", "board_fidelity", "board_view", "board_drc",
             "board_stats", "board_cross_check", "epro_inspect",
             "safety_table_check",
+            "board_job",
             "board_ops", "board_create", "board_propose", "board_apply",
             "board_checkpoints", "board_restore", "board_progress",
             "schematic_ops", "schematic_propose", "schematic_apply",
@@ -3102,7 +3431,8 @@ def _capabilities(_args):
             "lceda_api_probe",
             "lceda_pro_status", "lceda_pro_api", "lceda_pro_open",
             "lceda_pro_sessions", "lceda_pro_close", "lceda_pro_run",
-            "lceda_pro_steps",
+            "lceda_pro_steps", "lceda_write_snippet",
+            "lceda_step_record", "lceda_step_replay",
             "feedline_impedance", "feedline_width",
             "antenna_patch", "antenna_printed", "antenna_dipole_monopole",
             "antenna_helix", "antenna_small_loop", "antenna_q_limit", "antenna_chip",
@@ -3238,6 +3568,19 @@ def _capabilities(_args):
             "project bytes untouched (they were not compared before and after), and "
             "whether the vendor's own '--mcp' transport can be reached at all - this "
             "build's executable rejects the flag before the app sees it",
+            "Write snippets are generated from the app's own table, not from "
+            "memory (0.0.43): lceda_write_snippet reads the method names and the "
+            "vendor comments out of doc.api and assembles one candidate "
+            "save/move/create call, with the runtime receiver coming from that "
+            "class's callPath (the class name is not the property name, and no "
+            "lower-casing is ever done to bridge the two). The arguments are the "
+            "caller's, because the app reports names and comments rather than "
+            "signatures. It refuses instead of guessing: SNIPPET_NO_API when "
+            "nothing matches, SNIPPET_AMBIGUOUS with the candidates when two "
+            "things match equally, SNIPPET_NO_RECEIVER when the receiver cannot "
+            "be resolved. The method existing is the app's fact; its signature, "
+            "its return value and its effect are unproven, and nothing here ran "
+            "a snippet",
             "LCEDA Pro launch details (CORRECTED 2026-10-28, third round): the app "
             "DOES start here - the earlier 'it dies before Electron' reading was "
             "wrong, it described how it was launched. From a shell that inherits a "
@@ -3783,7 +4126,10 @@ _tool(
     "AUTHORITATIVE design-rule check: runs KiCad's own DRC engine (kicad-cli) and returns "
     "its verdict - violations by severity and type, and unconnected items. This is not "
     "this server's geometry opinion; when it disagrees with board_clearance, believe this "
-    "one. Read-only: the report goes to a temp directory, never beside your project.",
+    "one. Read-only: the report goes to a temp directory, never beside your project. "
+    "On a large board DRC can outlast any sane request, so background=true hands back "
+    "a job id instead: ask board_job(action='get', id=...) for the verdict later. A "
+    "running job has no result, and none is ever approximated.",
     {"type": "object",
      "properties": {
          "path": _str("absolute path to a .kicad_pcb"),
@@ -3791,6 +4137,9 @@ _tool(
          "strict": _bool("also report warnings as blocking (the write gate's strict "
                          "mode)"),
          "limit": _num("how many blocking/advisory entries to list", 20),
+         "timeout_s": _num("budget handed to the DRC subprocess (default 900 s)"),
+         "background": _bool("run it as a job and answer with its id instead of "
+                             "blocking", False),
      },
      "required": ["path"]},
     lambda a: _guarded(lambda: _board_drc(a)),
@@ -3834,6 +4183,7 @@ _tool(
 
 
 def _board_drc(args):
+    import os
     from .fidelity import engine as _engine
     path = args.get("path")
     if not path:
@@ -3845,21 +4195,135 @@ def _board_drc(args):
         return err("LCEDA Pro has no command line, so this server cannot obtain its DRC "
                    "verdict; use the app's own DRC or board_fidelity for a conversion "
                    "report", "VERDICT_SOURCE_UNAVAILABLE")
-    out = _engine.drc(path, severity=args.get("severity") or "all")
-    if out.get("status") != "ok":
-        return out
-    from .edit import drc_policy as _policy
-    view = _policy.classify(out.get("violations") or [],
-                            strict=bool(args.get("strict")),
-                            limit=int(args.get("limit") or 20))
-    out["blocking_if_this_were_an_edit"] = view
-    out["how_an_apply_treats_this"] = (
-        "board_apply compares the DRC of the file before and after the edit and blocks "
-        "on NEW violations at KiCad severity 'error' only; warnings are reported and "
-        "counted (they were 69/69 on the STM32F401 core board, all silkscreen/text). "
-        "Pass options.strict_drc=true to make every new violation block.")
-    return out
+    severity = args.get("severity") or "all"
+    timeout_s = float(args.get("timeout_s") or _engine.DRC_TIMEOUT_S)
 
+    def _do_drc():
+        out = _engine.drc(path, severity=severity, timeout=timeout_s)
+        if out.get("status") != "ok":
+            return out
+        from .edit import drc_policy as _policy
+        view = _policy.classify(out.get("violations") or [],
+                                strict=bool(args.get("strict")),
+                                limit=int(args.get("limit") or 20))
+        out["blocking_if_this_were_an_edit"] = view
+        out["how_an_apply_treats_this"] = (
+            "board_apply compares the DRC of the file before and after the edit and "
+            "blocks on NEW violations at KiCad severity 'error' only; warnings are "
+            "reported and counted (they were 69/69 on the STM32F401 core board, all "
+            "silkscreen/text). Pass options.strict_drc=true to make every new "
+            "violation block.")
+        return out
+
+    if args.get("background"):
+        from . import jobs as _jobs
+        try:
+            job = _jobs.submit("drc", _do_drc, label=os.path.basename(path),
+                               timeout_hint_s=timeout_s)
+        except _jobs.JobError as exc:
+            return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
+        return ok(
+            value={"job": job["id"], "state": job["state"],
+                   "kind": "drc", "label": job["label"],
+                   "timeout_s": timeout_s},
+            unit="str",
+            model="background_job(kicad-cli pcb drc)",
+            basis="the verdict is still KiCad's and nothing here re-implements it; "
+                  "only WHEN it is asked changed",
+            precision="NO RESULT YET. This answer carries a job id and nothing else: "
+                      "board_job(action='get', id=...) returns the DRC verdict when "
+                      "it exists, and reports 'running' until then. Jobs live in "
+                      "memory, so a server restart loses this one",
+            assumptions={"why": "DRC on an 88.7 MB board did not finish inside a "
+                                "single call, so blocking would have meant a "
+                                "fifteen-minute request or a truncated verdict",
+                         "wait_with": "board_job(action='wait', id=...) with a "
+                                      "budget of your own; each call waits at most "
+                                      "its timeout_s"},
+            extra={"job": job})
+    return _do_drc()
+
+
+def _board_job(args):
+    """The other half of a slow call: list / get / wait / cancel a background job."""
+    from . import jobs as _jobs
+    action = (args.get("action") or "get").lower()
+    jid = args.get("id")
+    if action not in ("list", "get", "wait", "cancel"):
+        return err("unknown action %r" % (action,), "ARG_INVALID",
+                   hint="action is one of list, get, wait, cancel")
+    try:
+        if action == "list":
+            got = _jobs.list_jobs(kind=args.get("kind"), state=args.get("state"),
+                                  limit=int(args.get("limit") or 50))
+            return ok(
+                value={"jobs": got, "count": len(got)},
+                unit="str",
+                model="in-process job registry",
+                basis="the jobs this server process submitted (board_drc with "
+                      "background=true is the one that produces them today)",
+                precision="jobs live in memory only: a restart loses every one of "
+                          "them, and a finished job is forgotten after %d s"
+                          % int(_jobs.KEEP_S),
+                assumptions={"not_a_queue": "submitting the same work twice is two "
+                                             "jobs; the second gets no credit for "
+                                             "the first",
+                             "cancel_is_not_a_kill": "a subprocess already started "
+                                                    "keeps running; the result is "
+                                                    "discarded, the machine is "
+                                                    "still busy"})
+        if not jid:
+            return err("id is required for action %r" % (action,), "ARG_MISSING",
+                       hint="board_job(action='list') shows the ids that exist")
+        if action == "get":
+            job = _jobs.get(jid)
+        elif action == "wait":
+            job = _jobs.wait(jid, timeout_s=float(args.get("timeout_s") or 30.0))
+        else:
+            job = _jobs.cancel(jid)
+    except _jobs.JobError as exc:
+        return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
+    still = job["state"] == "running"
+    return ok(
+        value=job,
+        unit="str",
+        model="in-process job registry (the work itself is unchanged)",
+        basis="the job's state and, once it has finished, the return value of the "
+              "function it ran (for drc: KiCad's own verdict, untouched)",
+        precision=("STILL RUNNING - this is not a result. No partial or previous "
+                   "verdict is offered as if it were this run's"
+                   if still else
+                   "state %r; the value is the work's own return value, not a "
+                   "summary of it" % job["state"]),
+        assumptions={"survives_a_restart": False,
+                     "cancel_is_not_a_kill": "cancelling marks the job so its "
+                                             "result is discarded; a subprocess "
+                                             "already running is not killed",
+                     "still_running": still},
+        extra={"job": job} if job["state"] != "running" else {})
+
+_tool(
+    "board_job",
+    "Ask about a background job started by another tool (today: board_drc with "
+    "background=true, which is how a large board avoids a fifteen-minute request). "
+    "action=list | get | wait | cancel. A running job answers 'running' and NOTHING "
+    "else - there is no partial verdict and no cached previous run to mistake for this "
+    "one. wait blocks only for its own timeout_s (per call), so a long wait is a series "
+    "of calls that each return, not one call that looks hung. Jobs live in memory: a "
+    "restart loses them, and an unknown id is JOB_NOT_FOUND rather than an empty answer.",
+    {"type": "object",
+     "properties": {
+         "action": _str("what to do with the job", ["list", "get", "wait", "cancel"],
+                         "get"),
+         "id": _str("job id, e.g. drc-3-1a2b3c"),
+         "timeout_s": _num("how long action='wait' may block this call", 30),
+         "kind": _str("action='list': only this kind"),
+         "state": _str("action='list': only this state",
+                       ["running", "done", "failed", "cancelled"]),
+         "limit": _num("action='list': how many to show", 50),
+     }},
+    _board_job,
+)
 
 def _board_cross_check(args):
     from .fidelity import crosscheck as _cc

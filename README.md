@@ -84,13 +84,13 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 |---|---|---|
 | 立创原理图 `.esch` 写 | `WRITE_UNSUPPORTED_FORMAT`（并按内容说出它是 zip 还是 SQLite） | 一次真实保存的**记录布局实测**（现在只有读） |
 | 立创 SQLite 工程 `.eprj2` 写 | 只读打开，写一律拒 | `history_data` 加密 + `ticket` 单调，手改会让工程打不开 |
-| 立创进程内写（`lceda_pcb_write`） | 只做「写前 probe → 你的片段 → 写后 probe」，`verified_against_app:false` | vendor 的**写方法名一个都没在真机上验过**；同时刻也没有文档上下文 |
+| 立创进程内写（`lceda_pcb_write`） | 只做「写前 probe → 你的片段 → 写后 probe」，`verified_against_app:false`；0.0.43 起 `lceda_write_snippet` 可把**名字**从应用的 `doc.api` 表里取（不是从记忆里造） | 名字与接收者有证据来源，**效果仍没有**：生成的 snippet 一次都没在真机上跑过，`verified_against_app` 恒 `false`；同时刻也没有文档上下文 |
 | 立创分步写 `lceda_pro_steps` | 工具在，真机未验证 | 只能在用户手动开「外部交互权限」的会话里验 |
 | websocket 网关 `lceda_api_probe` | 端口扫描 + 握手，本机 49620-49629 全部 `no_listener` | 同上 |
 | `app_open_project` 的 argv 形式 | 只回 `unconfirmed`；开工程请用 `lceda_pro_open` | 无法确认 `lceda-pro.exe <工程>` 真的会打开 |
 | `set_pad_net` 的「应用也这么写」 | `verified_by_app:false` | 从未观察到应用自己写那一行 `PAD_NET` |
 | `A` 卡的其余 code model（有状态 / 采样时钟 / 除法类） | `builtin` 按名字拒绝并点名（`integrator`、`divider`…） | 那部分是第二套器件描述语言（状态、采样时钟）；纯代数的四种（`gain`/`limit`/`summer`/`mult`）已在 `0.0.39`/`0.0.40` 进内置，`%v()` 端口写法仍拒（引擎也不收） |
-| 88.7 MB 级大板的 DRC | 超时 900 s 即报错，**不降级** | jetson 板实测 823 s / 2543.8 s 都没出报告 |
+| 88.7 MB 级大板的 DRC 出报告 | 0.0.43 起 `board_drc(background=true)` 只交回 `jid`，用 `board_job` 取回（运行中**没有结果**、失败留 `error`）；超时仍报错，**不降级** | jetson 板实测 823 s / 2543.8 s 都没出报告——后台作业只解决「等不起」，**不解决引擎自己失败**；`cancel` 只丢结果、不杀子进程 |
 
 #### B3 ｜做了但打折（能判断方向，不能拿去签核）
 
@@ -108,9 +108,9 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.42
-python run_server.py --selftest         # 149/149
-python -m unittest discover -s tests    # 2033 例（实测 978 s，约 16 分钟）
+python run_server.py --version          # 0.0.43
+python run_server.py --selftest         # 153/153
+python -m unittest discover -s tests    # 2090 例（实测 1026 s，约 17 分钟）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -188,7 +188,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 ## 工具（153 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -227,7 +227,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_loop_area` | 环路面积（走线长 × 到下层铜的距离） | **无叠层直接拒绝**（猜介质高度 = 猜 EMC 答案） |
 | `board_fidelity` | **自证**：节点/字节计数、token 双射往返、还没读取规则的节点清单，KiCad 侧再让 kicad-cli 把原件与写回件各画一次并比对铜箔/统计/位号 | 只读；临时目录工作，绝不写在工程旁边 |
 | `board_view` | 从保真树读事实：nets/规则类/层/叠层/setup/元件/pad（精确尺寸·钻孔·旋转·网络）/走线/过孔/zone（含**文件里存的填充多边形**）/板框图元/板上文字/尚无规则的节点 | 每条记录都带 `raw`（原始 S 表达式），视图漏掉的不会丢 |
-| `board_drc` | **判决**：跑 KiCad 自己的 DRC 引擎，回违规项（按严重级/类型）+ 未连接项 | 立创无命令行 → 明确拒绝给判决，不近似 |
+| `board_drc` | **判决**：跑 KiCad 自己的 DRC 引擎，回违规项（按严重级/类型）+ 未连接项 | 立创无命令行 → 明确拒绝给判决，不近似；大板用 `background=true` 交作业（默认超时 `DRC_TIMEOUT_S = 900`，`timeout_s` 可覆盖） |
 | `board_stats` | **判决**：KiCad 自己的板统计（尺寸/面积/正反铜面积含铺铜/板厚/最小线宽与孔径） | 只读 |
 | `board_cross_check` | **对账**：同一文件上，我们的间距测量与厂商 DRC 双向比对（recall / 漏报 / 我们多报 / 判不了） | 只有 clearance 有厂商对应物；zone 铜、板边孔规则、阻焊钢网明说不比；其余四个派生量回 `not_comparable` |
 | `epro_inspect` | 不解译地列出 `.epro` 成员/类型计数/原始 key 名 | 用来"关掉未知字段"，而不是猜字段名 |
@@ -246,6 +246,10 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `lceda_pro_sessions` | 列开着的文档会话 | 会话是文档，不是进程 |
 | `lceda_pro_close` | 关会话（可 destroy） | 不写工程文件；未保存改动会丢 |
 | `lceda_pro_run` | 在编辑器进程里跑一段 JS（async 函数体，`eda` 在作用域） | **能写**：片段自己决定做什么，本工具不担保；实测只跑过只读片段 |
+| `lceda_write_snippet` | 生成写 snippet：**名字问应用**（`doc.api`）、**参数问调用者**（`argsv` 原样传入）、**效果问 probe**（`lceda_pcb_write`） | 三档打分：精确名 > 名字含操作词 > 只有厂商注释（精确必须压过包含，否则 `save`/`saveAs` 变成「一样好」）；最高档多于一个 → `SNIPPET_AMBIGUOUS` 带候选，一个都没有 → `SNIPPET_NO_API`；`verified_against_app` 恒 `false` |
+| `lceda_step_record` | 把刚跑过的那一次 `lceda_pro_steps` 记成脚本：每步的返回值变成脚本里的 `expected`，脚本自带 sha256 | 零副作用；不给 `save=true` 也不给 `path` 时一个字节都不落盘；**没有值的步骤不带 `expected` 键**（不是 `expected: null`） |
+| `lceda_step_replay` | 逐步重跑并比较：`match` / `differs`（两个值都贴出来）/ `no_recorded_value` / `failed` | 失败即停并列出 `not_run`；`idempotent` 恒为 `"unknown"`；比的是**每步自己的返回值**，不是末态全等 |
+| `board_job` | 后台作业：`list` / `get` / `wait` / `cancel`（`board_drc(background=true)` 交回 `jid`） | 运行中**没有结果**（不近似、不填上一次的判决）；失败留 `error{type,message}`；未知 id → `JOB_NOT_FOUND`；每类并发上限 2（`JOB_BUSY`）；`cancel` 只丢结果不杀子进程 |
 | `app_launch` | 分离启动 EDA（不带工程） | 启动进程 ≠ 打开工程 |
 | `app_close` | WM_CLOSE 关窗（等同点 X，可能弹保存框） | `force` 才 TerminateProcess；不碰文件 |
 | `schematic_ops` | 原理图写路径的 op 目录（KiCad `.kicad_sch` 22 个，含 4 个 sheet op）+ 每条用的坐标系 | 调 `schematic_propose` 前先看它 |
@@ -345,9 +349,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.41
-python run_server.py --selftest      # 协议级自检，149/149（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问）
-python -m unittest discover -s tests # 2033 个用例（实测 978 s，约 16 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.43
+python run_server.py --selftest      # 协议级自检，153/153（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问）
+python -m unittest discover -s tests # 2090 个用例（实测 1026 s，约 17 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -412,6 +416,8 @@ MCP 客户端配置（stdio）：
   计数：差距与规则相差 <0.002 mm 的对（CM5 33 对、video 30 对、StickHub 20 对、tinytapeout 10 对）
   不进 recall 也不进 extra，判决只由厂商给。实测上限也测出来了：88.7 MB 的 jetson 板 DRC 两次都
   没出报告（823 s / 2543.8 s `ENGINE_FAILED`），所以默认超时 900 s，超时即报错、不降级。
+  0.0.43 补的是**等法**不是判决：`board_drc(background=true)` 交回 `jid`、`board_job` 取回，
+  运行中只回 `state: running` 而**不带结果**——但 2543.8 s 那次是引擎自己失败，后台化不改变这件事。
 - **立创侧还剩两处非实测。** ① 元件焊盘位置＝库封装 + 旋转/镜像变换推导（54.1% 铜端点命中率，
   见 docs/13 §6，底面镜像只有弱证据 35.1%）；② `set_pad_net` 追加一行 `PAD_NET` 时，第 5 字段
   按「封装文档里该焊盘号的每个 PAD 对象各写一行」——8159/8159 指向同号对象是实测量，但**从未观察到
@@ -735,7 +741,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 153 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 158 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -747,6 +753,9 @@ pcb_agent_mcp/
 │   │   └── fsutil.py             # 原子写（同卷临时文件 + fsync + os.replace）
 │   ├── desktop.py                # Desktop 层：ctypes 探测/启动/关闭/开工程（不碰文件）
 │   ├── lceda_live.py             # 立创 Pro 进程内桥：命令空间管道 + 帧层 + invoke/doc.api 客户端
+│   ├── lceda_snippet.py          # 从应用 doc.api 表生成写 snippet：三档打分 + 接收者三条来源，最高档不唯一就拒
+│   ├── lceda_steps.py            # 步骤脚本：录制/落盘/载入/复放，逐值比对 + sha256 自持 + 失败即停
+│   ├── jobs.py                   # 后台作业：内存作业表 + 提交时刻快照 + 并发上限；取消只丢结果
 │   ├── oracle.py                 # Oracle 层：只读度量，缺事实就拒绝回答
 │   ├── geometry.py               # 纯 stdlib 2D 几何（mm、Y 向上）
 │   ├── fidelity/                 # 保真层：整份文档进树，事实从树里读
@@ -801,11 +810,11 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 1990 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 2090 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
-├── docs/                         # 设计文档 00~43，建议按编号顺序读（索引见 docs/README.md）
+├── docs/                         # 设计文档 00~46，建议按编号顺序读（索引见 docs/README.md）
 ├── CHANGELOG.md
 └── LICENSE
 ```
