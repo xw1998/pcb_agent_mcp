@@ -57,10 +57,7 @@ GROUND_NAMES = ("0", "gnd", "ground", "gnd!", "vss")
 # Everything the language has that this module refuses by name instead of
 # silently ignoring (a silently ignored card is how a netlist "runs" and lies).
 NOT_IMPLEMENTED_CARDS = {
-    "F": "current-controlled current source (needs a named branch)",
-    "H": "current-controlled voltage source (needs a named branch)",
     "J": "JFET",
-    "K": "coupled inductors / mutual inductance",
     "S": "voltage-controlled switch",
     "W": "current-controlled switch",
     "A": "XSPICE analogue behavioural block",
@@ -891,6 +888,18 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
             return pin_map[low]
         return "%s.%s" % (path, low)
 
+    body_names = set(b["name"].lower() for b in sub["elements"])
+
+    def scoped_ref(nm):
+        """An element name inside this body -> its prefixed name.
+
+        A name that the body does not define is left alone on purpose: it may be
+        a top-level element, and that reference is checked (and refused with its
+        own message) when the whole deck is in hand.
+        """
+        low = str(nm).lower()
+        return "%s.%s" % (path, low) if low in body_names else nm
+
     out = []
     for body in sub["elements"]:
         copy = dict(body)
@@ -901,6 +910,11 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
         copy["nodes"] = tuple(mapped(n) for n in body["nodes"])
         if body.get("ctrl"):
             copy["ctrl"] = tuple(mapped(n) for n in body["ctrl"])
+        if copy["type"] in ("F", "H"):
+            copy["ctrl_name"] = scoped_ref(copy["ctrl_name"])
+        elif copy["type"] == "K":
+            copy["l1"] = scoped_ref(copy["l1"])
+            copy["l2"] = scoped_ref(copy["l2"])
         if copy["type"] == "X":
             copy["overrides"] = dict(
                 (k, _resolve_value(v, env, "%s (%s %s)"
@@ -1188,6 +1202,40 @@ def _parse_element(spec, line, lineno):
                 "nodes": (_node(parts[1]), _node(parts[2])),
                 "ctrl": (_node(parts[3]), _node(parts[4])),
                 "value": _value_or_expr(val(5, "gain"), lineno)}
+    if letter in ("F", "H"):
+        # F (CCCS) and H (CCVS) are controlled by the CURRENT through another
+        # element, which SPICE spells by naming that element - so the third
+        # token is a NAME, not a pair of control nodes. Reading it positionally
+        # (as E/G's four-node form) would turn "V1" into a node called V1 and
+        # solve a deck whose control term silently reads 0 V.
+        if len(parts) < 5:
+            raise ValueError("line %d: %s needs two nodes, the NAME of the element "
+                             "whose current controls it, and a gain: %sname n+ n- "
+                             "vname gain; got %r"
+                             % (lineno, name, letter, " ".join(parts[1:])))
+        if len(parts) > 5:
+            raise ValueError("line %d: %s has trailing %r. A %s card is exactly "
+                             "four fields: n+ n- vname gain"
+                             % (lineno, name, " ".join(parts[5:]), letter))
+        ctrl = parts[3]
+        if "=" in ctrl or _looks_numeric(ctrl):
+            raise ValueError("line %d: %s: the controlling element comes before the "
+                             "gain and %r is not an element name. The controlling "
+                             "element is the one whose CURRENT is read (its + to - "
+                             "branch current), so it has to be named, not measured"
+                             % (lineno, name, ctrl))
+        return {"type": letter, "name": name, "lineno": lineno,
+                "nodes": (_node(parts[1]), _node(parts[2])),
+                "ctrl_name": ctrl, "value": _value_or_expr(parts[4], lineno)}
+    if letter == "K":
+        # K is not a device with terminals: it is a statement about two existing
+        # inductors, so it has no nodes at all and owns no row of its own.
+        if len(parts) != 4:
+            raise ValueError("line %d: %s: a K card is exactly `Kname L1 L2 k` "
+                             "(the two inductors it couples and the coefficient), "
+                             "got %r" % (lineno, name, " ".join(parts[1:])))
+        return {"type": "K", "name": name, "lineno": lineno, "nodes": (),
+                "l1": parts[1], "l2": parts[2], "value": _value_or_expr(parts[3], lineno)}
     if letter == "D":
         model = val(3, "model name").lower()
         return {"type": "D", "name": name, "lineno": lineno,
@@ -1899,7 +1947,7 @@ class _Circuit(object):
                                      % (el.get("lineno") or "?", el["name"], dep))
         self.n = len(nodes)
         branches = [el for el in self.elements
-                    if el["type"] in ("V", "L", "E", "BV")]
+                    if el["type"] in ("V", "L", "E", "H", "BV")]
         self.branch_idx = {}
         for k, el in enumerate(branches):
             self.branch_idx[el["name"]] = self.n + 1 + k
@@ -1916,6 +1964,73 @@ class _Circuit(object):
                 self.branch_idx[el["name"] + "#i1"] = el["_row"]
                 extra += 1
         self.size = self.n + len(branches) + extra
+        # F/H (current-controlled sources) and K (coupled inductors) point at
+        # other elements BY NAME. Resolving them here means a typo fails at build
+        # time with the card's line number; deferring it to assembly would let a
+        # deck solve with the control term silently missing, which is exactly the
+        # class of answer this module refuses to give.
+        self.by_name = {}
+        for el in self.elements:
+            self.by_name.setdefault(el["name"].lower(), el)
+        self.branch_name = {}
+        for el in branches:
+            self.branch_name[el["name"].lower()] = el["name"]
+        self.couplings = []
+        for el in self.elements:
+            T = el["type"]
+            if T in ("F", "H"):
+                key = str(el["ctrl_name"]).lower()
+                where = "line %s" % (el.get("lineno") or "?")
+                if key not in self.by_name:
+                    raise ValueError("%s: %s is controlled by the current through "
+                                     "%r, which no card in this deck defines"
+                                     % (where, el["name"], el["ctrl_name"]))
+                if key not in self.branch_name:
+                    raise ValueError("%s: %s is controlled by %r, a %s card with no "
+                                     "branch current. Only a source or an inductor "
+                                     "(V, E, H, L, BV) carries a current that can be "
+                                     "named"
+                                     % (where, el["name"], el["ctrl_name"],
+                                        self.by_name[key]["type"]))
+                el["_ctrl_row"] = self.branch_idx[self.branch_name[key]]
+                el["_ctrl_resolved"] = self.by_name[key]["name"]
+            elif T == "K":
+                where = "line %s" % (el.get("lineno") or "?")
+                left = self.by_name.get(str(el["l1"]).lower())
+                right = self.by_name.get(str(el["l2"]).lower())
+                if left is None or right is None:
+                    missing = el["l1"] if left is None else el["l2"]
+                    raise ValueError("%s: %s couples %r and %r, and %r is not an "
+                                     "element of this deck"
+                                     % (where, el["name"], el["l1"], el["l2"],
+                                        missing))
+                if left["type"] != "L" or right["type"] != "L":
+                    bad = left if left["type"] != "L" else right
+                    raise ValueError("%s: %s couples %r and %r, but %r is a %s card. "
+                                     "Mutual inductance is defined between two "
+                                     "inductors; coupling anything else is not a "
+                                     "smaller model, it is a different one"
+                                     % (where, el["name"], el["l1"], el["l2"],
+                                        bad["name"], bad["type"]))
+                if left is right:
+                    raise ValueError("%s: %s couples %r to itself"
+                                     % (where, el["name"], left["name"]))
+                k = float(el["value"])
+                if abs(k) > 1.0 + 1e-12:
+                    raise ValueError("%s: %s: coupling coefficient %g is outside "
+                                     "[-1, 1]. |k| > 1 would put M^2 above L1*L2, "
+                                     "i.e. a mutual flux larger than both of the "
+                                     "fluxes that produce it" % (where, el["name"], k))
+                if left["value"] <= 0.0 or right["value"] <= 0.0:
+                    raise ValueError("%s: %s: an inductance of %g H cannot be "
+                                     "coupled (M = k*sqrt(L1*L2) needs both positive)"
+                                     % (where, el["name"],
+                                        left["value"] if left["value"] <= 0.0
+                                        else right["value"]))
+                el["_m"] = k * math.sqrt(left["value"] * right["value"])
+                el["_l1"] = left
+                el["_l2"] = right
+                self.couplings.append(el)
         # the parser's own "this was read but is not modelled" notes come first,
         # so a deck-level surprise and a solve-time surprise land in one list
         self.disabled = list(spec.get("warnings") or [])
@@ -2059,6 +2174,10 @@ class _Circuit(object):
         A, b = self._mat()
         for el in self.elements:
             T = el["type"]
+            if T == "K":
+                # K couples two BRANCH ROWS and has no terminals at all; it is
+                # stamped after this loop, where both rows are known to exist
+                continue
             na, nb = el["nodes"][0], el["nodes"][1]
             if T == "R":
                 self._conductance(A, na, nb, 1.0 / el["value"])
@@ -2126,6 +2245,25 @@ class _Circuit(object):
                 self._add(A, a, cm, -g)
                 self._add(A, bb, cp, -g)
                 self._add(A, bb, cm, g)
+            elif T == "F":
+                # the controlling quantity is a BRANCH UNKNOWN, not a node
+                # voltage: the gain lands on an existing column instead of a new
+                # row, so F adds no unknown of its own
+                a, bb = self.i(na), self.i(nb)
+                col = el["_ctrl_row"]
+                g = el["value"]
+                self._add(A, a, col, g)
+                self._add(A, bb, col, -g)
+            elif T == "H":
+                # H is a voltage source whose value is a current: it needs its own
+                # branch row, and that row carries -gain on the control column
+                row = self.branch_idx[el["name"]]
+                a, bb = self.i(na), self.i(nb)
+                self._add(A, row, a, 1.0)
+                self._add(A, row, bb, -1.0)
+                self._add(A, row, el["_ctrl_row"], -el["value"])
+                self._add(A, a, row, 1.0)
+                self._add(A, bb, row, -1.0)
             elif T == "BV":
                 self._stamp_b_voltage(A, b, el, x_prev, t, mode)
             elif T == "BI":
@@ -2144,6 +2282,24 @@ class _Circuit(object):
                 # from turning a lossy line into a silent wire
                 raise ValueError("%s (a %s card) reached the solver unexpanded"
                                  % (el["name"], T))
+        # Coupled inductors couple two BRANCH rows. Same companion model as one
+        # inductor, with the cross term M/h: an L card's row already reads
+        # v - (L/h)*i = -(L/h)*i_prev, so the mutual part is -(M/h)*i_other on
+        # the same row plus -(M/h)*i_other_prev on the right-hand side.
+        for cp in self.couplings:
+            row1 = self.branch_idx[cp["_l1"]["name"]]
+            row2 = self.branch_idx[cp["_l2"]["name"]]
+            if mode == "ac":
+                jw = complex(0.0, 2.0 * math.pi * cp["_f"])
+                self._add(A, row1, row2, -jw * cp["_m"])
+                self._add(A, row2, row1, -jw * cp["_m"])
+            elif mode == "tran":
+                rm = cp["_m"] / cp["_l1"]["_h"]
+                self._add(A, row1, row2, -rm)
+                self._add(A, row2, row1, -rm)
+                self._rhs(b, row1, -rm * cp["_l2"]["_iprev"])
+                self._rhs(b, row2, -rm * cp["_l1"]["_iprev"])
+            # DC: d/dt is 0, both inductors are wires, and M has nothing to act on
         # gmin to ground on every node: the standard "no floating node" crutch
         if mode != "ac" and gmin:
             for k in range(self.n):
@@ -2521,6 +2677,17 @@ def _element_report(circ, x, t=None, mode="dc"):
             # reporting 20 unnamed R/L/C per O card would bury the answer
             continue
         T = el["type"]
+        if T == "K":
+            # no terminals, no voltage: report what the card actually asserts
+            out.append({"name": el["name"], "type": "K",
+                        "inductors": [el["_l1"]["name"], el["_l2"]["name"]],
+                        "coupling": round(float(el["value"]), 12),
+                        "mutual_h": round(el["_m"], 15),
+                        "per_length": None,
+                        "note": ("a K card is a statement about two inductors, not a "
+                                 "device: it has no terminals and no current of its "
+                                 "own")})
+            continue
         na, nb = el["nodes"][0], el["nodes"][1]
         va = x[circ.i(na) - 1] if circ.i(na) else 0j
         vb = x[circ.i(nb) - 1] if circ.i(nb) else 0j
@@ -2541,10 +2708,15 @@ def _element_report(circ, x, t=None, mode="dc"):
                 rec["current_a"] = round(-s, 12)
                 rec["power_w"] = round(-s * v, 12)
                 rec["value"] = round(s, 9)
-        elif T in ("L", "E"):
+        elif T in ("L", "E", "H"):
             cur = x[circ.branch_idx[el["name"]] - 1].real
             rec["current_a"] = round(cur, 12)
             rec["power_w"] = round(v * cur, 12)
+        elif T == "F":
+            ic = x[el["_ctrl_row"] - 1].real
+            rec["control_current_a"] = round(ic, 12)
+            rec["current_a"] = round(el["value"] * ic, 12)
+            rec["power_w"] = round(v * el["value"] * ic, 12)
         elif T in ("BV", "BI"):
             val = circ.b_value(el, x, t)
             rec["expression"] = el["text"]
@@ -2679,7 +2851,10 @@ NOT_COMPUTED = [
     "accepted inside .model parameters",
     "a .subckt nested inside another .subckt, and any directive other than "
     ".model inside a .subckt body",
-    "current-controlled sources (F/H), switches (S/W), JFETs, coupled inductors (K)",
+    "switches (S/W), JFETs (J) and XSPICE blocks (A); controlled sources F/H and "
+    "mutual inductance K ARE solved, but not their second-order physics: K has no "
+    "loss terms, no frequency-dependent core and no saturation, and an F/H gain is a "
+    "constant, not a table",
     "MOSFET levels 2..7, BSIM, gate charge, capacitances and switching loss; W= "
     "L= and M= scale KP*(W/L)*m (level 1), while AD= AS= PD= PS= and the rest are "
     "read and reported as ignored, because junction capacitance and leakage are "
@@ -2885,7 +3060,7 @@ def _noise_analysis(circ, card, max_points):
     gain_flat = None
     for f in freqs:
         for el in circ.elements:
-            if el["type"] in ("C", "L", "T"):
+            if el["type"] in ("C", "L", "T", "K"):
                 el["_f"] = f
         bad = _tline_guard(circ, f)
         if bad is not None:
@@ -3274,7 +3449,7 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
     tline_warned = set()
     for f in freqs:
         for el in circ.elements:
-            if el["type"] in ("C", "L", "T"):
+            if el["type"] in ("C", "L", "T", "K"):
                 el["_f"] = f
         bad = _tline_guard(circ, f)
         if bad is not None:

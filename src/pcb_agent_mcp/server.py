@@ -1937,6 +1937,55 @@ def selftest():
           and abs(_big_n.get("1", 0.0) - 4000.0) < 1e-9,
           "node1 %s node2 %s" % (_big_n.get("1"), _big_n.get("2")))
 
+    # 0.0.34: the two current-controlled sources and mutual inductance. The tool
+    # must hand back the textbook number, not merely "solved": behind a 1 V source
+    # and 1 k the branch current is -1 mA, so F1 2 0 V1 2 drives -2 mA into node 2
+    # (2 V across 1 k) and H1 3 0 V1 2 is -2 mV - a card read positionally (V1
+    # taken as a node pair) would give 0 V on both and look solved.
+    _fh = ("* fh\nV1 1 0 1\nR1 1 0 1k\nF1 2 0 V1 2\nR2 2 0 1k\n"
+           "H1 3 0 V1 2\nR3 3 0 1k\n.op\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 153, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _fh}}})
+    _fh_out = json.loads(r["result"]["content"][0]["text"])
+    _fh_n = (_fh_out.get("value") or {}).get("nodes_v") or {}
+    _fh_els = {e.get("name"): e for e in ((_fh_out.get("value") or {}).get("elements") or [])}
+    check("a CCCS and a CCVS are solved, not rejected: F1 reads -1 mA and drives "
+          "2.000 V into 1 k, H1 makes -0.002 V (both are 0 V if the controlling NAME "
+          "is misread as a node pair)",
+          _fh_out.get("status") == "ok"
+          and abs(_fh_n.get("2", 0.0) - 2.0) < 1e-6
+          and abs(_fh_n.get("3", 0.0) + 0.002) < 1e-9
+          and abs((_fh_els.get("F1") or {}).get("control_current_a", 0.0) + 1e-3) < 1e-9,
+          "V2 %s V3 %s" % (_fh_n.get("2"), _fh_n.get("3")))
+
+    # K is a statement about two inductors, so the honest pair of answers is: an
+    # impossible one is refused by name, and a real one is a transformer. With
+    # L2/L1 = 4 and k = 1 an open secondary must sit at exactly twice the primary
+    # voltage; |k| > 1 would put M^2 above L1*L2 and is refused, not clamped.
+    _kk = ("* k\nV1 1 0 AC 1\nR1 1 3 1\nL1 3 0 100u\nL2 2 0 400u\n"
+           "K1 L1 L2 1\nR2 2 0 1meg\n.op\n.ac lin 2 1k 2k\n.end\n")
+    r = handle({"jsonrpc": "2.0", "id": 154, "method": "tools/call",
+                "params": {"name": "sim_spice", "arguments": {"netlist": _kk,
+                                                              "analysis": "ac"}}})
+    _kk_out = json.loads(r["result"]["content"][0]["text"])
+    _kk_p = ((_kk_out.get("value") or {}).get("points") or [{}])[0].get("nodes_v") or {}
+    _ratio = ((_kk_p.get("2") or {}).get("mag", 0.0)
+              / max((_kk_p.get("3") or {}).get("mag", 1.0), 1e-30))
+    r = handle({"jsonrpc": "2.0", "id": 155, "method": "tools/call",
+                "params": {"name": "sim_spice",
+                           "arguments": {"netlist": "* k\nV1 1 0 1\nL1 1 0 1m\n"
+                                                   "L2 2 0 1m\nK1 L1 L2 1.5\n"
+                                                   "R2 2 0 1k\n.op\n.end\n"}}})
+    _bad = json.loads(r["result"]["content"][0]["text"])
+    check("a K card is a transformer, not a discarded line: k=1 with L2/L1=4 puts the "
+          "open secondary at 2.000x the primary, and |k|=1.5 is refused by name with "
+          "the range in the message instead of being clamped to 1",
+          _kk_out.get("status") == "ok" and abs(_ratio - 2.0) < 1e-6
+          and _bad.get("status") == "error"
+          and _bad.get("reason_code") == "NETLIST_INVALID"
+          and "outside [-1, 1]" in (_bad.get("message") or ""),
+          "ratio %s, bad %s" % (round(_ratio, 9), _bad.get("reason_code")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
