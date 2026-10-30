@@ -27,6 +27,7 @@ ships no fab table and `steinberg_fatigue` demands z_allow_mm.
 import math
 
 from .result import ok, err
+from .thermal import _barrel_profile_rth
 
 RHO20_CU = 1.724e-8      # ohm*m, IACS copper at 20 C
 ALPHA_CU = 0.00393       # 1/K, linear region 0..100 C
@@ -650,11 +651,19 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
     is
 
         {"x1_mm", "y1_mm", "x2_mm", "y2_mm", "pitch_mm", "d_mm",
-         "plating_um", "span_mm" (default = plate thickness), "sink_c"}
+         "plating_um", "span_mm" (default = plate thickness), "sink_c",
+         "barrel_profile"?}
 
     and every via becomes ONE conductance to the sink node you name,
 
         G = k_cu * pi*((d/2)^2 - (d/2 - plating)^2) / span        [W/K]
+
+    `barrel_profile` (optional, per array) replaces that single wall with a wall
+    that varies along the barrel: [{"length_mm": .., "plating_um": ..}, ...] from
+    one end to the other, whose lengths add up to span_mm. The segments are in
+    SERIES, G = 1/sum(L_i/(k_cu*A_i)), so a thin middle is not averaged away.
+    Leaving it out is the uniform barrel, bit for bit; the answer always says
+    which wall it used.
 
     i.e. the annulus of the barrel (the drill area is the classic factor-of-10
     exaggeration), landing in the cell that contains the via centre. `sink_c`
@@ -877,7 +886,25 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
             r_out = vd / 2.0
             r_in = r_out - vpl_mm
             a_mm2 = math.pi * (r_out ** 2 - r_in ** 2)
-            g_one = kcu * (a_mm2 * 1e-6) / (span_mm * 1e-3)
+            vprof = va.get("barrel_profile")
+            r_barrel = None
+            prof_detail = []
+            t_eq_um = None
+            if vprof is not None:
+                if not isinstance(vprof, (list, tuple)) or not vprof:
+                    return err("thermal via array #%d: barrel_profile must be a "
+                               "non-empty list of {\"length_mm\", \"plating_um\"} "
+                               "segments" % idx, "ARG_INVALID",
+                               hint='[{"length_mm": 0.55, "plating_um": 25}, '
+                                    '{"length_mm": 0.5, "plating_um": 15}, '
+                                    '{"length_mm": 0.55, "plating_um": 25}]')
+                r_barrel, prof_detail, t_eq_um, msg, code = _barrel_profile_rth(
+                    vd, list(vprof), span_mm, kcu)
+                if r_barrel is None:
+                    return err("thermal via array #%d: %s" % (idx, msg), code)
+                g_one = 1.0 / r_barrel
+            else:
+                g_one = kcu * (a_mm2 * 1e-6) / (span_mm * 1e-3)
             cells, n_x, n_y = _via_centres(nx, ny, dx, dy, vx1, vy1, vx2, vy2,
                                            vpitch)
             on_grid = len(cells)
@@ -908,6 +935,18 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
                 "conductance_per_via_w_per_k": _sig(g_one),
                 "total_conductance_w_per_k": _sig(g_one * on_grid),
             })
+            if r_barrel is not None:
+                via_arrays[-1]["barrel_profile_modelled"] = True
+                via_arrays[-1]["barrel_profile"] = [
+                    {"index": seg["index"],
+                     "length_mm": _sig(seg["length_mm"]),
+                     "plating_um": _sig(seg["plating_um"]),
+                     "barrel_area_mm2": _sig(seg["barrel_area_mm2"]),
+                     "rth_k_per_w": _sig(seg["rth_k_per_w"]),
+                     "share_of_barrel_pct": _sig(
+                         100.0 * seg["rth_k_per_w"] / r_barrel)} for seg in prof_detail]
+                via_arrays[-1]["plating_equivalent_um"] = _sig(t_eq_um)
+                via_arrays[-1]["rth_per_via_k_per_w"] = _sig(r_barrel)
 
     # q_ref = the I^2R each cell would dissipate at 20 C (W)
     q_ref = [[0.0] * ny for _ in range(nx)]
@@ -1332,12 +1371,21 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
                       "(a plate in a box sees itself), no wavelength or "
                       "angle dependence, no solar or other external flux")
     if via_arrays:
-        nc_list[2] = ("each via is one barrel with uniform plating conducting "
-                      "to the sink you named: no plating thinning mid-barrel, "
-                      "no pad/plane spreading at either end, no copper barrel "
-                      "resistance variation with temperature (k_cu is one "
-                      "number), and no interaction with the neighbouring "
-                      "barrels")
+        if any(a.get("barrel_profile_modelled") for a in via_arrays):
+            nc_list[2] = ("each via is one barrel conducting to the sink you named "
+                          "with the wall profile you gave (the segments are in "
+                          "series, so a thin middle is not averaged away), but "
+                          "there is no pad/plane spreading at either end, no "
+                          "copper barrel resistance variation with temperature "
+                          "(k_cu is one number), and no interaction with the "
+                          "neighbouring barrels")
+        else:
+            nc_list[2] = ("each via is one barrel with uniform plating conducting "
+                          "to the sink you named: no plating thinning mid-barrel, "
+                          "no pad/plane spreading at either end, no copper barrel "
+                          "resistance variation with temperature (k_cu is one "
+                          "number), and no interaction with the neighbouring "
+                          "barrels")
 
     rad_report = None
     if emis is not None:
@@ -1383,9 +1431,13 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
             "heat_out_w": _sig(out_via),
             "equivalent_h_w_m2k": _sig(g_total / (2.0 * ac * nx * ny)),
             "assumption": ("each via is ONE copper barrel from its cell to the "
-                           "sink you named (G = k_cu*annulus/span), radial "
-                           "isothermal, no plating thinning mid-barrel, no pad "
-                           "or plane spreading at either end; the laminate's own "
+                           "sink you named (G = k_cu*annulus/span, or "
+                           "1/sum(L_i/(k_cu*A_i)) when a barrel_profile is "
+                           "given), radial isothermal, "
+                           + ("no pad " if any(a.get("barrel_profile_modelled")
+                                                for a in via_arrays)
+                              else "no plating thinning mid-barrel, no pad ")
+                           + "or plane spreading at either end; the laminate's own "
                            "vertical path is already inside h and is NOT added in "
                            "parallel, and a via lands in the single cell that "
                            "contains its centre"),
@@ -1455,9 +1507,12 @@ def board_electrothermal(width_mm, height_mm, thickness_mm, k_w_mk, h_w_m2k,
         prec += ("; radiation is one grey body per face at the cell temperature, "
                  "so the answer is the fixed point of a T^4 loop, not one pass")
     if via_arrays:
-        prec += ("; each via is a uniform-plating copper barrel between the cell "
-                 "and the sink you named, and that sink temperature is an input "
-                 "- it is not solved for")
+        prec += ("; each via is a "
+                 + ("copper barrel with the wall profile you gave"
+                    if any(a.get("barrel_profile_modelled") for a in via_arrays)
+                    else "uniform-plating copper barrel")
+                 + " between the cell and the sink you named, and that sink "
+                   "temperature is an input - it is not solved for")
     return ok({"t_max_c": round(tmax, 6),
                "t_min_c": round(tmin, 6),
                "t_avg_c": round(tavg, 6),

@@ -131,8 +131,100 @@ def thermal_stack(layers, area_mm2, power_w=None, t_ambient_c=None,
 
 # ------------------------------------------------------------------ vias
 
+def _barrel_profile_rth(drill_mm, segments, length_mm, k_cu):
+    """Series resistance of a barrel whose wall thickness varies along it.
+
+    R = sum over segments of L_i / (k_cu * A_i), A_i = pi*((d/2)^2 - (d/2-t_i)^2).
+
+    Returns (rth, detail, equivalent_uniform_plating_um) on success and
+    (None, None, None, message, code) on failure - a 5-tuple either way, so the
+    caller checks the first element only.
+    """
+    r_out = drill_mm / 2.0
+    detail = []
+    total_r = 0.0
+    total_len = 0.0
+    for idx, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            return (None, None, None, "barrel_profile segment %d is not an object "
+                    '{"length_mm", "plating_um"}' % idx, "ARG_INVALID")
+        li = _num(seg.get("length_mm"))
+        ti = _num(seg.get("plating_um"))
+        if li is None or ti is None:
+            return (None, None, None,
+                    "barrel_profile segment %d needs numeric length_mm and "
+                    "plating_um" % idx, "ARG_INVALID")
+        if li <= 0 or ti <= 0:
+            return (None, None, None,
+                    "barrel_profile segment %d: length_mm and plating_um must be "
+                    "> 0" % idx, "ARG_RANGE")
+        ti_mm = ti / 1000.0
+        if 2.0 * ti_mm >= drill_mm:
+            return (None, None, None,
+                    "barrel_profile segment %d: plating_um is not smaller than the "
+                    "drill radius - that segment would be solid copper and the "
+                    "annulus formula stops meaning anything" % idx, "ARG_RANGE")
+        r_in = r_out - ti_mm
+        a_mm2 = math.pi * (r_out ** 2 - r_in ** 2)
+        r_seg = (li * 1e-3) / (float(k_cu) * a_mm2 * 1e-6)
+        total_r += r_seg
+        total_len += li
+        detail.append({"index": idx, "length_mm": li, "plating_um": ti,
+                       "barrel_area_mm2": a_mm2, "rth_k_per_w": r_seg})
+    if abs(total_len - length_mm) > 1e-6:
+        return (None, None, None,
+                "barrel_profile lengths add up to %.12g mm but length_mm is "
+                "%.12g mm - the profile has to span the whole barrel, otherwise "
+                "the missing or extra copper is silently free" %
+                (total_len, length_mm), "ARG_RANGE")
+    # the uniform wall that would conduct the same: the same total copper area is
+    # not the same resistance (R is a series sum), so solve for the area instead
+    a_eq_mm2 = (total_len * 1e-3) / (float(k_cu) * total_r) * 1e6
+    r_in_eq = math.sqrt(max(0.0, r_out ** 2 - a_eq_mm2 / math.pi))
+    t_eq_um = (r_out - r_in_eq) * 1000.0
+    return (total_r, detail, t_eq_um, None, None)
+
+
+def _interface_rth(interface):
+    """One series layer at the end of the field, from stated material numbers.
+
+    R = interfaces * thickness / (k * area). Returns (rth, echo, msg, code).
+    """
+    if not isinstance(interface, dict):
+        return (None, None, "interface must be an object "
+                '{"area_mm2", "thickness_um", "k_w_mk", "interfaces"?}',
+                "ARG_INVALID")
+    a = _num(interface.get("area_mm2"))
+    th = _num(interface.get("thickness_um"))
+    k = _num(interface.get("k_w_mk"))
+    for name, v in (("area_mm2", a), ("thickness_um", th), ("k_w_mk", k)):
+        if v is None:
+            return (None, None, "interface needs numeric %s (a TIM pad is a "
+                    "thickness, a conductivity and an area; there is no table of "
+                    "TIMs in this file)" % name, "ARG_INVALID")
+        if v <= 0:
+            return (None, None, "interface: %s must be > 0" % name, "ARG_RANGE")
+    faces = interface.get("interfaces")
+    if faces is None:
+        faces = 1
+    try:
+        nf = int(faces)
+    except (TypeError, ValueError):
+        return (None, None, "interface: interfaces must be an integer 1..2",
+                "ARG_INVALID")
+    if nf != float(faces) or nf < 1 or nf > 2:
+        return (None, None, "interface: interfaces must be the INTEGER 1 or 2 "
+                "(one pad under the sink, or two - one at each end of the "
+                "barrel)", "ARG_RANGE")
+    r = nf * (th * 1e-6) / (k * a * 1e-6)
+    echo = {"area_mm2": a, "thickness_um": th, "k_w_mk": k, "interfaces": nf,
+            "rth_k_per_w": round(r, 9)}
+    return (r, echo, None, None)
+
+
 def via_array_thermal(drill_mm, plating_um, length_mm, count=1,
-                      pitch_mm=None, k_cu=K_CU, k_board=K_FR4):
+                      pitch_mm=None, k_cu=K_CU, k_board=K_FR4,
+                      barrel_profile=None, interface=None):
     """Thermal resistance through a field of plated vias, copper only.
 
     A via is a thin tube of copper: the cross-section is the ANNULUS
@@ -142,6 +234,24 @@ def via_array_thermal(drill_mm, plating_um, length_mm, count=1,
     If `pitch_mm` is given, the board's own FR4 in the cell around each via is
     added in PARALLEL - that is the honest picture of a via field, because the
     epoxy between the barrels also conducts (badly).
+
+    The default answer is deliberately OPTIMISTIC: one uniform wall, no pad
+    interfaces. The two optional arguments let the caller say by how much
+    instead of just being warned.
+
+    * `barrel_profile` = [{"length_mm": .., "plating_um": ..}, ...] walking along
+      the barrel from one end to the other. Plating really is thinner mid-barrel
+      (that is why IPC-4761 via structures exist at all), so a 3-segment profile
+      models the wall the way it comes out of the plating bath instead of one
+      uniform number. The segments are in SERIES: R = sum L_i/(k_cu*A_i), so the
+      thinnest segment dominates no matter how short it is. The lengths have to
+      add up to `length_mm`. Passing nothing keeps the single uniform barrel,
+      bit for bit. With a profile, `plating_um` becomes optional and is only
+      used for the comparison "what if it had been uniform".
+    * `interface` = {"area_mm2": .., "thickness_um": .., "k_w_mk": ..,
+      "interfaces": 1|2} is a series layer after the field: a TIM pad under a
+      heatsink, a gap filler, thermal tape. It is computed from the three
+      material numbers you state - this file still ships no TIM table.
     """
     d = _num(drill_mm)
     t = _num(plating_um)
@@ -150,23 +260,55 @@ def via_array_thermal(drill_mm, plating_um, length_mm, count=1,
         n = int(count)
     except (TypeError, ValueError):
         return err("count must be an integer", "ARG_INVALID")
-    if d is None or t is None or L is None:
-        return err("drill_mm, plating_um and length_mm must be numbers",
-                   "ARG_INVALID")
-    if d <= 0 or t <= 0 or L <= 0:
-        return err("drill_mm, plating_um and length_mm must be > 0", "ARG_RANGE")
+    if d is None or L is None:
+        return err("drill_mm and length_mm must be numbers", "ARG_INVALID")
+    if plating_um is not None and t is None:
+        return err("plating_um must be a number (or leave it out and give a "
+                   "barrel_profile instead)", "ARG_INVALID")
+    if t is None and barrel_profile is None:
+        return err("no wall: give plating_um, or barrel_profile with a "
+                   "plating_um on every segment", "ARG_INVALID")
+    if d <= 0 or L <= 0:
+        return err("drill_mm and length_mm must be > 0", "ARG_RANGE")
+    if t is not None and t <= 0:
+        return err("plating_um must be > 0", "ARG_RANGE")
     if n < 1:
         return err("count must be >= 1", "ARG_RANGE")
-    t_mm = t / 1000.0
-    if 2.0 * t_mm >= d:
-        return err("plating_um is not smaller than the drill radius - the barrel "
-                   "would be solid and the annulus formula stops meaning anything",
-                   "ARG_RANGE")
+    if t is not None:
+        t_mm = t / 1000.0
+        if 2.0 * t_mm >= d:
+            return err("plating_um is not smaller than the drill radius - the "
+                       "barrel would be solid and the annulus formula stops "
+                       "meaning anything", "ARG_RANGE")
     r_out = d / 2.0
-    r_in = r_out - t_mm
-    a_mm2 = math.pi * (r_out ** 2 - r_in ** 2)
-    a_m2 = a_mm2 * 1e-6
-    r_one = (L * 1e-3) / (float(k_cu) * a_m2)
+    a_mm2 = None
+    if t is not None:
+        r_in = r_out - t / 1000.0
+        a_mm2 = math.pi * (r_out ** 2 - r_in ** 2)
+    # ---- the barrel itself
+    r_prof = None
+    seg_detail = None
+    t_eq_um = None
+    if barrel_profile is not None:
+        if not isinstance(barrel_profile, (list, tuple)) or not barrel_profile:
+            return err("barrel_profile must be a non-empty list of "
+                       '{"length_mm", "plating_um"} segments', "ARG_INVALID",
+                       hint="a 1.6 mm barrel plated 25 um at the ends and 15 um in "
+                            "the middle is [{\"length_mm\": 0.55, \"plating_um\": "
+                            "25}, {\"length_mm\": 0.5, \"plating_um\": 15}, "
+                            "{\"length_mm\": 0.55, \"plating_um\": 25}]")
+        r_prof, seg_detail, t_eq_um, msg, code = _barrel_profile_rth(
+            d, list(barrel_profile), L, k_cu)
+        if r_prof is None:
+            return err(msg, code)
+    if barrel_profile is None:
+        r_one = (L * 1e-3) / (float(k_cu) * a_mm2 * 1e-6)
+    else:
+        r_one = r_prof
+        if a_mm2 is None:               # no nominal plating: report the thinnest
+            t_thin = min(s["plating_um"] for s in seg_detail)
+            r_in = r_out - t_thin / 1000.0
+            a_mm2 = math.pi * (r_out ** 2 - r_in ** 2)
     value = {"rth_one_via_k_per_w": round(r_one, 9),
              "rth_array_k_per_w": round(r_one / n, 9),
              "count": n,
@@ -176,9 +318,31 @@ def via_array_thermal(drill_mm, plating_um, length_mm, count=1,
              "drill_area_mm2": round(math.pi * r_out ** 2, 9)}
     basis = ("Rth = 1/(sum 1/R_i), R_i = L/(k_cu * A), "
              "A = pi*((d/2)^2 - (d/2 - t)^2)")
-    not_computed = ["barrel plating thinner at mid-board (makes it worse)",
-                    "spreading into the pad / plane at both ends",
+    not_computed = ["spreading into the pad / plane at both ends",
                     "solder wicking into the barrel (makes it better)"]
+    if barrel_profile is not None:
+        for s in seg_detail:
+            s["barrel_area_mm2"] = round(s["barrel_area_mm2"], 9)
+            s["rth_k_per_w"] = round(s["rth_k_per_w"], 9)
+            s["share_of_barrel_pct"] = round(100.0 * s["rth_k_per_w"] / r_one, 6)
+        value["barrel_profile"] = seg_detail
+        value["plating_equivalent_um"] = round(t_eq_um, 6)
+        value["barrel_area_mm2_source"] = ("plating_um" if t is not None
+                                           else "thinnest barrel_profile segment")
+        if t is not None:
+            r_uni = (L * 1e-3) / (float(k_cu) * a_mm2 * 1e-6)
+            value["rth_if_uniform_k_per_w"] = round(r_uni, 9)
+            value["plating_thinning_effect_pct"] = round(
+                100.0 * (r_one / r_uni - 1.0), 6)
+        basis += ("; with barrel_profile the segments are in series, "
+                  "R = sum L_i/(k_cu*A_i)")
+        not_computed.insert(0, "any wall profile other than the one you gave - the "
+                               "numbers are yours, not a plating-bath model")
+    else:
+        not_computed.insert(0, "barrel plating thinner at mid-board (makes it "
+                               "worse) - pass barrel_profile instead of guessing")
+    # ---- the FR4 cell around each barrel
+    r_base = r_one / n
     if pitch_mm is not None:
         p = _num(pitch_mm)
         if p is None or p <= 0:
@@ -197,18 +361,39 @@ def via_array_thermal(drill_mm, plating_um, length_mm, count=1,
         basis += ("; with pitch: the FR4 cell p^2 is put in parallel with one "
                   "barrel, then the cells are put in parallel")
         not_computed.append("thermal interaction between neighbouring barrels")
+        r_base = r_cell / n
+    # ---- one series layer after the field
+    if interface is not None:
+        r_if, iface_echo, msg, code = _interface_rth(interface)
+        if r_if is None:
+            return err(msg, code)
+        value["interface"] = iface_echo
+        value["rth_interface_k_per_w"] = round(r_if, 9)
+        value["rth_array_total_k_per_w"] = round(r_base + r_if, 9)
+        value["interface_share_of_total_pct"] = round(
+            100.0 * r_if / (r_base + r_if), 6)
+        basis += ("; the interface layer is in series with the whole field, "
+                  "R = interfaces * t/(k*A)")
+        not_computed.append("voiding / pump-out in the interface layer, and the "
+                            "pressure it is mounted at")
+    assumptions = {"drill_mm": d, "plating_um": t, "length_mm": L,
+                   "count": n, "k_cu": float(k_cu),
+                   "pitch_mm": (_num(pitch_mm) if pitch_mm is not None else None),
+                   "barrel_profile_segments": (len(barrel_profile)
+                                               if barrel_profile is not None
+                                               else None),
+                   "interface": (interface is not None)}
+    prec = ("first order lower bound on Rth: "
+            + ("the wall is the profile you gave, but " if barrel_profile is not None
+               else "the plating is uniform and thinner mid-barrel in reality, so ")
+            + "the two pad interfaces "
+            + ("are the interface layer you stated" if interface is not None
+               else "are not modelled")
+            + ". Do not use this to claim a via field is sufficient")
     return ok(value=value, unit="K/W", model="via_barrel_array",
-              basis=basis,
-              precision="first order and an OPTIMISTIC lower bound on Rth: the "
-                        "plating is thinner mid-barrel and the two pad interfaces "
-                        "are not modelled. Do not use this to claim a via field is "
-                        "sufficient",
-              assumptions={"drill_mm": d, "plating_um": t, "length_mm": L,
-                           "count": n, "k_cu": float(k_cu),
-                           "pitch_mm": (_num(pitch_mm) if pitch_mm is not None
-                                        else None)},
+              basis=basis, precision=prec,
+              assumptions=assumptions,
               extra={"not_computed": not_computed})
-
 
 # ------------------------------------------------------------------ 2D plate
 

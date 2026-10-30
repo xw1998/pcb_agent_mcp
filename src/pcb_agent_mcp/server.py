@@ -905,6 +905,55 @@ def selftest():
                                                ])["t_max_c"]) < 0.01,
               "bare %s" % (_bare_p.get("t_max_c"),))
 
+        # A barrel whose wall varies along it is a SERIES sum, so it is checkable
+        # by hand segment by segment - and a uniform profile must reproduce the
+        # number the plain call gives, because it is the same physics.
+        def _tv(**kw):
+            rr = handle({"jsonrpc": "2.0", "id": 863, "method": "tools/call",
+                         "params": {"name": "thermal_via_array",
+                                    "arguments": kw}})
+            return json.loads(rr["result"]["content"][0]["text"])
+        _uni = _tv(drill_mm=0.3, plating_um=25.0, length_mm=1.6)
+        _prof = _tv(drill_mm=0.3, plating_um=25.0, length_mm=1.6,
+                    barrel_profile=[{"length_mm": 0.55, "plating_um": 25.0},
+                                    {"length_mm": 0.5, "plating_um": 15.0},
+                                    {"length_mm": 0.55, "plating_um": 25.0}])
+        _flat = _tv(drill_mm=0.3, length_mm=1.6,
+                    barrel_profile=[{"length_mm": 1.6, "plating_um": 25.0}])
+        _r_out = 0.15
+        _r_hand = 0.0
+        for _L, _t in ((0.55, 25.0), (0.5, 15.0), (0.55, 25.0)):
+            _a = 3.141592653589793 * (_r_out ** 2 - (_r_out - _t / 1000.0) ** 2)
+            _r_hand += (_L * 1e-3) / (385.0 * _a * 1e-6)
+        check("a barrel thinned mid-span costs the series sum of its segments",
+              (_uni.get("value") or {}).get("rth_one_via_k_per_w") is not None
+              and abs((_prof.get("value") or {}).get("rth_one_via_k_per_w", 0)
+                      - _r_hand) < 1e-6,
+              "%s vs %s" % ((_prof.get("value") or {}).get(
+                  "rth_one_via_k_per_w"), round(_r_hand, 6)))
+        check("a one-segment barrel_profile is the uniform barrel, to the last digit",
+              abs((_flat.get("value") or {}).get("rth_one_via_k_per_w", 0)
+                  - (_uni.get("value") or {}).get("rth_one_via_k_per_w", 0)) < 1e-9
+              and (_flat.get("value") or {}).get("rth_array_k_per_w") ==
+              (_uni.get("value") or {}).get("rth_array_k_per_w"),
+              "%s vs %s" % ((_flat.get("value") or {}).get("rth_one_via_k_per_w"),
+                            (_uni.get("value") or {}).get("rth_one_via_k_per_w")))
+
+        # The interface layer is t/(k*A) in series with the field: two numbers to
+        # check, the layer itself and the array total that includes it.
+        _tim = _tv(drill_mm=0.3, plating_um=25.0, length_mm=1.6, count=9,
+                   pitch_mm=1.0,
+                   interface={"area_mm2": 25.0, "thickness_um": 100.0,
+                              "k_w_mk": 3.0})
+        _vv = _tim.get("value") or {}
+        _r_tim = (100.0 * 1e-6) / (3.0 * 25.0 * 1e-6)
+        check("a TIM layer is t/(k*A) in series with the via field",
+              abs(_vv.get("rth_interface_k_per_w", 0) - _r_tim) < 1e-9
+              and abs(_vv.get("rth_array_total_k_per_w", 0)
+                      - (_vv.get("rth_array_with_board_k_per_w", 0) + _r_tim))
+              < 1e-9,
+              "%s vs %s" % (_vv.get("rth_interface_k_per_w"), round(_r_tim, 9)))
+
         # --- cavity / electro-thermal. Again only closed forms and hand
         # arithmetic: f10 for a 100 mm plane at er=4.3 is c/(2 sqrt(er) * 0.1 m),
         # which is also the definition of a half guided wavelength.

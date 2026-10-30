@@ -3317,7 +3317,10 @@ def _capabilities(_args):
                               "(default: ambient, and the report says so); it lands in "
                               "the single cell holding its centre, so it is a point "
                               "load and the answer is grid-dependent - reported, not "
-                              "hidden. Neither is on by default. DC only, no skin "
+                              "hidden. A per-array barrel_profile (segments in "
+                              "series, G = 1/sum(L_i/(k_cu*A_i))) replaces the uniform "
+                              "wall, so a thin mid-barrel is not averaged away. "
+                              "Neither is on by default. DC only, no skin "
                               "effect, no AC loss, no 3-D, no component thermal mass "
                               "or contact resistance",
             "vibration": "mechanical vibration: natural frequencies and mode shapes of "
@@ -3743,8 +3746,9 @@ def _capabilities(_args):
             "(emissivity: both faces, one grey-body epsilon, exact T^4 as a lagged "
             "h_rad re-solved to a fixed point) and thermal_vias (one annular-section "
             "copper barrel per pitch cell as a conductance to a sink, landing in the "
-            "cell holding its centre) are modelled when asked for, and are OFF by "
-            "default so the numbers are bit-identical without them. Still not done: "
+            "cell holding its centre, or -- with a per-array barrel_profile -- a "
+            "segmented wall whose segments are in series) are modelled when asked for, "
+            "and are OFF by default so the numbers are bit-identical without them. Still not done: "
             "3-D, internal plane-to-plane radiation through the laminate, "
             "temperature-dependent emissivity, component thermal mass and contact "
             "resistance, AC loss (skin/proximity), device self-heating inside "
@@ -3767,11 +3771,16 @@ def _capabilities(_args):
             "because it does not converge (it moves with the truncation order), so no "
             "anti-resonance between the plane and the caps is claimed. Die-package "
             "inductance, split planes and via-barrel inductance are all outside",
-            "Thermal plating thinning, TIM interface resistance and heatsink "
-            "selection: thermal_via_array reports an OPTIMISTIC barrel resistance "
-            "(uniform plating), rth_cs is an input the user must supply, and "
-            "thermal_heatsink returns the BUDGET - there is deliberately no heatsink "
-            "table in this server",
+            "Thermal vias are a barrel model, by name: thermal_via_array takes the "
+            "wall as a profile (barrel_profile, series sum, so mid-barrel thinning is "
+            "no longer assumed away) and a series TIM/pad layer (interface, from the "
+            "area, thickness and k you state), and board_electrothermal's thermal_vias "
+            "takes the same profile. Still not done: a plating-bath or IPC-4761 via "
+            "structure model (the profile is YOUR numbers, not a process model), "
+            "pad/plane spreading at the barrel ends, solder wicking, voiding / "
+            "pump-out or mounting pressure in the interface layer, rth_cs (still an "
+            "input you must supply), and heatsink selection - thermal_heatsink returns "
+            "the BUDGET, there is deliberately no heatsink table in this server",
             "Vibration is a THIN-PLATE, SINGLE-MODE, LINEAR layer, by name: no shear "
             "deformation or rotary inertia (so a thick or short plate reads too "
             "stiff), no component mass or copper stiffening (so f1 reads high on a "
@@ -5184,21 +5193,39 @@ _tool(
     "thermal_via_array",
     "Thermal resistance through a field of plated vias - the thermal twin of "
     "via_resistance, same annulus geometry. With pitch_mm the surrounding FR4 is put in "
-    "parallel, which is what a real via field looks like. An OPTIMISTIC number: plating is "
-    "thinner mid-barrel.",
+    "parallel, which is what a real via field looks like. Alone it is an OPTIMISTIC "
+    "number (one uniform wall); give barrel_profile to model the wall thinning mid-barrel "
+    "and interface to add the TIM / pad layer that follows the field.",
     {"type": "object", "properties": {
         "drill_mm": _num("finished hole diameter"),
-        "plating_um": _num("barrel wall thickness"),
+        "plating_um": _num("barrel wall thickness (nominal; optional if "
+                           "barrel_profile says the wall segment by segment)", None),
         "length_mm": _num("board thickness"),
         "count": _num("number of vias", 1),
         "pitch_mm": _num("via pitch, to add the FR4 cell in parallel"),
         "k_board": _num("board dielectric conductivity", 0.3),
-    }, "required": ["drill_mm", "plating_um", "length_mm"]},
+        "barrel_profile": {"type": "array", "items": {"type": "object"},
+            "description":
+            "optional wall profile along the barrel: "
+            '[{"length_mm": 0.55, "plating_um": 25}, {"length_mm": 0.5, '
+            '"plating_um": 15}, {"length_mm": 0.55, "plating_um": 25}] - lengths add '
+            "up to length_mm. Series resistance sum(L_i/(k_cu*A_i)), so the thin "
+            "middle segment dominates. Real plating is thinner mid-barrel; this is "
+            "where you say by how much instead of taking the uniform wall"},
+        "interface": {"type": "object",
+            "description":
+            "optional series layer after the field: {area_mm2, thickness_um, k_w_mk, "
+            "interfaces? (1 or 2)} - a TIM pad, gap filler or thermal tape. R = "
+            "interfaces*thickness/(k*area); it is added to the array total, never "
+            "folded into the barrel"},
+    }, "required": ["drill_mm", "length_mm"]},
     lambda a: _thermal.via_array_thermal(a.get("drill_mm"), a.get("plating_um"),
                                          a.get("length_mm"),
                                          count=int(a.get("count") or 1),
                                          pitch_mm=a.get("pitch_mm"),
-                                         k_board=a.get("k_board") or 0.3),
+                                         k_board=a.get("k_board") or 0.3,
+                                         barrel_profile=a.get("barrel_profile"),
+                                         interface=a.get("interface")),
 )
 
 _tool(
@@ -5938,7 +5965,11 @@ _tool(
             "is ONE lumped conductance k_cu*pi*(r_out^2 - r_in^2)/span (annular "
             "section, not the drill area) landing in the cell that contains its "
             "centre, so a point load stays a point load. sink_c defaults to the "
-            "ambient and is reported as such"},
+            "ambient and is reported as such. Optional barrel_profile replaces the "
+            "uniform wall with [{\"length_mm\",\"plating_um\"},...] end to end "
+            "(lengths add up to span_mm): the segments are in SERIES, "
+            "G = 1/sum(L_i/(k_cu*A_i)), so a thin middle is not averaged away. "
+            "Omit it and the answer is the uniform barrel, bit for bit"},
     }, "required": ["width_mm", "height_mm", "thickness_mm", "k_w_mk", "h_w_m2k"]},
     lambda a: _electro.board_electrothermal(
         a.get("width_mm"), a.get("height_mm"), a.get("thickness_mm"),
