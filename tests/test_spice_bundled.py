@@ -65,6 +65,29 @@ R1 2 0 1k
 """
 
 
+# 0.0.40: the two MULTI-PORT algebraic models. Every number in these decks was
+# measured on the bundled ngspice-47 first; the builtin has to land on the same
+# value, and on the engine's own reading of the formulas:
+#   summer: out = out_offset + out_gain * SUM_i in_gain_i*(v_i + in_offset_i)
+#   mult  : out = out_offset + out_gain * PROD_i in_gain_i*(v_i + in_offset_i)
+SUMMER_OP = """* xspice summer
+V1 1 0 3
+V2 2 0 4
+A1 [1 2] 10 s1
+.model s1 summer(in_gain=[2 3] in_offset=[1 1] out_gain=2 out_offset=7)
+R1 10 0 1k
+.op
+"""
+
+MULT_OP = """* xspice mult
+V1 1 0 3
+V2 2 0 4
+A1 [1 2] 10 m1
+.model m1 mult(in_gain=[2 3] in_offset=[1 1] out_gain=2 out_offset=7)
+R1 10 0 1k
+.op
+"""
+
 class TestLookupRules(unittest.TestCase):
     """Which engine a request reaches - no binary needed for any of this."""
 
@@ -135,7 +158,7 @@ class TestLookupRules(unittest.TestCase):
         self.assertEqual(r["status"], "error")
         self.assertEqual(r["reason_code"], "NETLIST_INVALID")
         self.assertIn("INTEGRATOR", r["message"])
-        self.assertIn("only gain and limit", r["message"])
+        self.assertIn("only gain, limit, summer and mult", r["message"])
 
     def test_limit_range_is_refused_rather_than_clamped(self):
         # measured: 0.9 V in with limit_range=0.5 settles at 0.82 V, not 0.9 V
@@ -146,6 +169,105 @@ class TestLookupRules(unittest.TestCase):
         self.assertEqual(r["status"], "error")
         self.assertIn("limit_range", r["message"])
 
+
+    def test_builtin_solves_a_multi_port_summer(self):
+        # 0.0.40: a second input node, an ARRAY CONNECTION on the card and vector
+        # parameters in the .model. 2*(3+1) + 3*(4+1) = 23, *2 + 7 = 53 V, which
+        # is what the bundled engine answers on the same deck.
+        r = spice.simulate(SUMMER_OP, engine="builtin")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertAlmostEqual(r["value"]["nodes_v"]["10"], 53.0, delta=1e-9)
+        a = [e for e in r["value"]["elements"] if e["type"] == "A"][0]
+        self.assertEqual(a["kind"], "SUMMER")
+        self.assertEqual(a["inputs"], ["1", "2"])
+        self.assertEqual(a["in_gain"], [2.0, 3.0])
+        self.assertEqual(a["in_offset"], [1.0, 1.0])
+        self.assertEqual(a["out_gain"], 2.0)
+        self.assertEqual(a["out_offset"], 7.0)
+
+    def test_builtin_solves_a_bilinear_multiplier(self):
+        # 2*(3+1) * 3*(4+1) = 120, *2 + 7 = 247 V. A product is NOT a sum: if the
+        # implementation summed, this would read 53 V and the summer test above
+        # would still pass, which is why both exist.
+        r = spice.simulate(MULT_OP, engine="builtin")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertAlmostEqual(r["value"]["nodes_v"]["10"], 247.0, delta=1e-9)
+        a = [e for e in r["value"]["elements"] if e["type"] == "A"][0]
+        self.assertEqual(a["kind"], "MULT")
+
+    def test_a_three_port_multiplier_is_a_product_of_three(self):
+        # measured: mult() on 3 V, 4 V, 5 V settles at 60 V; with in_offset=[0 0 2]
+        # it settles at 84 V. A model hard-wired to two ports would fail here.
+        deck = ("* m3\nV1 1 0 3\nV2 2 0 4\nV3 3 0 5\nA1 [1 2 3] 10 m1\n"
+                ".model m1 mult(in_offset=[0 0 2])\nR1 10 0 1k\n.op\n")
+        r = spice.simulate(deck, engine="builtin")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertAlmostEqual(r["value"]["nodes_v"]["10"], 84.0, delta=1e-9)
+
+    def test_the_multi_port_models_take_vectors_not_the_scalar_gain(self):
+        # The trap: `summer(gain=[2 3])` LOOKS like the obvious spelling and the
+        # engine answers "MIF: unrecognized parameter (gain) - ignored", i.e. it
+        # silently keeps in_gain=1 and reports 7 V where 18 V was meant. Refusing
+        # the parameter is the only answer that cannot be mistaken for one.
+        r = spice.simulate("* s\nV1 1 0 3\nV2 2 0 4\nA1 [1 2] 10 s1\n"
+                           ".model s1 summer(gain=[2 3])\nR1 10 0 1k\n.op\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason_code"], "NETLIST_INVALID")
+        self.assertIn("gain= in .model", r["message"])
+        self.assertIn("in_gain=", r["message"])
+
+    def test_a_vector_length_must_match_the_port_count(self):
+        # measured: the engine refuses a 2-port block with in_gain=[2 3 4]
+        # outright, so padding or truncating here would invent an answer.
+        r = spice.simulate("* s\nV1 1 0 3\nV2 2 0 4\nA1 [1 2] 10 s1\n"
+                           ".model s1 summer(in_gain=[2 3 4])\nR1 10 0 1k\n.op\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason_code"], "NETLIST_INVALID")
+        self.assertIn("3 value(s) for 2 input node(s)", r["message"])
+
+    def test_a_scalar_where_a_vector_is_required_is_refused(self):
+        # measured: the engine answers "Array parameter expected - No array
+        # delimiter found" - the same class of silent fallback as `gain=`.
+        r = spice.simulate("* m\nV1 1 0 3\nV2 2 0 4\nA1 [1 2] 10 m1\n"
+                           ".model m1 mult(in_offset=1)\nR1 10 0 1k\n.op\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "error")
+        self.assertIn("ARRAY parameter", r["message"])
+
+    def test_a_single_input_multi_port_block_is_refused(self):
+        # measured: `A1 1 10 m1` and `A1 [1] 10 m1` are both an engine error, so
+        # one port is not "a summer of one" here either.
+        r = spice.simulate("* s\nV1 1 0 3\nA1 1 10 s1\n"
+                           ".model s1 summer(in_gain=[2])\nR1 10 0 1k\n.op\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "error")
+        self.assertIn("needs at least 2", r["message"])
+
+    def test_a_percent_v_array_connection_is_still_refused(self):
+        # 0.0.37 measured that the engine does not accept `%v(1) %v(2)` for an
+        # array connection (incomplete or empty netlist). The builtin keeps
+        # refusing it, so the control for "the deck parses here" stays honest.
+        r = spice.simulate("* p\nV1 1 0 3\nV2 2 0 4\nA1 %v(1) %v(2) 10 s1\n"
+                           ".model s1 summer()\nR1 10 0 1k\n.op\n",
+                           engine="builtin")
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason_code"], "NETLIST_INVALID")
+
+    def test_a_mult_block_is_refused_in_ac_like_limit(self):
+        # a mult's small-signal gain IS the other input's value, so it depends on
+        # the operating point; sweeping without one would report a gain nobody
+        # chose. summer() is linear and is allowed - the pair keeps this honest.
+        bad = spice.simulate("* m\nV1 1 0 ac 1\nV2 2 0 ac 1\nA1 [1 2] 10 m1\n"
+                             ".model m1 mult()\nR1 10 0 1k\n.ac dec 1 1 10\n",
+                             engine="builtin")
+        self.assertEqual(bad["status"], "error")
+        self.assertIn("in an .ac sweep", bad["message"])
+        good = spice.simulate("* s\nV1 1 0 ac 1\nV2 2 0 ac 1\nA1 [1 2] 10 s1\n"
+                              ".model s1 summer(in_gain=[2 3])\nR1 10 0 1k\n"
+                              ".ac dec 1 1 10\n", engine="builtin")
+        self.assertEqual(good["status"], "ok", good)
 
 class TestLicenceHygiene(unittest.TestCase):
     """A GPL binary in an MIT tree is only legal as a separate, documented prog."""
@@ -234,6 +356,16 @@ class TestBundledEngineRuns(unittest.TestCase):
         cross = r["cross_check"]
         self.assertEqual(cross["max_abs_diff_v"], 0.0)
         self.assertGreater(cross["compared_nodes"], 0)
+
+    def test_cross_check_agrees_exactly_on_the_multi_port_blocks(self):
+        # 0.0.40: both sides now solve summer/mult, so this comparison is real for
+        # them too. Exact 0.0 is the right expectation: the formulas are the ones
+        # measured off THIS engine, with no approximation in between.
+        for deck, want in ((SUMMER_OP, 53.0), (MULT_OP, 247.0)):
+            r = self._ok(deck, cross_check=True)
+            self.assertAlmostEqual(r["value"]["nodes_v"]["10"], want, delta=1e-9)
+            self.assertEqual(r["cross_check"]["max_abs_diff_v"], 0.0, r["cross_check"])
+            self.assertGreater(r["cross_check"]["compared_nodes"], 0)
 
     def test_a_pure_analog_deck_still_agrees_with_the_builtin_solver(self):
         # The bundle must not change the answer for decks the subset can do: this

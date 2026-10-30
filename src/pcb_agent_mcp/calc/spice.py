@@ -913,6 +913,8 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
         # "no node in common" instead of a mismatch
         copy["name"] = "%s.%s" % (path, body["name"].lower())
         copy["nodes"] = tuple(mapped(n) for n in body["nodes"])
+        if body.get("inputs"):
+            copy["inputs"] = tuple(mapped(n) for n in body["inputs"])
         if body.get("ctrl"):
             copy["ctrl"] = tuple(mapped(n) for n in body["ctrl"])
         if copy["type"] in ("F", "H", "W"):
@@ -945,6 +947,53 @@ def _instantiate(spec, el, path, caller_env, stack, depth):
     return out
 
 
+def _split_params(text):
+    """Split a .model body on whitespace that is OUTSIDE brackets and quotes.
+
+    An XSPICE vector parameter is written `in_gain=[2 3]`, and a plain
+    ``str.split()`` cuts that into ``in_gain=[2`` and ``3]``. Measured on
+    ngspice-47, whose own MIF reader then answers "unrecognized parameter (3]) -
+    ignored" and quietly keeps the default for every port - a wrong number with
+    no error, which is exactly what this module is not allowed to produce.
+    """
+    out, cur, depth, quote = [], [], 0, None
+    for ch in text:
+        if quote is not None:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "'\"":
+            quote = ch
+            cur.append(ch)
+            continue
+        if ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth = max(0, depth - 1)
+        if ch.isspace() and depth == 0:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+            continue
+        cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _param_value(text):
+    """A scalar SPICE number, or a `[a b c]` vector kept as a list."""
+    t = str(text).strip()
+    if t.startswith("[") and t.endswith("]"):
+        inner = t[1:-1].replace(",", " ")
+        vals = [_value(tok) for tok in inner.split()]
+        if not vals:
+            raise ValueError("a vector parameter written as [] names no value")
+        return vals
+    return _value(t)
+
+
 def _parse_model(spec, line, lineno):
     # .model NAME TYPE(p=v p=v ...)
     body = line[len(".model"):].strip()
@@ -960,13 +1009,13 @@ def _parse_model(spec, line, lineno):
         raise ValueError("line %d: .model needs NAME TYPE(...)" % lineno)
     name = head[0].strip().lower()
     kind = head[1].strip().upper()
-    bits = [kind] + inner.split()
+    bits = [kind] + _split_params(inner)
     params = {}
     for b in bits[1:]:
         if "=" not in b:
             continue
         k, v = b.split("=", 1)
-        params[k.strip().upper()] = _value(v)
+        params[k.strip().upper()] = _param_value(v)
     spec["models"][name] = {"type": kind, "params": params}
 
 
@@ -1164,15 +1213,44 @@ def _parse_urc(parts, name, lineno):
 # (`A1 1 0 10 g1`) is rejected by the engine as an "incomplete or empty netlist",
 # and the two-node form drives v(out) = 2*v(in) for gain(gain=2).
 #
-# Two code models are algebraic, i.e. they carry no state and no sample clock, so
-# they can be solved here instead of delegated:
+# A block with several inputs writes them as an ARRAY CONNECTION:
 #
-#   gain :  out = gain * (in + in_offset)
-#   limit:  out = gain * (in + in_offset), then clamped to
-#                 [out_lower_limit, out_upper_limit]
+#   A1 [1 2] 10 s1
+#   .model s1 summer(in_gain=[2 3] out_gain=1 out_offset=0)
 #
-# `in_offset` sits INSIDE the gain, not outside it: measured - 2 V in with
-# gain(gain=2 in_offset=1) settles at 6.0 V, not 5.0 V.
+# The `%v(1) %v(2)` spelling is NOT accepted by the engine for that (measured:
+# "incomplete or empty netlist"), so it is not accepted here either.
+#
+# Four code models are algebraic - no state, no sample clock - so they are solved
+# here instead of delegated. Every number below was measured on the bundled
+# ngspice-47 first, then written down:
+#
+#   gain   (1 input) :  out = gain * (in + in_offset)
+#   limit  (1 input) :  the same, then clamped to
+#                       [out_lower_limit, out_upper_limit]
+#   summer (n inputs):  out = out_offset + out_gain * SUM_i  in_gain_i*(v_i + in_offset_i)
+#   mult   (n inputs):  out = out_offset + out_gain * PROD_i in_gain_i*(v_i + in_offset_i)
+#
+# The multi-input models take `in_gain`/`in_offset` VECTORS, not the scalar
+# `gain`/`in_offset` of gain()/limit(): `summer(gain=[2 3])` makes the engine
+# answer "MIF: unrecognized parameter (gain) - ignored" and fall back to
+# in_gain=1 on every port (3 V + 4 V settles at 7.0 V, not 18.0 V). A vector must
+# also match the port count exactly - a 2-port block with in_gain=[2 3 4] is
+# refused by the engine outright - so the length is checked here instead of
+# being padded.
+#
+# Measurements behind the formulas:
+#   gain(gain=2 in_offset=1) at 2 V                -> 6.0 V   (offset INSIDE gain)
+#   summer() at 3 V, 4 V                           -> 7.0 V   (in_gain defaults to 1)
+#   summer(in_gain=[2 3])                          -> 18.0 V
+#   summer(in_gain=[2 3] in_offset=[1 1])          -> 23.0 V  (2*4 + 3*5)
+#   summer(... out_gain=2 out_offset=7)            -> 53.0 V  (2*23 + 7)
+#   mult() at 3 V, 4 V                             -> 12.0 V
+#   mult() at 3 V, 4 V, 5 V                        -> 60.0 V  (n inputs, not two)
+#   mult(in_offset=[0 0 2]) at 3 V, 4 V, 5 V       -> 84.0 V  (3*4*(5+2))
+#   mult(in_gain=[2 3] in_offset=[1 1] out_gain=2 out_offset=7) -> 247.0 V
+#   summer/mult with ONE input node                -> engine error, so >= 2 ports
+#   summer(in_gain=2) (scalar)                     -> "Array parameter expected"
 #
 # limit_range (XSPICE's polynomial corner smoothing) is refused by name rather
 # than approximated: with limit_range=0.5 an input of 0.9 V settles at 0.82 V
@@ -1181,34 +1259,70 @@ def _parse_urc(parts, name, lineno):
 # way. Both bounds must be given: the engine itself rejects `limit(gain=1
 # out_lower_limit=-1)` as incomplete, so there is no default to inherit.
 _XSPICE_KEYS = {
-    "GAIN": ("GAIN", "IN_OFFSET"),
-    "LIMIT": ("GAIN", "IN_OFFSET", "OUT_LOWER_LIMIT", "OUT_UPPER_LIMIT"),
+    # kind -> (minimum input ports, every .model parameter it may carry)
+    "GAIN": (1, ("GAIN", "IN_OFFSET")),
+    "LIMIT": (1, ("GAIN", "IN_OFFSET", "OUT_LOWER_LIMIT", "OUT_UPPER_LIMIT")),
+    "SUMMER": (2, ("IN_GAIN", "IN_OFFSET", "OUT_GAIN", "OUT_OFFSET")),
+    "MULT": (2, ("IN_GAIN", "IN_OFFSET", "OUT_GAIN", "OUT_OFFSET")),
 }
 
+
 def _parse_xspice(parts, name, lineno):
-    if len(parts) < 4:
+    toks = list(parts[1:])
+    if not toks:
         raise ValueError("line %d: %s needs an input node, an output node and the "
-                         "name of a code model: Aname in out model. An XSPICE block "
-                         "takes TWO nodes (the output is referenced to ground), not "
-                         "the four of an E card" % (lineno, name))
-    if len(parts) > 4:
-        raise ValueError("line %d: %s has trailing %r. An A card is exactly three "
-                         "fields: in out model; every parameter of the block lives "
-                         "in the .model it names"
-                         % (lineno, name, " ".join(parts[4:])))
-    for tok in parts[1:3]:
-        if "=" in tok or tok.startswith("%") or tok.startswith("["):
-            raise ValueError("line %d: %s: %r is not a node. Array connections "
-                             "([1 2 3]) and %%v() references belong to code models "
-                             "with several ports, none of which is solved here"
-                             % (lineno, name, tok))
-    if parts[1] == parts[2]:
-        raise ValueError("line %d: %s has the input and the output on the same node "
-                         "%r, so the block drives its own input"
-                         % (lineno, name, parts[1]))
+                         "name of a code model: Aname in out model" % (lineno, name))
+    if toks[0].startswith("["):
+        # array connection: A1 [1 2 3] out model
+        ins, i, closed = [], 0, False
+        while True:
+            tok = toks[i]
+            if i == 0:
+                tok = tok[1:]
+            if tok.endswith("]"):
+                tok = tok[:-1]
+                closed = True
+            for p in tok.split():
+                if "=" in p or p.startswith("%"):
+                    raise ValueError(
+                        "line %d: %s: %r is not a node. The engine does not accept "
+                        "%%v() references in an array connection (measured: "
+                        "incomplete or empty netlist); write A1 [1 2] out model"
+                        % (lineno, name, p))
+                ins.append(_node(p))
+            if closed:
+                i += 1
+                break
+            i += 1
+            if i >= len(toks):
+                raise ValueError("line %d: %s: the array connection is never closed. "
+                                 "All input nodes go inside ONE pair of square "
+                                 "brackets: A1 [1 2] out model" % (lineno, name))
+        rest = toks[i:]
+    else:
+        if "=" in toks[0] or toks[0].startswith("%"):
+            raise ValueError("line %d: %s: %r is not a node" % (lineno, name, toks[0]))
+        ins = [_node(toks[0])]
+        rest = toks[1:]
+    if not ins:
+        raise ValueError("line %d: %s: the array connection names no input node"
+                         % (lineno, name))
+    if len(rest) != 2:
+        raise ValueError("line %d: %s has %r after its input node(s). An A card is "
+                         "exactly: input node(s), output node, model - every "
+                         "parameter of the block lives in the .model it names"
+                         % (lineno, name, " ".join(rest) or "nothing"))
+    out_node, model = rest[0], rest[1]
+    if "=" in out_node or out_node.startswith("%"):
+        raise ValueError("line %d: %s: %r is not a node" % (lineno, name, out_node))
+    if out_node in ins:
+        raise ValueError("line %d: %s has the output on the same node %r as an "
+                         "input, so the block drives its own input"
+                         % (lineno, name, out_node))
     return {"type": "A", "name": name, "lineno": lineno,
-            "nodes": (_node(parts[1]), _node(parts[2])),
-            "model": parts[3]}
+            "nodes": (ins[0], _node(out_node)),
+            "inputs": tuple(ins), "model": model}
+
 
 def _xspice_model(spec, el):
     """Resolve an A card's .model into numbers, or refuse it by name."""
@@ -1222,31 +1336,85 @@ def _xspice_model(spec, el):
     kind = (m.get("type") or "").upper()
     params = m["params"]
     if kind not in _XSPICE_KEYS:
-        raise ValueError("%s names an XSPICE code model of type %r, and only gain "
-                         "and limit are solved here. Those two are pure algebra "
-                         "(out = gain*(in + in_offset), then optionally clamped); "
-                         "every other analogue code model carries state or a sample "
-                         "clock (integrator, ddt, s_xfer, ...) or several ports "
-                         "(summer, multiplier, ...), which is a different solver. "
-                         "Use engine=\"ngspice\" for those"
+        raise ValueError("%s names an XSPICE code model of type %r, and only gain, "
+                         "limit, summer and mult are solved here. Those four are "
+                         "pure algebra (no state, no sample clock); every other "
+                         "analogue code model carries state or a sample clock "
+                         "(integrator, ddt, s_xfer, ...) or divides and accumulates "
+                         "(divider, ...), which is a different solver. Use "
+                         "engine=\"ngspice\" for those"
                          % (where, kind or "untyped"))
-    allowed = _XSPICE_KEYS[kind]
+    min_ports, allowed = _XSPICE_KEYS[kind]
     for k in params:
         if k not in allowed:
             raise ValueError("%s: %s= in .model %r is refused by name, not ignored. "
                              "limit_range= changes the corner (measured: 0.9 V in "
-                             "with limit_range=0.5 settles at 0.82 V, not 0.9 V) "
-                             "and fraction= changes where the polynomial starts; "
-                             "approximating either would report a number where the "
-                             "caller is asking about that very corner"
-                             % (where, k, name))
+                             "with limit_range=0.5 settles at 0.82 V, not 0.9 V) and "
+                             "fraction= changes where the polynomial starts; "
+                             "approximating either would report a number right where "
+                             "the caller is asking about that corner. A %s block "
+                             "takes %s and nothing else"
+                             % (where, k.lower(), name, kind,
+                                ", ".join(a.lower() + "=" for a in allowed)))
+    inputs = el.get("inputs") or (el["nodes"][0],)
+    n = len(inputs)
+    if n < min_ports:
+        raise ValueError("%s: %s has %d input node(s) and needs at least %d. The "
+                         "engine itself refuses a single-input summer/mult (measured: "
+                         "Error on line 4), so the minimum is not extra caution here"
+                         % (where, name, n, min_ports))
     defaulted = []
-    gain = float(params.get("GAIN", 1.0))
-    if "GAIN" not in params:
-        defaulted.append("gain=1")
-    off = float(params.get("IN_OFFSET", 0.0))
-    if "IN_OFFSET" not in params:
-        defaulted.append("in_offset=0")
+    if kind in ("GAIN", "LIMIT"):
+        gain = params.get("GAIN", 1.0)
+        if isinstance(gain, list):
+            raise ValueError("%s: gain= in .model %r is a single number; the vector "
+                             "parameter of a multi-input block is in_gain="
+                             % (where, name))
+        if "GAIN" not in params:
+            defaulted.append("gain=1")
+        off = params.get("IN_OFFSET", 0.0)
+        if isinstance(off, list):
+            raise ValueError("%s: in_offset= in .model %r is a single number: a "
+                             "%s block has one port" % (where, name, kind))
+        if "IN_OFFSET" not in params:
+            defaulted.append("in_offset=0")
+        in_gain, in_offset = [float(gain)], [float(off)]
+        out_gain, out_off = 1.0, 0.0
+    else:
+        in_gain, in_offset, out_gain, out_off = [], [], 1.0, 0.0
+        for key, dflt in (("IN_GAIN", 1.0), ("IN_OFFSET", 0.0)):
+            vec = params.get(key)
+            if vec is None:
+                defaulted.append("%s=1 (x%d)" % (key.lower(), n)
+                                 if key == "IN_GAIN" else
+                                 "%s=0 (x%d)" % (key.lower(), n))
+                vec = [dflt] * n
+            elif not isinstance(vec, list):
+                raise ValueError("%s: %s= in .model %r is an ARRAY parameter "
+                                 "(measured: the engine answers \"Array parameter "
+                                 "expected - No array delimiter found\" for a scalar). "
+                                 "Write %s=[%s]"
+                                 % (where, key.lower(), name, key.lower(),
+                                    " ".join(repr(float(dflt))[:3] for _ in range(n))))
+            elif len(vec) != n:
+                raise ValueError("%s: %s= in .model %r has %d value(s) for %d input "
+                                 "node(s). The engine refuses that mismatch outright "
+                                 "(measured: Error on line 4), so the lengths are "
+                                 "checked here rather than padded"
+                                 % (where, key.lower(), name, len(vec), n))
+            [in_gain, in_offset][0 if key == "IN_GAIN" else 1].extend(
+                float(x) for x in vec)
+        for key, dflt in (("OUT_GAIN", 1.0), ("OUT_OFFSET", 0.0)):
+            val = params.get(key, dflt)
+            if isinstance(val, list):
+                raise ValueError("%s: %s= in .model %r is a single number"
+                                 % (where, key.lower(), name))
+            if key not in params:
+                defaulted.append("%s=%g" % (key.lower(), dflt))
+            if key == "OUT_GAIN":
+                out_gain = float(val)
+            else:
+                out_off = float(val)
     lo = hi = None
     if kind == "LIMIT":
         for key in ("OUT_LOWER_LIMIT", "OUT_UPPER_LIMIT"):
@@ -1264,24 +1432,46 @@ def _xspice_model(spec, el):
             raise ValueError("%s: .model %r has out_lower_limit=%g above "
                              "out_upper_limit=%g" % (where, name, lo, hi))
     el["kind"] = kind
-    el["gain"] = gain
-    el["in_offset"] = off
+    el["in_gain"] = in_gain
+    el["in_offset"] = in_offset
+    el["out_gain"] = out_gain
+    el["out_offset"] = out_off
     el["lo"] = lo
     el["hi"] = hi
     el["defaulted"] = defaulted
 
-def _xspice_eval(el, vin):
-    """(f(vin), df/dvin). The clamp is examined at the CURRENT iterate, which is
-    what makes a clipped block Newton-convergent: inside the band the slope is the
-    gain, outside it the output is a constant and the slope is 0."""
-    raw = el["gain"] * (vin + el["in_offset"])
-    if el["lo"] is None:
-        return raw, el["gain"]
-    if raw < el["lo"]:
-        return el["lo"], 0.0
-    if raw > el["hi"]:
-        return el["hi"], 0.0
-    return raw, el["gain"]
+
+def _xspice_eval(el, vins):
+    """(f(vins), [df/dv_i]) at the CURRENT iterate.
+
+    The clamp is examined at the current iterate, which is what makes a clipped
+    block Newton-convergent: inside the band the slope is the gain, outside it the
+    output is a constant and every slope is 0. A mult block is bilinear, so its
+    rows are the true partials and Newton reduces to a couple of steps.
+    """
+    shifted = [el["in_gain"][i] * (vins[i] + el["in_offset"][i])
+               for i in range(len(vins))]
+    if el["kind"] == "MULT":
+        raw = el["out_gain"]
+        for s_ in shifted:
+            raw *= s_
+        raw += el["out_offset"]
+        slopes = []
+        for i in range(len(vins)):
+            p = el["out_gain"] * el["in_gain"][i]
+            for j, s_ in enumerate(shifted):
+                if j != i:
+                    p *= s_
+            slopes.append(p)
+        return raw, slopes
+    raw = el["out_offset"] + el["out_gain"] * sum(shifted)
+    if el["lo"] is not None:
+        if raw < el["lo"]:
+            return el["lo"], [0.0] * len(vins)
+        if raw > el["hi"]:
+            return el["hi"], [0.0] * len(vins)
+    return raw, [el["out_gain"] * g for g in el["in_gain"]]
+
 
 def _parse_element(spec, line, lineno):
     parts = line.split()
@@ -2150,13 +2340,15 @@ class _Circuit(object):
         # node table
         nodes = []
         for el in self.elements:
-            for n in list(el["nodes"]) + list(el.get("ctrl") or ()):
+            for n in (list(el["nodes"]) + list(el.get("inputs") or ())
+                      + list(el.get("ctrl") or ())):
                 if n is not None and n not in nodes:
                     nodes.append(n)
         self.node_list = nodes
         self.has_ground = any(
             n is None for el in self.elements
-            for n in list(el["nodes"]) + list(el.get("ctrl") or ()))
+            for n in (list(el["nodes"]) + list(el.get("inputs") or ())
+                      + list(el.get("ctrl") or ())))
         self.node_idx = {n: i + 1 for i, n in enumerate(nodes)}
         for el in self.elements:
             for dep in el.get("deps") or ():
@@ -2279,7 +2471,7 @@ class _Circuit(object):
         # are not the caller's nodes (the O/U card is, with its section count).
         ext, inn = set(), set()
         for el in self.elements:
-            for n in el["nodes"]:
+            for n in list(el["nodes"]) + list(el.get("inputs") or ()):
                 if n is None:
                     continue
                 (inn if el.get("_internal") else ext).add(n)
@@ -2302,6 +2494,10 @@ class _Circuit(object):
         # add damping to a circuit that solves exactly in one step
         return not any(el["type"] in ("D", "Q", "M", "J", "S", "W")
                        or (el["type"] in ("BV", "BI") and el["deps"])
+                       # a mult block is bilinear: its small-signal gain is the
+                       # other input's value, so it is not one-step solvable and
+                       # wants the voltage limiter that is_linear() switches off
+                       or (el["type"] == "A" and el.get("kind") == "MULT")
                        for el in self.elements)
 
     def i(self, name):
@@ -2726,32 +2922,38 @@ class _Circuit(object):
                 self._add(A, a, row, 1.0)
                 self._add(A, bb, row, -1.0)
             elif T == "A":
-                # out = f(in) with the output referenced to ground, so the row is
-                # v(out) - f(v(in)) = 0 and needs its own branch current like V/E.
-                # The clamp is linearised at the previous iterate: inside the band
-                # the slope is the gain, outside it the output is constant (slope
-                # 0) - a piecewise-linear device, so Newton lands in one or two
-                # steps and a solved answer that sits on a bound is a real answer,
-                # not a stalled iterate.
+                # out = f(inputs) with the output referenced to ground, so the row
+                # is v(out) - f(...) = 0 and needs its own branch current like V/E.
+                # Every input voltage enters the row with -df/dv_i, linearised at
+                # the previous iterate: a clamp is piecewise linear (slope gain
+                # inside the band, 0 outside) and a mult is bilinear (the true
+                # partials), so Newton lands in one or two steps and an answer that
+                # sits on a bound is a real answer, not a stalled iterate.
                 row = self.branch_idx[el["name"]]
-                na_, nb_ = self.i(na), self.i(nb)
+                nb_ = self.i(nb)
+                ins_ = [self.i(n) for n in el["inputs"]]
                 if mode == "ac":
-                    if el["kind"] == "LIMIT":
+                    if el["kind"] in ("LIMIT", "MULT"):
                         raise ValueError(
-                            "%s: a limit block in an .ac sweep. The small-signal gain "
-                            "of a clipped block is the gain inside the band and zero "
-                            "outside it, i.e. it depends on where the operating point "
+                            "%s: a %s block in an .ac sweep. The small-signal gain of "
+                            "a clipped block is the gain inside the band and zero "
+                            "outside it, and a mult block's gain is the other input's "
+                            "value, i.e. both depend on where the operating point "
                             "sits, and this module does not carry an operating point "
-                            "into the sweep. Run .dc/.tran, or use a gain() model"
-                            % el["name"])
+                            "into the sweep. Run .dc/.tran, or use a gain()/summer() "
+                            "model" % (el["name"], el["kind"].lower()))
                     self._add(A, row, nb_, 1.0)
-                    self._add(A, row, na_, -el["gain"])
+                    for k_, n_in in enumerate(ins_):
+                        self._add(A, row, n_in, -el["out_gain"] * el["in_gain"][k_])
                 else:
-                    vin0 = x_prev[na_ - 1].real if na_ else 0.0
-                    f0, slope = _xspice_eval(el, vin0)
+                    vins0 = [x_prev[n - 1].real if n else 0.0 for n in ins_]
+                    f0, slopes = _xspice_eval(el, vins0)
                     self._add(A, row, nb_, 1.0)
-                    self._add(A, row, na_, -slope)
-                    self._rhs(b, row, f0 - slope * vin0)
+                    rhs0 = f0
+                    for k_, n_in in enumerate(ins_):
+                        self._add(A, row, n_in, -slopes[k_])
+                        rhs0 -= slopes[k_] * vins0[k_]
+                    self._rhs(b, row, rhs0)
                 self._add(A, nb_, row, 1.0)
             elif T == "G":
                 cp, cm = self.i(el["ctrl"][0]), self.i(el["ctrl"][1])
@@ -3269,10 +3471,12 @@ def _element_report(circ, x, t=None, mode="dc"):
             # an A card's own report is the block, not a two-terminal voltage:
             # v(nodes[0]) - v(nodes[1]) would be in - out, which is not a quantity
             # anyone wants. Give the input, the output and which region it landed in.
-            vin_ = vv(na).real
+            ins_ = list(el["inputs"])
+            vins_ = [vv(n).real for n in ins_]
+            vin_ = vins_[0]
             vout_ = vv(nb).real
             cur_ = x[circ.branch_idx[el["name"]] - 1].real
-            raw_ = el["gain"] * (vin_ + el["in_offset"])
+            raw_ = _xspice_eval(el, vins_)[0]
             if el["lo"] is None:
                 region = "linear"
             elif raw_ < el["lo"]:
@@ -3282,12 +3486,24 @@ def _element_report(circ, x, t=None, mode="dc"):
             else:
                 region = "linear"
             rec = {"name": el["name"], "type": "A", "model": el["model"],
-                   "kind": el["kind"], "input_v": round(vin_, 12),
-                   "output_v": round(vout_, 12), "voltage_v": round(vout_, 12),
+                   "kind": el["kind"], "output_v": round(vout_, 12),
+                   "voltage_v": round(vout_, 12),
                    "current_a": round(cur_, 12),
                    "power_w": round(vout_ * cur_, 12),
-                   "gain": el["gain"], "in_offset": el["in_offset"],
                    "region": region}
+            if len(ins_) == 1:
+                # a one-port block is exactly the 0.0.39 shape: in, out, gain,
+                # offset - the multi-port fields would only be noise here
+                rec["input_v"] = round(vin_, 12)
+                rec["gain"] = el["in_gain"][0]
+                rec["in_offset"] = el["in_offset"][0]
+            else:
+                rec["inputs"] = ins_
+                rec["input_vs"] = [round(v_, 12) for v_ in vins_]
+                rec["in_gain"] = list(el["in_gain"])
+                rec["in_offset"] = list(el["in_offset"])
+                rec["out_gain"] = el["out_gain"]
+                rec["out_offset"] = el["out_offset"]
             if el["lo"] is not None:
                 rec["out_lower_limit"] = el["lo"]
                 rec["out_upper_limit"] = el["hi"]
@@ -3514,12 +3730,13 @@ NOT_COMPUTED = [
     "accepted inside .model parameters",
     "a .subckt nested inside another .subckt, and any directive other than "
     ".model inside a .subckt body",
-    "only two XSPICE code models are solved: gain and limit, and only their "
-    "algebra (out = gain*(in + in_offset), optionally clamped to the two bounds). "
-    "Every other analogue code model carries state or a sample clock (integrator, "
-    "ddt, s_xfer) or several ports (summer, multiplier), and is refused by name "
-    "rather than approximated; a limit block is also refused inside .ac, because "
-    "its small-signal gain depends on which region the operating point sits in. "
+    "only four XSPICE code models are solved: gain, limit, summer and mult, and "
+    "only their algebra (out = out_offset + out_gain * SUM_i or PROD_i of "
+    "in_gain_i*(v_i + in_offset_i), optionally clamped to the two bounds). Every "
+    "other analogue code model carries state or a sample clock (integrator, ddt, "
+    "s_xfer) or divides and accumulates (divider), and is refused by name rather "
+    "than approximated; a limit or mult block is also refused inside .ac, because "
+    "its small-signal gain depends on where the operating point sits. "
     "JFETs (J), switches (S/W), controlled "
     "sources (F/H) and mutual inductance (K) ARE solved, but not their second-order "
     "physics: a JFET has no gate-channel junction diode (the report says when a "
@@ -4199,6 +4416,20 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
             "no V/I source carries an AC specification, so nothing drives the .ac "
             "sweep and every node reads 0 (this is SPICE's own rule: write "
             "'V1 1 0 AC 1' - the bare 'V1 1 0 3' is a DC value only)")
+    # A clipped block's small-signal gain is the gain inside the band and zero
+    # outside it, and a mult block's is the OTHER input's value: both are decided
+    # by where the operating point sits, and the sweep does not carry one into the
+    # matrix (assemble() would raise). Said here instead, as an envelope, so a
+    # caller sees a refusal rather than a traceback.
+    for el in circ.elements:
+        if el["type"] == "A" and el.get("kind") in ("LIMIT", "MULT"):
+            return err(
+                "%s: a %s block in an .ac sweep. Its small-signal gain depends on "
+                "where the operating point sits, and this sweep does not carry the "
+                "bias into the matrix. Run .dc/.tran, or use a gain()/summer() model"
+                % (el["name"], el["kind"].lower()), "NETLIST_INVALID",
+                hint="summer() is linear, so it IS swept; gain() is a constant. Only "
+                     "the two models whose gain moves with the bias are refused")
     x0, iters, why = _dc(circ)
     if x0 is None:
         bad = _expression_failure(why)

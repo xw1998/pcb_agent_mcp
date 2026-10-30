@@ -16,7 +16,7 @@ KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对
 | **Fidelity** | 把整份板文件**转换**成 AI 可读的表达：每个节点都进树，事实从树里读，往返由 KiCad 自己验证 | 已实现（KiCad 侧已被 kicad-cli 判决） |
 | **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（KiCad 侧：13 块真实板与 DRC 对账、412 个 pad 与 `pcbnew` 逐点对账；立创侧：194 个真实归档实测） |
 | **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积 / 单网 IR drop） | 已实现 |
-| **Sim** | 无板子的物理计算：SPICE 子集（DC/瞬态/AC）、铜阻与 PDN、热阻与 2-D 板温度、薄板模态与振动响应、平面谐振、电热耦合（单集中 Rth） | 已实现（子集，未实现项逐条点名拒绝（`0.0.37` 起 `A` 卡由随包 ngspice 承担；`0.0.39` 起 `gain`/`limit` 两种代数 code model 由内置自己解） |
+| **Sim** | 无板子的物理计算：SPICE 子集（DC/瞬态/AC）、铜阻与 PDN、热阻与 2-D 板温度、薄板模态与振动响应、平面谐振、电热耦合（单集中 Rth） | 已实现（子集，未实现项逐条点名拒绝（`0.0.37` 起 `A` 卡由随包 ngspice 承担；`0.0.39` 起 `gain`/`limit`、`0.0.40` 起多端口的 `summer`/`mult` 这四种代数 code model 由内置自己解） |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
 | **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 六道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 实测口径＝原地重写一个成员） |
 | **Route** | `board_route`：A* 布线（双栅格 + 精确多边形判决 + 事务化 + 按位置 rip-up），规则只从板/工程/调用方取，取不到就拒绝 | 已实现（50 网真板 baseline 27/50 → sweep+rip 38/50、端到端 apply 后 kicad-cli DRC 0 新增阻断项、12 网提速 5.5×；`0.0.15` 起爬电/差分对间距/等长进搜索，`0.0.16` 起回流/阻抗目标/拥塞协商也进了（协商默认关，一块板 +3 网 / +61% 时间），`0.0.17` 铺铜重填与多端网拓扑，`0.0.18` 起布不通要报**挡路的是谁**（`board_blockers`）与**哪些球埋着**（`board_fanout`）；仍然四邻 + 4×45°、不拆已接受的扇出、拓扑默认 mst 且不是精确 RSMT） |
@@ -58,7 +58,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 | **原理图**：KiCad 单页 22 op + 多页 4 个 sheet op | `0.0.1` / `0.0.33` | 裁判换成 KiCad 自己的网表 + ERC 双向 diff；页号按**工程全局**分配 | 不做跨多文件原子写、页面模板、搬文件、批量重命名 |
 | **布线器**：A* + 精确多边形判决 + 事务化 + 按位置 rip-up | `0.0.14`~`0.0.17` | 50 网真板 27/50 → 38/50（开协商 41/50）；端到端 apply 后 `kicad-cli DRC` 新增阻断项 = 0 | 四邻 + 4×45°、不拆已接受扇出、拓扑非精确 RSMT、拥塞协商默认关 |
 | **制造输出与同步**：Gerber/Excellon/STEP/PDF/BOM/网表 + 原理图↔板差集 | `0.0.18` | 产物**重新读一遍**验终止符/工具表/行数/ISO-10303-21；`out_dir` 落在源目录里直接拒 | 只外包 `kicad-cli`，不重写 writer；`schematic_pcb_sync` 一个字节都不写 |
-| **仿真（内置 SPICE）** | `0.0.7` 起，`0.0.27`~`0.0.39` 逐类长出来 | 器件 `R C L V I E G F H K D Q M B S W J` + `X`/`T`/`O`/`U` + `.noise` + `A` 的 `gain`/`limit`，每类都有对账（例：1 kΩ 读 `4.071372237e-09 = sqrt(4kT·1000)`） | 后向欧拉；无自热、无失真/傅里叶、无器件电容随温度；`A` 不进内置 |
+| **仿真（内置 SPICE）** | `0.0.7` 起，`0.0.27`~`0.0.39` 逐类长出来 | 器件 `R C L V I E G F H K D Q M B S W J` + `X`/`T`/`O`/`U` + `.noise` + `A` 的 `gain`/`limit`/`summer`/`mult`，每类都有对账（例：1 kΩ 读 `4.071372237e-09 = sqrt(4kT·1000)`） | 后向欧拉；无自热、无失真/傅里叶、无器件电容随温度；`A` 里只有四种纯代数 code model 进内置 |
 | **仿真（外部引擎 + 随包）** | `0.0.7` → `0.0.37` 随包 | 真 ngspice-47 逐节点对账（分压 5e-9 V）；随包副本与系统副本六类 deck 差 0 ~ 1 ulp | 只 Windows x86_64；`engine="auto"` **刻意不看随包**；不做 DLL 进程内 |
 | **热 / PDN / 振动 / 平面 / 电热** | `0.0.5`~`0.0.6`、`0.0.10` | 2-D 板温度 `73.393487 ℃` 对闭式 `73.39345`；Ritz 模态 SSSS 330.385 Hz、CCCC 602.382 Hz 与解析解吻合 | 1-D/2-D 稳态、薄板单模态、平面只有模频、电热单集中 `Rth` |
 | **DFM / 规则 / 流程工具** | `0.0.4`、`0.0.12` | 11 条规则目录 + 五态判定；22 条布局 + 14 条原理图规则，缺事实即 `undetermined` | 没有内置板厂表，也没有内置安规默认值 |
@@ -89,7 +89,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 | websocket 网关 `lceda_api_probe` | 端口扫描 + 握手，本机 49620-49629 全部 `no_listener` | 同上 |
 | `app_open_project` 的 argv 形式 | 只回 `unconfirmed`；开工程请用 `lceda_pro_open` | 无法确认 `lceda-pro.exe <工程>` 真的会打开 |
 | `set_pad_net` 的「应用也这么写」 | `verified_by_app:false` | 从未观察到应用自己写那一行 `PAD_NET` |
-| `A` 卡的其余 code model（有状态 / 多端口 / 数组连接） | `builtin` 按名字拒绝并点名（`integrator`、`summer`…） | 那部分是第二套器件描述语言（状态、采样时钟、`%v()`/`[1 2 3]` 端口数组），`gain`/`limit` 的代数已在 `0.0.39` 进内置 |
+| `A` 卡的其余 code model（有状态 / 采样时钟 / 除法类） | `builtin` 按名字拒绝并点名（`integrator`、`divider`…） | 那部分是第二套器件描述语言（状态、采样时钟）；纯代数的四种（`gain`/`limit`/`summer`/`mult`）已在 `0.0.39`/`0.0.40` 进内置，`%v()` 端口写法仍拒（引擎也不收） |
 | 88.7 MB 级大板的 DRC | 超时 900 s 即报错，**不降级** | jetson 板实测 823 s / 2543.8 s 都没出报告 |
 
 #### B3 ｜做了但打折（能判断方向，不能拿去签核）
@@ -107,9 +107,9 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.38
-python run_server.py --selftest         # 141/141
-python -m unittest discover -s tests    # 1990 例（约 13 分钟）
+python run_server.py --version          # 0.0.40
+python run_server.py --selftest         # 144/144
+python -m unittest discover -s tests    # 2002 例（实测 760 s，约 13 分钟）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -343,9 +343,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.38
-python run_server.py --selftest      # 协议级自检，141/141（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问）
-python -m unittest discover -s tests # 1990 个用例（约 13 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.40
+python run_server.py --selftest      # 协议级自检，144/144（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问）
+python -m unittest discover -s tests # 2002 个用例（实测 760 s，约 13 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 

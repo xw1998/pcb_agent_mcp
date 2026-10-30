@@ -9,6 +9,63 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.40] - 2026-10-30
+
+`A` 卡里**多端口但仍然只是代数表达式**的两种搬进内置求解器：`summer`（加权和）与 `mult`（加权积）。
+`0.0.39` 只覆盖单端口的 `gain`/`limit`，这一版把「端口多」这件事从「第二套器件描述语言」里摘出来——
+它们没有状态、没有采样时钟，方程仍是纯代数。
+
+### 为什么是这两种
+
+    summer:  out = out_offset + out_gain * SUM_i  in_gain_i * (v_i + in_offset_i)
+    mult:    out = out_offset + out_gain * PROD_i in_gain_i * (v_i + in_offset_i)
+
+`integrator`/`ddt`/`s_xfer`（带状态与采样时钟）与 `divider` 仍然按名字拒绝。
+
+### 实测锚点（先量后写）
+
+`summer()` 两端口 3 V+4 V ⇒ **7.0 V**；`in_gain=[2 3]` ⇒ **18.0 V**；
+`in_offset=[1 1]` ⇒ **23.0 V**；再 `out_gain=2 out_offset=7` ⇒ **53.0 V**。
+`mult()` 两端口 ⇒ **12.0 V**；三端口 ⇒ **60.0 V**；`in_offset=[0 0 2]` 三端口 ⇒ **84.0 V**；
+四参数全给 ⇒ **247.0 V**。
+
+### 五条只有量过才知道的语法事实
+
+1. **模型名是 `mult`，不是 `multiplier`**（后者引擎答 `no simulations run!`）。
+2. **多端口参数是向量 `in_gain`/`in_offset`，不是标量 `gain`**：`summer(gain=[2 3])` 被引擎
+   `ignored` 后**静默回退成 `in_gain=1`**，3 V+4 V 读 7.0 V 而不是 18.0 V。一个「成功」的读数掩盖了
+   参数没生效 ⇒ 内置对未知参数**直接拒绝并点名**。
+3. **向量长度必须恰好等于端口数**（2 端口给 3 个值 ⇒ 引擎 `Error on line 4`；内置报
+   `3 value(s) for 2 input node(s)`），不补齐。
+4. **标量给向量参数一律拒**（引擎自己是 `MIF-ERROR - Array parameter expected`）。
+5. **单端口的 `summer`/`mult` 被引擎拒**（`A1 1 10 m1` 与 `A1 [1] 10 m1` 都错）⇒ 最少 2 端口。
+
+数组连接写法 `A1 [1 2] 10 m1` 自本版起可解析；`%v(1) %v(2)` 引擎本身也不收，内置继续拒绝。
+
+### 内部形态
+
+仍是「代数表达式驱动的电压源」，右端从一元变多元：`v(out) - f(v_1 … v_n) = 0`，Jacobian 第 k 列
+`-df/dv_k`。`summer` 偏导是常数（一步 Newton）；`mult` 用**真偏导**（双线性，一两步收敛）并进
+`is_linear()` 的非线性判定。`.ac` 下 `limit`/`mult` 拒绝、`summer`/`gain` 放行——乘积块的小信号增益
+依赖工作点。元素字段改成 `in_gain`/`in_offset` 列表 + `out_gain`/`out_offset` 标量（旧的标量
+`el["gain"]` 不再存在），节点表把所有 `inputs` 算进外部节点，子电路实例化时跟着改名映射。
+
+### 判据
+
+- `tests/test_spice_bundled.py` 新增 9 例：正 3 例（53 V / 247 V / 三端口 60 V 与 84 V，且
+  `kind` 与 `in_gain` 都对），负 6 例（`gain=[]` 写法、向量长度、标量给向量、单端口、`%v()`、
+  `.ac` 遇 `mult`），对拍 1 例（两个 deck 的 `max_abs_diff_v` 都是 **0.0**）。
+- selftest 160/161/162（summer 53 V、mult 247 V、长度不符 `NETLIST_INVALID`）；id 158 文案同步成
+  四种模型。`--selftest` **144/144**（原 141）。
+- `.ac` 遇 `mult` 改走 `NETLIST_INVALID` 信封并带 `hint`（原先 `assemble()` 里的 `ValueError` 会
+  直接穿过 `simulate()`），raise 保留作 backstop。
+
+### 文档
+
+`docs/43` 新增 §43.11（实测表 + 五条语法事实 + 内部形态 + 判据清单）；`docs/17` §17.11 第三条收窄
+（`netlist_parsed:false` 只剩有状态 code model 与 `%v()` 写法，`[1 2 3]` 自本版起可解析）；README
+层表 Sim 行、A 段仿真行、B2 行与两处自查块同步；`tools.py` 的 `sim_spice` 自述。
+
 ## [0.0.39] - 2026-10-30
 
 `A` 卡（XSPICE 代码模型）里**纯代数**的两种搬进内置求解器：`gain` 与 `limit`。剩下的仍按名字拒绝。

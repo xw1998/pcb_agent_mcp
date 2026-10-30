@@ -235,3 +235,91 @@ env -u PYTHONHOME PYTHONPATH=src python -m unittest tests.test_spice_bundled -v
 `test_limit_range_is_refused_rather_than_clamped` / `test_cross_check_now_really_compares_this_deck`，
 selftest 157/158/159。负控制是后两条：**有状态的 code model 与会动拐点的参数仍然按名字拒绝**，
 所以「内置现在能跑 `A` 了」不等于「内置把不认识的卡当没写」。
+
+## 43.11 `0.0.40`：多端口但仍是纯代数的两种（`summer` / `mult`）
+
+`0.0.39` 的内置只覆盖**单端口**的 `gain`/`limit`。剩下的 `A` 卡分两类：一类有状态或带采样时钟
+（`integrator`、`ddt`、`s_xfer`、`divider`），另一类是**多端口但仍然只是代数表达式**——`summer`
+（加权和）与 `mult`（加权积）。后者没有任何状态，只是端口数多了，`0.0.40` 把它们搬进内置。
+
+### 实测（先量后写，随包 `ngspice-47`）
+
+四次探测就把语义钉住了，全部用 `-b` 批处理跑 `.tran 1u 5u` + `.print tran v(out)`：
+
+| deck | 读数 |
+| --- | --- |
+| `A1 [1 2] 10 m1` + `.model m1 summer()`，`V(1)=3 V`、`V(2)=4 V` | **7.0 V** |
+| `summer(in_gain=[2 3])` | **18.0 V** |
+| `summer(in_gain=[2 3] in_offset=[1 1])` | **23.0 V** |
+| 再加 `out_gain=2 out_offset=7` | **53.0 V** |
+| `mult()`，两输入 3 V / 4 V | **12.0 V** |
+| `mult()`，三输入 3 / 4 / 5 V | **60.0 V** |
+| `mult(in_offset=[0 0 2])`，三端口 | **84.0 V**（3·4·(5+2)） |
+| `mult(in_gain=[2 3] in_offset=[1 1] out_gain=2 out_offset=7)` | **247.0 V**（2·(2·2)·(3·2)+7） |
+
+于是表达式是：
+
+    summer:  out = out_offset + out_gain * Σ_i  in_gain_i * (v_i + in_offset_i)
+    mult:    out = out_offset + out_gain * Π_i  in_gain_i * (v_i + in_offset_i)
+
+`gain`/`limit` 是 `out_gain=1`、只有一个端口时的特例，所以两种写法在公式层是同一条式子——
+但**语法层不是**，见下面五条。
+
+### 五条先量后写才发现的语法事实
+
+1. **模型名是 `mult`，不是 `multiplier`**。写 `multiplier(...)` 引擎答 `no simulations run!`
+   （模型不存在）。直觉名在这里错得很安静。
+2. **多端口参数是向量，不是标量 `gain`**。`summer(gain=[2 3])` 看起来最自然，引擎答
+   `MIF: unrecognized parameter (gain) - ignored` 然后**静默回退到 `in_gain=1`**：3 V + 4 V 读
+   7.0 V 而不是 18.0 V。这是本轮最危险的一条——一个「成功」的读数（7 V 是个合法电压）掩盖了
+   参数根本没生效。所以内置对未知参数**直接拒绝并点名**正确的名字。
+3. **向量长度必须恰好等于端口数**。2 端口给 `in_gain=[2 3 4]` 被引擎拒成 `Error on line 4`；
+   内置报 `NETLIST_INVALID` 且消息含 `3 value(s) for 2 input node(s)`。不补齐——补齐等于发明答案。
+4. **标量给向量参数一律拒**。`in_gain=2` 对多端口模型不算「广播」，引擎自己答
+   `MIF-ERROR - Array parameter expected - No array delimiter found`。
+5. **单端口的 `summer`/`mult` 被引擎拒**。`A1 1 10 m1` 与 `A1 [1] 10 m1` 两种写法都是错的，
+   这两个模型最少 2 个端口；1 端口想要加权就去用 `gain`。
+
+数组连接写法是 `A1 [1 2] 10 m1`（方括号里空格分隔、跨 token 收集）。`%v(1) %v(2)` 写法
+**引擎本身也不接受**（`incomplete or empty netlist`），所以内置继续拒绝，理由与引擎一致。
+
+### 内部形态
+
+仍然是「代数表达式驱动的电压源」，只是方程的右端从一元变成多元：
+
+    v(out) - f(v_1 … v_n) = 0        Jacobian 第 k 列 = -df/dv_k
+
+- `summer` 的偏导是常数 `out_gain * in_gain_k`（线性，Newton 一步）；
+- `mult` 的偏导是**真偏导**（双线性 ⇒ 每一步残差对某个输入是线性的），Newton 一两步收敛，
+  不需要阻尼。
+- `mult` 因此进 `is_linear()` 的非线性判定（要电压限幅），`summer`/`gain` 不进。
+- `.ac` 下 `limit`/`mult` 拒绝、`summer`/`gain` 放行：乘积块的**小信号增益依赖工作点**
+  （`df/dv_k = out_gain * in_gain_k * Π_{j≠k}`），而这套求解器不带工作点进扫频。拒绝走的是
+  `NETLIST_INVALID` 信封（带 `hint` 指向 `summer`/`gain`），**不是**让 `ValueError` 穿过
+  `simulate()`——这条是 `0.0.40` 里唯一一处「先写了 raise、再补信封」的返工。
+
+元素内部字段（`el["in_gain"]`/`el["in_offset"]` 是 list，`el["out_gain"]`/`el["out_offset"]`
+是标量，旧的标量 `el["gain"]` **已不存在**）与节点表（外部节点要含所有 `inputs`）一起改了，
+子电路实例化时把 `inputs` 跟着改名映射。
+
+### 判据与负控制
+
+`tests/test_spice_bundled.py` 新增 9 例（`TestLookupRules` 8 例 + `TestBundledEngineRuns` 1 例）：
+
+- 正：`test_builtin_solves_a_multi_port_summer`（53 V 且 `kind == "SUMMER"`、`in_gain == [2,3]`）、
+  `test_builtin_solves_a_bilinear_multiplier`（247 V）、
+  `test_a_three_port_multiplier_is_a_product_of_three`（60 V 与 84 V）；
+- 负：`test_the_multi_port_models_take_vectors_not_the_scalar_gain`（`gain=[2 3]` 必须拒且点名
+  `in_gain`——防的正是上面第 2 条的静默回退）、
+  `test_a_vector_length_must_match_the_port_count`、`test_a_scalar_where_a_vector_is_required_is_refused`、
+  `test_a_single_input_multi_port_block_is_refused`、`test_a_percent_v_array_connection_is_still_refused`、
+  `test_a_mult_block_is_refused_in_ac_like_limit`；
+- 对拍：`test_cross_check_agrees_exactly_on_the_multi_port_blocks` 两 deck 的 `max_abs_diff_v`
+  都是 **0.0**（内置与引擎解的是同一条式子，中间没有近似）。
+
+selftest 侧是 id 160（summer 53 V）、161（mult 247 V）、162（`in_gain=[2 3 4]` 长度不符 →
+`NETLIST_INVALID` 且消息含 `3 value(s) for 2 input node(s)`）；id 158 的文案同步成四种模型。
+`--selftest` 实测 **144/144**。
+
+仍然按名字拒绝的：有状态/带时钟/除法类的 code model，以及 `%v()` 端口写法。理由没变——
+「跳过一张不认识的卡然后给出一个数字」正是这个模块一直在防的事。

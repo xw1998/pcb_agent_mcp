@@ -1031,11 +1031,12 @@ def selftest():
         payload = json.loads(r["result"]["content"][0]["text"])
         _m = payload.get("message") or ""
         check("a code model that carries STATE is still refused by name, and the "
-              "refusal says which two models this solver does have (integrator is "
-              "not silently turned into a wire)",
+              "refusal says which four models this solver does have (integrator "
+              "is not silently turned into a wire)",
               payload.get("status") == "error"
               and payload.get("reason_code") == "NETLIST_INVALID"
-              and "INTEGRATOR" in _m and "only gain and limit" in _m,
+              and "INTEGRATOR" in _m
+              and "only gain, limit, summer and mult" in _m,
               _m[:80])
 
         r = handle({"jsonrpc": "2.0", "id": 159, "method": "tools/call",
@@ -1052,6 +1053,66 @@ def selftest():
               "report a number exactly where the caller is asking about the corner",
               payload.get("status") == "error" and "limit_range" in _m,
               _m[:80])
+
+        # 0.0.40: the MULTI-PORT algebraic models. Two input nodes come in as an
+        # array connection on the card and as VECTORS in the .model; the builtin
+        # must land on the same 53 V the bundled engine reads (2*(3+1)+3*(4+1),
+        # then *2 + 7), and it must say which nodes it summed.
+        _SUMMER = ("* summer\nV1 1 0 3\nV2 2 0 4\nA1 [1 2] 10 s1\n"
+                   ".model s1 summer(in_gain=[2 3] in_offset=[1 1] "
+                   "out_gain=2 out_offset=7)\nR1 10 0 1k\n.op\n")
+        _MULT = ("* mult\nV1 1 0 3\nV2 2 0 4\nA1 [1 2] 10 m1\n"
+                 ".model m1 mult(in_gain=[2 3] in_offset=[1 1] "
+                 "out_gain=2 out_offset=7)\nR1 10 0 1k\n.op\n")
+        r = handle({"jsonrpc": "2.0", "id": 160, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": _SUMMER, "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = (payload.get("value") or {}).get("nodes_v") or {}
+        _a = [e for e in ((payload.get("value") or {}).get("elements") or [])
+              if e.get("type") == "A"]
+        check("0.0.40: the builtin SUMS a multi-port block itself - summer with "
+              "in_gain=[2 3] in_offset=[1 1] out_gain=2 out_offset=7 on 3 V,4 V "
+              "reads 53 V, the same number the bundled engine reads",
+              payload.get("status") == "ok" and abs(_v.get("10", 0.0) - 53.0) < 1e-9
+              and len(_a) == 1 and _a[0].get("kind") == "SUMMER"
+              and _a[0].get("in_gain") == [2.0, 3.0]
+              and _a[0].get("inputs") == ["1", "2"],
+              str(_v) + str(_a)[:160])
+
+        # ... and a PRODUCT is not a sum: same shape, 247 V. The pair is the
+        # control for each other, since either formula summing would leave the
+        # other's assertion standing.
+        r = handle({"jsonrpc": "2.0", "id": 161, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": _MULT, "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = (payload.get("value") or {}).get("nodes_v") or {}
+        _a = [e for e in ((payload.get("value") or {}).get("elements") or [])
+              if e.get("type") == "A"]
+        check("0.0.40: mult MULTIPLIES the same two ports - 2*(3+1) * 3*(4+1) * 2 "
+              "+ 7 = 247 V, so the two multi-port models are not one code path",
+              payload.get("status") == "ok" and abs(_v.get("10", 0.0) - 247.0) < 1e-9
+              and len(_a) == 1 and _a[0].get("kind") == "MULT",
+              str(_v) + str(_a)[:160])
+
+        # the refusal that has to survive: a vector whose length does not match
+        # the port count is an engine error, so it must not be padded here.
+        r = handle({"jsonrpc": "2.0", "id": 162, "method": "tools/call",
+                    "params": {"name": "sim_spice", "arguments": {
+                        "netlist": "* s\nV1 1 0 3\nV2 2 0 4\nA1 [1 2] 10 s1\n"
+                                   ".model s1 summer(in_gain=[2 3 4])\n"
+                                   "R1 10 0 1k\n.op\n",
+                        "engine": "builtin"}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _m = payload.get("message") or ""
+        check("a vector parameter whose length does not match the port count is "
+              "refused, not padded or truncated (the engine refuses that deck "
+              "outright), so no made-up port count reaches the answer",
+              payload.get("status") == "error"
+              and payload.get("reason_code") == "NETLIST_INVALID"
+              and "3 value(s) for 2 input node(s)" in _m,
+              _m[:90])
 
         # 0.0.30: the lossless line in the builtin. DC is a wire, so the matched
         # 3 V / 50 ohm divider must read 1.500 V at BOTH ports and +/-30 mA.
