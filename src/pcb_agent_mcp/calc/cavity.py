@@ -21,8 +21,11 @@ What it is NOT (and says so on every return):
     this geometry has the clean answer Qc = h/delta_s, independent of mode and
     of plane size) and dielectric loss (Qd = 1/tan_delta), plus an optional
     first-order surface-roughness correction on Rs. What it still does not
-    carry: radiation Q, the foil profile / Huray nodule model, and the fact
-    that a real plane pair's Q is dominated by whatever is soldered across it. So there is no
+    carry: radiation Q and the Huray nodule model (both are in `planar.py`, as
+    `plane_radiation_q` / `roughness_huray`; this module was left bit-for-bit
+    alone so that existing answers did not move), the foil profile, and the
+    fact that a real plane pair's Q is dominated by whatever is soldered
+    across it. So there is no
     "is this a problem" verdict anywhere - a resonance needs an excitation and a
     coupling to matter, and neither is in this module.
   * no via barrel inductance, no antipad capacitance, no plane-pair impedance
@@ -502,13 +505,15 @@ def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA,
         out["dielectric_not_included"] = (
             "no tan_delta was supplied, so q_total is the conductor limit only. "
             "For FR4-class prepreg tan_delta is ~0.02, i.e. Qd = 50, which is "
-            "LOWER than Qc in a normal stackup - the omission is not conservative.")
+            "LOWER than Qc in a normal stackup - the omission is not conservative. "
+                    "Radiation Q is a separate function (planar.plane_radiation_q).")
     else:
         out["which_dominates"] = ("dielectric" if qd < qc else "copper")
 
     if rq is None:
         plate_note = "PEC, smooth, both plates counted"
-        rough_prec = ("The model omits radiation Q, surface roughness and the "
+        rough_prec = ("The model omits radiation Q (planar.plane_radiation_q), "
+                      "surface roughness and the "
                       "damping of mounted components, so a real plane pair "
                       "usually rings LESS than this; treat it as an upper bound "
                       "on Q")
@@ -519,8 +524,9 @@ def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA,
                       "on Rs, both plates counted" % k_rough)
         rough_prec = ("Surface roughness is in as the one-number "
                       "Hammerstad-Jensen multiplier (Rs *= K, reported as "
-                      "roughness.loss_factor). Still omitted: radiation Q, the "
-                      "foil profile / Huray nodule model and the damping of "
+                      "roughness.loss_factor). Still omitted here: radiation Q "
+                      "(planar.plane_radiation_q), the Huray nodule carpet "
+                      "(planar.roughness_huray), the foil profile and the damping of "
                       "mounted components, so a real plane pair usually rings "
                       "LESS than this; treat it as an upper bound on Q")
         rough_nc = ("surface roughness beyond one Hammerstad-Jensen multiplier "

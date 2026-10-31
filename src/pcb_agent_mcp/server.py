@@ -3721,6 +3721,77 @@ def selftest():
           and _t_low.get("margin_to_melt_k") > 100.0,
           str(_t_low.get("peak_c")))
 
+    # --- plane edges and the Huray surface (0.0.60). Three numbers, each with a
+    # negative control that a blanket implementation would fail.
+    def _call(tool, args, rid):
+        return json.loads(handle(
+            {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+             "params": {"name": tool, "arguments": args}})
+        ["result"]["content"][0]["text"])
+
+    _hu = _call("roughness_huray", {"f_hz": 1e9, "nodule_radius_um": 0.5,
+                                    "surface_ratio": 1.0}, 1805)
+    _hu_v = _hu.get("value") or {}
+    _hu0 = _call("roughness_huray", {"f_hz": 1e9, "nodule_radius_um": 0.5,
+                                     "surface_ratio": 0.0}, 1806)
+    check("Huray: r=0.5 um at 1 GHz is 11.95 % above smooth copper, and the "
+          "reported knee is the frequency where delta = r/2 (F = 1/sqrt(5))",
+          _hu.get("status") == "ok"
+          and abs(_hu_v.get("loss_factor_K", -1) - 1.11953) < 1e-4
+          and abs((_hu_v.get("surface_ratio_dc") or 0) - 2.5) < 1e-12
+          and abs(_hu_v.get("knee_skin_depth_um", -1) - 0.25) < 1e-6
+          and (_hu0.get("value") or {}).get("loss_factor_K") == 1.0,
+          "K %s, knee %s Hz at delta %s um, flat K %s" % (
+              _hu_v.get("loss_factor_K"), _hu_v.get("knee_frequency_hz"),
+              _hu_v.get("knee_skin_depth_um"),
+              (_hu0.get("value") or {}).get("loss_factor_K")))
+    _hu_big = _call("roughness_huray", {"f_hz": 1e20, "nodule_radius_um": 0.5,
+                                        "surface_ratio": 3.0}, 1807)
+    check("Huray refuses an optical frequency instead of clamping: the snowball "
+          "model is quasi-static and 1e20 Hz puts the nodule above a wavelength",
+          _hu_big.get("status") == "error"
+          and _hu_big.get("reason_code") == "MODEL_SCOPE",
+          str(_hu_big.get("reason_code")))
+
+    _rq = _call("plane_radiation_q", {"a_mm": 50.0, "b_mm": 50.0, "h_mm": 0.2,
+                                      "er": 4.3}, 1808)
+    _rq_v = _rq.get("value") or {}
+    check("radiation Q of a 50 mm square, 0.2 mm FR4, (1,0): er*a/(6h) = 179.17, "
+          "and it is the copper that still dominates at 1.45 GHz",
+          _rq.get("status") == "ok"
+          and abs(_rq_v.get("q_radiation", -1) - 4.3 * 50.0 / (6.0 * 0.2)) < 0.01
+          and _rq_v.get("which_dominates") == "copper"
+          and abs(_rq_v.get("k0_h", -1) - 0.00606) < 1e-5,
+          "Q_rad %s, Qc %s, Q_tot %s, k0h %s" % (
+              _rq_v.get("q_radiation"), _rq_v.get("q_conductor"),
+              _rq_v.get("q_total"), _rq_v.get("k0_h")))
+    _rq_big = _call("plane_radiation_q", {"a_mm": 50.0, "b_mm": 50.0,
+                                          "h_mm": 100.0, "er": 4.3}, 1809)
+    check("radiation Q refuses k0*h >= 1: a 100 mm gap cannot be a narrow slot, "
+          "the aperture would radiate more than is incident on it",
+          _rq_big.get("status") == "error"
+          and _rq_big.get("reason_code") == "MODEL_SCOPE",
+          str(_rq_big.get("reason_code")))
+
+    _oe = _call("plane_open_end", {"a_mm": 50.0, "b_mm": 50.0, "h_mm": 0.2,
+                                   "er": 4.3}, 1810)
+    _oe_v = _oe.get("value") or {}
+    _oe_y = _call("plane_open_end", {"a_mm": 50.0, "b_mm": 30.0, "h_mm": 0.2,
+                                     "er": 4.3, "m": 1, "n": 0,
+                                     "open_edges": ["y0", "y1"]}, 1811)
+    _oe_y_v = _oe_y.get("value") or {}
+    check("an open edge adds delta_l = (h/2pi)(ln(2pi*a/h)+1) = 0.2661 mm, i.e. "
+          "-1.053 % on a 1.45 GHz mode, and a (1,0) mode does NOT move when only "
+          "the y edges open",
+          _oe.get("status") == "ok"
+          and abs((_oe_v.get("edge_extension_mm") or {}).get("x", -1)
+                  - 0.266086) < 1e-5
+          and abs(_oe_v.get("delta_f_over_f_pct", 0) + 1.05313) < 1e-4
+          and _oe_y_v.get("delta_f_over_f") == 0.0,
+          "dl %s mm, shift %s %%, y-only shift %s" % (
+              (_oe_v.get("edge_extension_mm") or {}).get("x"),
+              _oe_v.get("delta_f_over_f_pct"), _oe_y_v.get("delta_f_over_f")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

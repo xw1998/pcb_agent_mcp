@@ -608,7 +608,9 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # 164 -> 165 in 0.0.59 (fusing_current_taper - a new tool rather than a new
         # parameter, because one width_mm cannot express a tapered geometry).
         from pcb_agent_mcp import tools
-        self.assertEqual(len(tools.TOOLS), 165)
+        # 168 = 162 + the three 0.0.56..0.0.59 additions + the three 0.0.60
+        # plane additions (roughness_huray, plane_radiation_q, plane_open_end)
+        self.assertEqual(len(tools.TOOLS), 168)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

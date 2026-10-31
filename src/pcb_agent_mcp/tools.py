@@ -34,6 +34,7 @@ from .calc import vibration as _vib
 from .calc import vibration_poly as _vib_poly
 from .calc import reliability as _rel
 from .calc import cavity as _cavity
+from .calc import planar as _planar
 from .calc import electrothermal as _electro
 from .calc import filters as _filters
 from .calc import magnetics as _magnetics
@@ -3847,11 +3848,15 @@ def _capabilities(_args):
             "Qd = 1/tan_delta) plus the optional Hammerstad-Jensen surface-roughness "
             "multiplier on Rs (pass roughness_um; K = 1+(2/pi)atan(1.4(Rq/delta_s)^2), "
             "so Qc = h/(delta_s*K)), and pdn_plane_impedance / pdn_plane_with_caps "
-            "give the plane-pair impedance curve with and without the caps. Still "
-            "missing: radiation Q, the foil profile / Huray nodule model (the "
-            "roughness here is one number, not a surface), detuning from real open "
-            "edges, and leakage through voids - so the sum of the modelled losses is "
-            "an UPPER bound on Q, and the dominant loss of a real PDN resonance (the "
+            "give the plane-pair impedance curve with and without the caps. The two "
+            "things plane_q leaves out have their own tools: plane_radiation_q adds "
+            "the radiation Q of the open edges (and Qc/Qd in one reciprocal sum), "
+            "plane_open_end pulls the resonance down by the edge correction, and "
+            "roughness_huray replaces the one-number Rq multiplier with a Huray "
+            "nodule carpet (r, surface ratio). Still missing: the foil profile, "
+            "leakage through voids, and the caps mounted across the pair - so the "
+            "sum of the modelled losses is still an UPPER bound on Q, and the "
+            "dominant loss of a real PDN resonance (the "
             "packages mounted across it, and the caps in the plane-only curve) is "
             "outside. Even with Q there is no verdict: a resonance is a problem only "
             "together with an excitation and a coupling. When that distinction "
@@ -4005,8 +4010,9 @@ def _capabilities(_args):
             "turns capacitive is a number, not a forward reference. What is still "
             "outside it: die-package inductance and the plane-to-die path, split "
             "planes and moats, via-barrel / antipad inductance (that is the cap's own "
-            "esl_h, which YOU supply), radiation Q, and the open-edge detuning that "
-            "makes a real plane ring a few percent below the PMC values used here. "
+            "esl_h, which YOU supply), radiation Q (plane_radiation_q) and the "
+            "open-edge detuning that makes a real plane ring a few percent below "
+            "the PMC values used here (plane_open_end). "
             "Also outside: choosing the bank (this tool evaluates the caps you list, "
             "max 8 by name, and never optimises them) and anything the part library "
             "would know - esr_ohm / esl_h are your numbers, and a 0 there is an "
@@ -6286,9 +6292,11 @@ _tool(
     "roughness_um and Rs picks up the Hammerstad-Jensen multiplier "
     "K = 1+(2/pi)atan(1.4(Rq/delta_s)^2) (K(delta)=1.605, K->2 from below), i.e. "
     "Qc = h/(delta_s*K) - and because delta_s shrinks as 1/sqrt(f), the same foil "
-    "costs more at high frequency. Radiation Q, the foil profile / Huray nodules and "
-    "the damping of mounted capacitors are still NOT modelled, so read the answer as "
-    "an upper bound on Q. No pass/fail: a resonance is only a problem with an "
+    "costs more at high frequency. Radiation Q is NOT here: it lives in "
+    "plane_radiation_q, which also folds Qc, Qd and Q_rad into one 1/Q sum, and the "
+    "nodule carpet is roughness_huray. The foil profile and the damping of mounted "
+    "capacitors are still NOT modelled, so read this answer as an upper bound on Q. "
+    "No pass/fail: a resonance is only a problem with an "
     "excitation and a coupling.",
     {"type": "object", "properties": {
         "f_hz": _num("the mode frequency, e.g. from cavity_resonance"),
@@ -6304,6 +6312,115 @@ _tool(
         conductivity_s_m=(a["conductivity_s_m"]
                           if a.get("conductivity_s_m") is not None else 5.8e7),
         roughness_um=a.get("roughness_um")),
+)
+
+_tool(
+    "roughness_huray",
+    "Huray \"snowball\" surface roughness: Rs multiplier from a nodular copper "
+    "surface, instead of from one RMS height. You give a nodule radius and how "
+    "much surface it adds (surface_ratio = 4*pi*r^2*N per unit area, the number "
+    "Ansys SIwave prints, or the areal nodule density) and get "
+    "K = 1 + (RF-1)*F with RF = 1 + (3/2)*sr and F = 1/sqrt(1+2x+2x^2), "
+    "x = 2*delta_s/r: at DC the current climbs over every nodule (K -> RF), at "
+    "low frequency the skin depth never sees them (K -> 1), and the knee is "
+    "delta_s = r/2 where F = 1/sqrt(5) exactly. For 0.5 um nodules on 1 GHz "
+    "copper: sr = 1 gives K = 1.120, sr = 6 gives K = 1.717; the same surface at "
+    "10 GHz gives 1.334 / 3.001. Rs *= K, i.e. Qc /= K, i.e. sigma_eff = "
+    "sigma/K^2. It is NOT interchangeable with the Hammerstad-Jensen Rq "
+    "multiplier (that one is reported alongside when you pass rq_um, for "
+    "comparison only - a height statistic and a nodule geometry do not convert "
+    "without inventing a height distribution).",
+    {"type": "object", "properties": {
+        "f_hz": _num("evaluation frequency"),
+        "nodule_radius_um": _num("radius of one Huray nodule, e.g. 0.1..1 um"),
+        "surface_ratio": _num("Hall-Huray surface ratio 4*pi*r^2*N (published "
+                               "sets use 1 / 3 / 6 for low / medium / high; "
+                               "0 = flat)"),
+        "nodule_density_per_mm2": _num("ALTERNATIVE to surface_ratio: nodules per "
+                                        "square millimetre of flat surface"),
+        "conductivity_s_m": _num("copper conductivity", 5.8e7),
+        "mur": _num("relative permeability of the conductor", 1.0),
+        "rq_um": _num("optional RMS roughness, only to see the Hammerstad-Jensen "
+                       "number next to this one (no conversion is done)"),
+    }, "required": ["f_hz", "nodule_radius_um"]},
+    lambda a: _planar.huray_roughness(
+        a.get("f_hz"), nodule_radius_um=a.get("nodule_radius_um"),
+        surface_ratio=a.get("surface_ratio"),
+        nodule_density_per_mm2=a.get("nodule_density_per_mm2"),
+        conductivity_s_m=(a["conductivity_s_m"]
+                          if a.get("conductivity_s_m") is not None else 5.8e7),
+        mur=(a["mur"] if a.get("mur") is not None else 1.0),
+        rq_um=a.get("rq_um")),
+)
+
+_tool(
+    "plane_radiation_q",
+    "Radiation Q of a plane-pair mode radiating from its OPEN edges - the loss "
+    "cavity_plane_q says it does not model. Each open edge is a narrow slot "
+    "(gap h) in an infinite flange, whose radiation conductance per unit width "
+    "is G' = omega*eps0 = k0/eta0; omega then cancels against the stored "
+    "energy, so Q_rad = er*A_eff/(h*sum L_eff) - no frequency in it, but the "
+    "mode numbers DO matter (a (1,1) radiates from four edges with half the "
+    "energy per antinode volt, so its Q_rad is 2x lower than (1,0)). 50 mm on "
+    "0.2 mm of er=4.3 gives Q_rad = 179 on (1,0); on 1.6 mm it gives 22, i.e. "
+    "radiation then beats copper (Qc = 921). Pass tan_delta and q_total = "
+    "(1/Qc + 1/Qd + 1/Q_rad)^-1. The model is refused when k0*h >= 1 (an edge "
+    "cannot radiate more than arrives) and it treats the outside as air, the "
+    "edge as infinitely long (no corners) and the mode as unperturbed - expect "
+    "tens of percent against a 3-D solver. Nothing soldered across the planes "
+    "is in it, which is usually the dominant damping in a real PDN.",
+    {"type": "object", "properties": {
+        "a_mm": _num("plane dimension along x"),
+        "b_mm": _num("plane dimension along y"),
+        "h_mm": _num("dielectric thickness between the planes"),
+        "er": _num("relative permittivity between the planes"),
+        "m": _num("mode number along x (0,1,2,...), not both zero", 1),
+        "n": _num("mode number along y (0,1,2,...), not both zero", 0),
+        "open_edges": _arr("which edges are bare, from x0/x1/y0/y1 (x0 at x=0, "
+                           "x1 at x=a, y0 at y=0, y1 at y=b); omit for all four, "
+                           "pass [] or 'none' for a fully walled cavity"),
+        "tan_delta": _num("laminate loss tangent, to add Qd and report a real "
+                          "q_total (omit for none)"),
+        "conductivity_s_m": _num("copper conductivity", 5.8e7),
+    }, "required": ["a_mm", "b_mm", "h_mm", "er"]},
+    lambda a: _planar.plane_radiation_q(
+        a.get("a_mm"), a.get("b_mm"), a.get("h_mm"), a.get("er"),
+        m=(a["m"] if a.get("m") is not None else 1),
+        n=(a["n"] if a.get("n") is not None else 0),
+        open_edges=a.get("open_edges"), tan_delta=a.get("tan_delta"),
+        conductivity_s_m=(a["conductivity_s_m"]
+                          if a.get("conductivity_s_m") is not None else 5.8e7)),
+)
+
+_tool(
+    "plane_open_end",
+    "How far a BARE edge pulls a plane-pair resonance down: the fringing field at "
+    "an open edge makes the plane electrically longer than it is drawn, which is "
+    "the 'few percent' cavity_resonance says it does not apply. From the exact "
+    "2-D solution in its large-aspect-ratio limit (Love 1924; C ~ eps0*[l/h + "
+    "(1/pi)*(ln(2*pi*l/h)+1)], Yariv 2021), one open edge adds "
+    "delta_l = (h/(2*pi))*(ln(2*pi*a/h)+1), then a_eff = a + 2*delta_l and "
+    "f_eff = c/(2*sqrt(er))*sqrt((m/a_eff)^2+(n/b_eff)^2). 50 mm on 0.2 mm moves "
+    "the (1,0) mode down 1.05 %; the same plane on 1.6 mm of FR4 moves down "
+    "6.01 %. Only BARE edges get an extension (a stitched edge is a wall), the "
+    "edge is treated as infinitely long so the corners are not in it, and the "
+    "outside is air. Refused below a/h = 10 or b/h = 10 - the closed form is an "
+    "asymptotic in a/h and does not extrapolate to a fat, small plane.",
+    {"type": "object", "properties": {
+        "a_mm": _num("plane dimension along x"),
+        "b_mm": _num("plane dimension along y"),
+        "h_mm": _num("dielectric thickness between the planes"),
+        "er": _num("relative permittivity between the planes"),
+        "m": _num("mode number along x, not both m and n zero", 1),
+        "n": _num("mode number along y, not both m and n zero", 0),
+        "open_edges": _arr("which edges are bare, from x0/x1/y0/y1; omit for all "
+                           "four"),
+    }, "required": ["a_mm", "b_mm", "h_mm", "er"]},
+    lambda a: _planar.plane_open_end(
+        a.get("a_mm"), a.get("b_mm"), a.get("h_mm"), a.get("er"),
+        m=(a["m"] if a.get("m") is not None else 1),
+        n=(a["n"] if a.get("n") is not None else 0),
+        open_edges=a.get("open_edges")),
 )
 
 _tool(
