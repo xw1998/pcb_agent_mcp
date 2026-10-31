@@ -100,7 +100,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 - **脉冲降额**：`repetitive_pulse_rating` 是**一阶集中温度**（整根线一个温度），不是 3-D 热；`h` 不给默认值（裸板静风 ~10 到铜皮锁金属壳的数百，差 20 倍），`h/2` 与 `2h` 的稳态峰值一并报出（实测差 **245 %**）；不算长度方向温度梯度、板与铜面作为 `h` 之外的独立散热、熔化潜热、脉冲内集肤、电迁移、开铜后的电弧。**「单发」不是「列车」的近似**：1 mm/1 oz 单发熔断 318 A，占空比 10 % 的列车只许 10.3 A。失控阈值不含热容（是两个速率的比较），所以 `runs_away` 是**存在性**判断，不代表稳态温度低。
 - **振动**：薄板 Kirchhoff、单模态；`board_vibration` 的主答案仍是板框 bbox（非矩形会**偏软**，回 `outline_fill_fraction_of_bbox`），0.0.42 起另给 `plate_on_outline`＝**真实外轮廓**的解（L 形实测差 3.13×）；应力是三个极值，不是场。
 - **轮廓振动**：只解外轮廓（孔不网格化），`alpha_spread_pct` 是罚阶梯最平一档的步长（>3 % 只作指示），凹角与高边数**经常不收敛**，`modes[i].physical=false` 的阶是伪刚度不是模态。
-- **平面谐振**：只给模频与 λ_g 比例，另给**导体 + 介质损耗**的 Q 上界（`cavity_plane_q`：`Qc = h/δs`、`Qd = 1/tanδ`，两项之和是 Q 的上界）；辐射 Q、表面粗糙度、真实开边失谐都不算；「带内有哪些模、各多高」用 `pdn_plane_modes` 的单模峰值，「整条曲线多深」用 `pdn_plane_impedance`（0.0.49：有限焊盘孔径让模态和收敛，阶数闸门 + 平板电容锚点；点端口 2 GHz 从 order 8 的 5.71 Ω 爬到 256 的 19.23 Ω 无极限，0.5 mm 焊盘 256→384 只动 0.1 %）。**但曲线只是平面自己**：没有电容/封装/过孔 ⇒ Q 是上界、峰偏高偏窄、1.56 GHz 的谷（1.76 Ω）比真板更浅；平面与电容组的**反谐振**仍不报。
+- **平面谐振**：只给模频与 λ_g 比例，另给**导体 + 介质损耗**的 Q 上界（`cavity_plane_q`：`Qc = h/δs`、`Qd = 1/tanδ`，两项之和是 Q 的上界）；辐射 Q、表面粗糙度、真实开边失谐都不算；「带内有哪些模、各多高」用 `pdn_plane_modes` 的单模峰值，「整条曲线多深」用 `pdn_plane_impedance`（0.0.49：有限焊盘孔径让模态和收敛，阶数闸门 + 平板电容锚点；点端口 2 GHz 从 order 8 的 5.71 Ω 爬到 256 的 19.23 Ω 无极限，0.5 mm 焊盘 256→384 只动 0.1 %）。**但曲线只是平面自己**：没有电容/封装/过孔 ⇒ Q 是上界、峰偏高偏窄、1.56 GHz 的谷（1.76 Ω）比真板更浅。平面与电容组的**反谐振**：0.0.50 起 `pdn_plane_with_caps` 把 ≤8 颗电容的 RLC 并在腔体网络的电容端口上（端口降阶是**恒等式**，不是拟合），一条曲线里同时有平面自己的模与电容的并联/反谐振（实测 1 颗 100 nF/1 nH 把 2.86 GHz 的 92.45 Ω 变成 418 MHz 的 164 Ω 反谐振峰）；它只算**你点名的那几颗**，不选型、不优化，封装/过孔电感要你自己折进 `esl_h`，3-D 与相邻平面耦合不算。
 - **电热**：只闭合「铜 `R(T)` ↔ 一个集中 `Rth`」；2-D 板场的散热介质是**你给的层压板 k + 你列进 `copper_pours` 的铜**（0.0.44：精确面积重叠 → 每格一个面内片电导，面上取调和平均）。铜只帮忙它**在的地方**（同面积条带压在走线上降 6.7 K，挪到无热区降 0.002 K）。0.0.45 又补了两条真缺口：`emissivity` 打开**双面辐射**（`ε·σ·(T⁴−Ta⁴)` 精确改写成 `h_rad·(T−Ta)`，`h_rad` 滞后一迭代、整场重解到不动点；ε=0.9 降 2.72 K、辐射占散热 35.7 %，ε=0 逐位等于不传），`thermal_vias` 加**环形截面铜管到指定 sink**（`k_cu·π(r²−r_in²)/span`，落在中心所在的那一格，点载荷；同数量挪到无热区只动 1.9e-4 K）。0.0.46 再补两块：`thermal_via_array` 的 `barrel_profile` 让**中段镀层减薄按段串联**（`R = Σ L_i/(k_cu·A_i)`，最薄段 31 % 长度扛 42.2 % 阻力，等效厚度只能当摘要），`interface` 在整场之后**再串一层** `interfaces·t/(k·A)`（TIM / 焊盘；`interfaces=2` 逐位成倍，不除以根数）。仍然不算：3-D、层间内部辐射、温度相关发射率、元件热质量与接触热阻、**没列进来的铜**（不会自己去读 zone）、两端镀层**向外铺开**（孔口喇叭形）、镀液/孔型表（IPC-4761）、voiding 与泵出；竖向路径仍在 `h` 里。
 - **滤波器**：是**合成器**不是仿真器——给几何与电学零点，不给 EM 结果、色散、版图；集总带通的蒙特卡洛是 uniform 独立（最坏情况）。
 - **布线**：`routed` 不等于 DRC 干净；拥塞协商默认关（一块板 +3 网 / +61% 时间）；默认拓扑 `mst` 报的是 Manhattan 树干长。
@@ -110,9 +110,9 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.49
-python run_server.py --selftest         # 172/172
-python -m unittest discover -s tests    # 2301 例（实测 1032 s，约 17 分钟）
+python run_server.py --version          # 0.0.50
+python run_server.py --selftest         # 175/175
+python -m unittest discover -s tests    # 2324 例（实测 1076 s，约 18 分钟）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -188,7 +188,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（153 个）
+## 工具（162 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `cavity_plane_q`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
@@ -311,7 +311,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `ir_drop_chain` | 分段串联 IR drop（每段自己的宽/厚） | 不把不同线宽折算成平均宽 |
 | `pdn_impedance` | 电容组 `\|Z(f)\|` 全曲线 + 平面电容；给 `plane` 时附带**腔体模诊断** | 要看**反谐振峰**，不是看最低点；`plane` 只做诊断，**不改那条曲线** |
 | `pdn_plane_modes` | 平面腔体每个模的**峰值** `|Z_peak| = w·μ0·t·ψ(r1)ψ(r2)·Q/k²`（Q=1/tanδ）与端口耦合/null | **只给峰值**（单模闭式）；要整条曲线用 `pdn_plane_impedance`；过孔桶壁/反焊盘/分割平面/开放边缘失谐未算 |
-| `pdn_plane_impedance` | 平面阻抗**整条曲线**：模态和 `j·w·μ0·t·Σ A_mn/(k_mn²−κ²)`，铜+介质损耗，峰值/谷/首模 Q；`port_size_mm` **必填**（点源发散，焊盘正则化）+ 阶数扫描闸门 | **只是平面自己**：没有电容/封装/过孔 ⇒ Q 是上界、峰偏高偏窄、谷偏深；不报平面-电容反谐振 |
+| `pdn_plane_impedance` | 平面阻抗**整条曲线**：模态和 `j·w·μ0·t·Σ A_mn/(k_mn²−κ²)`，铜+介质损耗，峰值/谷/首模 Q；`port_size_mm` **必填**（点源发散，焊盘正则化）+ 阶数扫描闸门（0.0.50 起是双条件：差 < tol **且**增量至少减半） | **只是平面自己**：没有电容/封装/过孔 ⇒ Q 是上界、峰偏高偏窄、谷偏深；要看平面+你列的电容的反谐振用 `pdn_plane_with_caps` |
+| `pdn_plane_with_caps` | 平面 **+ ≤8 颗电容**（`c`/`esl_h`/`esr_ohm`/`at_mm`/`size_mm`）的整条 `\|Z(f)\|`：腔体做成 (N+1) 端口 Z 矩阵、电容并在自己端口上、端口降阶 `Z_in = Z00 − Z0c(Zcc+diag Z_c)⁻¹Zc0`（恒等式，可被导纳路径独立重算）；同时报 `peak_z_ohm` / `peak_at_cavity_mode` / `plane_only_peak_z_ohm` / `peak_ratio_vs_plane` / `at_plane_peak_damping` | 只算**你点名的电容**，不选型不优化；封装/过孔电感要靠 `esl_h` 自己给；≤8 颗、3-D 与相邻平面耦合不算；缺 `port_size_mm` 直接拒 |
 | `decoupling_check` | 给定电流/频段/纹波判够不够 | 三态 `pass/fail/indeterminate`；最坏点落在频段下沿说 **indeterminate**（那里由稳压器负责） |
 | `thermal_stack` | 叠层 1-D 热阻 `Σ t/(kA)` + 给定功耗的温升 | 严格 1-D，看不见扩热 |
 | `thermal_via_array` | 过孔阵列热阻（同环壁几何），可把周围 FR4 并联；给 `barrel_profile` 就把中段减薄**逐段串联**算（不再平均掉），给 `interface` 再加一层 TIM/焊盘在整场之后串联 | 不给剖面时仍偏乐观（一个均匀桶壁）；`barrel_profile` 是你给的形状，不是镀液模型 |
@@ -354,9 +355,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.49
-python run_server.py --selftest      # 协议级自检，172/172（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问）
-python -m unittest discover -s tests # 2301 个用例（实测 1032 s，约 17 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
+python run_server.py --version       # 0.0.50
+python run_server.py --selftest      # 协议级自检，175/175（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动六问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问）
+python -m unittest discover -s tests # 2324 个用例（实测 1075.690 s，约 18 分钟，kicad-cli / pcbnew 与二维场解用例占大头）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -680,7 +681,7 @@ MCP 客户端配置（stdio）：
   仍不算孔/挖空、不加元件质量与铜厚、不算应力；凹角（L 形 spread 14.7 %）与高边数
   （8 边形 vs 圆板 +26 %）直接报"没收敛"，不给一个看起来很准的数字。
 
-### 平面谐振与电热耦合：一个只给模频，一个只给一个 Rth（[docs/20](docs/20-平面谐振与电热耦合.md)）
+### 平面谐振与电热耦合：模频、曲线、反谐振，和一个 Rth（[docs/20](docs/20-平面谐振与电热耦合.md)、[docs/52](docs/52-平面阻抗曲线.md)、[docs/53](docs/53-平面电容反谐振.md)）
 
 - **腔体模是闭式的，Q 不是。** `cavity_resonance` 给 `f_mn = c/(2√εr)·√((m/a)²+(n/b)²)` 与 λ_g，
   100×80 mm / εr=4.3 的 (1,0) 落在 0.722864 GHz（λ_g 恰为 2a，即半波的定义），(1,1) 严格等于
@@ -697,6 +698,26 @@ MCP 客户端配置（stdio）：
   （`max|ΔZ|/max|Z|`）而不是逐点相对变化——首模以下电容与扩散电感的相消点上，|Z| 是两个大电抗
   之差，逐点相对误差物理上不可能收敛。函数里仍带电容锚点自检（`f=首模/100` 的求和必须回到
   `1/(ωC_plane)` 的 1 % 内，实测 0.149 %），这条自检曾抓出自己 20 倍的归一化错。
+- **平面与电容的反谐振，0.0.50 起算得出来，但只算你点名的那几颗。** 把腔体当成 (N+1) 端口
+  Z 矩阵（端口 0 = 注入点，1..N = 电容站，每端口带自己的焊盘孔径），电容按
+  `Z_c = esr + jω·esl + 1/(jωC)` 并在自己端口上，端口降阶
+  `Z_in = Z00 − Z0c·(Zcc + diag Z_c)⁻¹·Zc0` 是**线性网络恒等式、不是拟合**：同一结果可用
+  导纳路径（先求逆、对角加 `1/Z_c`、再求逆取 `[0][0]`）独立重算，实测差 ≤ 2e-6。三条独立真值
+  （零电容 = `pdn_plane_impedance` 逐点、开路 = `pdn_plane_impedance` 同频、导纳路径）与四条
+  **会失败的对照**（波腹阻尼 vs 节点不阻尼、4 nH 与 1 nH 的反谐振峰互换、零电容恒等、
+  `Re(Z)/|Z| ≥ 0` 无源性）都在 `tests/test_plane_caps.py` 里。矩阵法把每个模的除法只做一次、
+  被所有 (i,j) 共用（15 个元素 order 256 约 0.24 s）；`np_=1/2/3` 展开再快 2.5 倍。
+  读法要分开：反谐振会让加载峰**高于**平面峰（实测 `peak_ratio_vs_plane 1.773`），所以
+  `at_plane_peak_damping`（平面峰处被压到 1.535×）与 `peak_ratio_vs_plane` 是两个不同的数，
+  不能只读一个。
+- **0.0.49 的收敛门在 0.0.50 补严了——这是修正，不是新功能。** 原门只看"最后一阶的差 < tol"，
+  实测加载曲线 16/32/64/128 阶的差是 6.83/11.61/21.03/**22.31 %**（128 阶比 64 阶还大），
+  单条件门会在中途放行 2.5~9.7 % 错的答案。现在要求"差 < tol **且** 增量至少减半 **且** 至少三阶"，
+  且 `Z_in` 与 `Z00` 两半各自按自身带内峰值归一后过门；另修掉"只给一个频点时探针集为空、
+  门无物可测"的洞（实测该点 order 64 与 128 差 9.7 %）。plane-only 的默认答案**逐位不变**
+  （仍在 order 256 接受，peak 92.4503 Ω @ 2.85841 GHz），带电容的旧读数因此更新：
+  158.46 Ω / 439.6 MHz → **163.96 Ω / 417.93 MHz**（256 阶自身还差 2.5 %）。`max_order`
+  默认对 `pdn_plane_with_caps` 提到 **1024**（模节点位置 512 阶还动 2.1 %），plane-only 保持 256。
 - **过孔间距的判据故意不内置。** `λ_g/20` 与 `λ_g/10` 都在流传，差 2 倍，两者都不是推出来的；
   所以只给 `pitch_mm` 时回比例 + `indeterminate`，给了 `max_pitch_ratio` 才判 pass/fail，
   只给判据时回 `max_pitch_mm` 而**不反推一个间距**。测试里同一块板、同一个 15 mm 间距在 0.05 下
@@ -751,7 +772,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 161 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 162 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -820,11 +841,11 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 2301 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 2324 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
-├── docs/                         # 设计文档 00~52，建议按编号顺序读（索引见 docs/README.md）
+├── docs/                         # 设计文档 00~53，建议按编号顺序读（索引见 docs/README.md）
 ├── CHANGELOG.md
 └── LICENSE
 ```
@@ -845,7 +866,7 @@ pcb_agent_mcp/
   蚀刻公差、阻焊桥、丝印可读性、拼板与基准点、铜到成品孔壁这 8 类静态文件里没有可比事实，
   一律 `not_checked_by_design`，不要把它读成「通过」。
 - 平面谐振只给模频与**导体 + 介质损耗**的 Q 上界（`cavity_plane_q`，`Qc = h/δs`、`Qd = 1/tan_delta`，两项之和是上界）；**辐射 Q、表面粗糙度、真实开边失谐不算**：它只告诉你模在哪、间距是多少个 λ_g，
-  不告诉你这个模会不会出问题。曲线能算了（`pdn_plane_impedance`，0.0.49，需要 `port_size_mm`），但它算的是**平面自己**——没有电容、没有封装、没有过孔，所以 Q 是上界、峰偏高偏窄、谷偏深，**平面与电容组的反谐振仍不报**。电热耦合只闭合「铜 R(T) ↔ 一个集中 Rth」这一个环，不是热仿真；
+  不告诉你这个模会不会出问题。曲线能算了（`pdn_plane_impedance`，0.0.49，需要 `port_size_mm`），但它算的是**平面自己**——没有电容、没有封装、没有过孔，所以 Q 是上界、峰偏高偏窄、谷偏深；平面与**你列出的那 ≤8 颗电容**的反谐振由 `pdn_plane_with_caps` 报（0.0.50），它不替你选电容、也不含封装与过孔电感。电热耦合只闭合「铜 R(T) ↔ 一个集中 Rth」这一个环，不是热仿真；
   热失控判据 `dP/dT·Rth ≥ 1` 是精确的，但它继承你给的那个 Rth 的全部误差。
 - 振动估算是**设计参考，不是应力分析**。薄板 Kirchhoff 理论只管「板本身怎么弯」，不管焊点/引线/器件的
   实际应力；疲劳用 Steinberg 三带 + Miner 线性累积，允许挠度必须由你按器件类别给；冲击是单自由度

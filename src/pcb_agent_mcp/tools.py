@@ -3568,7 +3568,7 @@ def _capabilities(_args):
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
             "ir_drop_chain", "pdn_impedance", "pdn_plane_modes",
-            "pdn_plane_impedance", "decoupling_check",
+            "pdn_plane_impedance", "pdn_plane_with_caps", "decoupling_check",
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_convection",
             "board_ir_drop",
@@ -3870,17 +3870,19 @@ def _capabilities(_args):
             "density a fab will qualify), arc/plasma behaviour after the copper opens, "
             "and board_ir_drop's A/mm^2 verdict - that tool still reports density with "
             "no criterion attached",
-            "The plane-caps ANTI-RESONANCE, even now that the plane curve exists: "
-            "pdn_plane_impedance sums the cavity series for a finite pad and returns "
-            "the planes alone - no caps, no packages, no vias - and pdn_impedance / "
-            "decoupling_check are lumped RLC. Putting the two together is what would "
-            "show the peak where a cap bank turns inductive and the plane turns "
-            "capacitive; that is not done, so no anti-resonance is claimed and the Q "
-            "of a plane peak is an UPPER bound (a real bank damps it and the dips "
-            "here come out deeper than the board will). Still outside: die-package "
-            "inductance, split planes and moats, via-barrel / antipad inductance, "
-            "radiation Q, and the open-edge detuning that makes a real plane ring a "
-            "few percent below the PMC frequencies used here",
+            "The plane-caps network is COMPUTED now (pdn_plane_with_caps: the cavity "
+            "as an (N+1)-port Z matrix, each cap an R-L-C branch, port-reduced to "
+            "Z_in), so the anti-resonance where a bank turns inductive and the plane "
+            "turns capacitive is a number, not a forward reference. What is still "
+            "outside it: die-package inductance and the plane-to-die path, split "
+            "planes and moats, via-barrel / antipad inductance (that is the cap's own "
+            "esl_h, which YOU supply), radiation Q, and the open-edge detuning that "
+            "makes a real plane ring a few percent below the PMC values used here. "
+            "Also outside: choosing the bank (this tool evaluates the caps you list, "
+            "max 8 by name, and never optimises them) and anything the part library "
+            "would know - esr_ohm / esl_h are your numbers, and a 0 there is an "
+            "ideal capacitor, not a guess at a real one. decoupling_check stays "
+            "lumped RLC and cannot see the cavity except through plane_cap_farad",
             "Thermal vias are a barrel model, by name: thermal_via_array takes the "
             "wall as a profile (barrel_profile, series sum, so mid-barrel thinning is "
             "no longer assumed away) and a series TIM/pad layer (interface, from the "
@@ -5228,7 +5230,8 @@ _tool(
     "Modes with a voltage null at either point are reported as uncoupled instead of as a "
     "tiny number. Only peaks are given HERE; the summed curve is pdn_plane_impedance, "
     "which converges once the port has a finite pad and refuses to answer until the "
-    "truncation order stops moving. Neither tool claims an anti-resonance with the caps. "
+    "truncation order stops moving, and pdn_plane_with_caps is that same curve loaded by "
+    "real R-L-C cap branches - which is where the anti-resonances are. "
     "tan_delta is required because a lossless cavity has an infinite peak.",
     {"type": "object", "properties": {
         "width_mm": _num("plane width"),
@@ -5306,6 +5309,65 @@ _tool(
         points=(a.get("points") if a.get("points") is not None else 100),
         freqs_hz=a.get("freqs_hz"),
         max_order=(a.get("max_order") if a.get("max_order") is not None else 256),
+        tolerance=(a.get("tolerance") if a.get("tolerance") is not None else 0.01),
+        conductivity_s_m=a.get("conductivity_s_m", _power.COPPER_SIGMA)),
+)
+
+_tool(
+    "pdn_plane_with_caps",
+    "The plane impedance curve WITH the decoupling caps mounted on it: the cavity is an "
+    "(N+1)-port network and every cap is an R-L-C branch at its own site, so "
+    "Z_in = Z00 - Z0c*(Zcc + diag(esr + jw*esl + 1/(jwC)))^-1*Zc0 - the standard port "
+    "reduction, not a fit. This is what shows the peak where a cap bank turns inductive and "
+    "the plane turns capacitive: with 100 nF / 1 nH / 0.01 ohm on a 0.5 mm pad at the centre "
+    "of a 50x50 mm pair the loaded curve peaks at 164 ohm / 418 MHz against 92.5 ohm / "
+    "2.86 GHz for the planes alone (both at order 512, where doubling it moved the loaded "
+    "curve by 0.65 % of the band peak). "
+    "Every site needs its own pad (pad_mm) because a point port diverges, exactly as in "
+    "pdn_plane_impedance. esl_h and esr_ohm are YOUR numbers - no part library. The same "
+    "truncation gate applies and the tool refuses rather than returning a moving number.",
+    {"type": "object", "properties": {
+        "width_mm": _num("plane width"),
+        "height_mm": _num("plane height"),
+        "er": _num("relative permittivity of the dielectric between the planes"),
+        "thickness_mm": _num("plane separation"),
+        "tan_delta": _num("loss tangent of that dielectric (FR4 is 0.015..0.025). Required"),
+        "port_mm": {"type": "array", "description":
+                    "[x_mm, y_mm] where the current is injected (default: the centre)",
+                    "items": {"type": "number"}},
+        "port_size_mm": {"description":
+                         "the pad the injected current spreads over: one number for a square "
+                         "pad, or [x_mm, y_mm]. Required",
+                         "oneOf": [{"type": "number"},
+                                   {"type": "array", "items": {"type": "number"}}]},
+        "caps": {"type": "array", "description":
+                 "up to 8 caps, each {at_mm: [x,y], c_farad, pad_mm, esr_ohm?, esl_h?}. "
+                 "pad_mm is required; esr_ohm / esl_h default to 0, which is an ideal cap",
+                 "items": {"type": "object"}},
+        "f_start_hz": _num("band start (default: f10/50)"),
+        "f_stop_hz": _num("band stop (default: 3*f10)"),
+        "points": _num("log-spaced points on top of the mode frequencies (default 100)"),
+        "freqs_hz": {"type": "array", "description":
+                     "explicit frequencies; then f_start_hz/f_stop_hz/points are ignored",
+                     "items": {"type": "number"}},
+        "max_order": _num("highest modal index per axis the truncation scan may reach "
+                          "(8..1024, default 1024 - a 0.5 mm cap pad needs more order "
+                          "than the plane-only curve does: a cap on a mode node "
+                          "settles at 1024, not at 512)"),
+        "tolerance": _num("accepted max|dZ_in|/max|Z_in| between the last two orders "
+                          "(default 0.01)"),
+        "conductivity_s_m": _num("copper conductivity, S/m; null = ideal copper"),
+    }, "required": ["width_mm", "height_mm", "er", "thickness_mm", "tan_delta",
+                    "port_mm", "port_size_mm", "caps"]},
+    lambda a: _power.pdn_plane_with_caps(
+        a.get("width_mm"), a.get("height_mm"), a.get("er"),
+        a.get("thickness_mm"), a.get("tan_delta"),
+        port_mm=a.get("port_mm"), port_size_mm=a.get("port_size_mm"),
+        caps=a.get("caps"),
+        f_start_hz=a.get("f_start_hz"), f_stop_hz=a.get("f_stop_hz"),
+        points=(a.get("points") if a.get("points") is not None else 100),
+        freqs_hz=a.get("freqs_hz"),
+        max_order=(a.get("max_order") if a.get("max_order") is not None else 1024),
         tolerance=(a.get("tolerance") if a.get("tolerance") is not None else 0.01),
         conductivity_s_m=a.get("conductivity_s_m", _power.COPPER_SIGMA)),
 )

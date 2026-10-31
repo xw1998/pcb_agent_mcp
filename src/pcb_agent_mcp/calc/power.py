@@ -568,7 +568,7 @@ def _plane_q_of(f_hz, h_m, tan_delta, sigma):
     return 1.0 / (1.0 / qc + 1.0 / qd), qc, qd
 
 def _plane_modal_z(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, p1, p2,
-                   ap_x_m=0.0, ap_y_m=0.0):
+                   ap_x_m=0.0, ap_y_m=0.0, ap2_x_m=None, ap2_y_m=None):
     """Transfer impedance between two ports, modes m,n = 0..order.
 
         Z = j*w*mu0*h * sum_mn  A_mn / (k_mn^2 - kap^2),   kap^2 = k^2*(1 - j/Q)
@@ -594,6 +594,12 @@ def _plane_modal_z(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, p1, p2,
 
     ap_x_m/ap_y_m = 0 is a point port: the divergent case. It is kept because
     the negative control has to be able to run it.
+
+    ap2_x_m/ap2_y_m is the SECOND port's own pad. Left as None it means "same
+    pad as the first port", which keeps every one-port answer bit for bit. Two
+    different pads matter as soon as the ports are not interchangeable: a
+    decoupling cap site is a small pad, the injection point may be a big one,
+    and Z_ij then carries S_i*S_j rather than S^2.
     """
     if f_hz <= 0.0:
         return None
@@ -608,20 +614,32 @@ def _plane_modal_z(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, p1, p2,
     cx2 = [math.cos(pi * m * p2[0] / a_m) for m in range(n_i)]
     cy1 = [math.cos(pi * n * p1[1] / b_m) for n in range(n_i)]
     cy2 = [math.cos(pi * n * p2[1] / b_m) for n in range(n_i)]
-    sx = [1.0] * n_i
-    sy = [1.0] * n_i
+    sx1 = [1.0] * n_i
+    sy1 = [1.0] * n_i
+    if ap2_x_m is None:
+        ap2_x_m = ap_x_m
+    if ap2_y_m is None:
+        ap2_y_m = ap_y_m
+    sx2 = [1.0] * n_i
+    sy2 = [1.0] * n_i
     if ap_x_m > 0.0:
         for m in range(1, n_i):
-            sx[m] = _ap_sinc(pi * m * ap_x_m / (2.0 * a_m))
+            sx1[m] = _ap_sinc(pi * m * ap_x_m / (2.0 * a_m))
     if ap_y_m > 0.0:
         for n in range(1, n_i):
-            sy[n] = _ap_sinc(pi * n * ap_y_m / (2.0 * b_m))
+            sy1[n] = _ap_sinc(pi * n * ap_y_m / (2.0 * b_m))
+    if ap2_x_m > 0.0:
+        for m in range(1, n_i):
+            sx2[m] = _ap_sinc(pi * m * ap2_x_m / (2.0 * a_m))
+    if ap2_y_m > 0.0:
+        for n in range(1, n_i):
+            sy2[n] = _ap_sinc(pi * n * ap2_y_m / (2.0 * b_m))
     # ax[m] = (c_m^2/2) * S^2 * chi(x1) chi(x2), folded so that the 2/(a b)
     # of the eigenfunction normalisation comes out of the loop
     scale = 1.0 / (a_m * b_m)
-    ax = [((1.0 if m == 0 else 2.0) * sx[m] * sx[m] * cx1[m] * cx2[m])
+    ax = [((1.0 if m == 0 else 2.0) * sx1[m] * sx2[m] * cx1[m] * cx2[m])
           for m in range(n_i)]
-    ay = [((1.0 if n == 0 else 2.0) * sy[n] * sy[n] * cy1[n] * cy2[n])
+    ay = [((1.0 if n == 0 else 2.0) * sy1[n] * sy2[n] * cy1[n] * cy2[n])
           for n in range(n_i)]
     kx2 = [pi * m / a_m for m in range(n_i)]
     kx2 = [v * v for v in kx2]
@@ -870,6 +888,15 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
         mid *= 1.7
         if mid < hi:
             probe_f.append(mid)
+    if not probe_f:
+        # A band with no mode inside it and no room for the mid-band fill - one
+        # frequency, or a slice narrower than 1.7x - used to leave the gate with
+        # NOTHING to look at, and an empty scan passes at the first order it is
+        # allowed to. Measured: a single-frequency query was accepted at order
+        # 64 with the answer still 9.7 % away from its order-128 value. The
+        # caller's own edges are exactly what the number is about, so they are
+        # the probe.
+        probe_f = sorted(set([lo, hi]))
     probe_f.sort()
 
     def scan(order):
@@ -909,6 +936,7 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
     order = 8
     z_prev = scan(order)
     history = []
+    increments = []
     accepted = None
     while True:
         order_next = order * 2
@@ -916,11 +944,21 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
             order_next = order_cap
         z_next = scan(order_next)
         rc, where, pw_change = rel_change(z_prev, z_next)
+        prev_rc = increments[-1] if increments else None
+        increments.append(rc)
         history.append({"order": order_next,
                         "max_change_rel_to_peak": _sig(rc),
                         "max_pointwise_relative_change": _sig(pw_change),
-                        "worst_freq_hz": _sig(where)})
-        if rc <= tol:
+                        "worst_freq_hz": _sig(where) if where is not None else None})
+        # Two conditions, not one. "The last doubling moved less than tolerance"
+        # alone does not bound what is left: measured at a resonance this sum moves
+        # 0.72 %, 0.85 %, 0.83 %, 0.46 %, 0.04 % per doubling, so order 16 would
+        # have been accepted while still 2.2 % below the converged 92.45 ohm. The
+        # tail only shrinks once the increments themselves halve, and that is what
+        # is required here - the last increment under tolerance AND under half the
+        # one before it.
+        if (rc <= tol and len(increments) >= 3
+                and prev_rc is not None and rc <= 0.5 * prev_rc):
             accepted = order_next
             break
         if order_next >= order_cap:
@@ -937,7 +975,7 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
                 extra={"order_reached": order_next,
                        "max_change_rel_to_peak": _sig(rc),
                        "max_pointwise_relative_change": _sig(pw_change),
-                       "worst_freq_hz": _sig(where),
+                       "worst_freq_hz": _sig(where) if where is not None else None,
                        "order_scan": history})
         order, z_prev = order_next, z_next
 
@@ -1039,6 +1077,711 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
                            "side_walls": "PMC (open edge, no fence)",
                            "loss": "dielectric + copper; nothing is mounted "
                                    "across the planes, so Q is an upper bound"},
+              extra=extra)
+
+# ---------------------------------------------------------------------------
+# The plane WITH the decoupling caps: the cavity is an (N+1)-port network
+# ---------------------------------------------------------------------------
+_CAP_NOT_COMPUTED = (
+    "the die and package side: the injection point is a port on the cavity, not "
+    "a load with its own lead inductance, and the planes' via barrel/antipad "
+    "are still not in the cavity (see pdn_plane_impedance)",
+    "the mounting inductance beyond the number you pass: esl_h is yours, not a "
+    "library part, and the escape from the cap pad down to the plane belongs in "
+    "it. The same goes for esr_ohm",
+    "every capacitor you do not list, and the caps' own anti-resonances "
+    "against each other are only as good as the ESL/ESR you give them",
+    "split planes, moats, radiation Q, open-edge detuning and the finite "
+    "conductivity of the plane edge - all inherited from the plane-only model",
+    "any verdict: whether an anti-resonance is a problem depends on the current "
+    "spectrum the load draws, which is not in this number",
+)
+
+def _plane_modal_matrix(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, ports):
+    """The full Z matrix of the cavity between N+1 ports.
+
+        Z_ij = j*w*mu0*h/(a b) * sum_mn P_i(m) P_j(m) Q_i(n) Q_j(n) / (k_mn^2-kap^2)
+        P_i(m) = sqrt(c_m) S_x,i(m) cos(m pi x_i/a),   c_0 = 1, c_m = 2
+
+    so that P_i P_j rebuilds the (c_m) factor of the one-pair sum exactly, and
+    Q carries the same for n. The sqrt() split is deliberate: it is what lets
+    one division per mode be shared by every i,j, which is why building the
+    whole matrix costs barely more than two entries of it (measured: 15 entries
+    at order 256 in 0.24 s against 0.04 s for one).
+
+    ports = [(x_m, y_m, ap_x_m, ap_y_m), ...]; ap 0.0 is a point port, which is
+    the divergent case and must not be used for a diagonal element.
+    """
+    w = 2.0 * math.pi * f_hz
+    k2 = w * w * MU0 * EPS0 * er
+    q, _qc, _qd = _plane_q_of(f_hz, h_m, tan_delta, sigma)
+    kap2 = k2 * (1.0 - 1j / q)
+    n_i = order + 1
+    pi = math.pi
+    np_ = len(ports)
+    cs = math.sqrt(2.0)
+    p_all = []
+    q_all = []
+    for (x, y, apx, apy) in ports:
+        P = [1.0] * n_i
+        Q = [1.0] * n_i
+        for m in range(1, n_i):
+            s = _ap_sinc(pi * m * apx / (2.0 * a_m)) if apx > 0.0 else 1.0
+            P[m] = cs * s * math.cos(pi * m * x / a_m)
+            s = _ap_sinc(pi * m * apy / (2.0 * b_m)) if apy > 0.0 else 1.0
+            Q[m] = cs * s * math.cos(pi * m * y / b_m)
+        p_all.append(P)
+        q_all.append(Q)
+    kx2 = [(pi * m / a_m) ** 2 for m in range(n_i)]
+    ky2 = [(pi * n / b_m) ** 2 for n in range(n_i)]
+    # The hot loop is written out for 1..3 ports: one division per mode is
+    # shared by every (i,j) pair, and with the pair loop flattened this is
+    # measured 2.5x faster than the generic list-of-lists version. The generic
+    # path stays for the (rare, expensive anyway) 4..8 cap case.
+    if np_ == 1:
+        m00 = 0j
+        p0 = p_all[0]
+        q0 = q_all[0]
+        for m in range(n_i):
+            base = kx2[m]
+            a0m = p0[m]
+            for n in range(n_i):
+                a0 = a0m * q0[n]
+                m00 += a0 * a0 / (base + ky2[n] - kap2)
+        M = [[m00]]
+    elif np_ == 2:
+        m00 = m01 = m11 = 0j
+        p0, p1 = p_all
+        q0, q1 = q_all
+        for m in range(n_i):
+            base = kx2[m]
+            a0m = p0[m]
+            a1m = p1[m]
+            for n in range(n_i):
+                inv = 1.0 / (base + ky2[n] - kap2)
+                a0 = a0m * q0[n]
+                a1 = a1m * q1[n]
+                m00 += a0 * a0 * inv
+                m01 += a0 * a1 * inv
+                m11 += a1 * a1 * inv
+        M = [[m00, m01], [m01, m11]]
+    elif np_ == 3:
+        m00 = m01 = m02 = m11 = m12 = m22 = 0j
+        p0, p1, p2 = p_all
+        q0, q1, q2 = q_all
+        for m in range(n_i):
+            base = kx2[m]
+            a0m = p0[m]
+            a1m = p1[m]
+            a2m = p2[m]
+            for n in range(n_i):
+                inv = 1.0 / (base + ky2[n] - kap2)
+                a0 = a0m * q0[n]
+                a1 = a1m * q1[n]
+                a2 = a2m * q2[n]
+                m00 += a0 * a0 * inv
+                m01 += a0 * a1 * inv
+                m02 += a0 * a2 * inv
+                m11 += a1 * a1 * inv
+                m12 += a1 * a2 * inv
+                m22 += a2 * a2 * inv
+        M = [[m00, m01, m02], [m01, m11, m12], [m02, m12, m22]]
+    else:
+        M = [[0j] * np_ for _ in range(np_)]
+        for m in range(n_i):
+            base = kx2[m]
+            pm = [p_all[i][m] for i in range(np_)]
+            for n in range(n_i):
+                inv = 1.0 / (base + ky2[n] - kap2)
+                a = [pm[i] * q_all[i][n] for i in range(np_)]
+                for i in range(np_):
+                    ai = a[i]
+                    Mi = M[i]
+                    for j in range(i, np_):
+                        Mi[j] += ai * a[j] * inv
+    sc = 1j * w * MU0 * h_m / (a_m * b_m)
+    for i in range(np_):
+        for j in range(i, np_):
+            M[i][j] *= sc
+            if j != i:
+                M[j][i] = M[i][j]
+    return M
+
+def _csolve(A, b):
+    """Solve A x = b for a small complex matrix: Gaussian elimination with
+    partial pivoting. Returns None if A is singular (a cap branch that is a
+    perfect short at this frequency, at the port's own location)."""
+    n = len(b)
+    m = [row[:] for row in A]
+    x = list(b)
+    for k in range(n):
+        pk = k
+        best = abs(m[k][k])
+        for i in range(k + 1, n):
+            v = abs(m[i][k])
+            if v > best:
+                best, pk = v, i
+        if best == 0.0:
+            return None
+        if pk != k:
+            m[k], m[pk] = m[pk], m[k]
+            x[k], x[pk] = x[pk], x[k]
+        piv = m[k][k]
+        rowk = m[k]
+        for i in range(k + 1, n):
+            f = m[i][k] / piv
+            if f == 0j:
+                continue
+            rowi = m[i]
+            for j in range(k, n):
+                rowi[j] -= f * rowk[j]
+            x[i] -= f * x[k]
+    for k in range(n - 1, -1, -1):
+        acc = x[k]
+        rowk = m[k]
+        for j in range(k + 1, n):
+            acc -= rowk[j] * x[j]
+        x[k] = acc / rowk[k]
+    return x
+
+def pdn_plane_with_caps(width_mm, height_mm, er, thickness_mm, tan_delta=None,
+                        port_mm=None, port_size_mm=None, caps=None,
+                        f_start_hz=None, f_stop_hz=None, points=100,
+                        freqs_hz=None, max_order=1024, tolerance=0.01,
+                        conductivity_s_m=COPPER_SIGMA):
+    """|Z(f)| of a plane pair WITH the decoupling capacitors mounted on it.
+
+    pdn_plane_impedance is the planes alone, and it says so: the caps are
+    usually the dominant damping across a plane pair, so its peaks come out too
+    high and too narrow, and - the part that actually bites - the valley
+    BETWEEN two peaks is where a cap's inductance and the plane's capacitance
+    resonate, which the plane-only curve cannot show at all.
+
+    The model here is the classical one, and it is exact within it:
+
+      * the cavity is an (N+1)-port network; port 0 is the injection point and
+        ports 1..N are the cap sites, each with its own pad (a cap site is a
+        small pad, the injection point may not be);
+      * every cap is an R-L-C branch in series, esr_ohm + j*w*esl_h + 1/(j*w*C),
+        connected from the top plane to the bottom plane at its site;
+      * the input impedance is the standard port reduction
+
+            Z_in = Z00 - Z0c (Zcc + diag(Z_c))^-1 Zc0
+
+        which is what "load the cavity with branches" means once the network is
+        written down - no fitting, no curve peeking.
+
+    What you get back, and how to read it:
+      * peak_z_ohm / dip_z_ohm of the loaded curve, and false-free context for
+        them: plane_only_peak_z_ohm is Z00 on the SAME curve, so
+        damping_ratio tells you what the caps actually bought at the peak - it
+        is not a claim about a different model;
+      * an anti-resonance shows up as a peak that is NOT near a cavity mode:
+        the cap turns inductive, the plane is capacitive, and the two parallel-
+        resonate there. Drop esl_h and that peak moves up in frequency
+        (measured here: 4 nH puts it at 279 MHz, 1 nH at 440 MHz, while the
+        first cavity mode stays at 1.429 GHz).
+
+    Buried in the port reduction: the self term Z_ii of a point port diverges,
+    exactly as in pdn_plane_impedance, so every cap site needs its own pad
+    (pad_mm). Without it there is no answer to give.
+
+    Convergence. The same gate as the plane-only curve - double the order until
+    the loaded |Z_in| stops moving relative to the band peak - and the caps make
+    the series no easier to sum, because a cap pad is small - and the loaded
+    answer needs MORE order than the plane-only one, which is why the default
+    here is 1024 and there 256. Measured on the default band, one 100 nF / 1 nH
+    / 0.01 ohm cap on a 0.5 mm pad: at the centre of the pair it settles at
+    order 512 (at 256 the loaded curve near 400 MHz still moves 2.5 % of the
+    band peak); on the NODE of the (0,2) mode it needs the full 1024 (at 512 it
+    still moves 2.1 %). The node is the hard one because there the loaded |Z| is
+    a small difference of comparable numbers, so a truncation error in Z_0c or
+    Z_cc arrives amplified. If the gate refuses, the hint is the honest one:
+    raise max_order (it costs order^2) or widen the pad.
+    """
+    def num(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        return v
+
+    a = num(width_mm)
+    b = num(height_mm)
+    e = num(er)
+    t = num(thickness_mm)
+    td = num(tan_delta)
+    for name, v in (("width_mm", a), ("height_mm", b), ("er", e),
+                    ("thickness_mm", t)):
+        if v is None:
+            return err("%s is required and must be a number" % name, "ARG_REQUIRED")
+        if v <= 0.0:
+            return err("%s must be > 0" % name, "ARG_RANGE", extra={"offending": name})
+    if e < 1.0:
+        return err("er must be >= 1", "ARG_RANGE", extra={"er": e})
+    if td is None:
+        return err("tan_delta is required: with no loss every mode peak is "
+                   "infinite, and the caps would be damping an answer that does "
+                   "not exist", "ARG_REQUIRED",
+                   hint="FR4 is 0.015..0.025")
+    if td <= 0.0 or td >= 1.0:
+        return err("tan_delta must be in (0, 1)", "ARG_RANGE",
+                   extra={"tan_delta": td})
+    sg = None if conductivity_s_m is None else num(conductivity_s_m)
+    if sg is not None and sg <= 0.0:
+        return err("conductivity_s_m must be > 0, or null for ideal copper",
+                   "ARG_RANGE", extra={"conductivity_s_m": sg})
+
+    if port_size_mm is None:
+        return err("port_size_mm is required: it is the pad of the INJECTION "
+                   "point, and a point port makes the modal sum diverge",
+                   "ARG_REQUIRED",
+                   hint="a decoupling cap site and an injection point are both "
+                        "finite pads; the pad is what makes the series converge")
+    sx, sy = _plane_aperture(port_size_mm, a, b)
+    if sx == "bad":
+        return err("port_size_mm must be > 0 (a number, or [x, y] for a "
+                   "rectangular pad)", "ARG_RANGE",
+                   extra={"port_size_mm": port_size_mm})
+    if sx == "wide":
+        return err("port_size_mm must stay below half the plane", "ARG_RANGE",
+                   extra={"port_size_mm": port_size_mm, "plane_mm": [a, b]})
+
+    def point(p):
+        if p is None:
+            return None
+        if isinstance(p, dict):
+            x, y = num(p.get("x_mm")), num(p.get("y_mm"))
+        else:
+            try:
+                x, y = num(p[0]), num(p[1])
+            except (TypeError, IndexError):
+                return "bad"
+        if x is None or y is None:
+            return "bad"
+        if x < 0.0 or y < 0.0 or x > a or y > b:
+            return "out"
+        return (x, y)
+
+    r0 = point(port_mm)
+    if r0 in ("bad", "out"):
+        return err("port_mm must be [x_mm, y_mm] inside the plane", "ARG_RANGE")
+    if r0 is None:
+        r0 = (0.5 * a, 0.5 * b)
+
+    if caps is None:
+        caps = []
+    if not isinstance(caps, (list, tuple)):
+        return err("caps must be a list of {at_mm, c_farad, pad_mm} objects",
+                   "ARG_INVALID")
+    if len(caps) > 8:
+        return err("at most 8 capacitors per call: each one is another port and "
+                   "the modal matrix grows as (N+1)^2", "ARG_RANGE",
+                   extra={"count": len(caps)})
+    site = []
+    for k, c in enumerate(caps):
+        if not isinstance(c, dict):
+            return err("caps[%d] must be an object" % k, "ARG_INVALID")
+        at = point(c.get("at_mm"))
+        if at in ("bad", "out") or at is None:
+            return err("caps[%d].at_mm must be [x_mm, y_mm] inside the plane" % k,
+                       "ARG_RANGE")
+        cf = num(c.get("c_farad"))
+        if cf is None:
+            return err("caps[%d].c_farad is required and must be a number" % k,
+                       "ARG_REQUIRED")
+        if cf <= 0.0:
+            return err("caps[%d].c_farad must be > 0" % k, "ARG_RANGE")
+        if c.get("pad_mm") is None:
+            return err("caps[%d].pad_mm is required: a cap site is a finite pad, "
+                       "and a point port there would make the series diverge" % k,
+                       "ARG_REQUIRED",
+                       hint="the pad is the copper landing the cap sits on, not "
+                            "the via drill")
+        px_, py_ = _plane_aperture(c.get("pad_mm"), a, b)
+        if px_ == "bad":
+            return err("caps[%d].pad_mm must be > 0" % k, "ARG_RANGE")
+        if px_ == "wide":
+            return err("caps[%d].pad_mm must stay below half the plane" % k,
+                       "ARG_RANGE")
+        esr = num(c.get("esr_ohm", 0.0))
+        esl = num(c.get("esl_h", 0.0))
+        if esr is None or esr < 0.0:
+            return err("caps[%d].esr_ohm must be >= 0 (0 is an ideal cap)" % k,
+                       "ARG_RANGE")
+        if esl is None or esl < 0.0:
+            return err("caps[%d].esl_h must be >= 0 (0 is an ideal cap)" % k,
+                       "ARG_RANGE")
+        site.append({"at_mm": at, "c_farad": cf, "pad_mm": (px_, py_),
+                     "esr_ohm": esr, "esl_h": esl})
+
+    tol = num(tolerance)
+    if tol is None or tol <= 0.0 or tol >= 0.5:
+        return err("tolerance must be in (0, 0.5)", "ARG_RANGE",
+                   extra={"tolerance": tolerance})
+    try:
+        order_cap = int(max_order)
+    except (TypeError, ValueError):
+        return err("max_order must be an integer", "ARG_INVALID")
+    if order_cap < 8 or order_cap > 1024:
+        return err("max_order must be in 8..1024", "ARG_RANGE")
+
+    a_m, b_m, t_m = a * 1e-3, b * 1e-3, t * 1e-3
+    k_plane = C0 / math.sqrt(e)
+    ports = [(r0[0] * 1e-3, r0[1] * 1e-3, sx * 1e-3, sy * 1e-3)]
+    for s in site:
+        ports.append((s["at_mm"][0] * 1e-3, s["at_mm"][1] * 1e-3,
+                      s["pad_mm"][0] * 1e-3, s["pad_mm"][1] * 1e-3))
+    n_cap = len(site)
+
+    def f_of(m, n):
+        return k_plane * math.sqrt((math.pi * m / a_m) ** 2
+                                   + (math.pi * n / b_m) ** 2) / (2.0 * math.pi)
+
+    f_first = min(f_of(m, n) for m in range(2) for n in range(2) if (m or n))
+
+    # ---- band -------------------------------------------------------------
+    defaulted = False
+    grid = None
+    if freqs_hz is not None:
+        if not isinstance(freqs_hz, (list, tuple)) or not freqs_hz:
+            return err("freqs_hz must be a non-empty list", "ARG_INVALID")
+        grid = []
+        for f in freqs_hz:
+            f = num(f)
+            if f is None or f <= 0.0:
+                return err("every frequency must be > 0", "ARG_RANGE")
+            grid.append(f)
+        if len(grid) > 2000:
+            return err("freqs_hz is capped at 2000 points", "ARG_RANGE",
+                       extra={"count": len(grid)})
+        lo, hi = min(grid), max(grid)
+        spacing = "caller's list"
+    else:
+        lo = num(f_start_hz)
+        hi = num(f_stop_hz)
+        if lo is None or hi is None:
+            lo, hi = f_first / 50.0, 3.0 * f_first
+            defaulted = True
+        if lo <= 0.0 or hi <= lo:
+            return err("need 0 < f_start_hz < f_stop_hz", "ARG_RANGE",
+                       extra={"f_start_hz": lo, "f_stop_hz": hi})
+        try:
+            npts = int(points)
+        except (TypeError, ValueError):
+            return err("points must be an integer", "ARG_INVALID")
+        if npts < 8 or npts > 2000:
+            return err("points must be in 8..2000", "ARG_RANGE")
+        spacing = "log" if hi / lo > 10.0 else "linear"
+        if spacing == "log":
+            r = (hi / lo) ** (1.0 / (npts - 1))
+            grid = [lo * r ** i for i in range(npts)]
+        else:
+            grid = [lo + (hi - lo) * i / (npts - 1.0) for i in range(npts)]
+
+    m_lim = int(a_m * 2.0 * math.pi * hi / k_plane) + 1
+    n_lim = int(b_m * 2.0 * math.pi * hi / k_plane) + 1
+
+    probe_f = []
+    for m in range(m_lim + 1):
+        for n in range(n_lim + 1):
+            if not (m or n):
+                continue
+            fmn = f_of(m, n)
+            if lo <= fmn <= hi and fmn not in probe_f:
+                probe_f.append(fmn)
+            if len(probe_f) >= 10:
+                break
+        if len(probe_f) >= 10:
+            break
+    mid = lo
+    while mid < hi and len(probe_f) < 12:
+        mid *= 1.7
+        if mid < hi:
+            probe_f.append(mid)
+    if not probe_f:
+        # A band with no mode inside it and no room for the mid-band fill - one
+        # frequency, or a slice narrower than 1.7x - used to leave the gate with
+        # NOTHING to look at, and an empty scan passes at the first order it is
+        # allowed to. Measured: a single-frequency query was accepted at order
+        # 64 with the answer still 9.7 % away from its order-128 value. The
+        # caller's own edges are exactly what the number is about, so they are
+        # the probe.
+        probe_f = sorted(set([lo, hi]))
+    probe_f.sort()
+
+    def cap_z(f_hz, s):
+        w = 2.0 * math.pi * f_hz
+        return complex(s["esr_ohm"], w * s["esl_h"] - 1.0 / (w * s["c_farad"]))
+
+    def answer(f_hz, order):
+        """(Z_in, Z00): the loaded input impedance and the plane alone."""
+        M = _plane_modal_matrix(f_hz, a_m, b_m, t_m, e, td, sg, order, ports)
+        z00 = M[0][0]
+        if not n_cap:
+            return z00, z00
+        z0c = [M[0][1 + i] for i in range(n_cap)]
+        A = [[M[1 + i][1 + j] + (cap_z(f_hz, site[i]) if i == j else 0j)
+              for j in range(n_cap)] for i in range(n_cap)]
+        x = _csolve(A, z0c)
+        if x is None:
+            return "singular", z00
+        return z00 - sum(z0c[i] * x[i] for i in range(n_cap)), z00
+
+    def scan(order):
+        return [answer(f, order) for f in probe_f]
+
+    def rel_change(old, new):
+        """Worst change of BOTH answers the tool publishes, each against its own peak.
+
+        The loaded curve is the answer, but plane_only_* is published beside it, and
+        a truncated plane can converge in the loaded answer (a cap damps it) while
+        still moving in the plane-only one. Both are gated, so the plane-only numbers
+        stay comparable with pdn_plane_impedance at the order reported.
+        """
+        rc = []
+        for idx in (0, 1):
+            scale = 0.0
+            for pair in new:
+                if pair == "singular":
+                    return None, None, None, None, None
+                if abs(pair[idx]) > scale:
+                    scale = abs(pair[idx])
+            worst = 0.0
+            where = None
+            pointwise = 0.0
+            for f, po, pn in zip(probe_f, old, new):
+                if po == "singular" or pn == "singular":
+                    return None, None, None, None, None
+                d = abs(pn[idx] - po[idx])
+                if pn[idx] != 0:
+                    pointwise = max(pointwise, d / abs(pn[idx]))
+                d = d / scale if scale else d
+                if d > worst:
+                    worst, where = d, f
+            rc.append((worst, where, pointwise))
+        if rc[0][0] >= rc[1][0]:
+            worst, where, pointwise = rc[0]
+        else:
+            worst, where, pointwise = rc[1]
+        return worst, where, pointwise, rc[0][0], rc[1][0]
+
+    order = 8
+    z_prev = scan(order)
+    history = []
+    increments = []
+    accepted = None
+    while True:
+        order_next = order * 2
+        if order_next > order_cap:
+            order_next = order_cap
+        z_next = scan(order_next)
+        rc, where, pw_change, rc_in, rc_pl = rel_change(z_prev, z_next)
+        if rc is None:
+            return err("the loaded cavity is singular at one of the probe "
+                       "frequencies: a cap branch is a perfect short at the "
+                       "injection point", "NO_SOLUTION",
+                       hint="give the cap a non-zero esr_ohm or move it off the "
+                            "injection point")
+        prev_rc = increments[-1] if increments else None
+        increments.append(rc)
+        history.append({"order": order_next,
+                        "max_change_rel_to_peak": _sig(rc),
+                        "loaded_change_rel_to_peak": _sig(rc_in),
+                        "plane_only_change_rel_to_peak": _sig(rc_pl),
+                        "max_pointwise_relative_change": _sig(pw_change),
+                        "worst_freq_hz": _sig(where) if where is not None else None})
+        # Same two-condition gate as pdn_plane_impedance: a doubling under
+        # tolerance AND under half the previous doubling. One condition can be
+        # fooled by a slowly converging tail - the increments here can sit near
+        # the tolerance for several orders before they collapse.
+        if (rc <= tol and len(increments) >= 3
+                and prev_rc is not None and rc <= 0.5 * prev_rc):
+            accepted = order_next
+            break
+        if order_next >= order_cap:
+            return err(
+                "the loaded modal sum had not settled at order %d: |Z_in| still "
+                "moves %.4g%% of the band peak at %.6g Hz when the truncation "
+                "doubles, against a tolerance of %.4g%%"
+                % (order_next, 100.0 * rc, where or 0.0, 100.0 * tol),
+                "NOT_CONVERGED",
+                hint="widen the pad (port_size_mm / caps[].pad_mm) or raise "
+                     "max_order; a small pad is what makes this series hard to sum",
+                extra={"order_reached": order_next,
+                       "max_change_rel_to_peak": _sig(rc),
+                       "max_pointwise_relative_change": _sig(pw_change),
+                       "worst_freq_hz": _sig(where) if where is not None else None,
+                       "order_scan": history})
+        order, z_prev = order_next, z_next
+
+    insert = []
+    for m in range(min(accepted, m_lim) + 1):
+        for n in range(min(accepted, n_lim) + 1):
+            if not (m or n):
+                continue
+            fmn = f_of(m, n)
+            if lo <= fmn <= hi:
+                insert.append(fmn)
+    curve = sorted(set([round(f, 6) for f in grid] + [round(f, 6) for f in insert]))
+    if len(curve) > 240:
+        keep = set(round(f, 6) for f in insert)
+        stride = int(math.ceil(len(curve) / 240.0))
+        curve = [f for i, f in enumerate(curve) if i % stride == 0 or f in keep]
+
+    rows = []
+    worst_re = None
+    worst_re_f = None
+    for f in curve:
+        zi, zp = answer(f, accepted)
+        if zi == "singular":
+            return err("the loaded cavity is singular at %.6g Hz: a cap branch is "
+                       "a perfect short there" % f, "NO_SOLUTION",
+                       hint="give the cap a non-zero esr_ohm")
+        if zi.real < 0.0 and (worst_re is None or zi.real / abs(zi) < worst_re):
+            worst_re, worst_re_f = zi.real / abs(zi), f
+        rows.append({"freq_hz": _sig(f), "z_ohm": _sig(abs(zi)),
+                     "plane_only_z_ohm": _sig(abs(zp)),
+                     "phase_deg": _sig(math.degrees(math.atan2(zi.imag, zi.real)), 5)})
+    if worst_re is not None and worst_re < -1e-9:
+        return err("the loaded network is not passive: Re(Z_in) is %.3g of |Z_in| "
+                   "at %.6g Hz. A passive cavity plus esr >= 0 cannot do that, so "
+                   "the port reduction or a modal normalisation is wrong"
+                   % (worst_re, worst_re_f or 0.0),
+                   "INTERNAL_CHECK_FAILED",
+                   extra={"worst_re_over_abs_z": _sig(worst_re, 5),
+                          "worst_re_freq_hz": _sig(worst_re_f)})
+
+    peak = max(rows, key=lambda r: r["z_ohm"])
+    plane_peak = max(rows, key=lambda r: r["plane_only_z_ohm"])
+    first_mode = min(insert) if insert else None
+    dips = [r for r in rows if first_mode is not None and r["freq_hz"] > first_mode]
+    dip = min(dips, key=lambda r: r["z_ohm"]) if dips else None
+
+    # ---- integrity gates --------------------------------------------------
+    # (1) the plane half: below the first mode Z00 must be the plane cap. This
+    #     is the same anchor pdn_plane_impedance uses, measured there at 0.15 %.
+    c_pp = EPS0 * e * a_m * b_m / t_m
+    f_pl = f_first / 1000.0
+    zi_pl, zp_pl = answer(f_pl, accepted)
+    if zi_pl == "singular":
+        return err("the loaded cavity is singular at the plane anchor frequency",
+                   "NO_SOLUTION")
+    anchor = abs(abs(zp_pl) / (1.0 / (2.0 * math.pi * f_pl * c_pp)) - 1.0) * 100.0
+    if anchor > 1.0:
+        return err("the modal constants no longer rebuild the plane capacitance: "
+                   "%.4g ohm against %.4g ohm at %.6g Hz (%.3g%% off)"
+                   % (abs(zp_pl), 1.0 / (2.0 * math.pi * f_pl * c_pp), f_pl,
+                      anchor),
+                   "INTERNAL_CHECK_FAILED",
+                   extra={"plane_anchor_error_pct": _sig(anchor)})
+
+    # (2) the loaded half: at a frequency low enough that the cavity itself is
+    #     one capacitor, the loaded input must be the caps in parallel with the
+    #     plane capacitance. That anchor is only exact when the caps DOMINATE
+    #     there: the (0,0) mode carries a low-frequency copper-loss wart (Q =
+    #     h/delta_s makes a uniform field lossy as f -> 0, which it is not), and
+    #     the spreading inductance between the two ports is real. Measured: with
+    #     the caps 10x smaller than |Z00| the anchor holds to 0.02 %, with the
+    #     caps comparable to |Z00| it is off by up to 2.4 % - so it is applied
+    #     only in the regime where it means something, and reported either way.
+    f_lf = f_first / 1e5
+    zi_lf, zp_lf = answer(f_lf, accepted)
+    if zi_lf == "singular":
+        return err("the loaded cavity is singular at the anchor frequency",
+                   "NO_SOLUTION")
+    y_tot = complex(0.0, 2.0 * math.pi * f_lf * c_pp)
+    for s in site:
+        y_tot += 1.0 / cap_z(f_lf, s)
+    z_anchor = 1.0 / y_tot
+    anchor_lf = abs(abs(zi_lf) / abs(z_anchor) - 1.0) * 100.0
+    anchor_lf_ok = bool(site) and abs(z_anchor) <= 0.1 * abs(zp_lf)
+    if anchor_lf_ok and anchor_lf > 0.5:
+        return err("at %.6g Hz the loaded network no longer rebuilds its own "
+                   "low-frequency limit: %.4g ohm against %.4g ohm (%.3g%% off), "
+                   "and there the caps dominate, so nothing else can explain it"
+                   % (f_lf, abs(zi_lf), abs(z_anchor), anchor_lf),
+                   "INTERNAL_CHECK_FAILED",
+                   extra={"low_freq_anchor_error_pct": _sig(anchor_lf),
+                          "low_freq_anchor_hz": _sig(f_lf)})
+
+    # (3) passivity: a passive cavity loaded with esr >= 0 cannot hand energy
+    #     back. It bites if the port reduction or the matrix normalisation is
+    #     wrong, which is exactly the mistake a factor-of-two in P_i makes.
+    #     Checked over the curve below.
+
+    # what the caps did AT the plane's own worst mode - the number a cap bank
+    # has to move, as opposed to wherever the loaded curve happens to peak.
+    # plane_peak IS a row of the same curve, so this costs nothing.
+    at_plane_peak = plane_peak["z_ohm"]
+    q_first, qc_first, qd_first = _plane_q_of(f_first, t_m, td, sg)
+    c_tot = c_pp + sum(s["c_farad"] for s in site)
+    extra = {
+        "curve": rows,
+        "curve_points": len(rows),
+        "peak_z_ohm": peak["z_ohm"],
+        "peak_freq_hz": peak["freq_hz"],
+        "dip_z_ohm": dip["z_ohm"] if dip else None,
+        "dip_freq_hz": dip["freq_hz"] if dip else None,
+        "plane_only_peak_z_ohm": plane_peak["plane_only_z_ohm"],
+        "plane_only_peak_freq_hz": plane_peak["freq_hz"],
+        "peak_ratio_vs_plane": _sig(peak["z_ohm"] / plane_peak["plane_only_z_ohm"])
+                               if plane_peak["plane_only_z_ohm"] else None,
+        "peak_at_cavity_mode": bool(
+            min([abs(peak["freq_hz"] / f - 1.0) for f in insert])
+            < 0.01) if insert else False,
+        "at_plane_peak_z_ohm": at_plane_peak,
+        "at_plane_peak_damping": _sig(plane_peak["plane_only_z_ohm"]
+                                      / at_plane_peak) if at_plane_peak else None,
+        "band_hz": [_sig(lo), _sig(hi)],
+        "band_defaulted": defaulted,
+        "spacing": spacing,
+        "mode_frequencies_inserted": len(insert),
+        "first_resonance_hz": _sig(f_first),
+        "first_mode_q": _sig(q_first),
+        "first_mode_q_copper": _sig(qc_first),
+        "first_mode_q_dielectric": _sig(qd_first),
+        "plane_capacitance_f": _sig(c_pp),
+        "total_capacitance_f": _sig(c_tot),
+        "cap_count": n_cap,
+        "caps": [{"at_mm": list(s["at_mm"]), "c_farad": _sig(s["c_farad"]),
+                  "pad_mm": [s["pad_mm"][0], s["pad_mm"][1]],
+                  "esr_ohm": _sig(s["esr_ohm"]), "esl_h": _sig(s["esl_h"])}
+                 for s in site],
+        "truncation_order": accepted,
+        "truncation_max_change_rel_to_peak": history[-1]["max_change_rel_to_peak"],
+        "truncation_max_pointwise_relative_change":
+            history[-1]["max_pointwise_relative_change"],
+        "truncation_tolerance": tol,
+        "order_scan": history,
+        "plane_anchor_error_pct": _sig(anchor),
+        "low_freq_anchor_error_pct": _sig(anchor_lf),
+        "low_freq_anchor_hz": _sig(f_lf),
+        "low_freq_anchor_applicable": anchor_lf_ok,
+        "worst_re_over_abs_z": _sig(worst_re, 5) if worst_re is not None else None,
+        "port_mm": [r0[0], r0[1]],
+        "port_size_mm": [sx, sy],
+        "copper_loss": "included (Qc = h/delta_s)" if sg else
+                       "off: ideal copper, dielectric loss only",
+        "not_computed": list(_CAP_NOT_COMPUTED),
+    }
+    return ok(peak["z_ohm"], unit="ohm",
+              model="lossy_PMC_cavity_modal_sum_port_reduced_with_RLC_caps",
+              basis="Z_in = Z00 - Z0c*(Zcc + diag(esr + jw*esl + 1/(jwC)))^-1*Zc0, "
+                    "with Z_ij the cavity transfer impedance of "
+                    "pdn_plane_impedance for each port's own pad",
+              precision="the loaded curve is quoted at the truncation order in "
+                        "order_scan, where doubling the order moved it by less "
+                        "than truncation_tolerance",
+              assumptions={"er": e, "thickness_mm": t, "tan_delta": td,
+                           "conductivity_s_m": sg,
+                           "aperture": "every port is area-averaged over its own "
+                                       "pad, which is what gives the series a limit",
+                           "side_walls": "PMC (open edge, no fence)",
+                           "caps": "%d R-L-C branch(es) from plane to plane, "
+                                   "driven by the esr/esl you gave" % n_cap},
               extra=extra)
 
 def pdn_impedance(freqs_hz, caps, plane_cap_farad=None, r_series_ohm=0.0,

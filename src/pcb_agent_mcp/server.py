@@ -2008,6 +2008,71 @@ def selftest():
                  100.0 * (_pad384 / _pad256 - 1.0)),
               _pt256 > 2.0 * _pt8 and abs(_pad384 / _pad256 - 1.0) < 0.01,
               "%.3f/%.3f" % (_pt256, _pt8))
+
+        # --- 0.0.50, the caps ON the planes. Four readings, each of which can
+        # fail: the empty-cap limit is the plane tool, a cap on a mode null must
+        # NOT damp that mode, and the anti-resonance must follow the cap's own
+        # inductance down as the inductance goes up.
+        _base = {"width_mm": 50, "height_mm": 50, "er": 4.4,
+                 "thickness_mm": 1.6, "tan_delta": 0.02,
+                 "port_mm": [12.5, 25.0], "port_size_mm": 0.5}
+        _args = dict(_base)
+        _args["caps"] = []
+        _args["freqs_hz"] = [_flo, _f10]
+        _nc = json.loads(handle({"jsonrpc": "2.0", "id": 1601,
+                                 "method": "tools/call",
+                                 "params": {"name": "pdn_plane_with_caps",
+                                            "arguments": _args}})
+                         ["result"]["content"][0]["text"])
+        _nc_rows = _nc.get("curve") or []
+        _nc_hi = min(_nc_rows, key=lambda q: abs(q["freq_hz"] - _f10)) if _nc_rows else {}
+        check("with no caps the loaded answer IS the plane curve (%.4f vs %.4f ohm)"
+              % (_nc_hi.get("z_ohm", -1), _hi.get("z_ohm", -1)),
+              _nc.get("status") == "ok"
+              and abs(_nc_hi.get("z_ohm", 0.0) / _hi.get("z_ohm", 1.0) - 1.0) < 1e-9,
+              str(_nc_hi.get("freq_hz")))
+        _mode2 = 299792458.0 / (2.0 * _a * 4.4 ** 0.5) * 2.0   # the (0,2) mode
+        _z_mode = {}
+        for _tag, _at in (("antinode", [25.0, 25.0]), ("null", [25.0, 12.5])):
+            _a2 = dict(_base)
+            _a2["caps"] = [{"at_mm": _at, "c_farad": 100e-9, "pad_mm": 1.0,
+                            "esr_ohm": 0.01, "esl_h": 1e-9}]
+            _a2["freqs_hz"] = [_mode2]
+            _res = json.loads(handle({"jsonrpc": "2.0", "id": 1602,
+                                      "method": "tools/call",
+                                      "params": {"name": "pdn_plane_with_caps",
+                                                 "arguments": _a2}})
+                              ["result"]["content"][0]["text"])
+            _row = (_res.get("curve") or [{}])[0]
+            _z_mode[_tag] = (_row.get("z_ohm"), _row.get("plane_only_z_ohm"))
+        check("a cap on the (0,2) antinode damps it (%.3f of %.3f ohm) while the same "
+              "cap on its null does not (%.3f ohm)" % (
+                  _z_mode.get("antinode", (0, 1))[0], _z_mode.get("antinode", (0, 1))[1],
+                  _z_mode.get("null", (0, 0))[0]),
+              _z_mode["antinode"][0] < 0.8 * _z_mode["antinode"][1]
+              and abs(_z_mode["null"][0] / _z_mode["null"][1] - 1.0) < 0.01,
+              str(_z_mode))
+        _grid = [279e6, 440e6]
+        _z_esl = {}
+        for _esl in (1e-9, 4e-9):
+            _a3 = dict(_base)
+            _a3["caps"] = [{"at_mm": [25.0, 25.0], "c_farad": 100e-9, "pad_mm": 1.0,
+                            "esr_ohm": 0.01, "esl_h": _esl}]
+            _a3["freqs_hz"] = _grid
+            _res = json.loads(handle({"jsonrpc": "2.0", "id": 1603,
+                                      "method": "tools/call",
+                                      "params": {"name": "pdn_plane_with_caps",
+                                                 "arguments": _a3}})
+                              ["result"]["content"][0]["text"])
+            _z_esl[_esl] = [q["z_ohm"] for q in (_res.get("curve") or [])
+                            if q["freq_hz"] in _grid]
+        check("the cap/plane anti-resonance follows the cap inductance DOWN: 1 nH peaks "
+              "at 440 MHz (%.2f ohm, 279 MHz reads %.2f) and 4 nH at 279 MHz "
+              "(%.2f ohm, 440 MHz reads %.2f)"
+              % (_z_esl[1e-9][1], _z_esl[1e-9][0], _z_esl[4e-9][0], _z_esl[4e-9][1]),
+              _z_esl[1e-9][1] > 10.0 * _z_esl[1e-9][0]
+              and _z_esl[4e-9][0] > 10.0 * _z_esl[4e-9][1],
+              str(_z_esl))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 
