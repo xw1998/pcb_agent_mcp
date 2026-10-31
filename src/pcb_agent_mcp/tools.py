@@ -3913,7 +3913,7 @@ def _capabilities(_args):
             "point only - there is no stress map, no stress concentration at a hole "
             "or a stiffener, and no fatigue law applied to those numbers (Steinberg "
             "needs slope and allowable from you)",
-            "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives L/C values with its own S21 audited two ways; finite-Q dissipation and first-order parasitics (inductor cp, capacitor esl) are available but OFF unless asked for, and the loss model is a resistor per branch, not dielectric or conductor physics - no skin effect, no substrate loss, no temperature drift. filter_mc_yield does tolerance yield, but it is uniform and independent only (no correlation, no batch shift, no ageing), so it is a worst case whose confidence half-width grows as 1/sqrt(n_draws). filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity is TE101 only: no higher-order modes, no mode chart, no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no surface-roughness correction. filter_coupling_matrix evaluates the coupling matrix as a real network (finite zeros from a cross-coupling, finite-Qu loss), but it PERTURBS the inline matrix rather than running a full Cameron synthesis: the in-band ripple it reports is the perturbed one, so a cross-coupled filter whose mask matters still needs the synthesis run and then the EM run. It also has no dispersion, no iris or probe geometry, and no layout. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
+            "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives L/C values with its own S21 audited two ways; finite-Q dissipation and first-order parasitics (inductor cp, capacitor esl) are available but OFF unless asked for, and the loss model is a resistor per branch, not dielectric or conductor physics - no skin effect, no substrate loss, no temperature drift. filter_mc_yield does tolerance yield, but it is uniform and independent only (no correlation, no batch shift, no ageing), so it is a worst case whose confidence half-width grows as 1/sqrt(n_draws). filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity covers any TE_mnp / TM_mnp, charts the modes below a band edge and takes an Rq roughness correction, but it has no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no radiation Q and no 3-D field map. filter_coupling_matrix evaluates the coupling matrix as a real network (finite zeros from a cross-coupling, finite-Qu loss), but it PERTURBS the inline matrix rather than running a full Cameron synthesis: the in-band ripple it reports is the perturbed one, so a cross-coupled filter whose mask matters still needs the synthesis run and then the EM run. It also has no dispersion, no iris or probe geometry, and no layout. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "
                     "missing fact is refused or declared absent, never defaulted",
@@ -6402,11 +6402,15 @@ _tool(
 
 _tool(
     "filter_waveguide_cavity",
-    "Rectangular waveguide cavity in the TE101 mode: resonant length for a given a and b, "
-    "unloaded Q from wall loss computed TWO independent ways (closed-form bracket vs a "
-    "numerical |H_tan|^2 surface integral over all six walls - they must agree within 2 % "
-    "or the answer is refused), and R/Q. Only TE101: no higher-order modes, no mode chart, "
-    "no iris/coupling geometry.",
+    "Rectangular waveguide cavity in ANY TE_mnp / TM_mnp mode: the resonant length for a "
+    "given a and b, the unloaded Q from wall loss computed TWO independent ways (exact "
+    "closed-form sine/cosine integrals vs a field integration on a grid over all six walls "
+    "- they must agree within 2 % and the stored energies must balance, or the answer is "
+    "withheld), an optional mode chart of EVERY mode below a band edge (Qc, degeneracy and "
+    "the next mode above f0), an optional surface-roughness correction (Rq), and R/Q for "
+    "TE101. TM_mn0 has no length to give - it resonates at its transverse cutoff for any "
+    "length - and is refused by name rather than answered with a made-up d. No iris or "
+    "probe coupling geometry: that needs a full-wave solve.",
     {"type": "object", "properties": {
         "f0_hz": _num("target resonant frequency in Hz"),
         "a_mm": _num("broad-wall width a"),
@@ -6414,7 +6418,20 @@ _tool(
         "conductivity_s_m": _num("wall conductivity, default copper 5.8e7", 5.8e7),
         "mu_r": _num("relative permeability of the fill", 1.0),
         "er": _num("relative permittivity of the fill", 1.0),
-        "mode": _str("cavity mode", ["TE101"]),
+        "mode": _str("cavity mode: 'TE101' (three single digits, how everyone writes it) "
+                     "or underscored integers like 'TE_2_0_1' / 'TM_1_1_1' (the only "
+                     "unambiguous way to write an index >= 10 - plain 'TE201' could also "
+                     "mean 20,1 and a guess there would silently answer a different mode). "
+                     "Any valid TE_mnp (p >= 1) or TM_mnp (m, n >= 1).",
+                     None, "TE101"),
+        "roughness_um": _num("RMS surface roughness Rq in um (e.g. 2.0 for a milled wall): "
+                             "the surface resistance is multiplied by the "
+                             "Hammerstad-Jensen K and Qc is divided by it. Rz is NOT "
+                             "converted - pass Rq"),
+        "modes_upto_hz": _num("top of the mode chart in Hz: every TE_mnp/TM_mnp of this "
+                              "cavity below that frequency with its Qc, degeneracy and "
+                              "is_operating, plus the next mode above f0; at most 200 "
+                              "modes"),
     }, "required": ["f0_hz", "a_mm"]},
     lambda a: _filters.waveguide_cavity(
         a.get("f0_hz"), a.get("a_mm"),
@@ -6423,7 +6440,9 @@ _tool(
                           if a.get("conductivity_s_m") is not None else 5.8e7),
         mu_r=(a["mu_r"] if a.get("mu_r") is not None else 1.0),
         er=(a["er"] if a.get("er") is not None else 1.0),
-        mode=a.get("mode") or "TE101"),
+        mode=a.get("mode") or "TE101",
+        roughness_um=a.get("roughness_um"),
+        modes_upto_hz=a.get("modes_upto_hz")),
 )
 
 _tool(

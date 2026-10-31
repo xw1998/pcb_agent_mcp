@@ -2134,6 +2134,109 @@ def selftest():
               and "roughness" not in _smooth and "roughness" in _rough2
               and _rough2.get("q_conductor", 1e9) < 0.75 * _smooth.get("q_conductor", 0),
               "%s/%s" % (_rough2.get("q_conductor"), _smooth.get("q_conductor")))
+
+        # --- 0.0.52, the cavity side: any TE_mnp / TM_mnp, the mode chart, and
+        # roughness on Qc. The gates that can actually fail: (1) the general
+        # closed form must reproduce the TE101 bracket formula EXACTLY - same
+        # physics, two derivations, and a wrong sine/cosine pair in either one
+        # moves it; (2) every mode must balance U_e/U_m = 1, which is the check
+        # that caught a field expression with a missing factor during the
+        # rewrite (the ratio is u_e/u_m, NOT u_e/(u_e+u_m): the latter is 0.5 for
+        # every balanced mode and would be a gate with no teeth); (3) the chart
+        # must contain the neighbours at the right places with the right
+        # degeneracy, because "my filter is fine" is a claim about them.
+        from .calc.filters import _cavity_q_numeric as _cqnum
+
+        def _wc(_args, _id):
+            _env = json.loads(handle({"jsonrpc": "2.0", "id": _id,
+                                      "method": "tools/call",
+                                      "params": {"name": "filter_waveguide_cavity",
+                                                 "arguments": _args}})
+                               ["result"]["content"][0]["text"])
+            _flat = dict(_env.get("value") or {})
+            _flat.update({k: v for k, v in _env.items() if k != "value"})
+            return _flat
+
+        _wr = [22.86e-3, 10.16e-3]                     # WR-90
+        _t101 = _wc({"f0_hz": 10e9, "a_mm": 22.86, "b_mm": 10.16,
+                     "modes_upto_hz": 20e9}, 1609)
+        _chart = {q["mode"]: q for q in (_t101.get("mode_chart") or [])}
+        _gen101 = (_chart.get("TE_1_0_1") or {}).get("q_conductor")
+        check("the general closed form reproduces the TE101 bracket formula exactly "
+              "(%.1f vs %.1f, length %.4f mm, R/Q %.4f ohm)"
+              % (_gen101 or -1, _t101.get("q_conductor", -1),
+                 _t101.get("length_mm", -1), _t101.get("r_over_q_ohm") or -1),
+              _gen101 is not None
+              and abs(_gen101 - _t101.get("q_conductor", 0.0)) <= 0.11
+              and abs(_t101.get("length_mm", 0.0) - 19.8536) <= 1e-4
+              and abs((_t101.get("r_over_q_ohm") or 0.0) - 160.9572) <= 1e-4,
+              str(_t101.get("q_conductor")))
+
+        _t011 = _wc({"f0_hz": 16.573220e9, "a_mm": 22.86, "b_mm": 10.16,
+                     "mode": "TE_0_1_1"}, 1610)
+        _bal = []
+        for _fam, _m, _n, _p, _f in (("TE", 0, 1, 1, 16.573220e9),
+                                     ("TE", 1, 1, 1, 17.823e9),
+                                     ("TM", 1, 1, 1, 17.823e9),
+                                     ("TM", 2, 1, 1, 25.6615e9)):
+            _kx, _ky = _m * _math.pi / _wr[0], _n * _math.pi / _wr[1]
+            _kc2 = _kx * _kx + _ky * _ky
+            _k0 = 2.0 * _math.pi * _f / 299792458.0
+            _d = _p * _math.pi / _math.sqrt(_k0 * _k0 - _kc2)
+            _bal.append(_cqnum(_fam, _m, _n, _p, _wr[0], _wr[1], _d, _f, 0.026)[1])
+        check("every mode balances stored energy (u_e/u_m = %s) and TE_0_1_1 answers "
+              "at d = %.4f mm with a %.1f Qc that its own field integral confirms"
+              % (", ".join("%.9f" % b for b in _bal), _t011.get("length_mm", -1),
+                 _t011.get("q_conductor", -1)),
+              all(abs(b - 1.0) <= 1e-6 for b in _bal)
+              and abs(_t011.get("length_mm", 0.0) - 19.8536) <= 1e-4
+              and _t011.get("q_agreement_pct") == 0.0
+              and abs(_t011.get("q_conductor", 0.0) - 8828.7) <= 0.05,
+              str(_bal))
+
+        _deg = (_chart.get("TE_1_1_1") or {}).get("degeneracy")
+        _tm110 = (_chart.get("TM_1_1_0") or {}).get("f_hz")
+        check("the mode chart below 20 GHz holds %d modes, names TE_2_0_1 as the next "
+              "one (x%.4f), puts TM_1_1_0 at %.4f GHz and shows TE_1_1_1/TM_1_1_1 as a "
+              "degenerate pair (count %s)"
+              % (_t101.get("mode_chart_count", -1),
+                 ((_t101.get("next_mode") or {}).get("f_over_f0") or -1),
+                 (_tm110 or 0.0) / 1e9, _deg),
+              _t101.get("mode_chart_count") == 9
+              and (_t101.get("next_mode") or {}).get("mode") == "TE_2_0_1"
+              and abs((_tm110 or 0.0) - 16.1451e9) <= 1e6
+              and _deg == 2,
+              str(_t101.get("mode_chart_count")))
+
+        _rsm = _wc({"f0_hz": 10e9, "a_mm": 22.86, "b_mm": 10.16,
+                    "roughness_um": 2.0}, 1611)
+        _k52 = (_rsm.get("roughness") or {}).get("loss_factor") or 1.0
+        check("roughness divides this Qc by K = %.6f and says so: the reported smooth "
+              "Qc (%.1f) IS the smooth call's answer (%.1f), and rough*K returns "
+              "there (%.2f); K stays below 2"
+              % (_k52, (_rsm.get("roughness") or {}).get("q_conductor_smooth", -1),
+                 _t101.get("q_conductor", -1),
+                 _rsm.get("q_conductor", 0.0) * _k52),
+              abs((_rsm.get("roughness") or {}).get("q_conductor_smooth", 0.0)
+                  - _t101.get("q_conductor", 1.0)) <= 0.05
+              and 1.5 < _k52 < 2.0
+              and abs(_rsm.get("q_conductor", 0.0) * _k52
+                      / _t101.get("q_conductor", 1.0) - 1.0) <= 1e-4,
+              str((_rsm.get("roughness") or {}).get("q_conductor_smooth")))
+
+        # a filled cavity (er, mu_r) is where 0.0.51 refused: its field integral used
+        # vacuum eps/mu while the closed form did not, so the two disagreed and the
+        # tool withheld the answer. The agreement must now be exact, not merely small.
+        _med = _wc({"f0_hz": 12e9, "a_mm": 30.0, "b_mm": 15.0,
+                    "er": 2.2, "mu_r": 1.2}, 1612)
+        check("a dielectric/magnetic fill (er 2.2, mu_r 1.2) answers instead of "
+              "refusing: d = %.4f mm, Qc = %.1f, the two derivations agree to %.4f %%"
+              % (_med.get("length_mm", -1), _med.get("q_conductor", -1),
+                 _med.get("q_agreement_pct", -1)),
+              _med.get("status", "ok") != "error"
+              and abs(_med.get("length_mm", 0.0) - 7.9535) <= 1e-4
+              and _med.get("q_agreement_pct") == 0.0,
+              str(_med.get("message"))[:120])
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

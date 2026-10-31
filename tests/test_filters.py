@@ -250,8 +250,21 @@ class TestWaveguideCavity(unittest.TestCase):
         # 5 GHz is below the 6.56 GHz TE10 cutoff of WR-90: no TE101 exists
         _err(F.waveguide_cavity(5e9, 22.86, 10.16), "OUT_OF_VALIDITY")
 
-    def test_only_te101_is_implemented(self):
-        _err(F.waveguide_cavity(10e9, 22.86, 10.16, mode="TE011"), "NOT_IMPLEMENTED")
+    def test_higher_order_modes_are_answered_not_refused(self):
+        # 0.0.52 removed the TE101-only wall. TE011 at 10 GHz is BELOW its own
+        # TE01 cutoff (14.7536 GHz), so it must be refused for a physical reason
+        # with that cutoff named - not with "not implemented".
+        r = F.waveguide_cavity(10e9, 22.86, 10.16, mode="TE011")
+        self.assertEqual(r.get("reason_code"), "OUT_OF_VALIDITY")
+        self.assertIn("cutoff", r.get("message", ""))
+        self.assertIn("TE_0_1", r.get("message", ""))
+        # ... and at its own frequency it answers, with the same length as the
+        # TE101 that sits at 10 GHz only by coincidence of this a/b.
+        v = _ok(F.waveguide_cavity(16.573220e9, 22.86, 10.16, mode="TE011"))["value"]
+        self.assertEqual(v["mode"], "TE_0_1_1")
+        self.assertAlmostEqual(v["length_mm"], 19.8536, delta=1e-3)
+        self.assertAlmostEqual(v["q_conductor"], 8828.7, delta=80.0)
+        self.assertAlmostEqual(v["q_conductor"], v["q_conductor_numeric"], delta=1e-6)
 
     def test_default_b_is_a_over_two_and_says_so(self):
         v = _ok(F.waveguide_cavity(10e9, 22.86))["value"]

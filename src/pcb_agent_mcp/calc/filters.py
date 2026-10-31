@@ -7,7 +7,8 @@ module answers for each:
   2. "Turn that into a lumped LC bandpass and show me S21"   -> lumped_bandpass
   3. "Give me w and s for this odd/even impedance pair"      -> coupled_microstrip
   4. "Turn that into an edge-coupled resonator BPF"          -> coupled_resonator_bpf
-  and the cavity side: TE101 length, Qc, R/Q                  -> waveguide_cavity
+  and the cavity side: length, Qc, R/Q for any TE_mnp/TM_mnp   -> waveguide_cavity
+     plus the mode chart below a band edge (mode charts need neighbours)
 
 Two rules the whole module is built around:
 
@@ -31,6 +32,7 @@ import math
 import random
 
 from .result import ok, err
+from .roughness import roughness_factor
 
 C0 = 299792458.0                 # m/s, exact by definition
 EPS0 = 8.8541878128e-12          # F/m
@@ -1288,7 +1290,7 @@ def _te101_fields(x, y, z, a, b, d, e0=1.0):
     return ey, hx, hz
 
 
-def _te101_q_numeric(a, b, d, f0, rs_ohm, n=24):
+def _te101_q_numeric(a, b, d, f0, rs_ohm, n=24, eps=EPS0, mu=MU0):
     """Qc by integrating the wall currents and the stored energy numerically.
 
     Deliberately independent of the closed-form bracket algebra: this is the
@@ -1331,26 +1333,248 @@ def _te101_q_numeric(a, b, d, f0, rs_ohm, n=24):
             _ey, hx, hz = _te101_fields(x, 0.0, z, a, b, d)
             wall += 2.0 * (hx * hx + hz * hz) * (a / n) * (d / n)
 
-    u_e = 0.25 * EPS0 * int_e                       # peak-phasor time average
-    p_c = 0.5 * rs_ohm * wall / (w0 * MU0) ** 2     # |H| carries 1/(w mu)
+    u_e = 0.25 * eps * int_e                        # peak-phasor time average
+    p_c = 0.5 * rs_ohm * wall / (w0 * mu) ** 2      # |H| carries 1/(w mu)
     if p_c <= 0:
         return None
     return w0 * 2.0 * u_e / p_c
 
 
+# ------------------------------------------------------- general cavity modes
+def _sin2(idx, length):
+    """Integral of sin^2(idx*pi*x/length) over [0, length], in closed form."""
+    return 0.0 if idx == 0 else 0.5 * length
+
+def _cos2(idx, length):
+    """Integral of cos^2(idx*pi*x/length) over [0, length], in closed form."""
+    return length if idx == 0 else 0.5 * length
+
+def _parse_cavity_mode(mode):
+    """(family, m, n, p) from 'TE101' / 'te_1_0_1' / 'TM110'; None when unreadable.
+
+    Two spellings on purpose: three single digits (how everyone writes TE101) and
+    underscored integers (the only way to say TE_2_0_1 without ambiguity - 'TE201'
+    could also be 20,1 and a guess there would silently answer a different mode).
+    """
+    s = str(mode or "").strip().upper().replace(" ", "")
+    if len(s) < 3:
+        return None
+    fam, tail = s[:2], s[2:]
+    if fam not in ("TE", "TM"):
+        return None
+    if tail.startswith("_"):
+        parts = tail[1:].split("_")
+    elif len(tail) == 3 and tail.isdigit():
+        parts = list(tail)
+    else:
+        return None
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    return fam, int(parts[0]), int(parts[1]), int(parts[2])
+
+def _cavity_mode_name(fam, m, n, p):
+    return "%s_%d_%d_%d" % (fam, m, n, p)
+
+def _cavity_mode_reason(fam, m, n, p):
+    """Why (family, m, n, p) is not a cavity mode, or None when it is one."""
+    if m < 0 or n < 0 or p < 0:
+        return "mode indices must be >= 0"
+    if fam == "TE":
+        if m == 0 and n == 0:
+            return ("TE_mnp needs at least one of m, n non-zero: with both zero the "
+                    "transverse field is uniform (kc = 0) and no TE mode exists")
+        if p == 0:
+            return ("TE_mn0 needs p >= 1: the axial field goes as sin(p*pi*z/d), "
+                    "identically zero at p = 0, so TE_mn0 is not a mode")
+    else:
+        if m == 0 or n == 0:
+            return ("TM_mnp needs m >= 1 and n >= 1: with either index zero the axial "
+                    "E field sin(m*pi*x/a)*sin(n*pi*y/b) vanishes everywhere")
+    return None
+
+def _cavity_q_closed(fam, m, n, p, a, b, d, f0, rs_ohm, mur=1.0):
+    """Qc of TE_mnp / TM_mnp from the exact volume and wall integrals.
+
+    Qc = w*mu*int|H|^2 dV / (Rs * contour|H_tan|^2 dS) for peak phasors: the
+    stored energy at resonance is U = int(mu|H|^2)/2 and the wall loss is
+    Pc = Rs*contour(|H_tan|^2)/2. Every integral below is a product of
+    int sin^2 = L/2 and int cos^2 = L/2 (L itself when the index is 0), so the
+    answer is closed form - no quadrature, and no table of "the usual formula"
+    that could be copied with the wrong index pair.
+
+    For TM the H components carry a common (w*eps/kc^2) factor which cancels
+    between numerator and denominator, so it is dropped.
+    """
+    kx = m * math.pi / a
+    ky = n * math.pi / b
+    kz = p * math.pi / d
+    kc2 = kx * kx + ky * ky
+    if kc2 <= 0.0:
+        return None
+    sx, cx = _sin2(m, a), _cos2(m, a)
+    sy, cy = _sin2(n, b), _cos2(n, b)
+    sz, cz = _sin2(p, d), _cos2(p, d)
+    if fam == "TE":
+        fx = kz * kx / kc2
+        fy = kz * ky / kc2
+        vol = cx * cy * sz + fx * fx * sx * cy * cz + fy * fy * cx * sy * cz
+        # walls: z = 0,d carry Hx,Hy; x = 0,a carry Hy,Hz; y = 0,b carry Hx,Hz
+        wall = 2.0 * ((fx * fx * sx * cy + fy * fy * cx * sy)
+                      + (fy * fy * sy * cz + cy * sz)
+                      + (fx * fx * sx * cz + cx * sz))
+    else:
+        vol = ky * ky * sx * cy * cz + kx * kx * cx * sy * cz
+        # walls: z = 0,d carry Hx,Hy; x = 0,a carry Hy only; y = 0,b carry Hx only
+        wall = 2.0 * ((ky * ky * sx * cy + kx * kx * cx * sy)
+                      + kx * kx * sy * cz + ky * ky * sx * cz)
+    if vol <= 0.0 or wall <= 0.0:
+        return None
+    return (2.0 * math.pi * f0) * MU0 * mur * vol / (rs_ohm * wall)
+
+def _cavity_q_numeric(fam, m, n, p, a, b, d, f0, rs_ohm, mur=1.0, er=1.0,
+                      n_grid=24):
+    """(Qc, U_e/U_m) for TE_mnp / TM_mnp by integrating the fields on a grid.
+
+    Deliberately shares no algebra with _cavity_q_closed: the fields are written
+    out and both energies are integrated independently, so the returned ratio
+    U_e/U_m must come back at 1.0 (at resonance electric and magnetic energy are
+    equal - if it does not, an E or H expression is wrong and the tool refuses).
+    The ratio is u_e/u_m and not u_e/(u_e+u_m) on purpose: the latter is 0.5 for
+    every mode that balances, so it cannot fail and would be a gate with no teeth.
+    """
+    kx = m * math.pi / a
+    ky = n * math.pi / b
+    kz = p * math.pi / d
+    kc2 = kx * kx + ky * ky
+    if kc2 <= 0.0:
+        return None, None
+    w0 = 2.0 * math.pi * f0
+    mu = MU0 * mur
+    eps = EPS0 * er
+    dx, dy, dz = a / n_grid, b / n_grid, d / n_grid
+    sum_e = sum_h = 0.0
+    for i in range(n_grid):
+        x = (i + 0.5) * dx
+        for j in range(n_grid):
+            y = (j + 0.5) * dy
+            for k in range(n_grid):
+                z = (k + 0.5) * dz
+                if fam == "TE":
+                    hz = math.cos(kx * x) * math.cos(ky * y) * math.sin(kz * z)
+                    hx = -(kz * kx / kc2) * math.sin(kx * x) * math.cos(ky * y) * math.cos(kz * z)
+                    hy = -(kz * ky / kc2) * math.cos(kx * x) * math.sin(ky * y) * math.cos(kz * z)
+                    ex = -(w0 * mu * ky / kc2) * math.cos(kx * x) * math.sin(ky * y) * math.sin(kz * z)
+                    ey = (w0 * mu * kx / kc2) * math.sin(kx * x) * math.cos(ky * y) * math.sin(kz * z)
+                    e2 = ex * ex + ey * ey
+                    h2 = hx * hx + hy * hy + hz * hz
+                else:
+                    ez = math.sin(kx * x) * math.sin(ky * y) * math.cos(kz * z)
+                    ex = -(kz * kx / kc2) * math.cos(kx * x) * math.sin(ky * y) * math.sin(kz * z)
+                    ey = -(kz * ky / kc2) * math.sin(kx * x) * math.cos(ky * y) * math.sin(kz * z)
+                    hx = (w0 * eps * ky / kc2) * math.sin(kx * x) * math.cos(ky * y) * math.cos(kz * z)
+                    hy = -(w0 * eps * kx / kc2) * math.cos(kx * x) * math.sin(ky * y) * math.cos(kz * z)
+                    e2 = ex * ex + ey * ey + ez * ez
+                    h2 = hx * hx + hy * hy
+                sum_e += e2
+                sum_h += h2
+    cell = dx * dy * dz
+    int_e = sum_e * cell
+    int_h = sum_h * cell
+
+    def _face(fn, nu, nv, du, dv):
+        total = 0.0
+        for i in range(nu):
+            u = (i + 0.5) * du
+            for j in range(nv):
+                total += fn(u, (j + 0.5) * dv)
+        return total * du * dv
+
+    def _z_face(u, v):                       # fixed z, cos(kz z)^2 = 1
+        if fam == "TE":
+            hx = -(kz * kx / kc2) * math.sin(kx * u) * math.cos(ky * v)
+            hy = -(kz * ky / kc2) * math.cos(kx * u) * math.sin(ky * v)
+        else:
+            hx = (w0 * eps * ky / kc2) * math.sin(kx * u) * math.cos(ky * v)
+            hy = -(w0 * eps * kx / kc2) * math.cos(kx * u) * math.sin(ky * v)
+        return hx * hx + hy * hy
+
+    def _x_face(u, v):                       # fixed x (u = y, v = z)
+        if fam == "TE":
+            hy = -(kz * ky / kc2) * math.sin(ky * u) * math.cos(kz * v)
+            hz = math.cos(ky * u) * math.sin(kz * v)
+        else:
+            hy = -(w0 * eps * kx / kc2) * math.sin(ky * u) * math.cos(kz * v)
+            hz = 0.0
+        return hy * hy + hz * hz
+
+    def _y_face(u, v):                       # fixed y (u = x, v = z)
+        if fam == "TE":
+            hx = -(kz * kx / kc2) * math.sin(kx * u) * math.cos(kz * v)
+            hz = math.cos(kx * u) * math.sin(kz * v)
+        else:
+            hx = (w0 * eps * ky / kc2) * math.sin(kx * u) * math.cos(kz * v)
+            hz = 0.0
+        return hx * hx + hz * hz
+
+    wall = 2.0 * (_face(_z_face, n_grid, n_grid, dx, dy)
+                  + _face(_x_face, n_grid, n_grid, dy, dz)
+                  + _face(_y_face, n_grid, n_grid, dx, dz))
+    u_e = 0.25 * eps * int_e
+    u_m = 0.25 * mu * int_h
+    energy = u_e + u_m
+    loss = 0.5 * rs_ohm * wall
+    if energy <= 0.0 or loss <= 0.0:
+        return None, None
+    return w0 * energy / loss, (u_e / u_m if u_m > 0.0 else None)
+
+def _cavity_mode_chart(f_max, a, b, d, rs_ohm, c_eff, cap=200):
+    """[(f, family, m, n, p)] with f <= f_max, or (None, count) when over cap."""
+    m_max = int(math.floor(2.0 * f_max * a / c_eff)) + 1
+    n_max = int(math.floor(2.0 * f_max * b / c_eff)) + 1
+    p_max = int(math.floor(2.0 * f_max * d / c_eff)) + 1
+    rows = []
+    for fam in ("TE", "TM"):
+        for m in range(m_max + 1):
+            for n in range(n_max + 1):
+                for p in range(p_max + 1):
+                    if _cavity_mode_reason(fam, m, n, p):
+                        continue
+                    f = 0.5 * c_eff * math.sqrt((m / a) ** 2 + (n / b) ** 2
+                                                + (p / d) ** 2)
+                    if f <= f_max * (1.0 + 1e-12):
+                        rows.append((f, fam, m, n, p))
+    if len(rows) > cap:
+        return None, len(rows)
+    rows.sort()
+    return rows, len(rows)
+
+
 def waveguide_cavity(f0_hz, a_mm, b_mm=None, conductivity_s_m=5.8e7,
-                     mu_r=1.0, er=1.0, mode="TE101"):
-    """TE101 rectangular cavity: the length that resonates, Qc and R/Q.
+                     mu_r=1.0, er=1.0, mode="TE101", roughness_um=None,
+                     modes_upto_hz=None):
+    """Rectangular cavity in any TE_mnp / TM_mnp mode: length, Qc, R/Q, mode chart.
 
     No iris geometry and no coupling: those need a full-wave solve. What is here
     is the resonator every cavity filter is built from, with Qc computed twice -
-    once from the standard wall-loss bracket and once by integrating the fields
-    over the walls - and the two must agree before the answer is returned.
+    once from an exact closed form and once by integrating the fields over the
+    walls - and the two must agree before the answer is returned.
+
+    Two things that used to be refused and are now answered:
+
+      * any mode, not just TE101 - the length comes from kz = p*pi/d, so a mode
+        with p = 0 (TM_mn0) has no length to give and is refused by name rather
+        than answered with a made-up d;
+      * the mode CHART (pass modes_upto_hz), because "my filter is fine" is a
+        statement about the neighbours, not about the mode you designed.
     """
-    if str(mode or "").strip().upper() not in ("TE101", "TE101 "):
-        return err("only TE101 is implemented (TE011 and higher modes are the same "
-                   "algebra with different index pairs, deliberately not guessed at)",
-                   "NOT_IMPLEMENTED")
+    parsed = _parse_cavity_mode(mode)
+    if parsed is None:
+        return err("mode must be three single digits ('TE101') or underscored "
+                   "integers ('TE_2_0_1'); got %r" % (mode,), "ARG_INVALID")
+    fam, m, n, p = parsed
+    why = _cavity_mode_reason(fam, m, n, p)
+    if why:
+        return err(why, "ARG_INVALID")
     try:
         f0 = float(f0_hz)
         a = float(a_mm) / 1000.0
@@ -1362,6 +1586,29 @@ def waveguide_cavity(f0_hz, a_mm, b_mm=None, conductivity_s_m=5.8e7,
     if f0 <= 0 or a <= 0 or sigma <= 0 or mur <= 0 or er < 1.0:
         return err("f0_hz, a_mm, conductivity and mu_r must be > 0; er >= 1",
                    "ARG_RANGE")
+
+    rq = None
+    if roughness_um is not None:
+        try:
+            rq_um = float(roughness_um)
+        except (TypeError, ValueError):
+            return err("roughness_um must be a number (RMS Rq in um) or omitted",
+                       "ARG_RANGE")
+        if rq_um < 0:
+            return err("roughness_um must be >= 0: roughness cannot be negative. "
+                       "The model wants Rq (RMS); Rz is NOT converted", "ARG_RANGE")
+        rq = rq_um * 1e-6
+
+    f_max = None
+    if modes_upto_hz is not None:
+        try:
+            f_max = float(modes_upto_hz)
+        except (TypeError, ValueError):
+            return err("modes_upto_hz must be a number (the top of the chart) or "
+                       "omitted", "ARG_RANGE")
+        if f_max <= 0:
+            return err("modes_upto_hz must be > 0", "ARG_RANGE")
+
     if b_mm is None:
         b = a / 2.0
         b_assumed = True
@@ -1372,64 +1619,170 @@ def waveguide_cavity(f0_hz, a_mm, b_mm=None, conductivity_s_m=5.8e7,
             return err("b_mm must be > 0", "ARG_RANGE")
 
     c = C0 / math.sqrt(er * mur)
-    kx = math.pi / a
+    kx = m * math.pi / a
+    ky = n * math.pi / b
+    kc2 = kx * kx + ky * ky
     k0 = 2.0 * math.pi * f0 / c
-    disc = k0 * k0 - kx * kx
-    if disc <= 0:
-        return err("f0_hz = %.6g Hz is below the TE10 cutoff of this width "
-                   "(%.6g Hz): no TE101 resonance exists, the length would be "
-                   "imaginary" % (f0, c / (2.0 * a)), "OUT_OF_VALIDITY")
-    kz = math.sqrt(disc)
-    d = math.pi / kz
+    f_cut = c * math.sqrt(kc2) / (2.0 * math.pi)
 
-    # surface resistance at f0 for this conductivity
+    if p == 0:
+        # TM_mn0: kz = 0, the fields do not vary along the length, so d is not
+        # determined by the resonance. Say the resonance instead of inventing a d.
+        return err("TM_%d_%d_0 does not fix the cavity length: the fields are uniform "
+                   "along it, so this mode resonates at %.6g Hz for ANY length "
+                   "(its 2-D transverse resonance) - pass a mode with p >= 1 to get a "
+                   "length, or size the length from the bandwidth and Q you want"
+                   % (m, n, f_cut), "OUT_OF_VALIDITY")
+
+    kz2 = k0 * k0 - kc2
+    if kz2 <= 0.0:
+        return err("f0_hz = %.6g Hz is below the %s_%d_%d cutoff of this "
+                   "cross-section (%.6g Hz): no %s resonance exists at that frequency "
+                   "and the length would be imaginary"
+                   % (f0, fam, m, n, f_cut, _cavity_mode_name(fam, m, n, p)),
+                   "OUT_OF_VALIDITY")
+    kz = math.sqrt(kz2)
+    d = p * math.pi / kz
+
+    # surface resistance at f0, and the roughness multiplier on it. delta_s is
+    # built from THIS module's MU0 so that K, Rs and the reported skin depth
+    # never disagree with each other (roughness.skin_depth_m uses 4*pi*1e-7;
+    # the two differ by 5.4e-10 relative, far below the 6 digits reported).
     rs = math.sqrt(math.pi * f0 * MU0 * mur / sigma)
-    bracket = (kx * kx * b * d + kz * kz * a * b + (kx * kx + kz * kz) * a * d / 2.0)
-    q_closed = (2.0 * math.pi * f0) * MU0 * mur * k0 * k0 * (a * b * d) / (4.0 * rs * bracket)
-    q_num = _te101_q_numeric(a, b, d, f0, rs)
+    delta = math.sqrt(1.0 / (math.pi * f0 * MU0 * mur * sigma))
+    k_rough = roughness_factor(rq, delta)
+    rs_used = rs * k_rough
+
+    if (fam, m, n, p) == ("TE", 1, 0, 1):
+        bracket = (kx * kx * b * d + kz * kz * a * b
+                   + (kx * kx + kz * kz) * a * d / 2.0)
+        q_closed = (2.0 * math.pi * f0) * MU0 * mur * k0 * k0 * (a * b * d) \
+            / (4.0 * rs_used * bracket)
+        q_num = _te101_q_numeric(a, b, d, f0, rs_used,
+                                 eps=EPS0 * er, mu=MU0 * mur)
+        energy_ratio = None
+        r_over_q = 4.0 * b / ((2.0 * math.pi * f0) * EPS0 * er * a * d)
+    else:
+        q_closed = _cavity_q_closed(fam, m, n, p, a, b, d, f0, rs_used, mur)
+        q_num, energy_ratio = _cavity_q_numeric(fam, m, n, p, a, b, d, f0, rs_used,
+                                                mur, er)
+        r_over_q = None
+        if q_closed is None:
+            return err("this mode has no stored energy to divide by (kc = 0 or an "
+                       "empty wall integral), so Qc is not defined here", "ARG_INVALID")
     q_agree_pct = (None if q_num is None
                    else 100.0 * (q_num - q_closed) / q_closed)
+    if q_agree_pct is not None and abs(q_agree_pct) < 1e-9:
+        q_agree_pct = 0.0          # do not print "-0.0" for an exact match
     if q_num is not None and abs(q_agree_pct) > 2.0:
-        return err("the closed-form Qc (%.1f) and the wall-integral Qc (%.1f) differ by "
-                   "%.2f %%, so one of the two derivations is wrong"
+        return err("the closed-form Qc (%.1f) and the field-integral Qc (%.1f) differ "
+                   "by %.2f %%, so one of the two derivations is wrong"
                    % (q_closed, q_num, q_agree_pct), "INTERNAL_CHECK_FAILED")
+    if energy_ratio is not None and abs(energy_ratio - 1.0) > 1e-6:
+        return err("electric and magnetic stored energy disagree (U_e/U_m = %.9f), so "
+                   "one of the field expressions is wrong" % (energy_ratio,),
+                   "INTERNAL_CHECK_FAILED")
 
-    w0 = 2.0 * math.pi * f0
-    r_over_q = 4.0 * b / (w0 * EPS0 * er * a * d)
+    out = {"mode": _cavity_mode_name(fam, m, n, p),
+           "length_mm": round(d * 1000.0, 4),
+           "a_mm": round(a * 1000.0, 4), "b_mm": round(b * 1000.0, 4),
+           "f0_hz": round(f0, 6),
+           "surface_resistance_ohm": round(rs_used, 6),
+           "q_conductor": round(q_closed, 1),
+           "q_conductor_numeric": (None if q_num is None else round(q_num, 1)),
+           "q_agreement_pct": (None if q_agree_pct is None else round(q_agree_pct, 4)),
+           "r_over_q_ohm": (None if r_over_q is None else round(r_over_q, 4)),
+           "unloaded_q": round(q_closed, 1),
+           "b_assumed": b_assumed}
+
+    if rq is not None:
+        out["roughness"] = {"rq_um": round(rq * 1e6, 6),
+                            "loss_factor": round(k_rough, 6),
+                            "skin_depth_um": round(delta * 1e6, 6),
+                            # q_closed was computed with Rs*K, so the smooth value is
+                            # q_closed*K. Dividing here would divide by K twice and land
+                            # on a number no wall ever has.
+                            "q_conductor_smooth": round(q_closed * k_rough, 1),
+                            "model": "Hammerstad-Jensen K = 1+(2/pi)atan(1.4(Rq/ds)^2); "
+                                     "Rs *= K, so Qc /= K"}
+
+    if f_max is not None:
+        rows, count = _cavity_mode_chart(f_max, a, b, d, rs_used, c)
+        if rows is None:
+            return err("modes_upto_hz = %.6g Hz asks for %d modes, more than the 200 "
+                       "this tool will list; pass a narrower band"
+                       % (f_max, count), "ARG_RANGE")
+        chart = []
+        for f, cfam, cm, cn, cp in rows:
+            # Rs belongs to THIS mode's frequency, not to f0: Rs ~ sqrt(f), so
+            # reusing rs_used made every row above f0 look 10-25 % better than it
+            # is (the test that caught it compares a chart row against the same
+            # mode asked for directly). K moves with the skin depth too.
+            _delta_f = math.sqrt(1.0 / (math.pi * f * MU0 * mur * sigma))
+            _rs_f = (math.sqrt(math.pi * f * MU0 * mur / sigma)
+                     * roughness_factor(rq, _delta_f))
+            q = _cavity_q_closed(cfam, cm, cn, cp, a, b, d, f, _rs_f, mur)
+            chart.append({"mode": _cavity_mode_name(cfam, cm, cn, cp),
+                          "f_hz": round(f, 6),
+                          "f_over_f0": round(f / f0, 6),
+                          "q_conductor": (None if q is None else round(q, 1))})
+        for i, row in enumerate(chart):
+            same = sum(1 for other in chart
+                       if abs(other["f_hz"] - row["f_hz"]) <= 1e-9 * row["f_hz"])
+            row["degeneracy"] = same
+            row["is_operating"] = abs(row["f_hz"] - f0) <= 1e-9 * f0
+        nxt = None
+        for row in chart:
+            if row["f_hz"] > f0 * (1.0 + 1e-9):
+                nxt = dict(row)
+                break
+        out["mode_chart"] = chart
+        out["mode_chart_count"] = len(chart)
+        out["mode_chart_upto_hz"] = round(f_max, 6)
+        out["next_mode"] = nxt
+
+    not_computed = ["iris / coupling-window geometry (full-wave)",
+                    "dielectric and radiation loss (Qd, Qr)"]
+    if rq is None:
+        not_computed.append("surface roughness correction to Qc (pass roughness_um)")
+    if f_max is None:
+        not_computed.append("the mode chart (pass modes_upto_hz): every answer is "
+                           "this one mode, not the neighbours that may sit in your band")
+    not_computed.append("thermal drift of the resonance (needs the expansion "
+                        "coefficient)")
+    if r_over_q is None:
+        not_computed.append("R/Q of %s: R/Q is the integral of E along the coupling "
+                           "path (a probe or a loop), so it is only reported for "
+                           "TE101 where 4b/(w*eps*a*d) is the standard measure"
+                           % (_cavity_mode_name(fam, m, n, p),))
 
     return ok(
-        value={"mode": "TE101",
-               "length_mm": round(d * 1000.0, 4),
-               "a_mm": round(a * 1000.0, 4), "b_mm": round(b * 1000.0, 4),
-               "f0_hz": round(f0, 6),
-               "surface_resistance_ohm": round(rs, 6),
-               "q_conductor": round(q_closed, 1),
-               "q_conductor_numeric": (None if q_num is None else round(q_num, 1)),
-               "q_agreement_pct": (None if q_agree_pct is None else round(q_agree_pct, 4)),
-               "r_over_q_ohm": round(r_over_q, 4),
-               "unloaded_q": round(q_closed, 1),
-               "b_assumed": b_assumed},
+        value=out,
         unit="mm",
-        model="rectangular TE101 cavity: resonance, wall-loss Qc, R/Q",
-        basis=("TE101 resonance c/2 sqrt((1/a)^2+(1/d)^2); Qc = w*U/Pc with the "
-               "surface integral of |H_tan|^2 over the five wall pairs, evaluated "
-               "twice (closed-form bracket and numerical integration); "
-               "R/Q = 4b/(w*eps*a*d)"),
+        model="rectangular %s cavity: resonance, wall-loss Qc%s%s"
+              % (_cavity_mode_name(fam, m, n, p),
+                 ", R/Q" if r_over_q is not None else " (R/Q is TE101 only)",
+                 ", mode chart" if f_max is not None else ""),
+        basis=("f_mnp = c/2 sqrt((m/a)^2+(n/b)^2+(p/d)^2); Qc = w*U/Pc with "
+               "U = mu*int|H|^2/2 and Pc = Rs*contour|H_tan|^2/2, evaluated twice "
+               "(closed-form sine/cosine integrals and a field integration on a "
+               "grid); the two must agree within 2 % or the answer is withheld"
+               + ("; R/Q = 4b/(w*eps*a*d) (TE101)" if r_over_q is not None else "")
+               + ("; the mode chart enumerates every TE_mnp/TM_mnp below "
+                  "modes_upto_hz for this cavity, each with its closed-form Qc - the "
+                  "grid cross-check is run on the mode you asked for, not on all of "
+                  "them" if f_max is not None else "")),
         precision=("exact for a perfect rectangular cavity with smooth walls and no "
-                   "coupling; Qc is the ideal conductor value - real cavities lose "
-                   "another 10-30 %% to surface finish, joints and the iris, and "
+                   "coupling; Qc is the ideal-conductor value - real cavities lose "
+                   "another 10-30 % to surface finish, joints and the iris, and "
                    "dielectric loss is not included at all"),
-        assumptions={"walls": "same conductivity on all five walls, surface "
-                              "roughness ignored",
-                     "dielectric": "lossless (er only shifts the resonance)",
+        assumptions={"walls": "same conductivity on every wall; surface roughness %s"
+                              % ("included as Rs *= K (one-number Hammerstad-Jensen)"
+                                 if rq is not None else "ignored"),
+                     "dielectric": "lossless (er and mu_r only shift the resonance)",
                      "coupling": "none: no iris, no probe, no loop"},
-        extra={"not_computed": [
-                   "iris / coupling-window geometry (full-wave)",
-                   "dielectric and radiation loss (Qd, Qr)",
-                   "surface roughness correction to Qc",
-                   "higher-order modes and mode charts: TE101 only",
-                   "thermal drift of the resonance (needs the expansion coefficient)"],
-               "note": "a cavity filter is this resonator plus N-1 irises; the "
-                       "iris dimensioning is exactly the part that is not here",
+        extra={"not_computed": not_computed,
+               "note": "a cavity filter is this resonator plus N-1 irises; the iris "
+                       "dimensioning is exactly the part that is not here",
                "q_audit": "two independent derivations of Qc are compared; a mismatch "
                           "above 2 % withholds the answer"})
