@@ -9,6 +9,85 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.61] - 2026-11-01
+
+立创编辑器里的**第一次真机写入**，以及由此打开的一道闸门。0.0.60 之前
+`lceda_pcb_write` 的每份答案都硬编码 `verified_against_app: false`，因为**一次都没写过**。
+本版在 LCEDA Pro **V4.1.60**（bridge `4.1.60.198f38ab`）上把 create / delete / move / save
+各跑了一遍，并把「写进去了」拆成四级证据，然后把 `false` 换成**一张实测表**。
+
+一句话结论：**探针动了 → 工程文件变字节与 sha → 关掉重开几何一致 → 两次整应用重启后读回来
+仍是同一组数字。** 闸门只在这一条桥版本上、且这一次效应被读到时才打开。
+
+### 新增
+
+| 项 | 内容 |
+| --- | --- |
+| `lceda_write.VERIFIED_WRITES` | 「哪条桥版本 → 哪些 op 真跑过 → 哪天量的 → 逐条读数是什么 → 还差什么」。当前只有一条：`4.1.60.198f38ab` / `create, delete, move, save` / `2026-11-01` |
+| `lceda_write._gate()` | 三个同时成立的条件：调用方报了桥版本、版本在表里、op 在那条的 `ops` 里**且这一次**效应被读到（change 类必须探针动）。`report["measured"]` 把测量叙事随答案一起带走 |
+| `run(..., op=, bridge_version=)` | 两个新关键字参数，默认 `None` ⇒ 走旧路径。`not_verified` 在放行后换成该条目真正的 `still_not_verified` |
+| `docs/64-真机写一次.md` | 四级证据的原始读数（project/pcb uuid、tabId、两条 create 的 id、四次字节数与 sha、两次重启后的 `getAll()` 返回值）＋七个实测坑 |
+
+### 改了什么
+
+| 项 | 变化 | 为什么 |
+| --- | --- | --- |
+| `lceda_pcb_write` 的 `verified_against_app` | 从**硬编码 `false`** 改成**按表放闸** | 而在 V4.1.60 上它真的写进去过；继续打 `false` 同样是不诚实，只是反方向。**这是一个显式的输出变化**，单独登记在这里 |
+| `assumptions` / `precision` | 跟着 `report` 走：放行时写「写路径本身在这条桥版本上量过」，并保留 `bridge_version`；不放行时**原文案逐字保留** | 让读者一眼看出 `true` 的含义是「在这条版本上量过」，不是「支持的 API」 |
+| `lceda_pcb_write` / `lceda_write_snippet` 的注册描述 | 改口：列出「哪条桥版本 + 哪些 op 才能 true」，并写明生成器**本身**仍未验证 | 能力自述必须与行为一致 |
+| `not_implemented_yet` 第 6 条 | 从「任何 WRITE 都没跑过」改成四级证据 + **仍未证明的四条** | 清单不能因为一次成功就整条删掉 |
+| `not_implemented_yet` 第 7 条 | 加「一个生成器产出的 create 片段真机跑通过一次」，并登记两个坑（函数体必须 `return`、空串要写 `''`） | 一次成功只担保那一个片段 |
+
+### 实测读数（全部来自 V4.1.60）
+
+- `create('', 1, 0, 0, 10, 0, 0.2)` → 探针 `0 → 1`，id `62e0d3e03e906d83`，`duration_ms 48`
+- `save()` → 工程文件 **409600 → 569344** B，sha `a8872034…` → `a14010a1…`
+- `closeDocument` + `openDocument` → 同几何复读（layer 1、0,0–10,0、w 0.2）
+- `delete(id)` → `1 → 0`；再 save，sha 变 `22fd2d4a…`（size 不变）
+- `create('', 1, 1, 1, 21, 1, 0.25)` + save → **585728** B
+- **整应用重启**、按 uuid 从磁盘重开 → `getAll()` 仍是 `layer 1、(1,1)-(21,1)、w 0.25`
+- 第二轮走工具层：生成器产出 `return await eda.pcb_PrimitiveLine.create('', 1, 1, 5, 21, 5, 0.3);`
+  → `lceda_pcb_write` 探针 `1 → 2`；`modify(id,{startX:2})`（`(primitiveId, property)` 是
+  `doc.api` 报的签名）→ 探针 `1 → 2`；**第二次整应用重启**后两条线仍在：
+  `(2,1)-(21,1) w 0.25`、`(1,5)-(21,5) w 0.3`
+
+### 负控制（这一版新增的判据都能失败）
+
+| 情形 | 期望 | 实测 |
+| --- | --- | --- |
+| 版本命中 + op 在表里 + 探针动了 | 放行 | `true` |
+| 桥版本不在表里（`9.9.9`） | 拒 | `false` |
+| 不传版本（老调用方式） | 拒，且 `not_verified` 是旧的两条 | `false`，逐字相同 |
+| `op='write'`（调用方自定义） | 拒，哪怕探针动了 | `changed: true` 而 `verified_against_app: false` |
+| 版本命中但探针没动 | 拒 | `WRITE_HAD_NO_EFFECT` + `false` |
+| `save` | 放行，但明说**这一次**的 save 没被读回 | `true` + 「THIS call's save was not itself read back」 |
+
+### 边界（不许读成「立创写路径已经全验」）
+
+- 探针读到的**不等于**屏幕上看到的：每条读数都是应用自己的返回值。
+- 参数写错的片段抓不住：一个「什么都没干」的 create 会被探针抓到，一个「干了别的事」的抓不到。
+- `.epro` **归档**写路径仍未验（本篇验的是活编辑器路径，两者不许互相顶替）。
+- 厂商 `--mcp` 传输仍不可达；websocket 网关仍需用户手动开「外部交互权限」。
+- 探针工程是本服务自己 `createProject` 造在 `D:\lcedapro\project\` 里的，**用户工程全程只读**。
+
+### 顺带量到的坑（已写进 docs/64）
+
+`fn="run"` 收到的是**函数体**（只写表达式回 `null`，必须 `return`）；`argsv` 里的字符串是原样
+JS，空串要写 `"''"`；`SNIPPET_NO_RECEIVER` 是因为应用给的 `callPath` 是 `pcb_PrimitiveLine.`
+而不是 `eda.<prop>.`；`save()` 是**异步落盘**（一次 save 后 0.1 s 读磁盘还是旧字节、约 8 s 后
+才变），所以判落盘必须轮询；应用重启后 `session.list` 可能为空、`getCurrentProjectInfo()` 会
+60 s 超时而同一会话的 `getAllPcbsInfo()` 正常；`JSON.stringify` 判空不可靠（空数组回 `'{}'`）；
+Electron 窗口不向 UIA 暴露控件，模拟点击点不掉模态框。
+
+### 规模
+
+工具数不变（**168**，本版不新增工具）；`--selftest` 仍是 **213/213**；
+`tests/test_lceda_live.py` 45 → **53 例**（新增 `TheGateOpensOnlyWhereAMeasurementExists` 8 例）。
+
+| 项 | 读数 |
+| --- | --- |
+| 全量回归 | **2672 例 / OK (skipped=5) / 1197.812 s**（0.0.60 的 2664 + 本轮 8）。**耗时不作性能结论**：用例只多 8 个（+0.3 %）却慢了 144 s（+13.7 %），本轮没有单独排查原因，只如实记「这一次量到的是 1197.812 s」 |
+
 ## [0.0.60] - 2026-11-01
 
 腔体**外面**的三笔账。`cavity_plane_q` 的 docstring 从 0.0.10 起就列着三件明说不做的事：

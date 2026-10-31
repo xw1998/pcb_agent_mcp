@@ -432,10 +432,102 @@ class TheWriteToolCarriesThatDiscipline(unittest.TestCase):
         self.assertEqual(out["reason_code"], "ARG_INVALID")
         self.assertIn("move", out["hint"])
 
-    def test_the_tool_says_it_has_never_written_to_the_application(self):
+    def test_the_tool_says_which_builds_its_write_claim_covers(self):
         spec = self.T.TOOLS["lceda_pcb_write"]
         self.assertEqual(sorted(spec["inputSchema"]["required"]), ["code", "session"])
-        self.assertIn("verified_against_app=false", spec["description"])
+        # The description must name the gate, not just the flag: a reader has to be
+        # able to tell that true means "measured on this bridge", not "supported".
+        self.assertIn("VERIFIED_WRITES", spec["description"])
+        self.assertIn("verified_against_app", spec["description"])
+        self.assertIn("4.1.60.198f38ab", spec["description"])
+
+
+class TheGateOpensOnlyWhereAMeasurementExists(unittest.TestCase):
+    """`verified_against_app` is a table lookup, and every way of missing it is a
+    case here: an unlisted build, an op nobody ran there, a probe that did not
+    move. Without one of these the flag would be decoration."""
+
+    MEASURED = "4.1.60.198f38ab"
+
+    def _run(self, values, **kw):
+        from pcb_agent_mcp import lceda_write as W
+        return W.run(FakeEditor(values), "s1", "x()", probe="n", **kw)
+
+    def test_a_measured_build_with_a_moved_probe_opens_it(self):
+        res = self._run([0.0, "done", 1.0], op="create",
+                        bridge_version=self.MEASURED)
+        rep = res["report"]
+        self.assertTrue(rep["verified_against_app"])
+        self.assertIn("LCEDA Pro V4.1.60", rep["verified_by"])
+        self.assertEqual(rep["measured"]["measured_on"], "2026-11-01")
+        # The measurement narrative travels with the answer.
+        self.assertTrue(any("restart" in line for line in rep["measured"]["run"]))
+        # And the things nobody measured are still named.
+        self.assertTrue(any("screen" in n for n in rep["not_verified"]))
+
+    def test_a_build_that_was_never_touched_stays_false(self):
+        res = self._run([0.0, "done", 1.0], op="create", bridge_version="4.1.99.0")
+        self.assertFalse(res["report"]["verified_against_app"])
+
+    def test_no_version_at_all_stays_false(self):
+        res = self._run([0.0, "done", 1.0], op="create")
+        self.assertFalse(res["report"]["verified_against_app"])
+        self.assertEqual(res["report"]["not_verified"],
+                         ["that the file on disk changed",
+                          "that what the probe read is what a human sees"])
+
+    def test_an_op_that_was_never_run_there_stays_false(self):
+        # `write` is the caller-defined op: whatever it does, the table cannot
+        # vouch for it, so a moved probe must not be enough.
+        res = self._run([0.0, "done", 1.0], op="write",
+                        bridge_version=self.MEASURED)
+        self.assertTrue(res["report"]["changed"])
+        self.assertFalse(res["report"]["verified_against_app"])
+
+    def test_a_probe_that_did_not_move_never_opens_it(self):
+        res = self._run([1.0, "no-op", 1.0], op="create",
+                        bridge_version=self.MEASURED)
+        self.assertEqual(res["reason_code"], "WRITE_HAD_NO_EFFECT")
+        self.assertFalse(res["report"]["verified_against_app"])
+
+    def test_save_opens_it_and_says_the_call_itself_was_not_read_back(self):
+        from pcb_agent_mcp import lceda_write as W
+        res = W.run(FakeEditor(["saved"]), "s1", "x()", expect="no_error",
+                    op="save", bridge_version=self.MEASURED)
+        rep = res["report"]
+        self.assertTrue(rep["verified_against_app"])
+        self.assertIn("THIS call's save was not itself read back", rep["verified_by"])
+
+    def test_the_tool_reads_the_bridge_from_the_client_it_talks_to(self):
+        class Speaking(FakeEditor):
+            identity = {"bridgeVersion": TheGateOpensOnlyWhereAMeasurementExists.MEASURED}
+        client = Speaking([0.0, "done", 1.0])
+        from pcb_agent_mcp import tools as T
+        orig = T._live_client
+        T._live_client = lambda args: client
+        try:
+            out = T.call_tool("lceda_pcb_write", {
+                "session": "s", "code": "create()", "probe": "n", "op": "create"})
+        finally:
+            T._live_client = orig
+        self.assertEqual(out["status"], "ok", out)
+        self.assertTrue(out["assumptions"]["verified_against_app"])
+        self.assertEqual(out["assumptions"]["bridge_version"], self.MEASURED)
+        self.assertIn("measured on LCEDA Pro V4.1.60", out["precision"])
+
+    def test_the_tool_without_a_version_says_not_verified(self):
+        from pcb_agent_mcp import tools as T
+        client = FakeEditor([0.0, "done", 1.0])   # no identity, no ping
+        orig = T._live_client
+        T._live_client = lambda args: client
+        try:
+            out = T.call_tool("lceda_pcb_write", {
+                "session": "s", "code": "create()", "probe": "n", "op": "create"})
+        finally:
+            T._live_client = orig
+        self.assertFalse(out["assumptions"]["verified_against_app"])
+        self.assertIsNone(out["assumptions"]["bridge_version"])
+        self.assertIn("NOT VERIFIED AGAINST THIS APPLICATION BUILD", out["precision"])
 
 LIVE_ENDPOINTS = L.available_endpoints()
 

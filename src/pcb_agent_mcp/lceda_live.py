@@ -58,9 +58,11 @@ document open.
 
 NOT verified, and therefore never claimed here:
 
-  * any WRITE. No save, no create, no move was performed on the user's
-    projects; ``verified_against_app`` covers the read paths that were run,
-    and every tool says so field by field.
+  * any WRITE. This module is still the READ side only; writes go through
+    ``lceda_write``, which keeps the measurement table that decides when a
+    write claim may say ``verified_against_app: true``. As of 2026-11-01 that
+    table has one entry - LCEDA Pro V4.1.60 on a project this server created
+    itself - and nothing was ever written to a user's project here.
   * the vendor's own MCP transport (``--mcp stdio|http``, 127.0.0.1:3030,
     protocol 2025-06-18). Its code is in the shipped app.js and its
     ``<prefix>.help / .discover / .call`` wrapper is real, but this build's

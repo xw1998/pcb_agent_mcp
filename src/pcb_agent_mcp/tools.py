@@ -1022,9 +1022,12 @@ def _lceda_pcb_write(args):
 
     Nothing here invents the vendor's write API: the snippet is the caller's, and
     the discipline is this tool's - a probe before, the same probe after, and a
-    refusal (`WRITE_HAD_NO_EFFECT`) when the design did not move. Every answer
-    carries `verified_against_app: false`, because no write has been run against
-    the real application in this build.
+    refusal (`WRITE_HAD_NO_EFFECT`) when the design did not move.
+
+    `verified_against_app` follows `lceda_write.VERIFIED_WRITES`: true only when
+    the bridge that answered is a version this project really performed that op
+    on AND this call showed its effect. Everything else - an unlisted build, an
+    op never run there (`move`), a create whose probe did not move - stays false.
     """
     from . import lceda_write as _write
     op = args.get("op") or "write"
@@ -1036,12 +1039,23 @@ def _lceda_pcb_write(args):
         client = _live_client(args)
     except _live.LiveError as exc:
         return _live_error(exc)
+    # The gate keys off the bridge that actually answered, so it is read here and
+    # never assumed. A client without `identity`/`ping` (a stub, an older build)
+    # simply leaves it None, which is the "false" branch.
+    identity = getattr(client, "identity", None) or {}
+    bridge = identity.get("bridgeVersion")
+    if not bridge:
+        try:
+            bridge = (client.ping() or {}).get("bridgeVersion")
+        except Exception:
+            bridge = None
     try:
         res = _write.run(client, args.get("session"), args.get("code"),
                          probe=args.get("probe"),
                          expect=args.get("expect") or spec["expect"],
                          timeout_ms=args.get("timeout_ms"),
-                         label=args.get("label") or op)
+                         label=args.get("label") or op,
+                         op=op, bridge_version=bridge)
     except _write.WriteError as exc:
         return err(exc.message, exc.reason_code, hint=exc.hint, extra=exc.extra)
     except _live.LiveError as exc:
@@ -1052,6 +1066,22 @@ def _lceda_pcb_write(args):
     if res["status"] != "ok":
         return err(res["message"], res["reason_code"], hint=res["hint"],
                    extra={"report": report, "why_this_op_exists": spec["why"]})
+    measured = report["verified_against_app"]
+    if measured:
+        precision = ("The write path itself was measured on %s on %s: create, "
+                     "delete and save were run on it and read back, including two "
+                     "full restarts from disk. This answer's own effect is still "
+                     "only the probe's word, and the items in not_verified were not "
+                     "checked"
+                     % (report["measured"]["app"],
+                        report["measured"]["measured_on"]))
+    else:
+        precision = ("NOT VERIFIED AGAINST THIS APPLICATION BUILD. Either the bridge "
+                     "that answered is not a version this project has written on, or "
+                     "this op was never run there - so the claim is about the "
+                     "snippet's OBSERVED EFFECT, not about the vendor API having the "
+                     "semantics the caller assumed. A save has no observable state "
+                     "and is confirmed only by 'the call returned without an error'")
     return ok(
         value={"op": op, "changed": report["changed"],
                "expect": report["expect"], "probe_used": report["probe"]},
@@ -1059,20 +1089,16 @@ def _lceda_pcb_write(args):
         model="lceda_pro_create_save_move",
         basis="before/after probe comparison inside the running editor, with the "
               "caller's own snippet in between",
-        precision="NOT VERIFIED AGAINST THE APPLICATION. No write has ever been "
-                  "performed on a real project by this build, so every claim here is "
-                  "about the snippet's OBSERVED EFFECT, not about the vendor API "
-                  "having the semantics the caller assumed. A save has no "
-                  "observable state and is confirmed only by 'the call returned "
-                  "without an error'",
-        assumptions={"verified_against_app": False,
+        precision=precision,
+        assumptions={"verified_against_app": measured,
+                     "bridge_version": bridge,
                      "not_verified": report["not_verified"],
                      "why_this_op_exists": spec["why"],
                      "the_snippet_is_yours":
-                         "this server never synthesises a write call; the vendor's "
-                         "method names and argument shapes are unverified in this "
-                         "build and a generated guess is exactly the plausible wrong "
-                         "answer this project refuses"},
+                         "this server never synthesises a write call; the snippet "
+                         "is the caller's, and a generated guess at the vendor's "
+                         "method names is exactly the plausible wrong answer this "
+                         "project refuses"},
         extra={"report": report})
 
 def _lceda_pro_steps(args):
@@ -1273,10 +1299,15 @@ _tool(
     "runs before and after the write, and an identical value is a REFUSAL "
     "(WRITE_HAD_NO_EFFECT) - a write that silently did nothing is the failure mode "
     "that looks like success. `save` has nothing observable to compare and says so: "
-    "it is confirmed only by 'the call returned without an error'. Every answer "
-    "carries verified_against_app=false: no write has been run against the real "
-    "application in this build, so the snippet is yours and the claim is about its "
-    "observed effect, never about the vendor API's semantics.",
+    "it is confirmed only by 'the call returned without an error'. "
+    "verified_against_app is true ONLY when three things hold: you say which bridge "
+    "answered (it comes from ping), that exact version is a key of "
+    "lceda_write.VERIFIED_WRITES, and this call showed its own effect - so create / "
+    "delete / save on LCEDA Pro V4.1.60 (bridge 4.1.60.198f38ab, measured "
+    "2026-11-01, including a restart from disk) can answer true. An unlisted build, "
+    "an op never run there (move), or a probe that did not move all still answer "
+    "false. Either way the snippet is yours and the claim is about its observed "
+    "effect, never about the vendor API's semantics in general.",
     {"type": "object",
      "properties": dict(_LIVE_ARGS, **{
          "session": _str("session id from lceda_pro_open / lceda_pro_sessions"),
@@ -1398,9 +1429,12 @@ _tool(
     "SNIPPET_NO_API, two equally good matches are SNIPPET_AMBIGUOUS (with the names "
     "so you can `pick`), and a receiver that cannot be resolved is "
     "SNIPPET_NO_RECEIVER (the class name is not the runtime property name and this "
-    "tool will not lower-case it into one). Every answer is "
-    "verified_against_app=false with the unverified parts listed: the method exists, "
-    "its signature and its effect are still unproven.",
+    "tool will not lower-case it into one). Every answer here is "
+    "verified_against_app=false with the unverified parts listed: the method exists "
+    "and its comment is the vendor's, but the generator itself is not verified - one "
+    "create snippet it produced was run through `lceda_pcb_write` on LCEDA Pro "
+    "V4.1.60 (2026-11-01) and read back, which vouches for that snippet, not for the "
+    "generator and not for the arguments you pass it.",
     {"type": "object",
      "properties": dict(_LIVE_ARGS, **{
          "op": _str("what you want done: save | move | create",
@@ -3765,17 +3799,28 @@ def _capabilities(_args):
             "reports verified_against_app=false. The live path that DOES work is the "
             "editor's own command space (lceda_pro_*); both speak to the same running "
             "app by different doors",
-            "The live bridge's unverified half (measured 2026-10-28 on 4.1.60): reads "
-            "are proven - ping, open, session.list, session.close, doc.api and invoke "
-            "were all run against the real editor (see docs/24). NOT proven: any "
-            "WRITE. No save, no create, no move, no delete was performed on any "
-            "project, so whether a snippet's save is accepted by the app (and whether "
-            "the resulting file is what the editor would have written itself) stays "
-            "open, and lceda_pro_run says in every answer that the snippet, not the "
-            "tool, decides what happens. Also not proven: that open leaves the "
-            "project bytes untouched (they were not compared before and after), and "
+            "The live bridge's write half (REWRITTEN 2026-11-01 after the first real "
+            "write): reads were proven on 2026-10-28 (ping, open, session.list, "
+            "session.close, doc.api, invoke - see docs/24), and a write has now been "
+            "performed. On LCEDA Pro V4.1.60 (bridge 4.1.60.198f38ab), on a project "
+            "this server created ITSELF with createProject + createPcb - never on a "
+            "user's project: create moved the probe 0 -> 1; save changed the project "
+            "file 409600 -> 569344 bytes and its sha256; closeDocument + openDocument "
+            "read the line back with the same geometry; delete moved 1 -> 0; a move "
+            "through pcb_PrimitiveLine.modify changed startX and stayed changed; and "
+            "after two full application restarts, with the project reopened by uuid "
+            "from disk, getAll() still returned the same digits. The tool path was "
+            "measured too, not only the client: lceda_write_snippet produced the "
+            "create call and lceda_pcb_write ran it. What is STILL not proven: that "
+            "what a probe reads is what a person sees on screen (every reading is the "
+            "app's own return value), that a snippet with a wrong argument is refused "
+            "rather than silently doing something else, that the .epro ARCHIVE write "
+            "path reaches the app (only the live editor path was measured), and "
             "whether the vendor's own '--mcp' transport can be reached at all - this "
-            "build's executable rejects the flag before the app sees it",
+            "build's executable rejects the flag before the app sees it. Also "
+            "measured here: a save() returns before the file moves - one stat right "
+            "after it read the old bytes, the next check ~8 s later read the new ones "
+            "- so a disk check has to poll",
             "Write snippets are generated from the app's own table, not from "
             "memory (0.0.43): lceda_write_snippet reads the method names and the "
             "vendor comments out of doc.api and assembles one candidate "
@@ -3786,9 +3831,15 @@ def _capabilities(_args):
             "signatures. It refuses instead of guessing: SNIPPET_NO_API when "
             "nothing matches, SNIPPET_AMBIGUOUS with the candidates when two "
             "things match equally, SNIPPET_NO_RECEIVER when the receiver cannot "
-            "be resolved. The method existing is the app's fact; its signature, "
-            "its return value and its effect are unproven, and nothing here ran "
-            "a snippet",
+            "be resolved. Still true after the 2026-11-01 round: the generator "
+            "itself is not verified - one create snippet it produced ran through "
+            "lceda_pcb_write on V4.1.60 and its effect was read back, which "
+            "vouches for that snippet, not for the generator and not for the "
+            "arguments a caller passes. Two traps measured the same day: the code "
+            "a session receives is a function BODY, so a bare expression answers "
+            "null and it needs `return`; and an empty string argument must be "
+            "written as '\'\'' - argsv strings are inserted verbatim as "
+            "JavaScript, so '' is refused as empty",
             "LCEDA Pro launch details (CORRECTED 2026-10-28, third round): the app "
             "DOES start here - the earlier 'it dies before Electron' reading was "
             "wrong, it described how it was launched. From a shell that inherits a "
