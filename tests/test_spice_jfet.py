@@ -391,9 +391,32 @@ class TestRefusals(unittest.TestCase):
             self.assertIn("capacitance", msg, param)
 
     def test_flicker_noise_is_refused_rather_than_silently_omitted(self):
-        for param in ("KF=1e-16", "AF=1"):
-            msg = self._bad(_bias(model_extra=" " + param))
-            self.assertIn("flicker", msg, param)
+        """Since 0.0.54 the refusal moved to where the lie would be told.
+
+        KF= on a JFET used to fail at .op. It no longer does, because at .op it
+        changes nothing - exactly as in SPICE - and refusing a circuit for a
+        parameter that cannot affect the asked analysis is its own kind of wrong
+        answer. The refusal now sits at the .noise analysis, which is the only
+        place an ignored KF= would turn into a quiet number; there is no
+        reference model to copy for a JFET (measured: ngspice-47 moved its own
+        answer by 0.0 % for KF 1e-15..1e-6).
+        """
+        # .op is fine: nothing there can be affected
+        v = _op(_bias(model_extra=" KF=1e-16"))
+        self.assertAlmostEqual(_els(v)["J1"]["current_a"]["id"], 1e-3, places=12)
+        # .noise is not: name the device instead of reporting thermal+shot only
+        net = _bias(model_extra=" KF=1e-16").replace(
+            ".op", ".noise V(1) Vd lin 3 100 300")
+        r = spice.simulate(net)
+        self.assertEqual(r["status"], "error", r)
+        self.assertEqual(r["reason_code"], "NOT_MODELED")
+        self.assertIn("flicker", r["message"])
+        self.assertIn("J1", r["message"])
+        self.assertIn("0.0 %", r["hint"])
+        # and a bare AF= with no KF= has no flicker term to model: it answers
+        r2 = spice.simulate(_bias(model_extra=" AF=2").replace(
+            ".op", ".noise V(1) Vd lin 3 100 300"))
+        self.assertEqual(r2["status"], "ok", r2)
 
     def test_temperature_parameters_are_refused_at_one_temperature(self):
         for param in ("TCV=1m", "BEX=1"):

@@ -3778,8 +3778,11 @@ def _capabilities(_args):
             "O (an LTRA model) and U (a URC model), with "
             ".op/.tran/.ac/.noise/.model/.temp, expands .subckt/X instances itself "
             "(flattened before solving; numeric parameters and {+ - * / **} arithmetic, "
-            "subcircuit-local .model, nested instances, <=32 deep and no recursion), and "
-            "rejects F H J K S W A cards with the card named in the error. T "
+            "subcircuit-local .model, nested instances, <=32 deep and no recursion). "
+            "F H J K S W are SOLVED (0.0.31-0.0.36; the earlier note that claimed they "
+            "were rejected was wrong and is corrected here), and A cards for the gain "
+            "and limit code models since 0.0.39 - what is refused by name is the "
+            "XSPICE models that carry state or a sample clock, not these cards. T "
             "is ideal and lossless with one constant Z0 and one delay: at DC it is a "
             "wire, in .ac it is the exact lossless Y matrix (phase -2*pi*f*TD, and the "
             "half-wave points where an ideal line's admittance is infinite are REFUSED "
@@ -3802,8 +3805,18 @@ def _capabilities(_args):
             "reports a density per swept point, the rms over the swept band (the band IS "
             "the sweep, and the grid picks ln-f or f trapezoid, both stated), each "
             "element's share, and the input-referred density. Mechanisms: 4kT/R, "
-            "2q*|I| on junctions and transistors, (2/3)gm on a level-1 MOSFET. NOT "
-            "there: flicker (1/f), burst, induced gate noise, avalanche, and any "
+            "2q*|I| on junctions and transistors, (2/3)gm on a level-1 MOSFET, and "
+            "for a DIODE the flicker KF*|Id|^AF/f (0.0.54) - its f^-1 shape and "
+            "|Id|^1 scaling were MEASURED against the bundled ngspice-47 (fitting the "
+            "engine's two readings returns the card's KF to 0.11 %), and a "
+            "frequency-dependent density is evaluated at each swept point instead of "
+            "being held at one value. A KF= on a Q/M/J card is REFUSED at the .noise "
+            "analysis by name (NOT_MODELED) rather than answered without it, because "
+            "ngspice-47 itself applies no BJT/JFET/MOSFET flicker: measured, KF from "
+            "1e-15 to 1e-6 moved its own answer by 0.0 %, so there is no reference "
+            "model to copy and engine='ngspice' would return the same quiet number. "
+            "Also NOT there: burst, induced gate noise, avalanche, flicker on "
+            "anything but a diode, and any "
             "capacitor's ESR (that is an R card you either wrote or did not). It does "
             "NOT require an AC value on the input source (ngspice refuses the deck "
             "without one) and it refuses a card naming a node nothing connects. "
@@ -3837,9 +3850,16 @@ def _capabilities(_args):
             "is not an accuracy ranking); verified_against_engine is true only for the "
             "versions in this "
             "build's VERIFIED_ENGINES list, and false for any other version - a "
-            "different binary is not a verified engine. What neither path "
-            "does: temperature sweeps (one temperature per run), distortion, Monte "
-            "Carlo; the builtin solver also uses dense LU and refuses above ~400 "
+            "different binary is not a verified engine. A multi-valued .temp card is "
+            "a SWEEP in the builtin solver since 0.0.54 (one independent solve per "
+            "temperature, every case returned with its own bias point; temp_c as an "
+            "argument overrides the card and says so), and a single temperature per "
+            "run is what engine='ngspice' gets unless the deck drives its own loop. "
+            "What neither path does: distortion, and Monte Carlo - a deck writing an "
+            "`mc(...)` / `unif(...)` / `agauss(...)` / `gauss(...)` value is REFUSED "
+            "by name since 0.0.54 instead of being read as its nominal number, since "
+            "the call carries no sample count and no seed; the builtin solver also "
+            "uses dense LU and refuses above ~400 "
             "unknowns",
             "Electrothermal coupling stops at a 2-D plate: "
             "electrothermal_trace / electrothermal_conductor close the loop against one "
@@ -7306,12 +7326,48 @@ def call_tool(name, arguments):
     if spec is None:
         return err("unknown tool: " + str(name), "TOOL_NOT_FOUND",
                    hint="call tools/list")
+    args = arguments or {}
     try:
-        return spec["handler"](arguments or {})
+        out = spec["handler"](args)
     except KeyError as exc:
         return err("missing required argument: %s" % exc, "ARG_MISSING")
     except Exception as exc:  # noqa: BLE001
         return err("tool raised: %s: %s" % (type(exc).__name__, exc), "TOOL_RAISED")
+    return _flag_unread_arguments(spec, args, out)
+
+
+def _flag_unread_arguments(spec, args, out):
+    """Say so when an argument was never read, instead of answering as if it were.
+
+    A handler reads the keys it knows and cannot notice a misspelt one, so
+    `{"temperature_c": 50}` on a tool whose key is `temp_c` used to come back as
+    a complete, confident answer computed at the default. That is the same class
+    of error as a silently ignored netlist parameter: the answer is not wrong
+    arithmetic, it is an answer to a question the caller did not ask. Nothing is
+    invented or corrected here - the answer stands, and the caller is told which
+    keys never reached it. Correct calls are byte-identical to before (no key is
+    unknown, so no warning is added).
+    """
+    props = (spec.get("inputSchema") or {}).get("properties") or {}
+    if not props or not isinstance(args, dict):
+        return out
+    unknown = sorted(str(k) for k in args if k not in props)
+    if not unknown or not isinstance(out, dict):
+        return out
+    note = ("argument(s) %s are not in this tool's schema and were IGNORED - the "
+            "answer below was computed as if they had never been given (spelling "
+            "is exact: %s)" % (", ".join(unknown), ", ".join(sorted(props))))
+    warn = out.get("warnings")
+    if isinstance(warn, list):
+        warn.append(note)
+    else:
+        extra = out.get("extra")
+        if isinstance(extra, dict) and isinstance(extra.get("warnings"), list):
+            extra["warnings"].append(note)
+        else:
+            out["unread_arguments"] = unknown
+            out.setdefault("warnings", []).append(note)
+    return out
 
 
 def result_to_text(result):

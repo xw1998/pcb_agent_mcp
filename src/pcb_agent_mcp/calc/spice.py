@@ -290,7 +290,15 @@ def parse_netlist(text):
                                      "fstop": _value(parts[6])})
             continue
         if low.startswith(".temp"):
-            spec["options"]["temp_c"] = _value(line.split()[1])
+            # `.temp 25 100` is a SWEEP, not a list of suggestions. It used to
+            # be read as "take the first and drop the rest", which is a deck
+            # that runs and answers a question nobody asked.
+            vals = [_value(tok) for tok in line.split()[1:]]
+            if not vals:
+                raise ValueError("line %d: .temp needs at least one temperature"
+                                 % lineno)
+            spec["options"]["temp_c"] = vals[0]
+            spec["options"]["temp_list"] = vals
             continue
         if low.startswith("."):
             raise ValueError("line %d: unsupported directive %r"
@@ -567,18 +575,38 @@ _EXPR_OPS = {ast.Add: lambda a, b: a + b,
              ast.Pow: lambda a, b: a ** b}
 
 
+# SPICE's statistical values look like a number to a caller and are not one:
+# `R1 1 0 1k mc(1)` used to parse as 1000 ohm and come back as a perfectly good
+# deterministic answer to a question nobody asked. They are refused by name.
+_STAT_FUNCS = ("mc(", "unif(", "aunif(", "gauss(", "agauss(", "limit(")
+
 def _value_or_expr(tok, lineno):
     """A number, or a ``{...}`` expression kept for later.
 
     A subcircuit's parameters are not in scope at its definition, so the value
     has no answer yet; it becomes one when an instance supplies (or defaults)
     them.
+
+    A Monte-Carlo / statistical value (``mc(1)``, ``agauss(1, .1, 1)``) is
+    refused here by name rather than read as its nominal number: one run of a
+    distribution is not the distribution, and the deck carries neither the
+    sample count nor the seed that would make the answer mean anything.
     """
     t = str(tok).strip()
     if len(t) > 2 and t.startswith("{") and t.endswith("}"):
         return ("expr", t[1:-1].strip())
     if _looks_numeric(t):
         return _value(t)
+    low = t.lower()
+    for fn in _STAT_FUNCS:
+        if low.startswith(fn) or (" " + fn) in (" " + low):
+            raise ValueError(
+                "line %d: %r is a Monte-Carlo / statistical value, which this "
+                "subset does not run: the deck names neither the sample count nor "
+                "the seed, so reading it as its nominal number would be a "
+                "confident answer to a different question. Give the nominal value "
+                "and run the deck once per sample yourself (or use "
+                "engine='ngspice' with a .control loop)" % (lineno, t))
     raise ValueError("line %d: %r is neither a number nor a {…} expression (write "
                      "{%s} if it is arithmetic)" % (lineno, t, t))
 
@@ -1506,12 +1534,37 @@ def _parse_element(spec, line, lineno):
             raise ValueError("line %d: %s needs a %s" % (lineno, name, what))
         return parts[idx]
 
+    def _tail(allow_ic):
+        """Refuse anything after the value that this subset does not read.
+
+        `R1 1 0 1k mc(1)` is the shape that hurt: the value parses, the trailing
+        token is dropped, and the deck answers at 1 k as if the Monte-Carlo call
+        had never been written - a confident answer to a different question. A
+        SPICE R/C/L card carries exactly one value plus (C, L) an optional ic=,
+        so every other trailing token is named instead of ignored.
+        """
+        for p in low[4:]:
+            if allow_ic and p.startswith("ic="):
+                continue
+            raise ValueError(
+                "line %d: %s has trailing %r after its value. %s %s card carries one "
+                "value%s; this subset reads nothing else there, so the token would "
+                "be silently dropped and the answer computed as if it had never "
+                "been written%s"
+                % (lineno, name, p, "An" if letter in "AEFILMNORSX" else "A",
+                   letter, " and an optional ic=" if allow_ic
+                   else "", " (a mc(...)/agauss(...)/unif(...) is a Monte-Carlo "
+                             "call: it wants a distribution and a run count the "
+                             "deck does not carry)" if "(" in p else ""))
+
     if letter == "R":
+        _tail(False)
         return {"type": "R", "name": name, "nodes": (_node(parts[1]), _node(parts[2])),
                 "value": _value_or_expr(val(3, "resistance"), lineno)}
     if letter == "C":
         el = {"type": "C", "name": name, "nodes": (_node(parts[1]), _node(parts[2])),
               "value": _value_or_expr(val(3, "capacitance"), lineno), "ic": None}
+        _tail(True)
         for p in low[4:]:
             if p.startswith("ic="):
                 el["ic"] = _value(p.split("=", 1)[1])
@@ -1519,6 +1572,7 @@ def _parse_element(spec, line, lineno):
     if letter == "L":
         el = {"type": "L", "name": name, "nodes": (_node(parts[1]), _node(parts[2])),
               "value": _value_or_expr(val(3, "inductance"), lineno), "ic": None}
+        _tail(True)
         for p in low[4:]:
             if p.startswith("ic="):
                 el["ic"] = _value(p.split("=", 1)[1])
@@ -1536,6 +1590,12 @@ def _parse_element(spec, line, lineno):
     if letter == "X":
         return _parse_instance(parts, name, lineno)
     if letter in ("E", "G"):
+        if len(parts) > 6:
+            raise ValueError("line %d: %s has trailing %r. An %s card here is "
+                             "exactly five fields: n+ n- nc+ nc- gain (its value is "
+                             "a constant, not a table), and anything after the gain "
+                             "would be silently dropped"
+                             % (lineno, name, " ".join(parts[6:]), letter))
         return {"type": letter, "name": name,
                 "nodes": (_node(parts[1]), _node(parts[2])),
                 "ctrl": (_node(parts[3]), _node(parts[4])),
@@ -2465,6 +2525,13 @@ class _Circuit(object):
         # the parser's own "this was read but is not modelled" notes come first,
         # so a deck-level surprise and a solve-time surprise land in one list
         self.disabled = list(spec.get("warnings") or [])
+        _over = spec.get("options", {}).get("temp_c_overrode")
+        if _over:
+            self.disabled.append(
+                "the caller's temp_c argument overrode a .temp card that named %s; "
+                "only the caller's one temperature was solved (drop the argument "
+                "to get the card's own sweep, one independent solve per entry)"
+                % (list(_over),))
         self.defaulted = {}       # model params that fell back to a default
         self.lossy = spec.get("lossy") or []   # O/U cards, for the report only
         # Switches (S/W) are piecewise-linear: which of TWO resistances is in
@@ -2643,14 +2710,11 @@ class _Circuit(object):
               "(see IS=)",
         "FC": "a gate-junction forward-bias coefficient; there is no gate junction "
               "here (see IS=)",
-        "KF": "a flicker-noise coefficient. The noise report here carries channel "
-              "thermal noise only, so a nonzero KF= would be a silently quiet "
-              "answer",
-        "AF": "a flicker-noise exponent; no flicker noise is modelled (see KF=)",
-        "TCV": "a threshold temperature coefficient; this subset solves at one "
-               "temperature (27 C) and does not scale VTO",
-        "BEX": "a transconductance temperature exponent; this subset solves at one "
-               "temperature (27 C) and does not scale BETA",
+        "TCV": "a threshold temperature coefficient; this subset solves at the one "
+               "temperature the deck states (.temp / temp_c) and does not scale VTO "
+               "with it",
+        "BEX": "a transconductance temperature exponent; this subset solves at the "
+               "one temperature the deck states and does not scale BETA with it",
         "BETA1": "a second transconductance parameter of the level-2 JFET model; "
                  "only the level-1 square law is implemented",
         "LAMBDA1": "a second channel-length modulation parameter of the level-2 "
@@ -2675,6 +2739,12 @@ class _Circuit(object):
                 continue          # zero is the engine's own default: no internal node
             if k == "B" and float(params[k]) == 1.0:
                 continue          # 1.0 is the engine's default: the square law itself
+            if k in ("KF", "AF"):
+                # Not refused here any more: the honest place to refuse a flicker
+                # coefficient is the .noise analysis that would otherwise report
+                # thermal+shot for a deck that asked for 1/f (see _noise_sources).
+                # At .op/.ac/.tran it changes nothing, exactly as in SPICE.
+                continue
             why = self._JFET_REFUSED.get(k)
             if why is not None:
                 raise ValueError("%s: .model %r: %s= is %s; it is refused by name "
@@ -3743,8 +3813,9 @@ PRECISION = (
     "level-1 MOSFET with KP*(W/L)*m, level-1 JFET with BETA*AREA (no gate "
     "junction, no RD/RS), Ebers-Moll BJT and an ideal Shockley diode "
     "with no series resistance, no junction capacitance and no temperature beyond "
-    "the one stated. Noise is thermal 4kT/R and shot 2q*I only (.noise, since "
-    "0.0.32). A converged answer is the answer to this netlist, not to the board"
+    "the one stated. Noise is thermal 4kT/R, shot 2q*I and - since 0.0.54 - a "
+    "DIODE's flicker KF*|Id|^AF/f (.noise, since 0.0.32). A converged answer is "
+    "the answer to this netlist, not to the board"
 )
 
 NOT_COMPUTED = [
@@ -3765,7 +3836,11 @@ NOT_COMPUTED = [
     "sources (F/H) and mutual inductance (K) ARE solved, but not their second-order "
     "physics: a JFET has no gate-channel junction diode (the report says when a "
     "deck forward-biases it past 0.5 V), no RD/RS internal nodes, no device "
-    "capacitance and no flicker noise; a switch has two resistance states, no "
+    "capacitance and no flicker noise (a KF= on a J/Q/M model card is REFUSED at "
+    "the .noise analysis by name, because reporting thermal+shot for a deck that "
+    "asked for 1/f would be a quiet answer; MEASURED, ngspice-47 itself moved its "
+    "BJT/JFET/MOSFET noise by 0.0 % for KF 1e-15..1e-6); a switch has two "
+    "resistance states, no "
     "charge injection, no capacitance and no break-before-make; K has no loss "
     "terms, no frequency-dependent core and no saturation; and an F/H gain is a "
     "constant, not a table",
@@ -3784,15 +3859,18 @@ NOT_COMPUTED = [
     "ngspice-47 itself refuses an O card with nonzero G (\"Nonzero G (except RG) "
     "line not supported yet\"), so a g>0 deck cannot be cross-checked against it"
     % DEFAULT_LUMP,
-    "distortion (.disto), Monte Carlo / worst-case, and the noise mechanisms this "
-    "subset does not model: flicker (1/f), burst, avalanche, induced gate noise, "
-    "the noise of a B source, and the thermal noise of anything not written as an "
-    "R card (a capacitor's ESR is the ESR's)",
-    "temperature SWEEP (one temperature per run: `.temp` / temp_c), and junction "
-    "self-heating - the junction sits at the temperature you state, it does not "
-    "rise with dissipation. IS(T) and Vt(T) are modelled (XTI/EG/TNOM), so a "
-    "forward drop at a stated temperature is right, but device capacitances, "
-    "mobility and breakdown versus temperature are not",
+    "distortion (.disto), Monte Carlo / worst-case (an `mc(...)` / `unif(...)` / "
+    "`agauss(...)` value is refused by the parser rather than read as its nominal "
+    "number), and the noise mechanisms this subset does not model: flicker (1/f) "
+    "on anything but a diode (see the KF= note above), burst, avalanche, induced "
+    "gate noise, the noise of a B source, and the thermal noise of anything not "
+    "written as an R card (a capacitor's ESR is the ESR's)",
+    "junction self-heating - the junction sits at the temperature you state, it "
+    "does not rise with dissipation. IS(T) and Vt(T) are modelled (XTI/EG/TNOM), "
+    "so a forward drop at a stated temperature is right, but device capacitances, "
+    "mobility and breakdown versus temperature are not. A multi-valued `.temp` "
+    "card IS a sweep (one independent solve per temperature, since 0.0.54), but a "
+    "TEMPERATURE argument inside a model card (`temp=` on the element) is not read",
     "convergence for circuits that need continuation beyond gmin/source stepping",
 ]
 
@@ -3852,7 +3930,13 @@ def _noise_owner(circ, name):
     return base
 
 def _noise_sources(circ, x):
-    """What makes noise, at the bias point: [(name, mechanism, a, b, psd, text)].
+    """What makes noise, at the bias point.
+
+    Returns (sources, loud): `sources` is [(name, mechanism, a, b, psd, text)]
+    where `psd` is either a float (A^2/Hz, frequency independent) or a callable
+    f -> A^2/Hz (flicker's f^-1 falls out of the form, so one number would be a
+    lie read at any other frequency). `loud` is the devices that carry a flicker
+    coefficient this subset cannot model, which the caller refuses by name.
 
     Only mechanisms this subset actually models are listed, and each one names
     its formula. A device that contributes nothing here (an ideal source, a C or
@@ -3866,8 +3950,48 @@ def _noise_sources(circ, x):
         idx = circ.i(n)
         return x[idx - 1].real if idx else 0.0
 
+    def _flicker(el, i_amps):
+        """KF*|I|^AF/f as a frequency-dependent density, or None.
+
+        SPICE3's form for a junction: `KF*Id^AF/f`, one current source across
+        the junction, in A^2/Hz. MEASURED against the bundled ngspice-47 on a
+        forward-biased 1N4148-like junction (KF=1e-16, Id=3.3227e-5 A, 1 Hz and
+        10 Hz): fitting the engine's two readings gives KF = 1.00112e-16, i.e.
+        +0.11 % on the card's 1e-16, so the f^-1 shape and the |Id|^1 scaling
+        are the engine's, not a guess. `AF` defaults to 1 (SPICE3's default).
+
+        A device whose model carries KF but whose flicker form could NOT be
+        verified here returns None and is named in `loud` instead of being
+        quietly zero - see the Q/M/J branches.
+        """
+        pr = (circ.models.get(el["model"]) or {}).get("params") or {}
+        kf = pr.get("KF", 0.0)
+        try:
+            kf = float(kf)
+        except (TypeError, ValueError):
+            kf = 0.0
+        if kf <= 0.0:
+            return None
+        af = pr.get("AF", 1.0)
+        try:
+            af = float(af)
+        except (TypeError, ValueError):
+            af = 1.0
+        amp = abs(i_amps)
+        return (lambda f, kf=kf, af=af, amp=amp:
+                kf * (amp ** af) / f if f > 0.0 else 0.0)
+
+    loud = []
     for el in circ.elements:
         T = el["type"]
+        if T in ("Q", "M", "J"):
+            _pr = (circ.models.get(el["model"]) or {}).get("params") or {}
+            try:
+                _kf = float(_pr.get("KF") or 0.0)
+            except (TypeError, ValueError):
+                _kf = 0.0
+            if _kf > 0.0:
+                loud.append((el["name"], T, _kf))
         if T == "R":
             out.append((el["name"], "thermal", el["nodes"][0], el["nodes"][1],
                         4.0 * kT / el["value"], "4kT/R (Nyquist, a current source "
@@ -3884,6 +4008,12 @@ def _noise_sources(circ, x):
             out.append((el["name"], "shot", na, nk,
                         2.0 * E_CHARGE_C * abs(i_d),
                         "2q*|Id| (shot, a current source across the junction)"))
+            fl = _flicker(el, i_d)
+            if fl is not None:
+                out.append((el["name"], "flicker", na, nk, fl,
+                            "KF*|Id|^AF/f (1/f, a current source across the "
+                            "junction; the f^-1 shape and the |Id|^1 scaling "
+                            "were fitted to ngspice-47, KF read back +0.11 %)"))
         elif T == "Q":
             nc, nb, ne = el["nodes"]
             ic, ib, _ie = circ._bjt_currents(el, volt(nb), volt(nc), volt(ne))
@@ -3914,7 +4044,20 @@ def _noise_sources(circ, x):
                         "4kT*(2/3)*gm (channel thermal, saturation form; the gate "
                         "junction's shot noise and flicker are not modelled, and "
                         "there is no gate current to make shot noise from)"))
-    return out
+    return out, loud
+
+def _psd_probe_freqs(freqs):
+    """The frequencies a frequency-dependent density is quoted at: the band ends.
+
+    Two points and not one, because the whole content of a 1/f source is that
+    its density is not the same at the two ends of the band - a single number
+    would read like a constant and hide the only interesting fact about it.
+    """
+    if not freqs:
+        return []
+    if len(freqs) == 1:
+        return [freqs[0]]
+    return [freqs[0], freqs[-1]]
 
 def _noise_band(points, key, geometric=False):
     """Integrate a density over the swept band. The band IS the sweep.
@@ -3989,7 +4132,36 @@ def _noise_analysis(circ, card, max_points):
                    % why, "NOT_CONVERGED",
                    hint="every noise density here is evaluated AT the bias point "
                         "(4kT/R, 2q*Id, gm), so without a bias there is no noise")
-    sources = _noise_sources(circ, x0)
+    sources, loud = _noise_sources(circ, x0)
+    if loud:
+        # A device that states KF= is asking for 1/f noise. Reporting thermal +
+        # shot without it would be a quiet number the caller asked not to get,
+        # and the reference engine is no help either: MEASURED, ngspice-47 moved
+        # its BJT/JFET/MOSFET answer by 0.0 % for KF between 1e-15 and 1e-6, so
+        # "use engine='ngspice'" would return the same quiet number without
+        # saying anything. The honest answer is to refuse and name the device.
+        return err("noise cannot be reported: %s carr%s KF=, and flicker (1/f) "
+                   "noise on a %s is not modelled by this subset - the f^-1 form "
+                   "was verified against ngspice-47 for a DIODE only, where fitting "
+                   "the engine's two readings reproduces the card's KF to 0.11 %%"
+                   % (", ".join("%s (%s)" % (nm, kd) for (nm, kd, _kf) in loud),
+                      "ies" if len(loud) == 1 else "y",
+                      "JFET" if (loud[0][1] == "J" and len(loud) == 1) else
+                      ("BJT" if (loud[0][1] == "Q" and len(loud) == 1) else
+                       ("MOSFET" if (loud[0][1] == "M" and len(loud) == 1)
+                        else "Q/M/J device"))),
+                   "NOT_MODELED",
+                   hint="MEASURED: ngspice-47 (the engine bundled with this "
+                        "package) applies no BJT/JFET/MOSFET flicker at all - KF "
+                        "from 1e-15 to 1e-6 changed its own noise answer by 0.0 % "
+                        "- so there is no reference model to copy and "
+                        "engine='ngspice' would return the same thermal+shot "
+                        "number without telling you. Remove KF= (and AF=) from "
+                        "those model cards if thermal + shot is the answer you "
+                        "want; only a diode's KF is modelled here",
+                   extra={"devices_with_unmodelled_flicker":
+                          [{"element": nm, "type": kd, "kf": float(kf)}
+                           for (nm, kd, kf) in loud]})
     e = [0j] * circ.size
     if pos is not None:
         e[circ.i(pos) - 1] += 1.0
@@ -4034,7 +4206,11 @@ def _noise_analysis(circ, card, max_points):
             ia, ib = circ.i(a_node), circ.i(b_node)
             h = ((y[ia - 1] if ia else 0j) - (y[ib - 1] if ib else 0j))
             owner = _noise_owner(circ, name)
-            per[owner] = per.get(owner, 0.0) + abs(h) ** 2 * psd
+            # a flicker density is f^-1, so it is evaluated AT this frequency:
+            # one number for the whole sweep would be a lie at every point but
+            # the one it was taken at
+            psd_f = psd(f) if callable(psd) else psd
+            per[owner] = per.get(owner, 0.0) + abs(h) ** 2 * psd_f
         onoise2 = sum(per.values())
         rec = {"freq_hz": round(f, 6),
                "onoise_v_per_sqrt_hz": _sig10(math.sqrt(onoise2)),
@@ -4078,11 +4254,25 @@ def _noise_analysis(circ, card, max_points):
         key = (owner, mechanism)
         cur = mech.get(key)
         if cur is None:
-            mech[key] = {"element": owner, "mechanism": mechanism,
-                         "elements": 1, "psd_a2_per_hz": psd, "formula": text}
+            cur = {"element": owner, "mechanism": mechanism,
+                   "elements": 1, "formula": text}
+            if callable(psd):
+                # a density that follows the frequency has no single value, so
+                # the two ends of the band are reported instead of a midpoint
+                # that would look like a constant
+                cur["frequency_dependent"] = True
+                cur["psd_a2_per_hz_at"] = dict(
+                    ("%g" % f, _sig10(psd(f)))
+                    for f in _psd_probe_freqs(freqs))
+            else:
+                cur["psd_a2_per_hz"] = psd
+            mech[key] = cur
         else:
             cur["elements"] += 1
-            cur["psd_a2_per_hz"] += psd
+            if callable(psd):
+                cur["frequency_dependent"] = True
+            else:
+                cur["psd_a2_per_hz"] = cur.get("psd_a2_per_hz", 0.0) + psd
     return ok(value={"analysis": "noise",
                      "output": card["out_text"],
                      "input_source": src["name"],
@@ -4109,11 +4299,18 @@ def _noise_analysis(circ, card, max_points):
                      "(A^T y = e_out) once per frequency, so the output response to "
                      "any current injected between two nodes is y[a] - y[b] and every "
                      "source is accounted for in the same solve; densities are "
-                     "Nyquist 4kT/R and shot 2q*I"),
+                     "Nyquist 4kT/R, shot 2q*I and a diode's flicker "
+                     "KF*|Id|^AF/f (evaluated at each swept frequency, not held at "
+                     "one value)"),
               precision=("exact for the linearised circuit in double precision, so the "
-                         "error that matters is the MODEL: thermal 4kT/R and shot 2q*I "
-                         "only - no flicker (1/f), no burst, no induced gate noise, no "
-                         "avalanche, and a level-1 MOSFET's (2/3)gm channel noise. The "
+                         "error that matters is the MODEL: thermal 4kT/R, shot 2q*I, "
+                         "a level-1 MOSFET's (2/3)gm channel noise, and for a DIODE "
+                         "only the flicker KF*|Id|^AF/f - whose f^-1 shape and |Id|^1 "
+                         "scaling were fitted to ngspice-47 on a forward-biased "
+                         "junction (KF read back 1.00112e-16 against the card's "
+                         "1e-16, i.e. +0.11 %). No burst, no avalanche, no induced "
+                         "gate noise, and NO flicker on a Q/M/J (those are refused "
+                         "above rather than reported without it). The "
                          "integral is a trapezoid over the swept points in the "
                          "sweep's own variable, so it is a band-limited number and "
                          "any sweep under-resolves a peak narrower than its spacing"),
@@ -4169,11 +4366,16 @@ def _tline_guard(circ, f):
     return None
 
 def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_points=200,
-                       temp_c=None):
+                       temp_c=None, _temp_sweep=False):
     """Run one analysis. Returns the standard envelope.
 
     `temp_c` overrides a `.temp` card in the netlist (the caller's stated
     temperature wins), and with neither the junction temperature is TEMP_C.
+
+    A `.temp` card with MORE than one number is a sweep: the deck is re-solved
+    once per temperature and every case is returned, instead of reading the
+    first number and dropping the rest (which is how a deck answers a question
+    nobody asked). `_temp_sweep` is internal and stops the recursion.
     """
     try:
         spec = parse_netlist(netlist)
@@ -4181,11 +4383,37 @@ def _simulate_builtin(netlist, analysis=None, max_iter=DEFAULT_MAX_ITER, max_poi
         return err(str(exc), "NETLIST_INVALID",
                    hint="the parser refuses a card it does not implement instead of "
                         "skipping it; see NOT_IMPLEMENTED_CARDS")
+    temps = spec["options"].pop("temp_list", [])
     if temp_c is not None:
         try:
             spec["options"]["temp_c"] = float(temp_c)
         except (TypeError, ValueError):
             return err("temp_c must be a number", "ARG_INVALID")
+        if len(temps) > 1:
+            spec["options"]["temp_c_overrode"] = list(temps)
+    if temp_c is None and len(temps) > 1 and not _temp_sweep:
+        cases = []
+        for t in temps:
+            one = _simulate_builtin(netlist, analysis=analysis, max_iter=max_iter,
+                                    max_points=max_points, temp_c=t,
+                                    _temp_sweep=True)
+            if (not isinstance(one, dict)) or one.get("status") != "ok":
+                return one
+            cases.append({"temp_c": t, "result": one})
+        return ok(value={"analysis": "temperature_sweep",
+                         "temperatures_c": list(temps),
+                         "cases": cases,
+                         "note": "the deck was solved once per temperature; each "
+                                 "case is a complete answer under 'result', with "
+                                 "its own assumptions.temp_c and its own warnings"},
+                  unit="mixed", model="mna_newton_dc",
+                  basis="one independent solve per entry of the .temp card (the "
+                        "temperature changes IS(T), Vt and every junction "
+                        "exponential, so a single bias point cannot stand in for "
+                        "several)",
+                  precision=PRECISION,
+                  assumptions={"temperatures_c": list(temps),
+                               "analyses": analysis or "auto"})
     try:
         circ = _Circuit(spec)
     except ValueError as exc:

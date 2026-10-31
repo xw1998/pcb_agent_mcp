@@ -9,6 +9,124 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.54] - 2026-10-31
+
+`calc_capabilities.not_implemented_yet` 第 14 条原先写着「rejects F H J K S W A cards with the
+card named in the error」。**这句话是假的**：`F`/`H`/`J`/`K`/`S`/`W` 六种卡全部求解成功，
+`A` 的 `gain`/`limit` 也在列，而源码里的 `NOT_IMPLEMENTED_CARDS = {}` 是个空字典。顺着这条
+逐条实测 19 条 `not_implemented_yet`，又抓到三处更坏的——**接了活、没干、还照常返回一个看起来
+可信的数字**。
+
+一句话结论：**能实测确认的就实现，实测确认不出来的就按名拒答**。没有一处「静默忽略」，也
+没有一处「猜一个公式」。
+
+### ⚠ 三处「静默忽略」被换掉（这是**改行为**，但只在别名陈的 deck 上）
+
+| 卡片 | 0.0.53 实测行为 | 0.0.54 |
+| --- | --- | --- |
+| 二极管 `KF=` / `AF=`（1/f 噪声） | `.noise` 结果在 f=1 与 f=10 上**逐位相同**（卡片读进来了，一分钱没体现） | **实现** `flicker_psd = KF·|Id|^AF / f`（A²/Hz，跨结电流源）；两点复现 ngspice-47 到 0.0589 % / 0.069 % |
+| `Q` / `M` / `J` 的 `KF=` | 同上，静默忽略 | `.noise` 时 **`NOT_MODELED` 按名拒答**（`.op` 仍照常求解——`KF` 在 DC 点本来就不影响任何东西） |
+| `R1 1 0 1k mc(1)` | 返回 `ok`，`value = 1000.0` | **`NETLIST_INVALID`** 按名拒答（`mc(`/`unif(`/`aunif(`/`gauss(`/`agauss(`/`limit(` 六种） |
+| `.temp 25 100` | 只解了 25 ℃，100 ℃ 被丢掉 | **扫描**：每温度一次独立求解，返回 `analysis="temperature_sweep"` + `cases[]` |
+
+### 二极管 1/f 的公式是从随包引擎里**反解**出来的，不是猜的
+
+随包引擎（`vendor/ngspice/bin/ngspice_con.exe`，ngspice-47 Windows build）同一个 deck：
+f=1 → `2.534181e-08`，f=10 → `8.302515e-09`。自解（只含 shot + thermal）两点都是
+`2.283233345e-09`（`D1` 贡献 `2.038732797e-18`、`R1` 贡献 `3.174421712e-18`，`|H|² = 1.9150e5`）。
+两点差值之比恰为 **10** ⇒ 频率指数就是 −1。`Id = 3.3227e-5 A` 由 shot 的 `2q*Id` 反推
+（`psd = 1.0645775669853785e-23`），反解得
+
+    KF = S_flicker(f)·f / |Id|^AF = 1.00112e-16     （卡片 1e-16，即 +0.11 %）
+
+形状、量纲、位置三者一起被钉死：**跨结的一个电流源，`KF·|Id|^AF/f`**。新实现的对引擎误差
+**0.0589 %（1 Hz）/ 0.069 %（10 Hz）**——那 0.11 % 的反解残差 + 两次舍入就是全部，不是拟合参数。
+
+`AF` 是**电流**的指数、不是频率的指数。我一开始写错了（以为 `S·f²` 在 `AF=2` 时恒定），
+实测发现 `S·f` 在两个 AF 下都恒定；`AF=2` 的 `S·f²` 假设被三点拟合否掉（拟出负的 `T` 与非零
+残差 1.88e-9）。测试里因此写成「两个 AF 下 `S·f` 都恒定」，`AF` 的效果交给另一类：
+`AF=1` 时 flicker 之比 == shot 之比，`AF=2` 时 == 比值的平方（线性读法偏差 > 0.1）。
+
+### `Q`/`M`/`J` 为什么不做：引擎自己也不做（这是**实测事实**，写进了 hint）
+
+- BJT：`KF` 从 `1e-15` 扫到 `1e-6`（九个数量级），ngspice-47 的噪声答案**逐位相同**
+  （f=1 与 f=10 都是 `6.547292e-09`）。
+- MOSFET：`F ∝ KF·Id·TOX/L²` 能拟出来（`TOX`×2 → ×2、`W`×10 → ×10、`L`×2 → ×0.125、
+  `KF`×10 → ×10，三点解 `S=T+F/f` 残差 ≤ 1e-14），但 `F` 是**输出参考量**、里面已经含了
+  `|H|²`，而 `|H|` 随 `R_D`/`gm`/`W/L` 一起变 ⇒ 器件级公式与电路级增益分不开。**宁愿不做也不猜。**
+
+所以 `.noise` 时的拒答消息里明写：「MEASURED: ngspice-47 … KF from 1e-15 to 1e-6 changed its
+own noise answer by 0.0 % - so there is no reference model to copy and `engine='ngspice'` would
+return the same thermal+shot number without telling you」，并给出
+`extra.devices_with_unmodelled_flicker`（元素名 / 类型 / `KF` 值）让人自己决定要不要删 `KF=`。
+
+### `.temp` 多值是**扫描**，不是「取第一个」
+
+`analysis = "temperature_sweep"`、`temperatures_c = [...]`、`cases = [{"temp_c": t, "result": {…}}]`，
+每个 `case` 是**一次独立求解**（不是把同一个 bias 点换个标签）。判据：`case[i]` 的 `nodes_v`
+必须与「该温度单独跑一遍」**逐位相同**；负控制是 25 ℃ 与 100 ℃ 的读数本身必须不同
+（否则「复制一份、改个温度标签」也能过闸）。实测（`V1 1 0 5 / R1 1 2 1k / D1 2 0 DM(IS=1e-14)`）：
+25 ℃ → `0.695820796` V，100 ℃ → `0.570918132` V。
+
+- `temp_c` 参数与 `.temp` 卡片同时出现时，参数赢，但 `_Circuit.__init__` 会登记一条覆盖警告
+  （「temp_c argument overrode a .temp card that named …; only the caller's one temperature was
+  solved (drop the argument to get the card's own sweep)」）。
+- `.temp` 后面一个数都没有 → `NETLIST_INVALID`（不是空扫描 + 空 `cases`）。
+- **多条 `.temp` 卡**仍按 SPICE 语义取最后一条（实测：`.temp 25` 之后 `.temp 100` ⇒ 答案就是
+  100 ℃ 的 `0.570918132`），这一版没有把它变成累积列表。
+
+### 行尾 token 与未知参数：两处「打了字、没人看」
+
+- R/C/L 的解析器读完 value 就把剩下的 token **全丢掉**，所以 `R1 1 0 1k 2k`、`R1 1 0 1k tc1=0.1`、
+  `R1 1 0 1k mc(1)` 全被当成 `1k`。新增 `_tail()`：`R` 一律拒，`C`/`L` 只放行文档化的 `ic=`。
+- `E` 卡是**恰好五个字段**（`n+ n- nc+ nc- gain`），六个字段是别的卡（`TABLE`/`POLY` 形态）
+  混进来的信号 ⇒ `len(parts) > 6` 即拒。负控制：五字段的 `E1 2 0 1 0 2` 仍答 `node2 == 10.0`。
+- **`call_tool` 加了未知参数点名**。起因是我自己手工验证时把 `temp_c` 写成了 `temperature_c`，
+  工具**静默忽略**了这个参数并返回了一份完整答案。现在不属于该工具 `inputSchema` 的键会被写进
+  `warnings`（「argument(s) … are not in this tool's schema and were IGNORED - the answer below
+  was computed as if they had never been given (spelling is exact: …)」）。**不报错**，因为工具
+  层并不知道上层是否有意冗余；**正确调用不产生这条警告**、也不产生 `unread_arguments` 键。
+
+### 能力自述的**订正登记**（不是悄悄改掉）
+
+第 14 条那句假声明改成「F H J K S W are SOLVED (0.0.31-0.0.36; **the earlier note that claimed
+they were rejected was wrong** and is corrected here), and A cards for the gain and limit code
+models since 0.0.39 - what is refused by name is the XSPICE models that carry state or a sample
+clock, not these cards.」旧文案原样留在括号里并注明 was wrong。另外两处：噪声机制段加入二极管
+flicker + 「frequency-dependent density is evaluated at each swept point」+ `Q/M/J` 的 `KF=` 拒答 +
+「ngspice-47 自己 0.0 %」；温度/MC 段改为「多值 `.temp` 是 SWEEP」「`mc(...)` 被按名拒答」。
+模块级 `PRECISION` 也从「Noise is thermal 4kT/R, shot 2q*I」扩成含二极管 flicker。
+
+### 默认答案**逐位不变**的自证
+
+- `KF` 不给 ⇒ `_flicker()` 返回 `None` ⇒ `sources` 里**根本不会多出一条**。
+- `.temp` 单值（或不写）⇒ 走原路径，不产生 `cases`，信封形状不变。
+- 常量密度源 ⇒ `callable(psd)` 为假 ⇒ 走原 `psd_a2_per_hz` 分支。
+- 值就是数 ⇒ `_STAT_FUNCS` 不命中 ⇒ 解析结果不变。
+- 参数名拼对 ⇒ 无 `warnings`、无 `unread_arguments`。
+
+每一处新增行为都有一条「旧行为还在」的负控制测试兜着，所以「加了功能」与「改了答案」是
+**可分辨**的两件事。
+
+### 测试
+
+- 新增 `tests/test_spice_flicker_temp.py`（23 例）：`TheDiodeFlickerReproducesTheEngine`、
+  `TheShapeIsFrequencyDependent`、`TheFlickerFollowsTheCurrent`、`TheUnmodelledFlickerIsRefused`、
+  `TheTemperatureCardIsASweep`、`MonteCarloValuesAreRefused`、
+  `TheCardsThatWereFalselyClaimedToBeRejected`、`NoTrailingTokenIsDropped`、
+  `AnArgumentNoHandlerReadsIsReported`。
+- `tests/test_spice_jfet.py` 的 `test_flicker_noise_is_refused_rather_than_silently_omitted`
+  改口：`.op` + `KF=1e-16` 现在 `ok`（`id == 1e-3`），`.noise` 时 `NOT_MODELED`。
+- `server.py` 新增 5 条 selftest（二极管 KF 复现 + `KF=0` 负控制 / Q-M-J 拒答 + 无 KF 对照 /
+  `.temp` 扫描 + 单温度逐位对照 / `mc(1)` 拒答 + `1k` 对照 / 未知参数点名 + 正确调用对照），
+  并把原「J 拒答 KF」那条改成只拒 `RD`/`RS`/`B`/`CGS`（KF 已搬到噪声期）。
+  `--selftest` **188/188 → 193/193**。
+- 全量回归：`unittest discover -s tests` → **2441 例 / OK (skipped=5) / 4133.839 s**
+  （0.0.53 是 2418 例 / 1329.823 s；这次实测时本机另有 5 个 CPU 满载的外部进程，所以
+  4133.839 s **不是**空载基线，两者的耗时不可直接比，用例数 2418 → 2441 才是增量）。
+
+`docs/57-SPICE-1f噪声与温度扫描.md` 记全部实测数字与判据-负控制对照表。
+
 ## [0.0.53] - 2026-10-31
 
 `vibration_plate_modes` 从 0.0.10 起一直是「**裸的**均质板」：厚度方向上只有层压板一种材料，

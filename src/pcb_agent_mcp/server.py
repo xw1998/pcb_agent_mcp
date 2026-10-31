@@ -1261,8 +1261,11 @@ def selftest():
         # 0.0.36: the parameters that would change the answer are refused BY NAME
         # (RD/RS are internal nodes, B is a different equation) - an ignored
         # parameter is a netlist that runs and lies.
+        # (KF= moved to the .noise analysis in 0.0.54: at .op it changes nothing,
+        # exactly as in SPICE, and the refusal now sits where the lie would be
+        # told - see the NOT_MODELED check further down.)
         _msgs = []
-        for _m in ("RD=100", "RS=100", "B=2", "CGS=1p", "KF=1e-16"):
+        for _m in ("RD=100", "RS=100", "B=2", "CGS=1p"):
             r = handle({"jsonrpc": "2.0", "id": 153, "method": "tools/call",
                         "params": {"name": "sim_spice", "arguments": {
                             "netlist": "* jf\nVd 1 0 5\nVg 2 0 0\n"
@@ -1272,9 +1275,9 @@ def selftest():
             _p = json.loads(r["result"]["content"][0]["text"])
             _msgs.append((_p.get("reason_code") == "NETLIST_INVALID"
                           and _m.split("=")[0] in (_p.get("message") or "")))
-        check("builtin J refuses RD/RS/B/CGS/KF by name (every one of them changes "
+        check("builtin J refuses RD/RS/B/CGS by name (every one of them changes "
               "the answer, measured) instead of stamping a number nobody chose",
-              all(_msgs), str(_msgs))
+              len(_msgs) == 4 and all(_msgs), str(_msgs))
 
         # 0.0.37: the engine this repository ships (vendor/ngspice, an unmodified
         # upstream build called as a separate process) is reachable ONLY by asking
@@ -3191,6 +3194,117 @@ def selftest():
           "on@0 %s, off@5 %s, band %s/%s" % (
               _seeds["on0"].get("2"), _seeds["off5"].get("2"),
               _seeds["band_on"].get("2"), _seeds["band_none"].get("2")))
+
+    # --- 0.0.54: the three decks that used to answer a different question ---
+    # (a) a diode's KF= was ignored, so the noise report was 1/f-free while the
+    #     card said otherwise. The check is against ngspice-47's own two readings
+    #     on the same deck, and the negative control is the same deck with KF=0:
+    #     if the term is real, 1 Hz has to fall by an order of magnitude.
+    _fl = "* flicker\nV1 2 0 dc 0.6 ac 1\nR1 2 1 1k\nD1 1 0 DM\n" \
+          ".model DM D(KF=%s AF=1)\n.noise v(1) V1 dec 1 1 10\n.end\n"
+    def _noise_of(kf):
+        return json.loads(handle({"jsonrpc": "2.0", "id": 159, "method": "tools/call",
+                                  "params": {"name": "sim_spice", "arguments": {
+                                      "netlist": _fl % kf}}})["result"]["content"][0]["text"])
+    _n_kf = _noise_of("1e-16")
+    _n_no = _noise_of("0")
+    _n_pts = [p["onoise_v_per_sqrt_hz"] for p in (_n_kf.get("value") or {}).get("points") or []]
+    _n_no_pts = [p["onoise_v_per_sqrt_hz"] for p in (_n_no.get("value") or {}).get("points") or []]
+    check("a diode's KF= is a density, not decoration: 1 Hz and 10 Hz reproduce "
+          "ngspice-47's own 2.534181e-08 / 8.302515e-09 within 1 %%, and the same "
+          "deck with KF=0 drops 1 Hz by more than 3x (shot+thermal only)",
+          _n_kf.get("status") == "ok" and _n_no.get("status") == "ok"
+          and len(_n_pts) == 2 and len(_n_no_pts) == 2
+          and abs(_n_pts[0] / 2.534181e-08 - 1.0) < 0.01
+          and abs(_n_pts[1] / 8.302515e-09 - 1.0) < 0.01
+          and _n_pts[0] / _n_no_pts[0] > 3.0
+          and abs(_n_no_pts[0] / _n_no_pts[1] - 1.0) < 1e-9,
+          "%s / %s vs %s / %s" % (_n_pts[:1], _n_pts[1:], _n_no_pts[:1],
+                                  _n_no_pts[1:]))
+
+    # (b) KF on a JFET/BJT/MOSFET has no reference model to copy (measured: the
+    #     bundled ngspice-47 moved by 0.0 % for KF 1e-15..1e-6), so the .noise
+    #     analysis REFUSES the deck by name instead of reporting thermal+shot as
+    #     if it were the answer. The negative control is the same deck without KF.
+    _jf_kf = ("* jf\nVd 1 0 5\nVg 2 0 0\nJ1 1 2 0 jm%s\n"
+              ".model jm NJF(VTO=-1 BETA=1m%s)\n.noise V(1) Vd lin 3 100 300\n.end\n")
+    def _jf_noise(extra):
+        return json.loads(handle({"jsonrpc": "2.0", "id": 1590, "method": "tools/call",
+                                  "params": {"name": "sim_spice", "arguments": {
+                                      "netlist": _jf_kf % ("", extra)}}})["result"]["content"][0]["text"])
+    _jk = _jf_noise(" KF=1e-16 AF=1")
+    _jn = _jf_noise("")
+    check("a KF= this subset cannot model is REFUSED at .noise, not answered "
+          "without it: NOT_MODELED names J1 and carries the measured 0.0 % fact, "
+          "while the same deck without KF= answers",
+          _jk.get("status") == "error" and _jk.get("reason_code") == "NOT_MODELED"
+          and "J1" in (_jk.get("message") or "")
+          and "0.0 %" in (_jk.get("hint") or "")
+          and _jn.get("status") == "ok",
+          "%s / %s" % (_jk.get("reason_code"), _jn.get("status")))
+
+    # (c) `.temp 25 100` used to be read as "take 25, drop 100". It is a sweep: one
+    #     independent solve per temperature, and each case must BE the deck run at
+    #     that one temperature - the negative control that a copied result fails.
+    _tdeck = ("* t\nV1 1 0 5\nR1 1 2 1k\nD1 2 0 DM\n.model DM D(IS=1e-14)\n"
+              ".temp %s\n.op\n.end\n")
+    def _run(*args):
+        return json.loads(handle({"jsonrpc": "2.0", "id": 1591, "method": "tools/call",
+                                  "params": {"name": "sim_spice",
+                                             "arguments": dict(args[0])}})["result"]["content"][0]["text"])
+    _sweep = _run({"netlist": _tdeck % "25 100"})
+    _sv = _sweep.get("value") or {}
+    _cases = _sv.get("cases") or []
+    _solo = [_run({"netlist": _tdeck % ("%g" % t)}) for t in (25.0, 100.0)]
+    _solo_v = [(x.get("value") or {}).get("nodes_v") or {} for x in _solo]
+    check("`.temp 25 100` is a SWEEP, not a first-value: two cases, each with its "
+          "own temperature, and each one bit-identical to the deck run at that one "
+          "temperature (25 C and 100 C differ, so a copied case fails)",
+          _sweep.get("status") == "ok" and _sv.get("analysis") == "temperature_sweep"
+          and len(_cases) == 2
+          and [c.get("temp_c") for c in _cases] == [25.0, 100.0]
+          and (_cases[0].get("result") or {}).get("value", {}).get("nodes_v") == _solo_v[0]
+          and (_cases[1].get("result") or {}).get("value", {}).get("nodes_v") == _solo_v[1]
+          and _solo_v[0].get("2") != _solo_v[1].get("2"),
+          "%s cases, %s vs %s" % (len(_cases),
+                                  (_cases[0].get("result") or {}).get("value", {}).get("nodes_v", {}).get("2"),
+                                  (_cases[1].get("result") or {}).get("value", {}).get("nodes_v", {}).get("2")))
+
+    # (d) `mc(1)` / `agauss(...)` used to parse as the nominal number and come back
+    #     as a confident deterministic answer. Refused by name, and the negative
+    #     control is the same deck with a plain value.
+    _mc = ("V1 1 0 5\nR1 1 0 %s\n.op\n.end\n")
+    _mc_bad = json.loads(handle({"jsonrpc": "2.0", "id": 1592, "method": "tools/call",
+                                 "params": {"name": "sim_spice", "arguments": {
+                                     "netlist": _mc % "1k mc(1)"}}})["result"]["content"][0]["text"])
+    _mc_ok = json.loads(handle({"jsonrpc": "2.0", "id": 1593, "method": "tools/call",
+                                "params": {"name": "sim_spice", "arguments": {
+                                    "netlist": _mc % "1k"}}})["result"]["content"][0]["text"])
+    check("a Monte-Carlo value is REFUSED by name (it used to read as its nominal "
+          "number): 'mc(1)' is NETLIST_INVALID with the reason spelled out, and "
+          "'1k' in the same deck answers",
+          _mc_bad.get("status") == "error"
+          and _mc_bad.get("reason_code") == "NETLIST_INVALID"
+          and "Monte-Carlo" in (_mc_bad.get("message") or "")
+          and _mc_ok.get("status") == "ok",
+          "%s / %s" % (_mc_bad.get("reason_code"), _mc_ok.get("status")))
+
+    # (e) an argument no handler reads used to produce a complete answer computed
+    #     at the default. It is named now, and a correct call gains nothing.
+    _unk = json.loads(handle({"jsonrpc": "2.0", "id": 1594, "method": "tools/call",
+                              "params": {"name": "sim_spice", "arguments": {
+                                  "netlist": _mc % "1k", "temperature_c": 50}}})["result"]["content"][0]["text"])
+    _unk_ok = json.loads(handle({"jsonrpc": "2.0", "id": 1595, "method": "tools/call",
+                                 "params": {"name": "sim_spice", "arguments": {
+                                     "netlist": _mc % "1k"}}})["result"]["content"][0]["text"])
+    check("an argument the handler never reads is NAMED instead of silently "
+          "ignored ('temperature_c' vs 'temp_c'), and a correct call adds no such "
+          "warning",
+          _unk.get("status") == "ok"
+          and any("temperature_c" in w and "IGNORED" in w
+                  for w in (_unk.get("warnings") or []))
+          and not any("IGNORED" in w for w in (_unk_ok.get("warnings") or [])),
+          str((_unk.get("warnings") or [])[:1]))
 
     # --- repeating pulse trains: three readings, no field solver ---
     # (a) with the cooling deleted the model must BE Onderdonk, not nearly it. The
