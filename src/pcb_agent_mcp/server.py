@@ -1917,6 +1917,66 @@ def selftest():
               and _br.get("reason_code") == "THERMAL_RUNAWAY",
               str(_br.get("reason_code")))
 
+        # --- the through-thickness stack (0.0.58). Two levels with a uniform
+        # source on the top level have an exact answer with ONE convection face
+        # per surface level, so this scores the layered solve against arithmetic.
+        _w, _hh, _th = 50.0, 50.0, 1.6
+        _a = (_w * 1e-3) * (_hh * 1e-3)
+        _stack = {"copper_layers": [{"z_mm": 0.0, "thickness_um": 0.0},
+                                    {"z_mm": _th, "thickness_um": 0.0}]}
+        r = handle({"jsonrpc": "2.0", "id": 1091, "method": "tools/call",
+                    "params": {"name": "board_electrothermal", "arguments": {
+                        "width_mm": _w, "height_mm": _hh, "thickness_mm": _th,
+                        "k_w_mk": 0.3, "h_w_m2k": 10, "cell_mm": 2.0,
+                        "alpha_per_k": 0.0, "layer_stack": _stack,
+                        "conductors": [{"x1_mm": 0.0, "y1_mm": _hh / 2,
+                                        "x2_mm": _w, "y2_mm": _hh / 2,
+                                        "width_mm": _hh, "thickness_um": 35,
+                                        "current_a": 20.0, "z_mm": _th}]}}})
+        _ls = json.loads(r["result"]["content"][0]["text"])
+        _hA = 10.0 * _a
+        _G = 0.3 * _a / (_th * 1e-3)
+        _q = _ls.get("total_power_at_20c_w") or 0.0
+        _ut = _q * (_hA + _G) / (_hA * (_hA + 2 * _G))
+        _ub = _q * _G / (_hA * (_hA + 2 * _G))
+        _lvs = ((_ls.get("layer_stack") or {}).get("levels") or [])
+        check("layered stack matches the 2-level closed form (%.6f/%.6f C)"
+              % (25 + _ut, 25 + _ub),
+              _ls.get("status") == "ok" and len(_lvs) == 2
+              and abs(_lvs[1]["t_max_c"] - (25 + _ut)) < 1e-3
+              and abs(_lvs[0]["t_max_c"] - (25 + _ub)) < 1e-3
+              and _lvs[0]["role"] == "bottom face"
+              and _lvs[1]["role"] == "top face"
+              and ((_ls.get("energy_balance") or {})
+                   .get("residual_allowance_w") or 0) > 0,
+              "%s %s" % (_lvs[1]["t_max_c"] if len(_lvs) > 1 else None,
+                         _lvs[0]["t_max_c"] if _lvs else None))
+
+        # k_z -> infinity means the levels are shorted, and then the stack MUST
+        # reproduce the single plate: the regression anchor for the whole model.
+        _tr = [{"x1_mm": 0.0, "y1_mm": _hh / 2, "x2_mm": 45.0, "y2_mm": _hh / 2,
+                "width_mm": 2.0, "thickness_um": 35, "current_a": 3.0,
+                "z_mm": _th}]
+        _plate = json.loads(handle(
+            {"jsonrpc": "2.0", "id": 1092, "method": "tools/call",
+             "params": {"name": "board_electrothermal", "arguments": {
+                 "width_mm": _w, "height_mm": _hh, "thickness_mm": _th,
+                 "k_w_mk": 0.3, "h_w_m2k": 10, "cell_mm": 2.0,
+                 "conductors": _tr}}})["result"]["content"][0]["text"])
+        _short = json.loads(handle(
+            {"jsonrpc": "2.0", "id": 1093, "method": "tools/call",
+             "params": {"name": "board_electrothermal", "arguments": {
+                 "width_mm": _w, "height_mm": _hh, "thickness_mm": _th,
+                 "k_w_mk": 0.3, "h_w_m2k": 10, "cell_mm": 2.0,
+                 "conductors": _tr, "tol_k": 1e-6,
+                 "layer_stack": dict(_stack, k_z_w_mk=1e6)}}})
+            ["result"]["content"][0]["text"])
+        check("k_z -> infinity reproduces the single plate (%.6f vs %.6f C)"
+              % (_short.get("t_max_c") or -1, _plate.get("t_max_c") or -1),
+              _plate.get("status") == "ok" and _short.get("status") == "ok"
+              and abs(_short.get("t_max_c") - _plate.get("t_max_c")) < 0.01,
+              "%s vs %s" % (_short.get("t_max_c"), _plate.get("t_max_c")))
+
         # --- plate stress against the exact mode. A plate simply supported on all
         # four edges has w = A sin(pi x/a) sin(pi y/b) as its (1,1) mode, so the
         # surface stress at the centre is arithmetic, and the largest von Mises

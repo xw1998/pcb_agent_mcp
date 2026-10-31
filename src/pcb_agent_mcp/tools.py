@@ -3419,9 +3419,22 @@ def _capabilities(_args):
                               "hidden. A per-array barrel_profile (segments in "
                               "series, G = 1/sum(L_i/(k_cu*A_i))) replaces the uniform "
                               "wall, so a thin mid-barrel is not averaged away. "
-                              "Neither is on by default. DC only, no skin "
-                              "effect, no AC loss, no 3-D, no component thermal mass "
-                              "or contact resistance",
+                              "Neither is on by default. layer_stack (0.0.58) turns "
+                              "the single plate into N through-thickness levels: one "
+                              "in-plane field per level, midpoint slabs that add up to "
+                              "the board, coupling ONLY through the laminate k_z, "
+                              "convection/radiation ONLY on the two outer levels (an "
+                              "internal plane sees no air), per-level copper zones at "
+                              "exact area fractions, and thermal vias as a series of "
+                              "gaps rather than a path to a sink. The vertical "
+                              "direction is an exact per-column tridiagonal solve "
+                              "relaxed as one block (a stiff k_z can no longer look "
+                              "converged on the first sweep), and k_z -> infinity "
+                              "reproduces the single plate. That is a layered "
+                              "(z-direction finite-volume) model, not a 3-D field "
+                              "solve: each level is isothermal across its slab. DC "
+                              "only, no skin effect, no AC loss, no component thermal "
+                              "mass or contact resistance",
             "vibration": "mechanical vibration: natural frequencies and mode shapes of "
                          "a thin plate (Rayleigh-Ritz, monomial basis, exact for SSSS "
                          "and CCCC and needs no mode table), single-mode random response "
@@ -3893,8 +3906,13 @@ def _capabilities(_args):
             "copper barrel per pitch cell as a conductance to a sink, landing in the "
             "cell holding its centre, or -- with a per-array barrel_profile -- a "
             "segmented wall whose segments are in series) are modelled when asked for, "
-            "and are OFF by default so the numbers are bit-identical without them. Still not done: "
-            "3-D, internal plane-to-plane radiation through the laminate, "
+            "and are OFF by default so the numbers are bit-identical without them. "
+            "layer_stack turns the plate into N through-thickness levels (0.0.58), but it is a "
+            "layered z-direction finite-volume model, not a 3-D field solve: each level is "
+            "isothermal across its slab, so a real 3-D field, internal plane-to-plane radiation "
+            "through the laminate, anisotropic laminate k and the copper-to-resin interface "
+            "thermal resistance are still not done. Still not done: "
+            "3-D (as above, layered only), internal plane-to-plane radiation through the laminate, "
             "temperature-dependent emissivity, component thermal mass and contact "
             "resistance, AC loss (skin/proximity), device self-heating inside "
             "sim_spice, reading the conductors or the zones straight off a board "
@@ -6299,7 +6317,19 @@ _tool(
     "re-solved until it stops moving, so the answer is the T^4 solution and not an "
     "eps folded into h; thermal_vias adds copper barrels as a conductance to a sink "
     "per cell. Neither is on unless you ask for it, and with neither the numbers are "
-    "bit-identical to 0.0.44.",
+    "bit-identical to 0.0.44. layer_stack replaces the single plate with N "
+    "through-thickness levels: one in-plane field per level (each level isothermal "
+    "across its own slab, midpoint slabs that add up to the board), driven only by "
+    "conduction through the laminate k_z between adjacent levels, with convection and "
+    "radiation ONLY on the two outer faces - an internal level sees no air, which is "
+    "exactly what a plane inside the board does. Each level may carry copper (zones = "
+    "rectangles, exact area fractions). The vertical direction is solved as an exact "
+    "per-column tridiagonal system (Thomas) and relaxed as one block while the in-plane "
+    "field is swept by SOR, so a very stiff k_z cannot be mistaken for convergence; as "
+    "k_z -> infinity the answer degenerates to the single-plate number. thermal_vias in "
+    "this mode become a short between adjacent levels (a series of gaps, never a path "
+    "to a sink) and sink_c / barrel_profile / a partial span are refused. layer_stack "
+    "and copper_pours are mutually exclusive: the same copper counted twice.",
     {"type": "object", "properties": {
         "width_mm": _num("plate width"),
         "height_mm": _num("plate height"),
@@ -6337,6 +6367,20 @@ _tool(
         "emissivity": _num("optional 0..1 grey-body emissivity of BOTH faces; omit or "
                             "0 to leave radiation out entirely. Adding it lowers t_max "
                             "and never raises it", None),
+        "layer_stack": {"type": "object", "description":
+            "optional: model the board as N through-thickness levels instead of one "
+            "plate. {copper_layers: [{z_mm, thickness_um, zones?}, ...], k_z_w_mk?}. "
+            "z_mm is 0 at the bottom face and thickness_mm at the top; copper_layers "
+            "must be non-empty (pass one entry with thickness_um 0 to say 'no copper') "
+            "and its z_mm values become the level nodes, always including both faces. "
+            "zones = [{x1_mm,y1_mm,x2_mm,y2_mm}, ...] limits that level's copper to "
+            "rectangles (exact area fraction); omit them for full-board copper. "
+            "k_z_w_mk is the through-thickness laminate conductivity (default k_w_mk). "
+            "Internal levels have no convection and no radiation; only the two outer "
+            "levels exchange heat with the air. In this mode every conductor needs an "
+            "explicit z_mm (one of the level nodes) and layers must be 1, because a "
+            "trace on the wrong layer is a wrong answer, not a default. Mutually "
+            "exclusive with copper_pours."},
         "thermal_vias": {"type": "array", "items": {"type": "object"},
             "description":
             "optional: copper barrels that carry heat DOWN the board to a sink. "
@@ -6361,6 +6405,7 @@ _tool(
         k_copper_w_mk=a.get("k_copper_w_mk"),
         emissivity=a.get("emissivity"),
         thermal_vias=a.get("thermal_vias"),
+        layer_stack=a.get("layer_stack"),
         alpha_per_k=(a["alpha_per_k"] if a.get("alpha_per_k") is not None else 0.00393),
         rho20_ohm_m=(a["rho20_ohm_m"] if a.get("rho20_ohm_m") is not None else 1.724e-8),
         tol_k=(a["tol_k"] if a.get("tol_k") is not None else 1e-4),

@@ -9,6 +9,62 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.58] - 2026-10-31
+
+电热的**厚度方向**。0.0.57 及之前 `board_electrothermal` 解的是一块**均质板**：热源在顶层铜上、
+地板在另一面，而它按同一个 `k_w_mk` 在面内扩散,厚度方向只是一块没有结构的板。本版加
+`layer_stack`（**默认关，关时体积与行为零变化**）：N 个层节点、中点法则 slab、层间只有层压板
+`k_z`、**对流/辐射只在最上与最下两个表面层**（埋进板里的平面确实没有空气）。
+
+一句话结论：**层堆做出来了，闭式锚点 1e-6 一致、`k_z → ∞` 代数恒等地退化回单平面；但本版
+必须先登记一处自己犯的错——第一版在 z 方向也做扫描，`k_z = 1e6`（合法的"层间短路"）时
+第一次扫描就宣称收敛，返回的其实是初始猜测，8.5 K 的静默错答案。**
+
+### 新增
+
+| 项 | 内容 |
+| --- | --- |
+| `board_electrothermal` | 新参数 `layer_stack`（`copper_layers[{z_mm,thickness_um,zones?}]` + `k_z_w_mk?`）；能力自述把 "no 3-D" 改口为 "layered z-direction finite volume, not a 3-D field solve" |
+| `calc/electrothermal.py` | `_build_stack`（层节点 / 中点 slabs / 片导 / 逐层铜厚面积平均）、**`_sor_layers` 重写**（面内 SOR + 逐列三对角精确解 + 整块松弛）、`_solve_layers_3d`（返回辐射外层次数）、`op_norm`、双门允许量、`stack_report`、分层过孔报告、`_LAYERED_MODEL` |
+| 返回块 | `layer_stack`（`levels[{index,z_mm,slab_mm,copper_um_area_avg,surface,role,t_max_c,t_min_c,t_avg_c}]` / `gaps[{conductance_w_per_k,via_conductance_w_per_k,conductance_with_vias_w_per_k,net_heat_up_w,through_vias_w,areal_rth_m2k_per_w}]` / `hot_level` / `rise_across_board_k`）、`energy_balance.residual_allowance_w` + `residual_allowance`（**仅分层路径**） |
+| 测试 | `tests/test_electrothermal_layers.py` **29 例**（新，含 13 类拒绝与 9 条负控制）；既有 196 例电热测试全绿 |
+| selftest | 2 条新读数（分层闭式 1e-3 K、`k_z → ∞` 对单平面 0.01 K），`203/203` → **`205/205`** |
+| 全量回归 | **2569 例 / OK (skipped=5) / 865.034 s**（0.0.57 的 2540 + 29；本机同为无外部满载进程，可与 0.0.57 的 892.297 s 同负载比较） |
+
+### 登记修正（不静默改变既有答案）
+
+1. **z 方向的假收敛（8.5 K）**：判据"单次扫描最大改动 < `tol_k`"在刚性耦合下第 1 次扫描即成立
+   （改动量是 `O(h·A/gz)`）。实测两层无铜 `k_z = 1e6` → **26.2468 °C / `sor_sweeps = 1`**，而正确
+   答案是单平面的 **34.771887 °C**。改逐列 Thomas 后 `tol 1e-4/1e-6/1e-8` 给
+   34.771012 / 34.771874 / 34.771882（90/142/197 sweeps，差 ≤ 1.3e-5 K）。**只影响分层路径**。
+2. **`hc_face = h·ac`**：第一版给每个表面层单平面的两面 `2h·ac`，散热翻倍 ⇒ 能量不平衡 −95.208 %。
+3. **`omega = 1.0`**：面内的 1.85 在"整列一块"的松弛上式破坏性的（崩成 0.001 °C / 负温）。
+4. **物理性门的分层相对 slack**（`0.002·升幅`）：`k_z = 1e12` 的 `t_min = 24.986143` 会误伤。
+5. **分层瞬态补 `t = 0` 那一格**：否则同一个 `points` 在两条路径上 `history` 长度不同。
+6. **分层过孔报告要显式覆盖 `extra["thermal_vias"]`**：原先一直显示 "no thermal_vias given"。
+
+**单平面自证**：`discover -s tests -p "test_*thermal*.py"` → 196 例 OK；本轮每处改动都以
+`stk is not None` 为界，0.0.57 的输出逐位不变（`test_the_plate_output_is_unchanged` 断言
+无 `layer_stack` 键、`energy_balance` 里无 `residual_allowance_w`）。
+
+### 算术锚点（不是自己对自己的回放）
+
+两层均匀源、`alpha_per_k = 0`、每表面层**一个**对流面：`u_top = q(hA+G)/(hA(hA+2G))`、
+`u_bot = qG/(hA(hA+2G))` ⇒ 实测 **25.035534 / 25.033734**，手算同值（1e-6），`residual` 3.2e-11。
+瞬态容量 **44.1549 J/K** = `rho·cp·A·t`。三层对称（源在中层）@ `k_z = 0.05/0.3/5`：
+(27.068/27.445/27.068)、(27.188/27.257/27.188)、(27.217/27.221/27.217) —— 中层最热、两表面对称。
+117 个 `d = 0.3` 通孔：`rise_across_board_k` 10.464 → 10.464，`via_conductance_w_per_k` 0.6318
+（层压板本身比想象中更会导热，物理上正常）。
+
+### 边界
+
+层内等温（z 方向有限体积，**不是 3-D 场解**）、层间只有层压板 `k_z` + 你列的过孔、无介质各向异性、
+无铜-树脂界面热阻、内部层无对流无辐射、过孔仍是点载荷（网格相关）、DC（无趋肤/介质/AC 损耗）。
+`layer_stack` 与 `copper_pours` 互斥（同一块铜会算两遍），分层模式下 `conductors` 必须显式给
+`z_mm` 且 `layers == 1`，`sink_c` / `barrel_profile` / 非全厚 `span` 一律拒答。
+
+详见 [docs/61](docs/61-电热-层间三维与多平面耦合.md)。
+
 ## [0.0.57] - 2026-10-31
 
 振动层补四个缺口。前三处是"能力清单上写着不做"，第四处是**算错了**——而且错得很有道理，
