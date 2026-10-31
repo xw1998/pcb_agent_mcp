@@ -2073,6 +2073,67 @@ def selftest():
               _z_esl[1e-9][1] > 10.0 * _z_esl[1e-9][0]
               and _z_esl[4e-9][0] > 10.0 * _z_esl[4e-9][1],
               str(_z_esl))
+        # --- 0.0.51, surface roughness. K is ONE formula, so the three readings
+        # here are the ones that can fail: its anchors (a wrong exponent, a wrong
+        # 1.4 or a missing square all move them), the sigma_eff identity (the same
+        # loss reached through a second code path, sigma/K^2), and the dielectric
+        # side staying bit-identical (a coefficient that leaked into Qd fails).
+        from .calc.roughness import skin_depth_m as _skin_m
+        from .calc.power import COPPER_SIGMA as _cu_sigma
+
+        def _pq(_args, _id):
+            _env = json.loads(handle({"jsonrpc": "2.0", "id": _id,
+                                      "method": "tools/call",
+                                      "params": {"name": "cavity_plane_q",
+                                                 "arguments": _args}})
+                               ["result"]["content"][0]["text"])
+            _flat = dict(_env.get("value") or {})
+            _flat.update({k: v for k, v in _env.items() if k != "value"})
+            return _flat
+
+        _sd_um = _skin_m(1e9, _cu_sigma) * 1e6      # one skin depth at 1 GHz, um
+        _smooth = _pq({"f_hz": 1e9, "h_mm": 1.6, "tan_delta": 0.02}, 1604)
+        _anchors = {}
+        for _i, _mult in enumerate((1.0, 2.0, 10.0)):
+            _r = _pq({"f_hz": 1e9, "h_mm": 1.6, "tan_delta": 0.02,
+                      "roughness_um": _sd_um * _mult}, 1604 + _i)
+            _anchors[_mult] = (_r.get("roughness") or {}).get("loss_factor")
+        check("roughness K(delta_s) = %.5f, K(2 delta_s) = %.5f, K(10 delta_s) = "
+              "%.5f and never reaches 2 (delta_s = %.4f um at 1 GHz in copper)"
+              % (_anchors[1.0], _anchors[2.0], _anchors[10.0], _sd_um),
+              abs(_anchors[1.0] - 1.60514) < 5e-5
+              and abs(_anchors[2.0] - 1.88750) < 5e-5
+              and abs(_anchors[10.0] - 1.99545) < 5e-5
+              and 1.995 < _anchors[10.0] < 2.0,
+              str(_anchors))
+
+        # the same loss, said as a worse conductor: Rs*K == 1/(sigma_eff*delta_s)
+        # with sigma_eff = sigma/K^2. Two calls, one identity - if K were applied
+        # to the wrong quantity one of these numbers moves.
+        _via_eff = _pq({"f_hz": 1e9, "h_mm": 1.6,
+                        "conductivity_s_m": _cu_sigma / _anchors[2.0] ** 2}, 1607)
+        _rough2 = _pq({"f_hz": 1e9, "h_mm": 1.6, "tan_delta": 0.02,
+                       "roughness_um": 2.0 * _sd_um}, 1608)
+        # qc goes as sqrt(sigma), so sigma -> sigma/K^2 gives qc -> qc/K: the
+        # same loss as Rs *= K, reached through a conductivity instead. The K
+        # (not K^2) on the Qc side is the whole point - an implementation that
+        # divided by K^2 here would land on 214.9 instead of 405.6.
+        check("sigma_eff = sigma/K^2 reproduces the roughened Qc through a second "
+              "code path (%.6f vs %.6f, K = %.5f)"
+              % (_via_eff.get("q_conductor"),
+                 _smooth.get("q_conductor") / _anchors[2.0], _anchors[2.0]),
+              abs(_via_eff.get("q_conductor", 0.0)
+                  / (_smooth.get("q_conductor", 1.0) / _anchors[2.0]) - 1.0) < 5e-6,
+              "%.9f" % (_via_eff.get("q_conductor", 0.0)
+                        / (_smooth.get("q_conductor", 1.0) / _anchors[2.0])))
+
+        check("roughness moves q_conductor only: q_dielectric is unchanged "
+              "(%.6f vs %.6f) and the roughness block appears only when asked for"
+              % (_rough2.get("q_dielectric", -1), _smooth.get("q_dielectric", -1)),
+              _rough2.get("q_dielectric") == _smooth.get("q_dielectric")
+              and "roughness" not in _smooth and "roughness" in _rough2
+              and _rough2.get("q_conductor", 1e9) < 0.75 * _smooth.get("q_conductor", 0),
+              "%s/%s" % (_rough2.get("q_conductor"), _smooth.get("q_conductor")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 

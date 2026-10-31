@@ -39,9 +39,13 @@ import math
 from .result import ok, err
 from .field2d import _ellip_K, stripline_zero_thickness_z0
 from .rf import C0_MM_PER_NS
+from .roughness import MU0, roughness_factor, skin_depth_m
 
 ETA0 = 376.730313668          # free-space wave impedance, ohm
-MU0 = 1.25663706212e-6        # H/m
+# MU0 now comes from `.roughness` (4*pi*1e-7, exact by the SI-2019 definition
+# of the ampere). The old literal 1.25663706212e-6 was the pre-2019 measured
+# value; it differs by 5.4e-10 relative, i.e. far below the 6 significant
+# digits every answer in this repo is reported to.
 SIGMA_CU = 5.8e7              # S/m, annealed copper (what a PCB house quotes)
 
 KINDS = ("microstrip", "stripline", "cpw", "gcpw", "cpw_diff", "gcpw_diff")
@@ -172,7 +176,7 @@ def _surface_resistance(freq_ghz):
 
 def _skin_depth_um(freq_ghz):
     f = float(freq_ghz) * 1e9
-    return 1e6 * math.sqrt(1.0 / (math.pi * f * MU0 * SIGMA_CU))
+    return 1e6 * skin_depth_m(f, SIGMA_CU)   # shared with the plane-Q path
 
 def _roughness_factor(roughness_um, freq_ghz):
     """Hammerstad-Jensen surface-roughness multiplier on Rs.
@@ -188,7 +192,7 @@ def _roughness_factor(roughness_um, freq_ghz):
         return 1.0, None
     delta = _skin_depth_um(freq_ghz)
     x = r / delta
-    k = 1.0 + (2.0 / math.pi) * math.atan(1.4 * x * x)
+    k = roughness_factor(r * 1e-6, delta * 1e-6)   # one formula, in `roughness.py`
     return k, {"roughness_um": r, "skin_depth_um": round(delta, 4),
                "roughness_over_skin": round(x, 3), "factor": round(k, 4)}
 

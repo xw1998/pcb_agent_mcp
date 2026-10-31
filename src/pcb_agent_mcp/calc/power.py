@@ -12,6 +12,7 @@ import math
 
 from .result import ok, err
 from .cavity import COPPER_SIGMA
+from .roughness import roughness_factor, skin_depth_m
 
 RHO_CU_20 = 1.724e-8      # ohm*m, annealed copper (IACS 100%)
 ALPHA_CU = 0.00393        # 1/K, 0..100 C linear region
@@ -536,13 +537,16 @@ _PLANE_CURVE_NOT_COMPUTED = (
     "cavity, not a via inside a real pad/antipad stack",
     "split planes, moats and every return-path discontinuity: the model is one "
     "unbroken rectangle with PMC side walls",
-    "radiation Q, surface roughness, glass-weave Dk inhomogeneity, and the "
-    "open-edge detuning of the mode frequencies (a real plane rings a few "
-    "percent LOW of the PMC values used here)",
+    "radiation Q, glass-weave Dk inhomogeneity, and the open-edge detuning of "
+    "the mode frequencies (a real plane rings a few percent LOW of the PMC "
+    "values used here)",
     "the capacitors and packages mounted across the planes. They are usually "
     "the DOMINANT damping of a real PDN resonance and they are not in this sum, "
     "so the Q here is an upper bound and the peaks come out too high and too "
     "narrow - this curve is the planes alone",
+    "surface roughness beyond the one-number Hammerstad-Jensen multiplier: no "
+    "Huray nodule model, no foil profile, no anisotropic roughness - pass "
+    "roughness_um to turn the multiplier on (without it the copper is smooth)",
     "any verdict: a resonance matters only together with an excitation and a "
     "coupling, and neither is in this number",
 )
@@ -553,22 +557,31 @@ def _ap_sinc(u):
         return 1.0
     return math.sin(u) / u
 
-def _plane_q_of(f_hz, h_m, tan_delta, sigma):
+def _plane_q_of(f_hz, h_m, tan_delta, sigma, rq_m=None):
     """Q of one cavity mode: copper (Qc = h/delta_s) and dielectric (Qd = 1/tand).
 
     Returns (q_total, q_copper, q_dielectric). At f = 0, or with sigma None
     (ideal copper), there is no conductor loss: a uniform field has H = 0
     between the plates, so the (0,0) mode is damped by the dielectric only.
+
+    rq_m is the RMS surface roughness: it multiplies Rs by the Hammerstad-Jensen
+    factor K(rq/delta_s), i.e. Qc = h/(delta_s*K), and NOTHING else - the
+    dielectric side is unaffected, which is the negative control the tests use
+    (a roughness that leaked into Qd would change q_dielectric and fail).
+    rq_m = None is smooth copper, bit for bit.
     """
     qd = 1.0 / tan_delta
     if f_hz <= 0.0 or sigma is None:
         return qd, None, qd
     delta_s = math.sqrt(1.0 / (math.pi * f_hz * MU0 * sigma))
     qc = h_m / delta_s
+    if rq_m:
+        qc = qc / roughness_factor(rq_m, delta_s)
     return 1.0 / (1.0 / qc + 1.0 / qd), qc, qd
 
 def _plane_modal_z(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, p1, p2,
-                   ap_x_m=0.0, ap_y_m=0.0, ap2_x_m=None, ap2_y_m=None):
+                   ap_x_m=0.0, ap_y_m=0.0, ap2_x_m=None, ap2_y_m=None,
+                   rq_m=None):
     """Transfer impedance between two ports, modes m,n = 0..order.
 
         Z = j*w*mu0*h * sum_mn  A_mn / (k_mn^2 - kap^2),   kap^2 = k^2*(1 - j/Q)
@@ -605,7 +618,7 @@ def _plane_modal_z(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, p1, p2,
         return None
     w = 2.0 * math.pi * f_hz
     k2 = w * w * MU0 * EPS0 * er
-    q, _qc, _qd = _plane_q_of(f_hz, h_m, tan_delta, sigma)
+    q, _qc, _qd = _plane_q_of(f_hz, h_m, tan_delta, sigma, rq_m)
     kap2 = k2 * (1.0 - 1j / q)
     n_i = order + 1
     pi = math.pi
@@ -680,7 +693,7 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
                         port_mm=None, port_size_mm=None, probe_mm=None,
                         f_start_hz=None, f_stop_hz=None, points=100,
                         freqs_hz=None, max_order=256, tolerance=0.01,
-                        conductivity_s_m=COPPER_SIGMA):
+                        conductivity_s_m=COPPER_SIGMA, roughness_um=None):
     """|Z(f)| of one plane pair, as a CURVE: the modal sum, with a convergence gate.
 
     pdn_plane_modes reports the single-mode peaks and refuses the curve, because
@@ -752,6 +765,21 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
     if sg is not None and sg <= 0.0:
         return err("conductivity_s_m must be > 0, or null for ideal copper",
                    "ARG_RANGE", extra={"conductivity_s_m": sg})
+
+    rq = None
+    if roughness_um is not None:
+        rq_um = num(roughness_um)
+        if rq_um is None or rq_um < 0.0:
+            return err("roughness_um must be >= 0 (RMS surface roughness Rq, in "
+                       "micrometres)", "ARG_RANGE",
+                       extra={"roughness_um": roughness_um})
+        if sg is None:
+            return err("roughness_um corrects the COPPER loss, but "
+                       "conductivity_s_m is null (ideal copper) - pass a "
+                       "conductivity or drop the roughness", "ARG_RANGE",
+                       extra={"roughness_um": roughness_um,
+                              "conductivity_s_m": None})
+        rq = rq_um * 1e-6
 
     if port_size_mm is None:
         return err("port_size_mm is required: it is the pad (or via) size, and it "
@@ -901,7 +929,7 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
 
     def scan(order):
         return [_plane_modal_z(f, a_m, b_m, t_m, e, td, sg, order, q1, q2,
-                               sx * 1e-3, sy * 1e-3) for f in probe_f]
+                               sx * 1e-3, sy * 1e-3, rq_m=rq) for f in probe_f]
 
     def rel_change(z_old, z_new):
         """Change of the answer, measured against the PEAK it contains.
@@ -1000,7 +1028,7 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
     rows = []
     for f in curve:
         z = _plane_modal_z(f, a_m, b_m, t_m, e, td, sg, accepted, q1, q2,
-                           sx * 1e-3, sy * 1e-3)
+                           sx * 1e-3, sy * 1e-3, rq_m=rq)
         if z is None:
             continue
         rows.append({"freq_hz": _sig(f), "z_ohm": _sig(abs(z)),
@@ -1017,7 +1045,7 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
     # ---- integrity gate: the very same constants must rebuild the plane cap --
     f_chk = f_first / 1000.0
     z_chk = _plane_modal_z(f_chk, a_m, b_m, t_m, e, td, sg, accepted, q1, q2,
-                           sx * 1e-3, sy * 1e-3)
+                           sx * 1e-3, sy * 1e-3, rq_m=rq)
     c_pp = EPS0 * e * a_m * b_m / t_m
     z_cap = 1.0 / (2.0 * math.pi * f_chk * c_pp)
     anchor = abs(abs(z_chk) / z_cap - 1.0) * 100.0
@@ -1029,7 +1057,7 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
                    "INTERNAL_CHECK_FAILED",
                    extra={"capacitance_anchor_error_pct": _sig(anchor)})
 
-    q_first, qc_first, qd_first = _plane_q_of(f_first, t_m, td, sg)
+    q_first, qc_first, qd_first = _plane_q_of(f_first, t_m, td, sg, rq)
     extra = {
         "curve": rows,
         "curve_points": len(rows),
@@ -1060,6 +1088,18 @@ def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
                        "off: ideal copper, dielectric loss only",
         "not_computed": list(_PLANE_CURVE_NOT_COMPUTED),
     }
+    if rq is not None:
+        k_first = roughness_factor(rq, skin_depth_m(f_first, sg))
+        extra["roughness"] = {
+            "rq_um": _sig(rq * 1e6),
+            "loss_factor_at_first_mode": _sig(k_first),
+            "skin_depth_at_first_mode_um": _sig(skin_depth_m(f_first, sg) * 1e6),
+            "q_copper_smooth_at_first_mode": _sig(qc_first * k_first),
+            "q_copper_with_roughness_at_first_mode": _sig(qc_first),
+            "model": "K = 1 + (2/pi)*atan(1.4*(Rq/delta_s)^2) "
+                     "(Hammerstad-Jensen): Rs *= K, Qc = h/(delta_s*K); the "
+                     "dielectric side is untouched",
+        }
     return ok(peak["z_ohm"], unit="ohm",
               model="lossy_PMC_cavity_modal_sum_with_finite_pad_aperture",
               basis="Z = j*w*mu0*h*sum_mn A_mn/(k_mn^2 - k^2*(1 - j/Q_mn)), "
@@ -1097,7 +1137,8 @@ _CAP_NOT_COMPUTED = (
     "spectrum the load draws, which is not in this number",
 )
 
-def _plane_modal_matrix(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, ports):
+def _plane_modal_matrix(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, ports,
+                        rq_m=None):
     """The full Z matrix of the cavity between N+1 ports.
 
         Z_ij = j*w*mu0*h/(a b) * sum_mn P_i(m) P_j(m) Q_i(n) Q_j(n) / (k_mn^2-kap^2)
@@ -1114,7 +1155,7 @@ def _plane_modal_matrix(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, ports)
     """
     w = 2.0 * math.pi * f_hz
     k2 = w * w * MU0 * EPS0 * er
-    q, _qc, _qd = _plane_q_of(f_hz, h_m, tan_delta, sigma)
+    q, _qc, _qd = _plane_q_of(f_hz, h_m, tan_delta, sigma, rq_m)
     kap2 = k2 * (1.0 - 1j / q)
     n_i = order + 1
     pi = math.pi
@@ -1248,7 +1289,7 @@ def pdn_plane_with_caps(width_mm, height_mm, er, thickness_mm, tan_delta=None,
                         port_mm=None, port_size_mm=None, caps=None,
                         f_start_hz=None, f_stop_hz=None, points=100,
                         freqs_hz=None, max_order=1024, tolerance=0.01,
-                        conductivity_s_m=COPPER_SIGMA):
+                        conductivity_s_m=COPPER_SIGMA, roughness_um=None):
     """|Z(f)| of a plane pair WITH the decoupling capacitors mounted on it.
 
     pdn_plane_impedance is the planes alone, and it says so: the caps are
@@ -1333,6 +1374,21 @@ def pdn_plane_with_caps(width_mm, height_mm, er, thickness_mm, tan_delta=None,
     if sg is not None and sg <= 0.0:
         return err("conductivity_s_m must be > 0, or null for ideal copper",
                    "ARG_RANGE", extra={"conductivity_s_m": sg})
+
+    rq = None
+    if roughness_um is not None:
+        rq_um = num(roughness_um)
+        if rq_um is None or rq_um < 0.0:
+            return err("roughness_um must be >= 0 (RMS surface roughness Rq, in "
+                       "micrometres)", "ARG_RANGE",
+                       extra={"roughness_um": roughness_um})
+        if sg is None:
+            return err("roughness_um corrects the COPPER loss, but "
+                       "conductivity_s_m is null (ideal copper) - pass a "
+                       "conductivity or drop the roughness", "ARG_RANGE",
+                       extra={"roughness_um": roughness_um,
+                              "conductivity_s_m": None})
+        rq = rq_um * 1e-6
 
     if port_size_mm is None:
         return err("port_size_mm is required: it is the pad of the INJECTION "
@@ -1518,7 +1574,8 @@ def pdn_plane_with_caps(width_mm, height_mm, er, thickness_mm, tan_delta=None,
 
     def answer(f_hz, order):
         """(Z_in, Z00): the loaded input impedance and the plane alone."""
-        M = _plane_modal_matrix(f_hz, a_m, b_m, t_m, e, td, sg, order, ports)
+        M = _plane_modal_matrix(f_hz, a_m, b_m, t_m, e, td, sg, order, ports,
+                                rq_m=rq)
         z00 = M[0][0]
         if not n_cap:
             return z00, z00
@@ -1716,7 +1773,7 @@ def pdn_plane_with_caps(width_mm, height_mm, er, thickness_mm, tan_delta=None,
     # has to move, as opposed to wherever the loaded curve happens to peak.
     # plane_peak IS a row of the same curve, so this costs nothing.
     at_plane_peak = plane_peak["z_ohm"]
-    q_first, qc_first, qd_first = _plane_q_of(f_first, t_m, td, sg)
+    q_first, qc_first, qd_first = _plane_q_of(f_first, t_m, td, sg, rq)
     c_tot = c_pp + sum(s["c_farad"] for s in site)
     extra = {
         "curve": rows,
@@ -1767,6 +1824,19 @@ def pdn_plane_with_caps(width_mm, height_mm, er, thickness_mm, tan_delta=None,
                        "off: ideal copper, dielectric loss only",
         "not_computed": list(_CAP_NOT_COMPUTED),
     }
+    if rq is not None:
+        k_first = roughness_factor(rq, skin_depth_m(f_first, sg))
+        extra["roughness"] = {
+            "rq_um": _sig(rq * 1e6),
+            "loss_factor_at_first_mode": _sig(k_first),
+            "skin_depth_at_first_mode_um": _sig(skin_depth_m(f_first, sg) * 1e6),
+            "q_copper_smooth_at_first_mode": _sig(qc_first * k_first),
+            "q_copper_with_roughness_at_first_mode": _sig(qc_first),
+            "model": "K = 1 + (2/pi)*atan(1.4*(Rq/delta_s)^2) "
+                     "(Hammerstad-Jensen): Rs *= K, Qc = h/(delta_s*K); the "
+                     "dielectric side is untouched, and the capacitors see the "
+                     "same roughened planes the curve does",
+        }
     return ok(peak["z_ohm"], unit="ohm",
               model="lossy_PMC_cavity_modal_sum_port_reduced_with_RLC_caps",
               basis="Z_in = Z00 - Z0c*(Zcc + diag(esr + jw*esl + 1/(jwC)))^-1*Zc0, "

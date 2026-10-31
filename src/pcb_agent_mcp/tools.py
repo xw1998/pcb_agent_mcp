@@ -2878,8 +2878,9 @@ _tool(
             "verify_field": _bool("run the 2-D field solver on the same cross-section "
                                   "and report the difference (slower)"),
             "field_levels": _num("refinement levels for the field check", 1),
-            "roughness_um": _num("copper surface roughness Ra in um; multiplies Rs by "
-                                 "the Hammerstad-Jensen factor (0 = smooth)", 0.0),
+            "roughness_um": _num("copper surface roughness Rq (RMS) in um; multiplies Rs "
+                                 "by the Hammerstad-Jensen factor (0 = smooth; Rz is "
+                                 "not converted)", 0.0),
             "spacing_mm": _num("edge-to-edge gap between the two strips of a pair "
                                "(cpw_diff / gcpw_diff only; required there)"),
         },
@@ -3749,15 +3750,20 @@ def _capabilities(_args):
             "plus any statement about plated barrels - via_current_allowed refuses "
             "standard=ipc2152 for exactly that reason (STANDARD_SCOPE)",
             "Plane resonances as a SOLVED field: cavity_resonance gives the ideal "
-            "PMC-wall TM_mn0 eigenvalues, cavity_via_fence gives pitch/lambda_g and "
+            "PMC-wall TM_mn0 eigenvalues, cavity_via_fence gives pitch/lambda_g, "
             "cavity_plane_q gives the copper + dielectric Q (Qc = h/delta_s, "
-            "Qd = 1/tan_delta). Still missing: radiation Q, surface roughness, "
-            "detuning from real open edges, plane-pair impedance and leakage through "
-            "voids - so the sum of the two modelled losses is an UPPER bound on Q, and "
-            "the dominant loss of a real PDN resonance (the caps and packages mounted "
-            "across it) is outside. Even with Q there is no verdict: a resonance is a "
-            "problem only together with an excitation and a coupling. When that "
-            "distinction decides the design, use a 3-D field solver",
+            "Qd = 1/tan_delta) plus the optional Hammerstad-Jensen surface-roughness "
+            "multiplier on Rs (pass roughness_um; K = 1+(2/pi)atan(1.4(Rq/delta_s)^2), "
+            "so Qc = h/(delta_s*K)), and pdn_plane_impedance / pdn_plane_with_caps "
+            "give the plane-pair impedance curve with and without the caps. Still "
+            "missing: radiation Q, the foil profile / Huray nodule model (the "
+            "roughness here is one number, not a surface), detuning from real open "
+            "edges, and leakage through voids - so the sum of the modelled losses is "
+            "an UPPER bound on Q, and the dominant loss of a real PDN resonance (the "
+            "packages mounted across it, and the caps in the plane-only curve) is "
+            "outside. Even with Q there is no verdict: a resonance is a problem only "
+            "together with an excitation and a coupling. When that distinction "
+            "decides the design, use a 3-D field solver",
             "Safety-distance tables for standards other than IEC 60664-1: "
             "IEC 62368-1, IEC 61010-1 and the instrument standards each tabulate "
             "their own creepage/clearance, and this build only carries IEC 60664-1 "
@@ -5298,6 +5304,10 @@ _tool(
         "tolerance": _num("accepted max|dZ|/max|Z| between the last two orders "
                           "(default 0.01)"),
         "conductivity_s_m": _num("copper conductivity, S/m; null = ideal copper"),
+        "roughness_um": _num("RMS copper surface roughness Rq in um; Rs *= "
+                             "Hammerstad-Jensen K(Rq/delta_s), so Qc = "
+                             "h/(delta_s*K) (omit for smooth; needs a real "
+                             "conductivity, Rz is NOT converted)"),
     }, "required": ["width_mm", "height_mm", "er", "thickness_mm", "tan_delta",
                     "port_mm", "port_size_mm"]},
     lambda a: _power.pdn_plane_impedance(
@@ -5310,7 +5320,8 @@ _tool(
         freqs_hz=a.get("freqs_hz"),
         max_order=(a.get("max_order") if a.get("max_order") is not None else 256),
         tolerance=(a.get("tolerance") if a.get("tolerance") is not None else 0.01),
-        conductivity_s_m=a.get("conductivity_s_m", _power.COPPER_SIGMA)),
+        conductivity_s_m=a.get("conductivity_s_m", _power.COPPER_SIGMA),
+        roughness_um=a.get("roughness_um")),
 )
 
 _tool(
@@ -5357,6 +5368,9 @@ _tool(
         "tolerance": _num("accepted max|dZ_in|/max|Z_in| between the last two orders "
                           "(default 0.01)"),
         "conductivity_s_m": _num("copper conductivity, S/m; null = ideal copper"),
+        "roughness_um": _num("RMS copper surface roughness Rq in um; same "
+                             "Hammerstad-Jensen multiplier on Rs as in "
+                             "pdn_plane_impedance (omit for smooth)"),
     }, "required": ["width_mm", "height_mm", "er", "thickness_mm", "tan_delta",
                     "port_mm", "port_size_mm", "caps"]},
     lambda a: _power.pdn_plane_with_caps(
@@ -5369,7 +5383,8 @@ _tool(
         freqs_hz=a.get("freqs_hz"),
         max_order=(a.get("max_order") if a.get("max_order") is not None else 1024),
         tolerance=(a.get("tolerance") if a.get("tolerance") is not None else 0.01),
-        conductivity_s_m=a.get("conductivity_s_m", _power.COPPER_SIGMA)),
+        conductivity_s_m=a.get("conductivity_s_m", _power.COPPER_SIGMA),
+        roughness_um=a.get("roughness_um")),
 )
 
 _tool(
@@ -6052,20 +6067,28 @@ _tool(
     "plane size, the aspect ratio and the mode numbers, and proportional to the "
     "dielectric thickness, which is not what most tables imply. Give tan_delta and "
     "you also get Qd = 1/tan_delta; FR4's 0.02 gives 50, i.e. the dielectric usually "
-    "dominates and a scary mode on lossy prepreg is often a non-event. Radiation Q, "
-    "surface roughness and the damping of mounted capacitors are NOT modelled, so "
-    "read the answer as an upper bound on Q. No pass/fail: a resonance is only a "
-    "problem with an excitation and a coupling.",
+    "dominates and a scary mode on lossy prepreg is often a non-event. Pass "
+    "roughness_um and Rs picks up the Hammerstad-Jensen multiplier "
+    "K = 1+(2/pi)atan(1.4(Rq/delta_s)^2) (K(delta)=1.605, K->2 from below), i.e. "
+    "Qc = h/(delta_s*K) - and because delta_s shrinks as 1/sqrt(f), the same foil "
+    "costs more at high frequency. Radiation Q, the foil profile / Huray nodules and "
+    "the damping of mounted capacitors are still NOT modelled, so read the answer as "
+    "an upper bound on Q. No pass/fail: a resonance is only a problem with an "
+    "excitation and a coupling.",
     {"type": "object", "properties": {
         "f_hz": _num("the mode frequency, e.g. from cavity_resonance"),
         "h_mm": _num("dielectric thickness between the two planes"),
         "tan_delta": _num("laminate loss tangent, e.g. 0.02 for FR4 (omit for none)"),
         "conductivity_s_m": _num("copper conductivity", 5.8e7),
+        "roughness_um": _num("RMS copper surface roughness Rq in um, e.g. 0.3..1 for "
+                             "HVLP foil, a few um for standard ED foil (omit for "
+                             "smooth; Rz is NOT converted)"),
     }, "required": ["f_hz", "h_mm"]},
     lambda a: _cavity.plane_q(
         a.get("f_hz"), a.get("h_mm"), tan_delta=a.get("tan_delta"),
         conductivity_s_m=(a["conductivity_s_m"]
-                          if a.get("conductivity_s_m") is not None else 5.8e7)),
+                          if a.get("conductivity_s_m") is not None else 5.8e7),
+        roughness_um=a.get("roughness_um")),
 )
 
 _tool(

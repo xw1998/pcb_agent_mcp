@@ -19,9 +19,10 @@ What it is NOT (and says so on every return):
   * Q is a SEPARATE function (`plane_q`), because a mode location and a mode
     damping are different questions. `plane_q` carries copper loss (which for
     this geometry has the clean answer Qc = h/delta_s, independent of mode and
-    of plane size) and dielectric loss (Qd = 1/tan_delta). What it still does
-    not carry: radiation Q, surface roughness, and the fact that a real plane
-    pair's Q is dominated by whatever is soldered across it. So there is no
+    of plane size) and dielectric loss (Qd = 1/tan_delta), plus an optional
+    first-order surface-roughness correction on Rs. What it still does not
+    carry: radiation Q, the foil profile / Huray nodule model, and the fact
+    that a real plane pair's Q is dominated by whatever is soldered across it. So there is no
     "is this a problem" verdict anywhere - a resonance needs an excitation and a
     coupling to matter, and neither is in this module.
   * no via barrel inductance, no antipad capacitance, no plane-pair impedance
@@ -35,6 +36,7 @@ convention, not a derivation, so it is the caller's to state: pass
 import math
 
 from .result import ok, err
+from .roughness import roughness_factor
 
 C0 = 299792458.0      # m/s, exact by definition
 MU0 = 4e-7 * math.pi  # H/m, exact in SI-2019
@@ -349,7 +351,8 @@ def _plane_q_by_integration(a_mm, b_mm, m, n, h_mm, f_hz,
     return w * stored / lost
 
 
-def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA):
+def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA,
+             roughness_um=None):
     """Damping of a plane-pair mode at f_hz: copper Q, dielectric Q, and their sum.
 
     Conductor loss. Perturbation theory on the idealised cavity (PMC side walls,
@@ -384,12 +387,22 @@ def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA):
     Not modelled, and these can dominate in a real board:
       * radiation Q (open edges, a split plane, an unshielded edge radiating) -
         not in the parallel-plate model at all;
-      * surface roughness, which raises Rs by 20-80% above ~1 GHz;
+      * surface roughness beyond the one-number multiplier below (no Huray
+        nodule model, no foil profile, no anisotropic roughness);
       * inhomogeneous Dk (glass weave, prepreg/core asymmetry);
       * the damping of whatever is mounted across the planes - decoupling
         capacitors and IC packages are usually the dominant loss of a real PDN
         resonance, and they are exactly what this idealisation leaves out;
       * temperature and frequency dependence of tan_delta.
+
+    Surface roughness (optional). Pass `roughness_um` and Rs is multiplied by
+    the Hammerstad-Jensen factor K = 1 + (2/pi)*atan(1.4*(Rq/delta_s)^2), i.e.
+    Qc = h/(delta_s*K): K(delta_s) = 1.605, K(2*delta_s) = 1.888, and K
+    approaches 2 from below. Because delta_s shrinks as sqrt(1/f), the SAME
+    foil costs more at high frequency - that is the whole point of the
+    correction. Rq is the RMS roughness, which is what the model wants; foil
+    datasheets usually quote Rz instead and there is no universal conversion,
+    so it is not done here. Leave it out and nothing about the answer moves.
 
     No verdict: `higher Q = worse` is not a rule. A resonance is a problem when
     something drives it and something couples to it; this function reports the
@@ -411,10 +424,25 @@ def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA):
     if sg <= 0:
         return err("conductivity_s_m must be > 0", "ARG_RANGE")
 
+    rq = None
+    if roughness_um is not None:
+        rq_um = _num(roughness_um)
+        if rq_um is None or rq_um < 0.0:
+            return err("roughness_um must be >= 0 (RMS surface roughness Rq, in "
+                       "micrometres; the Hammerstad-Jensen model wants Rq, not "
+                       "Rz)", "ARG_RANGE", extra={"roughness_um": roughness_um})
+        rq = rq_um * 1e-6
+
     w = 2.0 * math.pi * f
     delta = math.sqrt(2.0 / (w * MU0 * sg))         # skin depth, m
     rs = 1.0 / (sg * delta)                          # = sqrt(w mu / (2 sigma))
     qc = h * 1e-3 / delta                            # = omega mu h / (2 Rs)
+    qc_smooth = qc
+    k_rough = 1.0
+    if rq:
+        k_rough = roughness_factor(rq, delta)
+        rs = rs * k_rough                             # Rs *= K
+        qc = qc / k_rough                             # = h / (delta_s * K)
 
     td = None
     if tan_delta is not None:
@@ -457,6 +485,19 @@ def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA):
             "q_dielectric_vs_f": "flat for a fixed tan_delta",
         },
     }
+    if rq is not None:
+        out["roughness"] = {
+            "rq_um": _sig(rq * 1e6),
+            "loss_factor": _sig(k_rough),
+            "skin_depth_um": _sig(delta * 1e6),
+            "roughness_over_skin": _sig(rq / delta),
+            "q_conductor_smooth": _sig(qc_smooth),
+            "surface_resistance_ohm_sq_smooth": _sig(rs / k_rough),
+            "model": "K = 1 + (2/pi)*atan(1.4*(Rq/delta_s)^2) "
+                     "(Hammerstad-Jensen): Rs *= K, Qc = h/(delta_s*K); "
+                     "equivalent to sigma_eff = sigma/K^2",
+        }
+
     if qd is None:
         out["dielectric_not_included"] = (
             "no tan_delta was supplied, so q_total is the conductor limit only. "
@@ -465,25 +506,47 @@ def plane_q(f_hz, h_mm, tan_delta=None, conductivity_s_m=COPPER_SIGMA):
     else:
         out["which_dominates"] = ("dielectric" if qd < qc else "copper")
 
+    if rq is None:
+        plate_note = "PEC, smooth, both plates counted"
+        rough_prec = ("The model omits radiation Q, surface roughness and the "
+                      "damping of mounted components, so a real plane pair "
+                      "usually rings LESS than this; treat it as an upper bound "
+                      "on Q")
+        rough_nc = ("surface roughness correction to Rs (~+20..80% above 1 GHz) "
+                    "- pass roughness_um for the Hammerstad-Jensen multiplier")
+    else:
+        plate_note = ("PEC with the Hammerstad-Jensen roughness multiplier %.4f "
+                      "on Rs, both plates counted" % k_rough)
+        rough_prec = ("Surface roughness is in as the one-number "
+                      "Hammerstad-Jensen multiplier (Rs *= K, reported as "
+                      "roughness.loss_factor). Still omitted: radiation Q, the "
+                      "foil profile / Huray nodule model and the damping of "
+                      "mounted components, so a real plane pair usually rings "
+                      "LESS than this; treat it as an upper bound on Q")
+        rough_nc = ("surface roughness beyond one Hammerstad-Jensen multiplier "
+                    "of Rq/delta_s: no Huray nodule model, no foil profile, no "
+                    "anisotropic roughness, no Rz-to-Rq conversion")
+    basis_rough = (" Rs *= K with K = 1 + (2/pi)*atan(1.4*(Rq/delta_s)^2), so "
+                   "Qc = h/(delta_s*K); equivalently sigma_eff = sigma/K^2"
+                   if rq is not None else "")
+
     return ok(out, "dimensionless Q",
               "perturbation-theory Q of a parallel-plate mode",
               "Qc = omega*mu*h/(2*Rs) = h/delta_s with delta_s = sqrt(2/(omega*mu*"
               "sigma)) and Rs = 1/(sigma*delta_s); Qd = 1/tan_delta; "
-              "1/Q = 1/Qc + 1/Qd",
+              "1/Q = 1/Qc + 1/Qd" + basis_rough,
               "closed form on the idealised cavity (PEC plates, PMC side walls): "
               "Qc is exact for that model and independent of a, b, m, n, which is "
               "the surprising part and is cross-checked numerically in the tests. "
-              "The model omits radiation Q, surface roughness and the damping of "
-              "mounted components, so a real plane pair usually rings LESS than "
-              "this; treat it as an upper bound on Q",
-              {"plates": "PEC, smooth, both plates counted",
+              + rough_prec,
+              {"plates": plate_note,
                "dielectric": "homogeneous, loss expressed as one tan_delta",
                "side_walls": "PMC - no side-wall loss, hence none of the fence "
                              "geometry appears in Qc",
                "coupling": "no excitation and no load, so no verdict follows"},
               {"not_computed": [
                   "radiation Q (open edges, split planes, an edge that radiates)",
-                  "surface roughness correction to Rs (~+20..80% above 1 GHz)",
+                  rough_nc,
                   "Dk/Df variation with frequency and temperature, glass weave",
                   "damping by decoupling capacitors and packages - usually the "
                   "dominant loss of a real PDN resonance",
