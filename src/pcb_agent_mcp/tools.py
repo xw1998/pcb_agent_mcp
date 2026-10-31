@@ -205,6 +205,9 @@ _tool(
         a.get("delta_t_c", 10), a.get("standard")),
 )
 
+C_ALPHA = _current.ALPHA_234_CU   # 1/254: copper's (234 + T) law
+K_TH_CU = _current.K_THERMAL_CU
+
 _CUR_STD_OPT = _str(
     "OPTIONAL here. Only used to say how far the fusing current sits from the "
     "CONTINUOUS rating (capacity_a, fuse_over_capacity). The fusing number itself "
@@ -240,6 +243,61 @@ _tool(
         delta_t_c=(a["delta_t_c"] if a.get("delta_t_c") is not None else 10.0),
         layer=a.get("layer", "external"),
         standard=a.get("standard")),
+)
+
+_tool(
+    "fusing_current_taper",
+    "Fusing current, or time to melt, for a trace whose WIDTH CHANGES along it - a "
+    "fuse neck, a via-fanout bottleneck, a trace stepping down into a pad. One "
+    "isothermal node per axial segment joined by each pair's two half-lengths in "
+    "series, copper's own rho(T), backward Euler. THIS is the length axis "
+    "fusing_current deletes: it says the narrow part melts first, how much the "
+    "surrounding copper delays it (reported as conduction_delay_pct, measured "
+    "against a conduction-off control arm, not asserted), and - when ends_c gives "
+    "the terminals a temperature - the current below which no steady state melts "
+    "at all. Give exactly one of current_a and t_melt_s. A current that does not "
+    "melt returns NO time, only the peak and the margin.",
+    {"type": "object", "properties": {
+        "segments": {"type": "array", "description": "axial sections in order from "
+                     "one end to the other; each {length_mm, width_mm}, both > 0",
+                     "items": {"type": "object", "properties": {
+                         "length_mm": {"type": "number"},
+                         "width_mm": {"type": "number"}}}},
+        "thickness_um": _num("copper thickness in um (overrides copper_oz)"),
+        "copper_oz": _num("copper weight in oz, used unless thickness_um is given", 1),
+        "t_ambient_c": _num("starting temperature in Celsius", 25),
+        "alpha_per_k": _num("resistivity temperature coefficient, 1/K; copper's own "
+                            "1/254 is what makes a uniform segment reproduce "
+                            "Onderdonk", round(C_ALPHA, 9)),
+        "k_thermal_w_mk": _num("axial thermal conductivity of the copper, W/(m*K); "
+                               "0 switches conduction off (the control arm)", 400),
+        "ends_c": _num("temperature of BOTH terminals in Celsius. Give it and the "
+                       "ends stop being insulated, which is the only way a steady "
+                       "threshold exists"),
+        "current_a": _num("current in A -> the answer is the time to melt"),
+        "t_melt_s": _num("time to melt in seconds -> the answer is the current"),
+        "t_end_s": _num("how long to march when current_a is given", 10),
+        "dt_s": _num("time step; default t_end_s/2000, and both melt times are "
+                     "interpolated inside a step"),
+        "max_steps": _num("refuse rather than grind past this many steps", 200000),
+        "melt_c": _num("melt temperature in Celsius", 1083),
+    }, "required": ["segments"]},
+    lambda a: _current.fusing_current_taper(
+        a.get("segments"),
+        thickness_um=a.get("thickness_um"),
+        copper_oz=(a["copper_oz"] if a.get("copper_oz") is not None else 1.0),
+        t_ambient_c=(a["t_ambient_c"] if a.get("t_ambient_c") is not None else 25.0),
+        alpha_per_k=(a["alpha_per_k"] if a.get("alpha_per_k") is not None
+                     else C_ALPHA),
+        k_thermal_w_mk=(a["k_thermal_w_mk"] if a.get("k_thermal_w_mk") is not None
+                        else 400.0),
+        ends_c=a.get("ends_c"),
+        current_a=a.get("current_a"),
+        t_melt_s=a.get("t_melt_s"),
+        t_end_s=(a["t_end_s"] if a.get("t_end_s") is not None else 10.0),
+        dt_s=a.get("dt_s"),
+        max_steps=(int(a["max_steps"]) if a.get("max_steps") is not None else 200000),
+        melt_c=(a["melt_c"] if a.get("melt_c") is not None else 1083.0)),
 )
 
 _tool(
@@ -3369,7 +3427,9 @@ def _capabilities(_args):
                           "ngspice instead, and cross-check the two solvers against "
                           "each other), current and PDN (trace / via / barrel "
                           "resistance, IR drop from the board's own copper, "
-                          "decoupling impedance and worst-case anti-resonance), and "
+                          "decoupling impedance and worst-case anti-resonance), "
+                          "fusing (one-pulse adiabatic, along a taper with axial "
+                          "conduction, and pulse trains), and "
                           "thermal (1-D stacks, via arrays, a real 2-D plate solve "
                           "with an energy-balance check, RC transients, heatsink "
                           "budget). Every model is lumped or closed-form: no "
@@ -3552,7 +3612,8 @@ def _capabilities(_args):
         },
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
-            "via_current_allowed", "fusing_current", "repetitive_pulse_rating",
+            "via_current_allowed", "fusing_current", "fusing_current_taper",
+            "repetitive_pulse_rating",
             "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "coplanar_field", "coplanar_pair_field", "crosstalk_coupled_lines",
@@ -3919,19 +3980,25 @@ def _capabilities(_args):
             "file - board_electrothermal takes geometry, it does not open the "
             ".kicad_pcb for "
             "you",
-            "Surge and fusing beyond one pulse: fusing_current answers the single-pulse "
+            "Surge and fusing: fusing_current answers the single-pulse "
             "adiabatic question (Onderdonk 1928) and states its four one-sided "
             "assumptions (no cooling, no latent heat, equal-area rectangle, no skin "
             "effect); repetitive_pulse_rating answers the TRAIN - one lumped "
             "temperature, cooling as h*P with h supplied by you (no default, because "
             "it ranges 20x), copper's own resistance law solved exactly per interval, "
-            "and the melt boundary as a closed form. Still not done: the trace's "
-            "LENGTHWISE gradient (one temperature for the whole trace), board and "
-            "plane as separate sinks from h, latent heat at the melt, skin effect "
-            "inside a short pulse, electromigration (Black's equation needs a current "
-            "density a fab will qualify), arc/plasma behaviour after the copper opens, "
-            "and board_ir_drop's A/mm^2 verdict - that tool still reports density with "
-            "no criterion attached",
+            "and the melt boundary as a closed form. fusing_current_taper adds the "
+            "LENGTH axis (0.0.59): one isothermal node per axial segment, each pair "
+            "joined by two half-lengths in series, copper's own rho(T), backward Euler "
+            "- so a neck melts first, the arms' shared heat shows up as a MEASURED "
+            "conduction_delay_pct against a conduction-off control arm, and with "
+            "ends_c giving the terminals a temperature there is a steady threshold "
+            "below which nothing melts. What that still leaves out: cooling to air "
+            "and to the board (the taper model has axial conduction ONLY, so it has "
+            "no h at all), the transverse gradient inside a narrow neck, latent heat "
+            "at the melt, skin effect inside a short pulse, electromigration (Black's "
+            "equation needs a current density a fab will qualify), arc/plasma after "
+            "the copper opens, and board_ir_drop's A/mm^2 verdict - that tool still "
+            "reports density with no criterion attached",
             "The plane-caps network is COMPUTED now (pdn_plane_with_caps: the cavity "
             "as an (N+1)-port Z matrix, each cap an R-L-C branch, port-reduced to "
             "Z_in), so the anti-resonance where a bank turns inductive and the plane "

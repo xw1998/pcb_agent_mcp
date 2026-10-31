@@ -604,9 +604,11 @@ class TestThroughTheToolSurface(unittest.TestCase):
     def test_the_tool_count_is_unchanged(self):
         # a deliberate ratchet: adding a tool must bump this number, so the surface
         # cannot grow by accident. 162 -> 164 in 0.0.55 (magnetics_select_core and
-        # magnetics_data, both backed by data/magnetic_materials.json).
+        # magnetics_data, both backed by data/magnetic_materials.json);
+        # 164 -> 165 in 0.0.59 (fusing_current_taper - a new tool rather than a new
+        # parameter, because one width_mm cannot express a tapered geometry).
         from pcb_agent_mcp import tools
-        self.assertEqual(len(tools.TOOLS), 164)
+        self.assertEqual(len(tools.TOOLS), 165)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

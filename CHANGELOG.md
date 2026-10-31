@@ -9,6 +9,110 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.59] - 2026-10-31
+
+熔断的**长度方向**。`fusing_current` 一直写着 `assumptions.spatial = "one temperature for the
+whole trace cross-section and length"` —— 对一根等宽走线这句话只是保守，对**锥形/分段**走线
+它换不来唯一的答案：熔在哪一段。本版加一个**新工具**（不是一个新参数，因为单宽度表达不了分段
+几何，而且"熔在哪"是新的一维信息）：`fusing_current_taper`。
+
+一句话结论：**均匀段对三个独立锚点（解析绝热式 / Onderdonk / 分段无关性）都在千分之几内，
+"传导到底省了多少"由一条真跑一遍的绝热对照臂量出来而不是声称，且 `fusing_current` 与
+`repetitive_pulse_rating` 的可执行代码一行未改、答案逐位不变。**
+
+### 新增
+
+| 项 | 内容 |
+| --- | --- |
+| `fusing_current_taper` | 一段走线（`segments[{length_mm,width_mm}]`）**沿长度**的温度与单发熔断：1-D 轴向有限体积 + 后向 Euler + 逐段 Thomas；可选 `ends_c` 另解稳态并二分出 `steady_threshold_a`；可选 `t_melt_s` **反解电流** |
+| `calc/current.py` | 新增常量 `ALPHA_234_CU = 1/254`、`K_THERMAL_CU = 400`、`MELT_CU_C = 1083`；新增 `_taper_adiabatic_current`、`_taper_geometry`、`_thomas`、`_taper_coeffs`、`_taper_run`、`_taper_steady`、`_taper_steady_threshold`、`fusing_current_taper`（`fusing_current` / `repetitive_pulse_rating` 一行未改） |
+| `tools.py` | 注册 `fusing_current_taper`（schema 只 required `segments`）；模块级 `C_ALPHA` / `K_TH_CU` 供 schema 默认值与 lambda 共用（防漂移）；`calc_capabilities` 的 `simulation` 层补 `"fusing (one-pulse adiabatic, along a taper with axial conduction, and pulse trains)"`（此前这一族在能力自述里**完全没提**）；`not_implemented_yet` 里把"沿长度的梯度"从"仍未做"删掉并改写成新工具的介绍 + **仍然**不做的东西 |
+| 返回块 | `segments[{length_mm,width_mm,area_mm2,resistance_ohm}]`、`profile[{x_mm,t_c,current_density_a_mm2,r_ohm}]`、`hot_segment`、`melted`/`t_melt_s`/`melt_segment`/`melt_at_mm`、`peak_c`/`peak_segment`/`margin_k`、`conduction_delay_pct` + `adiabatic_control`、`steady_threshold_a`、`reverse`/`asked_time` |
+| 测试 | `tests/test_fusing_taper.py` **41 例**（新；8 个类，17 条拒绝各带 `reason_code`，其余每条判据配能翻脸的负控制） |
+| selftest | 3 条新读数（均匀段 0.993269 s 且 `conduction_delay_pct == 0.0`、颈部熔在 `melt_segment == 1` / `melt_at_mm == 21.0` 且 delay > 5、2 A 不熔时 `value is None`），`205/205` → **`208/208`** |
+| 全量回归 | **2610 例 / OK (skipped=5) / 874.399 s**（0.0.58 的 2569 + 41；本机同为无外部满载进程，可与 0.0.58 的 865.034 s 同负载比较） |
+| 工具数 | **164 → 165** |
+
+### 算术锚点（三个，互不共享近似）
+
+| 锚点 | 读数 | 差 |
+| --- | --- | --- |
+| 均匀段（2 mm × 35 µm，25 ℃）对**解析绝热式** `t = ρ_m·c_p/(ρ20·α) · ln((1+α(T_m−20))/(1+α(T_a−20))) / J²` | 20.21 A ⇒ **0.993269 s**（解析 0.993880） | **−0.0614 %** |
+| 同一读数对 **Onderdonk** 的 `I = A·√(33·ln10/(t))`（1 s） | 1 s 需要 20.21 A | **−0.6731 %** |
+| **分段无关性**：同一根线切成 n=1/2/5/10/40 段 | 全部 **0.993269 s** | **< 1e-9** |
+
+`33` 与今天常数的关系写在这里而不是拟合掉：`ρ_m·c_p/ρ20 = 33.21`（Onderdonk 的 33 是 1940 年代
+的铜常数），`33·ln10 = 75.985` 对 `76.46` ⇒ 解析式本身就差 **0.31 %**。**本版不把 33 改成 33.21
+去凑 Onderdonk**：那会把"Onderdonk 是旧常数下的闭式"这条事实抹掉。
+
+### 传导是量出来的，不是声称的
+
+`conduction_delay_pct` 不由公式给，而是**真跑一遍对照臂**：`k_thermal_w_mk = 0`、两端绝热、
+窗口 `max(at_s, t_melt·1.02)`。均匀段上它**精确 0**（负控制：对照臂不是"少算一点"），
+并有测试断言 `k_thermal_w_mk=0` 的正跑与该对照臂**逐位相同**。
+
+颈部扫描（臂 20 mm×2 mm、颈 2 mm、总长 42 mm、35 µm、**30 A**、窗 1 s）：
+
+| 颈宽 mm | `t_melt_s` | 同窗绝热对照 | `conduction_delay_pct` |
+| --- | --- | --- | --- |
+| 2.00（= 均匀） | 0.450642 | 0.450642 | **0.000** |
+| 1.00 | 0.234030 | 0.112355 | **+108.295** |
+| 0.50 | 0.039764 | 0.027780 | **+43.137** |
+| 0.25 | 0.007593 | 0.006627 | **+14.584** |
+
+平均宽（1.9286 mm）的均匀段 = **0.419000 s**，颈 0.5 mm 比它早 **10.5×**。delay 随颈宽
+**非单调**（108 → 43 → 15 %）是真物理：颈越细越快、侧面一热传导的相对贡献就越大；
+登记为**不许"修平"**，测试里也不钉单调性。
+
+### 端条件与反解
+
+`ends_c` 给出才谈稳态：另解一个没有 `C/dt` 的线性系统，并对 I 二分。
+100 mm×2 mm×35 µm 的 **`steady_threshold_a = 3.049725 A`**（代回稳态峰值 **1083.0017 ℃**）、
+颈 0.5 mm 的锥形 **9.427701 A**。端固定让 20.21 A 的熔断从 0.993269 挪到 **1.007784 s**
+（+1.461 %）、25 A 从 0.648901 到 0.655064（+0.950 %）。
+
+绝热端（`ends_c=None`）对任何正电流都**没有稳态**，所以 `steady_threshold_a` 回 `null` +
+写死的理由——这是**回答**不是缺失。
+
+反解方向（给 `t_melt_s` 求电流，对数二分，下界 = 最窄段绝热电流 × 0.999、上界 ×4 扩）：
+
+| 目标 t | 求得 I | 下界 | 正反往返相对偏差 |
+| --- | --- | --- | --- |
+| 0.02 s | **39.085049 A** | 35.617071 | −6.5e-4 |
+| 0.05 s | **27.861327 A** | 22.526214 | −4.6e-4 |
+| 0.10 s | **23.093069 A** | 15.928438 | −2.0e-4 |
+| 0.30 s | **19.168011 A** | 9.196288 | −2.2e-4 |
+
+**不熔不给数**：2 A / 1 s ⇒ `value: null`、`peak_c 29.1838`、`margin_k 1053.82`；5 A / 10 s ⇒
+`peak_c 471.2996`、`margin_k 611.70`。`status` 仍是 ok（不是错误），但答案里没有任何时间数字。
+
+### 登记（本版开发中自己踩的四个坑，都已修在实现里）
+
+1. **反解返回 `unit = "s"`（问法错位）**：反解会把 `current_a` 覆盖成求得值，后面的
+   `if current_a is not None and run["melted"]` 于是误判成"问时间"。加 `asked_time = current_a is None`
+   （覆盖前取），`value`/`unit` 与对照窗口三处都改用它。
+2. **反解 `t_melt_s = 0.3` 返回 `melted: False`**：二分收敛点上熔断恰好落在窗口末端，
+   `temp[i] < melt_c <= new[i]` 的严格不等式在边界上有歧义。最终正跑窗口改成
+   `t_melt_target * 1.02`，让穿越严格落在最后一步内部。
+3. **`steady_threshold_a` 恒为 `None`**：I 越过失控点后 `_taper_steady` 返回**负温度**
+   （`diag` 变负），`peak >= melt_c` 判不出"已过阈值"，二分一直向上扩到 60 次失败。
+   改成 `if min(diag) <= 0.0: return None`（数学上就是 M-矩阵性质丢了 = 无稳态），
+   阈值二分把 `None` 当成"在上界之上"。
+4. **`adiabatic_control` 判为 `null`**：对照臂窗口原来用 `run["at_s"]`（熔断前最后一步）比真实
+   `t_melt` 略小。改成 `max(at_s, t_melt·1.02)`。
+5. **全量回归第一次跑出 1 个失败**：`tests/test_vibration_mass_copper.py` 里的工具数棘轮
+   `assertEqual(len(tools.TOOLS), 164)` —— 它就是设计成加工具必须显式改这个数的，
+   按本版 165 更新并标注由来，单文件复测 46 例 OK，第二次全量回归 2610 例全通过。
+
+### 边界
+
+侧向散热**没有 `h` 参数**（这一族是绝热侧面，与 `repetitive_pulse_rating` 的 `h` 不可互相替代）、
+段内横向等温、无熔潜热、无集肤、无电迁移、无开断后电弧、脉冲**列车**不在本工具。
+`precision` 里写的是 **`OPPOSITE`**：删侧向散热会使电流偏低、抹横向梯度会使电流偏高，
+谁赢取决于宽厚比，所以**不给统一误差符号**。`board_ir_drop` 的 A/mm² 粗判据不进本工具。
+
+详见 [docs/62](docs/62-熔断沿长度的一维梯度.md)。
+
 ## [0.0.58] - 2026-10-31
 
 电热的**厚度方向**。0.0.57 及之前 `board_electrothermal` 解的是一块**均质板**：热源在顶层铜上、

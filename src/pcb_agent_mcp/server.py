@@ -3661,6 +3661,66 @@ def selftest():
           str(_hole_nc[0].get("verdict") if _hole_nc else "missing"))
     _shutil.rmtree(_sm_tmp, ignore_errors=True)
 
+    # --- fusing along a taper (0.0.59). A UNIFORM trace with insulated ends has
+    # identical neighbours, so every axial conduction term cancels in pairs and the
+    # 1-D model must reproduce the lumped adiabatic answer - i.e. Onderdonk's, to
+    # the 0.33 % residue between Onderdonk's 33 and today's rho_m*cp/rho20.
+    _i_ond = json.loads(handle(
+        {"jsonrpc": "2.0", "id": 1800, "method": "tools/call",
+         "params": {"name": "fusing_current", "arguments": {
+             "width_mm": 2.0, "t_s": 1.0, "thickness_um": 35,
+             "t_ambient_c": 25.0}}})["result"]["content"][0]["text"])["value"]
+    _t_uni = json.loads(handle(
+        {"jsonrpc": "2.0", "id": 1801, "method": "tools/call",
+         "params": {"name": "fusing_current_taper", "arguments": {
+             "segments": [{"length_mm": 100.0, "width_mm": 2.0}],
+             "thickness_um": 35, "current_a": _i_ond, "t_end_s": 1.5}}})
+        ["result"]["content"][0]["text"])
+    check("a uniform taper segment melts when Onderdonk says (%s s at %s A)"
+          % (_t_uni.get("t_melt_s"), _i_ond),
+          _t_uni.get("status") == "ok" and _t_uni.get("melted") is True
+          and abs(_t_uni["t_melt_s"] - 1.0) < 0.01
+          and _t_uni["adiabatic_control"]["conduction_delay_pct"] == 0.0,
+          "%s s, delay %s" % (_t_uni.get("t_melt_s"),
+                              (_t_uni.get("adiabatic_control") or {})
+                              .get("conduction_delay_pct")))
+
+    _neck = [{"length_mm": 20.0, "width_mm": 2.0},
+             {"length_mm": 2.0, "width_mm": 0.5},
+             {"length_mm": 20.0, "width_mm": 2.0}]
+    _t_nk = json.loads(handle(
+        {"jsonrpc": "2.0", "id": 1802, "method": "tools/call",
+         "params": {"name": "fusing_current_taper", "arguments": {
+             "segments": _neck, "thickness_um": 35, "current_a": 30.0,
+             "t_end_s": 1.0}}})["result"]["content"][0]["text"])
+    _t_um = json.loads(handle(
+        {"jsonrpc": "2.0", "id": 1803, "method": "tools/call",
+         "params": {"name": "fusing_current_taper", "arguments": {
+             "segments": [{"length_mm": 42.0, "width_mm": 1.5}],
+             "thickness_um": 35, "current_a": 30.0,
+             "t_end_s": 1.0}}})["result"]["content"][0]["text"])
+    check("a neck melts in the narrow segment, before the uniform mean-width trace "
+          "(%s vs %s s) with the arms' delay measured"
+          % (_t_nk.get("t_melt_s"), _t_um.get("t_melt_s")),
+          _t_nk.get("melt_segment") == 1
+          and abs(_t_nk.get("melt_at_mm") - 21.0) < 1e-6
+          and _t_nk["t_melt_s"] < _t_um["t_melt_s"]
+          and (_t_nk["adiabatic_control"]["conduction_delay_pct"] or 0) > 5.0,
+          "delay %s %%" % ((_t_nk.get("adiabatic_control") or {})
+                           .get("conduction_delay_pct")))
+
+    _t_low = json.loads(handle(
+        {"jsonrpc": "2.0", "id": 1804, "method": "tools/call",
+         "params": {"name": "fusing_current_taper", "arguments": {
+             "segments": [{"length_mm": 100.0, "width_mm": 2.0}],
+             "thickness_um": 35, "current_a": 2.0, "t_end_s": 1.0}}})
+        ["result"]["content"][0]["text"])
+    check("a current that does not melt returns NO time, only the peak and margin",
+          _t_low.get("status") == "ok" and _t_low.get("melted") is False
+          and _t_low.get("value") is None and _t_low.get("t_melt_s") is None
+          and _t_low.get("margin_to_melt_k") > 100.0,
+          str(_t_low.get("peak_c")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

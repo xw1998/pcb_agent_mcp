@@ -1047,3 +1047,580 @@ def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
         },
         extra=out,
     )
+
+
+# ---------------------------------------------------------------------------
+# Fusing ALONG a taper: a trace whose width changes has a temperature PROFILE
+# ---------------------------------------------------------------------------
+# fusing_current answers for ONE width and deletes spatial extent on purpose ("one
+# temperature for the whole trace cross-section and length"). A real neck - a fuse,
+# a via-fanout bottleneck, a trace stepping down into a pad - melts in the narrow
+# part, and the copper either side both feeds heat into it and drains heat out of
+# it. So the same physics needs a second model, and this one has no fitted
+# constants either:
+#
+#   C_i dT_i/dt = I^2 R_i(T_i) + sum_j G_ij (T_j - T_i)   (+ G_end (T_end - T_i))
+#
+#   C_i    = rho_m c_p A_i L_i                       J/K   (node = segment centre)
+#   R_i    = rho(T_i) L_i / A_i                      ohm
+#   G_ij   = 1 / (L_i/(2 k A_i) + L_j/(2 k A_j))     W/K   (two half-segments in series)
+#   rho(T) = rho20 (1 + alpha (T - 20))              copper's own law
+#
+# rho is LINEAR in T, so the source is a_i + b_i T and the system stays tridiagonal:
+# backward Euler + Thomas, exact in time per step, no iteration and no convergence
+# criterion to fake. ALPHA_234_CU = 1/254 is the (234 + T) law referenced at 20 C -
+# the same 234 as Onderdonk (1928) - which is what makes the anchor below work: a
+# UNIFORM segment with insulated ends has identical neighbours, every conduction
+# term cancels in pairs, and the system collapses to the lumped adiabatic ODE whose
+# melt time is Onderdonk's closed form (measured residue < 0.5 %, and it is the
+# 33-vs-modern-constants residue, recorded in docs/62 - not fitted away).
+ALPHA_234_CU = 1.0 / 254.0   # copper's (234 + T)/254 resistance law, at 20 C
+K_THERMAL_CU = 400.0         # W/(m K) at room temperature (401 at 20 C, ~340 at 1000 C)
+MELT_CU_C = 1083.0
+
+
+def _taper_adiabatic_current(area_m2, t_s, ta_c, melt_c, alpha, rho_m, cp, rho20):
+    """Current whose ADIABATIC melt time is exactly t_s, for a linear rho(T).
+
+    dT/dt = I^2 rho20 (1 + alpha (T - 20)) / (rho_m cp A^2), so
+
+        t_s = rho_m cp A^2 / (I^2 rho20 alpha) * ln((1+a(melt-20))/(1+a(ta-20)))
+
+    Note what is NOT in that expression: the length. Which is exactly why the
+    narrowest segment of a taper is the one that goes first, and why this is a
+    valid LOWER bound for any geometry with conduction on - conduction can only
+    carry heat away from the neck, so the real fusing current is higher.
+    """
+    num = 1.0 + alpha * (melt_c - T_REF_C)
+    den = 1.0 + alpha * (ta_c - T_REF_C)
+    if den <= 0.0 or num <= den:
+        return None
+    shape = math.log(num / den) / alpha
+    return area_m2 * math.sqrt(rho_m * cp * shape / (t_s * rho20))
+
+
+def _taper_geometry(segments, thick_um):
+    """Per-segment geometry, or an error. A dropped segment is a different trace."""
+    if not isinstance(segments, (list, tuple)) or len(segments) == 0:
+        return None, err("segments must be a non-empty list of {length_mm, width_mm} "
+                         "objects", "ARG_INVALID",
+                         hint="a taper is per-segment geometry: one entry per axial "
+                              "section, in order from one end to the other")
+    t_m = thick_um * 1e-6
+    if not (t_m > 0):
+        return None, err("copper thickness must be > 0", "ARG_RANGE")
+    geom = []
+    x = 0.0
+    for i, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            return None, err("segments[%d] is not an object with length_mm/width_mm" % i,
+                             "ARG_INVALID")
+        try:
+            L_mm = float(seg.get("length_mm"))
+            w_mm = float(seg.get("width_mm"))
+        except (TypeError, ValueError):
+            return None, err("segments[%d].length_mm and width_mm must be numbers" % i,
+                             "ARG_INVALID")
+        if not (L_mm > 0):
+            return None, err("segments[%d].length_mm must be > 0" % i, "ARG_RANGE")
+        if not (w_mm > 0):
+            return None, err("segments[%d].width_mm must be > 0" % i, "ARG_RANGE")
+        L = L_mm * 1e-3
+        w = w_mm * 1e-3
+        geom.append({"index": i, "length_mm": round(L_mm, 6),
+                     "width_mm": round(w_mm, 6), "length_m": L, "width_m": w,
+                     "area_m2": w * t_m, "x_mm": round(x + L_mm / 2.0, 6)})
+        x += L_mm
+    return {"segments": geom, "total_mm": round(x, 6), "thick_um": thick_um,
+            "narrowest_width_mm": round(min(s["width_mm"] for s in geom), 6)}, None
+
+
+def _thomas(diag, lower, upper, rhs):
+    """Tridiagonal solve; lower[i]*x[i-1] + diag[i]*x[i] + upper[i]*x[i+1] = rhs[i]."""
+    n = len(diag)
+    if diag[0] == 0.0:
+        return None
+    cp = [0.0] * n
+    dp = [0.0] * n
+    cp[0] = (upper[0] / diag[0]) if n > 1 else 0.0
+    dp[0] = rhs[0] / diag[0]
+    for i in range(1, n):
+        den = diag[i] - lower[i] * cp[i - 1]
+        if den == 0.0:
+            return None
+        cp[i] = (upper[i] / den) if i < n - 1 else 0.0
+        dp[i] = (rhs[i] - lower[i] * dp[i - 1]) / den
+    x = [0.0] * n
+    x[n - 1] = dp[n - 1]
+    for i in range(n - 2, -1, -1):
+        x[i] = dp[i] - cp[i] * x[i + 1]
+    return x
+
+
+def _taper_coeffs(g, current_a, k_w_mk, ends_c, alpha, rho_m, cp, rho20):
+    """Per-node heat capacity, inter-node conductance, source a_i + b_i T."""
+    seg = g["segments"]
+    n = len(seg)
+    cap = [rho_m * cp * s["area_m2"] * s["length_m"] for s in seg]
+    cond = [0.0] * max(0, n - 1)
+    if k_w_mk > 0.0:
+        for i in range(n - 1):
+            r = (0.5 * seg[i]["length_m"] / (k_w_mk * seg[i]["area_m2"]) +
+                 0.5 * seg[i + 1]["length_m"] / (k_w_mk * seg[i + 1]["area_m2"]))
+            cond[i] = (1.0 / r) if r > 0.0 else 0.0
+    g0 = gN = 0.0
+    if ends_c is not None and k_w_mk > 0.0:
+        # half a segment of copper to the terminal
+        g0 = 2.0 * k_w_mk * seg[0]["area_m2"] / seg[0]["length_m"]
+        gN = 2.0 * k_w_mk * seg[-1]["area_m2"] / seg[-1]["length_m"]
+    a_src = [0.0] * n
+    b_src = [0.0] * n
+    for i in range(n):
+        r = rho20 * seg[i]["length_m"] / seg[i]["area_m2"]
+        a_src[i] = current_a * current_a * r * (1.0 - alpha * T_REF_C)
+        b_src[i] = current_a * current_a * r * alpha
+    return cap, cond, g0, gN, a_src, b_src
+
+
+def _taper_run(g, current_a, t_end_s, dt_s, melt_c, ta_c, ends_c, k_w_mk,
+               alpha, rho_m, cp, rho20):
+    """March the axial system to t_end_s (or to the first melt) and report both."""
+    seg = g["segments"]
+    n = len(seg)
+    cap, cond, g0, gN, a_src, b_src = _taper_coeffs(
+        g, current_a, k_w_mk, ends_c, alpha, rho_m, cp, rho20)
+    temp = [float(ta_c)] * n
+    nsteps = int(math.ceil(t_end_s / dt_s - 1e-9))
+    t = 0.0
+    t_melt = None
+    idx = None
+    for _step in range(nsteps):
+        diag = [0.0] * n
+        lower = [0.0] * n
+        upper = [0.0] * n
+        rhs = [0.0] * n
+        for i in range(n):
+            s = 0.0
+            if i > 0:
+                lower[i] = -cond[i - 1]
+                s += cond[i - 1]
+            if i < n - 1:
+                upper[i] = -cond[i]
+                s += cond[i]
+            if i == 0:
+                s += g0
+            if i == n - 1:
+                s += gN
+            diag[i] = cap[i] / dt_s - b_src[i] + s
+            rhs[i] = cap[i] / dt_s * temp[i] + a_src[i]
+        if g0:
+            rhs[0] += g0 * ends_c
+        if gN:
+            rhs[n - 1] += gN * ends_c
+        new = _thomas(diag, lower, upper, rhs)
+        if new is None:
+            return None, err("the axial system went singular at t = %.4g s (the "
+                             "current has passed the point where heat generation "
+                             "outruns conduction)" % t, "SOLVER_SINGULAR")
+        for v in new:
+            if v != v or v in (float("inf"), float("-inf")):
+                return None, err("non-finite temperature at t = %.4g s" % t,
+                                 "SOLVER_DIVERGED")
+        for i in range(n):
+            if temp[i] < melt_c <= new[i]:
+                frac = (melt_c - temp[i]) / (new[i] - temp[i])
+                tt = t + frac * dt_s
+                if t_melt is None or tt < t_melt:
+                    t_melt, idx = tt, i
+        if t_melt is not None:
+            break
+        temp = new
+        t += dt_s
+    return {"melted": t_melt is not None, "t_melt_s": t_melt, "melt_segment": idx,
+            "temperature_c": temp, "at_s": t, "steps": nsteps,
+            "dt_s": dt_s, "conduction_delay_pct": None}, None
+
+
+def _taper_steady(g, current_a, ends_c, k_w_mk, alpha, rho_m, cp, rho20):
+    """Steady state with FIXED terminals: peak temperature, or None if singular.
+
+    With insulated ends there is no steady state at all for I > 0 (nothing removes
+    heat), so this only exists when ends_c is supplied - which is exactly the
+    question "below what current does it stop heating".
+    """
+    seg = g["segments"]
+    n = len(seg)
+    cap, cond, g0, gN, a_src, b_src = _taper_coeffs(
+        g, current_a, k_w_mk, ends_c, alpha, rho_m, cp, rho20)
+    diag = [0.0] * n
+    lower = [0.0] * n
+    upper = [0.0] * n
+    rhs = [0.0] * n
+    for i in range(n):
+        s = 0.0
+        if i > 0:
+            lower[i] = -cond[i - 1]
+            s += cond[i - 1]
+        if i < n - 1:
+            upper[i] = -cond[i]
+            s += cond[i]
+        if i == 0:
+            s += g0
+        if i == n - 1:
+            s += gN
+        diag[i] = -b_src[i] + s
+        rhs[i] = a_src[i]
+    if g0:
+        rhs[0] += g0 * ends_c
+    if gN:
+        rhs[n - 1] += gN * ends_c
+    # A non-positive diagonal means the generation term has already outrun the
+    # conduction term: the steady matrix is no longer an M-matrix and there IS no
+    # steady state. Solving it anyway returns a negative temperature, which is the
+    # classic way to get a confident wrong branch, so say so instead.
+    if min(diag) <= 0.0:
+        return None
+    x = _thomas(diag, lower, upper, rhs)
+    if x is None:
+        return None
+    if any(v != v or v > 1e6 for v in x):
+        return None
+    return max(x)
+
+
+def _taper_steady_threshold(g, melt_c, ends_c, k_w_mk, alpha, rho_m, cp, rho20):
+    """Bisect the current whose steady peak sits exactly at the melt point."""
+    lo, hi = 1e-9, 1.0
+    for _ in range(60):
+        peak = _taper_steady(g, hi, ends_c, k_w_mk, alpha, rho_m, cp, rho20)
+        if peak is None or peak >= melt_c:
+            break
+        lo, hi = hi, hi * 4.0
+    else:
+        return None
+    for _ in range(120):
+        mid = 0.5 * (lo + hi)
+        peak = _taper_steady(g, mid, ends_c, k_w_mk, alpha, rho_m, cp, rho20)
+        if peak is None or peak >= melt_c:
+            hi = mid
+        else:
+            lo = mid
+        if hi / lo - 1.0 < 1e-9:
+            break
+    return 0.5 * (lo + hi)
+
+
+def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c=25.0,
+                         alpha_per_k=ALPHA_234_CU, k_thermal_w_mk=K_THERMAL_CU,
+                         ends_c=None, current_a=None, t_melt_s=None, t_end_s=10.0,
+                         dt_s=None, max_steps=200000, melt_c=MELT_CU_C,
+                         rho_mass_kg_m3=RHO_MASS_CU, cp_j_kgk=CP_CU,
+                         rho20_ohm_m=RHO20_CU):
+    """Fusing current (or time to melt) for a trace whose WIDTH CHANGES along it.
+
+    Two questions, pick one and give the other as its answer:
+
+      * current_a given  -> how long until the hottest segment reaches melt
+      * t_melt_s given   -> what current melts it in that time (bisection)
+
+    What the model is, in one line: one isothermal node per axial segment, joined by
+    each pair's two half-lengths in series, copper's own rho(T), backward Euler. No
+    fitted constants - it is the same physics as repetitive_pulse_rating minus the
+    cooling to air/board and plus the length axis.
+
+    Read the answer as one-sided, and in a direction that FLIPS with the geometry:
+    deleting cooling to air/board makes the number low (it really can shed heat
+    sideways), while making each cross-section isothermal makes it high (a narrow
+    neck really runs hotter at its edges than at its centre). Which error wins
+    depends on the aspect ratio, so no blanket sign is claimed.
+
+    `ends_c` is the temperature of the two terminals (degC). Give it and the ends
+    stop being insulated, which is what makes a steady state exist at all - and then
+    `steady_threshold_a` (the current whose steady peak is the melt point) becomes a
+    real number instead of "there is none".
+    """
+    try:
+        copper_oz = float(copper_oz)
+        t_ambient_c = float(t_ambient_c)
+        alpha_per_k = float(alpha_per_k)
+        k_thermal_w_mk = float(k_thermal_w_mk)
+        t_end_s = float(t_end_s)
+        max_steps = int(max_steps)
+        melt_c = float(melt_c)
+        rho_mass_kg_m3 = float(rho_mass_kg_m3)
+        cp_j_kgk = float(cp_j_kgk)
+        rho20_ohm_m = float(rho20_ohm_m)
+    except (TypeError, ValueError):
+        return err("numeric arguments required", "ARG_INVALID")
+    if thickness_um is None:
+        thick_um = copper_oz * OZ_TO_UM
+    else:
+        try:
+            thick_um = float(thickness_um)
+        except (TypeError, ValueError):
+            return err("thickness_um must be numeric", "ARG_INVALID")
+    if not (thick_um > 0):
+        return err("copper thickness must be > 0", "ARG_RANGE")
+    if alpha_per_k <= 0:
+        return err("alpha_per_k must be > 0: with no resistivity rise there is no "
+                   "runaway and this model has no melt criterion to solve", "ARG_RANGE",
+                   hint="copper's own value is 1/254 = %.6f" % ALPHA_234_CU)
+    if k_thermal_w_mk < 0:
+        return err("k_thermal_w_mk must be >= 0 (0 = conduction switched off)",
+                   "ARG_RANGE")
+    if t_ambient_c <= -ONDERDONK_REF_C:
+        return err("t_ambient_c must be above -234 C", "ARG_RANGE")
+    if not (t_ambient_c < melt_c):
+        return err("melt_c must be above t_ambient_c", "ARG_RANGE")
+    if melt_c >= 1e5:
+        return err("melt_c is not a temperature", "ARG_RANGE")
+    if ends_c is not None:
+        try:
+            ends_c = float(ends_c)
+        except (TypeError, ValueError):
+            return err("ends_c must be numeric (the terminal temperature in C)",
+                       "ARG_INVALID")
+        if ends_c <= -ONDERDONK_REF_C:
+            return err("ends_c must be above -234 C", "ARG_RANGE")
+        if not (ends_c < melt_c):
+            return err("ends_c must be below melt_c: a terminal already at the melt "
+                       "point answers nothing", "ARG_RANGE")
+    if (current_a is None) == (t_melt_s is None):
+        return err("give exactly one of current_a (-> time to melt) or t_melt_s "
+                   "(-> current that melts in that time)", "ARG_REQUIRED",
+                   hint="the two are the same curve read in opposite directions")
+    g, e = _taper_geometry(segments, thick_um)
+    if e:
+        return e
+    if not (rho_mass_kg_m3 > 0 and cp_j_kgk > 0 and rho20_ohm_m > 0):
+        return err("rho_mass_kg_m3, cp_j_kgk and rho20_ohm_m must all be > 0",
+                   "ARG_RANGE")
+    n = len(g["segments"])
+
+    asked_time = current_a is None
+    if current_a is not None:
+        try:
+            current_a = float(current_a)
+        except (TypeError, ValueError):
+            return err("current_a must be numeric", "ARG_INVALID")
+        if current_a <= 0:
+            return err("current_a must be > 0", "ARG_RANGE")
+        if not (t_end_s > 0):
+            return err("t_end_s must be > 0", "ARG_RANGE")
+        dt = float(dt_s) if dt_s is not None else t_end_s / 2000.0
+        if not (dt > 0):
+            return err("dt_s must be > 0", "ARG_RANGE")
+        if dt > t_end_s:
+            dt = t_end_s
+        steps = int(math.ceil(t_end_s / dt - 1e-9))
+        if steps > max_steps:
+            return err("this would take %d steps (max_steps = %d)" % (steps, max_steps),
+                       "ARG_RANGE", hint="raise dt_s or max_steps")
+        run, e = _taper_run(g, current_a, t_end_s, dt, melt_c, t_ambient_c, ends_c,
+                            k_thermal_w_mk, alpha_per_k, rho_mass_kg_m3, cp_j_kgk,
+                            rho20_ohm_m)
+        if e:
+            return e
+    else:
+        try:
+            t_melt_target = float(t_melt_s)
+        except (TypeError, ValueError):
+            return err("t_melt_s must be numeric", "ARG_INVALID")
+        if not (t_melt_target > 0):
+            return err("t_melt_s must be > 0", "ARG_RANGE")
+        dt = float(dt_s) if dt_s is not None else t_melt_target / 2000.0
+        if not (dt > 0):
+            return err("dt_s must be > 0", "ARG_RANGE")
+        if dt > t_melt_target:
+            dt = t_melt_target
+        steps = int(math.ceil(t_melt_target / dt - 1e-9))
+        if steps > max_steps:
+            return err("this would take %d steps (max_steps = %d)" % (steps, max_steps),
+                       "ARG_RANGE", hint="raise dt_s or max_steps")
+        # lower bracket: the adiabatic current of the NARROWEST segment, which melts
+        # first with no conduction at all -> conduction can only push the answer up
+        narrow = min(s["area_m2"] for s in g["segments"])
+        i_lo = _taper_adiabatic_current(narrow, t_melt_target, t_ambient_c, melt_c,
+                                        alpha_per_k, rho_mass_kg_m3, cp_j_kgk,
+                                        rho20_ohm_m)
+        if i_lo is None or not (i_lo > 0):
+            return err("the adiabatic lower bracket came out non-positive; check "
+                       "melt_c / t_ambient_c", "INTERNAL")
+        i_lo *= 0.999
+
+        def melts(i_test):
+            r, ee = _taper_run(g, i_test, t_melt_target, dt, melt_c, t_ambient_c,
+                               ends_c, k_thermal_w_mk, alpha_per_k, rho_mass_kg_m3,
+                               cp_j_kgk, rho20_ohm_m)
+            if ee:
+                return ee, None
+            return None, (r["melted"] and r["t_melt_s"] <= t_melt_target)
+
+        # expand the top of the bracket until it melts in time
+        for _ in range(40):
+            ee, hit = melts(i_lo)
+            if ee:
+                return ee
+            if not hit:
+                break
+            i_lo *= 0.5
+        else:
+            return err("could not find a current that does NOT melt in time",
+                       "INTERNAL")
+        i_hi = i_lo * 4.0
+        for _ in range(40):
+            ee, hit = melts(i_hi)
+            if ee:
+                return ee
+            if hit:
+                break
+            i_hi *= 4.0
+        else:
+            return err("no current up to %.3g A melts this in %.4g s" % (i_hi, t_melt_target),
+                       "NO_SOLUTION",
+                       hint="that cannot happen with alpha > 0 unless dt_s is too big "
+                            "to resolve the rise; try a smaller dt_s")
+        lo, hi = i_lo, i_hi
+        for _ in range(60):
+            mid = math.sqrt(lo * hi)
+            ee, hit = melts(mid)
+            if ee:
+                return ee
+            if hit:
+                hi = mid
+            else:
+                lo = mid
+            if hi / lo - 1.0 < 1e-9:
+                break
+        current_a = math.sqrt(lo * hi)
+        # 2 % past the target so the crossing is strictly INSIDE the last step: at the
+        # bracket point itself the node lands on melt_c exactly and "crossed" is
+        # ambiguous, which would report melted=false on a converged answer
+        run, e = _taper_run(g, current_a, t_melt_target * 1.02, dt, melt_c,
+                            t_ambient_c, ends_c, k_thermal_w_mk, alpha_per_k,
+                            rho_mass_kg_m3, cp_j_kgk, rho20_ohm_m)
+        if e:
+            return e
+
+    # --- the adiabatic control: same current, conduction and terminals switched off
+    if run["melted"]:
+        ctrl_window = max(run["at_s"], run["t_melt_s"] * 1.02)
+    elif asked_time:
+        ctrl_window = float(t_melt_s)
+    else:
+        ctrl_window = t_end_s
+    ctrl, e = _taper_run(g, current_a, ctrl_window, dt, melt_c, t_ambient_c, None,
+                         0.0, alpha_per_k, rho_mass_kg_m3, cp_j_kgk, rho20_ohm_m)
+    delay = None
+    if not e and run["melted"] and ctrl["melted"] and ctrl["t_melt_s"] > 0:
+        delay = 100.0 * (run["t_melt_s"] - ctrl["t_melt_s"]) / ctrl["t_melt_s"]
+        run["conduction_delay_pct"] = delay
+
+    seg = g["segments"]
+    profile = []
+    for i in range(n):
+        profile.append({"segment": i, "x_mm": seg[i]["x_mm"],
+                        "width_mm": seg[i]["width_mm"],
+                        "t_c": round(run["temperature_c"][i], 4)})
+    hot = max(range(n), key=lambda i: run["temperature_c"][i])
+    extra = {
+        "melted": run["melted"],
+        "t_melt_s": (round(run["t_melt_s"], 6) if run["melted"] else None),
+        "melt_at_mm": (seg[run["melt_segment"]]["x_mm"]
+                       if run["melt_segment"] is not None else None),
+        "melt_segment": run["melt_segment"],
+        "melt_c": round(melt_c, 3),
+        "current_a": round(current_a, 6),
+        "peak_c": round(run["temperature_c"][hot], 4),
+        "peak_segment": hot,
+        "peak_at_s": round(run["at_s"], 6),
+        "margin_to_melt_k": round(melt_c - run["temperature_c"][hot], 4),
+        "segment_count": n,
+        "length_total_mm": g["total_mm"],
+        "narrowest_width_mm": g["narrowest_width_mm"],
+        "thickness_um": round(thick_um, 3),
+        "copper_oz": round(thick_um / OZ_TO_UM, 3),
+        "t_ambient_c": round(t_ambient_c, 2),
+        "alpha_per_k": alpha_per_k,
+        "k_thermal_w_mk": k_thermal_w_mk,
+        "ends_c": (round(ends_c, 3) if ends_c is not None else None),
+        "ends_are": ("fixed at ends_c" if ends_c is not None else
+                     "insulated (no heat leaves through the ends)"),
+        "dt_s": dt,
+        "steps": run["steps"],
+        "time_resolution_s": dt,
+        "temperature_profile_c": profile,
+        "adiabatic_control": {
+            "conduction": "off (k_thermal_w_mk = 0, ends insulated)",
+            "melted": ctrl["melted"] if not e else None,
+            "t_melt_s": (round(ctrl["t_melt_s"], 6)
+                         if (not e and ctrl["melted"]) else None),
+            "conduction_delay_pct": (round(delay, 3) if delay is not None else None),
+            "why_null": (None if delay is not None else
+                         "no pair of melt times to compare (one of the two runs did "
+                         "not melt within its window, or the control itself errored)"),
+        },
+    }
+    if ends_c is not None:
+        thr = _taper_steady_threshold(g, melt_c, ends_c, k_thermal_w_mk, alpha_per_k,
+                                      rho_mass_kg_m3, cp_j_kgk, rho20_ohm_m)
+        extra["steady_threshold_a"] = (round(thr, 6) if thr is not None else None)
+        extra["steady_threshold_note"] = (
+            "current whose STEADY peak (terminals fixed, no time stepping) is exactly "
+            "melt_c; above it no steady state exists and the trace melts. This is the "
+            "1-D fin solution, so it is exact for this discretisation"
+            if thr is not None else
+            "could not bracket a steady threshold inside 60 doublings from 1 A")
+    else:
+        extra["steady_threshold_a"] = None
+        extra["steady_threshold_note"] = (
+            "none exists: with insulated ends nothing removes heat at steady state, so "
+            "for any positive current the temperature keeps rising. Pass ends_c to ask "
+            "the question with an answer")
+
+    if asked_time:
+        value, unit = round(current_a, 6), "A"
+    elif run["melted"]:
+        value, unit = round(run["t_melt_s"], 6), "s"
+    else:
+        value, unit = None, "s"
+
+    return ok(
+        value=value,
+        unit=unit,
+        model="taper_1d_axial_conduction_fusing",
+        basis="1-D axial finite volume on segment centres: C_i dT_i/dt = I^2 R_i(T_i) "
+              "+ sum_j G_ij (T_j - T_i), R_i = rho(T_i) L_i / A_i, G_ij = the two "
+              "half-lengths in series, rho(T) = rho20 (1 + alpha (T - 20)) with "
+              "alpha = 1/254 (copper's own 234 law, the same 234 as Onderdonk 1928); "
+              "backward Euler + Thomas, melt at the point where a node crosses melt_c",
+        precision="+/-25% and two one-sided choices that point in OPPOSITE directions: "
+                  "cooling to air/board is deleted (only axial conduction survives), "
+                  "which makes the number low, while each cross-section is one "
+                  "temperature, which misses the edge crowding at a narrow neck and "
+                  "makes it high. k_thermal_w_mk is yours (400 is bulk copper; a thin "
+                  "film, a plated layer or a trace over a void is worse). Latent heat "
+                  "is not modelled (melt point, not molten), and time is resolved to "
+                  "dt_s - both melt times in the answer are interpolated within a step",
+        assumptions={
+            "material": "copper: rho20 = %.3g ohm*m, rho_m = %.4g kg/m^3, "
+                        "c_p = %.4g J/(kg*K), melt %.0f C, k = %.4g W/(m*K)"
+                        % (rho20_ohm_m, rho_mass_kg_m3, cp_j_kgk, melt_c, k_thermal_w_mk),
+            "spatial": "1-D along the trace. Each segment is isothermal over its whole "
+                       "cross-section and its length is lumped to one node at the "
+                       "centre; no transverse gradient, so a narrow neck's hot edges "
+                       "are not resolved",
+            "cooling": "axial conduction only. No convection, no radiation, no board, "
+                       "no plane, no solder - %s" % (
+                           "the two ends are pinned at ends_c"
+                           if ends_c is not None else
+                           "and the ends are insulated, so nothing leaves"),
+            "phase_change": "not modelled (melt point only, no latent heat)",
+            "waveform": "constant current; a pulse of the same RMS is not equivalent",
+            "skin_effect": "not modelled",
+            "geometry": "rectangular segments of constant width, joined end to end; "
+                        "corner heating, current crowding at the step and the extra "
+                        "surface of a step are not modelled",
+        },
+        extra=extra,
+    )
