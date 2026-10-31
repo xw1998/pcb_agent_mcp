@@ -3939,13 +3939,24 @@ def _capabilities(_args):
             "the BUDGET, there is deliberately no heatsink table in this server",
             "Vibration is a THIN-PLATE, SINGLE-MODE, LINEAR layer, by name: no shear "
             "deformation or rotary inertia (so a thick or short plate reads too "
-            "stiff), ONE point mass and SYMMETRIC copper skins are modelled (0.0.53: "
-            "a rank-one mass update, and D11/D12/D22/D66 summed layer by layer) but "
-            "distributed component mass, component stiffness, an ASYMMETRIC stack "
-            "(which needs a membrane-bending term), copper on the polygonal-outline "
-            "path and copper in the stress tool's separate solve are not - leave "
-            "copper_um and added_mass_g out and f1 reads high on a 2 oz board or one "
-            "with a heavy can, no compliance in the mount itself, no "
+            "stiff). Copper skins with DIFFERENT thicknesses on the two faces ARE "
+            "modelled (0.0.57: A/B/D section, and for the in-plane-free plate the "
+            "REDUCED stiffness D* = D - B A^-1 B with mid-plane strain eps0 = "
+            "-A^-1 B kappa), but an unsymmetric result is the FLAT-STATE "
+            "linearisation: a board free to warp bows, and that equilibrium is NOT "
+            "solved. Mass enters as ONE point (rank-one update) or as distributed "
+            "patches (added_mass_regions, exact patch moments divided by the patch "
+            "area; omit size_mm for the whole plate). Component STIFFNESS is not "
+            "modelled (the mass is in, the spring is not), and each layer is "
+            "isotropic (one E and one nu per layer, so an orthotropic laminate E1 != "
+            "E2 reads wrong). Copper on the polygonal-outline path and in the stress "
+            "tool's separate solve is modelled since 0.0.57 - the surface stress there "
+            "now uses the E AND nu OF THE LAYER AT THAT SURFACE (0.0.56 paired "
+            "copper's E with the laminate's nu, ~10 percent on 1 oz; the correction "
+            "is registered in the changelog and the uncoupled default path is "
+            "bit-identical) - leave copper_um and added_mass_g out and f1 reads high "
+            "on a 2 oz board or one with a heavy can, no compliance in the mount "
+            "itself, no "
             "assembly-level modes, no solder-joint creep or BGA-ball fatigue (only "
             "the Steinberg lead-wire form, whose slope and allowable YOU supply), no "
             "random-plus-shock superposition, no drop simulation, no nonlinear "
@@ -5688,11 +5699,15 @@ _tool(
     "custom edge conditions, so it is exact for SSSS and CCCC squares (verified against "
     "the analytic eigenvalues) and needs no mode table. Gives f1..fn, the antinode "
     "position, the quiet-area fraction, and the normalised deflection at any probe "
-    "points you name. Two things the bare laminate cannot see are optional: copper_um "
-    "(a symmetric skin pair, transformed section -> D11/D12/D22/D66 summed layer by "
-    "layer, plus its mass) and added_mass_g at a point (an exact rank-one mass update, "
-    "so a mass on a node leaves that mode alone). Both OFF by default, and with both "
-    "off every number is bit-identical to before.",
+    "points you name. Four things the bare laminate cannot see are optional, all OFF "
+    "by default, and with all four off every number is bit-identical to before: "
+    "copper_um (a skin pair, transformed section -> A/B/D summed layer by layer plus "
+    "its mass), copper_um_bottom (when the two faces differ, which couples bending and "
+    "stretching: the plate then answers with the REDUCED D* = D - B A^-1 B and its "
+    "neutral plane leaves mid-plane), added_mass_g at a point (an exact rank-one mass "
+    "update, so a mass on a node leaves that mode alone), and added_mass_regions (mass "
+    "spread over rectangles, e.g. a potted or conformally coated board, integrated with "
+    "exact polynomial moments).",
     {"type": "object", "properties": {
         "a_mm": _num("plate length"),
         "b_mm": _num("plate width"),
@@ -5731,6 +5746,20 @@ _tool(
                              "[x_mm, y_mm] where that mass sits; default the plate "
                              "centre (the usual antinode, and the worst case)",
                              "items": {}},
+        "copper_um_bottom": _num(
+            "copper on the BOTTOM face alone, in um, when the two faces differ (1 oz "
+            "top / 2 oz bottom, or copper on one side only). Leave it out and "
+            "copper_um means both faces. An UNSYMMETRIC stack couples bending and "
+            "stretching: the plate is solved with the reduced D* = D - B A^-1 B, the "
+            "neutral plane moves off mid-plane, and the frequencies are those about "
+            "the FLAT state - a board free to warp bows and is a different, softer "
+            "problem"),
+        "added_mass_regions": {"type": "array", "description":
+                               "distributed masses, each {mass_g, center_mm:[x,y], "
+                               "size_mm:[w,h]} (omit size_mm for the whole plate - "
+                               "potting or conformal coat). Integrated as an exact "
+                               "polynomial moment, so it is the real mode-shape "
+                               "weighting and not a smear", "items": {}},
     }, "required": ["a_mm", "b_mm", "thickness_mm"]},
     lambda a: _vib.plate_modes(
         a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"),
@@ -5743,8 +5772,10 @@ _tool(
         probe_points=a.get("probe_points"),
         stress_amplitude_mm=a.get("stress_amplitude_mm"),
         copper_um=a.get("copper_um"),
+        copper_um_bottom=a.get("copper_um_bottom"),
         added_mass_g=a.get("added_mass_g"),
-        added_mass_at_mm=a.get("added_mass_at_mm")),
+        added_mass_at_mm=a.get("added_mass_at_mm"),
+        added_mass_regions=a.get("added_mass_regions")),
 )
 
 _tool(
@@ -5760,8 +5791,10 @@ _tool(
     "faceted or re-entrant outline says so instead of quoting a fake 0.1 %. Verified "
     "against the rectangular path on a square (ss -0.01 %, clamped +0.01 %, corners "
     "-0.01 %, free mode 4 +0.001 %, cantilever -0.4 %) and within 1.1 % of the "
-    "circular plate eigenvalues. Holes are not meshed and stress is not computed on "
-    "a polygonal outline.",
+    "circular plate eigenvalues. Copper skins are supported too (copper_um, and "
+    "copper_um_bottom when the two faces differ): the same A/B/D section the "
+    "rectangular path uses, so a square reads the same frequency on both paths. "
+    "Holes are not meshed and stress is not computed on a polygonal outline.",
     {"type": "object", "properties": {
         "ring_mm": {"type": "array", "description":
                     "outline vertices in order, each [x_mm, y_mm] or "
@@ -5790,6 +5823,14 @@ _tool(
         "supports": {"type": "array", "description":
                      "extra point supports, each [x_mm, y_mm] or {x_mm, y_mm}",
                      "items": {}},
+        "copper_um": _num(
+            "copper on BOTH faces, thickness in um per face (35 = 1 oz). Summed into "
+            "the plate's own D11/D22/D12/D66 and its mass per area - the same section "
+            "the rectangular path builds, so the two agree on a square"),
+        "copper_um_bottom": _num(
+            "copper on the BOTTOM face only, in um, when it differs from copper_um. "
+            "An unsymmetric stack answers with the REDUCED D* = D - B A^-1 B and its "
+            "frequencies are those about the FLAT state"),
     }, "required": ["ring_mm", "thickness_mm"]},
     lambda a: _vib_poly.plate_modes_polygon(
         _ring_arg(a.get("ring_mm")), a.get("thickness_mm"),
@@ -5800,7 +5841,9 @@ _tool(
         n_modes=int(a.get("n_modes") or 4),
         penalty_alphas=a.get("penalty_alphas"),
         probe_points=a.get("probe_points"),
-        supports=_ring_arg(a.get("supports"))),
+        supports=_ring_arg(a.get("supports")),
+        copper_um=a.get("copper_um"),
+        copper_um_bottom=a.get("copper_um_bottom")),
 )
 
 _tool(
@@ -5814,7 +5857,10 @@ _tool(
     "corner torque), and the largest principal stress peaks where the bending "
     "curvatures do (a bay centre). Reporting one point for both is how a max stress "
     "comes out a third low. Frequencies converge faster than curvatures: on SSSS the "
-    "frequency moves 0.04 % between degree 5 and 9 while the stress moves 3.6 %.",
+    "frequency moves 0.04 % between degree 5 and 9 while the stress moves 3.6 %. With "
+    "copper the surface is the copper: each face uses its own layer's E and nu at that "
+    "layer's z (0.0.56 used copper's E beside the laminate's nu, a 10 % error on 1 oz), "
+    "and a one-sided stack solves BOTH faces and reports the worse one.",
     {"type": "object", "properties": {
         "a_mm": _num("plate length"),
         "b_mm": _num("plate width"),
@@ -5836,6 +5882,14 @@ _tool(
                             "(5,7,9) up to this", 9),
         "degrees": {"type": "array", "description":
                     "explicit degree ladder, e.g. [5,7,9]", "items": {}},
+        "copper_um": _num(
+            "copper on BOTH faces, um per face (35 = 1 oz). The stress is then taken "
+            "at the copper surface, with copper's own E and nu - not at the laminate's "
+            "h/2 with the laminate's nu"),
+        "copper_um_bottom": _num(
+            "copper on the BOTTOM face only, in um, when the two faces differ. Both "
+            "surfaces are then solved and the worse one is reported, with "
+            "von_mises_by_surface_mpa giving each"),
     }, "required": ["a_mm", "b_mm", "thickness_mm", "amplitude_mm"]},
     lambda a: _vib.plate_stress(
         a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"), a.get("amplitude_mm"),
@@ -5845,7 +5899,9 @@ _tool(
         mount=(a.get("mount") or "corners"), bc_x=a.get("bc_x"),
         bc_y=a.get("bc_y"),
         poly_degree=(int(a["poly_degree"]) if a.get("poly_degree") is not None else None),
-        degrees=(tuple(a["degrees"]) if a.get("degrees") else None)),
+        degrees=(tuple(a["degrees"]) if a.get("degrees") else None),
+        copper_um=a.get("copper_um"),
+        copper_um_bottom=a.get("copper_um_bottom")),
 )
 
 _tool(

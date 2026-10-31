@@ -700,6 +700,48 @@ def selftest():
               and payload.get("reason_code") == "OUTLINE_INVALID",
               str(payload.get("reason_code")))
 
+        # --- 0.0.57: unsymmetric copper. One skin couples bending and stretching,
+        # so the in-plane-free stiffness is D - B A^-1 B (SOFTER than D) and the
+        # plate must land between the bare board and the double-sided one. The
+        # three checks below can all fail: a section that kept D, or that put the
+        # second skin on, changes every one of them.
+        r = handle({"jsonrpc": "2.0", "id": 855, "method": "tools/call",
+                    "params": {"name": "vibration_plate_modes", "arguments": {
+                        "a_mm": 100, "b_mm": 80, "thickness_mm": 1.6,
+                        "material": "fr4", "mount": "ssss", "n_modes": 1,
+                        "copper_um": 35, "copper_um_bottom": 0}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        _asym = (_v.get("composite") or {}).get("asymmetric") or {}
+        _f1 = ((_v.get("modes") or [{}])[0]).get("freq_hz", 0)
+        check("one-sided copper reports B != 0, D* below D (2.65 %), and the "
+              "neutral plane moved to +0.0816 mm",
+              payload.get("status") == "ok"
+              and abs((_asym.get("b11_n") or 0.0) - 3558.77) < 1.0
+              and abs((_asym.get("stiffness_lost_pct") or 0.0) - 2.65) < 0.05
+              and abs((_asym.get("neutral_plane_mm") or 0.0) - 0.0815537) < 1e-5,
+              str(_asym))
+        check("one-sided copper f11 = 737.558 Hz, i.e. between the bare board "
+              "(677.29) and the double-sided one (800.849)",
+              abs(_f1 - 737.558) < 0.02, str(_f1))
+
+        r = handle({"jsonrpc": "2.0", "id": 856, "method": "tools/call",
+                    "params": {"name": "vibration_plate_modes", "arguments": {
+                        "a_mm": 100, "b_mm": 80, "thickness_mm": 1.6,
+                        "material": "fr4", "mount": "ssss", "n_modes": 1,
+                        "added_mass_regions": [{"mass_g": 20.0}]}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        _dm = _v.get("added_mass_distributed") or {}
+        _beta = _dm.get("added_over_plate") or 0.0
+        _fd = ((_v.get("modes") or [{}])[0]).get("freq_hz", 0)
+        # a mass spread over the WHOLE plate scales f by 1/sqrt(1+beta); the
+        # point-mass path would not (a mass at a node leaves a mode alone)
+        check("a whole-plate 20 g spread drops f11 by 1/sqrt(1+beta) = 498.682 Hz",
+              abs(_beta - 0.844595) < 1e-5
+              and abs(_fd - 677.29 / _math.sqrt(1.0 + _beta)) < 0.02
+              and abs(_fd - 498.682) < 0.02, "%.4f beta=%.6f" % (_fd, _beta))
+
         # --- the write snippet is built from the APP's OWN table: the method name
         # and the receiver both come out of a document that the editor itself
         # produces, and the class name is never lower-cased into a property name.

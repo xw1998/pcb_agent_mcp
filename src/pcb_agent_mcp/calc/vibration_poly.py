@@ -287,8 +287,13 @@ def _corner_supports(ring, x0, y0, x1, y1):
 
 # ---------------------------------------------------------------------- solver
 def _solve_once(ring_mm, x0, y0, a_mm, b_mm, h_mm, props, bcs, p, pts,
-                alphas, n_need):
-    """Assemble once, run the penalty ladder. Returns (runs, meta) or (None, err)."""
+                alphas, n_need, sect=None):
+    """Assemble once, run the penalty ladder. Returns (runs, meta) or (None, err).
+
+    `sect` is the laminate section from `vibration._laminate_section` when
+    copper skins are present. It is None for the bare laminate, and that path
+    is left verbatim so the copper-free answers do not move by one bit.
+    """
     n = len(ring_mm)
     am = a_mm * 1e-3
     bm = b_mm * 1e-3
@@ -298,6 +303,17 @@ def _solve_once(ring_mm, x0, y0, a_mm, b_mm, h_mm, props, bcs, p, pts,
     rho = props["rho"]
     D = E * hm ** 3 / (12.0 * (1.0 - nu * nu))
     mpa = rho * hm
+    # Generalised (orthotropic) stiffness of the built-up section. For the bare
+    # laminate this is exactly D on the diagonal and nu*D off it, i.e. the same
+    # operator written as a 3x3 - so `dmat` stays None unless copper is asked
+    # for, and the isotropic code below is not touched.
+    dmat = None
+    if sect is not None:
+        dmat = (sect["d11"], sect["d22"], sect["d12"], sect["d66"])
+        mpa = mpa + _vib.RHO_CU * (sect["t_top"] + sect["t_bot"])
+        # the penalty scale must follow the plate's own stiffness, or a copper
+        # board would be clamped more weakly than a bare one at the same alpha
+        D = sect["d11"]
 
     nring = [((x - x0) / a_mm, (y - y0) / b_mm) for (x, y) in ring_mm]
     monos = [(d - j, j) for d in range(p + 1) for j in range(d + 1)]
@@ -319,18 +335,37 @@ def _solve_once(ring_mm, x0, y0, a_mm, b_mm, h_mm, props, bcs, p, pts,
         for bi in range(ai, nb):
             i2, j2, x2_, y2_, z2_ = ijk[bi]
             M[ai][bi] = mpa * jac * I[i1 + i2][j1 + j2]
-            st = 0.0
-            if x1_ and x2_:
-                st += x1_ * x2_ * I[i1 + i2 - 4][j1 + j2] / (am ** 4)
-            if y1_ and y2_:
-                st += y1_ * y2_ * I[i1 + i2][j1 + j2 - 4] / (bm ** 4)
-            if x1_ and y2_:
-                st += nu * x1_ * y2_ * I[i1 + i2 - 2][j1 + j2 - 2] / (am * am * bm * bm)
-            if x2_ and y1_:
-                st += nu * x2_ * y1_ * I[i1 + i2 - 2][j1 + j2 - 2] / (am * am * bm * bm)
-            if z1_ and z2_:
-                st += 2.0 * (1.0 - nu) * z1_ * z2_ * I[i1 + i2 - 2][j1 + j2 - 2] / (am * am * bm * bm)
-            K[ai][bi] = D * jac * st
+            if dmat is None:
+                st = 0.0
+                if x1_ and x2_:
+                    st += x1_ * x2_ * I[i1 + i2 - 4][j1 + j2] / (am ** 4)
+                if y1_ and y2_:
+                    st += y1_ * y2_ * I[i1 + i2][j1 + j2 - 4] / (bm ** 4)
+                if x1_ and y2_:
+                    st += nu * x1_ * y2_ * I[i1 + i2 - 2][j1 + j2 - 2] / (am * am * bm * bm)
+                if x2_ and y1_:
+                    st += nu * x2_ * y1_ * I[i1 + i2 - 2][j1 + j2 - 2] / (am * am * bm * bm)
+                if z1_ and z2_:
+                    st += 2.0 * (1.0 - nu) * z1_ * z2_ * I[i1 + i2 - 2][j1 + j2 - 2] / (am * am * bm * bm)
+                K[ai][bi] = D * jac * st
+            else:
+                # int [D11 w_xx^2 + D22 w_yy^2 + 2 D12 w_xx w_yy + 4 D66 w_xy^2]
+                # - the same energy the isotropic path writes with D, nu*D and
+                # D(1-nu)/2, only now the three numbers come from the section.
+                d11, d22, d12, d66 = dmat
+                den = am * am * bm * bm
+                g = 0.0
+                if x1_ and x2_:
+                    g += d11 * x1_ * x2_ * I[i1 + i2 - 4][j1 + j2] / (am ** 4)
+                if y1_ and y2_:
+                    g += d22 * y1_ * y2_ * I[i1 + i2][j1 + j2 - 4] / (bm ** 4)
+                if x1_ and y2_:
+                    g += d12 * x1_ * y2_ * I[i1 + i2 - 2][j1 + j2 - 2] / den
+                if x2_ and y1_:
+                    g += d12 * x2_ * y1_ * I[i1 + i2 - 2][j1 + j2 - 2] / den
+                if z1_ and z2_:
+                    g += 4.0 * d66 * z1_ * z2_ * I[i1 + i2 - 2][j1 + j2 - 2] / den
+                K[ai][bi] = jac * g
     for ai in range(nb):
         for bi in range(ai + 1, nb):
             K[bi][ai] = K[ai][bi]
@@ -480,14 +515,16 @@ def _solve_once(ring_mm, x0, y0, a_mm, b_mm, h_mm, props, bcs, p, pts,
             penf.append(0.0 if lam <= 0.0 else min(1.0, max(0.0, pen / lam)))
         runs.append((al, evals, coef, penf))
     meta = {"nb": nb, "rank": rk, "monos": monos, "D": D, "mpa": mpa,
-            "have_ss": have_ss, "have_cc": have_cc}
+            "have_ss": have_ss, "have_cc": have_cc, "sect": sect,
+            "dmat": dmat}
     return runs, meta
 
 
 def plate_modes_polygon(ring_mm, thickness_mm, material=None, e_gpa=None,
                         nu=None, rho_kg_m3=None, mount="ssss", edges_bc=None,
                         poly_degree=_DEFAULT_P, n_modes=4, penalty_alphas=None,
-                        probe_points=None, supports=None):
+                        probe_points=None, supports=None, copper_um=None,
+                        copper_um_bottom=None):
     """Natural frequencies of a thin plate whose outline is `ring_mm`.
 
     ring_mm          list of (x_mm, y_mm) - any vertex order, any position
@@ -499,6 +536,15 @@ def plate_modes_polygon(ring_mm, thickness_mm, material=None, e_gpa=None,
                      flattens is reported, and the step size there is the
                      honest uncertainty of the answer (see `basis.alpha_scan`)
     supports         extra point supports [(x_mm, y_mm)]
+    copper_um        copper skin thickness per face, in um. The skins are not a
+                     fudge factor on the laminate: the section is summed layer
+                     by layer (A, B, D) and the plate is solved with the D11 /
+                     D22 / D12 / D66 of that section, exactly as the
+                     rectangular path does. Copper-free answers are unchanged.
+    copper_um_bottom copper on the BOTTOM face, in um, when it differs from
+                     copper_um. Leave it out and copper_um means BOTH faces
+                     (the same meaning it has on the rectangular path); pass 0
+                     to leave the bottom face bare.
 
     Same envelope as `plate_modes` (status / value / unit / model / precision).
     """
@@ -566,6 +612,44 @@ def plate_modes_polygon(ring_mm, thickness_mm, material=None, e_gpa=None,
     if a_mm <= 0.0 or b_mm <= 0.0:
         return _vib.err("the outline bbox has zero size", "OUTLINE_INVALID")
 
+    # ---- copper skins: same transformed section the rectangle uses ---------
+    hm = h_mm * 1e-3
+    cu_top = 0.0
+    cu_bot = 0.0
+    if copper_um is not None:
+        cu = _vib._num(copper_um)
+        if cu is None or cu < 0.0:
+            return _vib.err("copper_um must be a number >= 0 (thickness per face)",
+                            "ARG_RANGE")
+        cu_top = cu * 1e-6
+        # copper_um ALONE means the same on both faces - that is what it means
+        # on the rectangular path, and two tools that disagree about the same
+        # word would be worse than one tool with no copper at all
+        cu_bot = cu_top
+    if copper_um_bottom is not None:
+        cb = _vib._num(copper_um_bottom)
+        if cb is None or cb < 0.0:
+            return _vib.err("copper_um_bottom must be a number >= 0 (thickness on "
+                            "the bottom face, in um)", "ARG_RANGE",
+                            hint="give copper_um_bottom only when the two faces "
+                                 "differ; copper_um alone means both faces")
+        cu_bot = cb * 1e-6
+    sect = None
+    if cu_top > 0.0 or cu_bot > 0.0:
+        hz = hm / 2.0
+        if cu_top >= 0.5 * hz or cu_bot >= 0.5 * hz:
+            return _vib.err("copper is %.3f um top / %.3f um bottom on a %.3f mm "
+                            "laminate - that is a copper plate with a laminate "
+                            "core, not a PCB"
+                            % (cu_top * 1e6, cu_bot * 1e6, h_mm),
+                            "OUT_OF_VALIDITY",
+                            hint="the section is still arithmetic, but the "
+                                 "thin-plate limit this solve rests on is gone")
+        sect = _vib._laminate_section(hm, props["e"], props["nu"], cu_top, cu_bot)
+        if sect is None:
+            return _vib.err("the laminate section is singular (A is not "
+                            "invertible)", "OUT_OF_VALIDITY")
+
     if edges_bc is None:
         bcs, msg = _edge_bcs(mount, ring, x0, y0, x1, y1)
         if bcs is None:
@@ -600,7 +684,7 @@ def plate_modes_polygon(ring_mm, thickness_mm, material=None, e_gpa=None,
     expect_rigid = _rigid_count(bcs, pts)
 
     runs, meta = _solve_once(ring, x0, y0, a_mm, b_mm, h_mm, props, bcs, p,
-                             pts, alphas, max(nmodes, 6))
+                             pts, alphas, max(nmodes, 6), sect=sect)
     if runs is None:
         return _vib.err(meta, "INTERNAL", hint="try a lower poly_degree")
     mpa = meta["mpa"]
@@ -790,8 +874,20 @@ def plate_modes_polygon(ring_mm, thickness_mm, material=None, e_gpa=None,
             "%d of %d penalty strengths were rejected because the spectrum was "
             "not healthy (a spurious zero-frequency mode appeared)"
             % (len(runs) - len(healthy), len(runs)))
-    warnings.append("component mass and copper are not added, and the mounting "
-                    "itself is treated as rigid")
+    if sect is None:
+        warnings.append("component mass and copper are not added, and the "
+                        "mounting itself is treated as rigid")
+    else:
+        warnings.append("component mass is not added and the mounting itself is "
+                        "treated as rigid; the copper skins ARE in the section")
+        if sect["asym"]:
+            warnings.append(
+                "the two copper faces differ (%g um top / %g um bottom), so the "
+                "stack is unsymmetric: the stiffness used is the REDUCED "
+                "D* = D - B A^-1 B (the plate is free to extend in-plane), and "
+                "the frequencies are those about the FLAT state - a board free "
+                "to warp bows and is a different, softer problem"
+                % (cu_top * 1e6, cu_bot * 1e6))
     warnings.append("outline holes / cutouts are not meshed - only the outer "
                     "ring is solved")
     if p < 8 and (meta["have_cc"] or pts):
@@ -815,6 +911,40 @@ def plate_modes_polygon(ring_mm, thickness_mm, material=None, e_gpa=None,
                          "rho_kg_m3": props["rho"], "preset": material},
             "flexural_rigidity_n_m": _vib._sig(meta["D"]),
             "mass_per_area_kg_m2": _vib._sig(mpa),
+            "composite": (None if sect is None else {
+                "copper_um_top": _vib._sig(cu_top * 1e6),
+                "copper_um_bottom": _vib._sig(cu_bot * 1e6),
+                "d11_n_m": _vib._sig(sect["d11"]),
+                "d22_n_m": _vib._sig(sect["d22"]),
+                "d12_n_m": _vib._sig(sect["d12"]),
+                "d66_n_m": _vib._sig(sect["d66"]),
+                "laminate_d11_n_m": _vib._sig(
+                    props["e"] * hm ** 3 / (12.0 * (1.0 - props["nu"] ** 2))),
+                "mass_share_copper": _vib._sig(
+                    _vib.RHO_CU * (cu_top + cu_bot) / mpa, 4),
+                "e_cu_gpa": _vib._sig(_vib.E_CU / 1e9), "nu_cu": _vib.NU_CU,
+                "symmetric": not sect["asym"],
+                "asymmetric": (None if not sect["asym"] else {
+                    "a11_n_per_m": _vib._sig(sect["a11"]),
+                    "b11_n": _vib._sig(sect["b11"]),
+                    "b_over_a_mm": _vib._sig(sect["b11"] / sect["a11"] * 1e3),
+                    "d11_before_reduction_n_m": _vib._sig(sect["d11_sym"]),
+                    "d11_reduced_n_m": _vib._sig(sect["d11"]),
+                    "stiffness_lost_pct": _vib._sig(
+                        100.0 * (1.0 - sect["d11"] / sect["d11_sym"]), 3),
+                    "neutral_plane_mm": _vib._sig(sect["z0"] * 1e3),
+                    "z_top_surface_mm": _vib._sig(sect["z_top_surface"] * 1e3),
+                    "z_bottom_surface_mm": _vib._sig(sect["z_bot_surface"] * 1e3),
+                    "note": ("B != 0 couples bending and stretching; the "
+                             "in-plane-free plate shows the REDUCED "
+                             "D* = D - B A^-1 B, and the flat state is not an "
+                             "equilibrium (it bows) - these are the frequencies "
+                             "about the FLAT state"),
+                }),
+                "formula": "A = int Q dz, B = int Q z dz, D = int Q z^2 dz over "
+                           "laminate + skins; the plate energy uses D11, D22, "
+                           "D12, 4 D66 of that section",
+            }),
             "bc": {"edges": [str(b) for b in bcs],
                    "point_supports_mm": [[_vib._sig(sx), _vib._sig(sy)]
                                          for (sx, sy) in pts],

@@ -475,20 +475,41 @@ class TestTheStressSurface(unittest.TestCase):
         self.assertAlmostEqual(s["surface_z_mm"], 0.8, delta=1e-6)
 
     def test_the_stress_scales_by_the_surface_modulus_times_z(self):
-        """sigma ~ E z /(1-nu^2) at fixed curvature, and the curvature does not
-        change with copper. So the ratio of the two reported stresses must be
-        (E_CU z_cu /(1-nu_cu^2)) / (E z /(1-nu^2)) - a number computed here
-        from the material tables, not from the module's answer."""
+        """sigma = -Q(z) z (k + nu k') at the peak, and BOTH the modulus and the
+        nu in that bracket belong to the layer at the surface. The curvature is
+        the same with and without copper at equal amplitude, so the ratio of the
+        two reported peaks must be
+
+            (E_CU z_cu /(1-nu_cu^2)) / (E_lam z_lam /(1-nu_lam^2))
+            times (k_y + nu_cu k_x) / (k_y + nu_lam k_x)
+
+        - built here from the material tables and the curvatures the tool
+        reports, never from the tool's stress.
+
+        Registered correction (0.0.57): 0.0.56 used copper's E beside the
+        LAMINATE's nu, so this ratio collapsed to the bare material factor
+        5.2874. The honest value on this plate is 5.8741; a revert fails here.
+        """
         lam = _plate(stress_amplitude_mm=0.01)["modes"][0]["stress"]
         cop = _plate(copper_um=35.0, stress_amplitude_mm=0.01)["modes"][0]["stress"]
+        kx, ky = cop["curvature_per_m"]
+        kx0, ky0 = lam["curvature_per_m"]
+        # copper at equal amplitude does not move the curvature of this mode
+        self.assertAlmostEqual(kx / kx0, 1.0, places=9)
+        self.assertAlmostEqual(ky / ky0, 1.0, places=9)
         e_lam, nu_lam, z_lam = 24e9, 0.15, 0.8e-3
         factor = ((V.E_CU * 0.835e-3 / (1.0 - V.NU_CU ** 2))
                   / (e_lam * z_lam / (1.0 - nu_lam ** 2)))
+        mix = (ky + V.NU_CU * kx) / (ky + nu_lam * kx)
         self.assertAlmostEqual(cop["sigma_max_mpa"] / lam["sigma_max_mpa"],
-                               factor, delta=factor * 2e-3)
-        # von Mises is NOT scaled: it mixes sigma with tau, and tau / sigma is
-        # (1+nu)/(1-nu) at a fixed point, so a different nu moves the mix. If
-        # it did scale cleanly this would be a hidden factor-2 somewhere.
+                               factor * mix, delta=factor * mix * 2e-3)
+        # and the nu in the bracket is not a no-op on this plate: the old
+        # mixed-nu recipe is >5 % away, so the assertion above has teeth
+        self.assertGreater(abs(mix - 1.0), 0.05)
+        self.assertNotAlmostEqual(cop["sigma_max_mpa"] / lam["sigma_max_mpa"],
+                                  factor, delta=factor * 0.05)
+        # von Mises is NOT scaled by that ratio: it mixes sigma with tau, and
+        # tau / sigma depends on nu as well, so a different nu moves the mix.
         self.assertNotAlmostEqual(cop["von_mises_mpa"] / lam["von_mises_mpa"],
                                   factor, delta=factor * 0.05)
 
@@ -587,14 +608,24 @@ class TestThroughTheToolSurface(unittest.TestCase):
         from pcb_agent_mcp import tools
         self.assertEqual(len(tools.TOOLS), 164)
 
-    def test_capabilities_stops_claiming_copper_is_unmodelled(self):
+    def test_capabilities_states_the_boundaries_0_0_57_moved(self):
+        """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only
+        skins and one point mass; 0.0.57 models different faces and distributed
+        patches, so those two items have to name the NEW boundary (flat-state
+        linearisation for an unsymmetric stack, stiffness still absent) instead of
+        claiming the capability is missing."""
         from pcb_agent_mcp import tools
         c = tools.call_tool("calc_capabilities", {})
         blob = " ".join(c["not_implemented_yet"])
         self.assertNotIn("no component mass or copper stiffening", blob)
-        self.assertIn("SYMMETRIC copper skins are modelled", blob)
-        self.assertIn("ASYMMETRIC stack", blob)
-        self.assertIn("distributed component mass", blob)
+        # the old blanket denials are gone because they are now false
+        self.assertNotIn("SYMMETRIC copper skins are modelled", blob)
+        self.assertNotIn("distributed component mass, component stiffness", blob)
+        # ...and what replaced them names the real remaining limit
+        self.assertIn("DIFFERENT thicknesses on the two faces ARE", blob)
+        self.assertIn("FLAT-STATE", blob)
+        self.assertIn("REDUCED stiffness", blob)
+        self.assertIn("Component STIFFNESS is not modelled", blob)
 
 
 if __name__ == "__main__":
