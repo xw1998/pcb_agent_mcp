@@ -3306,6 +3306,96 @@ def selftest():
           and not any("IGNORED" in w for w in (_unk_ok.get("warnings") or [])),
           str((_unk.get("warnings") or [])[:1]))
 
+    # --- 0.0.55: a core table that is data, and every missing number named ---
+    # (a) the turns satisfy BOTH relations, recomputed here from the table's rows,
+    #     and the peak is judged on Amin where the vendor publishes one;
+    # (b) a material's published Bsat is only used at the temperature it was
+    #     published at - 3C90 at 100 C must come back UNJUDGED, not interpolated;
+    # (c) a measured loss point is a point: the same part at another frequency is
+    #     "unknown", not the same watts;
+    # (d) 1000x the inductance is 1000x the flux turns - the guard against an H/mH
+    #     slip being invisible.
+    def _sel(**kw):
+        rr = handle({"jsonrpc": "2.0", "id": 1600, "method": "tools/call",
+                     "params": {"name": "magnetics_select_core", "arguments": kw}})
+        return json.loads(rr["result"]["content"][0]["text"])
+
+    _sc = _sel(inductance_h=100e-6, i_peak_a=3.0, b_max_t=0.3, limit=3)
+    _sc_rows = (_sc.get("value") or {}).get("candidates") or []
+    _sc_ok = bool(_sc_rows)
+    for _row in _sc_rows:
+        _area = (_row.get("flux_area_mm2") or _row["ae_mm2"]) * 1e-6
+        if abs(100e-6 * 3.0 / (_row["turns"] * _area) - _row["b_peak_t"]) > 1e-6:
+            _sc_ok = False
+        if _row["b_peak_t"] > 0.3 * (1 + 1e-12):
+            _sc_ok = False
+    _sc_sorted = [r["ve_mm3"] for r in _sc_rows] == sorted(r["ve_mm3"] for r in _sc_rows)
+    check("select_core returns cores whose reported peak flux IS L*Ipk/(N*A) "
+          "recomputed from the vendor rows, never above the limit, smallest "
+          "effective volume first",
+          _sc.get("status") == "ok" and _sc_ok and _sc_sorted,
+          "%d rows, sorted %s" % (len(_sc_rows), _sc_sorted))
+
+    _cold = _sel(inductance_h=100e-6, i_peak_a=3.0, material="3C90",
+                 temperature_c=25)
+    _hot = _sel(inductance_h=100e-6, i_peak_a=3.0, material="3C90",
+                temperature_c=100)
+    check("a material's Bsat is used only at the temperature it was published at: "
+          "3C90 at 25 C is judged, at 100 C every part comes back "
+          "saturation_unknown with the reason spelled out - no interpolation",
+          _cold.get("status") == "ok"
+          and (_cold.get("value") or {}).get("feasible_count", 0) > 0
+          and _hot.get("status") == "ok"
+          and (_hot.get("value") or {}).get("feasible_count") == 0
+          and (_hot.get("unjudged") or [{}])[0].get("reason") == "saturation_unknown",
+          "cold %s / hot %s: %s" % (
+              (_cold.get("value") or {}).get("feasible_count"),
+              (_hot.get("value") or {}).get("feasible_count"),
+              ((_hot.get("unjudged") or [{}])[0].get("because") or "")[:48]))
+
+    _at_ref = _sel(inductance_h=200e-6, i_peak_a=2.0, material="3C90",
+                   temperature_c=25, freq_hz=25e3, b_ac_t=0.2, shape="U 20/16/7")
+    _off_ref = _sel(inductance_h=200e-6, i_peak_a=2.0, material="3C90",
+                    temperature_c=25, freq_hz=100e3, b_ac_t=0.2, shape="U 20/16/7")
+    _ref_row = ((_at_ref.get("value") or {}).get("candidates") or [{}])[0]
+    _off_row = ((_off_ref.get("value") or {}).get("candidates") or [{}])[0]
+    check("a vendor's measured loss point is reproduced at its own condition "
+          "(1.9 W at 200 mT / 25 kHz) and the SAME part at 100 kHz is 'unknown, "
+          "give me loss_exponents' - the condition is data, not decoration",
+          _ref_row.get("core_loss_w") == 1.9
+          and _off_row.get("core_loss_w") is None
+          and "loss_exponents" in (_off_row.get("core_loss_basis") or ""),
+          "%s W at 25 kHz / %s at 100 kHz" % (_ref_row.get("core_loss_w"),
+                                              _off_row.get("core_loss_w")))
+
+    _small = _sel(inductance_h=100e-6, i_peak_a=3.0, b_max_t=0.3,
+                  material="N87", shape="PQ 20/16")
+    _big = _sel(inductance_h=100e-3, i_peak_a=3.0, b_max_t=0.3,
+                material="N87", shape="PQ 20/16")
+    _n_small = (((_small.get("value") or {}).get("candidates") or [{}])[0]
+                .get("turns")) or 0
+    _n_big = (((_big.get("value") or {}).get("candidates") or [{}])[0]
+              .get("turns")) or 0
+    _browse = json.loads(handle({
+        "jsonrpc": "2.0", "id": 1601, "method": "tools/call",
+        "params": {"name": "magnetics_data",
+                   "arguments": {"kind": "cores", "name": "B66325G0000X187"}}}
+    )["result"]["content"][0]["text"])
+    _browse_row = ((_browse.get("value") or {}).get("rows") or [{}])[0]
+    _nope = _sel(inductance_h=100e-6, i_peak_a=1.0, material="unicorn")
+    check("1000x the inductance is ~1000x the flux turns (an H-vs-mH slip cannot "
+          "hide), the browse tool returns the same vendor row select_core used, "
+          "and an unknown material is NOT_FOUND with the list of real ones",
+          _n_small > 0 and 950 < _n_big / _n_small < 1050
+          and _browse_row.get("ae_mm2") == 178.0
+          and _browse_row.get("aw_mm2") == 178.0
+          and _nope.get("reason_code") == "NOT_FOUND"
+          and "materials_in_table" in _nope,
+          "%s -> %s turns, Ae %s, N87? %s" % (_n_small, _n_big,
+                                              _browse_row.get("ae_mm2"),
+                                              "N87" in str(_nope.get(
+                                                  "materials_in_table"))))
+
     # --- repeating pulse trains: three readings, no field solver ---
     # (a) with the cooling deleted the model must BE Onderdonk, not nearly it. The
     #     two routes share no constant: ours is rho20/rho_m/c_p, its is the 33.

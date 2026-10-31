@@ -3469,8 +3469,17 @@ def _capabilities(_args):
                          "is really in CCM) and Steinmetz core loss with the caller's "
                          "k/alpha/beta and a NAMED unit convention. The ripple ratio is "
                          "the caller's design choice; saturation is graded only when a "
-                         "part Isat is supplied; no core selection and no material "
-                         "table lives here",
+                         "part Isat is supplied. Since 0.0.55 there IS a core table: "
+                         "select_core picks from real vendor cores "
+                         "(data/magnetic_materials.json, every row with its source "
+                         "URL) by turns-from-AL AND turns-from-flux, judges the peak "
+                         "against the material's published Bsat only at 25/100 C, "
+                         "estimates the gap from series reluctance, uses the "
+                         "vendor's one measured loss point as-is and refuses to move "
+                         "it without your exponents, and names every rejection. Still "
+                         "absent: any temperature rise (no published Rth), the "
+                         "DC-bias roll-off of AL, gap fringing, and Steinmetz "
+                         "coefficients - those are yours to supply",
             "stackup": "laminate shortlist (er, tan_delta, practical band, cost) and a "
                        "4 / 6 layer stack whose signal layers each get their own "
                        "solved trace width from the same microstrip model the feedline "
@@ -6552,9 +6561,10 @@ _tool(
     "CCM ends, and the winding's I^2R loss if you supply dcr_ohm. Ripple ratio r is a "
     "DESIGN CHOICE (0.2-0.4 typical) - it is not derived. Saturation is graded only if "
     "you supply the part's Isat; without it the answer says what is missing instead of "
-    "guessing. No core selection and no core loss here (magnetics_core_loss takes your "
-    "own Steinmetz triple); a load BELOW the CCM boundary is a different problem - use "
-    "magnetics_dcm, where the duty is not 1-Vin/Vout.",
+    "guessing. Core loss here needs your own Steinmetz triple (magnetics_core_loss); "
+    "to pick an actual core, magnetics_select_core ranks the real parts in "
+    "data/magnetic_materials.json; a load BELOW the CCM boundary is a different "
+    "problem - use magnetics_dcm, where the duty is not 1-Vin/Vout.",
     {"type": "object", "properties": {
         "topology": _str("converter topology", list(_magnetics.TOPOLOGIES)),
         "vin_v": _num("input voltage"),
@@ -6668,6 +6678,94 @@ _tool(
         dc_resistance_ohm=a.get("dc_resistance_ohm"),
         temperature_c=a.get("temperature_c"),
         resistivity_ohm_m=a.get("resistivity_ohm_m")),
+)
+
+_tool(
+    "magnetics_select_core",
+    "Pick a REAL core for an (L, Ipk) requirement from data/magnetic_materials.json "
+    "(vendor-published Ae / le / Ve / AL / Amin / mass / Bsat / one measured loss "
+    "point per part, every row carrying its source URL). Turns come from the "
+    "inductance (L = AL*N^2) AND from the flux limit (B = L*Ipk/(N*Ae)), whichever "
+    "is larger; the gap is then whatever series reluctance the difference implies. "
+    "The flux limit is your b_max_t, or bsat_derate x the material's published Bsat "
+    "at temperature_c - and only at 25 C or 100 C, the two temperatures vendors "
+    "print. Core loss is the vendor's own measured point when you ask for exactly "
+    "its condition; away from it, the scaling needs loss_exponents=(x, y) from the "
+    "material's fit, which this server does not invent. Rejections are named "
+    "(saturates / window_overflow / saturation_unknown / no_geometry / filter). NOT "
+    "modelled: temperature rise (no part has a published Rth), the DC-bias roll-off "
+    "of AL, gap fringing, winding AC resistance, AL tolerance.",
+    {"type": "object", "properties": {
+        "inductance_h": _num("the inductance you need, in HENRY (100 uH = 1e-4)"),
+        "i_peak_a": _num("peak winding current, which sets the flux"),
+        "i_rms_a": _num("RMS current, for the copper loss (with "
+                        "current_density_a_mm2)"),
+        "freq_hz": _num("frequency, for the core loss"),
+        "b_ac_t": _num("AC flux amplitude (half the peak-to-peak swing) for the core "
+                       "loss - not the same number as the peak flux density"),
+        "b_max_t": _num("your own flux limit; overrides the material's Bsat path"),
+        "material": _str("only cores of this material (e.g. N87, 3C90)"),
+        "shape": _str("only cores whose shape contains this text (e.g. E42, PQ)"),
+        "temperature_c": _num("operating temperature: 25 or 100, the temperatures "
+                              "vendors publish Bsat at", 100.0),
+        "bsat_derate": _num("fraction of Bsat the peak is allowed to use - a design "
+                            "margin, not a material law", 0.8),
+        "loss_exponents": {"type": "array", "items": {"type": "number"},
+                           "description": "the material fit's (x, y) frequency and "
+                                          "flux exponents, to move a measured loss "
+                                          "point to another operating point"},
+        "current_density_a_mm2": _num("winding current density, for wire area and "
+                                      "copper loss"),
+        "fill_factor": _num("copper fill factor of the winding window (with a "
+                            "former's winding area, this is the window check)"),
+        "limit": _num("how many feasible cores to list (smallest Ve first)"),
+        "require_window_fit": _bool("drop cores whose winding window could not be "
+                                    "checked, instead of listing them"),
+        "data_path": _str("override the table path (testing)"),
+    }, "required": ["inductance_h", "i_peak_a"]},
+    lambda a: _magnetics.select_core(
+        a.get("inductance_h"), a.get("i_peak_a"),
+        i_rms_a=a.get("i_rms_a"),
+        freq_hz=a.get("freq_hz"),
+        b_ac_t=a.get("b_ac_t"),
+        b_max_t=a.get("b_max_t"),
+        material=a.get("material"),
+        shape=a.get("shape"),
+        temperature_c=(a["temperature_c"] if a.get("temperature_c") is not None
+                       else 100.0),
+        bsat_derate=(a["bsat_derate"] if a.get("bsat_derate") is not None else 0.8),
+        loss_exponents=a.get("loss_exponents"),
+        current_density_a_mm2=a.get("current_density_a_mm2"),
+        fill_factor=a.get("fill_factor"),
+        limit=a.get("limit"),
+        require_window_fit=a.get("require_window_fit"),
+        data_path=a.get("data_path")),
+)
+
+_tool(
+    "magnetics_data",
+    "Read back the magnetic table: the materials (mu_i, Bsat at the temperatures the "
+    "vendor published, Tc, density, resistivity, the vendor's loss density) and the "
+    "cores (Ae / le / Ve / AL / Amin / mass / coil-former winding area and mean turn "
+    "length / one measured loss point with its condition). Nothing is computed here - "
+    "this is the transcription with the source URL of every row, so a number can be "
+    "checked instead of trusted. Absent values come back as null with a note saying "
+    "why, and no Steinmetz triple is stored anywhere in the table.",
+    {"type": "object", "properties": {
+        "kind": _str("which table", ["materials", "cores", "all"], "materials"),
+        "name": _str("exact material name or part number"),
+        "material": _str("only cores of this material"),
+        "shape": _str("only shapes containing this text"),
+        "vendor": _str("only rows whose vendor contains this text"),
+        "data_path": _str("override the table path (testing)"),
+    }, "required": []},
+    lambda a: _magnetics.magnetic_data(
+        kind=(a.get("kind") or "materials"),
+        name=a.get("name"),
+        material=a.get("material"),
+        shape=a.get("shape"),
+        vendor=a.get("vendor"),
+        data_path=a.get("data_path")),
 )
 
 _tool(

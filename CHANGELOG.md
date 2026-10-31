@@ -9,6 +9,128 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.55] - 2026-10-31
+
+`magnetics_inductor` 的自述原话是 `no core selection and no material table lives here`。
+这句话诚实，但它背后的缺口不小：**没有表就答不了"哪个买得到的磁芯装得下这个电感、要几匝、
+要不要开气隙、会不会饱和、窗口塞不塞得进"**。这一版补上——补法不是"算一个最佳答案"，
+而是**先要一张带来源的厂商表**，再对每个候选部件逐条点名它为什么行、为什么不行。
+
+一句话结论：**表里每个数都能点开来源；每个取不到的数都是 `null` 并写明缺什么；饱和只在
+厂商公布过的温度上判、中间温度不插值；损耗是一个实测点，不是一条曲线。**
+
+### 新增
+
+| 项 | 内容 |
+| --- | --- |
+| `data/magnetic_materials.json` | **新增**，12 种材料 / 16 个磁芯，`verified: true`、`retrieved: 2026-10-31`，**每行带 `source` URL** |
+| `magnetics_select_core` | 选型：两条匝数约束取大、峰值磁密、气隙（串联磁阻差）、厂商实测损耗点（或按调用方给的指数外推）、绕组 DC 与窗口；`verdict` 或**具名**出局原因 |
+| `magnetics_data` | 把表读回来（`kind=materials\|cores\|all` + 材料/形状/厂商/名称过滤）。**不算任何东西**，是带出处的转录 |
+| 工具数 | **162 → 164** |
+
+### 表里有什么、没有什么
+
+材料：`mu_i`、`bsat_mt_25c` / `bsat_mt_100c`（**只填厂商明写的那个温度**）、`tc_min_c`、
+`density_kg_m3`、`resistivity_ohm_m`、损耗密度参考点 `pv_ref = (kW/m³, B, f, T)`。
+磁芯：`ae_mm2` / `le_mm` / `ve_mm3` / `al_nh` / `gap_um` / `amin_mm2` / `core_factor_mm1` /
+`mass_g` / `loss_ref`（一个实测点 + 工况）/ E 42/21/15 的骨架 `aw_mm2 = 178`、`mlt_mm = 93`。
+
+**没有的，四句话写在表头 `what_this_is_not`：**
+
+1. **不是 Steinmetz 拟合。** TDK / Ferroxcube 的 `Cm/x/y` 在材料 PDF 里，2026-10-31 用
+   `web` 抓 `product.tdk.com` / `ferroxcube.com` 全失败（JS 渲染）⇒ 16 行 `steinmetz` **全是
+   `null`**；`select_core` 只在**调用方自己给两个指数**时才把实测点外推。
+2. **不是热模型。** 一个 `Rth` 都没找到 ⇒ 只报瓦，不报温升（`delta_t_k` 在任何返回里都不存在）。
+3. **不是 B-H 曲线。** `bsat` 是一个点（好一点是两个温度的两个点）；点之间的形状、AL 的直流
+   偏置跌落、AL 的温度系数全都没有。
+4. **不是全型号。** 16 个磁芯是"厂商页面写全了几何的磁芯"，不是"能买到的磁芯"。
+
+最能说明纪律的一格是 **N27 的损耗密度**：页面给了 `920 kW/m³`，但可达的那段没写 (B, f, T)。
+于是它被存成 `pv_quoted_unconditioned_kw_m3`（**引文**），`pv_ref` 是 `null`——同样的
+920 kW/m³ 在 200 mT/100 kHz 与 100 mT/300 kHz 下对应完全不同的材料，**没有工况的损耗密度
+不是一个可以拿来算的数**，`schema` 里也没给它参与计算的路。
+
+### 选型的三条式子
+
+    N   = max(ceil(sqrt(L/AL)), ceil(L·Ipk/(B_lim·Amin)), 1)
+    g   = µ0·A·N²/L − le/µi            （串联磁阻差，无边缘修正）
+    Awire = Irms/J,  R_dc = ρ(T)·N·MLT/Awire,  P_cu = Irms²R_dc
+
+`A` 用 **`Amin`**（厂商给了就用）——中心柱比外腿窄的磁芯里通量峰在窄柱上。两条匝数下界
+**都报出来**：ELP 18/4/10（N87）在 100 µH / 3 A / 0.3 T 下 `turns_from_al = 6.201737`、
+`turns_from_flux = 25.445293` ⇒ **26 匝**、`b_peak = 0.2936 T`（AL 只要求 7 匝，7 匝会把峰值
+推到 1.09 T）。这也解释了一个反直觉的数：**同一件 PQ 20/16（N87）100 µH → 16 匝，
+100 mH → 15823 匝**（989.4 倍，不是 √1000 = 31.6 倍）——小电感时 `N_al` 赢（∝√L），
+大电感时 `N_b` 赢（∝L）。
+
+### 饱和只在公布过的温度上判
+
+`b_limit_t` 优先级：调用方给的 `b_max_t` > `bsat_derate × Bsat(material, T)`（默认
+`bsat_derate = 0.80`，是设计余量不是材料参数）。`temperature_c` 只认表里有 Bsat 的温度
+（现在 **25 / 100 ℃**），中间温度**不插值**：
+
+| 调用 | 结果 |
+| --- | --- |
+| 3C90 @ 25 ℃ | **6 个可行** |
+| 3C90 @ 100 ℃ | **0 个可行 + 6 个 `unjudged`**（`reason = "saturation_unknown"`，`because = "3C90 has no published Bsat at 100 C in this table"`），`status` 仍是 `ok` |
+
+第一版是"材料缺 Bsat 就整次调用返回错误"——那样一个只有 25 ℃ 数据的材料会把整个问题打死，
+哪怕问题本身可答。现在的形态是**能判的照判、判不了的按名挂起**（`unjudged` 在顶层）。
+
+### 损耗是"一个点"
+
+四级路径：Steinmetz（表里恒 `null`，路径保留）→ 厂商实测点且**工况逐项相等**（相对容差
+1e-6）⇒ 原样复现 → 要调用方给 `loss_exponents=(x, y)` 才按
+`P_ref·(f/f_ref)^x·(B/B_ref)^y` 外推 → 再否则 `core_loss_w = null` + "未知不是零"。
+
+U20/16/7-3C90（实测点 `1.9 W @ 200 mT / 25 kHz / 100 ℃`）：
+
+| 调用 | `core_loss_w` |
+| --- | --- |
+| `freq_hz=25000, b_ac_t=0.2` | **1.9**（"the vendor's own measured point"） |
+| `freq_hz=100000, b_ac_t=0.2` | **`null`**（工况不对，要指数） |
+| 同上 + `loss_exponents=[1.6, 2.5]` | **17.460215** |
+
+`b_ac_t` 的语义写死在参数说明里：**交流磁密幅值**（峰峰的一半），不是峰峰值。
+
+### 绕组与窗口：只在该部件真有骨架数据时判
+
+E 42/21/15（N87，2 A rms / 5 A·mm⁻² / k_u = 0.4）：`wire_area_mm2` 0.4、`copper_area_mm2` 2.4、
+`r_dc_ohm` 0.031611、`p_copper_w` 0.126444、窗口需求 6.0 / 178 mm² ⇒ `window_fits = true`。
+其余部件 `window_fits = null` 并进 `window_image`（"能选但没验窗口"比"假装验过"诚实）；
+`require_window_fit = true` 时它们以 `window_unchecked` 出局。绕组只算 **DC**（趋肤/邻近在
+`magnetics_winding_ac`，两个工具不互相冒充）。
+
+### 拒答一律带名字
+
+`rejected[].reason` 是封闭集：`saturates` / `saturation_unknown` / `window_overflow` /
+`window_unchecked` / `no_geometry` / `material_filter` / `shape_filter`。材料名或形状认不出 ⇒
+`NOT_FOUND` + `materials_in_table` / `shapes_in_table`。`feasible` 按 `ve_mm3` 升序，
+`limit` **只截列表不改计数**。`not_modelled` 固定输出：无 Rth ⇒ 无温升、DC 偏置 AL 跌落、
+气隙边缘场、绕组 AC、AL 容差、任何 Steinmetz 拟合都不算。
+
+### 测试与自检
+
+- `tests/test_magnetic_select.py`：**新增 36 例，全 PASS**。每条判据配一条**能翻脸**的负控制，
+  其中两条最值钱：`test_no_steinmetz_triple_is_invented`（将来谁真填了三元组，这条会主动失败，
+  提醒重定外推路径）、`test_a_thousandfold_inductance_is_a_thousandfold_flux_turns`（单位滑档
+  ——mH 当 H 写——会让比值从 ~1000 掉到 ~31.6，落在断言外）。
+- `server.py`：4 条 selftest（本块用 JSON-RPC id `1600`/`1601` 的局部 helper，不走全局编号）⇒ `--selftest` **193/193 → 197/197**。
+- 全量回归：**2477 例 / OK (skipped=5) / 2031.147 s**（`2441` + 36 例；同一台机器上另有 5 个 CPU
+  满载的外部进程，所以这个秒数只跟同负载的另一次实测比）。既有用例里有一条**故意**要跟着动：
+  `test_vibration_mass_copper` 的工具数闸门 `162` → `164`——那条测试的存在意义就是"工具数不能悄悄长"，
+  所以新工具加进来必须显式抬这一格，否则它会失败（本轮它确实先失败了一次，抬完再跑干净）。
+
+### 不变
+
+既有磁件工具的可执行代码**一行未改**：`git diff` 在 `calc/magnetics.py` 里只删了 3 行 docstring
+（"no core selection and no saturation curve from a real material" 那段改成 `select_core` 的
+边界说明），在 `tools.py` 里只删了 5 行工具描述文字。`magnetics_inductor` / `magnetics_core_loss` /
+`magnetics_dcm` / `magnetics_winding_ac` 的答案与 `0.0.54` **逐位相同**，新参数全部有默认值，
+旧函数签名未动，`TOOLS` 里既有工具名一个未变。
+
+文档：[`docs/58-磁芯选型与厂商材料表.md`](docs/58-磁芯选型与厂商材料表.md)。
+
 ## [0.0.54] - 2026-10-31
 
 `calc_capabilities.not_implemented_yet` 第 14 条原先写着「rejects F H J K S W A cards with the

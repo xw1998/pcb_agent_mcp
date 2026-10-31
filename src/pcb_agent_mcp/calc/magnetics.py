@@ -15,9 +15,10 @@ derivation in the same form):
 
 What this module still does NOT do:
 
-  * no core selection and no saturation curve from a real material - it reports
-    the peak/valley/RMS the winding must survive and, only if you supply a
-    saturation current, whether that part is enough;
+  * saturation is judged against a REAL vendor material only in select_core,
+    and only at the temperatures that material actually publishes (25 C / 100 C);
+    inductor_ccm still just reports the peak/valley/RMS the winding must survive
+    and, only if you supply a saturation current, whether that part is enough;
   * no CONTROL loop, no soft-start, no slope compensation, no stability;
   * efficiency is one number, not a curve, and is assumed constant.
 
@@ -36,9 +37,18 @@ What it does, in four entry points:
   winding_ac_resistance
                     Dowell's 1-D F_R = R_ac/R_dc for a layer stack (foil or round
                     wire), so the DC resistance an ohmmeter reads can be turned
-                    into the resistance the switching frequency sees.
+                    into the resistance the switching frequency sees;
+  select_core       pick a real core from data/magnetic_materials.json for an
+                    (L, Ipk) requirement: turns from AL, turns from the flux
+                    limit, the peak flux density, the gap it would need, the
+                    core loss at the one measured reference point (extrapolated
+                    only if YOU give the exponents) and the winding window - and
+                    a named reason for every part that is rejected;
+  magnetic_data     read that table back, with the URL behind every row.
 """
+import json
 import math
+import os
 
 from .result import ok, err
 
@@ -897,3 +907,543 @@ def winding_ac_resistance(freq_hz, layers, shape="foil", thickness_mm=None,
                         else "20 C copper unless resistivity_ohm_m was given",
          "gap_field": "not modelled",
          "litz": "not modelled"})
+
+# --------------------------------------------------------------------------
+# core selection against the vendor table
+#
+# data/magnetic_materials.json holds published material constants and effective
+# core parameters, every row carrying the URL it was transcribed from. It is
+# data, not a fit: where a vendor number was unreachable the field is null and
+# every answer below says WHICH field is missing rather than filling it in.
+# --------------------------------------------------------------------------
+
+DATA_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))),
+    "data", "magnetic_materials.json",
+)
+
+# The two temperatures the vendor tables actually publish a Bsat at. A value in
+# between is not interpolated: the curve between them is not linear and nothing
+# in this table measures it.
+BSAT_TEMPERATURES = (25.0, 100.0)
+
+# A design choice, not a material property: how much of the published Bsat an
+# inductor is allowed to use at its peak current. 0.8 is a common margin; the
+# caller can move it, and b_max_t overrides the whole material path.
+BSAT_DERATE_TYPICAL = 0.80
+
+# How far below the part's own AL the required AL has to be before this build says
+# "gap it" rather than "use it as-is". A DESIGN tolerance, not a material law: AL is
+# quoted +/-25% on many of these parts, so a shortfall inside 10% is inside the
+# spread you already accept.
+GAP_NEEDED_BELOW = 0.90
+
+
+def _load_magnetic_data(path=None):
+    p = path or DATA_PATH
+    if not os.path.exists(p):
+        return None, "core/material table missing: " + p
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        return None, "core/material table unreadable: %s" % exc
+    if not data.get("verified"):
+        return None, ("core/material table present but not marked verified; rows "
+                      "would have to be trusted unexamined")
+    if not data.get("cores"):
+        return None, "core/material table has no cores"
+    return data, None
+
+
+def _norm_key(text):
+    return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+
+def _bsat_at(material, temperature_c):
+    """(bsat_mt, None) or (None, why-not)."""
+    if not material:
+        return None, "material not in the table"
+    if abs(temperature_c - 25.0) < 1e-9:
+        v = material.get("bsat_mt_25c")
+    elif abs(temperature_c - 100.0) < 1e-9:
+        v = material.get("bsat_mt_100c")
+    else:
+        return None, ("%s publishes no Bsat at %g C (only %s C); a value between "
+                      "two published points is not interpolated because the curve "
+                      "between them is not linear"
+                      % (material.get("name"), temperature_c,
+                         " / ".join("%g" % t for t in BSAT_TEMPERATURES)))
+    if v is None:
+        return None, ("%s has no published Bsat at %g C in this table"
+                      % (material.get("name"), temperature_c))
+    return float(v), None
+
+
+def magnetic_data(kind="materials", name=None, material=None, shape=None,
+                  vendor=None, data_path=None):
+    """Read back the vendor table: materials, cores, or both.
+
+    Nothing here is computed - it is the transcription, with the source URL, so a
+    user can check a number instead of trusting it.
+    """
+    data, why = _load_magnetic_data(data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="fill data/magnetic_materials.json with verified rows")
+    k = str(kind or "materials").strip().lower()
+    if k in ("materials", "material"):
+        rows = data.get("materials") or []
+    elif k in ("cores", "core"):
+        rows = data.get("cores") or []
+    elif k in ("all", "both", "everything"):
+        rows = list(data.get("materials") or []) + list(data.get("cores") or [])
+    else:
+        return err("kind must be materials, cores or all", "ARG_INVALID")
+
+    def keep(row):
+        if name is not None:
+            key = _norm_key(name)
+            if key not in (_norm_key(row.get("name")), _norm_key(row.get("part"))):
+                return False
+        if material is not None:
+            if _norm_key(material) != _norm_key(row.get("material", row.get("name"))):
+                return False
+        if shape is not None:
+            if _norm_key(shape) not in _norm_key(row.get("shape")):
+                return False
+        if vendor is not None:
+            if _norm_key(vendor) not in _norm_key(row.get("vendor")):
+                return False
+        return True
+
+    rows = [r for r in rows if keep(r)]
+    if not rows:
+        return err("no row matches those filters", "NOT_FOUND",
+                   hint="magnetic_data with no filters lists everything in the table",
+                   extra={"kind": k})
+    return ok(
+        {"kind": k, "count": len(rows), "rows": rows,
+         "table_retrieved": data.get("retrieved"),
+         "table_caveats": data.get("what_this_is_not")},
+        "vendor rows",
+        "data/magnetic_materials.json (as published by the vendor, not re-fitted here)",
+        "every row carries `source`: the URL it was transcribed from",
+        "as published - the vendor's own typical values at the condition stated",
+        {"fits": "none performed: no Steinmetz triple is stored anywhere in the table",
+         "thermal": "no Rth for any part, so no temperature rise is offered"},
+        {"table_path": data_path or DATA_PATH})
+
+
+def _core_loss_for(core, material, freq_hz, b_ac_t, exponents):
+    """Core loss in watts, or (None, why-not)."""
+    ref = core.get("loss_ref")
+    if freq_hz is None or b_ac_t is None:
+        return None, ("core loss needs the AC excitation: pass freq_hz and b_ac_t "
+                      "(the AC flux amplitude, i.e. half the peak-to-peak swing)")
+    if b_ac_t <= 0:
+        return None, "b_ac_t must be > 0: a DC-only core has no core loss"
+    # (1) the material's own Steinmetz fit, if the table ever gets one
+    st = (material or {}).get("steinmetz")
+    if st and core.get("ve_mm3"):
+        pv = (float(st["k"]) * freq_hz ** float(st["alpha"])
+              * b_ac_t ** float(st["beta"]))
+        return pv * core["ve_mm3"] * 1e-9, "material Steinmetz fit, P_v * Ve"
+    # (2) the part's own measured reference point, scaled only with exponents
+    #     the caller supplied - the exponents are NOT invented here
+    if not ref:
+        return None, ("this part has no measured loss point in the table and its "
+                      "material has no Steinmetz fit, so the loss at this "
+                      "operating point is unknown (not zero)")
+    f_ref = float(ref["f_khz"]) * 1e3
+    b_ref = float(ref["b_mt"]) * 1e-3
+    same = (abs(freq_hz - f_ref) <= 1e-6 * f_ref
+            and abs(b_ac_t - b_ref) <= 1e-6 * b_ref)
+    if same:
+        return float(ref["p_w"]), ("the vendor's own measured point: %g W/set at "
+                                   "%g mT / %g kHz / %g C"
+                                   % (ref["p_w"], ref["b_mt"], ref["f_khz"],
+                                      ref["temp_c"]))
+    if not exponents:
+        return None, ("the operating point is not the measured one (%g mT / %g kHz "
+                      "/ %g C); scaling a single point away from its condition needs "
+                      "loss_exponents=(x, y) from the material's fit"
+                      % (ref["b_mt"], ref["f_khz"], ref["temp_c"]))
+    x, y = exponents
+    p = float(ref["p_w"]) * (freq_hz / f_ref) ** x * (b_ac_t / b_ref) ** y
+    return p, ("scaled from %g W/set at %g mT / %g kHz with the caller's "
+               "exponents x=%g y=%g" % (ref["p_w"], ref["b_mt"], ref["f_khz"], x, y))
+
+
+def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
+                b_max_t=None, material=None, shape=None, temperature_c=100.0,
+                bsat_derate=BSAT_DERATE_TYPICAL, loss_exponents=None,
+                current_density_a_mm2=None, fill_factor=None, limit=None,
+                require_window_fit=False, data_path=None):
+    """Choose a real core for an (L, Ipk) requirement, or say why none fits.
+
+    The two constraints that decide the turns:
+
+        L  = AL * N^2                  -> N_al   = sqrt(L / AL)
+        B  = L * Ipk / (N * Ae)        -> N_b    = L * Ipk / (B_limit * Ae)
+
+    N = max(ceil(N_al), ceil(N_b), 1). Current goes beyond B_limit if N_b > N_al,
+    so that part needs a gap or more turns; a part whose AL is already small
+    enough needs no gap.
+
+    `B_limit` is the caller's `b_max_t` when given, otherwise
+    `bsat_derate * Bsat(material, temperature_c)` - and Bsat is only used at the
+    temperatures the material publishes (25 C / 100 C). The derate is a DESIGN
+    MARGIN, not a material property.
+
+    What is refused rather than guessed: saturation at a temperature the material
+    does not publish; a gap length when the material's mu_i is unknown; core loss
+    away from a measured point without caller-supplied exponents; copper loss or
+    a winding-window verdict when the table has neither a former's winding area
+    nor a mean turn length for that core; and any temperature rise at all, because
+    no part in the table has a published thermal resistance.
+    """
+    data, why = _load_magnetic_data(data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="fill data/magnetic_materials.json with verified rows")
+    try:
+        L = _f("inductance_h", inductance_h)
+        ipk = _f("i_peak_a", i_peak_a)
+        temp = _f("temperature_c", temperature_c)
+        derate = _f("bsat_derate", bsat_derate)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    if L <= 0:
+        return err("inductance_h must be > 0", "ARG_RANGE")
+    if ipk <= 0:
+        return err("i_peak_a must be > 0", "ARG_RANGE",
+                   hint="the peak current is what sets the flux; a zero-current "
+                        "inductor needs no core")
+    if not (0 < derate <= 1):
+        return err("bsat_derate must be in (0, 1]", "ARG_RANGE",
+                   hint="it multiplies the material's Bsat; > 1 would allow the "
+                        "core to saturate by construction")
+    if b_max_t is not None:
+        try:
+            b_lim = _f("b_max_t", b_max_t)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if b_lim <= 0:
+            return err("b_max_t must be > 0", "ARG_RANGE")
+        b_lim_basis = "given by the caller"
+    else:
+        b_lim = None
+        b_lim_basis = None
+
+    expo = None
+    if loss_exponents is not None:
+        try:
+            expo = (_f("loss_exponents[0]", loss_exponents[0]),
+                    _f("loss_exponents[1]", loss_exponents[1]))
+        except (TypeError, ValueError, IndexError):
+            return err("loss_exponents must be a pair (x, y)",
+                       "ARG_INVALID",
+                       hint="x is the frequency exponent, y the flux exponent, from "
+                            "the material's own fit - they are not derived here")
+        if expo[0] <= 0 or expo[1] <= 0:
+            return err("loss_exponents must both be > 0", "ARG_RANGE")
+
+    mats = {m.get("name"): m for m in (data.get("materials") or [])}
+    cores = data.get("cores") or []
+
+    want_mat = _norm_key(material) if material else None
+    want_shape = _norm_key(shape) if shape else None
+
+    # an empty answer is not an answer: name the filter that nothing matched
+    if want_mat and not any(_norm_key(c.get("material")) == want_mat
+                            for c in cores):
+        return err("no core in the table uses material " + str(material),
+                   "NOT_FOUND",
+                   hint="the table is data, not a catalogue: magnetic_data lists "
+                        "what is actually in it",
+                   extra={"materials_in_table": sorted(
+                       {c.get("material") for c in cores if c.get("material")})})
+    if want_shape and not any(want_shape in _norm_key(c.get("shape"))
+                              for c in cores):
+        return err("no core in the table has a shape containing " + str(shape),
+                   "NOT_FOUND",
+                   hint="magnetic_data(kind='cores') lists the parts that are in it",
+                   extra={"shapes_in_table": sorted(
+                       {c.get("shape") for c in cores if c.get("shape")})})
+
+    considered, rejected = [], []
+    for core in cores:
+        part = core.get("part")
+        if want_mat and _norm_key(core.get("material")) != want_mat:
+            rejected.append({"part": part, "reason": "material_filter"})
+            continue
+        if want_shape and want_shape not in _norm_key(core.get("shape")):
+            rejected.append({"part": part, "reason": "shape_filter"})
+            continue
+        if not core.get("ae_mm2"):
+            rejected.append({"part": part, "reason": "no_geometry",
+                             "because": core.get("incomplete_note")
+                             or "effective area is null in the table"})
+            continue
+        mat = mats.get(core.get("material"))
+        row = {"part": part, "vendor": core.get("vendor"),
+               "shape": core.get("shape"), "material": core.get("material"),
+               "ae_mm2": core.get("ae_mm2"), "le_mm": core.get("le_mm"),
+               "ve_mm3": core.get("ve_mm3"), "al_nh": core.get("al_nh"),
+               "gap_um": core.get("gap_um"), "mass_g": core.get("mass_g"),
+               "missing": []}
+
+        ae_m2 = float(core["ae_mm2"]) * 1e-6
+
+        # --- how many turns: the inductance and the flux limit each want a number
+        n_al = None
+        if core.get("al_nh"):
+            n_al = math.sqrt(L / (float(core["al_nh"]) * 1e-9))
+        else:
+            row["missing"].append("al_nh")
+
+        # --- the flux limit for THIS part
+        if b_lim is not None:
+            limit_t, limit_note = b_lim, b_lim_basis
+        else:
+            bsat_mt, sat_note = _bsat_at(mat, temp)
+            if bsat_mt is None:
+                row["b_limit_t"] = None
+                row["saturation"] = "unknown"
+                row["missing"].append("b_limit_t")
+                row["b_limit_because"] = sat_note
+                limit_t, limit_note = None, sat_note
+            else:
+                limit_t = bsat_mt * 1e-3 * derate
+                limit_note = ("%g%% of %s's published %g mT at %g C"
+                              % (derate * 100.0, mat.get("name"), bsat_mt, temp))
+        row["b_limit_t"] = _fmt(limit_t) if limit_t is not None else None
+        row["b_limit_basis"] = limit_note
+        if core.get("amin_mm2") and core["amin_mm2"] < core["ae_mm2"]:
+            row["flux_area_mm2"] = core["amin_mm2"]
+            row["flux_area_note"] = ("Amin < Ae, so the peak flux density is judged "
+                                     "on Amin")
+            ae_flux = float(core["amin_mm2"]) * 1e-6
+        else:
+            ae_flux = ae_m2
+
+        if limit_t is None:
+            # This part cannot be judged here, but that is no reason to refuse the
+            # whole question: the caller may still want the parts that can be.
+            rejected.append({"part": part, "reason": "saturation_unknown",
+                             "because": limit_note,
+                             "material": core.get("material")})
+            continue
+
+        n_b = L * ipk / (limit_t * ae_flux)
+        n = int(max(1, math.ceil(max(n_al if n_al is not None else 1.0, n_b))))
+        b_peak = L * ipk / (n * ae_flux)
+
+        row["turns_from_al"] = _fmt(n_al) if n_al is not None else None
+        row["turns_from_flux"] = _fmt(n_b)
+        row["turns"] = n
+        row["b_peak_t"] = _fmt(b_peak)
+        row["b_peak_over_limit"] = _fmt(b_peak / limit_t) if limit_t else None
+
+        # --- saturation verdict
+        bsat_mt, sat_note = _bsat_at(mat, temp)
+        if bsat_mt is not None:
+            b_sat = bsat_mt * 1e-3
+            row["bsat_t"] = _fmt(b_sat)
+            if b_peak > b_sat:
+                row["saturation"] = "over"
+                row["saturation_note"] = ("peak %g mT exceeds the published %g mT at "
+                                          "%g C even with %d turns"
+                                          % (b_peak * 1e3, bsat_mt, temp, n))
+            else:
+                row["saturation"] = "ok"
+                row["saturation_note"] = ("peak %g mT of the published %g mT at %g C"
+                                          % (b_peak * 1e3, bsat_mt, temp))
+        elif b_lim is not None:
+            row["saturation"] = "ok" if b_peak <= b_lim else "over"
+            row["saturation_note"] = "judged against the caller's b_max_t only"
+        # else: set above as "unknown"
+
+        # --- does it need a gap?
+        al_req = L / float(n) ** 2 * 1e9
+        row["al_required_nh"] = _fmt(al_req)
+        if core.get("al_nh"):
+            ratio = al_req / float(core["al_nh"])
+            row["al_ratio"] = _fmt(ratio)
+            row["l_at_n_ungapped_h"] = _fmt(float(core["al_nh"]) * 1e-9 * n * n)
+            row["gap_required"] = bool(ratio < GAP_NEEDED_BELOW)
+        else:
+            row["gap_required"] = None
+            row["al_because"] = (core.get("al_note")
+                                 or "AL is null in the table")
+        mu_i = (mat or {}).get("mu_i")
+        if row["gap_required"]:
+            if mu_i:
+                # standard gap estimate, no fringing correction: the gap's
+                # reluctance and the core's are in series
+                g = MU0 * ae_m2 * n ** 2 / L - (float(core["le_mm"]) * 1e-3
+                                                / float(mu_i))
+                if g > 0:
+                    row["gap_mm"] = _fmt(g * 1e3)
+                    row["gap_basis"] = ("series reluctance with the ungapped core, "
+                                        "NO fringing correction (fringing makes the "
+                                        "real gap a little smaller)")
+                else:
+                    row["gap_mm"] = None
+                    row["gap_because"] = ("the series-reluctance estimate came out "
+                                          "negative, i.e. %d turns already give more "
+                                          "than the required reluctance with no gap"
+                                          % n)
+            else:
+                row["gap_mm"] = None
+                row["missing"].append("gap_mm")
+                row["gap_because"] = ("mu_i is unknown for this material, so the "
+                                      "core's own reluctance cannot be separated from "
+                                      "the gap's")
+        else:
+            row["gap_mm"] = 0.0 if core.get("gap_um") == 0 else None
+            if row["gap_mm"] is None:
+                row["gap_because"] = core.get("gap_note") or "gap not stated"
+
+        # --- core loss
+        p_core, p_note = _core_loss_for(core, mat, freq_hz, b_ac_t, expo)
+        row["core_loss_w"] = _fmt(p_core) if p_core is not None else None
+        row["core_loss_basis"] = p_note
+        if p_core is None:
+            row["missing"].append("core_loss_w")
+        ref = core.get("loss_ref")
+        if ref:
+            row["core_loss_at_ref_w"] = ref.get("p_w")
+            row["core_loss_ref_condition"] = {
+                "b_mt": ref.get("b_mt"), "f_khz": ref.get("f_khz"),
+                "temp_c": ref.get("temp_c")}
+
+        # --- copper loss and the winding window
+        rectx = None
+        if i_rms_a is not None and current_density_a_mm2 is not None:
+            try:
+                irms = _f("i_rms_a", i_rms_a)
+                j = _f("current_density_a_mm2", current_density_a_mm2)
+            except ValueError as exc:
+                return err(str(exc), "ARG_INVALID")
+            if irms <= 0 or j <= 0:
+                return err("i_rms_a and current_density_a_mm2 must be > 0",
+                           "ARG_RANGE")
+            a_wire = irms / j
+            rectx = {"i_rms_a": _fmt(irms), "current_density_a_mm2": j,
+                     "wire_area_mm2": _fmt(a_wire),
+                     "copper_area_mm2": _fmt(a_wire * n)}
+            if core.get("mlt_mm"):
+                rho = COPPER_RESISTIVITY_OHM_M * (1.0 + COPPER_TEMPCO_PER_K
+                                                  * (temp - 20.0))
+                r_dc = rho * n * float(core["mlt_mm"]) * 1e-3 / (a_wire * 1e-6)
+                rectx["r_dc_ohm"] = _fmt(r_dc)
+                rectx["p_copper_w"] = _fmt(irms ** 2 * r_dc)
+                rectx["p_copper_basis"] = ("rho at %g C, N * mean-turn-length / wire "
+                                           "area, DC only (skin/proximity: "
+                                           "magnetics_winding_ac)" % temp)
+            else:
+                rectx["p_copper_w"] = None
+                rectx["missing_wire"] = ("no mean turn length for this core in the "
+                                         "table, so the turn length is unknown")
+                row["missing"].append("p_copper_w")
+            if fill_factor is not None and core.get("aw_mm2"):
+                try:
+                    ku = _f("fill_factor", fill_factor)
+                except ValueError as exc:
+                    return err(str(exc), "ARG_INVALID")
+                needed = a_wire * n / ku
+                rectx["fill_factor"] = ku
+                rectx["window_area_mm2"] = core["aw_mm2"]
+                rectx["window_area_needed_mm2"] = _fmt(needed)
+                rectx["window_fits"] = bool(needed <= core["aw_mm2"])
+                rectx["window_basis"] = ("former winding area with fill factor %g; "
+                                         "the former geometry is the vendor's, the "
+                                         "fill factor is yours" % ku)
+            else:
+                rectx["window_fits"] = None
+                rectx["window_because"] = (
+                    "the table has no winding area for this core" if not
+                    core.get("aw_mm2") else "pass fill_factor to check the window")
+        row["winding"] = rectx
+
+        # --- verdict
+        verdicts = []
+        if row["saturation"] == "over":
+            verdicts.append("saturates")
+        if rectx and rectx.get("window_fits") is False:
+            verdicts.append("window_overflow")
+        if require_window_fit and (not rectx or rectx.get("window_fits") is None):
+            verdicts.append("window_unchecked")
+        row["verdict"] = verdicts[0] if verdicts else "feasible"
+        if verdicts:
+            # one shape for every rejection: a part, a name for the reason, and
+            # whatever numbers could still be computed
+            row["reason"] = verdicts[0]
+            rejected.append(row)
+        else:
+            considered.append(row)
+
+    feasible = sorted(considered, key=lambda r: (r.get("ve_mm3") or 1e30,
+                                                 r.get("mass_g") or 1e30))
+    if limit is not None:
+        try:
+            lim = int(limit)
+        except (TypeError, ValueError):
+            return err("limit must be an integer", "ARG_INVALID")
+        if lim <= 0:
+            return err("limit must be >= 1", "ARG_RANGE")
+        shown = feasible[:lim]
+    else:
+        shown = feasible
+
+    unchecked = [r["part"] for r in feasible
+                 if not (r.get("winding") and r["winding"].get("window_fits")
+                         in (True, False))]
+    out = {
+        "requirement": {"inductance_h": _fmt(L), "i_peak_a": _fmt(ipk),
+                        "temperature_c": temp,
+                        "freq_hz": freq_hz, "b_ac_t": b_ac_t},
+        "b_limit_t": (_fmt(b_lim) if b_lim is not None
+                      else "%g x Bsat of the part's material" % derate),
+        "candidates": shown,
+        "rejected": rejected,
+        "feasible_count": len(feasible),
+        "table_rows": len(cores),
+        "window_image": ("the winding window could not be checked for "
+                         + ", ".join(unchecked)) if unchecked else None,
+        "not_modelled": [
+            "temperature rise: no part in the table has a published thermal "
+            "resistance, so these are watts and nothing else",
+            "the DC-bias roll-off of AL (a gapped ferrite loses inductance long "
+            "before it saturates at Bsat) - only the Bsat point is judged",
+            "fringing flux at the gap: the gap estimate is series reluctance only, "
+            "and fringing loss and the extra copper loss near the gap are absent",
+            "winding AC resistance (magnetics_winding_ac) and skin effect",
+            "tolerance: AL is quoted +/-25% on many parts, so the turns from AL are "
+            "a nominal value, not a guarantee",
+            "any Steinmetz fit for the ferrites: no vendor coefficients are stored, "
+            "so a loss away from a measured point needs loss_exponents from you",
+        ],
+    }
+    return ok(
+        out, "core sets, smallest effective volume first",
+        "Faraday + inductance relation on vendor effective parameters "
+        "(L = AL*N^2, B = L*Ipk/(N*Ae))",
+        "Ae / le / Ve / AL / Amin / mass / loss point from "
+        "data/magnetic_materials.json, which carries the vendor URL for every row",
+        "exact arithmetic on the vendor's published typical values; the uncertainty "
+        "that matters is theirs (AL tolerance, Bsat read off a curve, loss at one "
+        "condition), not the arithmetic",
+        {"flux_area": "Amin is used instead of Ae where the vendor publishes both",
+         "bsat_derate": "a design margin chosen by the caller, not a material law",
+         "gap": "series reluctance, no fringing; requires the material's mu_i",
+         "verdicts": "saturates / window_overflow / window_unchecked / feasible - a "
+                     "feasible verdict means the flux and the data that was present "
+                     "passed, never that the part is a good design"},
+        {"rejected_count": len(rejected),
+         "unjudged": [r for r in rejected
+                      if r.get("reason") == "saturation_unknown"],
+         "feasible_parts": [r["part"] for r in feasible]})

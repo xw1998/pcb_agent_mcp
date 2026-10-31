@@ -581,8 +581,11 @@ class TestThroughTheToolSurface(unittest.TestCase):
                                delta=PLAIN_F1 * 1e-5)
 
     def test_the_tool_count_is_unchanged(self):
+        # a deliberate ratchet: adding a tool must bump this number, so the surface
+        # cannot grow by accident. 162 -> 164 in 0.0.55 (magnetics_select_core and
+        # magnetics_data, both backed by data/magnetic_materials.json).
         from pcb_agent_mcp import tools
-        self.assertEqual(len(tools.TOOLS), 162)
+        self.assertEqual(len(tools.TOOLS), 164)
 
     def test_capabilities_stops_claiming_copper_is_unmodelled(self):
         from pcb_agent_mcp import tools
