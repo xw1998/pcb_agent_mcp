@@ -9,6 +9,131 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.53] - 2026-10-31
+
+`vibration_plate_modes` 从 0.0.10 起一直是「**裸的**均质板」：厚度方向上只有层压板一种材料，
+质量只有板自己。于是两个最常见的板级问题它答不对——**外层铜把 f1 抬起来多少**（2 oz 上读低
+15 % 以上），以及**一颗 20 g 的连接器把 f1 压下去多少**（读高 2 倍以上）。这一版把这两件事装成
+**三个参数**（`copper_um` / `added_mass_g` / `added_mass_at_mm`），不是新工具：工具总数仍是 162。
+
+一句话结论：**铜只做双面对称的薄皮**（进变换截面），**质量只做一个用户给定的点**（秩一白化，
+不截断模态）。两者都是闭式，没有一处需要全波或有限元，所以没有一处猜。
+
+### ⚠ 这是**加字段**，且**默认逐位不变**
+
+- `value["composite"]` 与 `value["added_mass"]` 是**新增**字段，不给新参数时**都是 `None`**。
+- 铜走 `if cu_t > 0.0:` 的**新展开式**，`else:` 分支是 0.0.52 的旧式逐字保留；
+  点质量走 `apply_mass is None` 直通。所以默认路径的浮点运算是**同一条**，不是"应该差不多"。
+- 自证：`plate_modes(100, 80, 1.6, material="fr4", mount="custom", bc_x=["ss"]*2, bc_y=["ss"]*2)`
+  不给三个新参数时 f1 仍是 `677.290`（与 0.0.52 逐位相同），旧振动测试 3 个文件 99 例全跑通过，
+  selftest 里另有一条 `copper_um=0.0` 的**严格 `==`**（连 `composite is None`、`added_mass is None` 一起判）。
+
+### ⚠ `warnings` 的文案变了（内容更窄，不再是一句话打包）
+
+0.0.52 里恒定的那句「component mass, copper stiffening… not modelled」被拆成**条件式**：
+
+| 条件 | 现在的 warning |
+| --- | --- |
+| `copper_um > 0` | 「copper_um is a SYMMETRIC skin pair (%g um per face); …real 1/2 oz outer layers with inner planes break that symmetry and add a membrane-bending term…」 |
+| 没给 `copper_um` | 「copper stiffening is not modelled: pass copper_um … which is what makes f1 read high on a 2 oz board」 |
+| 没给 `added_mass_g` | 「component mass is not modelled: pass added_mass_g (and its point) or f1 reads high on a board with one heavy part」 |
+| 铜或质量**任一**没给 | 「mounting compliance and shear deformation are not modelled either」 |
+
+也就是说**两条都给的时候，"安装柔度/剪切变形"那一句仍然会出现**（它本来就还没做），
+但"铜/质量没建模"那两句会消失。读 `warnings` 的调用方需要按内容而不是条数判断。
+
+### ⚠ 有铜时 `stress` 的**语义**变了：取最外层**铜面**，不是层压板中面
+
+`plate_modes(stress_amplitude_mm=…, copper_um=…)` 现在用 `z_s = h/2 + t`、`E_s = E_CU`、`ν_s = NU_CU`
+算应力（最外层已经不是层压板），并在返回值里**明说**：`stress.surface_material = "copper"`、
+`stress.surface_z_mm = 0.835`。不给铜时逐位仍是旧口径（`"laminate"`、`0.8`）。
+
+实测（1 oz，amplitude 0.01 mm）：`sigma_max` 0.331804 → **1.7544 MPa**（×5.288
+`= (110·0.835/(1−0.34²))/(24·0.8/(1−0.15²))`），但 `von_mises` 0.356682 → **1.56796 MPa** 只 ×4.396
+—— 因为 `τ/σ = (1+ν)/(1−ν)` 随 ν 变了。**「不该跟着缩」这件事在测试里用 `assertNotAlmostEqual`
+而不是漏掉**。
+
+### 模型
+
+```
+D11 = Σ E_i/(1−ν_i²)·∫z²dz      D12 = Σ ν_i E_i/(1−ν_i²)·∫z²dz
+D66 = Σ E_i/(2(1+ν_i))·∫z²dz    mpa = ρh + 2·ρ_cu·t
+铜皮: ∫z²dz 单面 = ((h/2+t)³ − (h/2)³)/3，双面对称 ×2
+K  = d11·T_xx + d22·T_yy + d12·T_mix + 2·d66·T_tw
+点质量: M = I + β s sᵀ,  β = m/(mpa·a·b),  c = √(1+β|s|²) − 1,  d = −c/(1+c)
+        A = I + d·s sᵀ  (对称),  K' = AᵀKA = AKA,  ω² = μ/mpa,  v = A·y
+```
+
+`|s| = 0`（点落在节线上）⇒ 严格 no-op。铜常数 `E_CU = 110 GPa`、`NU_CU = 0.34`、`RHO_CU = 8960`。
+
+### 三道能失败的闸门
+
+1. **变换截面必须被独立积分复现**。测试里另写一份三层（铜/层压板/铜）Simpson 分层积分，
+   `D11 / D12 / D66 / mpa` 四项相对误差 < 1e-5；1 oz / 2 oz / 0.5 oz 与另一种材料
+   （30 GPa / ν0.2 / 1900 / 2 mm）都跑。**Simpson 必须偶数个区间**——写成 1001 时 D11 读
+   14.18974（真值 14.20004，−0.07 %），看着像模型错、其实是求积错，这条坑写进了 docstring。
+2. **形状一根不动，且 `f ∝ √(D11/mpa)` 是精确的**。这条有代数根：每一层都满足
+   `E/(1−ν²) − 2·E/(2(1+ν)) = νE/(1−ν²)`，加权求和后仍有
+   `d12/d11 ≡ 1 − 2·d66/d11 ≡ ν_eff`（FR-4 1 oz 实测 0.2278669，与恒等式差 3.4e-6，
+   差异**只来自 6 位有效数字的输出舍入**）⇒ 三个 D 退化成"一个有效 ν 乘 d11"⇒ 模态形状不动。
+   实测 `800.849 / 677.290 = 1.18243 = √(14.2/3.5872 ÷ 8.38056/2.96)`，antinode 与 quiet area
+   的振型值对裸板**严格相等**。
+3. **"只加质量"这个错答案必须被负控制打死**。`677.290/√(3.5872/2.96) = 615.237`，
+   比裸板还**低 23.2 %**——一个只把铜皮质量加进去、不加刚度的实现绝不可能落到 800.849。
+   selftest 同时判 `_mass_only < 0.95·_plain_f` **且** `f1(1oz) > 1.2·_mass_only`。
+
+### 真值表（FR-4 E24 / ν0.15 / ρ1850，100×80×1.6 mm，SSSS）
+
+| 输入 | f1 (Hz) | D11 / mpa | 备注 |
+| --- | --- | --- | --- |
+| 无铜 | **677.290** | 8.38056 / 2.96 | 与解析 SSSS 闭式一致 |
+| 17.5 µm（0.5 oz） | — | 11.228 / — | 精确 11.228022 |
+| 35 µm（1 oz） | **800.849** | 14.2 / 3.5872 | `mass_share_copper` 0.1748 |
+| 70 µm（2 oz） | **888.369** | 20.5284 / 4.2144 | `mass_share_copper` 0.2976 |
+| 20 g @ 板心 | **316.044** | — | `mass_ratio` 0.844595（板 23.68 g）、`mode_basis_at_point` 13.7777、`whitening_c` 2.5548 |
+| 0.001 g @ [0, 40]（节线） | **677.290** | — | 逐位相同，`basis` 0.0、`c` 0.0 |
+
+位置依赖（20 g）：板心 **316.044** < 四分点 (25,20) **436.228** < 近边 (95,40) **645.209** < 节线 **677.290**。
+
+**全秩 vs 单模**：单模锚点 `677.290/√(1+4×0.844595) = 323.6815`，全秩一解 316.044 比它**低 2.36 %**
+—— 截断到单模会让答案**偏高**，这是"闭式白化"相对"只留一阶"的分辨读数。
+**错误锚点**（用 `β|s|²` 而不是 `β(cᵀs)²`）会给出 ≈190 Hz，与 316 差 66 %——手算的坑，代码是对的。
+
+### 两个数学坑（踩过，写进测试 docstring 防回退）
+
+1. 从 `M = L Lᵀ` 得到的白化矩阵是 **`L⁻ᵀ`，不是 `L⁻¹`**：`X M Xᵀ = I` 只对 `X = L⁻¹` 成立，
+   `Xᵀ M X ≠ I`。
+2. `L⁻ᵀ` 与闭式 `M^{-1/2}` 相差一个**正交因子**（`X = A Q`）⇒ 两个白化刚度矩阵**逐元不同、
+   只有特征值相同**（实测特征值一致到 1.3e-15，矩阵差到 9e-2）。所以测试只比特征值；
+   逐元比较在**任何**容差下都是错测试。
+
+### 拒答
+
+| 输入 | `reason_code` | `message` / `hint` |
+| --- | --- | --- |
+| `added_mass_g = 0` 或负数 | `ARG_RANGE` | `"must be a number > 0"` + `"no component mass"` |
+| `added_mass_at_mm = [120, 40]`（板外） | `ARG_RANGE` | `"outside the plate"` |
+| `added_mass_at_mm = [50, -1]` | `ARG_RANGE` | `"outside the plate"` |
+| `added_mass_at_mm = "here"` | `ARG_INVALID` | — |
+| `copper_um = -1` / `"lots"` | `ARG_RANGE` | — |
+| `copper_um = 420`（> h/2） | `OUT_OF_VALIDITY` | hint 含 `"thin-plate limit"`；399 仍 `ok` |
+
+### 仍然不建模（`calc_capabilities` 第 19 条已改口）
+
+分布元件质量、元件刚度、**不对称**叠层（外层 1/2 oz + 内层平面会破坏对称、要膜-弯耦合项）、
+多边形轮廓路径（`vibration_plate_outline`）上的铜、应力工具那个**独立求解**里的铜、
+安装柔度、剪切变形、转动惯量、装配级与焊点蠕变。±10 % 仍是多项式基的误差棒。
+
+### 落点
+
+- `calc/vibration.py`：`E_CU`/`NU_CU`/`RHO_CU`、`_rank1_whiten`（+250/−28 行）。
+- `tools.py`：三项 schema + lambda 透传 + 描述；`_capabilities` 第 19 条从
+  「no component mass or copper stiffening」改成「ONE point mass and SYMMETRIC copper skins are modelled …」。
+- `tests/test_vibration_mass_copper.py`：**46 例**（含独立 Simpson 分层积分、负控制、秩一白化对
+  Cholesky 路径的特征值对照）。
+- `server.py`：**5 条 selftest**（1613–1619 组），`--selftest` 从 183/183 到 **188/188**。
+- `docs/56-振动-铜加强筋与点质量.md`；全量用例 2418 例（实测 1329.823 s）。
+
 ## [0.0.52] - 2026-10-31
 
 `filter_waveguide_cavity` 从 0.0.16 起只做 TE101：**长度、Rs、Qc、R/Q 四个数，旁的全拒**。
@@ -142,7 +267,7 @@ WR-90（22.86 × 10.16 mm）、10 GHz、铜、光滑：
 **五条**读数：通用闭式 vs 括号式、每模 `u_e/u_m`、模谱、粗糙度、填充腔）、
 `tests/test_waveguide_modes.py`（**29 例**，含**自写独立壁损积分**——用 `|H|²−|H·n|²` 从来不点
 切向分量，所以不会"跟闭式一起错"）、`docs/55-波导腔全模谱与粗糙度.md`。
-自检 **178 → 183**，回归 **2372 例 / OK (skipped=5) / 1316.292 s**（0.0.51 是 2343 例 / 1242.191 s）。
+自检 **178 → 183**，回归 **2418 例 / OK (skipped=5) / 1329.823 s**（0.0.51 是 2343 例 / 1242.191 s）。
 
 ## [0.0.51] - 2026-10-31
 

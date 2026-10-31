@@ -44,6 +44,15 @@ MATERIALS = {
     "alumina":   {"e_gpa": 300.0, "nu": 0.22, "rho_kg_m3": 3900.0},
 }
 
+# Copper foil, handbook values for rolled/electrodeposited sheet: E 110 GPa,
+# nu 0.34, rho 8960. Electroplated copper on a board is softer (annealed, 60..90
+# GPa) and a plated barrel is not a foil at all - this is the SHEET the outer
+# layers are made of, and the stiffening it brings scales with sqrt(E), so a
+# softer copper changes the answer by a few percent, not by a factor.
+E_CU = 110.0e9
+NU_CU = 0.34
+RHO_CU = 8960.0
+
 MATERIAL_NOTE = ("preset = typical value, not a supplier datasheet; FR-4 E spans "
                  "18..30 GPa with resin content and glass weave, and f ~ sqrt(E)")
 
@@ -385,10 +394,51 @@ def _pick_degree(n_pairs, poly_degree, max_dof):
     return None, None, None
 
 
+def _rank1_whiten(stiff, s_vec, beta):
+    """Whiten a symmetric stiffness by a mass matrix I + beta*s*s^T.
+
+    Returns (stiff2, apply) where stiff2 = A K A and apply(y) = A y, with A the
+    inverse square root of the mass. Closed form, no iteration: with u = s/|s|
+    and c = sqrt(1 + beta |s|^2) - 1, the Cholesky factor of the mass is
+    I + c u u^T, so A = I + d u u^T with d = -c/(1+c). |s| = 0 returns the input
+    untouched, which is what makes a mass sitting on a node a no-op.
+    """
+    n = len(stiff)
+    sn2 = sum(v * v for v in s_vec)
+    if sn2 <= 0.0:
+        return stiff, None
+    cc = math.sqrt(1.0 + beta * sn2) - 1.0
+    if cc == 0.0:
+        return stiff, None
+    dd = -cc / (1.0 + cc)
+    u_vec = [v / math.sqrt(sn2) for v in s_vec]
+    ku = [sum(stiff[i][j] * u_vec[j] for j in range(n)) for i in range(n)]
+    uku = sum(u_vec[i] * ku[i] for i in range(n))
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        row = stiff[i]
+        dst = out[i]
+        kui = ku[i]
+        ui = u_vec[i]
+        for j in range(n):
+            dst[j] = (row[j] + dd * (kui * u_vec[j] + ui * ku[j])
+                      + dd * dd * uku * ui * u_vec[j])
+
+    def apply(y):
+        d = 0.0
+        for i in range(len(y)):
+            d += u_vec[i] * y[i]
+        d *= dd
+        return [y[i] + d * u_vec[i] for i in range(len(y))]
+
+    return out, apply
+
+
 def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                 rho_kg_m3=None, mount="corners", bc_x=None, bc_y=None,
                 n_modes=4, poly_degree=7, probe_points=None, max_dof=MAX_DOF,
-                stress_amplitude_mm=None):
+                stress_amplitude_mm=None, copper_um=None, added_mass_g=None,
+                added_mass_at_mm=None):
     """Natural frequencies and mode shapes of a rectangular thin plate.
 
     Rayleigh-Ritz on a monomial basis (psi = xi^k eta^l) restricted to the null
@@ -408,10 +458,31 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
         U = D/2 * int[ w_xx^2 + w_yy^2 + 2 nu w_xx w_yy + 2(1-nu) w_xy^2 ]
     with D = E h^3 / (12 (1 - nu^2)) and mass per area rho*h.
 
-    Not modelled, and said so in the envelope: added mass and stiffening from
-    the components and copper, the compliance of the mounting itself, shear
-    deformation and rotary inertia (thin-plate limit), and the error of
-    rectangularising a non-rectangular outline.
+    Two additions on top of the bare laminate (both OFF by default, and with
+    both off every number is bit-identical to the bare solve):
+
+    copper_um
+        copper on BOTH faces, thickness in um per face. It enters twice and the
+        two effects point in opposite directions: the skins raise the flexural
+        rigidity (a transformed section, D11 / D12 / D22 / D66 summed layer by
+        layer with each layer's own E and nu) and they raise the mass per area.
+        Because the stack is symmetric the neutral axis stays at mid-plane, so a
+        single set of D's is enough; an ASYMMETRIC stack would also need a
+        membrane-bending term and that is not modelled.
+
+    added_mass_g / added_mass_at_mm
+        a point mass (a connector, a can, a battery) at a point, default the
+        plate centre. It is a rank-one addition to the mass matrix,
+        M = I + beta s s^T with s the mode basis sampled at that point, so the
+        solve stays a plain symmetric eigenproblem: the whitening factor of
+        I + beta |s|^2 u u^T is (1 + c) with c = sqrt(1 + beta |s|^2) - 1, in
+        closed form. No iteration, no single-mode truncation, and a mass placed
+        at a node of a mode leaves that mode exactly alone.
+
+    Still not modelled, and still said so in the envelope: the mass of the
+    components anywhere but at the one point you name (and their own stiffness),
+    mounting compliance, shear deformation and rotary inertia (thin-plate
+    limit), and the error of rectangularising a non-rectangular outline.
     """
     a = _pos(a_mm)
     b = _pos(b_mm)
@@ -510,6 +581,37 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
     Dflex = E * hm ** 3 / (12.0 * (1.0 - nu_v * nu_v))
     mpa = rho * hm  # kg/m^2
 
+    # ---- copper skins: a transformed section, not a fudge factor -----------
+    # D11 = sum_i E_i/(1-nu_i^2) * int z^2 dz over layer i, and D12 / D66 split
+    # the same way. Symmetric skins keep the neutral axis at mid-plane, so the
+    # laminate's own nu can no longer be used for the coupling term - each layer
+    # brings its own nu and the D12 sum is what carries it.
+    cu_t = 0.0
+    if copper_um is not None:
+        cu = _num(copper_um)
+        if cu is None or cu < 0.0:
+            return err("copper_um must be a number >= 0 (thickness per face)",
+                       "ARG_RANGE")
+        cu_t = cu * 1e-6
+    if cu_t > 0.0:
+        hz = hm / 2.0
+        iz_cu = ((hz + cu_t) ** 3 - hz ** 3) / 3.0   # int z^2 dz, one skin
+        d11 = (E * hm ** 3 / (12.0 * (1.0 - nu_v * nu_v))
+               + 2.0 * E_CU / (1.0 - NU_CU * NU_CU) * iz_cu)
+        d22 = d11
+        d12 = (nu_v * E * hm ** 3 / (12.0 * (1.0 - nu_v * nu_v))
+               + 2.0 * NU_CU * E_CU / (1.0 - NU_CU * NU_CU) * iz_cu)
+        d66 = (E * hm ** 3 / (24.0 * (1.0 + nu_v))
+               + 2.0 * E_CU / (2.0 * (1.0 + NU_CU)) * iz_cu)
+        if cu_t >= hz * 0.5:
+            return err("copper_um is %.3f mm per face on a %.3f mm laminate - "
+                       "that is a copper plate with a laminate core, not a PCB"
+                       % (cu * 1e-3, h_mm), "OUT_OF_VALIDITY",
+                       hint="the transformed section is still arithmetic, but the "
+                            "thin-plate limit this solve rests on is gone")
+        mpa = rho * hm + 2.0 * RHO_CU * cu_t
+        Dflex = d11
+
     ndof = nx * ny
     stiff = [[0.0] * ndof for _ in range(ndof)]
     a4 = am ** 4
@@ -521,19 +623,29 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
             for k in range(nx):
                 for l in range(ny):
                     J = k * ny + l
-                    val = (
-                        I2xw[i][k] * M0yw[j][l] / a4
-                        + M0xw[i][k] * I2yw[j][l] / b4
-                        + nu_v * (ICxw[i][k] * I1yw[j][l]
-                                  + I1xw[i][k] * ICyw[j][l]) / a2b2
-                        + (1.0 - nu_v) * (D1xw[i][k] * D1yw[j][l]
-                                          + D1xw[i][k] * D1yw[j][l]) / a2b2
-                    )
                     # U = D/2 * int[...] is a quadratic form, so d2U gives the
                     # stiffness as D * int[...] - the 1/2 cancels. Writing 0.5
                     # here halves every eigenvalue and drops every frequency by
                     # exactly sqrt(2), which looks plausible and is wrong.
-                    stiff[I][J] += Dflex * val
+                    if cu_t > 0.0:
+                        txx = I2xw[i][k] * M0yw[j][l] / a4
+                        tyy = M0xw[i][k] * I2yw[j][l] / b4
+                        tmx = (ICxw[i][k] * I1yw[j][l]
+                               + I1xw[i][k] * ICyw[j][l]) / a2b2
+                        ttw = (D1xw[i][k] * D1yw[j][l]
+                               + D1xw[i][k] * D1yw[j][l]) / a2b2
+                        stiff[I][J] += (d11 * txx + d22 * tyy + d12 * tmx
+                                        + 2.0 * d66 * ttw)
+                    else:
+                        val = (
+                            I2xw[i][k] * M0yw[j][l] / a4
+                            + M0xw[i][k] * I2yw[j][l] / b4
+                            + nu_v * (ICxw[i][k] * I1yw[j][l]
+                                      + I1xw[i][k] * ICyw[j][l]) / a2b2
+                            + (1.0 - nu_v) * (D1xw[i][k] * D1yw[j][l]
+                                              + D1xw[i][k] * D1yw[j][l]) / a2b2
+                        )
+                        stiff[I][J] += Dflex * val
 
     # corners: point supports at the four corners of the [0,a] x [0,b] rectangle
     point_fix = (key == "corners")
@@ -646,6 +758,58 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
     else:
         base_cols = None
 
+    # ---- a point mass is a rank-one addition to the mass matrix -----------
+    # M = I + beta s s^T, with s the whitened basis sampled at the mass and
+    # beta = m / (mass_per_area * a * b). Its square root is closed form: for
+    # M = I + beta |s|^2 u u^T (u = s/|s|) the Cholesky factor is I + c u u^T
+    # with (1+c)^2 = 1 + beta |s|^2, so the whitened stiffness is A K A with
+    # A = L^-1 = I + d u u^T, d = -c/(1+c). Both c and d vanish when the mass
+    # sits on a node of the basis (|s| = 0), which is the negative control.
+    apply_mass = None
+    mass_report = None
+    if added_mass_g is not None:
+        mg = _num(added_mass_g)
+        if mg is None or mg <= 0.0:
+            return err("added_mass_g must be a number > 0", "ARG_RANGE",
+                       hint="a mass of zero is not a mass; leave the argument out "
+                            "to say 'no component mass'")
+        m_kg = mg * 1e-3
+        if added_mass_at_mm is not None:
+            try:
+                px = float(added_mass_at_mm[0])
+                py = float(added_mass_at_mm[1])
+            except (TypeError, ValueError, IndexError):
+                return err("added_mass_at_mm must be [x_mm, y_mm]", "ARG_INVALID")
+            if not (0.0 <= px <= a and 0.0 <= py <= b):
+                return err("added_mass_at_mm (%.3f, %.3f) is outside the plate "
+                           "(%.3f x %.3f mm)" % (px, py, a, b), "ARG_RANGE",
+                           hint="a mass off the plate is not carried by the plate")
+            x0, y0 = px / a, py / b
+        else:
+            x0 = y0 = 0.5
+        s_full = shape(x0, y0)
+        if base_cols is not None:
+            s_vec = [sum(base_cols[p][i] * s_full[i] for i in range(len(s_full)))
+                     for p in range(len(base_cols))]
+        else:
+            s_vec = s_full
+        snorm2 = sum(v * v for v in s_vec)
+        beta = m_kg / (mpa * am * bm)
+        cc = math.sqrt(1.0 + beta * snorm2) - 1.0
+        stiff, apply_mass = _rank1_whiten(stiff, s_vec, beta)
+        mass_report = {
+            "added_mass_g": _sig(mg),
+            "at_mm": [_sig(x0 * a), _sig(y0 * b)],
+            "plate_mass_g": _sig(mpa * am * bm * 1e3),
+            "mass_ratio": _sig(m_kg / (mpa * am * bm)),
+            "mode_basis_at_point": _sig(snorm2, 6),
+            "whitening_c": _sig(cc, 6),
+            "note": ("s^2 is the whitened basis norm at the mass point; a point "
+                     "mass on a node (s^2 = 0) leaves every mode untouched, and "
+                     "the plate's own modal mass is its full mass because the "
+                     "basis is mass-orthonormal"),
+        }
+
     evals, evecs = _jacobi(stiff)
 
     # omega^2 = lambda / mass_per_area   (the mass matrix is the identity)
@@ -691,7 +855,8 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
     for mi, lam in enumerate(evals):
         if mi >= nmodes:
             break
-        vec = full_vec(evecs[mi])
+        col = evecs[mi] if apply_mass is None else apply_mass(evecs[mi])
+        vec = full_vec(col)
         shp = shape
         # grid scan for the antinode and for the quiet-area fraction
         best = -1.0
@@ -726,8 +891,18 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
             # second derivative of a degree-K polynomial is degree K-2.
             ng = 21
             scale = (amp_mm * 1e-3) / peak      # metres per unit coefficient
-            ez = E * (hm / 2.0) / (1.0 - nu_v * nu_v)
-            g1 = E / (2.0 * (1.0 + nu_v))
+            # With copper skins the OUTERMOST material is copper, and the bending
+            # stress at a given curvature is E/(1-nu^2) * z * kappa - so the
+            # surface stress has to use copper's E and nu at copper's z, not the
+            # laminate's at h/2. The laminate surface is no longer the surface.
+            if cu_t > 0.0:
+                z_s = hm / 2.0 + cu_t
+                e_s, nu_s = E_CU, NU_CU
+            else:
+                z_s = hm / 2.0
+                e_s, nu_s = E, nu_v
+            ez = e_s * z_s / (1.0 - nu_s * nu_s)
+            g1 = e_s / (2.0 * (1.0 + nu_s))
             # Two different questions, two different peaks. von Mises is largest
             # where the TWISTING curvature w_xy is largest (a corner, for a
             # sinusoid-like mode); the largest principal stress is where the
@@ -747,7 +922,7 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                     kxy *= scale
                     sx = -ez * (kx + nu_v * ky)
                     sy = -ez * (ky + nu_v * kx)
-                    txy = -2.0 * g1 * (hm / 2.0) * kxy
+                    txy = -2.0 * g1 * z_s * kxy
                     mid = 0.5 * (sx + sy)
                     rr = math.sqrt(0.25 * (sx - sy) ** 2 + txy * txy)
                     hi = mid + rr
@@ -769,7 +944,8 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
             sp = best_s
             entry["stress"] = {
                 "amplitude_mm": _sig(amp_mm),
-                "surface_z_mm": _sig(h_mm / 2.0),
+                "surface_z_mm": _sig(z_s * 1e3),
+                "surface_material": ("copper" if cu_t > 0.0 else "laminate"),
                 # ---- extremes, each at its own location
                 "von_mises_mpa": _sig(best_vm["vm"] / 1e6),
                 "von_mises_at_mm": [_sig(best_vm["x"]), _sig(best_vm["y"])],
@@ -785,7 +961,7 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                 "sigma_y_mpa": _sig(sp["sy"] / 1e6),
                 "tau_xy_mpa": _sig(sp["t"] / 1e6),
                 "curvature_per_m": [_sig(sp["kx"]), _sig(sp["ky"])],
-                "surface_strain_ue": _sig(1e6 * abs(sp["hi"]) / E),
+                "surface_strain_ue": _sig(1e6 * abs(sp["hi"]) / e_s),
                 "peak_locations_note":
                     ("the reported extremes sit in symmetry-equivalent sets (the "
                      "four corners share one value, so does each bay centre); one "
@@ -795,7 +971,9 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                      "they are different points and both are reported"),
                 "formula": "sigma_x = -E z/(1-nu^2) (w_xx + nu w_yy), "
                            "sigma_y = -E z/(1-nu^2) (w_yy + nu w_xx), "
-                           "tau_xy = -E z/(1+nu) w_xy, z = h/2",
+                           "tau_xy = -E z/(1+nu) w_xy, with E/nu/z of the "
+                           "OUTERMOST layer (copper when copper_um is given, "
+                           "else the laminate) and z measured from mid-plane",
             }
         if probes_out is not None:
             d = []
@@ -822,9 +1000,22 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
             "with the polynomial degree, treat the first mode as +-10 %")
     if abs(a - b) > 0.2 * max(a, b):
         pass
-    warnings.append(
-        "component mass, copper stiffening, mounting compliance and shear "
-        "deformation are not modelled")
+    if cu_t > 0.0:
+        warnings.append(
+            "copper_um is a SYMMETRIC skin pair (%g um per face); real 1/2 oz "
+            "outer layers with inner planes break that symmetry and add a "
+            "membrane-bending term this solve does not carry" % (cu_t * 1e6))
+    else:
+        warnings.append(
+            "copper stiffening is not modelled: pass copper_um and the transformed "
+            "section raises D11, which is what makes f1 read high on a 2 oz board")
+    if added_mass_g is None:
+        warnings.append(
+            "component mass is not modelled: pass added_mass_g (and its point) or "
+            "f1 reads high on a board with one heavy part")
+    if cu_t <= 0.0 or added_mass_g is None:
+        warnings.append(
+            "mounting compliance and shear deformation are not modelled either")
 
     return ok(
         {
@@ -835,6 +1026,17 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
             },
             "flexural_rigidity_n_m": _sig(Dflex),
             "mass_per_area_kg_m2": _sig(mpa),
+            "composite": (None if cu_t <= 0.0 else {
+                "copper_um_per_face": _sig(cu_t * 1e6),
+                "d11_n_m": _sig(d11), "d12_n_m": _sig(d12), "d66_n_m": _sig(d66),
+                "laminate_d11_n_m": _sig(
+                    E * hm ** 3 / (12.0 * (1.0 - nu_v * nu_v))),
+                "mass_share_copper": _sig(2.0 * RHO_CU * cu_t / mpa, 4),
+                "e_cu_gpa": _sig(E_CU / 1e9), "nu_cu": NU_CU,
+                "formula": "D11 = sum_i E_i/(1-nu_i^2) int z^2 dz over the layers "
+                           "(laminate + two skins), same split for D12 and D66",
+            }),
+            "added_mass": mass_report,
             "bc": {"x": list(pairs[0]), "y": list(pairs[1]),
                    "mount": key, "point_supports": 4 if point_fix else 0},
             "basis": {"poly_degree": K, "n_x": nx, "n_y": ny, "dof": ndof,

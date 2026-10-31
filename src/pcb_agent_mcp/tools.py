@@ -3901,8 +3901,13 @@ def _capabilities(_args):
             "the BUDGET, there is deliberately no heatsink table in this server",
             "Vibration is a THIN-PLATE, SINGLE-MODE, LINEAR layer, by name: no shear "
             "deformation or rotary inertia (so a thick or short plate reads too "
-            "stiff), no component mass or copper stiffening (so f1 reads high on a "
-            "board with one heavy part), no compliance in the mount itself, no "
+            "stiff), ONE point mass and SYMMETRIC copper skins are modelled (0.0.53: "
+            "a rank-one mass update, and D11/D12/D22/D66 summed layer by layer) but "
+            "distributed component mass, component stiffness, an ASYMMETRIC stack "
+            "(which needs a membrane-bending term), copper on the polygonal-outline "
+            "path and copper in the stress tool's separate solve are not - leave "
+            "copper_um and added_mass_g out and f1 reads high on a 2 oz board or one "
+            "with a heavy can, no compliance in the mount itself, no "
             "assembly-level modes, no solder-joint creep or BGA-ball fatigue (only "
             "the Steinberg lead-wire form, whose slope and allowable YOU supply), no "
             "random-plus-shock superposition, no drop simulation, no nonlinear "
@@ -5636,7 +5641,11 @@ _tool(
     "custom edge conditions, so it is exact for SSSS and CCCC squares (verified against "
     "the analytic eigenvalues) and needs no mode table. Gives f1..fn, the antinode "
     "position, the quiet-area fraction, and the normalised deflection at any probe "
-    "points you name.",
+    "points you name. Two things the bare laminate cannot see are optional: copper_um "
+    "(a symmetric skin pair, transformed section -> D11/D12/D22/D66 summed layer by "
+    "layer, plus its mass) and added_mass_g at a point (an exact rank-one mass update, "
+    "so a mass on a node leaves that mode alone). Both OFF by default, and with both "
+    "off every number is bit-identical to before.",
     {"type": "object", "properties": {
         "a_mm": _num("plate length"),
         "b_mm": _num("plate width"),
@@ -5660,6 +5669,21 @@ _tool(
             "peak deflection of the mode, in mm. Give it and each mode also carries "
             "the surface stress; leave it out and no stress is reported, because a "
             "mode shape has no amplitude until you say how hard it is driven"),
+        "copper_um": _num(
+            "copper on BOTH faces, thickness in um per face (35 = 1 oz, 70 = 2 oz). "
+            "A transformed section: each layer brings its own E and nu, D11/D12/D22/"
+            "D66 are summed layer by layer and the mass per area grows too. It "
+            "RAISES f1 (D11 wins over the added mass) - without it a 2 oz board "
+            "reads stiff-free"),
+        "added_mass_g": _num(
+            "a point mass in grams (connector, can, battery). Exact rank-one "
+            "addition to the mass matrix, not a global mass scaling: a mass on a "
+            "node of a mode leaves that mode untouched, which is the check that it "
+            "is a point and not a smear"),
+        "added_mass_at_mm": {"type": "array", "description":
+                             "[x_mm, y_mm] where that mass sits; default the plate "
+                             "centre (the usual antinode, and the worst case)",
+                             "items": {}},
     }, "required": ["a_mm", "b_mm", "thickness_mm"]},
     lambda a: _vib.plate_modes(
         a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"),
@@ -5670,7 +5694,10 @@ _tool(
         n_modes=int(a.get("n_modes") or 4),
         poly_degree=int(a.get("poly_degree") or 7),
         probe_points=a.get("probe_points"),
-        stress_amplitude_mm=a.get("stress_amplitude_mm")),
+        stress_amplitude_mm=a.get("stress_amplitude_mm"),
+        copper_um=a.get("copper_um"),
+        added_mass_g=a.get("added_mass_g"),
+        added_mass_at_mm=a.get("added_mass_at_mm")),
 )
 
 _tool(

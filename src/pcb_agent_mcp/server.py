@@ -2237,6 +2237,141 @@ def selftest():
               and abs(_med.get("length_mm", 0.0) - 7.9535) <= 1e-4
               and _med.get("q_agreement_pct") == 0.0,
               str(_med.get("message"))[:120])
+
+        # --- 0.0.53, copper skins and a point mass on the plate solve. Five
+        # readings, each of which can fail: (1) the transformed section, checked
+        # through the per-layer identity d12/d11 == 1 - 2 d66/d11 that holds for
+        # every isotropic layer separately and therefore for the sum; (2) the
+        # exact sqrt(D11/mass) scaling plus the NEGATIVE control - mass alone
+        # would predict 615 Hz, so an implementation that only grew the mass
+        # cannot land on 800.849; (3) the single-mode anchor for a centre mass
+        # (323.7 Hz) against the full rank-one solve (316.0 Hz); (4) a mass on a
+        # node, which must leave every mode bit-identical because that is what
+        # separates a point mass from a smear; (5) the default path - no copper,
+        # no mass - must be the bare plate and must say so.
+        def _vp(_args, _id):
+            _env = json.loads(handle({"jsonrpc": "2.0", "id": _id,
+                                      "method": "tools/call",
+                                      "params": {"name": "vibration_plate_modes",
+                                                 "arguments": _args}})
+                               ["result"]["content"][0]["text"])
+            _flat = dict(_env.get("value") or {})
+            _flat.update({k: v for k, v in _env.items() if k != "value"})
+            return _flat
+
+        _pbase = {"a_mm": 100.0, "b_mm": 80.0, "thickness_mm": 1.6,
+                  "material": "fr4", "mount": "custom",
+                  "bc_x": ["ss", "ss"], "bc_y": ["ss", "ss"]}
+        _pf = {}
+        for _i, _cu in enumerate((None, 35.0, 70.0)):
+            _a = dict(_pbase)
+            if _cu is not None:
+                _a["copper_um"] = _cu
+            _pf[_i] = _vp(_a, 1613 + _i)
+        _plain_f = ((_pf[0].get("modes") or [{}])[0]).get("freq_hz", 0.0)
+        _c1 = _pf[1].get("composite") or {}
+        _c2 = _pf[2].get("composite") or {}
+        _nu_eff = (_c1.get("d12_n_m", 0.0) / _c1.get("d11_n_m", 1.0))
+        check("copper skins are a transformed section: 1 oz gives D11 %.4f N m and "
+              "D66 %.4f (2 oz: %.4f / %.4f), mass per area %.4f, and the per-layer "
+              "identity d12/d11 = 1-2 d66/d11 holds to %.1e"
+              % (_c1.get("d11_n_m", -1), _c1.get("d66_n_m", -1),
+                 _c2.get("d11_n_m", -1), _c2.get("d66_n_m", -1),
+                 _pf[1].get("mass_per_area_kg_m2", -1),
+                 abs(_nu_eff - (1.0 - 2.0 * _c1.get("d66_n_m", 0.0)
+                                / _c1.get("d11_n_m", 1.0)))),
+              abs(_c1.get("d11_n_m", 0.0) - 14.2) < 1e-4
+              and abs(_c1.get("d66_n_m", 0.0) - 5.48217) < 1e-4
+              and abs(_c2.get("d11_n_m", 0.0) - 20.5284) < 1e-4
+              and abs(_c2.get("d66_n_m", 0.0) - 7.57053) < 1e-4
+              and abs(_pf[1].get("mass_per_area_kg_m2", 0.0) - 3.5872) < 1e-4
+              and abs(_nu_eff - (1.0 - 2.0 * _c1.get("d66_n_m", 0.0)
+                                 / _c1.get("d11_n_m", 1.0))) < 3e-5,
+              str(_c1))
+
+        # f ~ sqrt(D11 / mass per area) EXACTLY, because the two skin terms
+        # collapse onto one effective nu (the identity checked above) and the
+        # mode shape never moves. And the mass on its own points the other way:
+        # 677.29/sqrt(3.5872/2.96) = 615.2 Hz, so landing on 800.849 is only
+        # possible if the stiffness is really in there.
+        _mass_only = _plain_f / _math.sqrt(
+            _pf[1].get("mass_per_area_kg_m2", 1.0)
+            / _pf[0].get("mass_per_area_kg_m2", 1.0))
+        _base_ratio = (_pf[0].get("flexural_rigidity_n_m", 1.0)
+                       / _pf[0].get("mass_per_area_kg_m2", 1.0))
+        _scale_err = 0.0
+        for _i in (1, 2):
+            _ratio = (_pf[_i].get("flexural_rigidity_n_m", 1.0)
+                      / _pf[_i].get("mass_per_area_kg_m2", 1.0))
+            _pred = _plain_f * _math.sqrt(_ratio / _base_ratio)
+            _got = ((_pf[_i].get("modes") or [{}])[0]).get("freq_hz", 0.0)
+            _scale_err = max(_scale_err, abs(_got / _pred - 1.0))
+        check("copper raises f1 by exactly sqrt(D11/mass): 1 oz %.3f Hz and 2 oz "
+              "%.3f Hz against a bare plate at %.3f (scaling error %.1e), while "
+              "the MASS ALONE would have predicted %.2f Hz downwards"
+              % (((_pf[1].get("modes") or [{}])[0]).get("freq_hz", 0.0),
+                 ((_pf[2].get("modes") or [{}])[0]).get("freq_hz", 0.0),
+                 _plain_f, _scale_err, _mass_only),
+              abs(((_pf[1].get("modes") or [{}])[0]).get("freq_hz", 0.0)
+                  - 800.849) < 1e-3
+              and abs(((_pf[2].get("modes") or [{}])[0]).get("freq_hz", 0.0)
+                      - 888.369) < 1e-3
+              and _scale_err < 1e-6
+              and _mass_only < 0.95 * _plain_f
+              and ((_pf[1].get("modes") or [{}])[0]).get("freq_hz", 0.0)
+              > 1.2 * _mass_only,
+              str(_mass_only))
+
+        # A point mass at the centre of the (1,1) mode: the single-mode anchor
+        # f0/sqrt(1 + 4 m/M_plate) is an OUTSIDE reference (plate theory, using
+        # phi_max = 2 at the centre of a SSSS plate). The full rank-one solve
+        # must land within a few percent of it and strictly below it, because
+        # the higher modes the anchor ignores pull the answer down a little.
+        _pm = _vp(dict(_pbase, added_mass_g=20.0), 1616)
+        _pm_rep = _pm.get("added_mass") or {}
+        _pm_f = ((_pm.get("modes") or [{}])[0]).get("freq_hz", 0.0)
+        _anchor = _plain_f / _math.sqrt(
+            1.0 + 4.0 * _pm_rep.get("mass_ratio", 0.0))
+        check("a 20 g mass at the plate centre drops f1 from %.3f Hz to %.3f Hz, "
+              "%.2f %% below the single-mode anchor %.3f Hz (mass ratio %.4f)"
+              % (_plain_f, _pm_f, 100.0 * (_anchor - _pm_f) / _anchor, _anchor,
+                 _pm_rep.get("mass_ratio", -1)),
+              _pm_rep.get("mass_ratio") is not None
+              and abs(_pm_rep.get("mass_ratio", 0.0) - 0.844595) < 1e-5
+              and 0.0 < (_anchor - _pm_f) / _anchor < 0.05,
+              str(_pm_f))
+
+        # The negative control for 'point, not smear': a mass sitting on a nodal
+        # line (x = 0) must leave EVERY mode bit-identical, because the basis
+        # vanishes there and the rank-one update is the identity. A smear would
+        # move all of them.
+        _pn = _vp(dict(_pbase, added_mass_g=0.001, added_mass_at_mm=[0.0, 40.0]),
+                  1617)
+        _pn_rep = _pn.get("added_mass") or {}
+        _pfull = _vp(dict(_pbase, n_modes=4), 1618)
+        _node_ok = _pn_rep.get("whitening_c") == 0.0
+        for _got, _ref in zip(_pn.get("modes") or [], _pfull.get("modes") or []):
+            _node_ok = _node_ok and _got.get("freq_hz") == _ref.get("freq_hz")
+        check("a mass on a nodal line is a true no-op (whitening c = %s): all %d "
+              "modes come back bit-identical to the bare plate"
+              % (_pn_rep.get("whitening_c"), len(_pfull.get("modes") or [])),
+              _node_ok and len(_pfull.get("modes") or []) >= 4,
+              str(_pn_rep.get("whitening_c")))
+
+        # Default unchanged: copper_um = 0 is the same code path as omitting it,
+        # and the bare call reports both new blocks as absent rather than as
+        # an empty dict, so a reader can tell 'not asked' from 'asked, got zero'.
+        _pz = _vp(dict(_pbase, copper_um=0.0), 1619)
+        check("copper_um = 0 answers exactly as omitting it (%.3f Hz, composite %s, "
+              "added_mass %s) - the default path is the bare plate"
+              % (((_pz.get("modes") or [{}])[0]).get("freq_hz", 0.0),
+                 _pz.get("composite"), _pz.get("added_mass")),
+              _pz.get("composite") is None
+              and _pz.get("added_mass") is None
+              and ((_pz.get("modes") or [{}])[0]).get("freq_hz")
+              == ((_pf[0].get("modes") or [{}])[0]).get("freq_hz")
+              and abs(_plain_f - 677.29) < 1e-3,
+              str((_pz.get("modes") or [{}])[0].get("freq_hz")))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 
