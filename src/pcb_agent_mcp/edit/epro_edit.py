@@ -76,6 +76,130 @@ ANY_LAYER = None
 #: member suffixes that carry a record stream (the measured ``epro_doc.STREAM_DIRS``)
 STREAM_EXTS = tuple(sorted(set(_ep.STREAM_DIRS.values())))
 
+#: Archives this module wrote and then had the **application itself** re-open.
+#: Keyed by container kind. An entry exists only where a run below was measured;
+#: a container kind with no entry is one nobody has fed back to the app, and the
+#: result then keeps saying exactly that (see ``_acceptance``).
+#:
+#: The judgement is not "import returned ok". Both ``extractProjectInfo`` and
+#: ``importProjectByProjectFile`` return success for a zip whose PCB record
+#: stream is garbage (run ``negative_control_a`` below) - only reading the
+#: geometry back out of the opened document can fail, so that is the only
+#: reading this table is willing to call evidence.
+ACCEPTED_ARCHIVES = {
+    "epro_zip": {
+        "measured_on": "2026-11-01",
+        "app": "LCEDA Pro V4.1.60",
+        "bridge": "4.1.60.198f38ab",
+        "door": ("eda.sys_FileManager.importProjectByProjectFile(File, 'JLCEDA "
+                 "Pro', props, {operation:'New Project', ...}) -> "
+                 "dmt_Project.openProject(uuid) -> dmt_Pcb.getAllPcbsInfo() -> "
+                 "dmt_EditorControl.openDocument(pcbUuid) -> "
+                 "eda.pcb_PrimitiveLine.getAll() (readings in mil)"),
+        "unit": "mil",
+        "run": [
+            {"arm": "control",
+             "what": "the app's own export, untouched by this module",
+             "bytes": 108580,
+             "sha256": "f339d7b09bd96a5ab6b2ab1c5255d8918f1fdaf70484471973cfbf611b9416d0",
+             "import_returned": "ok (project d24397f2e42af86c97051ca5b1d936f69d8c50f276464f5a0778e60449c4f7ab)",
+             "lines_read_back": [[2, 1, 21, 1, 0.25], [1, 5, 21, 5, 0.3]]},
+            {"arm": "written",
+             "what": "same archive after set_track id=e1 width_mm=0.5",
+             "bytes": 108443,
+             "sha256": "57d238c9a8fc9c94688c14bc329f0039356440e309efa26ff476452c17f444aa",
+             "import_returned": "ok (project 0fe207c0793cbf1c06143fb61a96437346f27b052203bf2a746ed82caf652487)",
+             "lines_read_back": [[2, 1, 21, 1, 19.685], [1, 5, 21, 5, 0.3]],
+             "note": "19.685 mil = 0.499999 mm, the width the plan named; the "
+                     "line the plan did not name still reads 0.3"},
+            {"arm": "negative_control_a",
+             "what": "valid zip, PCB record stream replaced with garbage "
+                     "(['BOGUS',1,2,3] plus a broken LINE)",
+             "bytes": 95966,
+             "sha256": "e8ff189ad5a61784cb4b1a92e8e9f6ba1b6b205adc8d0d374a2c0ccd400f085e",
+             "import_returned": "ok (project 41a715b1...) - so a successful import "
+                                "proves nothing",
+             "lines_read_back": [],
+             "why": "this is the run that makes the geometry reading a real "
+                    "criterion: it fails here while every import-level signal "
+                    "still says success"},
+            {"arm": "negative_control_b",
+             "what": "not a zip at all (b'not a zip at all' * 100)",
+             "import_returned": "undefined, no project created",
+             "why": "shows the door does refuse something, so 'returns ok' is "
+                    "not vacuous"},
+        ],
+        "limits": [
+            "one application build only (V4.1.60 / bridge 4.1.60.198f38ab); a "
+            "different build is a different instrument and says nothing",
+            "ZIP container only: .eprj/.eprj2 (SQLite) is still refused, not "
+            "covered by any run",
+            "measured through the 'ImportDocument' + 'New Project' door only; "
+            "the 'Existing Project' door merges into an existing project and "
+            "the 'Offline Client Local Path' door needs an extension permission "
+            "that was not enabled",
+            "the screen was not inspected: acceptance is established by reading "
+            "primitives back through the app's own API, not by looking at a "
+            "window",
+            "geometry read back is two LINE records of one PCB in one archive",
+        ],
+    },
+}
+
+def _acceptance(container):
+    """What was measured about this container kind, or None.
+
+    None is not "rejected": it is "nobody has fed an archive of this kind back
+    to the application", and every caller must word it that way.
+    """
+    return ACCEPTED_ARCHIVES.get(container)
+
+def _acceptance_report(container):
+    """The ``app_acceptance`` block of an apply result."""
+    measured = _acceptance(container)
+    if measured is None:
+        return {"container": container, "accepted_by_app": None,
+                "measured": None,
+                "note": ("no archive of this container kind has been re-opened "
+                         "in LCEDA Pro by this project, so nothing is claimed")}
+    written = [r for r in measured["run"] if r["arm"] == "written"]
+    control = [r for r in measured["run"] if r["arm"] == "control"]
+    return {
+        "container": container,
+        "accepted_by_app": True,
+        "measured": measured,
+        "read_back": written[0]["lines_read_back"] if written else None,
+        "control_read_back": control[0]["lines_read_back"] if control else None,
+    }
+
+def _not_verified_text(container, verified_by_app):
+    """The honest sentence about what an apply does *not* establish."""
+    measured = _acceptance(container)
+    if measured is not None:
+        written = [r for r in measured["run"] if r["arm"] == "written"]
+        control = [r for r in measured["run"] if r["arm"] == "control"]
+        w = written[0]["lines_read_back"] if written else []
+        c = control[0]["lines_read_back"] if control else []
+        return ("an archive written by this module (sha256 %s) was imported into "
+                "%s (bridge %s) on %s and the application read the geometry back "
+                "as %s where the untouched control archive (sha256 %s) reads %s - "
+                "so 'the application accepts a written archive' is claimed for "
+                "this container on that one build. NOT established: any other "
+                "application build, any .eprj/.eprj2 (SQLite) container, any door "
+                "other than 'ImportDocument' into a new project, that a human "
+                "looking at the window would agree, or that this particular "
+                "write is accepted (a write that appends a record the vendor was "
+                "never seen writing is still reported as verified_by_app=%s)"
+                % (written[0]["sha256"][:16] + "...", measured["app"],
+                   measured["bridge"], measured["measured_on"], w,
+                   control[0]["sha256"][:16] + "..." if control else "?",
+                   c, "true" if verified_by_app else "false"))
+    return ("this archive was never opened in LCEDA Pro after the "
+            "write, so 'the application accepts it' is not claimed"
+            if verified_by_app else
+            "a record was appended that the vendor was not observed "
+            "writing there: the application may ignore it")
+
 
 # --------------------------------------------------------------- small helpers
 def _num(value):
@@ -621,6 +745,7 @@ def propose(path, operations, options=None):
         "blocking": blocking,
         "warnings": warnings,
         "verified_by_app": plan["verified_by_app"],
+        "app_acceptance": _acceptance_report(container_kind),
         "expires_in_seconds": PLAN_TTL,
         "next": ("edit_apply(plan_id=%r, confirm=true) - that call takes a "
                  "checkpoint, writes atomically, then re-reads the file from disk "
@@ -832,15 +957,13 @@ def apply_plan(plan_id, confirm=False, options=None):
             "gates_passed": sorted(k for k, v in gates.items()
                                    if isinstance(v, dict) and v.get("ok") is True),
             "verified_by_app": plan["verified_by_app"],
+            "app_acceptance": _acceptance_report(plan["container"]),
             "decision": ("every gate passed: the bytes on disk are the planned "
                          "bytes, every other member and every unnamed line kept "
                          "its bytes, and the adapter re-read the written file and "
                          "saw the promised geometry"),
-            "not_verified": ("this archive was never opened in LCEDA Pro after the "
-                             "write, so 'the application accepts it' is not claimed"
-                             if plan["verified_by_app"] else
-                             "a record was appended that the vendor was not observed "
-                             "writing there: the application may ignore it"),
+            "not_verified": _not_verified_text(plan["container"],
+                                               plan["verified_by_app"]),
             "how_to_undo": "board_restore(checkpoint_id=%r, confirm=true)"
                            % checkpoint["checkpoint_id"],
         }

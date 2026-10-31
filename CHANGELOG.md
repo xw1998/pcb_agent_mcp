@@ -9,6 +9,75 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.62] - 2026-11-01
+
+立创 **`.epro` 归档「写出去之后，应用认不认」**这一格的实测回答。此前每次 `board_apply` 都会在
+`not_verified` 里自己声明「这份归档写出后从没在 LCEDA Pro 里打开过，所以不宣称应用接受它」。
+本版把它从"不宣称"改成一次**带控制臂与两条负控制**的实测，并把读数随每次 apply 一起带走。
+
+一句话结论：**同一份归档，控制臂回读 `0.25`、写入臂回读 `19.685`（=0.499999 mm，正是计划点名的
+0.5 mm），而计划没点名的另一条线两边都是 `0.3`。** 应用接受我们写的 `.epro`，且只读到我们改的那一个值。
+
+### 判据为什么不是「导入成功」
+
+`extractProjectInfo` 与 `importProjectByProjectFile` 的成功返回**都不是有效判据**：负控制 A
+（zip 结构合法，但 PCB 成员的记录流被换成垃圾 `["BOGUS",1,2,3]` + 一条坏 `LINE`）
+**两个都返回成功、还照样建出了工程**，只有 `eda.pcb_PrimitiveLine.getAll()` 的回读是 `[]`。
+所以本版唯一承认的证据是**几何回读**，负控制 A 就是这个判据会失败的地方。
+
+### 四臂实测（全部 2026-11-01，LCEDA Pro V4.1.60 / bridge `4.1.60.198f38ab`）
+
+| 臂 | 文件 / 字节 / sha256 | `extractProjectInfo` | `import…` 返回 | PCB2 线段回读 |
+| --- | --- | --- | --- | --- |
+| 控制臂（应用自己导出，本模块没动） | `probe_export.epro` / 108580 / `f339d7b0…` | ok | 建成工程 `d24397f2…` | **`[[2,1,21,1,0.25],[1,5,21,5,0.3]]`** |
+| 写入臂（`set_track e1 width_mm 0.5`） | `probe_written.epro` / 108443 / `57d238c9…` | ok | 建成工程 `0fe207c0…` | **`[[2,1,21,1,19.685],[1,5,21,5,0.3]]`** |
+| 负控制 A（合法 zip，记录流换垃圾） | `probe_corrupt.epro` / 95966 / `e8ff189a…` | **仍 ok** | **仍 ok、仍建工程** `41a715b1…` | **`[]`（全丢）** |
+| 负控制 B（根本不是 zip） | — | 未测 | **`undefined`，没建工程** | — |
+
+### 新增
+
+| 项 | 内容 |
+| --- | --- |
+| `edit/epro_edit.ACCEPTED_ARCHIVES` | 容器类型 → 实测条目：`measured_on` / `app` / `bridge` / `door`（那条门到底怎么调）/ `unit` / `run`（四条臂，带 `bytes`+`sha256`+`import_returned`+`lines_read_back`）/ `limits`。当前只有 `epro_zip` 一条 |
+| `_acceptance()` / `_acceptance_report()` | 命中表 → `{container, accepted_by_app: true, measured, read_back, control_read_back}`；**未命中 → `accepted_by_app: None` + 「nothing is claimed」**，不读成"被拒" |
+| `_not_verified_text()` | 命中表时给出两条 sha256、两边回读、以及**四件不覆盖的事**；未命中时**逐字保留 0.0.61 的旧文案** |
+| `apply_plan` / `propose` 的 `app_acceptance` | 新增字段（加字段，不改语义） |
+| `docs/65-归档写后重开.md` | 那条门的完整参数、`File` 要求、`getProjectFile` 导出回路、base64 送字节、回读链路、四臂表、两个负控制为什么必须存在、本轮没证明的五点 |
+
+### 改了什么
+
+| 项 | 变化 | 为什么 |
+| --- | --- | --- |
+| `.epro` 的 `apply_plan().not_verified` | 命中表后换成本轮的实测句子（带读数与四个边界）；未命中的容器**原文案逐字保留** | 继续写"没验过"同样是不诚实，只是反方向。**这是一个显式的输出变化**，单独登记在这里 |
+| `not_implemented_yet` 第 3 条 | 从「no written archive was re-opened」改成实测读数 + 判据为何是回读 + 四条范围 | 清单不能因为一次成功就整条删掉 |
+| `not_implemented_yet` 第 6 条 | 删掉「`.epro` 归档写路径未验」，改成「这条桥本身没走归档（归档那条是另外导入验的）」 | 两件事不许互相顶替 |
+| `tests/test_epro_edit.py` | `test_the_result_names_how_to_undo_it` 的断言跟着换；新增 `TestAppAcceptance` **12 例** | 老断言断的是"没验过"，现在是"验过且写明范围" |
+
+`verified_by_app` 的**语义一行没动**：它说的是「这个 op 形态是厂商被观察到写过的」，与「应用接受这份
+归档」是两件事。所以一个 `verified_by_app=false` 的写入，即使归档被应用接受了，那句话照样留着。
+
+### 边界（不许读成「立创写路径已经全验」）
+
+- **只对一个 app build**（V4.1.60 / bridge `4.1.60.198f38ab`）。换 build 就是换仪器。
+- **只 ZIP 容器**：`.eprj` / `.eprj2`（SQLite）仍 `SQLITE_REFUSED`，`.esch` 仍 `WRITE_UNSUPPORTED_FORMAT`。
+- **只一条门**：`props.importOption='ImportDocument'` + `saveTo.operation='New Project'`。
+  `Existing Project` 门会把归档**合并进**那个工程；`Offline Client Local Path` 门需要未启用的扩展权限。
+- **屏幕未核对**：每条读数都是应用自己的返回值。
+- **回读的几何只有 2 条 LINE、1 块 PCB、1 份归档**。
+- `importProjectByProjectFile` 之后**同一次 invoke 内**读不到内容（`boards:0 / pcbs:[]`），
+  下一次 invoke 才正常——所以不能在同一次调用里判"导入后内容在不在"。
+- bridge 的 `open(path)` **打不开 `.epro`**（session alive 但 `getCurrentProjectInfo()` 空），
+  `.eprj2` 则完整 ⇒ `open` + alive 不是判据。
+
+### 规模
+
+工具数不变（**168**，本版不新增工具）；`--selftest` 仍是 **213/213**；
+`tests/test_epro_edit.py` 49 → **61 例**（新增 `TestAppAcceptance` 12 例）。
+
+| 项 | 读数 |
+| --- | --- |
+| 全量回归 | **2684 例 / OK (skipped=3) / 1575.615 s**（0.0.61 的 2672 + 本轮 12）。**耗时不作性能结论**：本轮机器上同时有 lceda-pro 的 5~6 个进程在跑（上一版实测时的情况未记录），只如实记这一次量到的是 1575.615 s。`skipped` 这一次是 3，上一版是 5，**没有排查是哪两条不再跳过**，不当作结论 |
+
 ## [0.0.61] - 2026-11-01
 
 立创编辑器里的**第一次真机写入**，以及由此打开的一道闸门。0.0.60 之前

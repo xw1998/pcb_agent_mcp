@@ -348,7 +348,8 @@ class TestApplyGates(_Case):
         result = self.apply([{"op": "set_track", "id": "l1", "width_mm": 1.0}])
         self.assertIn("board_restore", result["how_to_undo"])
         self.assertTrue(result["checkpoint"]["checkpoint_id"])
-        self.assertIn("never opened in LCEDA Pro", result["not_verified"])
+        self.assertIn("was imported into", result["not_verified"])
+        self.assertIn("NOT established", result["not_verified"])
 
     def test_every_gate_the_module_promises_is_reported(self):
         result = self.apply([{"op": "set_text", "id": "s1", "text": "REV C"}])
@@ -409,6 +410,99 @@ class TestArchiveShape(_Case):
         self.assertTrue(member.is_verbatim())
         self.assertEqual([d.kind for d in member.documents], ["FOOTPRINT", "PCB"])
 
+
+class TestAppAcceptance(unittest.TestCase):
+    """The one thing only the application can answer: does it open what we wrote?
+
+    Every reading below was taken on 2026-11-01 against LCEDA Pro V4.1.60
+    (bridge 4.1.60.198f38ab); the numbers are transcribed from that run, and the
+    tests hold the table to being internally consistent with the plan that
+    produced it - a table that drifts from its own geometry would still pass a
+    "the key exists" check, so the arithmetic is asserted too.
+    """
+
+    def test_a_measured_container_is_declared(self):
+        entry = X.ACCEPTED_ARCHIVES["epro_zip"]
+        self.assertEqual(entry["measured_on"], "2026-11-01")
+        self.assertIn("V4.1.60", entry["app"])
+        self.assertEqual(entry["bridge"], "4.1.60.198f38ab")
+        self.assertIn("importProjectByProjectFile", entry["door"])
+        self.assertEqual(entry["unit"], "mil")
+
+    def test_the_table_carries_both_arms_and_both_negative_controls(self):
+        arms = [r["arm"] for r in X.ACCEPTED_ARCHIVES["epro_zip"]["run"]]
+        self.assertEqual(sorted(arms), ["control", "negative_control_a",
+                                        "negative_control_b", "written"])
+
+    def test_the_written_arm_differs_from_the_control_only_where_planned(self):
+        run = {r["arm"]: r for r in X.ACCEPTED_ARCHIVES["epro_zip"]["run"]}
+        control = run["control"]["lines_read_back"]
+        written = run["written"]["lines_read_back"]
+        self.assertEqual(len(control), len(written))
+        changed = [(c, w) for c, w in zip(control, written) if c != w]
+        self.assertEqual(len(changed), 1, written)
+        # the record the plan named: id 1, width 0.5 mm expressed in mil
+        self.assertEqual(changed[0][0][:4], [2, 1, 21, 1])
+        self.assertAlmostEqual(changed[0][1][-1] * 0.0254, 0.5, places=4)
+        self.assertEqual(changed[0][0][-1], 0.25)
+
+    def test_the_size_drop_is_explained_by_the_shorter_number(self):
+        run = {r["arm"]: r for r in X.ACCEPTED_ARCHIVES["epro_zip"]["run"]}
+        # "0.25" -> "19.685" is a longer field, "0.3" stayed; the archive is
+        # deflated, so a smaller total is expected and not evidence of loss.
+        self.assertLess(run["written"]["bytes"], run["control"]["bytes"])
+
+    def test_the_garbage_stream_arm_reads_back_nothing(self):
+        run = {r["arm"]: r for r in X.ACCEPTED_ARCHIVES["epro_zip"]["run"]}
+        self.assertEqual(run["negative_control_a"]["lines_read_back"], [])
+        self.assertIn("proves nothing", run["negative_control_a"]["import_returned"])
+        self.assertIn("undefined",
+                      run["negative_control_b"]["import_returned"])
+
+    def test_every_run_states_its_bytes_and_sha256(self):
+        for rec in X.ACCEPTED_ARCHIVES["epro_zip"]["run"]:
+            if "sha256" in rec:
+                self.assertEqual(len(rec["sha256"]), 64, rec["arm"])
+                self.assertGreater(rec["bytes"], 0, rec["arm"])
+
+    def test_the_limits_name_the_scope(self):
+        limits = " ".join(X.ACCEPTED_ARCHIVES["epro_zip"]["limits"])
+        for word in ("build", "ZIP", "Existing Project", "screen"):
+            self.assertIn(word, limits)
+
+    def test_the_report_carries_the_read_back_numbers(self):
+        report = X._acceptance_report("epro_zip")
+        self.assertTrue(report["accepted_by_app"])
+        self.assertIsNotNone(report["measured"])
+        self.assertEqual(report["read_back"][0][-1], 19.685)
+        self.assertEqual(report["control_read_back"][0][-1], 0.25)
+
+    def test_an_unmeasured_container_claims_nothing(self):
+        for kind in ("eprj_sqlite", "esch_json", None, ""):
+            report = X._acceptance_report(kind)
+            self.assertIsNone(report["accepted_by_app"], kind)
+            self.assertIsNone(report["measured"], kind)
+            self.assertIn("nothing is claimed", report["note"])
+
+    def test_the_fallback_sentence_is_the_old_one(self):
+        # An unmeasured container must not silently inherit the new claim.
+        text = X._not_verified_text("eprj_sqlite", True)
+        self.assertIn("never opened in LCEDA Pro", text)
+        self.assertNotIn("was imported into", text)
+        text = X._not_verified_text("eprj_sqlite", False)
+        self.assertIn("the application may ignore it", text)
+        self.assertNotIn("was imported into", text)
+
+    def test_the_claim_sentence_names_the_four_things_it_does_not_cover(self):
+        text = X._not_verified_text("epro_zip", True)
+        self.assertIn("was imported into", text)
+        for word in ("application build", ".eprj/.eprj2", "ImportDocument",
+                     "looking at the window"):
+            self.assertIn(word, text)
+
+    def test_a_write_the_vendor_was_never_seen_making_is_still_reported(self):
+        text = X._not_verified_text("epro_zip", False)
+        self.assertIn("verified_by_app=false", text)
 
 if __name__ == "__main__":
     unittest.main()
