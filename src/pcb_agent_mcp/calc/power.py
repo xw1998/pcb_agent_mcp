@@ -11,6 +11,7 @@ Units are fixed and stated: mm, um, A, V, ohm, K, W. Copper is 1.724e-8 ohm*m at
 import math
 
 from .result import ok, err
+from .cavity import COPPER_SIGMA
 
 RHO_CU_20 = 1.724e-8      # ohm*m, annealed copper (IACS 100%)
 ALPHA_CU = 0.00393        # 1/K, 0..100 C linear region
@@ -313,11 +314,10 @@ EPS0 = 8.8541878128e-12
 C0 = 299792458.0
 
 _PLANE_NOT_COMPUTED = (
-    "the plane impedance CURVE. The modal sum for an open-edged plane pair "
-    "converges far too slowly near and above its first resonance to be quoted: "
-    "measured here, |Z| at 1.45 GHz moves 5.6 -> 9.4 ohm when the truncation goes "
-    "from order 10 to 40, so a curve would be a function of the truncation order, "
-    "not of your board. Only the single-mode peaks are reported",
+    "the plane impedance CURVE, from THIS function. Each row here is one "
+    "single-mode peak; the tails of the other modes are not summed. For the "
+    "curve use pdn_plane_impedance, which sums the whole series with a finite "
+    "pad and refuses to answer until the truncation order has stopped moving",
     "via barrel / antipad inductance and the capacitance of the gaps around them",
     "split planes, moats and return-path discontinuities",
     "copper loss and radiation: the only damping here is the loss tangent the "
@@ -347,8 +347,10 @@ def pdn_plane_modes(width_mm, height_mm, er, thickness_mm, tan_delta,
     right; see tests/test_pdn_plane.py, which does exactly that.
 
     Only the peaks are reported, and each peak is the single-mode estimate. The
-    sum over the OTHER modes is not computed, because it does not converge (see
-    not_computed) - so do not read two adjacent numbers here as a curve.
+    sum over the OTHER modes is not computed here - see not_computed, and note
+    that the summed CURVE now exists as pdn_plane_impedance (a finite pad is
+    what gives that sum a limit) - so do not read two adjacent numbers here as
+    a curve.
 
     tan_delta is required: with no loss the peak is infinite and "R ohm" would be
     a made-up number. Q = 1/tan_delta is the ONLY damping in the model, so the
@@ -517,12 +519,527 @@ def pdn_plane_modes(width_mm, height_mm, er, thickness_mm, tan_delta,
               basis="|Z_peak_mn| = w*mu0*t*psi_mn(r1)*psi_mn(r2)*Q/k_mn^2 at "
                     "f_mn = c/(2*sqrt(er))*sqrt((m/a)^2+(n/b)^2), Q = 1/tan_delta",
               precision="single-mode peak. The other modes' tails are NOT summed "
-                        "(that sum does not converge), so two adjacent rows are not "
-                        "a curve and no anti-resonance is claimed",
+                        "here, so two adjacent rows are not a curve and no "
+                        "anti-resonance is claimed; the summed curve is "
+                        "pdn_plane_impedance (finite pad, gated on order)",
               assumptions={"er": e, "thickness_mm": t, "tan_delta": td,
                            "loss": "dielectric only - no copper, no radiation"},
               extra=extra)
 
+
+# ---------------------------------------------------------------------------
+# The plane impedance CURVE: the modal sum, with the aperture that makes it sum
+# ---------------------------------------------------------------------------
+_PLANE_CURVE_NOT_COMPUTED = (
+    "die package, via barrel and antipad inductance, and the capacitance of the "
+    "gap around a via - the ports here are area-averaged pads on an ideal "
+    "cavity, not a via inside a real pad/antipad stack",
+    "split planes, moats and every return-path discontinuity: the model is one "
+    "unbroken rectangle with PMC side walls",
+    "radiation Q, surface roughness, glass-weave Dk inhomogeneity, and the "
+    "open-edge detuning of the mode frequencies (a real plane rings a few "
+    "percent LOW of the PMC values used here)",
+    "the capacitors and packages mounted across the planes. They are usually "
+    "the DOMINANT damping of a real PDN resonance and they are not in this sum, "
+    "so the Q here is an upper bound and the peaks come out too high and too "
+    "narrow - this curve is the planes alone",
+    "any verdict: a resonance matters only together with an excitation and a "
+    "coupling, and neither is in this number",
+)
+
+# 1-D aperture factor: the pad's own average of one eigenfunction
+def _ap_sinc(u):
+    if u == 0.0:
+        return 1.0
+    return math.sin(u) / u
+
+def _plane_q_of(f_hz, h_m, tan_delta, sigma):
+    """Q of one cavity mode: copper (Qc = h/delta_s) and dielectric (Qd = 1/tand).
+
+    Returns (q_total, q_copper, q_dielectric). At f = 0, or with sigma None
+    (ideal copper), there is no conductor loss: a uniform field has H = 0
+    between the plates, so the (0,0) mode is damped by the dielectric only.
+    """
+    qd = 1.0 / tan_delta
+    if f_hz <= 0.0 or sigma is None:
+        return qd, None, qd
+    delta_s = math.sqrt(1.0 / (math.pi * f_hz * MU0 * sigma))
+    qc = h_m / delta_s
+    return 1.0 / (1.0 / qc + 1.0 / qd), qc, qd
+
+def _plane_modal_z(f_hz, a_m, b_m, h_m, er, tan_delta, sigma, order, p1, p2,
+                   ap_x_m=0.0, ap_y_m=0.0):
+    """Transfer impedance between two ports, modes m,n = 0..order.
+
+        Z = j*w*mu0*h * sum_mn  A_mn / (k_mn^2 - kap^2),   kap^2 = k^2*(1 - j/Q)
+        A_mn = (c_m c_n)^2/(a b) * chi_m(x1) chi_m(x2) chi_n(y1) chi_n(y2)
+               * S_x(m)^2 * S_y(n)^2
+        chi_i = cos(i*pi*x/a),  S = sin(u)/u averaged over the pad,
+        u = i*pi*s/(2a),  Q = Q(f) = 1/(1/Qc + 1/Qd),  Qc = h/delta_s
+
+    Why Q is evaluated at f and not at f_mn: the loss is put into the medium
+    (one complex wavenumber for the whole cavity), which is the classical lossy
+    cavity and needs no per-mode bookkeeping. At resonance the two conventions
+    are identical, and off resonance the difference is that a high mode gets a
+    little more damping than its own frequency would give - which changes |Z|
+    where that mode is not what you are looking at.
+
+    The aperture factor S is the whole reason this converges. With a point port
+    (S = 1) the tail of the double sum is 1/(m^2+n^2) and the sum has no limit -
+    a point source in a 2-D sheet has a logarithmically infinite reactance.
+    Averaging the eigenfunction over a pad of side s multiplies the tail by
+    about (2a/(pi s m))^2 (2b/(pi s n))^2, so the sum is finite once the
+    truncation passes m ~ 2a/(pi s). Physically: a pad cannot couple to a mode
+    whose half-wavelength is shorter than the pad.
+
+    ap_x_m/ap_y_m = 0 is a point port: the divergent case. It is kept because
+    the negative control has to be able to run it.
+    """
+    if f_hz <= 0.0:
+        return None
+    w = 2.0 * math.pi * f_hz
+    k2 = w * w * MU0 * EPS0 * er
+    q, _qc, _qd = _plane_q_of(f_hz, h_m, tan_delta, sigma)
+    kap2 = k2 * (1.0 - 1j / q)
+    n_i = order + 1
+    pi = math.pi
+    # per-index tables: eigenfunction at each port, pad average, normalisation
+    cx1 = [math.cos(pi * m * p1[0] / a_m) for m in range(n_i)]
+    cx2 = [math.cos(pi * m * p2[0] / a_m) for m in range(n_i)]
+    cy1 = [math.cos(pi * n * p1[1] / b_m) for n in range(n_i)]
+    cy2 = [math.cos(pi * n * p2[1] / b_m) for n in range(n_i)]
+    sx = [1.0] * n_i
+    sy = [1.0] * n_i
+    if ap_x_m > 0.0:
+        for m in range(1, n_i):
+            sx[m] = _ap_sinc(pi * m * ap_x_m / (2.0 * a_m))
+    if ap_y_m > 0.0:
+        for n in range(1, n_i):
+            sy[n] = _ap_sinc(pi * n * ap_y_m / (2.0 * b_m))
+    # ax[m] = (c_m^2/2) * S^2 * chi(x1) chi(x2), folded so that the 2/(a b)
+    # of the eigenfunction normalisation comes out of the loop
+    scale = 1.0 / (a_m * b_m)
+    ax = [((1.0 if m == 0 else 2.0) * sx[m] * sx[m] * cx1[m] * cx2[m])
+          for m in range(n_i)]
+    ay = [((1.0 if n == 0 else 2.0) * sy[n] * sy[n] * cy1[n] * cy2[n])
+          for n in range(n_i)]
+    kx2 = [pi * m / a_m for m in range(n_i)]
+    kx2 = [v * v for v in kx2]
+    tot = 0j
+    for m in range(n_i):
+        base = kx2[m]
+        am = ax[m] * scale
+        if am == 0.0:
+            continue
+        inner = 0j
+        for n in range(n_i):
+            kn = pi * n / b_m
+            inner += ay[n] / (base + kn * kn - kap2)
+        tot += am * inner
+    return 1j * w * MU0 * h_m * tot
+
+def _plane_aperture(v, a, b):
+    """port_size_mm given as one number (square) or [x, y]."""
+    if v is None:
+        return None, None
+    if isinstance(v, (list, tuple)):
+        try:
+            sx, sy = float(v[0]), float(v[1])
+        except (TypeError, ValueError, IndexError):
+            return "bad", "bad"
+    else:
+        try:
+            sx = sy = float(v)
+        except (TypeError, ValueError):
+            return "bad", "bad"
+    if sx <= 0.0 or sy <= 0.0:
+        return "bad", "bad"
+    if sx >= min(a, b) * 0.5 or sy >= min(a, b) * 0.5:
+        return "wide", "wide"
+    return sx, sy
+
+def pdn_plane_impedance(width_mm, height_mm, er, thickness_mm, tan_delta=None,
+                        port_mm=None, port_size_mm=None, probe_mm=None,
+                        f_start_hz=None, f_stop_hz=None, points=100,
+                        freqs_hz=None, max_order=256, tolerance=0.01,
+                        conductivity_s_m=COPPER_SIGMA):
+    """|Z(f)| of one plane pair, as a CURVE: the modal sum, with a convergence gate.
+
+    pdn_plane_modes reports the single-mode peaks and refuses the curve, because
+    a POINT port makes the modal sum diverge (measured here on a 50x50 mm pair
+    at 2 GHz: 5.7 -> 19.2 ohm between order 8 and 256, still climbing, no
+    limit). The divergence is a property of the point
+    source, not of the physics: a real pad has a finite size, and averaging the
+    eigenfunction over that pad turns the sum into a convergent one. So the one
+    argument that was missing is the pad size - and it is required here, because
+    with a smaller pad the answer is a function of the truncation order and
+    nothing else.
+
+    What you get back:
+      * the curve, sampled on your grid PLUS every cavity mode inside the band
+        (the peaks are narrow - Q is 20..100 - so a grid alone would step over
+        them; the mode frequencies are inserted, and the tool says so);
+      * the peak |Z| and where it is, and the deepest DIP between modes, which
+        is the number a capacitor bank has to beat;
+      * the truncation order it settled on, the relative change that bought it,
+        and the whole order scan - so the number can be audited rather than
+        trusted.
+
+    Damping. Two mechanisms, both from the same geometry: Qc = h/delta_s (which
+    drops a, b and m,n - see plane_q) and Qd = 1/tan_delta. They add as
+    reciprocals. Pass conductivity_s_m=None for ideal copper (that is also how
+    the earlier point-port measurement is reproduced, which is why the negative
+    control is exact rather than approximate).
+
+    Not modelled, and these can dominate: everything in not_computed, first of
+    which is the decoupling capacitors themselves - they are usually the biggest
+    loss across a plane pair, so the peaks here are too high and too narrow.
+    """
+    def num(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        return v
+
+    a = num(width_mm)
+    b = num(height_mm)
+    e = num(er)
+    t = num(thickness_mm)
+    td = num(tan_delta)
+    for name, v in (("width_mm", a), ("height_mm", b), ("er", e),
+                    ("thickness_mm", t)):
+        if v is None:
+            return err("%s is required and must be a number" % name, "ARG_REQUIRED")
+        if v <= 0.0:
+            return err("%s must be > 0" % name, "ARG_RANGE", extra={"offending": name})
+    if e < 1.0:
+        return err("er must be >= 1", "ARG_RANGE", extra={"er": e})
+    if td is None:
+        return err("tan_delta is required: with no loss every mode peak is "
+                   "infinite and the curve has no value at a resonance",
+                   "ARG_REQUIRED",
+                   hint="FR4 is 0.015..0.025. Copper loss cannot stand in for "
+                        "it - Qd = 1/tan_delta is the only damping a dielectric "
+                        "with no stated loss tangent has")
+    if td <= 0.0 or td >= 1.0:
+        return err("tan_delta must be in (0, 1)", "ARG_RANGE",
+                   extra={"tan_delta": td})
+    # an explicit null means ideal copper: no conductor loss. That switch is not
+    # decoration - it is how the point-port measurement of pdn_plane_modes is
+    # reproduced bit for bit, so the negative control is exact.
+    sg = None if conductivity_s_m is None else num(conductivity_s_m)
+    if sg is not None and sg <= 0.0:
+        return err("conductivity_s_m must be > 0, or null for ideal copper",
+                   "ARG_RANGE", extra={"conductivity_s_m": sg})
+
+    if port_size_mm is None:
+        return err("port_size_mm is required: it is the pad (or via) size, and it "
+                   "is the only thing that makes the modal sum converge",
+                   "ARG_REQUIRED",
+                   hint="with a point port the sum has no limit: measured here on "
+                        "a 50x50 mm pair at 2 GHz it reads 5.7 ohm at order 8, "
+                        "13.7 at 64 and 19.2 at 256, still climbing. Averaging "
+                        "the mode over the pad is what makes that sum converge, "
+                        "so the pad size is part of the answer, not a detail")
+    sx, sy = _plane_aperture(port_size_mm, a, b)
+    if sx == "bad":
+        return err("port_size_mm must be > 0 (a number, or [x, y] for a "
+                   "rectangular pad)", "ARG_RANGE",
+                   extra={"port_size_mm": port_size_mm})
+    if sx == "wide":
+        return err("port_size_mm must stay below half the plane: a pad that "
+                   "wide is not a port, it is a plane", "ARG_RANGE",
+                   extra={"port_size_mm": port_size_mm,
+                          "plane_mm": [a, b]})
+
+    def point(p, name):
+        if p is None:
+            return None
+        if isinstance(p, dict):
+            x, y = num(p.get("x_mm")), num(p.get("y_mm"))
+        else:
+            try:
+                x, y = num(p[0]), num(p[1])
+            except (TypeError, IndexError):
+                return "bad"
+        if x is None or y is None:
+            return "bad"
+        if x < 0.0 or y < 0.0 or x > a or y > b:
+            return "out"
+        return (x, y)
+
+    r1 = point(port_mm, "port_mm")
+    if r1 in ("bad", "out"):
+        return err("port_mm must be [x_mm, y_mm] inside the plane", "ARG_RANGE")
+    r2 = point(probe_mm, "probe_mm")
+    if r2 in ("bad", "out"):
+        return err("probe_mm must be [x_mm, y_mm] inside the plane", "ARG_RANGE")
+    if r1 is None:
+        r1 = (0.5 * a, 0.5 * b)
+    if r2 is None:
+        r2 = r1
+
+    tol = num(tolerance)
+    if tol is None or tol <= 0.0 or tol >= 0.5:
+        return err("tolerance must be in (0, 0.5)", "ARG_RANGE",
+                   extra={"tolerance": tolerance})
+    try:
+        order_cap = int(max_order)
+    except (TypeError, ValueError):
+        return err("max_order must be an integer", "ARG_INVALID")
+    if order_cap < 8 or order_cap > 1024:
+        return err("max_order must be in 8..400", "ARG_RANGE")
+
+    a_m, b_m, t_m = a * 1e-3, b * 1e-3, t * 1e-3
+    k_plane = C0 / math.sqrt(e)
+    # _plane_modal_z works in metres; the caller's points are in mm
+    q1 = (r1[0] * 1e-3, r1[1] * 1e-3)
+    q2 = (r2[0] * 1e-3, r2[1] * 1e-3)
+
+    def f_of(m, n):
+        return k_plane * math.sqrt((math.pi * m / a_m) ** 2
+                                   + (math.pi * n / b_m) ** 2) / (2.0 * math.pi)
+
+    f_first = min(f_of(m, n) for m in range(2) for n in range(2) if (m or n))
+
+    # ---- band -------------------------------------------------------------
+    defaulted = False
+    grid = None
+    if freqs_hz is not None:
+        if not isinstance(freqs_hz, (list, tuple)) or not freqs_hz:
+            return err("freqs_hz must be a non-empty list", "ARG_INVALID")
+        grid = []
+        for f in freqs_hz:
+            f = num(f)
+            if f is None or f <= 0.0:
+                return err("every frequency must be > 0", "ARG_RANGE",
+                           extra={"offending": f})
+            grid.append(f)
+        if len(grid) > 2000:
+            return err("freqs_hz is capped at 2000 points", "ARG_RANGE",
+                       extra={"count": len(grid)})
+        lo, hi = min(grid), max(grid)
+        spacing = "caller's list"
+    else:
+        lo = num(f_start_hz)
+        hi = num(f_stop_hz)
+        if lo is None or hi is None:
+            lo, hi = f_first / 50.0, 3.0 * f_first
+            defaulted = True
+        if lo <= 0.0 or hi <= lo:
+            return err("need 0 < f_start_hz < f_stop_hz", "ARG_RANGE",
+                       extra={"f_start_hz": lo, "f_stop_hz": hi})
+        try:
+            npts = int(points)
+        except (TypeError, ValueError):
+            return err("points must be an integer", "ARG_INVALID")
+        if npts < 8 or npts > 2000:
+            return err("points must be in 8..2000", "ARG_RANGE")
+        spacing = "log" if hi / lo > 10.0 else "linear"
+        if spacing == "log":
+            r = (hi / lo) ** (1.0 / (npts - 1))
+            grid = [lo * r ** i for i in range(npts)]
+        else:
+            grid = [lo + (hi - lo) * i / (npts - 1.0) for i in range(npts)]
+
+    # how far in m and n a mode can still sit below f_hi (f_mn >= k_plane*m/(2 pi a))
+    m_lim = int(a_m * 2.0 * math.pi * hi / k_plane) + 1
+    n_lim = int(b_m * 2.0 * math.pi * hi / k_plane) + 1
+
+    # ---- the order scan, on the frequencies that decide it -----------------
+    # The peak is the most truncation-sensitive point on the curve, so the scan
+    # includes every mode inside the band; a dozen points is enough to certify
+    # the whole grid, and the full grid is then computed once.
+    probe_f = []
+    for m in range(m_lim + 1):
+        for n in range(n_lim + 1):
+            if not (m or n):
+                continue
+            fmn = f_of(m, n)
+            if lo <= fmn <= hi and fmn not in probe_f:
+                probe_f.append(fmn)
+            if len(probe_f) >= 10:
+                break
+        if len(probe_f) >= 10:
+            break
+    mid = lo
+    while mid < hi and len(probe_f) < 12:
+        mid *= 1.7
+        if mid < hi:
+            probe_f.append(mid)
+    probe_f.sort()
+
+    def scan(order):
+        return [_plane_modal_z(f, a_m, b_m, t_m, e, td, sg, order, q1, q2,
+                               sx * 1e-3, sy * 1e-3) for f in probe_f]
+
+    def rel_change(z_old, z_new):
+        """Change of the answer, measured against the PEAK it contains.
+
+        Not point by point: below the first mode the plane pair is the parallel
+        combination of its capacitance and its spreading inductance, so there is
+        a frequency where the two cancel and |Z| collapses. Near that dip |Z| is
+        the difference of two larger reactive terms, and a point-wise relative
+        tolerance there is unmeetable however many modes you add (measured: the
+        dip is still moving 2.5 % while every other point has settled to 0.02 %).
+        The error that matters is the error on the scale of the answer, so it is
+        measured against max|Z| over the probe set. Both numbers are reported.
+        """
+        scale = 0.0
+        for z in z_new:
+            if z is not None and abs(z) > scale:
+                scale = abs(z)
+        worst = 0.0
+        where = None
+        pointwise = 0.0
+        for f, zo, zn in zip(probe_f, z_old, z_new):
+            if zo is None or zn is None:
+                continue
+            d = abs(zn - zo)
+            if zn != 0:
+                pointwise = max(pointwise, d / abs(zn))
+            d = d / scale if scale else d
+            if d > worst:
+                worst, where = d, f
+        return worst, where, pointwise
+
+    order = 8
+    z_prev = scan(order)
+    history = []
+    accepted = None
+    while True:
+        order_next = order * 2
+        if order_next > order_cap:
+            order_next = order_cap
+        z_next = scan(order_next)
+        rc, where, pw_change = rel_change(z_prev, z_next)
+        history.append({"order": order_next,
+                        "max_change_rel_to_peak": _sig(rc),
+                        "max_pointwise_relative_change": _sig(pw_change),
+                        "worst_freq_hz": _sig(where)})
+        if rc <= tol:
+            accepted = order_next
+            break
+        if order_next >= order_cap:
+            return err(
+                "the modal sum had not settled at order %d: |Z| still moves "
+                "%.4g%% of the band peak at %.6g Hz when the truncation doubles, "
+                "against a tolerance of %.4g%%. A smaller pad makes this worse, "
+                "not better - the aperture is what regularises the series"
+                % (order_next, 100.0 * rc, where or 0.0, 100.0 * tol),
+                "NOT_CONVERGED",
+                hint="widen port_size_mm (the pad, not the via drill) or raise "
+                     "max_order. Without a finite pad the sum has no limit, "
+                     "which is exactly why pdn_plane_modes refuses the curve",
+                extra={"order_reached": order_next,
+                       "max_change_rel_to_peak": _sig(rc),
+                       "max_pointwise_relative_change": _sig(pw_change),
+                       "worst_freq_hz": _sig(where),
+                       "order_scan": history})
+        order, z_prev = order_next, z_next
+
+    # ---- the curve --------------------------------------------------------
+    # insert every mode inside the band: the peaks have Q = 20..100, so a grid
+    # of a few hundred points steps right over them
+    insert = []
+    for m in range(min(accepted, m_lim) + 1):
+        for n in range(min(accepted, n_lim) + 1):
+            if not (m or n):
+                continue
+            fmn = f_of(m, n)
+            if lo <= fmn <= hi:
+                insert.append(fmn)
+    curve = sorted(set([round(f, 6) for f in grid] + [round(f, 6) for f in insert]))
+    if len(curve) > 240:
+        # keep the caller's grid honest by thinning it, never the mode peaks
+        keep = set(round(f, 6) for f in insert)
+        stride = int(math.ceil(len(curve) / 240.0))
+        curve = [f for i, f in enumerate(curve) if i % stride == 0 or f in keep]
+
+    rows = []
+    for f in curve:
+        z = _plane_modal_z(f, a_m, b_m, t_m, e, td, sg, accepted, q1, q2,
+                           sx * 1e-3, sy * 1e-3)
+        if z is None:
+            continue
+        rows.append({"freq_hz": _sig(f), "z_ohm": _sig(abs(z)),
+                     "phase_deg": _sig(math.degrees(math.atan2(z.imag, z.real)), 5)})
+
+    peak = max(rows, key=lambda r: r["z_ohm"])
+    # the dip the caps have to beat: the lowest |Z| strictly between two modes.
+    # Below the first mode the curve is the capacitance (it only falls), so a dip
+    # only means something when there is a mode under it.
+    first_mode = min(insert) if insert else None
+    dips = [r for r in rows if first_mode is not None and r["freq_hz"] > first_mode]
+    dip = min(dips, key=lambda r: r["z_ohm"]) if dips else None
+
+    # ---- integrity gate: the very same constants must rebuild the plane cap --
+    f_chk = f_first / 1000.0
+    z_chk = _plane_modal_z(f_chk, a_m, b_m, t_m, e, td, sg, accepted, q1, q2,
+                           sx * 1e-3, sy * 1e-3)
+    c_pp = EPS0 * e * a_m * b_m / t_m
+    z_cap = 1.0 / (2.0 * math.pi * f_chk * c_pp)
+    anchor = abs(abs(z_chk) / z_cap - 1.0) * 100.0
+    if anchor > 1.0:
+        return err("the modal constants no longer rebuild the plane capacitance: "
+                   "%.4g ohm against %.4g ohm at %.6g Hz (%.3g%% off). The curve "
+                   "would be wrong by the same factor"
+                   % (abs(z_chk), z_cap, f_chk, anchor),
+                   "INTERNAL_CHECK_FAILED",
+                   extra={"capacitance_anchor_error_pct": _sig(anchor)})
+
+    q_first, qc_first, qd_first = _plane_q_of(f_first, t_m, td, sg)
+    extra = {
+        "curve": rows,
+        "curve_points": len(rows),
+        "peak_z_ohm": peak["z_ohm"],
+        "peak_freq_hz": peak["freq_hz"],
+        "dip_z_ohm": dip["z_ohm"] if dip else None,
+        "dip_freq_hz": dip["freq_hz"] if dip else None,
+        "band_hz": [_sig(lo), _sig(hi)],
+        "band_defaulted": defaulted,
+        "spacing": spacing,
+        "mode_frequencies_inserted": len(insert),
+        "first_resonance_hz": _sig(f_first),
+        "first_mode_q": _sig(q_first),
+        "first_mode_q_copper": _sig(qc_first),
+        "first_mode_q_dielectric": _sig(qd_first),
+        "plane_capacitance_f": _sig(c_pp),
+        "truncation_order": accepted,
+        "truncation_max_change_rel_to_peak": history[-1]["max_change_rel_to_peak"],
+        "truncation_max_pointwise_relative_change":
+            history[-1]["max_pointwise_relative_change"],
+        "truncation_tolerance": tol,
+        "order_scan": history,
+        "capacitance_anchor_error_pct": _sig(anchor),
+        "port_mm": [r1[0], r1[1]],
+        "probe_mm": [r2[0], r2[1]],
+        "port_size_mm": [sx, sy],
+        "copper_loss": "included (Qc = h/delta_s)" if sg else
+                       "off: ideal copper, dielectric loss only",
+        "not_computed": list(_PLANE_CURVE_NOT_COMPUTED),
+    }
+    return ok(peak["z_ohm"], unit="ohm",
+              model="lossy_PMC_cavity_modal_sum_with_finite_pad_aperture",
+              basis="Z = j*w*mu0*h*sum_mn A_mn/(k_mn^2 - k^2*(1 - j/Q_mn)), "
+                    "A_mn = (c_m c_n)^2/(a b)*prod cos * pad average S_x^2 S_y^2, "
+                    "1/Q_mn = 1/Qc + 1/Qd, Qc = h/delta_s, Qd = 1/tan_delta",
+              precision="the curve is quoted at the truncation order in "
+                        "order_scan, where doubling the order moved it by less "
+                        "than truncation_tolerance. At a smaller pad the sum has "
+                        "no limit and the tool refuses instead of returning one",
+              assumptions={"er": e, "thickness_mm": t, "tan_delta": td,
+                           "conductivity_s_m": sg,
+                           "aperture": "the mode is averaged over a %.4g x %.4g mm "
+                                       "pad, which is what gives the sum a limit"
+                                       % (sx, sy),
+                           "side_walls": "PMC (open edge, no fence)",
+                           "loss": "dielectric + copper; nothing is mounted "
+                                   "across the planes, so Q is an upper bound"},
+              extra=extra)
 
 def pdn_impedance(freqs_hz, caps, plane_cap_farad=None, r_series_ohm=0.0,
                   plane=None):

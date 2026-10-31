@@ -266,11 +266,16 @@ class TestPdnIntegration(unittest.TestCase):
 
 class TestEnvelopeHonesty(unittest.TestCase):
 
-    def test_the_not_computed_list_names_the_convergence_problem(self):
+    def test_the_not_computed_list_points_at_the_curve_tool(self):
+        """0.0.49: the list used to say the sum "does not converge". The sum does
+        converge once the port has a pad, so the honest statement is now "not
+        summed HERE - see pdn_plane_impedance, which gates on the truncation
+        order". The other four gaps must survive verbatim."""
         r = _call()
         blob = " ".join(r["not_computed"]).lower()
-        self.assertIn("converges", blob)
+        self.assertIn("pdn_plane_impedance", blob)
         self.assertIn("truncation", blob)
+        self.assertNotIn("does not converge", blob)
         self.assertIn("via barrel", blob)
         for word in ("split planes", "copper loss", "open-edge"):
             self.assertIn(word, blob)

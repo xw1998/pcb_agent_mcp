@@ -3567,7 +3567,8 @@ def _capabilities(_args):
             "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
-            "ir_drop_chain", "pdn_impedance", "pdn_plane_modes", "decoupling_check",
+            "ir_drop_chain", "pdn_impedance", "pdn_plane_modes",
+            "pdn_plane_impedance", "decoupling_check",
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_convection",
             "board_ir_drop",
@@ -3869,13 +3870,17 @@ def _capabilities(_args):
             "density a fab will qualify), arc/plasma behaviour after the copper opens, "
             "and board_ir_drop's A/mm^2 verdict - that tool still reports density with "
             "no criterion attached",
-            "The plane impedance CURVE (as opposed to its mode peaks): pdn_impedance / "
-            "decoupling_check are lumped RLC in parallel and can prove a bank is clearly "
-            "insufficient but not that it is sufficient; pdn_plane_modes gives the peak "
-            "|Z| at each cavity mode inside the band, but the modal SUM is not computed "
-            "because it does not converge (it moves with the truncation order), so no "
-            "anti-resonance between the plane and the caps is claimed. Die-package "
-            "inductance, split planes and via-barrel inductance are all outside",
+            "The plane-caps ANTI-RESONANCE, even now that the plane curve exists: "
+            "pdn_plane_impedance sums the cavity series for a finite pad and returns "
+            "the planes alone - no caps, no packages, no vias - and pdn_impedance / "
+            "decoupling_check are lumped RLC. Putting the two together is what would "
+            "show the peak where a cap bank turns inductive and the plane turns "
+            "capacitive; that is not done, so no anti-resonance is claimed and the Q "
+            "of a plane peak is an UPPER bound (a real bank damps it and the dips "
+            "here come out deeper than the board will). Still outside: die-package "
+            "inductance, split planes and moats, via-barrel / antipad inductance, "
+            "radiation Q, and the open-edge detuning that makes a real plane ring a "
+            "few percent below the PMC frequencies used here",
             "Thermal vias are a barrel model, by name: thermal_via_array takes the "
             "wall as a profile (barrel_profile, series sum, so mid-barrel thinning is "
             "no longer assumed away) and a series TIM/pad layer (interface, from the "
@@ -5221,9 +5226,9 @@ _tool(
     "Peak |Z| at each parallel-plate (cavity) mode of a plane pair, from the single mode "
     "that rings: |Z_peak| = w*mu0*t*psi_mn(r1)*psi_mn(r2)*Q/k_mn^2 with Q = 1/tan_delta. "
     "Modes with a voltage null at either point are reported as uncoupled instead of as a "
-    "tiny number. Only peaks are given - the SUM over modes does not converge near and "
-    "above the first resonance (measured: |Z| at 1.45 GHz moves 5.6 -> 9.4 ohm when the "
-    "truncation goes from order 10 to 40), so no curve and no anti-resonance is claimed. "
+    "tiny number. Only peaks are given HERE; the summed curve is pdn_plane_impedance, "
+    "which converges once the port has a finite pad and refuses to answer until the "
+    "truncation order stops moving. Neither tool claims an anti-resonance with the caps. "
     "tan_delta is required because a lossless cavity has an infinite peak.",
     {"type": "object", "properties": {
         "width_mm": _num("plane width"),
@@ -5248,6 +5253,61 @@ _tool(
         probe_mm=a.get("probe_mm"), port_mm=a.get("port_mm"),
         band_hz=a.get("band_hz"),
         max_order=(a.get("max_order") if a.get("max_order") is not None else 6)),
+)
+
+_tool(
+    "pdn_plane_impedance",
+    "The plane impedance CURVE, not just its peaks: Z(f) = j*w*mu0*t * sum_mn "
+    "A_mn/(k_mn^2 - k^2(1 - j/Q)) between two points on a plane pair, with copper and "
+    "dielectric loss. A POINT port makes that sum diverge (measured on 50x50 mm at 2 GHz: "
+    "5.7 -> 19.2 ohm from order 8 to 256, still climbing), so port_size_mm - the pad or via "
+    "the current actually spreads over - is REQUIRED: averaging the eigenfunction over the "
+    "pad is what gives the sum a limit. Answers only after a truncation scan has stopped "
+    "moving (NOT_CONVERGED otherwise). Reports the peak |Z|, the deepest dip between modes, "
+    "and the first mode's Q. The curve is the PLANES ALONE: no caps, no package, no vias - "
+    "so Q is an upper bound and the dips come out deeper than a real board's.",
+    {"type": "object", "properties": {
+        "width_mm": _num("plane width"),
+        "height_mm": _num("plane height"),
+        "er": _num("relative permittivity of the dielectric between the planes"),
+        "thickness_mm": _num("plane separation"),
+        "tan_delta": _num("loss tangent of that dielectric (FR4 is 0.015..0.025). Required: "
+                          "a lossless cavity has no finite impedance at a resonance"),
+        "port_mm": {"type": "array", "description":
+                    "[x_mm, y_mm] the current is injected at (default: the centre)",
+                    "items": {"type": "number"}},
+        "port_size_mm": {"description":
+                         "the pad the current spreads over, in mm: one number for a square "
+                         "pad, or [x_mm, y_mm]. Required - a point port has no limit",
+                         "oneOf": [{"type": "number"},
+                                   {"type": "array", "items": {"type": "number"}}]},
+        "probe_mm": {"type": "array", "description":
+                     "[x_mm, y_mm] where Z is measured (default: the port itself)",
+                     "items": {"type": "number"}},
+        "f_start_hz": _num("band start (default: f10/50)"),
+        "f_stop_hz": _num("band stop (default: 3*f10)"),
+        "points": _num("log-spaced points on top of the mode frequencies (default 100)"),
+        "freqs_hz": {"type": "array", "description":
+                     "explicit frequencies; then f_start_hz/f_stop_hz/points are ignored",
+                     "items": {"type": "number"}},
+        "max_order": _num("highest modal index per axis the truncation scan may reach "
+                          "(8..1024, default 256)"),
+        "tolerance": _num("accepted max|dZ|/max|Z| between the last two orders "
+                          "(default 0.01)"),
+        "conductivity_s_m": _num("copper conductivity, S/m; null = ideal copper"),
+    }, "required": ["width_mm", "height_mm", "er", "thickness_mm", "tan_delta",
+                    "port_mm", "port_size_mm"]},
+    lambda a: _power.pdn_plane_impedance(
+        a.get("width_mm"), a.get("height_mm"), a.get("er"),
+        a.get("thickness_mm"), a.get("tan_delta"),
+        port_mm=a.get("port_mm"), port_size_mm=a.get("port_size_mm"),
+        probe_mm=a.get("probe_mm"),
+        f_start_hz=a.get("f_start_hz"), f_stop_hz=a.get("f_stop_hz"),
+        points=(a.get("points") if a.get("points") is not None else 100),
+        freqs_hz=a.get("freqs_hz"),
+        max_order=(a.get("max_order") if a.get("max_order") is not None else 256),
+        tolerance=(a.get("tolerance") if a.get("tolerance") is not None else 0.01),
+        conductivity_s_m=a.get("conductivity_s_m", _power.COPPER_SIGMA)),
 )
 
 _tool(

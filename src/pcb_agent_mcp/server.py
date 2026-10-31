@@ -1955,6 +1955,59 @@ def selftest():
               and _pm.get("worst_mode_in_band") is not None
               and "NOT the PDN" in str(_pm.get("verdict")),
               str((_pm.get("worst_mode_in_band") or {}).get("f_hz")))
+
+        # --- 0.0.49, the plane CURVE. The sum used to be refused because a point
+        # port makes it diverge; a finite pad is what gives it a limit. Three
+        # independent readings, and the divergence itself as the counter-test.
+        from .calc import power as _pwm
+        _a = _b = 0.05
+        _t = 1.6e-3
+        _cpp = 8.8541878128e-12 * 4.4 * _a * _b / _t
+        _f10 = 299792458.0 / (2.0 * _a * 4.4 ** 0.5)
+        _flo = _f10 / 1000.0
+        r = handle({"jsonrpc": "2.0", "id": 114, "method": "tools/call",
+                    "params": {"name": "pdn_plane_impedance", "arguments": {
+                        "width_mm": 50, "height_mm": 50, "er": 4.4,
+                        "thickness_mm": 1.6, "tan_delta": 0.02,
+                        "port_mm": [12.5, 25.0], "port_size_mm": 0.5,
+                        "freqs_hz": [_flo, _f10]}}})
+        _cw = json.loads(r["result"]["content"][0]["text"])
+        _rows = _cw.get("curve") or []
+        _lo = min(_rows, key=lambda q: abs(q["freq_hz"] - _flo)) if _rows else {}
+        _zcap = 1.0 / (2.0 * 3.141592653589793 * _flo * _cpp)
+        check("curve at f10/1000 IS the parallel-plate capacitance (%.4f vs %.4f ohm)"
+              % (_lo.get("z_ohm", -1), _zcap),
+              _cw.get("status") == "ok"
+              and abs(_lo.get("z_ohm", 0.0) / _zcap - 1.0) < 0.01,
+              str(_lo.get("freq_hz")))
+        _q = _pwm._plane_q_of(_f10, _t, 0.02, _pwm.COPPER_SIGMA)[0]
+        _psi = 2.0 / (_a * _b) * 0.5
+        _w = 2.0 * 3.141592653589793 * _f10
+        _peak = _w * 4e-7 * 3.141592653589793 * _t * _psi * 50.0 / (
+            (3.141592653589793 / _a) ** 2)
+        _peak *= _q * 0.02
+        _hi = min(_rows, key=lambda q: abs(q["freq_hz"] - _f10)) if _rows else {}
+        check("curve at f10 equals the single-mode peak x Q_total*tan_delta "
+              "(%.4f vs %.4f ohm)" % (_hi.get("z_ohm", -1), _peak),
+              abs(_hi.get("z_ohm", 0.0) / _peak - 1.0) < 0.01,
+              str(_hi.get("freq_hz")))
+        _p = (12.5e-3, 25.0e-3)
+        _pt8 = abs(_pwm._plane_modal_z(2e9, _a, _b, _t, 4.4, 0.02,
+                                      _pwm.COPPER_SIGMA, 8, _p, _p))
+        _pt256 = abs(_pwm._plane_modal_z(2e9, _a, _b, _t, 4.4, 0.02,
+                                        _pwm.COPPER_SIGMA, 256, _p, _p))
+        _pad256 = abs(_pwm._plane_modal_z(2e9, _a, _b, _t, 4.4, 0.02,
+                                         _pwm.COPPER_SIGMA, 256, _p, _p,
+                                         0.5e-3, 0.5e-3))
+        _pad384 = abs(_pwm._plane_modal_z(2e9, _a, _b, _t, 4.4, 0.02,
+                                         _pwm.COPPER_SIGMA, 384, _p, _p,
+                                         0.5e-3, 0.5e-3))
+        check("point port still diverges (%.3f -> %.3f ohm, x%.2f) while the same "
+              "sum with a 0.5 mm pad has a limit (%.3f -> %.3f ohm, x%.1f %%)"
+              % (_pt8, _pt256, _pt256 / _pt8, _pad256, _pad384,
+                 100.0 * (_pad384 / _pad256 - 1.0)),
+              _pt256 > 2.0 * _pt8 and abs(_pad384 / _pad256 - 1.0) < 0.01,
+              "%.3f/%.3f" % (_pt256, _pt8))
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
 
