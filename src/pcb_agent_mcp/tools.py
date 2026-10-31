@@ -3739,16 +3739,25 @@ def _capabilities(_args):
             "answer carries that list as not_computed so it cannot be mistaken for a "
             "full answer. The hand-off is deliberate: design here, then simulate or "
             "measure",
-            "DFM rules the fab states that this layer cannot measure: solder-mask "
-            "slivers and mask-defined pitch, silkscreen line width / text height, "
-            "impedance-controlled stackup sign-off (the fab's coupon is the verdict), "
+            "DFM rules the fab states that this layer STILL cannot measure (0.0.56 "
+            "narrowed this list, it did not shorten it): mask-defined pads, where the "
+            "opening is smaller than the copper, and any mask sliver that is not the "
+            "gap between two openings; silkscreen items that state no line width "
+            "(no default is substituted) and silk-over-pad clipping; "
+            "impedance-controlled stackup sign-off (the fab's coupon is the verdict); "
             "process tolerances (hole position, plating and copper weight, board "
-            "thickness), panelisation / tooling rails / V-cut / fiducials, and "
-            "copper-to-finished-hole-wall spacing with plating build-up. They are "
-            "listed in every dfm_check answer as not_checked_by_design. Also NOT "
-            "here: any built-in fab capability table - "
-            "dfm_capability REJECTS a document without a source and does not fill "
-            "the gaps with typical values",
+            "thickness); panelisation / tooling rails / V-cut / fiducials; the "
+            "distinction between a plated and a non-plated slot beyond what the file "
+            "states; barrel taper and hole-size tolerance behind the plating figure, "
+            "and the annular ring AFTER plating, because rings here are measured to "
+            "the drill wall. All of it is listed in every dfm_check answer as "
+            "not_checked_by_design. What IS measured since 0.0.56: silkscreen stroke "
+            "width and character height, the solder-mask web between two openings on "
+            "one side, and another net's copper to the finished hole wall - the last "
+            "one only when the capability document states `plating_um`, and refused "
+            "rather than defaulted when it does not. Also NOT here: any built-in fab "
+            "capability table - dfm_capability REJECTS a document without a source "
+            "and does not fill the gaps with typical values",
             "BGA/thermal via array temperature rise, fuse behaviour, and any IPC-2152 "
             "parameter the published fit drops (board thickness, adjacent copper, "
             "airflow, mask opening): data/ipc2152_tables.json no longer ships an empty "
@@ -5626,11 +5635,14 @@ _tool(
     "known rules it states, which it leaves unanswered, and whether it is usable at all. "
     "An unknown rule key is REJECTED (a typo would otherwise read as 'not stated'), and a "
     "document with no `source` is REJECTED - an unattributed limit cannot be told apart "
-    "from an invented one. This server ships NO fab table on purpose.",
+    "from an invented one. An optional `plating_um` states the fab's hole plating "
+    "build-up (a process figure, not a limit) and is what makes copper-to-finished-hole "
+    "answerable; it is never defaulted. This server ships NO fab table on purpose.",
     {"type": "object", "properties": {
         "capability": {"type": "object", "description":
                        '{"fab": "...", "source": "where the numbers came from", '
-                       '"verified": false, "rules": {"min_track_width_mm": 0.127, ...}}. '
+                       '"verified": false, "plating_um": 25, '
+                       '"rules": {"min_track_width_mm": 0.127, ...}}. '
                        "Rule keys: %s" % ", ".join(sorted(_dfm.RULES))},
     }, "required": ["capability"]},
     lambda a: _dfm.validate(a.get("capability")),
@@ -5640,9 +5652,15 @@ _tool(
     "dfm_check",
     "Compare THIS board against a supplied fab capability document: narrowest track, "
     "copper-to-copper gap, via drill and annular rings, plated-pad rings, hole-to-hole web, "
-    "copper-to-edge, narrowest cut-out, board width/height and copper layer count. The "
-    "limits are the document's, the measurements are the board's, and every rule the "
-    "document leaves out is reported as UNANSWERED rather than passed. " + _NOT_WRITTEN,
+    "copper-to-edge, narrowest cut-out, board width/height, copper layer count, narrowest "
+    "silkscreen stroke, smallest silk character height, narrowest solder-mask web between "
+    "two openings on ONE side, and another net's copper to the FINISHED hole wall (drill "
+    "radius plus the document's `plating_um`). The limits are the document's, the "
+    "measurements are the board's, and every rule the document leaves out is reported as "
+    "UNANSWERED rather than passed. A silk item that states no width is excluded and "
+    "counted, never given a default; copper-to-finished-hole is refused when the document "
+    "states no `plating_um`, because measuring to the drill wall is a different quantity. "
+    + _NOT_WRITTEN,
     {"type": "object", "properties": dict({
         "capability": {"type": "object", "description":
                        "the same document dfm_capability validates"},

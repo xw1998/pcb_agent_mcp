@@ -74,31 +74,77 @@ RULES = {
         "what": "number of copper layers",
         "unit": "count", "direction": "max", "fact": "copper_layers",
     },
+    # 0.0.56: three quantities that used to be listed as "not checked by design"
+    # are measured now, so a capability document can carry a limit for them.
+    "min_silk_line_width_mm": {
+        "what": "narrowest silkscreen stroke (drawn lines and text strokes alike)",
+        "unit": "mm", "direction": "min", "fact": "min_silk_line_width",
+    },
+    "min_silk_text_height_mm": {
+        "what": "smallest silkscreen character height",
+        "unit": "mm", "direction": "min", "fact": "min_silk_text_height",
+    },
+    "min_mask_web_mm": {
+        "what": "narrowest strip of solder mask between two openings on one side",
+        "unit": "mm", "direction": "min", "fact": "min_mask_web",
+    },
+    "min_copper_to_hole_mm": {
+        "what": "smallest gap from another net's copper to a FINISHED hole wall "
+                "(drill radius + the plating the document states)",
+        "unit": "mm", "direction": "min", "fact": "min_copper_to_hole",
+    },
 }
 
 # Things a fab capability document often states that this layer CANNOT check.
 # Listed so "not in the result" is not read as "checked and fine".
 NOT_CHECKED_BY_DESIGN = [
-    "solder mask sliver / mask-defined pitch (needs the mask apertures, which the "
-    "adapter does not project onto copper)",
-    "silkscreen minimum line width and text height (silk is not measured at all here)",
+    # 0.0.56 narrowed this: the web BETWEEN two openings is measured now
+    # (`min_mask_web_mm`). What is still not modelled is a mask feature that does
+    # not come from a gap - a mask-defined pad (opening smaller than the copper)
+    # and a sliver between an opening and the mask's own edge are not judged.
+    "mask-defined pads (an opening smaller than its copper) and any mask sliver "
+    "that is not the gap between two openings",
+    # 0.0.56 narrowed this too: stroke widths and character heights are measured
+    # (`min_silk_line_width_mm`, `min_silk_text_height_mm`). Still not modelled:
+    # items whose width the file does not state, and silk clipping over pads.
+    "silkscreen items that state no line width (no default is substituted), and "
+    "silk-over-pad clipping",
     "impedance-controlled stackup sign-off (see diff_impedance_field; the fab's own "
     "coupon is the verdict)",
     "hole positional tolerance, plating thickness tolerance, board thickness "
     "tolerance, copper weight tolerance - process tolerances, not geometry",
     "panelisation, tooling/break-away rails, V-cut, fiducials and their clearance",
     "non-plated slot vs plated slot distinction beyond what the file states",
-    "copper-to-hole (drill) spacing as the fab measures it from the finished hole "
-    "wall, including plating build-up",
+    # 0.0.56 narrowed this: copper to the finished hole wall IS measured when the
+    # document supplies `plating_um`. The annular ring is still measured to the
+    # DRILL wall - a plated hole's finished ring is smaller, and that is not
+    # folded in, because silently shrinking an existing answer is not a fix.
+    "barrel taper and hole-size tolerance behind the plating figure, and the "
+    "annular ring AFTER plating (rings here are measured to the drill wall)",
     "arc/teardrop smoothing of routed corners (arcs here are polylines)",
 ]
 
 PRECISION = (
     "limits come from the supplied capability document verbatim - this layer does "
     "not round, tighten or invent them; measurements are the same ones the Oracle "
-    "reports elsewhere (polyline arcs, solder-mask expansion and plating build-up "
-    "not modelled), so a measurement within a few microns of a limit should be "
-    "re-read as 'at the limit', not as a pass"
+    "reports elsewhere (arcs are polylines). Solder-mask expansion is applied only "
+    "where the file states it and defaults to 0 where it does not; plating build-up "
+    "is applied only when the document supplies `plating_um`. So a measurement "
+    "within a few microns of a limit should be re-read as 'at the limit', not as "
+    "a pass"
+)
+
+# A process parameter, not a geometry limit: how far the copper in the barrel grows
+# past the drilled wall. It belongs to the same document as the limits (it is a
+# property of the fab) and it is NEVER defaulted - a hole measured to the drill
+# wall and one measured to the finished wall differ by exactly this, and guessing
+# it would decide the verdict.
+PLATING_KEY = "plating_um"
+
+PLATING_NOTE = (
+    "state the fab's hole plating thickness in micrometres, e.g. \"plating_um\": 25; "
+    "without it, copper-to-finished-hole is reported not_checked rather than "
+    "measured against the drill wall"
 )
 
 
@@ -111,6 +157,29 @@ def _rows(rules):
     return [{"rule": k, "what": v["what"], "unit": v["unit"],
              "direction": v["direction"]} for k, v in sorted(RULES.items())
             if k not in rules]
+
+
+def read_plating(doc):
+    """`plating_um` -> (millimetres or None, error or None). Never defaulted."""
+    if not isinstance(doc, dict):
+        return None, None
+    v = doc.get(PLATING_KEY)
+    if v is None:
+        return None, None
+    if not _is_number(v):
+        return None, err("`%s` is not a finite number" % PLATING_KEY,
+                         "CAPABILITY_VALUE_INVALID",
+                         hint=PLATING_NOTE,
+                         extra={"invalid_rules": [{"rule": PLATING_KEY,
+                                                   "value": repr(v),
+                                                   "why": "not a finite number"}]})
+    if v < 0:
+        return None, err("`%s` is negative" % PLATING_KEY,
+                         "CAPABILITY_VALUE_INVALID",
+                         hint=PLATING_NOTE,
+                         extra={"invalid_rules": [{"rule": PLATING_KEY, "value": v,
+                                                   "why": "must be >= 0"}]})
+    return float(v) / 1000.0, None
 
 
 def read_capability(doc):
@@ -135,6 +204,9 @@ def read_capability(doc):
                          hint='state where the numbers came from, e.g. '
                               '"fab capability page, checked 2026-10-28" or '
                               '"quotation #1234 from <fab>"')
+    _plating_mm, plating_err = read_plating(doc)
+    if plating_err:
+        return None, plating_err
     unknown = sorted(k for k in rules if k not in RULES)
     if unknown:
         return None, err("unknown rule key(s): %s - the whole document is rejected, "
@@ -176,6 +248,8 @@ def validate(doc):
         "stated": [{"rule": k, "limit": v, "unit": RULES[k]["unit"],
                     "what": RULES[k]["what"]} for k, v in sorted(rules.items())],
         "not_stated": _rows(rules),
+        "plating_um": (None if doc.get(PLATING_KEY) is None
+                       else float(doc.get(PLATING_KEY))),
         "not_checked_by_design": NOT_CHECKED_BY_DESIGN,
     }
     if not doc.get("verified"):
@@ -288,6 +362,8 @@ def evaluate(doc, facts, tol=0.0):
         "rules_stated": len(rules),
         "rules_known": len(RULES),
         "missing_known_rules": _rows(rules),
+        "plating_um": (None if doc.get(PLATING_KEY) is None
+                       else float(doc.get(PLATING_KEY))),
         "not_checked_by_design": NOT_CHECKED_BY_DESIGN,
     }
     warn = []

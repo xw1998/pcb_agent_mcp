@@ -40,7 +40,8 @@ FACT_KEYS = (
     "nets",               # net names / codes
     "stackup",            # layer order, thickness, er, tand, copper weight
     "design_rules",       # clearance matrix, track widths (often in a side file)
-    "pad_to_mask",        # solder mask expansion
+    "pad_to_mask",        # solder mask openings and the expansion applied to them
+    "silk",               # silkscreen stroke widths and character heights
     "component_3d",       # height / courtyard information
 )
 
@@ -67,6 +68,13 @@ class Board(object):
         self.tracks = []           # [{net, layer, width, start, end}]
         self.vias = []             # [{net, x, y, drill, diameter, from, to, kind}]
         self.graphics = []         # board-level copper graphics (gr_poly/gr_line on *.Cu)
+        # Silkscreen and solder-mask openings. NEITHER IS COPPER, so neither goes
+        # into `graphics`: counting silk as copper invented copper-to-edge
+        # violations on every board whose silk sits close to the edge. Footprint
+        # items live on the footprint dict (`silk` / `mask`) because that is where
+        # the reference designator is; these two lists are the board-level ones.
+        self.silk = []             # [{layer, kind, width_mm, height_mm, uuid}]
+        self.mask_apertures = []   # [{layer, poly, margin_mm, margin_source}]
         self.zones = []            # [{net, layer, outline, fill_mode, priority, keepout, points}]
         self.nets = {}             # code -> name
         self.stackup = []          # [{name, type, thickness_mm, er, tand, copper_um}]

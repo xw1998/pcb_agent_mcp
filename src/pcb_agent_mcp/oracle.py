@@ -1775,19 +1775,24 @@ def _hole_list(board):
         holes.append({"kind": "via",
                       "ref": "via@(%.3f,%.3f)" % (via["x"], via["y"]),
                       "x": float(via["x"]), "y": float(via["y"]),
-                      "drill_mm": float(drill), "diameter_mm": float(dia)})
+                      "drill_mm": float(drill), "diameter_mm": float(dia),
+                      "net": via.get("net"), "uuid": via.get("uuid")})
     for fp in board.footprints:
         for pad in fp.get("pads") or []:
             hole = pad.get("hole_mm")
             if hole is None:
                 continue
-            holes.append({"kind": "pad",
-                          "ref": "%s.%s" % (fp.get("ref") or "?",
-                                            pad.get("number") or "?"),
+            ref = "%s.%s" % (fp.get("ref") or "?", pad.get("number") or "?")
+            holes.append({"kind": "pad", "ref": ref,
                           "x": float(pad["x"]), "y": float(pad["y"]),
                           "drill_mm": float(hole),
                           "diameter_mm": min(float(pad.get("w") or 0.0),
-                                             float(pad.get("h") or 0.0))})
+                                             float(pad.get("h") or 0.0)),
+                          "net": pad.get("net"), "uuid": pad.get("uuid"),
+                          # The pad that OWNS the hole is the annular ring, which is
+                          # a different rule; kept here so the copper-to-hole sweep
+                          # can leave it out without relying on net matching.
+                          "owner_ref": ref})
     return holes
 
 def _hole_web(holes, window_mm=5.0):
@@ -1896,6 +1901,231 @@ def _min_copper_to_edge(board, items, segs, window_mm=5.0):
             "where": "%s vs %s edge (%.3f,%.3f)-(%.3f,%.3f)"
                      % (best[1], kind, a[0], a[1], b[0], b[1])}
 
+def _dist_item_to_point(item, pt):
+    """Edge distance from a copper item to a POINT (a hole centre)."""
+    if "poly" in item:
+        return G.dist_point_polygon(pt, item["poly"])
+    a, b, w = item["seg"]
+    return max(0.0, G.dist_point_segment(pt, a, b) - w / 2.0)
+
+
+def _silk_items(board):
+    """Every silkscreen item, board-level and footprint-level, with its owner."""
+    out = []
+    for it in board.silk or []:
+        item = dict(it)
+        item.setdefault("ref", None)
+        out.append(item)
+    for fp in board.footprints:
+        for it in fp.get("silk") or []:
+            item = dict(it)
+            item["ref"] = fp.get("ref") or "?"
+            out.append(item)
+    return out
+
+
+def _silk_facts(board):
+    """Narrowest silk stroke and smallest silk character height, both measured.
+
+    An item that does not state a width is EXCLUDED and counted, never defaulted:
+    KiCad's fallback belongs to the program, and inventing 0.15 mm for it would
+    turn "I could not read this" into "I checked it".
+    """
+    items = _silk_items(board)
+    facts = {}
+    if not items:
+        facts["min_silk_line_width"] = {"not_applicable":
+                                        "no silkscreen item on this board"}
+        facts["min_silk_text_height"] = {"not_applicable":
+                                         "no silkscreen item on this board"}
+        return facts
+
+    def _num(v):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) \
+            and v > 0 else None
+
+    widths = [(float(i["width_mm"]), i) for i in items if _num(i.get("width_mm"))]
+    unknown_w = [i for i in items if not _num(i.get("width_mm"))]
+    if widths:
+        w, item = min(widths, key=lambda t: t[0])
+        where = "%s %s on %s" % (item.get("ref") or "board-level",
+                                 item.get("kind"), item.get("layer"))
+        if item.get("kind") in ("fp_text", "gr_text"):
+            where += " (%r)" % (item.get("text") or "")
+        if unknown_w:
+            where += ("; %d other silk item(s) state no line width and are excluded, "
+                      "so the true minimum may be smaller" % len(unknown_w))
+        facts["min_silk_line_width"] = {"measured": w, "where": where}
+    else:
+        facts["min_silk_line_width"] = {
+            "why": "no silkscreen item states a line width (%d item(s) present, none "
+                   "with a width)" % len(items)}
+
+    texts = [i for i in items if i.get("kind") in ("fp_text", "gr_text")]
+    heights = [(float(i["height_mm"]), i) for i in texts if _num(i.get("height_mm"))]
+    unknown_h = [i for i in texts if not _num(i.get("height_mm"))]
+    if heights:
+        h, item = min(heights, key=lambda t: t[0])
+        where = "%s silk text %r on %s" % (item.get("ref") or "board-level",
+                                           item.get("text") or "", item.get("layer"))
+        if unknown_h:
+            where += ("; %d other text(s) state no size and are excluded"
+                      % len(unknown_h))
+        facts["min_silk_text_height"] = {"measured": h, "where": where}
+    elif texts:
+        facts["min_silk_text_height"] = {
+            "why": "%d silkscreen text(s) present, none states a character size"
+                   % len(texts)}
+    else:
+        facts["min_silk_text_height"] = {"not_applicable":
+                                         "no silkscreen text on this board"}
+    return facts
+
+
+def _mask_apertures(board):
+    """Every solder-mask opening, one per (item, side).
+
+    A pad opening is the pad's own outline grown by its expansion; an opening drawn
+    as a graphic is the drawn polygon (KiCad applies the pad expansion to pads only).
+    Both sides are kept apart: a front opening and a back one are separated by the
+    board thickness, not by a mask web.
+    """
+    from .adapters.canonical import pad_points
+    out = []
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            sides = pad.get("mask_layers") or []
+            if not sides:
+                continue
+            pts = pad_points(pad)
+            if not pts:
+                continue
+            for side in sides:
+                out.append({"layer": side, "poly": pts,
+                            "margin_mm": float(pad.get("mask_margin") or 0.0),
+                            "margin_source": pad.get("mask_margin_source"),
+                            "ref": "%s.%s" % (fp.get("ref") or "?",
+                                              pad.get("number") or "?")})
+        for g in fp.get("mask") or []:
+            out.append({"layer": g["layer"], "poly": g["poly"],
+                        "margin_mm": float(g.get("margin_mm") or 0.0),
+                        "margin_source": g.get("margin_source") or "graphic",
+                        "ref": "%s.mask" % (fp.get("ref") or "?")})
+    for g in board.mask_apertures or []:
+        out.append({"layer": g["layer"], "poly": g["poly"],
+                    "margin_mm": float(g.get("margin_mm") or 0.0),
+                    "margin_source": g.get("margin_source") or "graphic",
+                    "ref": "board mask graphic"})
+    return out
+
+
+def _mask_web(apertures, window_mm=5.0):
+    """Smallest strip of mask between two openings on ONE side, or a bound.
+
+    An opening is its item grown by the expansion the file states, so the web
+    between two of them is (copper gap) - (margin a) - (margin b): growing a shape
+    by a disc of radius r moves its boundary out by exactly r, so no polygon has to
+    be offset (and no offset polygon is approximated). Pairs whose web is not
+    positive are MERGED openings - no mask between them at all - and are counted
+    rather than reported as a zero-width web, because "no web" is not "a web too
+    thin to make".
+    """
+    by_layer = {}
+    for a in apertures:
+        by_layer.setdefault(a["layer"], []).append(a)
+    best = None
+    merged = 0
+    for side in sorted(by_layer):
+        items = by_layer[side]
+        if len(items) < 2:
+            continue
+        reach = float(window_mm) + 2.0 * max(float(i.get("margin_mm") or 0.0)
+                                             for i in items)
+        rows = sorted(((G.bbox_of(i["poly"]), idx) for idx, i in enumerate(items)),
+                      key=lambda t: t[0][0])
+        for k, (bb, i) in enumerate(rows):
+            for bb2, j in rows[k + 1:]:
+                if bb2[0] - bb[2] > reach:
+                    break
+                if bb2[1] - bb[3] > reach or bb[1] - bb2[3] > reach:
+                    continue
+                a1, a2 = items[i], items[j]
+                web = (G.dist_polygon_polygon(a1["poly"], a2["poly"])
+                       - float(a1.get("margin_mm") or 0.0)
+                       - float(a2.get("margin_mm") or 0.0))
+                if web <= 1e-9:
+                    merged += 1
+                    continue
+                if web <= window_mm and (best is None or web < best[0]):
+                    best = (web, a1, a2, side)
+    if best is None:
+        if merged:
+            return {"not_applicable":
+                    "every pair of neighbouring openings on the same side merges "
+                    "(%d pair(s)), so there is no mask web anywhere" % merged}
+        if not any(len(v) >= 2 for v in by_layer.values()):
+            return {"not_applicable":
+                    "fewer than two solder-mask openings on any one side"}
+        return {"lower_bound": float(window_mm),
+                "where": "no two openings on one side are within %.2f mm of each other"
+                         % window_mm}
+    w, a1, a2, side = best
+    # Rounded to 1e-6 mm (a nanometre): polygon distances carry float noise, and
+    # 0.2999999999999986 against a 0.3 limit is a FAIL on an exact comparison -
+    # a verdict decided by the last bit of a double, not by the board.
+    return {"measured": round(float(w), 6),
+            "where": "%s vs %s on %s: copper gap %.4f - %.4f - %.4f mm%s"
+                     % (a1["ref"], a2["ref"], side,
+                        w + float(a1.get("margin_mm") or 0.0)
+                        + float(a2.get("margin_mm") or 0.0),
+                        float(a1.get("margin_mm") or 0.0),
+                        float(a2.get("margin_mm") or 0.0),
+                        ("; %d pair(s) merge" % merged) if merged else "")}
+
+
+def _copper_to_hole(items, holes, plating_mm, window_mm=5.0):
+    """Another net's copper to the FINISHED hole wall: distance - drill/2 - plating.
+
+    The pad that OWNS a hole is left out: its copper is the annular ring, which is
+    a different rule (and is still measured to the drill wall - see the precision
+    note). Same-net copper is left out too, because a via's own trace touching its
+    pad is a connection, not a spacing.
+    """
+    if not holes:
+        return {"not_applicable": "no drilled hole on this board"}
+    if not items:
+        return {"not_applicable": "no copper on this board"}
+    reach = float(window_mm)
+    best = None
+    for h in holes:
+        cx, cy = h["x"], h["y"]
+        radius = h["drill_mm"] / 2.0
+        owner = (h.get("owner_ref") or "").split("#")[0]
+        hole_net = h.get("net")
+        for item in items:
+            x0, y0, x1, y1 = _item_bbox(item)
+            if (x0 - reach > cx or cx > x1 + reach
+                    or y0 - reach > cy or cy > y1 + reach):
+                continue
+            if item["ref"] == h["ref"] or item["ref"].split("#")[0] == owner:
+                continue
+            inet = item.get("net")
+            if inet is not None and hole_net is not None and inet == hole_net:
+                continue
+            d = _dist_item_to_point(item, (cx, cy)) - radius - float(plating_mm)
+            if d <= window_mm and (best is None or d < best[0]):
+                best = (d, h, item)
+    if best is None:
+        return {"lower_bound": float(window_mm),
+                "where": "no other-net copper is within %.2f mm of a finished hole "
+                         "wall" % window_mm}
+    d, h, item = best
+    return {"measured": round(max(0.0, d), 6),
+            "where": "%s vs %s hole (drill %.3f, plating %.1f um)"
+                     % (item["ref"], h["ref"], h["drill_mm"],
+                        float(plating_mm) * 1000.0)}
+
+
 def _polygon_throat(points):
     """Narrowest distance across a simple polygon: min over vertices of the
     distance to a non-adjacent edge.
@@ -1917,12 +2147,18 @@ def _polygon_throat(points):
                 best = d
     return best
 
-def _dfm_facts(board, rules, layer=None, window_mm=5.0, check_clearance=True):
+def _dfm_facts(board, rules, layer=None, window_mm=5.0, check_clearance=True,
+               plating_mm=None):
     """Measure the facts a capability document can talk about.
 
     Each fact is `measured` (a number, or a proven bound) or explains why it is
     not: `not_applicable` when the board has no such feature, `why` when this
     server cannot measure it.
+
+    `plating_mm` is the fab's hole plating build-up, taken from the capability
+    document (`plating_um`). None means the document did not state it, and then
+    copper-to-finished-hole is refused instead of being measured to the drill
+    wall - the two differ by exactly this number.
     """
     facts = {}
 
@@ -2061,6 +2297,34 @@ def _dfm_facts(board, rules, layer=None, window_mm=5.0, check_clearance=True):
                                            % ", ".join(sorted(cu))}
     else:
         facts["copper_layers"] = {"why": "no copper item names a copper layer"}
+
+    # -- silkscreen --------------------------------------------------------
+    # Not copper, so never part of `items`; a separate measurement with its own
+    # two limits (stroke width, character height).
+    facts.update(_silk_facts(board))
+
+    # -- solder-mask web ---------------------------------------------------
+    if "min_mask_web_mm" not in rules:
+        facts["min_mask_web"] = {"why": "the capability document does not state "
+                                        "min_mask_web_mm, so the aperture sweep "
+                                        "was skipped"}
+    else:
+        facts["min_mask_web"] = _mask_web(_mask_apertures(board),
+                                          window_mm=window_mm)
+
+    # -- copper to the finished hole wall ----------------------------------
+    if "min_copper_to_hole_mm" not in rules:
+        facts["min_copper_to_hole"] = {"why": "the capability document does not "
+                                              "state min_copper_to_hole_mm, so the "
+                                              "hole-wall distances were not measured"}
+    elif plating_mm is None:
+        facts["min_copper_to_hole"] = {
+            "why": "the capability document states no `plating_um`, so the finished "
+                   "hole wall is unknown; measuring to the drill wall would answer a "
+                   "different question"}
+    else:
+        facts["min_copper_to_hole"] = _copper_to_hole(items, holes, plating_mm,
+                                                      window_mm=window_mm)
     return facts
 
 def dfm_check(board, capability, layer=None, window_mm=5.0, check_clearance=True):
@@ -2069,13 +2333,21 @@ def dfm_check(board, capability, layer=None, window_mm=5.0, check_clearance=True
     The limits are the document's; every measurement is this board's; nothing is
     defaulted. Rules the document does not state are listed as unanswered, and
     rules this server cannot measure come back `not_checked` with the reason.
+
+    `plating_um` in the document is the fab's hole plating build-up; it is a
+    process figure that decides `min_copper_to_hole_mm`, so it is read from the
+    same place as the limits and never assumed.
     """
     from .calc import dfm as _dfm
     rules, e = _dfm.read_capability(capability)
     if e:
         return e
+    plating_mm, plating_err = _dfm.read_plating(capability)
+    if plating_err:
+        return plating_err
     facts = _dfm_facts(board, rules, layer=layer, window_mm=float(window_mm),
-                       check_clearance=bool(check_clearance))
+                       check_clearance=bool(check_clearance),
+                       plating_mm=plating_mm)
     out = _dfm.evaluate(capability, facts)
     if out.get("status") == "ok":
         out["value"]["facts"] = {k: v for k, v in sorted(facts.items())}

@@ -22,6 +22,13 @@ The fixture (50 x 30 mm outline, 1 mm slot):
   pad U3.1 (25,15) SMD 1 x 1 net SIG               gap to track 1
                                                    = 14.5 - 10.1 = 4.4
   slot     (35,5)-(36,15) on Edge.Cuts             throat = 1.0
+  silk     line (2,18)-(8,18) 0.12 wide            narrowest silk stroke = 0.12
+  silk     every reference text is 1.0 mm high     smallest silk height = 1.0
+  mask     U4.1/U4.2 1x1 on 1.4 mm pitch, both
+           VCC, (setup (pad_to_mask_clearance 0.05))
+                                                   web = 0.4 - 0.05 - 0.05 = 0.3
+  hole     nothing of another net within 5 mm of
+           a finished hole wall                    proven bound >= 5.0
 """
 import itertools
 import os
@@ -40,19 +47,32 @@ _seq = itertools.count()
 BOARD = """(kicad_pcb (version 20221018) (generator pcbnew)
   (general (thickness 1.6))
   (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+  (setup (pad_to_mask_clearance 0.05))
   (net 0 "") (net 1 "VCC") (net 2 "SIG")
   (gr_rect (start 0 0) (end 50 30) (layer "Edge.Cuts") (width 0.1))
   (gr_rect (start 35 5) (end 36 15) (layer "Edge.Cuts") (width 0.1))
+  (gr_line (start 2 28) (end 8 28) (stroke (width 0.12) (type solid))
+    (layer "F.SilkS"))
   (footprint "T:A" (layer "F.Cu") (at 10 10)
-    (fp_text reference "U1" (at 0 -2) (layer "F.SilkS"))
+    (fp_text reference "U1" (at 0 -2) (layer "F.SilkS")
+      (effects (font (size 1 1) (thickness 0.15))))
     (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "VCC")))
   (footprint "T:B" (layer "F.Cu") (at 40 20)
-    (fp_text reference "U2" (at 0 -2) (layer "F.SilkS"))
+    (fp_text reference "U2" (at 0 -2) (layer "F.SilkS")
+      (effects (font (size 1 1) (thickness 0.15))))
     (pad "1" thru_hole circle (at 0 0) (size 1 1) (drill 0.4)
       (layers "*.Cu" "*.Mask") (net 1 "VCC")))
   (footprint "T:C" (layer "F.Cu") (at 25 15)
-    (fp_text reference "U3" (at 0 -2) (layer "F.SilkS"))
+    (fp_text reference "U3" (at 0 -2) (layer "F.SilkS")
+      (effects (font (size 1 1) (thickness 0.15))))
     (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 2 "SIG")))
+  (footprint "T:D" (layer "F.Cu") (at 45 5)
+    (fp_text reference "U4" (at 0 -2) (layer "F.SilkS")
+      (effects (font (size 1 1) (thickness 0.15))))
+    (pad "1" smd rect (at -0.7 0) (size 1 1) (layers "F.Cu" "F.Mask")
+      (net 1 "VCC"))
+    (pad "2" smd rect (at 0.7 0) (size 1 1) (layers "F.Cu" "F.Mask")
+      (net 1 "VCC")))
   (segment (start 10 10) (end 30 10) (width 0.2) (layer "F.Cu") (net 1))
   (segment (start 1 10) (end 1 20) (width 0.25) (layer "F.Cu") (net 1))
   (via (at 20 10) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))
@@ -69,9 +89,13 @@ def board():
     return kicad_pcb.parse_board(path)
 
 
-def cap(rules, source="vendor capability page, checked 2026-10-28", verified=True):
-    return {"fab": "test fab", "source": source, "verified": verified,
-            "rules": dict(rules)}
+def cap(rules, source="vendor capability page, checked 2026-10-28", verified=True,
+        plating_um=25):
+    out = {"fab": "test fab", "source": source, "verified": verified,
+           "rules": dict(rules)}
+    if plating_um is not None:
+        out["plating_um"] = plating_um
+    return out
 
 
 ALL_RULES = {
@@ -86,6 +110,10 @@ ALL_RULES = {
     "max_board_width_mm": 50.0,
     "max_board_height_mm": 30.0,
     "max_copper_layers": 2,
+    "min_silk_line_width_mm": 0.10,
+    "min_silk_text_height_mm": 0.8,
+    "min_mask_web_mm": 0.25,
+    "min_copper_to_hole_mm": 0.5,
 }
 
 

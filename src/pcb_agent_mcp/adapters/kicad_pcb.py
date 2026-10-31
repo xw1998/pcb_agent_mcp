@@ -324,6 +324,10 @@ def _pad_from_node(pad_node):
             oy = num(on, 2, 0.0) or 0.0
             if ox or oy:
                 off = [ox, -oy]
+    # Mask expansion can be set per pad, and the mask web a fab has to hold is
+    # exactly this number. It was never read before 0.0.56: `pad_to_mask` was a
+    # blanket "parsed only on demand" and the mask web could not be measured.
+    mask_m = num(child(pad_node, "solder_mask_margin"), 1, None)
     net_node = child(pad_node, "net")
     net_code = None
     net_name = None
@@ -390,6 +394,8 @@ def _pad_from_node(pad_node):
                    "ignored_primitives": ignored}
             if off:
                 out["offset"] = off
+            if mask_m is not None:
+                out["solder_mask_margin"] = mask_m
             return out
     out = {"number": number, "net": net_name or net_code, "x": x, "y": y,
            "uuid": _uuid(pad_node),
@@ -399,6 +405,8 @@ def _pad_from_node(pad_node):
     pad_clear = num(child(pad_node, "clearance"), 1, None)
     if pad_clear is not None:
         out["clearance"] = pad_clear
+    if mask_m is not None:
+        out["solder_mask_margin"] = mask_m
     if shape == "roundrect":
         # 0.25 is the KiCad file format's documented default corner ratio, not a guess
         # about this board: it applies when the file does not spell the ratio out.
@@ -430,6 +438,36 @@ def _convex_hull(points):
 def _is_copper(name):
     n = str(name or "")
     return n == "*.Cu" or n.endswith(".Cu")
+
+def _is_silk(name):
+    return str(name or "").endswith(".SilkS")
+
+def _is_mask(name):
+    n = str(name or "")
+    return n == "*.Mask" or n.endswith(".Mask")
+
+_MASK_SIDES = ("F.Mask", "B.Mask")
+
+def mask_layers(layers):
+    """The concrete solder-mask layers an item names, `*.Mask` expanded to both.
+
+    Kept separate from the raw `layers` list because a mask opening is per SIDE:
+    two pads that both write `*.Mask` have an opening on each side, and a mask web
+    is the gap between two openings on the SAME side. Measuring `*.Mask` as one
+    pseudo-layer would compare a front opening with a back one across the board
+    thickness.
+    """
+    out = []
+    for name in layers or []:
+        if not _is_mask(name):
+            continue
+        if str(name) == "*.Mask":
+            for side in _MASK_SIDES:
+                if side not in out:
+                    out.append(side)
+        elif str(name) not in out:
+            out.append(str(name))
+    return out
 
 
 def _graphic_poly(g):
@@ -479,9 +517,62 @@ def _graphic_poly(g):
 
 
 _GRAPHIC_KINDS = ("fp_poly", "fp_rect", "fp_circle", "fp_line", "fp_arc")
+# Board-level graphics use the `gr_` prefix, footprint-level ones `fp_`. They are two
+# different name spaces, and a board-level `gr_line` is not in `_GRAPHIC_KINDS`:
+# reusing the footprint tuple there silently dropped every board-level silk line,
+# mask opening and copper graphic the file draws at top level.
+_BOARD_GRAPHIC_KINDS = ("gr_poly", "gr_rect", "gr_circle", "gr_line", "gr_arc")
+_SILK_TEXT_KINDS = ("fp_text", "gr_text")
+
+def _stroke_width(g):
+    """A graphic's stroke width, or None when the file does not state one.
+
+    None is never replaced by a default: KiCad's fallback is a program setting,
+    not a property of this board, and a silk line measured at an invented width
+    is exactly the kind of fabricated number this project refuses to give.
+    """
+    w = num(child(child(g, "stroke"), "width"), 1, None)
+    if w is None:
+        w = num(child(g, "width"), 1, None)      # pre-6 files write it inline
+    return w
+
+def _text_metrics(node):
+    """(character height, stroke thickness) from `(effects (font ...))`, mm.
+
+    Height is the SECOND number of `(size w h)`: that is the glyph height a fab's
+    "minimum legend height" rule is about. Either value is None when the file does
+    not state it (`(size 1 1)` with no thickness is common), and None stays None
+    all the way into the answer.
+    """
+    eff = child(node, "effects")
+    font = child(eff, "font") if eff else None
+    if not font:
+        return None, None
+    sz = child(font, "size")
+    h = None
+    if sz is not None:
+        h = num(sz, 2, None)
+        if h is None:
+            h = num(sz, 1, None)
+    return h, num(child(font, "thickness"), 1, None)
+
+def _silk_item(kind, node):
+    """One silkscreen item: a stroked shape, or a text with a size and a stroke."""
+    layer = atom(child(node, "layer"), 1, "")
+    item = {"layer": layer, "kind": kind, "uuid": _uuid(node)}
+    if kind in _SILK_TEXT_KINDS:
+        item["text"] = (atom(node, 2, "") if kind == "fp_text"
+                        else atom(node, 1, "")) or ""
+        item["height_mm"], item["width_mm"] = _text_metrics(node)
+    else:
+        item["width_mm"] = _stroke_width(node)
+    return item
 
 
-def _footprint(node):
+def _footprint(node, mask_expansion=0.0):
+    """One placed footprint. `mask_expansion` is the board's
+    `(setup (pad_to_mask_clearance ...))`, used when neither the pad nor the
+    footprint states an expansion of its own."""
     lib_id = atom(node, 1, "")
     layer = atom(child(node, "layer"), 1, "F.Cu")
     at = child(node, "at")
@@ -515,6 +606,10 @@ def _footprint(node):
     # footprint says 0.125 while the class says 0.13) as 7 violations that the
     # vendor DRC does not have - a 5 micrometre difference deciding a verdict.
     fp_clear = num(child(node, "clearance"), 1, None)
+    # A footprint can set one mask expansion for all of its pads. The precedence
+    # is KiCad's: pad `solder_mask_margin` > footprint `solder_mask_margin` >
+    # `(setup (pad_to_mask_clearance ...))`.
+    fp_mask = num(child(node, "solder_mask_margin"), 1, None)
     # `(net_tie_pad_groups "1, 2")` declares pads of one footprint that are MEANT to
     # touch: KiCad's DRC does not report a clearance violation inside a group, and a
     # net tie drawn as two abutting pads is common (royalblue54L_feather JP1, a
@@ -532,6 +627,21 @@ def _footprint(node):
     for pad in pads:
         if fp_clear is not None and pad.get("clearance") is None:
             pad["clearance"] = fp_clear
+        sides = mask_layers(pad.get("layers"))
+        if sides:
+            own = pad.get("solder_mask_margin")
+            if own is not None:
+                pad["mask_margin"], pad["mask_margin_source"] = float(own), "pad"
+            elif fp_mask is not None:
+                pad["mask_margin"], pad["mask_margin_source"] = float(fp_mask), "footprint"
+            else:
+                # Absent everywhere means zero: that is what KiCad itself writes
+                # into `(setup (pad_to_mask_clearance ...))` when the field is
+                # empty, and the source is recorded so the answer can say so.
+                pad["mask_margin"] = float(mask_expansion or 0.0)
+                pad["mask_margin_source"] = ("setup" if mask_expansion
+                                             else "absent_treated_as_zero")
+            pad["mask_layers"] = sides
         pad["net_tie_group"] = None
         for gi, nums in enumerate(tie_groups):
             if str(pad.get("number") or "") in nums:
@@ -578,6 +688,25 @@ def _footprint(node):
                          # polygon-vs-polygon 0.0 mm pairs took their place.
                          "poly": [(x + qx * ca - qy * sa, y + qx * sa + qy * ca)
                                   for qx, qy in poly]})
+    # Silkscreen and solder-mask openings drawn as footprint graphics. Neither is
+    # copper (so neither enters `graphics`), and both are per side.
+    silk, mask = [], []
+    for g in node:
+        if not (isinstance(g, list) and g):
+            continue
+        if g[0] not in _GRAPHIC_KINDS and g[0] not in _SILK_TEXT_KINDS:
+            continue
+        glayer = atom(child(g, "layer"), 1, "")
+        if _is_silk(glayer):
+            silk.append(_silk_item(g[0], g))
+            continue
+        if _is_mask(glayer) and g[0] in _GRAPHIC_KINDS:
+            mpoly = _graphic_poly(g)
+            if mpoly:
+                mask.append({"layer": glayer, "uuid": _uuid(g), "margin_mm": 0.0,
+                             "margin_source": "graphic",
+                             "poly": [(x + qx * ca - qy * sa, y + qx * sa + qy * ca)
+                                      for qx, qy in mpoly]})
     bbox = None
     if pads:
         xs, ys = [], []
@@ -594,6 +723,7 @@ def _footprint(node):
         flags = [f for f in flags if isinstance(f, str)]
     dnp = ("dnp" in flags) or (child(node, "dnp") is not None)
     return {"ref": ref, "value": value, "lib_id": lib_id, "graphics": graphics,
+            "silk": silk, "mask": mask,
             "x": round(x, 4),
             "y": round(y, 4), "rotation": rot, "layer": layer,
             "bbox": _bbox_dict(bbox), "pads": pads,
@@ -780,6 +910,17 @@ def _stackup(board_node, thickness):
     return layers
 
 
+def _mask_source_counts(board):
+    """How many mask-bearing pads got their expansion from each level."""
+    out = {}
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            if not pad.get("mask_layers"):
+                continue
+            src = pad.get("mask_margin_source") or "?"
+            out[src] = out.get(src, 0) + 1
+    return out
+
 def _apply_netclass_assignments(rules, net_names):
     """Put each net into the class the PROJECT says it is in.
 
@@ -854,8 +995,17 @@ def parse_board_text(text, path="<memory>", project_path=None):
         except (TypeError, ValueError):
             board.nets[code] = name
 
+    # The board-wide default for how far a solder-mask opening grows past its pad.
+    # Absent means 0, which is what KiCad itself writes when the field is empty;
+    # each aperture records which of the three levels supplied its number, so a
+    # measured mask web can always be traced back to where the expansion came from.
+    _setup = child(tree, "setup")
+    mask_expansion = num(child(_setup, "pad_to_mask_clearance"), 1, 0.0) if _setup else 0.0
+    if mask_expansion is None:
+        mask_expansion = 0.0
+
     for fp_node in children(tree, "footprint") + children(tree, "module"):
-        board.footprints.append(_footprint(fp_node))
+        board.footprints.append(_footprint(fp_node, mask_expansion=mask_expansion))
 
     for seg in children(tree, "segment"):
         board.tracks.append({
@@ -897,10 +1047,25 @@ def parse_board_text(text, path="<memory>", project_path=None):
         })
 
     for gnode in tree:
-        if not (isinstance(gnode, list) and gnode and gnode[0] in
-                ("gr_poly", "gr_rect", "gr_circle", "gr_line", "gr_arc")):
+        if not (isinstance(gnode, list) and gnode):
+            continue
+        gkind = gnode[0]
+        if gkind not in _BOARD_GRAPHIC_KINDS and gkind not in _SILK_TEXT_KINDS:
             continue
         layer = atom(child(gnode, "layer"), 1, "")
+        if _is_silk(layer):
+            board.silk.append(_silk_item(gkind, gnode))
+            continue
+        if _is_mask(layer) and gkind in _BOARD_GRAPHIC_KINDS:
+            # A mask opening drawn as a graphic: it is the opening itself, with no
+            # expansion to add (KiCad applies `pad_to_mask_clearance` to pads only).
+            mpoly = _graphic_poly(gnode)
+            if mpoly:
+                board.mask_apertures.append({"layer": layer, "poly": mpoly,
+                                             "margin_mm": 0.0,
+                                             "margin_source": "graphic",
+                                             "uuid": _uuid(gnode)})
+            continue
         if not _is_copper(layer):
             continue
         poly = _graphic_poly(gnode)
@@ -967,8 +1132,25 @@ def parse_board_text(text, path="<memory>", project_path=None):
                bool(rules.get("source") or rules.get("net_class_source")),
                None if (rules.get("source") or rules.get("net_class_source"))
                else "no .kicad_pro and no (net_class ...) block in the board file")
-    board.mark("pad_to_mask", False, "mask expansion lives in (setup (pad_to_mask_clearance)) "
-                                     "and per-pad (solder_mask_margin); parsed only on demand")
+    board.mark("silk",
+               bool(board.silk or any(f.get("silk") for f in board.footprints)),
+               None if (board.silk or any(f.get("silk") for f in board.footprints))
+               else "no item names a *.SilkS layer")
+    _mask_items = sum(len(f.get("mask") or []) for f in board.footprints) + \
+        len(board.mask_apertures)
+    _mask_pads = sum(1 for f in board.footprints for p in (f.get("pads") or [])
+                     if p.get("mask_layers"))
+    board.mark("pad_to_mask", bool(_mask_items or _mask_pads),
+               None if (_mask_items or _mask_pads)
+               else "no pad and no graphic names a *.Mask layer, so there is no "
+                    "solder-mask opening to measure")
+    if _mask_items or _mask_pads:
+        board.present["pad_to_mask"]["expansion"] = {
+            "rule": "pad (solder_mask_margin) > footprint (solder_mask_margin) > "
+                    "(setup (pad_to_mask_clearance ...)), absent = 0",
+            "board_default_mm": float(mask_expansion),
+            "pads_from": _mask_source_counts(board),
+        }
     board.mark("component_3d", any(child(n, "model") is not None
                                    for n in children(tree, "footprint")),
                "3D model presence is recorded, geometry is not evaluated")

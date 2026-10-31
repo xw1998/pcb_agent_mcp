@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这五十八篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这五十九篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 > **完成度总账在仓库根 README 的「一页速查：做完了什么 / 还差什么」**（哪些做完、哪些结构上不做、
@@ -90,9 +90,10 @@
   （铜阻 / 过孔 / 电感 / 电阻网络 / IR drop / PDN 三态）、`calc/thermal.py`（热阻串 / 过孔阵列 /
   2-D 板 / 瞬态 / 散热片 / 对流）与 `oracle.board_ir_drop`，以及 14 个仿真类工具与 81 个测试；
   边界是**只做子集**：未实现的 SPICE 卡、自热、平面谐振、全波、电热耦合全部逐条点名拒绝。
-- `18` → `calc/dfm.py`（11 条规则目录 + 能力文档体检 + 五态判定）、`oracle.dfm_check` 与
-  `_dfm_facts`（11 个事实，每条带 `where`），以及 2 个 DFM 工具与 28 个测试；
-  边界是**没有内置板厂表**：8 类量不出来的项目写进 `not_checked_by_design`，
+- `18` → `calc/dfm.py`（**15** 条规则目录 + 能力文档体检 + 五态判定；0.0.56 从 11 条扩到 15，
+  见 `59`）、`oracle.dfm_check` 与 `_dfm_facts`（15 个事实，每条带 `where`），以及 2 个 DFM
+  工具与 65 个测试；边界是**没有内置板厂表**：8 类量不出来的项目写进
+  `not_checked_by_design`（0.0.56 把其中三条收窄成真正剩下的那部分，条数不变），
   有界搜索窗外的情况只给 `lower_bound`，不冒充最小值。
 - `19` → `calc/vibration.py`（Rayleigh-Ritz 薄板模态 / Miles 随机响应 / Steinberg 疲劳 / Newmark 冲击 / 传递率 / 板级应力三极值）与 `oracle.board_vibration`（板框 bbox + stackup 厚度 + 元件当探针点），以及 6 个振动类工具与 73 个测试（含 `tests/test_vibration_stress.py` 的 21 例）；边界是**薄板、单模态、线性**：不算剪切变形、元件附加质量、装配柔度、焊点蠕变、随机+冲击叠加、跌落、非线性接触。应力**不是解出来的场**，而是由同一组 Ritz 曲率算出的三个极值（板角 von Mises / 跨中主应力 / 板边剪应力），张量分量只在 `sigma_max` 点报。
 - `21` → `calc/spice.py` 的外部引擎段（`find_ngspice` / `_deck_for_ngspice` / `_run_ngspice` / `_parse_raw` / `_cross_check`，以及 `simulate(..., engine=…, cross_check=…)`），`tests/test_spice_engine.py`（37 例）+ `tests/_fake_ngspice.py`（假引擎）。外部路径已对着**真 ngspice-47**（MSYS2 Windows 构建）跑过并逐节点对账（分压 5e-9 V、RC 阶跃与 RLC AC 逐位 0.0），再用**第二个构建 ngspice-41**（conda-forge）跑同一批 deck 做**跨版本对拍**（`.op`/`.ac` 逐位 0.0，`.tran` 最多差 1.24e-4 V，两构建步长控制不同）；`verified_against_engine` 按**引擎版本**门控，只有 `VERIFIED_ENGINES`（`ngspice-47`、`ngspice-41`）里的版本为 true，别的二进制一律 false（门控本身由假引擎自称版本号来测，不需要真引擎）；默认引擎是 `builtin`（同一网表在两台机器不能给不同答案）。
@@ -173,4 +174,29 @@
   默认（`KF` 不给 / `.temp` 单值 / 值就是数 / 参数名拼对）的输出与 0.0.53 **逐位相同**，每一处新增行为都有一条「旧行为还在」的负控制。
 - `58` → `data/magnetic_materials.json`（12 种材料 / 16 个磁芯，每行带来源 URL，取不到的数一律 `null` + 说明）+ `calc/magnetics.py` 的 `_load_magnetic_data`/`_norm_key`/`_bsat_at`/`_core_loss_for`/`magnetic_data`/`select_core`，`tools.py` 的 `magnetics_select_core`（工具数 162 → **164**）与 `magnetics_data` 两个新工具 + `magnetics_inductor` 的能力自述改口，1 个新测试文件（`tests/test_magnetic_select.py` 36 例，每条判据配一条能翻脸的负控制）与 4 条 selftest（`193/193` → **`197/197`**，全部带实测读数）；
   边界是**表 + 两条约束 + 一个损耗点**：这一版给的是"从一张真厂商表里挑部件，并对每个候选点名为什么行/为什么不行"，不是"算一个最佳答案"；匝数 `N = max(ceil(sqrt(L/AL)), ceil(L·Ipk/(B_lim·Amin)), 1)`、饱和只在厂商公布过 Bsat 的温度上判（25 / 100 ℃，**不插值**，缺数据进顶层 `unjudged`）、气隙是串联磁阻差 `g = µ0·A·N²/L − le/µi`（无边缘修正）、损耗是厂商的**一个实测点**（工况精确匹配才复现，离工况要调用方给 `loss_exponents=(x,y)`）、窗口只在真有骨架数据的部件上判（E 42/21/15：aw 178 mm²、mlt 93 mm）；无 Rth、无 Steinmetz 三元组（表里恒 `null`，将来谁填了 `test_no_steinmetz_triple_is_invented` 会主动失败）、无 B-H 曲线、无 DC 偏置 AL 跌落、无 AL 容差最坏情况 —— 判据是「PQ 20/16（N87）100 µH / 3 A / 0.3 T 答 16 匝、`b_peak` 0.296677、气隙 0.186405 mm」「ELP 18/4/10 同一问题 `turns_from_al` 6.201737 对 `turns_from_flux` 25.445293 ⇒ 26 匝，磁通约束才是活约束」「电感 ×1000 ⇒ 同一件 16 → 15823 匝（989.4 倍，磁通主导时线性）」，两条负控制都能翻脸：3C90 在 25 ℃ 6 个可行、100 ℃ **0 个可行 + 6 个 `saturation_unknown`**（插值会给出一个假答案）、U20/16/7-3C90 的实测点 1.9 W @200 mT/25 kHz 逐位复现而 100 kHz 同 B 必须 `null`（忽略工况仍会报 1.9）。
-- 代码里的每条"拒绝回答"分支，都能在这五十八篇里找到对应的判据来源。
+- `59` → 把 `not_checked_by_design` 里三条变成实测：`calc/dfm.py` 的 4 条新规则键
+  （`min_silk_line_width_mm` / `min_silk_text_height_mm` / `min_mask_web_mm` /
+  `min_copper_to_hole_mm`，规则数 11 → **15**）+ `read_plating`（`plating_um`，微米，
+  从不默认）、`adapters/kicad_pcb.py` 的丝印与阻焊投影（`board.silk` / `board.mask_apertures`
+  / `fp["silk"]` / `fp["mask"]` / `pad["mask_layers"]` / `pad["mask_margin(_source)"]`，
+  把 `pad_to_mask` 从"只在需要时解析"改成真解析）、`oracle.py` 的 `_silk_facts` /
+  `_mask_apertures` / `_mask_web` / `_copper_to_hole`，1 个新测试文件
+  （`tests/test_dfm_silk_mask.py` **37 例**，5 个类，每条判据配一条能翻脸的负控制）与
+  4 条 selftest（`197/197` → **`200/200`**）；边界与三个口径：
+  **阻焊 web 不偏移多边形**——开窗 = 铜按 margin 做圆盘膨胀，`dist(A⊕D_r1,B⊕D_r2) =
+  dist(A,B) − r1 − r2` 对圆盘膨胀恒等成立，所以量铜间距再减两个 margin，**精确无近似**；
+  web ≤ 0 是**开窗合并**（"没有阻焊"≠"阻焊太薄"），计数进 `note` 而不是报 0；正面
+  `F.Mask` 与背面 `B.Mask` **绝不配对**（把 `*.Mask` 当一层会拿板厚当阻焊桥）。
+  **丝印**：宽度读 `(stroke (width x))`（回落 pre-6 的内联 `(width x)`），字高读
+  `(effects (font (size w h)))` 的**第二个**数（`EDA_TEXT::Format` 写的是 `.x` 再 `.y`，
+  `.y` 才是高度，读第一个数会把合格的板报成 0.6 mm）；**文件没写的宽度不填默认值**，
+  只排除 + 计数，并在 `where` 里写"the true minimum may be smaller"。
+  **铜到成品孔壁** `= dist(另一网络铜, 孔心) − drill/2 − plating`：`plating_um` 放在
+  **能力文档**里（与限值同源，工具 schema 不动、工具数仍 164），没给就 `not_checked`
+  而不是按 0 量到钻壁；排除拥有该孔的 pad（那是环形环）与同网络铜（那是连接）。
+  三条负控制都能翻脸：0.11 mm 笔画对 0.12 限值 FAIL、开窗合并报 `not_applicable` 而非 0、
+  同一块板 `plating_um` 0 → 1.100 pass / 100 → 1.000 **fail**。登记过的三处输出改变：
+  `rules_known` 11 → 15（`coverage_pct` 分母变）、`present["pad_to_mask"]` 由 false
+  变 true（旧 note 说"按需解析"，现在不再成立）、`present` 新增 `silk`；既有 11 条读数
+  逐位不变（主夹具 `min_copper_gap` 4.4 / `min_copper_to_edge` 0.875 / passed 15 / failed 0）。
+- 代码里的每条"拒绝回答"分支，都能在这五十九篇里找到对应的判据来源。

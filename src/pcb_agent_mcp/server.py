@@ -3454,6 +3454,111 @@ def selftest():
               _p_below.get("steady_peak_c"), _p_above.get("runs_away"),
               _p_below.get("max_repetitive_current_a")))
 
+    _ABSENT_SELFTEST = object()
+    # --- 0.0.56: three quantities that used to be "not checked by design" ---
+    # (a) the narrowest SILK stroke is a file fact: the board-level gr_line says
+    #     0.12 and a text at (size 1 1) says 1.0 high - reading the FIRST number
+    #     of (size w h) would report the cell width instead of the glyph height;
+    # (b) the mask WEB between two openings is (copper gap - margin - margin):
+    #     1.4 mm pitch, 1.0 mm pads, 0.05 each side = 0.300;
+    # (c) copper to the FINISHED hole wall is (distance - drill/2 - plating), so
+    #     the SAME board passes at 0 um plating and fails at 100 um - and with no
+    #     plating_um at all it must refuse, because measuring to the drill wall
+    #     answers a different question.
+    # `tmp` is removed by the time this block runs, so this fixture gets its own
+    # directory (removed once the checks below have read it).
+    _sm_tmp = _tempfile.mkdtemp(prefix="pcbagent-silkmask-")
+    _silkmask_board = os.path.join(_sm_tmp, "silkmask.kicad_pcb")
+    with open(_silkmask_board, "wb") as fh:
+        fh.write(b'(kicad_pcb (version 20221018) (generator pcbnew)\n'
+                 b'  (general (thickness 1.6))\n'
+                 b'  (layers (0 "F.Cu" signal) (31 "B.Cu" signal)'
+                 b' (44 "Edge.Cuts" user))\n'
+                 b'  (setup (pad_to_mask_clearance 0.05))\n'
+                 b'  (net 0 "") (net 1 "VCC") (net 2 "SIG")\n'
+                 b'  (gr_rect (start 0 0) (end 50 30) (layer "Edge.Cuts")'
+                 b' (width 0.1))\n'
+                 b'  (gr_line (start 5 28) (end 15 28)'
+                 b' (stroke (width 0.12) (type solid)) (layer "F.SilkS"))\n'
+                 b'  (footprint "T:H" (layer "F.Cu") (at 20 10)\n'
+                 b'    (fp_text reference "J1" (at 0 -2) (layer "F.SilkS")'
+                 b' (effects (font (size 1 1) (thickness 0.15))))\n'
+                 b'    (pad "1" thru_hole circle (at 0 0) (size 1.2 1.2)'
+                 b' (drill 0.6) (layers "*.Cu" "*.Mask") (net 1 "VCC")))\n'
+                 b'  (segment (start 21.5 8) (end 21.5 12) (width 0.2)'
+                 b' (layer "F.Cu") (net 2))\n'
+                 b'  (footprint "T:P" (layer "F.Cu") (at 35 20)\n'
+                 b'    (fp_text reference "U2" (at 0 -2) (layer "F.SilkS")'
+                 b' (effects (font (size 1 1) (thickness 0.15))))\n'
+                 b'    (pad "1" smd rect (at -0.7 0) (size 1 1)'
+                 b' (layers "F.Cu" "F.Mask") (net 1 "VCC"))\n'
+                 b'    (pad "2" smd rect (at 0.7 0) (size 1 1)'
+                 b' (layers "F.Cu" "F.Mask") (net 1 "VCC")))\n)\n')
+
+    def _sm(rules, plating=_ABSENT_SELFTEST):
+        cap = {"fab": "selftest", "source": "selftest fixture", "rules": dict(rules)}
+        if plating is not _ABSENT_SELFTEST:
+            cap["plating_um"] = plating
+        rr = handle({"jsonrpc": "2.0", "id": 1700, "method": "tools/call",
+                     "params": {"name": "dfm_check", "arguments": {
+                         "path": _silkmask_board, "capability": cap}}})
+        return json.loads(rr["result"]["content"][0]["text"])
+
+    _sm_out = _sm({"min_silk_line_width_mm": 0.10,
+                   "min_silk_text_height_mm": 0.8,
+                   "min_mask_web_mm": 0.25})
+    _sm_facts = (_sm_out.get("value") or {}).get("facts") or {}
+    check("0.0.56 measures silk and the mask web: the 0.12 mm board-level silk "
+          "line is the narrowest stroke, the 1.0 mm glyph height is read from the "
+          "SECOND number of (size w h), and 1.4 mm pitch - 1.0 mm pads - 2 x 0.05 "
+          "leaves a 0.300 mm mask web that passes a 0.25 limit",
+          _sm_out.get("status") == "ok"
+          and (_sm_out["value"].get("overall")) == "pass"
+          and abs((_sm_facts.get("min_silk_line_width") or {})
+                  .get("measured", -1) - 0.12) < 1e-9
+          and abs((_sm_facts.get("min_silk_text_height") or {})
+                  .get("measured", -1) - 1.0) < 1e-9
+          and abs((_sm_facts.get("min_mask_web") or {})
+                  .get("measured", -1) - 0.3) < 1e-9,
+          "overall %s, silk %s, height %s, web %s" % (
+              (_sm_out.get("value") or {}).get("overall"),
+              (_sm_facts.get("min_silk_line_width") or {}).get("measured"),
+              (_sm_facts.get("min_silk_text_height") or {}).get("measured"),
+              (_sm_facts.get("min_mask_web") or {}).get("measured")))
+
+    # 1.5 mm to a 0.2 mm track's centreline, less half the track = 1.4;
+    # less the 0.3 mm drill radius = 1.1. The plating then decides.
+    _hole_rules = {"min_copper_to_hole_mm": 1.05}
+    _hole_0 = _sm(_hole_rules, plating=0)
+    _hole_100 = _sm(_hole_rules, plating=100)
+    _hole_none = _sm(_hole_rules)
+    check("copper to the FINISHED hole wall subtracts the plating the document "
+          "states: 1.1 mm at 0 um passes a 1.05 limit and 1.0 mm at 100 um fails "
+          "it - same board, same limit, the plating decides",
+          abs(((_hole_0.get("value") or {}).get("facts") or {})
+              .get("min_copper_to_hole", {}).get("measured", -1) - 1.1) < 1e-9
+          and abs(((_hole_100.get("value") or {}).get("facts") or {})
+                  .get("min_copper_to_hole", {}).get("measured", -1) - 1.0) < 1e-9
+          and [c["verdict"] for c in (_hole_0.get("value") or {})["checks"]
+               if c["rule"] == "min_copper_to_hole_mm"] == ["pass"]
+          and [c["verdict"] for c in (_hole_100.get("value") or {})["checks"]
+               if c["rule"] == "min_copper_to_hole_mm"] == ["fail"],
+          "0 um -> %s, 100 um -> %s" % (
+              ((_hole_0.get("value") or {}).get("facts") or {})
+              .get("min_copper_to_hole", {}).get("measured"),
+              ((_hole_100.get("value") or {}).get("facts") or {})
+              .get("min_copper_to_hole", {}).get("measured")))
+
+    _hole_nc = [c for c in (_hole_none.get("value") or {}).get("checks") or []
+                if c["rule"] == "min_copper_to_hole_mm"]
+    check("without plating_um the hole-wall rule is NOT_CHECKED with the reason, "
+          "never passed - measuring to the drill wall is a different quantity",
+          _hole_none.get("status") == "ok" and len(_hole_nc) == 1
+          and _hole_nc[0]["verdict"] == "not_checked"
+          and "plating_um" in (_hole_nc[0].get("note") or ""),
+          str(_hole_nc[0].get("verdict") if _hole_nc else "missing"))
+    _shutil.rmtree(_sm_tmp, ignore_errors=True)
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

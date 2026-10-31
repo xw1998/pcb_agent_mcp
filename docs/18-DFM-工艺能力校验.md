@@ -142,3 +142,22 @@ board.outline = [polys[0]] + polys[1:]      # 旧
 - 注册 1 例（两个工具都在 `tools/list` 与 `_capabilities.available` 里，旧的"DFM 未实现"一行已删）。
 
 `--selftest` 加 3 条指纹：错键被拒、同一块板对 0.15 mm 限值通过、对 0.25 mm 限值失败并点名规则。
+
+## 18.9 0.0.56 的更新（本页 18.1~18.8 的写法仍然成立，只有三处被收窄）
+
+0.0.56 把 `18.6` 里"不算"的三条变成实测：**阻焊 web**、**丝印线宽与字高**、
+**铜到成品孔壁**。因此：
+
+- `RULES` 由 11 条变 **15** 条（新增 `min_silk_line_width_mm` / `min_silk_text_height_mm` /
+  `min_mask_web_mm` / `min_copper_to_hole_mm`），`coverage_pct` 的分母跟着从 11 变 15；
+- 能力文档多一个**可选**的 `plating_um`（微米，工艺参数，与限值同源），它不通过
+  `rules` 传，也**从不默认**——不给就 `not_checked`，因为量到钻壁是另一个量；
+- `NOT_CHECKED_BY_DESIGN` **仍是 8 条**，三条被改写成"真正剩下的那部分"
+  （mask-defined pad 与阻焊 sliver / 不写线宽的丝印与丝印压焊盘 / 桶壁斜度与镀后环形环），
+  所以 `18.6` 的清单要按 `docs/59` 读，条数没变；
+- `tests/test_dfm.py` 仍是 28 例，但夹具扩了 4 条新规则并在同一次
+  `test_everything_within_capability_passes` 里一起过（这正好证明新增规则没有动既有读数）；
+  新量的独立判据与负控制在 `tests/test_dfm_silk_mask.py`（37 例）。
+
+完整口径（Minkowski 恒等式、`(size w h)` 的第二个数是字高、`plating_um` 为什么不默认、
+三处登记过的输出改变）见 [`docs/59`](59-阻焊丝印与成品孔.md)。

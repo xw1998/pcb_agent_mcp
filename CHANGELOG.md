@@ -9,6 +9,141 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.56] - 2026-10-31
+
+`dfm_capability` 的 `not_checked_by_design` 里有一条是"阻焊 web"，还有一条是"丝印线宽"，
+第三条是"铜到孔壁"。这三条在**每张板厂能力表里都是必填项**（"最小阻焊桥 0.10 mm"、
+"最小丝印线宽 0.15 mm"、"铜到孔壁 0.25 mm"），而我们只能回一句"不检查"。这一版把三条
+变成**实测**。
+
+一句话结论：**能算的算到出处，不能算的说清差哪一步；工艺参数从文档来，不从记忆来。**
+
+### 新增
+
+| 项 | 内容 |
+| --- | --- |
+| `calc/dfm.py` 规则 | **11 → 15**：`min_silk_line_width_mm` / `min_silk_text_height_mm` / `min_mask_web_mm` / `min_copper_to_hole_mm` |
+| `dfm.plating_um` | 能力文档新增可选键（微米），`read_plating` 校验并转毫米；**从不默认** |
+| `board.silk` / `board.mask_apertures` | 板级 + 封装级丝印条目与阻焊开窗投影；`pad["mask_layers"]` / `pad["mask_margin(_source)"]` |
+| `present["pad_to_mask"]` | 从 `{present: false, note: "parsed only on demand"}` 变成真解析：`{present: true, expansion: {rule, board_default_mm, pads_from}}` |
+| 测试 | `tests/test_dfm_silk_mask.py` **37 例**（5 个类）；selftest 3 条 |
+| 工具数 | **164**（不变——`plating_um` 属于能力文档，不是新工具参数） |
+
+### 阻焊 web：不偏移多边形
+
+开窗 = 铜形状按 `margin` 做 Minkowski 膨胀，核是半径 `margin` 的圆盘。对圆盘膨胀有恒等式
+
+    dist(A ⊕ D_r1 , B ⊕ D_r2) = dist(A, B) − r1 − r2
+
+所以 `web = dist(铜A, 铜B) − margin_A − margin_B`，**精确、不含近似**。偏移多边形是
+"假精度"的来源，这里绕开了它。`margin` 按 KiCad 的优先级取：pad 自己的
+`(solder_mask_margin)` > footprint 的 > `(setup (pad_to_mask_clearance ...))` >
+三处都没写 = **0**（这是 KiCad 自己写进 setup 的值，字段留空就是 0），且每块开窗都在
+`pads_from` 里记账，能追到是哪个层级给的数。
+
+两条只有踩过才知道的：
+
+- **正反面绝不配对**。`*.Mask` 展开成 `F.Mask` + `B.Mask`；把 `*.Mask` 当一层，量到的是
+  **板厚**，不是阻焊桥。
+- **`web ≤ 0` 是"合并"，不是"0 宽的桥"**。开窗叠在一起 = 中间没有阻焊，这是常见合法形态
+  （大膨胀的密脚 QFN）。报 "0 mm web" 会被读成"桥太细做不出来"。所以合并对数进 `note`、
+  判词 `not_applicable`。
+
+读数取整到 **1e-6 mm**：多边形距离带浮点噪声，`0.2999999999999986` 对 `0.3` 的精确比较会
+FAIL——那是双精度最后一位决定的判词，不是板子的判词。
+
+### 丝印：字高是 `(size w h)` 的**第二个**数
+
+| 量 | 读法 |
+| --- | --- |
+| 笔画宽度 | `(stroke (width x))`，回落 pre-6 的内联 `(width x)` |
+| 字符高度 | `(effects (font (size w h)))` 的 **`h`**（`EDA_TEXT::Format` 写 `.x` 再 `.y`，`.y` 才是高度） |
+
+**文件没写的宽度不填默认值**：KiCad 的回落值是程序设置，不是这块板的属性；编一个 0.15 mm
+进去，"我读不到"就变成了"我检查过了"。这样的条目被**排除 + 计数**，`where` 里明写
+`"N other silk item(s) state no line width and are excluded, so the true minimum may be
+smaller"`——这句话承认这个数是**上界**，所以它只能用来证"合格"。
+
+开发中真踩的坑：板级图形叫 `gr_line`/`gr_rect`/…，封装级叫 `fp_line`/`fp_rect`/…，**两套
+名字空间**。一开始板级循环复用了封装级的 `_GRAPHIC_KINDS`（只有 `fp_*`），结果**每一条板级
+丝印、板级开窗、板级铜图形都被静默丢掉**，`board.silk` 恒为空，主夹具的"最细丝印"被一块
+0.15 的 text 顶替了设计里的 0.12 line。修法是分开两个元组，并留一条负控制
+（`F.Cu` 上的 0.05 mm `gr_line` 不得成为最细丝印）盯住"种类 + 层共同决定归属"。
+
+### 铜到成品孔壁：`dist − drill/2 − plating`
+
+    gap = dist(另一网络的铜, 孔心) − drill/2 − plating
+
+`plating` 来自能力文档的 `plating_um`（微米）。**没给就拒答**：verdict `not_checked` +
+`note = "... the finished hole wall is unknown; measuring to the drill wall would answer
+a different question"`。负数/非有限数 ⇒ `CAPABILITY_VALUE_INVALID`。
+
+两处排除，两个不同理由：**拥有该孔的 pad**（它的铜是环形环，`min_pth_annular_ring_mm`
+管）与**同网络铜**（过孔接出去的走线是连接，不是间距）。
+
+同一块板、同一个 1.05 mm 限值：
+
+| `plating_um` | gap | 判词 |
+| --- | --- | --- |
+| `0` | **1.100** | pass |
+| `100` | **1.000** | **fail** |
+
+**同一条指令换个工艺参数，判词翻面**——所以它必须来自文档，不能来自我们的记忆。
+
+### 仍然不算什么（`NOT_CHECKED_BY_DESIGN` 仍是 8 条）
+
+条数不变，是**收窄**不是删除（`docs/README.md` 里"8 类"那句话因此仍然成立）。三条被
+收窄成真正剩下的那部分：**mask-defined pad**（开窗比铜小）与"开窗到板边/阻焊自身边缘的
+sliver"；**不写线宽的丝印**与**丝印压焊盘**；**barrel taper / 孔径公差**与**镀后环形环**
+（环形环这里仍量到钻壁——镀层会让成品环变小，但改 `min_pth_annular_ring_mm` 就是**静默
+改变既有答案**，只登记不动）。
+
+### 判据与负控制
+
+| 负控制 | 抓的是 |
+| --- | --- |
+| 0.11 mm 笔画对 0.12 限值 ⇒ **FAIL**，0.12 对 0.12 ⇒ pass | 判据方向 |
+| `(size 0.6 1.8)` 必须报 **1.8** | 读错字段 |
+| `F.Cu` 的 0.05 mm `gr_line` 不得成为最细丝印 | `gr_*` / `fp_*` 混用 |
+| 不写宽度的条目被排除 + 计数 | 编默认值 |
+| 1.4 间距 − 1.0 盘 − 2×0.05 = **0.300**，对 0.31 限值 ⇒ FAIL | 算术 |
+| pad 0.2 / fp 0.15 / setup 0.05 三档 ⇒ 0.150 / 0.100 / 0.300 | 优先级 |
+| 一面对两块、另一面一块 ⇒ **绝不**互配 | 面不分 |
+| 开窗合并 ⇒ `not_applicable` + 合并对数，不是 0 | 把"没有"当"太薄" |
+| `F.Mask` 图形 = 0 膨胀（0.150 − 0.050 − 0.000 = 0.100） | 图形也被加 margin |
+| 0 µm ⇒ 1.100 pass / 100 µm ⇒ 1.000 fail | 镀层真的进了算式 |
+| 无 `plating_um` ⇒ `not_checked`，**不是** pass | 按 0 算 |
+| `plating_um = -1` / `"25"` ⇒ `CAPABILITY_VALUE_INVALID` | 类型与符号 |
+| 1.2 盘 / 0.6 孔 ⇒ `lower_bound`，**不是** 0.0 | 环形环当间距 |
+| 同网络走线接自家过孔 ⇒ `lower_bound` | 连接当间距 |
+| NPTH 孔也被邻网铜约束：0.75 − 0.1 − 0.25 − 0.025 = **0.375** | 只管 PTH |
+| `len(RULES) == 15`；`NOT_CHECKED_BY_DESIGN` 仍 8 条 | 目录漂移、删条目当收窄 |
+| `read_plating(25) == (0.025, None)`；1 条规则 = 6.7 % | 微米/毫米、分母 |
+
+### 默认答案不变（以及登记过的三处改变）
+
+**没变的**：既有 11 条规则的读数与判词逐位不变（主夹具同一次 `dfm_check`：
+`min_copper_gap` **4.4**、`min_copper_to_edge` **0.875**、`passed 15 / failed 0`）；
+`dependencies = []` 仍成立；`TOOLS` 仍 **164**；不写这三条限值的既有调用，对应 fact 一律
+`why: "...so the sweep was skipped"`，`not_stated` 照旧点名。
+
+**登记过的三处**：`rules_known` **11 → 15**（`coverage_pct` 分母从 11 变 15，同一份 3 条
+规则的文档从 27.3 % 掉到 20.0 %——不是覆盖变差，是分母变准）；`present["pad_to_mask"]` 由
+false 变 true（0.0.55 那句"只在需要时解析"当时是真的，现在不真了）；`present` 新增 `silk`。
+
+全部落在 [`docs/59`](docs/59-阻焊丝印与成品孔.md)。
+
+### 验证（实测，不是预期）
+
+| 门 | 实测 |
+| --- | --- |
+| `tests/test_dfm.py` | **28 例**全 OK（主夹具同一次 `dfm_check`：`passed 15 / failed 0`，既有的 `min_copper_gap` **4.4** / `min_copper_to_edge` **0.875** 逐位不变） |
+| `tests/test_dfm_silk_mask.py` | **37 例**全 OK（0.013 s，5 个类） |
+| `run_server.py --selftest` | **200/200 passed**（0.0.55 是 197；新增 3 条：丝印 0.12 / 字高 1.0 / web 0.300；同一块板 `plating_um` 0 ⇒ **1.100 pass**、100 ⇒ **1.000 fail**；不给 `plating_um` ⇒ `not_checked`） |
+| 全量 `unittest discover -s tests` | **2514 例 / OK (skipped=5) / 911.376 s**（2477 + 37；这次本机没有别的满载进程，0.0.55 那次另跑着 5 个 CPU 满载的外部进程、2031.147 s ⇒ 秒数只能跟同一负载下的另一次比） |
+| `pcb_agent_mcp.tools.TOOLS` | **164**（不变；`plating_um` 属能力文档，不是新工具参数） |
+| `pyproject.toml` `dependencies` | `[]`（不变） |
+
 ## [0.0.55] - 2026-10-31
 
 `magnetics_inductor` 的自述原话是 `no core selection and no material table lives here`。
