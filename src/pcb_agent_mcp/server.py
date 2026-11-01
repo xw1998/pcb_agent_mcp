@@ -4814,9 +4814,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (175 tools now), so an agent that asks what can be computed is "
+          "table (176 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 175
+          len(_tools.TOOLS) == 176
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -4991,8 +4991,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (175 tools now)",
-          len(_tools.TOOLS) == 175
+          "table (176 tools now)",
+          len(_tools.TOOLS) == 176
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5058,6 +5058,95 @@ def selftest():
           % (_pdef_v.get("table_rows"), _pdef_v.get("feasible_count"),
              _psel_c.get("part"), _psel_c.get("turns"),
              _psel_c.get("b_limit_t"), _psel_c.get("core_loss_w")))
+
+    # ---- 0.0.77: the vendor's DC-bias fit (% mu_i = 1/(a + b*H^c)) ---------
+    _dc_disp = {"\u00b5": "u", "\u03bc": "u", "\u0192": "f"}
+
+    def _dcf(text):
+        folded = "".join(_dc_disp.get(ch, ch) for ch in str(text or ""))
+        return "".join(ch for ch in folded.lower() if ch.isalnum())
+
+    _dc = _call("magnetics_data", {"kind": "dc_bias_fit"}, 1885).get("value") or {}
+    _dc_rows = _dc.get("rows") or []
+    _dc_groups = sorted({(r.get("material"), r.get("shape_family")) for r in _dc_rows})
+    _dc_pages = sorted({r.get("printed_page") for r in _dc_rows})
+    check("the DC-bias fit table is the printed one and is refused if it is not: 29 "
+          "material x core-shape groups, 125 rows, printed pages 63-65, every row "
+          "carrying a = 0.01 - the constant that pins the fit to 100 % at zero bias, "
+          "so a table whose columns slipped is rejected instead of answered from",
+          _dc.get("count") == 125 and _dc.get("total_matching") == 125
+          and len(_dc_groups) == 29 and _dc_pages == [63, 64, 65]
+          and all(r.get("a") == 0.01 and (r.get("b") or 0) > 0 and (r.get("c") or 0) > 0
+                  for r in _dc_rows),
+          "%d rows, %d groups, pages %s"
+          % (len(_dc_rows), len(_dc_groups), _dc_pages))
+
+    _dc_fit = {(_dcf(r.get("material")), _dcf(r.get("shape_family")),
+                int(r.get("permeability"))): (r.get("a"), r.get("b"), r.get("c"))
+               for r in _dc_rows}
+    _dc_p10 = ((_pw.get("material_comparison_printed_page_10") or {}).get("rows") or {})
+    _dc_err = []
+    for _name, _entry in _dc_p10.items():
+        _abc = _dc_fit.get((_dcf(_name), _dcf("Toroids"), 60))
+        if not _abc:
+            continue
+        for _pct, _key in ((80.0, "perm_vs_dc_bias_oe_at_80pct_mu_i"),
+                           (50.0, "perm_vs_dc_bias_oe_at_50pct_mu_i")):
+            _printed = _entry.get(_key)
+            if not _printed:
+                continue
+            _hh = ((1.0 / _pct - _abc[0]) / _abc[1]) ** (1.0 / _abc[2])
+            _dc_err.append((abs(_hh - _printed) / float(_printed), _name, _pct,
+                            _hh, _printed))
+    _dc_worst = max(_dc_err) if _dc_err else (9.9, "", 0.0, 0.0, 0)
+    check("the fit reproduces the catalog's OWN printed 80 %/50 % summary table: all "
+          "18 numbers for the nine 60u materials, worst 0.96 % (MPP at 50 %: 106.0 Oe "
+          "against a printed 105). This is the check that missed by a factor of 2-3.5 "
+          "on the previous attempt, which took its fit from a different printed page",
+          len(_dc_err) == 18 and _dc_worst[0] <= 0.01 and _dc_worst[2] == 50.0,
+          "%d numbers, worst %.4f %s at %g %% (%.1f vs %s)"
+          % (len(_dc_err), _dc_worst[0], _dc_worst[1], _dc_worst[2], _dc_worst[3],
+             _dc_worst[4]))
+
+    _dc_ex2 = _call("magnetics_dc_bias", {"material": "Kool Mu", "permeability": 60,
+                                          "shape_family": "Toroids", "turns": 20,
+                                          "dc_current_a": 20, "le_mm": 63.5},
+                    1886)
+    _dc_ex3 = _call("magnetics_dc_bias", {"material": "Kool Mu", "permeability": 60,
+                                          "shape_family": "Toroids", "h_oe": 15.8},
+                    1887)
+    _dc_v2 = _dc_ex2.get("value") or {}
+    _dc_v3 = _dc_ex3.get("value") or {}
+    check("both worked examples printed in the catalog come out: Example 2 (60u Kool "
+          "Mu, 20 turns, 20 A, le 63.5 mm) prints 'from curve fit equation, % mu_i = "
+          "0.58' and the fit gives 58.4 % at 79.16 Oe; Example 3 prints B = 0.092 T at "
+          "15.8 Oe and integrating the fit gives 0.0936 T (1.7 % high - at that H the "
+          "curve is still flat, so this example pins the magnitude and not the integral "
+          "form; the 95 Oe point, where the chord is 35 % low, is the one that does)",
+          abs((_dc_v2.get("h_oe") or 0.0) - 79.16) < 0.02
+          and abs((_dc_v2.get("percent_initial_permeability") or 0.0) - 58.4) < 0.5
+          and abs((_dc_v3.get("b_t") or 0.0) - 0.092) < 0.002,
+          "ex2 %s Oe -> %s %%, ex3 B %s T (%s)"
+          % (_dc_v2.get("h_oe"), _dc_v2.get("percent_initial_permeability"),
+             _dc_v3.get("b_t"), _dc_v3.get("h_source")))
+
+    _dc_hi = _call("magnetics_dc_bias", {"material": "Kool Mu", "permeability": 60,
+                                         "shape_family": "Toroids", "h_oe": 2000.0},
+                   1888).get("value") or {}
+    _dc_bad = _call("magnetics_dc_bias", {"material": "MPP", "permeability": 55,
+                                          "shape_family": "Toroids", "h_oe": 10.0},
+                    1889)
+    check("an H outside the 10-800 Oe band the graphs plot is flagged and NOT clamped, "
+          "and a permeability the vendor never printed is refused with the list of the "
+          "fourteen it did print rather than interpolated",
+          any("outside" in w for w in (_dc_hi.get("warnings") or []))
+          and (_dc_hi.get("percent_initial_permeability") or 9.9) < 1.0
+          and _dc_bad.get("reason_code") == "NOT_FOUND"
+          and (_dc_bad.get("permeabilities_printed") or []) ==
+          [14, 19, 26, 40, 60, 75, 90, 125, 147, 160, 173, 200, 300, 550],
+          "hi %s %% with %d warnings; MPP 55u -> %s"
+          % (_dc_hi.get("percent_initial_permeability"),
+             len(_dc_hi.get("warnings") or []), _dc_bad.get("reason_code")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

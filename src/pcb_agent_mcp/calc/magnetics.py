@@ -1972,7 +1972,7 @@ def _magnetic_data_powder(kind, material=None, permeability=None, limit=None,
 
 def magnetic_data(kind="materials", name=None, material=None, shape=None,
                   vendor=None, data_path=None, permeability=None, limit=None,
-                  powder_data_path=None):
+                  powder_data_path=None, bias_data_path=None):
     """Read back the vendor table: materials, cores, or both.
 
     Nothing here is computed - it is the transcription, with the source URL, so a
@@ -1989,6 +1989,8 @@ def magnetic_data(kind="materials", name=None, material=None, shape=None,
     if k in ("powder_parts", "powder_part"):
         return _magnetic_data_powder("powder_parts", material, permeability, limit,
                                      name, powder_data_path)
+    if k in ("dc_bias_fit", "dc_bias", "dcbias", "bias_fit"):
+        return _magnetic_data_dc_bias(material, permeability, limit, bias_data_path)
     if k in ("materials", "material"):
         rows = data.get("materials") or []
     elif k in ("cores", "core"):
@@ -2939,3 +2941,377 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
          "unjudged": [r for r in rejected
                       if r.get("reason") == "saturation_unknown"],
          "feasible_parts": [r["part"] for r in feasible]})
+
+# --------------------------------------------------------------------------
+# DC bias: how much of mu_i survives a DC magnetising force
+#
+# The catalog's "Permeability versus DC Bias Curves" section closes with three
+# "Fit Formula" pages that print, one row per (material, core shape family,
+# permeability), the triple of
+#
+#     % initial permeability = 1 / (a + b * H^c),   H in Oersteds
+#
+# data/dc_bias_fit.json is that transcription (29 groups, 125 rows). Three
+# independent printed sources were used to check it before it was written down:
+#
+#   * printed p.10 prints, per material, the Oe at which mu reaches 80 % and
+#     50 % of mu_i at 60u. All 18 numbers come back out of the fit (worst
+#     0.96 %, fifteen of them within 0.1 %).
+#   * printed p.24 Example 2 prints "from curve fit equation, % mu_i = 0.58"
+#     for 60u Kool Mu at 79.2 Oe; the fit gives 58.4 %.
+#   * the ten curves of the printed p.52 MPP Toroids panel were read off the
+#     page as pixels at 600 dpi with the axes calibrated from the printed grid
+#     lines; seven curves match their own permeability to 0.11-1.08 % over five
+#     levels each, and the next-best permeability is 6-30 % away.
+#
+# What this section deliberately does NOT do:
+#
+#   * it does not interpolate between permeabilities. The vendor prints a fit
+#     per permeability because the curve is not a scaled copy of its neighbour;
+#     asking for a permeability that is not printed is refused with the list of
+#     printed ones.
+#   * it does not clamp H. The page prints "Note: Fit valid only for range shown
+#     on graph" without the numbers, so the caller's H is reported as-is and an
+#     H outside the band the graphs actually plot is flagged in `warnings`.
+#   * it does not model saturation. %mu_i is a small-signal quantity; the flux
+#     it is asked to carry is reported beside it (b_t, and the ratio to the
+#     material's printed saturation flux density) so that a design that has
+#     walked into saturation is visible rather than hidden inside a percentage.
+# --------------------------------------------------------------------------
+
+DC_BIAS_PATH = os.path.join(os.path.dirname(DATA_PATH), "dc_bias_fit.json")
+
+DC_BIAS_SCHEMA = "dc-bias-fit"
+
+# The band the DC-bias graphs actually plot, measured rather than assumed: the
+# grid lines of the printed p.52 MPP Toroids panel read off as 20/30/.../700 Oe
+# with the frame at 10 and 800. Other panels in the section are drawn on the same
+# frame; this is a sample, not a per-group promise, and `warnings` says so.
+DC_BIAS_PLOTTED_OE = (10.0, 800.0)
+
+
+def _load_dc_bias(path=None):
+    """(data, None) or (None, why-not). The shape of the table is part of the contract."""
+    p = path or DC_BIAS_PATH
+    if not os.path.exists(p):
+        return None, "DC-bias fit table missing: " + p
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        return None, "DC-bias fit table unreadable: %s" % exc
+    if data.get("schema") != DC_BIAS_SCHEMA:
+        return None, ("DC-bias fit table has schema %r, not %r; the shape of the table "
+                      "is checked rather than assumed, because a reader that guessed "
+                      "would answer from the wrong field"
+                      % (data.get("schema"), DC_BIAS_SCHEMA))
+    groups = data.get("groups") or []
+    if not groups:
+        return None, "DC-bias fit table has no groups"
+    for g in groups:
+        rows = g.get("rows") or []
+        if not rows:
+            return None, ("DC-bias fit group %r/%r has no rows"
+                          % (g.get("material"), g.get("shape_family")))
+        for r in rows:
+            try:
+                a = float(r["a"]); b = float(r["b"]); c = float(r["c"])
+                float(r["permeability"])
+            except Exception:  # noqa: BLE001
+                return None, ("DC-bias fit row in %r/%r is not a (permeability, a, b, c) "
+                              "quadruple: %r" % (g.get("material"),
+                                                 g.get("shape_family"), r))
+            # a is printed as 0.01 on every row, which is what pins the fit to
+            # 100 % at zero bias. A different a means the columns slipped.
+            if abs(a - 0.01) > 1e-12:
+                return None, ("DC-bias fit row %r of %r/%r carries a = %g, but every "
+                              "printed row carries a = 0.01; the transcription has "
+                              "shifted a column and the fit would not be pinned to "
+                              "100 %% at zero bias"
+                              % (r.get("permeability"), g.get("material"),
+                                 g.get("shape_family"), a))
+            if b <= 0 or c <= 0:
+                return None, ("DC-bias fit row %r of %r/%r has b = %g, c = %g; the fit "
+                              "is only decreasing for positive b and c"
+                              % (r.get("permeability"), g.get("material"),
+                                 g.get("shape_family"), b, c))
+    return data, None
+
+
+def dc_bias_percent(a, b, c, h_oe):
+    """The vendor's formula, evaluated: percent of mu_i left at H oersteds."""
+    return 1.0 / (a + b * float(h_oe) ** float(c))
+
+
+def dc_bias_b_t(a, b, c, permeability, h_oe, steps=4000):
+    """Flux density reached at H, by integrating the fit.
+
+    B[T] = 1e-4 * integral of mu_r,differential dH over 0..H, with
+    mu_r,differential = permeability * percent / 100. The 1e-4 is the CGS
+    conversion the catalog itself prints (B[T] = mu_r * H[Oe] * 1e-4 for the
+    chord). Integrating is what makes this agree with the printed magnetisation
+    curves: 60u Kool Mu at 95 Oe gives 0.442 T against the 0.441 T printed in
+    Example 2, where reading B off the chord (mu_r * H) would give 0.285 T.
+    """
+    n = int(steps)
+    if n < 100:
+        n = 100
+    h = float(h_oe)
+    scale = 1e-4 * float(permeability) / 100.0
+    dh = h / n
+    total = 0.0
+    prev = dc_bias_percent(a, b, c, 0.0)
+    for i in range(1, n + 1):
+        cur = dc_bias_percent(a, b, c, dh * i)
+        total += 0.5 * (prev + cur) * dh
+        prev = cur
+    return scale * total
+
+
+# The printed material names carry the vendor's micro sign (U+00B5) and its
+# script f (U+0192), and the rest of this module spells the same materials
+# "Kool Mu" / "Kool Mu HF". Folding the three letter-lookalikes before comparing
+# is what lets one call site answer to either spelling; a strict isalnum() key
+# keeps the micro sign as a letter and would refuse "Kool Mu" outright.
+_DC_FOLD = {0x00B5: "u", 0x03BC: "u", 0x0192: "f"}
+
+
+def _dc_key(text):
+    return "".join(ch for ch in str(text or "").translate(_DC_FOLD).lower()
+                   if ch.isalnum())
+
+
+def _dc_bias_group(data, material=None, shape_family=None):
+    """[(group, None)] or [(None, why-not)] - matching is exact on the printed names."""
+    groups = data.get("groups") or []
+    mats = []
+    for g in groups:
+        if g.get("material") not in mats:
+            mats.append(g.get("material"))
+    if material is None:
+        return None, ("material is required; the table prints %d material lines: %s"
+                      % (len(mats), ", ".join(mats)))
+    key = _dc_key(material)
+    hit = [g for g in groups if _dc_key(g.get("material")) == key]
+    if not hit:
+        return None, ("no DC-bias fit is printed for material %r; the table carries: %s"
+                      % (material, ", ".join(mats)))
+    if shape_family is None:
+        shapes = []
+        for g in hit:
+            if g.get("shape_family") not in shapes:
+                shapes.append(g.get("shape_family"))
+        if len(shapes) == 1:
+            return hit[0], None
+        return None, ("%r is printed for %d core shape families (%s); name one with "
+                      "shape_family - the coefficients differ between them, so "
+                      "picking one would be an invention"
+                      % (material, len(shapes), ", ".join(shapes)))
+    skey = _dc_key(shape_family)
+    for g in hit:
+        if _dc_key(g.get("shape_family")) == skey:
+            return g, None
+    shapes = [g.get("shape_family") for g in hit]
+    return None, ("%r has no DC-bias fit printed for shape family %r; it is printed "
+                  "for: %s" % (material, shape_family, ", ".join(shapes)))
+
+
+def magnetics_dc_bias(material, permeability, shape_family=None, h_oe=None,
+                      turns=None, dc_current_a=None, le_mm=None,
+                      bias_data_path=None, include_b=True):
+    """Percent of mu_i left at a DC magnetising force, from the vendor's own fit."""
+    data, why = _load_dc_bias(bias_data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="restore data/dc_bias_fit.json")
+    group, why = _dc_bias_group(data, material, shape_family)
+    if group is None:
+        return err(why, "NOT_FOUND",
+                   hint="magnetic_data(kind='dc_bias_fit') lists every printed row")
+
+    perms = [int(r["permeability"]) for r in group.get("rows") or []]
+    if permeability is None:
+        return err("permeability is required: the vendor prints one fit per "
+                   "permeability, and the curve is not a scaled copy of its neighbour",
+                   "ARG_INVALID",
+                   hint="printed permeabilities for %s / %s: %s"
+                        % (group.get("material"), group.get("shape_family"),
+                           ", ".join(str(x) for x in perms)),
+                   extra={"permeabilities_printed": perms})
+    try:
+        perm = int(float(permeability))
+    except Exception:  # noqa: BLE001
+        return err("permeability must be a number", "ARG_INVALID")
+    row = None
+    for r in group.get("rows") or []:
+        if int(r["permeability"]) == perm:
+            row = r
+            break
+    if row is None:
+        return err("%s / %s prints no DC-bias fit for permeability %s"
+                   % (group.get("material"), group.get("shape_family"), perm),
+                   "NOT_FOUND",
+                   hint="printed permeabilities: " + ", ".join(str(x) for x in perms),
+                   extra={"permeabilities_printed": perms})
+
+    # H: either given directly, or from the winding and the path length
+    have_h = h_oe is not None
+    have_geo = turns is not None or dc_current_a is not None or le_mm is not None
+    if have_h and have_geo:
+        return err("give either h_oe or turns+dc_current_a+le_mm, not both - they are "
+                   "two ways of stating the same magnetising force and taking one "
+                   "silently would hide the other", "ARG_INVALID")
+    if not have_h and not have_geo:
+        return err("give h_oe, or turns + dc_current_a + le_mm", "ARG_INVALID")
+    h_source = "given"
+    if not have_h:
+        missing = [n for n, v in (("turns", turns), ("dc_current_a", dc_current_a),
+                                  ("le_mm", le_mm)) if v is None]
+        if missing:
+            return err("missing " + ", ".join(missing)
+                       + " (H[Oe] = 0.4*pi*N*I[A]/le[cm])", "ARG_INVALID")
+        try:
+            n_t = float(turns); i_a = float(dc_current_a); le = float(le_mm)
+        except Exception:  # noqa: BLE001
+            return err("turns, dc_current_a and le_mm must be numbers", "ARG_INVALID")
+        if n_t <= 0 or i_a <= 0 or le <= 0:
+            return err("turns, dc_current_a and le_mm must all be positive "
+                       "(a DC bias of zero oersteds is not a bias)", "ARG_INVALID")
+        h_oe = 0.4 * math.pi * n_t * i_a / (le / 10.0)
+        h_source = "from turns and path length (CGS, the catalog's own relation)"
+    try:
+        h = float(h_oe)
+    except Exception:  # noqa: BLE001
+        return err("h_oe must be a number", "ARG_INVALID")
+    if not (h > 0):
+        return err("h_oe must be positive; zero bias means no derating at all and is "
+                   "not this tool's answer", "ARG_INVALID")
+
+    a = float(row["a"]); b = float(row["b"]); c = float(row["c"])
+    pct = dc_bias_percent(a, b, c, h)
+    warnings = []
+    lo, hi = DC_BIAS_PLOTTED_OE
+    if h < lo or h > hi:
+        warnings.append(
+            "H = %.4g Oe lies outside the %.0f-%.0f Oe band the catalog's DC-bias "
+            "graphs plot (measured from the printed p.52 panel's grid lines); the page "
+            "prints 'Fit valid only for range shown on graph' and gives no numbers, so "
+            "this answer is an extrapolation of the vendor's fit" % (h, lo, hi))
+    if pct < 25.0:
+        warnings.append(
+            "%% mu_i = %.3g is below the low-permeability end of the plotted curves; "
+            "the fit is being evaluated where the page shows no curve" % pct)
+
+    out = {
+        "material": group.get("material"),
+        "shape_family": group.get("shape_family"),
+        "permeability": perm,
+        "h_oe": _fmt(h),
+        "h_source": h_source,
+        "percent_initial_permeability": _fmt(pct),
+        "inductance_ratio": _fmt(pct / 100.0),
+        "fit": {"a": a, "b": _fmt(b), "c": c,
+                "printed_page": group.get("printed_page"),
+                "printed_formula": "% initial permeability = 1 / (a + b*H^c)"},
+        "warnings": warnings,
+    }
+    if include_b:
+        b_t = dc_bias_b_t(a, b, c, perm, h)
+        out["b_t"] = _fmt(b_t)
+        out["b_t_basis"] = ("integral of the fit over 0..H (B[T] = 1e-4 * int mu_r dH, "
+                            "the CGS relation the catalog prints); the chord form "
+                            "mu_r*H*1e-4 gives %s T here and is only right while the "
+                            "curve is still flat" % _fmt(1e-4 * perm * pct / 100.0 * h))
+        sat = _dc_bias_bsat(group.get("material"))
+        if sat is not None:
+            out["saturation_flux_density_t"] = sat
+            out["b_saturation_ratio"] = _fmt(b_t / sat)
+            if b_t / sat > 0.7:
+                warnings.append(
+                    "B = %.4g T is %.0f %% of the %.4g T the material prints for "
+                    "saturation; %% mu_i is a small-signal quantity and does not model "
+                    "saturation, so beyond this point the answer understates the drop"
+                    % (b_t, 100.0 * b_t / sat, sat))
+    if not warnings:
+        out["warnings"] = []
+    return ok(
+        out, "percent of initial permeability, and the flux that bias produces",
+        "vendor DC-bias fit % mu_i = 1/(a + b*H^c), plus B = 1e-4 * int mu_r,diff dH",
+        "data/dc_bias_fit.json - Magnetics Powder Core Catalog, 'Permeability versus DC "
+        "Bias Curves - Fit Formula', printed pp.63-65 (pdf pp.65-67); every row carries "
+        "the page it was transcribed from",
+        "3 significant figures on a curve fit the vendor ships; the fit itself is not "
+        "more accurate than its own printed curves (checked to 1.1 % on a sample)",
+        {"h": "H[Oe] = 0.4*pi*N*I[A]/le[cm] when computed from the winding",
+         "permeability": "the vendor's nominal mu for that row; nothing is interpolated "
+                         "between printed permeabilities",
+         "range": "the fit is used where the caller asks for it; an H outside the "
+                  "plotted band is flagged rather than clamped",
+         "saturation": "b_t is the flux the bias produces, not a saturation model",
+         "temperature": "the fit is the one the catalog prints; it is not re-fitted per "
+                        "temperature because the catalog does not",
+         "shape_family": "coefficients differ between shape families for the same "
+                         "material - that is a printed fact, not an artefact"},
+        {"warnings": warnings,
+         "source_url": (data.get("source") or {}).get("url"),
+         "printed_caveat": data.get("caveat_printed")})
+
+
+def _dc_bias_bsat(material):
+    """The saturation flux density printed on p.10 for that material, or None."""
+    try:
+        data, _why = _load_powder_cores()
+        row = ((data or {}).get("material_comparison_printed_page_10") or {}).get(
+            "rows") or {}
+        for name, entry in row.items():
+            if _dc_key(name) == _dc_key(material):
+                v = entry.get("sat_flux_density_t")
+                return float(v) if v is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _magnetic_data_dc_bias(material=None, permeability=None, limit=None, path=None):
+    """Read the DC-bias fit table back, filtered - the transcription, not an answer."""
+    data, why = _load_dc_bias(path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE")
+    rows = []
+    for g in data.get("groups") or []:
+        if material is not None and _dc_key(material) != _dc_key(g.get("material")):
+            continue
+        for r in g.get("rows") or []:
+            if permeability is not None and int(r["permeability"]) != int(permeability):
+                continue
+            rows.append({"material": g.get("material"),
+                         "shape_family": g.get("shape_family"),
+                         "permeability": int(r["permeability"]),
+                         "a": float(r["a"]), "b": float(r["b"]),
+                         "c": float(r["c"]),
+                         "printed_page": g.get("printed_page")})
+    if not rows:
+        mats = []
+        for g in data.get("groups") or []:
+            if g.get("material") not in mats:
+                mats.append(g.get("material"))
+        return err("no DC-bias fit row matches those filters", "NOT_FOUND",
+                   hint="materials printed: " + ", ".join(mats),
+                   extra={"materials_printed": mats})
+    total = len(rows)
+    if limit is not None:
+        rows = rows[:max(1, int(limit))]
+    return ok(
+        {"kind": "dc_bias_fit", "count": len(rows), "total_matching": total,
+         "rows": rows,
+         "formula": (data.get("formula") or {}).get("printed"),
+         "table_retrieved": (data.get("source") or {}).get("retrieved"),
+         "printed_caveat": data.get("caveat_printed"),
+         "table_path": DC_BIAS_PATH},
+        "vendor DC-bias fit rows",
+        "data/dc_bias_fit.json (transcribed, not re-fitted)",
+        "Magnetics Powder Core Catalog, 'Fit Formula' pages, printed pp.63-65",
+        "as printed (a = 0.01, b and c to four significant figures)",
+        {"fits": "the fit is the vendor's; magnetics_dc_bias evaluates it",
+         "curve": "no curve and no graph is carried here"},
+        {"source_url": (data.get("source") or {}).get("url")})

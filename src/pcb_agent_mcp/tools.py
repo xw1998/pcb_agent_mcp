@@ -3790,7 +3790,17 @@ def _capabilities(_args):
             "gap (a powder core has none - AL is the distributed-gap value), the "
             "nominal part weight (only Ve x density x factor, an estimate), and a "
             "Bsat per temperature (the catalog prints one value per column with no "
-            "temperature against it). "
+            "temperature against it). The DC-BIAS rolloff arrived in 0.0.77: "
+            "data/dc_bias_fit.json holds the catalog's own 125 fit rows (29 material x "
+            "core-shape groups, % mu_i = 1/(a + b*H^c), printed pp.63-65) and "
+            "magnetics_dc_bias evaluates one, reproducing all 18 numbers of the "
+            "catalog's printed 80 %/50 % summary table and both worked examples. What "
+            "that tool does NOT do: interpolate between printed permeabilities (it "
+            "refuses with the list), depend on temperature (one fit, not one per "
+            "temperature), model saturation (% mu_i is small-signal; the flux is "
+            "reported beside it), or feed back into select_core's turn count (more "
+            "turns means more oersteds means less mu - a fixed point 0.0.77 does not "
+            "solve). "
             "No saturation CURVE of a real "
             "material: only a single Bsat per published temperature, never "
             "interpolated between them. Gapped-core fringing loss IS computed since "
@@ -7853,6 +7863,62 @@ _tool(
 )
 
 _tool(
+    "magnetics_dc_bias",
+    "How much of a powder core's initial permeability survives a DC bias - the number "
+    "that decides whether the inductance you computed at zero current is still there "
+    "at the current it has to carry. It evaluates the VENDOR's own printed fit, "
+    "% mu_i = 1 / (a + b*H^c) with H in oersteds, transcribed from the catalog's "
+    "'Permeability versus DC Bias Curves - Fit Formula' pages (29 material x core-shape "
+    "groups, 125 rows, printed pp.63-65, in data/dc_bias_fit.json). Give h_oe "
+    "directly, or give turns + dc_current_a + le_mm and it computes H = "
+    "0.4*pi*N*I[A]/le[cm], which is the catalog's own relation. The fit is printed per "
+    "PERMEABILITY and per CORE SHAPE FAMILY, not per material, and the curve of one "
+    "permeability is not a scaled copy of its neighbour's - so an unprinted "
+    "permeability or shape family is refused with the list of printed ones rather than "
+    "interpolated. The answer also carries the flux that bias produces, b_t, obtained "
+    "by integrating the fit (the chord form mu_r*H is only right while the curve is "
+    "still flat: at 95 Oe the integral gives 0.442 T where the chord gives 0.285 T, and "
+    "the catalog itself prints 0.441 T), plus the ratio to the material's printed "
+    "saturation flux density. Checked before it was written down: the fit reproduces "
+    "all 18 numbers of the catalog's printed 80 %/50 % summary table (worst 0.96 %), "
+    "both worked examples (58.4 % against a printed 0.58; B = 0.0936 T against a "
+    "printed 0.092 T), and seven curves of the printed p.52 graph read off as pixels "
+    "(0.11-1.08 %). NOT modelled: temperature (the catalog prints one fit, not one per "
+    "temperature), saturation (% mu_i is a small-signal quantity - the flux is reported "
+    "beside it, not used to correct it), and the turn-count feedback loop (more turns "
+    "means more oersteds means less mu, which is a fixed point this tool does not "
+    "solve - iterate it yourself or feed h_oe back in).",
+    {"type": "object", "properties": {
+        "material": _str("material as the catalog prints it (Kool Mu, Kool Mu MAX, "
+                         "Kool Mu MAX High Performance, Kool Mu HF, Kool Mu Ultra, "
+                         "XFlux, XFlux Ultra, Edge, High Flux, MPP)"),
+        "permeability": _num("the row's nominal permeability in u (14, 26, 60, 125 ...). "
+                             "Part of the question: the vendor prints a different fit "
+                             "for each"),
+        "shape_family": _str("the core shape family the fit is printed for (Toroids, "
+                             "'E Cores, U Cores & EER Cores', 'EQ & LP Cores', "
+                             "'Blocks, Round Blocks & Cylinders'). Optional only when "
+                             "the material is printed for exactly one family"),
+        "h_oe": _num("DC magnetising force in oersteds, if you already have it"),
+        "turns": _num("or the winding: turns (used with dc_current_a and le_mm)"),
+        "dc_current_a": _num("the DC current the winding carries, in amperes"),
+        "le_mm": _num("the magnetic path length in mm, from the core's own data"),
+        "include_b": _bool("also report the flux density the bias produces (default "
+                           "true)"),
+        "bias_data_path": _str("override the fit table path (testing)"),
+    }, "required": ["material", "permeability"]},
+    lambda a: _magnetics.magnetics_dc_bias(
+        a.get("material"), a.get("permeability"),
+        shape_family=a.get("shape_family"),
+        h_oe=a.get("h_oe"),
+        turns=a.get("turns"),
+        dc_current_a=a.get("dc_current_a"),
+        le_mm=a.get("le_mm"),
+        bias_data_path=a.get("bias_data_path"),
+        include_b=(True if a.get("include_b") is None else bool(a.get("include_b")))),
+)
+
+_tool(
     "magnetics_data",
     "Read back the magnetic table: the materials (mu_i, Bsat at the temperatures the "
     "vendor published, Tc, density, resistivity, the vendor's loss density) and the "
@@ -7870,12 +7936,15 @@ _tool(
     "purchasable part number (1923 of them), each with its geometry, printed AL, "
     "permeability, AL tolerance band and a mass ESTIMATE (Ve x printed density x "
     "printed permeability factor; withheld for 200/300/550 u, which the vendor prints "
-    "no factor for). Five vendor printing anomalies are carried in "
+    "no factor for). kind='dc_bias_fit' returns the third table - the catalog's own "
+    "DC-bias fit rows (% mu_i = 1/(a + b*H^c), 29 material x shape groups, 125 rows, "
+    "printed pp.63-65) which magnetics_dc_bias evaluates. Five vendor printing "
+    "anomalies are carried in "
     "`printing_anomalies` verbatim rather than corrected, including one part number "
     "printed against two different sizes.",
     {"type": "object", "properties": {
         "kind": _str("which table", ["materials", "cores", "all", "powder_cores",
-                                      "powder_parts"], "materials"),
+                                      "powder_parts", "dc_bias_fit"], "materials"),
         "name": _str("exact material name or part number"),
         "material": _str("only cores of this material"),
         "shape": _str("only shapes containing this text"),
@@ -7884,6 +7953,7 @@ _tool(
         "limit": _num("powder tables only: cap the number of rows returned"),
         "data_path": _str("override the table path (testing)"),
         "powder_data_path": _str("override the powder-core table path (testing)"),
+        "bias_data_path": _str("override the DC-bias fit table path (testing)"),
     }, "required": []},
     lambda a: _magnetics.magnetic_data(
         kind=(a.get("kind") or "materials"),
@@ -7894,7 +7964,8 @@ _tool(
         data_path=a.get("data_path"),
         permeability=a.get("permeability"),
         limit=a.get("limit"),
-        powder_data_path=a.get("powder_data_path")),
+        powder_data_path=a.get("powder_data_path"),
+        bias_data_path=a.get("bias_data_path")),
 )
 
 _tool(

@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.76` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
+当前版本 `0.0.77` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -69,7 +69,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 | **铜到多少频率就不该再按 DC 算了**：趋肤效应的 1-D 精确解 | `0.0.66` | 薄板内沿厚度的扩散方程有闭式解 `R_ac/R_dc = s(sinh2s+sin2s)/(cosh2s−cos2s)`，`s = t/δ`；1 oz 铜 `R` 高出 DC 1 % 的频率是 **1.198257 MHz**、10 MHz 是 **1.5408001 倍**（`δ` 20.897 µm，`s` 1.6749 ⇒ **还不是** `√f` 区）、`f_10%` 3.864536 MHz、`f_2x` 15.535544 MHz；`s=1` 锚 **1.0856357047503276 / 0.6503925810415222**；小 s 展开 `R−1 = 4s⁴/45`、`X = 2s²/3`（后者与板内感 `ωμ₀t/3` 独立吻合）；大 s `R = X = s` 45°；**另一条独立解**（复三对角 FD，n=501..8001）差 0.2004→0.0125 %，精确按 O(dz²) 减半；`faces='two'` 在 35 µm 上**逐位等于** `faces='one'` 在 17.5 µm 上（差 <1e-12）；`current_density_field` 加 `frequency_hz` 后`R` 与 `peak_j` 同乘 1.5408、`peak_j_gross` 与 `crowding_factor` **不动** | 只有 **1-D**（沿厚度）：横向重分布、边沿拥挤、邻近效应、平面内涡流、过孔场、位移电流**都不在解里**（`limits.not_modelled` 6 条）；粗糙度只作 Hammerstad 乘子且默认关（不给 `Rq` 时明说是**下界**）；升温不在迭代里（100 ℃ 时 `dc_sheet` 4.9257e-4→8.7122e-4 而 `R/Rdc` **降到** 1.3456，因为 `δ` 随 `ρ` 变大）；`f_1%`/`f_2x` 随厚度 ∝ **1/t²** ⇒ 2 oz 的 `f_1%` 是 1 oz 的 **1/4**，且同频率下越厚 `R/Rdc` 越大（70 µm@1 MHz 1.1068 对 35 µm 1.0070）——「厚铜更好」只对**绝对** `R_ac` 成立 || **平面边缘**：开边辐射 Q、开边失谐、Huray 结节 | `0.0.60` | 50×50 mm/0.2 mm/εr 4.3 的 (1,0)：`Q_rad` **179.167** = 手算 `εr·a/(6h)`，`Qc` 115.071 ⇒ `Q_total` **70.0689**、(1,1) **134.375**；`k₀h=0.00606004` 过闸、`h=100 mm` 拒；开边 Δl **0.266086 mm** ⇒ 位移 **−1.05313 %**，1.6 mm 上 **−6.01208 %**，`(1,0)` 只开 y 边位移**精确 0**；Huray 1 GHz/r 0.5 µm/sr 1 给 `K` **1.11953**、knee **69.8767 GHz**（`δ = r/2`） | 辐射按窄缝 + 无限 PEC 法兰、无角点、介质与铜同时截止，对 3-D 求解器差**几十个百分点**；开边是大长宽比渐近式（`a/h ≥ 10`）、不改 Q；Huray 只乘铜的 `Rs`、不与 `Rq` 互推、`r > λ₀/100` 拒绝；三个工具都**不给 pass/fail** |
 | **立创真机写入**：`lceda_pcb_write` 的 create / delete / move / save | `0.0.61` | 在 V4.1.60 上：create 探针 `0 → 1`、save 让工程文件 **409600 → 569344 B** 且 sha 变、delete `1 → 0`、`modify(id,{startX:2})` 后被**两次重启**仍为 `(2,1)-(21,1)`；第二轮走工具层（`lceda_write_snippet` 生成 → `lceda_pcb_write` 执行）复现同一结论 | 只证明「写进去了」，不证明「写对了」：参数写错抓不住、屏幕未核对（`.epro` 归档那条另验于 `0.0.62`，走的是导入不是这条桥）；闸门按桥版本表放行，不传版本的答案与 0.0.60 **逐字相同** |
 | **立创归档写后重开**：`board_apply` 写出的 `.epro` 是否被应用接受 | `0.0.62` | 应用自己的导出件（控制臂）回读 `[[2,1,21,1,0.25],[1,5,21,5,0.3]]`；本模块改 `set_track e1 width 0.5 mm` 后回读 **`[[2,1,21,1,19.685],[1,5,21,5,0.3]]`**（19.685 mil = 0.499999 mm，没点名的线仍 0.3）；负控制 A（记录流换成垃圾）**导入仍返回 ok 但回读 `[]`**，负控制 B（不是 zip）导入返回 `undefined` | 只对 **V4.1.60（bridge `4.1.60.198f38ab`）**、只 ZIP、只 `ImportDocument` + `New Project` 这条门成立；屏幕未核对；`.esch` 与 `.eprj2` 仍拒写 |
-| **磁件选型**：真厂商表 → 匝数 / 磁密 / 气隙 / 损耗点 / 窗口 | `0.0.55`、`0.0.74`~`0.0.76` | 12 种材料 / 16 个磁芯每行带来源 URL；36 例负控制（缺 Bsat 不插值、单点损耗不外推、少一匝必越限、4× 频率同 B 必须 `null`）；`0.0.76` 加**粉末磁环**（Magnetics 粉末芯目录印刷 p.155–197）：**43 个尺寸 / 500 个磁导率行 / 1923 个可买料号**，九列材料按**坐标**取（厂商对空单元格根本不印，按词序解析会在缺格处整行右移），六条互检：`Ve = Ae·Le` 42/43（唯一例外 p.193 是印的 Ve 自己错）、`Le` 对对数均值周长 43/43 < 1 %、`Ae` 对外接矩形 0.90–1.00、**料号材料码 vs 列 1921/1923**、`AL/µ` 分组中位仅 3 处超 12 %（渲染确认印刷即如此）、每列磁导率 ⊆ 厂商印的范围；5 条印刷异常**原样保留并登记**（含同一个 `0058133A2` 印在两个尺寸上） | 无 Rth（不报温升）、无 Steinmetz 三元组、无 B-H 曲线、无 DC 偏置 AL 跌落；窗口只有 1 个部件有骨架数据；磁环**目录不印 MLT** ⇒ 铜损一律 `null` + 具名 missing（不拿 `π(OD+ID)/2` 顶替）、`gap_mm` 是 `null` 不是凑出来的、200/300/550 µ 没印密度因子 ⇒ `mass_g` 拒绝插值、标称重量不印 ⇒ 质量是 `Ve×密度×因子` 的估计值 |
+| **磁件选型**：真厂商表 → 匝数 / 磁密 / 气隙 / 损耗点 / 窗口 | `0.0.55`、`0.0.74`~`0.0.77` | 12 种材料 / 16 个磁芯每行带来源 URL；36 例负控制（缺 Bsat 不插值、单点损耗不外推、少一匝必越限、4× 频率同 B 必须 `null`）；`0.0.76` 加**粉末磁环**（Magnetics 粉末芯目录印刷 p.155–197）：**43 个尺寸 / 500 个磁导率行 / 1923 个可买料号**，九列材料按**坐标**取（厂商对空单元格根本不印，按词序解析会在缺格处整行右移），六条互检：`Ve = Ae·Le` 42/43（唯一例外 p.193 是印的 Ve 自己错）、`Le` 对对数均值周长 43/43 < 1 %、`Ae` 对外接矩形 0.90–1.00、**料号材料码 vs 列 1921/1923**、`AL/µ` 分组中位仅 3 处超 12 %（渲染确认印刷即如此）、每列磁导率 ⊆ 厂商印的范围；5 条印刷异常**原样保留并登记**（含同一个 `0058133A2` 印在两个尺寸上）；`0.0.77` 加 **DC 偏置**（同一份目录的 `Permeability versus DC Bias Curves — Fit Formula` 三页，印刷 63–65）：`% µi = 1/(a + b·H^c)`（H 单位 Oe），**29 组 / 125 行**，`a` 恒 0.01 ⇒ 输出就是百分数本身；五重校验：p.10 汇总表的 **18 个 80 %/50 % 数字全中**（最差 MPP 50 %：106.00 对印 105 = 0.96 %，其中 15 个在 0.1 % 内、第 16 个 0.12 %）、印刷 Example 2（60µ Kool Mu / 20 匝 / 20 A ⇒ 58.408 %，原文 0.58）、印刷 Example 3（H=15.8 Oe ⇒ 积分 0.0936 T，印 0.092 T）、p.52 曲线 600 dpi 像素读数（网格线自标定，10 条曲线里 7 条在自己磁导率上 5 点吻合 0.11–1.08 %）、结构一致性（`a` 全 0.01、`b,c > 0`）；`b_t` **必须积分** `1e-4·∫µr dH`（95 Oe 弦式只给 0.285 T，积分 0.4421 T 对印 0.441 T） | 无 Rth（不报温升）、无 Steinmetz 三元组、无 B-H 曲线、**DC 偏置能算 `% µi` 跌落但没接进 `select_core`**（匝数↑ ⇒ H↑ ⇒ µ↓ 是不动点）、不随温度、不建模饱和（`b_t` 只作对照）；窗口只有 1 个部件有骨架数据；磁环**目录不印 MLT** ⇒ 铜损一律 `null` + 具名 missing（不拿 `π(OD+ID)/2` 顶替）、`gap_mm` 是 `null` 不是凑出来的、200/300/550 µ 没印密度因子 ⇒ `mass_g` 拒绝插值、标称重量不印 ⇒ 质量是 `Ve×密度×因子` 的估计值 |
 | **DFM / 规则 / 流程工具** | `0.0.4`、`0.0.12`、`0.0.56` | 15 条规则目录 + 五态判定（0.0.56 把丝印线宽/字高、阻焊 web、铜到**成品**孔壁从"不检查"变成实测）；22 条布局 + 14 条原理图规则，缺事实即 `undetermined` | 没有内置板厂表，也没有内置安规默认值；丝印不写宽度只报上界，`plating_um` 不给就拒答成品孔壁 |
 
 ### B ｜没做完，分三种，**别混读**
@@ -122,12 +122,12 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.76
-python run_server.py --selftest         # 274/274
-python -m unittest discover -s tests    # 3112 例（实测 1233.364 s、skipped=5；0.0.75 是 3086 例 /
-                                        #   961.090 s，本轮新增 26 例（`tests/test_powder_cores.py`）；
+python run_server.py --version          # 0.0.77
+python run_server.py --selftest         # 278/278
+python -m unittest discover -s tests    # 3147 例（实测 1000.249 s、skipped=5；0.0.76 是 3112 例 /
+                                        #   1233.364 s，本轮新增 35 例（`tests/test_dc_bias_fit.py`）；
                                         #   秒数不作性能结论——本机负载没有记录；skipped 仍是那 5 条；
-                                        #   3086 + 26）
+                                        #   3112 + 35）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -203,9 +203,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（175 个）
+## 工具（176 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` /
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` / `magnetics_dc_bias` /
 `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor` / `ac_self_heating`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
@@ -314,8 +314,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `magnetics_winding_ac` | Dowell 1-D 的 `F_R = R_ac/R_dc`：箔 / 圆线层叠，拆成自发场与邻近场两项，可回算欧姆 | 1-D 场看不见**气隙边缘场**（有气隙电感里最大的一项）；无 litz、无交错绕组的 MMF 图、无谐波叠加、无磁芯损耗 |
 | `magnetics_fringing_loss` | 气隙边缘场的铜损：2-D 磁荷模型（两条反向带电条带）解出 `H_z`/`H_x`，`q` 由轴向积分的闭式定，沿厚度积分 `H_z²` 后乘**精确**板因子 `g(D)`（`D = t/δ`，`D→0` 精确退回薄板式）。返回逐层损耗、等效串联电阻、`loss_over_dc`、`probes[]` | 2-D（沿 `leg_depth` 无限）；极面理想磁导体（无饱和）；径向分量**未建模**（这里实测是轴向的 `0.32`）；与 Dowell 邻近项**按功率相加、无交叉项**；圆线拒绝（给 `field_weight_a2_m` + `probe_radii_mm` 自己乘线因子）；单频正弦；均匀 MMF、同轴壳（`layers` 同时是壳数与匝数）|
 | `magnetics_material_core_loss` | 五种粉末芯（Kool Mµ / MPP / High Flux / XFlux / Edge，含 Ultra 与 **High DC Bias** 变体）的 **厂商自己印的**损耗拟合 `PL = a·Bpk^b·f^c`（mW/cm³ + 特斯拉 + kHz），按 **材料 × 变体 × 形状 × 磁导率**（Ultra 还要看频率在 100 kHz 哪一侧）从表里查出那一行，再委托 `magnetics_core_loss` 的 `khz_t` 约定算。`value` 里回报行标签、印刷页码、源 URL、系数本身与「这是曲线拟合不是保证值」。Kool Mµ 60µ 环 100 kHz 复现目录印的 `11.0 / 168 / 466 mW/cm³`（`11.0384 / 167.589 / 466.030`），XFlux 60µ 环 50 kHz / 0.1 T 复现汇总表印的 `575`（`574.999`）| 表里 **93 行**、五个粉末材料有拟合——**九个铁氧体没有**（它们出版的是 material-level 三元组，不是这种按磁导率的表）；系数表只覆盖环 / E-U-EER / EQ-LP / 块 四个形状族；`High DC Bias` 是**另外两页独立印的行**（p.12 / p.14），与基础线差 15 %–34 %，必须显式传 `variant`；拟合不含 DC 偏置与温度，且只在 5 kHz–2 MHz、≤0.5 T 的曲线范围内有意义（出界只警告）；问题没问全就**拒绝**，不替你挑磁导率 |
-| `magnetics_select_core` | 从 `data/magnetic_materials.json`（`include_powder_cores=true` 时并上 `data/powder_cores.json` 的 43 个粉末磁环尺寸）里挑磁芯：两条匝数约束取大、峰值磁密、要不要开气隙（串联磁阻差）、厂商**一个**实测损耗点（或按你给的指数外推，`flux_waveform="triangle"`+`duty` 时按 iGSE 形状比只缩损耗、`turns`/`b_peak`/`gap` 不动）、绕组 DC 与窗口，每个候选都带 `verdict` 或具名出局原因 | 表不是全型号；饱和只在厂商公布过 Bsat 的温度上判（25 / 100 ℃，**不插值**，缺数据进 `unjudged`）；无 Rth（不报温升）、无 DC 偏置 AL 跌落、无气隙边缘场修正、窗口只有 1 个部件有骨架数据；粉末磁环是**分布式气隙**（`gap_mm` 恒 `null`、`gap_is_distributed` 为真）、磁导率只有目录真印的那些（传 55 µ 报 `NOT_FOUND` + `permeabilities_printed`，不就近取整）|
-| `magnetics_data` | 把那张表读回来：材料的 μi / Bsat（各温度）/ Tc / 损耗密度，磁芯的 Ae·le·Ve·AL·Amin·质量·骨架窗口与平均匝长·实测损耗点，**每行带来源 URL**；`kind="powder_cores"` 读粉末磁环目录（43 个尺寸 × 9 列材料），`kind="powder_parts"` 把它展平成 1923 行料号 | 这里不算任何东西，只是带出处的转录；取不到的字段是 `null` + 说明；表里没有任何 **material-level** Steinmetz 三元组（五个粉末材料的 per-permeability 厂商拟合在 `loss_fit` 里，用 `magnetics_material_core_loss` 去算）|
+| `magnetics_dc_bias` | 厂商印的 **DC 偏置**拟合 `% µi = 1/(a + b·H^c)`（H 单位 **Oersteds**，`H = 0.4π·N·I/le[cm]`；`a` 全为 0.01 ⇒ 结果直接是百分数，H=0 得 100 %）。按 **材料 × 磁导率 × 形状族** 查出那一行，返回 `percent_initial_permeability`、`inductance_ratio`、`fit{a,b,c,printed_page,printed_formula}`；给 `include_b=true` 时再把 `µr(H)` 从 0 积到 H 得 `b_t`（`1e-4·∫µr,diff dH`，梯形 4000 步），并拿厂商 p.10 的 Bsat 报 `b_saturation_ratio`；`le_mm` 可省（缺了就用目录印的 le），N 与 I 也可省（直接给 `h_oe`）| 10 个粉末材料 / 29 组 / 125 行（Kool Mµ 与 MPP 的 E/ER 组厂商没印，MPP Blocks 只有 26µ）；磁导率**只有目录真印的那些**（传 55 µ 报 `NOT_FOUND` + `permeabilities_printed`，不插值、不就近取整）；`shape_family` 在多个形状族都有该磁导率时**必须给**；H 超出目录曲线画到的 10–800 Oe 只警告不夹紧；B 是**从 0 积到 H** 的增量磁密，不含直流预磁化偏置点；不建模饱和、不随温度（目录只有 25 ℃ 一条曲线）；铁氧体没有这张表（只覆盖粉末芯）；不做「匝数 × H × µ」的不动点迭代——那要你自己把 `magnetics_dc_bias`的结果喂回去 |
+| `magnetics_select_core` | 从 `data/magnetic_materials.json`（`include_powder_cores=true` 时并上 `data/powder_cores.json` 的 43 个粉末磁环尺寸）里挑磁芯：两条匝数约束取大、峰值磁密、要不要开气隙（串联磁阻差）、厂商**一个**实测损耗点（或按你给的指数外推，`flux_waveform="triangle"`+`duty` 时按 iGSE 形状比只缩损耗、`turns`/`b_peak`/`gap` 不动）、绕组 DC 与窗口，每个候选都带 `verdict` 或具名出局原因 | 表不是全型号；饱和只在厂商公布过 Bsat 的温度上判（25 / 100 ℃，**不插值**，缺数据进 `unjudged`）；无 Rth（不报温升）、无气隙边缘场修正、窗口只有 1 个部件有骨架数据；**不替你迭代 DC 偏置**（匝数↑ ⇒ 磁动势↑ ⇒ µ↓ ⇒ 同样电流下 H 又变，是不动点；要自己拿 `magnetics_dc_bias` 喂回去）；粉末磁环是**分布式气隙**（`gap_mm` 恒 `null`、`gap_is_distributed` 为真）、磁导率只有目录真印的那些（传 55 µ 报 `NOT_FOUND` + `permeabilities_printed`，不就近取整）|
+| `magnetics_data` | 把那张表读回来：材料的 μi / Bsat（各温度）/ Tc / 损耗密度，磁芯的 Ae·le·Ve·AL·Amin·质量·骨架窗口与平均匝长·实测损耗点，**每行带来源 URL**；`kind="powder_cores"` 读粉末磁环目录（43 个尺寸 × 9 列材料），`kind="powder_parts"` 把它展平成 1923 行料号，`kind="dc_bias_fit"` 读 DC 偏置拟合表（29 组 / 125 行 `(permeability, a, b, c)` + 每组印刷页） | 这里不算任何东西，只是带出处的转录；取不到的字段是 `null` + 说明；表里没有任何 **material-level** Steinmetz 三元组（五个粉末材料的 per-permeability 厂商拟合在 `loss_fit` 里，用 `magnetics_material_core_loss` 去算）|
 | `stackup_material` | 这个频率该用哪种板材（er / tanδ / 适用频段 / 成本），以及它看不见什么 | 频段上限是**工程约定**；Dk-频率曲线、批次公差、工艺兼容性都不在表里 |
 | `stackup_design` | 4 / 6 层叠：层角色、铜厚、介质分配、**每信号层各自的 50Ω 线宽**、缝合孔 λ_g/20、铜对称性 | 介质分配是**等比**的，不是压合图；线宽必须回到板厂 er 上重解 |
 | `rf_chain` | 级联增益、Friis 噪声（含各级占比）、级联 IIP3/OIP3、kTB 底噪与灵敏度 | 缺任一级 `nf_db` ⇒ NF 是 `None` 不是部分和；IP3 公式是 worst case；级间失配不在里面 |
@@ -382,10 +383,10 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.76
-python run_server.py --selftest      # 协议级自检，274/274（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问）
-python -m unittest discover -s tests # 3112 个用例（实测 1233.364 s、skipped=5，kicad-cli / pcbnew 与二维场解用例占大头；
-                                     #   0.0.75 同机 3086 例跑了 961.090 s，秒数随机器负载浮动，不作性能结论）
+python run_server.py --version       # 0.0.77
+python run_server.py --selftest      # 协议级自检，278/278（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问、DC 偏置四问）
+python -m unittest discover -s tests # 3147 个用例（实测 1000.249 s、skipped=5，kicad-cli / pcbnew 与二维场解用例占大头；
+                                     #   0.0.76 同机 3112 例跑了 1233.364 s，秒数随机器负载浮动，不作性能结论）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -688,7 +689,8 @@ MCP 客户端配置（stdio）：
   这句话诚实，但它藏着的缺口很大：没有表就答不了"哪个买得到的磁芯装得下这个电感"。
   0.0.55 加 `data/magnetic_materials.json`（12 种材料 / 16 个磁芯，`verified: true`，
   每行带来源 URL）与两个工具：`magnetics_select_core`（选型）和 `magnetics_data`（读表，
-  不算任何东西）。纪律写在表头的 `what_this_is_not` 里：**不是 Steinmetz 拟合**
+  不算任何东西）；`0.0.77` 起又多了第三个 `magnetics_dc_bias`——厂商 DC 偏置
+  `Fit Formula` 三页（印刷 63–65）的 `% µi = 1/(a + b·H^c)`，29 组 / 125 行。纪律写在表头的 `what_this_is_not` 里：**不是 Steinmetz 拟合**
   （TDK/Ferroxcube 的 `Cm/x/y` 在材料 PDF 里、`web` 抓不到 ⇒ 16 行的 `steinmetz` 全是
   `null`；外推只在**你**给了两个指数时做）、**不是热模型**（一个 `Rth` 都没找到 ⇒ 只报瓦、
   不报温升）、**不是 B-H 曲线**（`bsat` 只有点）、**不是全型号**。最能说明纪律的一格是
@@ -1005,7 +1007,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 175 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 176 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -1076,8 +1078,9 @@ pcb_agent_mcp/
 │   ├── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
 │   ├── magnetic_materials.json   # 12 种材料 / 16 个磁芯，每行带来源 URL（0.0.55 起）
 │   ├── powder_cores.json         # 粉末磁环目录：43 尺寸 / 500 磁导率行 / 1923 料号（0.0.76 起）
+│   ├── dc_bias_fit.json          # DC 偏置拟合：29 组 / 125 行 (µ, a, b, c)，印刷 p.63–65（0.0.77 起）
 │   └── creepage_tables.json      # 电气间隙/爬电距离阶梯（schematic_review 的隔离间距用）
-├── tests/                        # 3112 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 3147 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）

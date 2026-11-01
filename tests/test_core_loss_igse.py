@@ -382,7 +382,7 @@ class TestTools(unittest.TestCase):
         # count, and silently growing the surface is how a tool list rots.
         # 0.0.72 does add one (magnetics_fringing_loss): 173 -> 174
         # 0.0.74 adds one more (magnetics_material_core_loss): 174 -> 175
-        self.assertEqual(len(tools.TOOLS), 175)
+        self.assertEqual(len(tools.TOOLS), 176)
 
 
 if __name__ == "__main__":
