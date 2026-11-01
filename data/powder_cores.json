@@ -1,0 +1,1179 @@
+{
+  "schema": "powder-core-toroid",
+  "version": "0.0.76",
+  "what_this_is": "Magnetics (mag-inc) powder-core toroid data: physical geometry and AL per permeability, transcribed from the vendor catalog. It is a transcription of printed tables, not a model.",
+  "source": {
+    "vendor": "Magnetics, a Division of Spang & Company",
+    "document": "Powder Core Catalog",
+    "url": "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf",
+    "file_bytes": 12415449,
+    "pdf_pages": 210,
+    "pdf_pages_used": "156-198",
+    "printed_pages_used": "154-197 (printed page = pdf page - 1)",
+    "retrieved": "2026-11-01",
+    "extraction": "PyMuPDF text words. Column assignment uses the x position of the nine material column headers on each page (Kool Mu, Kool Mu MAX, Kool Mu Hf, Kool Mu Ultra, XFlux, XFlux Ultra, Edge, High Flux, MPP), not token order, because the catalog drops cells that are empty.",
+    "printed_page_is_what_is_cited_below": true
+  },
+  "units": {"od_mm": "mm", "id_mm": "mm", "ht_mm": "mm", "window_area_mm2": "mm^2", "ae_mm2": "mm^2", "le_mm": "mm", "ve_mm3": "mm^3", "area_product_mm4": "mm^4", "surface_area_mm2": "mm^2", "al_nh": "nH/T^2 found in the table body"},
+  "column_order": ["Kool Mµ", "Kool Mµ MAX", "Kool Mµ Hƒ", "Kool Mµ Ultra", "XFlux", "XFlux Ultra", "Edge", "High Flux", "MPP"],
+  "material_code_prefix": {"55": "MPP", "58": "High Flux", "59": "Edge", "70": "Kool Mµ Ultra", "74": "XFlux Ultra", "76": "Kool Mµ Hƒ", "77": "Kool Mµ", "78": "XFlux", "79": "Kool Mµ MAX"},
+  "part_number_reading": {
+    "layout": "GradingCode(2) + MaterialCode(2) + CatalogNumber(3) + CoreFinish(2), e.g. C055206A2",
+    "grading_code": {"00": "not graded, AL is printed as a single value with the +-8% band stated above the column", "C0": "graded into narrower inductance bands, see al_tolerance_pct_c0"},
+    "material_code": "the two digits after the grading code; this is what the nine columns carry, and it is used here as an independent cross-check that the column assignment is right",
+    "core_finish": {"A2": "2000 VAC min wire-to-wire (varies by OD), High Flux / Edge / MPP only", "A7": "2000 VAC min (varies by OD), Kool Mu family and XFlux family", "A9": "8000 VAC min, OD > 4.65 mm", "AY": "600 VAC min, Parylene-C, OD 3.56-16.6 mm, not available for 550u MPP"},
+    "core_finish_printed_page": 17,
+    "printed_page": 17
+  },
+  "al_tolerance_pct_c0": {"rule": "MPP and High Flux cores with a C0 prefix and OD > 4.65 mm are graded into 2% inductance bands; MPP cores with a C0 prefix and OD 4.65 mm and smaller are graded into 5% bands.", "od_gt_4p65": 2, "od_le_4p65": 5, "default_without_c0": 8, "printed_page": 18},
+  "material_comparison_printed_page_10": {
+    "what_this_is": "the vendor own nine-column comparison table on printed p.10, transcribed by column x position; the same page that the loss fits were cross-checked against in 0.0.75",
+    "printed_page": 10,
+    "columns": ["Kool Mµ", "Kool Mµ MAX", "Kool Mµ Hƒ", "Kool Mµ Ultra", "XFlux", "XFlux Ultra", "Edge", "High Flux", "MPP"],
+    "rows": {
+      "Kool Mµ": {"alloy_composition": "FeSiAl", "available_permeabilities_printed": {"min": 14, "max": 125}, "core_loss_60u_mw_cc_at_50khz_1000g": 215, "core_loss_60u_mw_cc_at_100khz_1000g": 550, "perm_vs_dc_bias_oe_at_80pct_mu_i": 45, "perm_vs_dc_bias_oe_at_50pct_mu_i": 95, "temp_stability_60u_pct_shift_minus60_to_200c": 6, "curie_temp_c": 500, "sat_flux_density_t": 1.0, "frequency_response_flat_to_mhz": 5, "relative_cost": "1x*"},
+      "Kool Mµ MAX": {"alloy_composition": "FeSiAl", "available_permeabilities_printed": {"min": 14, "max": 90}, "core_loss_60u_mw_cc_at_50khz_1000g": 210, "core_loss_60u_mw_cc_at_100khz_1000g": 550, "perm_vs_dc_bias_oe_at_80pct_mu_i": 65, "perm_vs_dc_bias_oe_at_50pct_mu_i": 130, "temp_stability_60u_pct_shift_minus60_to_200c": 3, "curie_temp_c": 500, "sat_flux_density_t": 1.0, "frequency_response_flat_to_mhz": 13, "relative_cost": "2x"},
+      "Kool Mµ Hƒ": {"alloy_composition": "FeSiAl", "available_permeabilities_printed": {"min": 26, "max": 60}, "core_loss_60u_mw_cc_at_50khz_1000g": 120, "core_loss_60u_mw_cc_at_100khz_1000g": 325, "perm_vs_dc_bias_oe_at_80pct_mu_i": 60, "perm_vs_dc_bias_oe_at_50pct_mu_i": 115, "temp_stability_60u_pct_shift_minus60_to_200c": 5, "curie_temp_c": 500, "sat_flux_density_t": 1.0, "frequency_response_flat_to_mhz": 16, "relative_cost": "2x"},
+      "Kool Mµ Ultra": {"alloy_composition": "FeSiAl", "available_permeabilities_printed": {"min": 26, "max": 60}, "core_loss_60u_mw_cc_at_50khz_1000g": 100, "core_loss_60u_mw_cc_at_100khz_1000g": 160, "perm_vs_dc_bias_oe_at_80pct_mu_i": 60, "perm_vs_dc_bias_oe_at_50pct_mu_i": 120, "temp_stability_60u_pct_shift_minus60_to_200c": 5, "curie_temp_c": 500, "sat_flux_density_t": 1.0, "frequency_response_flat_to_mhz": 3, "relative_cost": "3x"},
+      "XFlux": {"alloy_composition": "FeSi", "available_permeabilities_printed": {"min": 19, "max": 125}, "core_loss_60u_mw_cc_at_50khz_1000g": 575, "core_loss_60u_mw_cc_at_100khz_1000g": 1280, "perm_vs_dc_bias_oe_at_80pct_mu_i": 100, "perm_vs_dc_bias_oe_at_50pct_mu_i": 170, "temp_stability_60u_pct_shift_minus60_to_200c": 4, "curie_temp_c": 700, "sat_flux_density_t": 1.6, "frequency_response_flat_to_mhz": 4, "relative_cost": "1.2x"},
+      "XFlux Ultra": {"alloy_composition": "FeSi", "available_permeabilities_printed": {"min": 26, "max": 60}, "core_loss_60u_mw_cc_at_50khz_1000g": 450, "core_loss_60u_mw_cc_at_100khz_1000g": 1035, "perm_vs_dc_bias_oe_at_80pct_mu_i": 110, "perm_vs_dc_bias_oe_at_50pct_mu_i": 180, "temp_stability_60u_pct_shift_minus60_to_200c": 2.5, "curie_temp_c": 700, "sat_flux_density_t": 1.6, "frequency_response_flat_to_mhz": 2.5, "relative_cost": "1.5x"},
+      "Edge": {"alloy_composition": "FeNi", "available_permeabilities_printed": {"min": 14, "max": 125}, "core_loss_60u_mw_cc_at_50khz_1000g": 150, "core_loss_60u_mw_cc_at_100khz_1000g": 375, "perm_vs_dc_bias_oe_at_80pct_mu_i": 130, "perm_vs_dc_bias_oe_at_50pct_mu_i": 205, "temp_stability_60u_pct_shift_minus60_to_200c": 2, "curie_temp_c": 500, "sat_flux_density_t": 1.5, "frequency_response_flat_to_mhz": 15, "relative_cost": "5x"},
+      "High Flux": {"alloy_composition": "FeNi", "available_permeabilities_printed": {"min": 14, "max": 160}, "core_loss_60u_mw_cc_at_50khz_1000g": 250, "core_loss_60u_mw_cc_at_100khz_1000g": 625, "perm_vs_dc_bias_oe_at_80pct_mu_i": 100, "perm_vs_dc_bias_oe_at_50pct_mu_i": 185, "temp_stability_60u_pct_shift_minus60_to_200c": 4.5, "curie_temp_c": 500, "sat_flux_density_t": 1.5, "frequency_response_flat_to_mhz": 1, "relative_cost": "4x-6x"},
+      "MPP": {"alloy_composition": "FeNiMo", "available_permeabilities_printed": {"min": 14, "max": 550}, "core_loss_60u_mw_cc_at_50khz_1000g": 165, "core_loss_60u_mw_cc_at_100khz_1000g": 450, "perm_vs_dc_bias_oe_at_80pct_mu_i": 60, "perm_vs_dc_bias_oe_at_50pct_mu_i": 105, "temp_stability_60u_pct_shift_minus60_to_200c": 2.5, "curie_temp_c": 460, "sat_flux_density_t": 0.8, "frequency_response_flat_to_mhz": 2, "relative_cost": "7x-9x"}
+    },
+    "the_saturation_row_is_the_one_to_use_for_a_powder_part": "printed p.10 gives one saturation number per material column, with no temperature and no tolerance; that is what a DC-bias verdict should be judged against, and it is the only page in this catalog that prints a saturation number for MPP",
+    "asterisks": "the catalog marks some cells with a star (e.g. Ultra 100 mW/cc, Edge 130 Oe, High Flux 130 Oe, Kool Mu 1x*); the star points at a footnote that this transcription does not carry, so those cells are copied with the star"
+  },
+  "material_properties_printed_page_16": {
+    "what_this_is": "Curie temperature, density at 60u, coefficient of thermal expansion per material column, and the factors that relate a 60u density to the other permeabilities - printed on p.16",
+    "printed_page": 16,
+    "density_basis": "grams/cm3 for the 60u permeability of that column; a pressed powder core carries binder, so this is the core bulk density and not the alloy density",
+    "weight_is_an_estimate": "the catalog says See individual data sheets for nominal core weights, so a mass computed from Ve x density x factor is an estimate, not the vendor nominal weight",
+    "rows": {
+      "Kool Mµ": {"curie_temp_c": 500, "density_60u_g_cm3": 5.8, "cte_ppm_per_c": 10.8},
+      "Kool Mµ MAX": {"curie_temp_c": 500, "density_60u_g_cm3": 6.5, "cte_ppm_per_c": 10.8},
+      "Kool Mµ Hƒ": {"curie_temp_c": 500, "density_60u_g_cm3": 6.0, "cte_ppm_per_c": 10.8},
+      "Kool Mµ Ultra": {"curie_temp_c": 500, "density_60u_g_cm3": 6.0, "cte_ppm_per_c": 10.8},
+      "XFlux": {"curie_temp_c": 700, "density_60u_g_cm3": 6.9, "cte_ppm_per_c": 11.6},
+      "XFlux Ultra": {"curie_temp_c": 700, "density_60u_g_cm3": 7.1, "cte_ppm_per_c": 11.6},
+      "Edge": {"curie_temp_c": 500, "density_60u_g_cm3": 7.8, "cte_ppm_per_c": 5.8},
+      "High Flux": {"curie_temp_c": 500, "density_60u_g_cm3": 7.6, "cte_ppm_per_c": 5.8},
+      "MPP": {"curie_temp_c": 460, "density_60u_g_cm3": 7.8, "cte_ppm_per_c": 12.9}
+    },
+    "permeability_density_factors_60u": {"14": 0.85, "19": 0.89, "26": 0.91, "40": 0.96, "60": 1.0, "75": 1.02, "90": 1.03, "125": 1.05, "147": 1.06, "160": 1.07, "173": 1.08},
+    "permeabilities_without_a_printed_factor": [200, 300, 550],
+    "permeabilities_without_a_printed_factor_note": "p.16 prints eleven factors for fourteen permeabilities; 200u, 300u and 550u have none, so a mass for those is refused rather than interpolated"
+  },
+  "cells": {"a_part_number": "that material is offered in this size at this permeability", "a_dash": "the catalog prints a dash: not offered", "null": "the catalog prints nothing at all in this cell (the cell is blank, which is why token order cannot be used to read this table)"},
+  "printing_anomalies": [
+    {"printed_page": 176, "pdf_page": 177, "perm": 40, "column": "MPP", "printed": "0058330A2", "why": "this is a High Flux part number (material code 58) printed in the MPP column, identical to the High Flux cell in the same row; the MPP part number is missing. Kept verbatim, confirmed on the rendered page.", "verified_by": "rendered page image, not only the text layer"},
+    {"printed_page": 191, "pdf_page": 192, "perm": 75, "column": "Edge", "printed": "0058871A2", "why": "this is a High Flux part number (material code 58) printed in the Edge column, identical to the High Flux cell in the same row; the Edge part number is missing. Kept verbatim, confirmed on the rendered page.", "verified_by": "rendered page image, not only the text layer"},
+    {"printed_page": 162, "pdf_page": 163, "perm": 60, "column": "High Flux", "printed": "CO58031A2", "why": "the second character is the letter O in the PDF content stream, not the digit zero; every other graded part number on the same pages uses the digit zero. Visually the two are indistinguishable, so a buyer must be told. Kept verbatim.", "verified_by": "text-layer character code, compared against the other C0 cells on the same page"},
+    {"printed_page": 193, "pdf_page": 194, "perm": null, "column": "geometry", "printed": "Ae 492, Le 177.2, Ve 81,500", "why": "the vendor own three numbers are mutually inconsistent: 492 x 177.2 = 87,182, and 81,500 / 177.2 = 460. Ae is confirmed independently (0.989 of the rectangular cross-section HT*(OD-ID)/2), Le is confirmed independently (log-mean pi*(OD-ID)/ln(OD/ID) = 177.19). So the printed Ve is the odd one out by 6.5%. All three are stored verbatim; nothing was corrected.", "verified_by": "rendered page image plus two independent geometric checks"},
+    {"printed_page": 166, "pdf_page": 167, "perm": 14, "column": "High Flux", "printed": "0058133A2", "why": "the same High Flux part number is printed again on printed p.168 (pdf p.169) against a different size (OD 16.59 mm, perm 40 u). A catalog number encodes the size and the AL, so one part number cannot be right for two sizes; the catalog does not say which cell is the wrong one, so both rows are kept verbatim and neither part number is invented. Found by counting distinct part numbers against distinct cells (1923 cells, 1920 distinct).", "verified_by": "both pages rendered and read as images; the text layer agrees with the images on both pages"}
+  ],
+  "sizes": [
+    {
+      "size": "OD 3.56 / ID 1.78 / HT 1.52 mm",
+      "printed_page": 155,
+      "pdf_page": 156,
+      "od_mm": 3.56, "id_mm": 1.78, "ht_mm": 1.52,
+      "od_mm_after_finish": 4.19, "id_mm_after_finish": 1.27, "ht_mm_after_finish": 2.16,
+      "geometry": {
+        "window_area_mm2": 1.27, "ae_mm2": 1.3, "le_mm": 8.06, "ve_mm3": 10.5,
+        "area_product_mm4": 1.65, "surface_area_unwound_core_mm2": 60, "surface_area_40pct_winding_factor_mm2": 70,
+        "ve_mm3_from_ae_le": 10.5, "ve_selfcheck_ratio": 1.0021, "le_mm_log_mean_check": 8.07
+      },
+      "rows": [
+        {"perm": 60, "al_nh": 13, "parts": ["0077141A7", "-", "-", "-", "-", "-", "-", "C058141A2", "0055141A2"]},
+        {"perm": 75, "al_nh": 16, "parts": ["0077445A7", "-", "-", "-", "-", "-", "-", "0058445A2", "0055445A2"]},
+        {"perm": 90, "al_nh": 19, "parts": ["0077444A7", "-", "-", "-", "-", "-", "-", "0058444A2", "0055444A2"]},
+        {"perm": 125, "al_nh": 26, "parts": ["0077140A7", "-", "-", "-", "-", "-", "-", "C058140A2", "C055140A2"]},
+        {"perm": 147, "al_nh": 31, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055139A2"]},
+        {"perm": 160, "al_nh": 33, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055138A2"]},
+        {"perm": 173, "al_nh": 36, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055134A2"]},
+        {"perm": 200, "al_nh": 42, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055137A2"]},
+        {"perm": 300, "al_nh": 62, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055135A2"]}
+      ]
+    },
+    {
+      "size": "OD 3.94 / ID 2.24 / HT 2.54 mm",
+      "printed_page": 156,
+      "pdf_page": 157,
+      "od_mm": 3.94, "id_mm": 2.24, "ht_mm": 2.54,
+      "od_mm_after_finish": 4.57, "id_mm_after_finish": 1.73, "ht_mm_after_finish": 3.18,
+      "geometry": {
+        "window_area_mm2": 2.32, "ae_mm2": 2.11, "le_mm": 9.42, "ve_mm3": 19.9,
+        "area_product_mm4": 4.9, "surface_area_unwound_core_mm2": 90, "surface_area_40pct_winding_factor_mm2": 110,
+        "ve_mm3_from_ae_le": 19.9, "ve_selfcheck_ratio": 1.0012, "le_mm_log_mean_check": 9.46
+      },
+      "rows": [
+        {"perm": 60, "al_nh": 17, "parts": ["0077151A7", "-", "-", "-", "-", "-", "-", "C058151A2", "0055151A2"]},
+        {"perm": 75, "al_nh": 21, "parts": ["0077155A7", "-", "-", "-", "-", "-", "-", "0058155A2", "0055155A2"]},
+        {"perm": 90, "al_nh": 25, "parts": ["0077154A7", "-", "-", "-", "-", "-", "-", "0058154A2", "0055154A2"]},
+        {"perm": 125, "al_nh": 35, "parts": ["0077150A7", "-", "-", "-", "-", "-", "-", "C058150A2", "C055150A2"]},
+        {"perm": 147, "al_nh": 41, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055149A2"]},
+        {"perm": 160, "al_nh": 45, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055148A2"]},
+        {"perm": 173, "al_nh": 48, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055144A2"]},
+        {"perm": 200, "al_nh": 56, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055147A2"]},
+        {"perm": 300, "al_nh": 84, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055145A2"]}
+      ]
+    },
+    {
+      "size": "OD 4.65 / ID 2.36 / HT 2.54 mm",
+      "printed_page": 157,
+      "pdf_page": 158,
+      "od_mm": 4.65, "id_mm": 2.36, "ht_mm": 2.54,
+      "od_mm_after_finish": 5.28, "id_mm_after_finish": 1.85, "ht_mm_after_finish": 3.18,
+      "geometry": {
+        "window_area_mm2": 2.69, "ae_mm2": 2.85, "le_mm": 10.6, "ve_mm3": 30.3,
+        "area_product_mm4": 7.66, "surface_area_unwound_core_mm2": 110, "surface_area_40pct_winding_factor_mm2": 130,
+        "ve_mm3_from_ae_le": 30.2, "ve_selfcheck_ratio": 1.003, "le_mm_log_mean_check": 10.61
+      },
+      "rows": [
+        {"perm": 60, "al_nh": 20, "parts": ["0077181A7", "-", "-", "-", "-", "-", "-", "0058181A2", "0055181A2"]},
+        {"perm": 75, "al_nh": 25, "parts": ["0077185A7", "-", "-", "-", "-", "-", "-", "0058185A2", "0055185A2"]},
+        {"perm": 90, "al_nh": 30, "parts": ["0077184A7", "-", "-", "-", "-", "-", "-", "0058184A2", "0055184A2"]},
+        {"perm": 125, "al_nh": 42, "parts": ["0077180A7", "-", "-", "-", "-", "-", "-", "C058180A2", "C055180A2"]},
+        {"perm": 147, "al_nh": 49, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055179A2"]},
+        {"perm": 160, "al_nh": 53, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055178A2"]},
+        {"perm": 173, "al_nh": 57, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055174A2"]},
+        {"perm": 200, "al_nh": 67, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055177A2"]},
+        {"perm": 300, "al_nh": 99, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055175A2"]}
+      ]
+    },
+    {
+      "size": "OD 6.35 / ID 2.79 / HT 2.79 mm",
+      "printed_page": 158,
+      "pdf_page": 159,
+      "od_mm": 6.35, "id_mm": 2.79, "ht_mm": 2.79,
+      "od_mm_after_finish": 6.99, "id_mm_after_finish": 2.29, "ht_mm_after_finish": 3.43,
+      "geometry": {
+        "window_area_mm2": 4.08, "ae_mm2": 4.7, "le_mm": 13.6, "ve_mm3": 64,
+        "area_product_mm4": 19.2, "surface_area_unwound_core_mm2": 170, "surface_area_40pct_winding_factor_mm2": 200,
+        "ve_mm3_from_ae_le": 63.9, "ve_selfcheck_ratio": 1.0013, "le_mm_log_mean_check": 13.6
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 6, "parts": ["0077023A7", "-", "-", "-", "-", "-", "-", "0058023A2", "0055023A2"]},
+        {"perm": 19, "al_nh": 8, "parts": ["0077823A7", "-", "-", "-", "-", "-", "-", "-", "0055823A2"]},
+        {"perm": 26, "al_nh": 10, "parts": ["0077022A7", "-", "-", "-", "-", "-", "-", "0058022A2", "0055022A2"]},
+        {"perm": 40, "al_nh": 18, "parts": ["0077826A7", "-", "-", "-", "-", "-", "-", "0058826A2", "0055826A2"]},
+        {"perm": 60, "al_nh": 24, "parts": ["0077021A7", "-", "-", "-", "-", "-", "-", "C058021A2", "C055021A2"]},
+        {"perm": 75, "al_nh": 30, "parts": ["0077825A7", "-", "-", "-", "-", "-", "-", "0058825A2", "0055825A2"]},
+        {"perm": 90, "al_nh": 36, "parts": ["0077824A7", "-", "-", "-", "-", "-", "-", "0058824A2", "0055824A2"]},
+        {"perm": 125, "al_nh": 50, "parts": ["0077020A7", "-", "-", "-", "-", "-", "-", "C058020A2", "C055020A2"]},
+        {"perm": 147, "al_nh": 59, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058019A2", "C055019A2"]},
+        {"perm": 160, "al_nh": 64, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058018A2", "C055018A2"]},
+        {"perm": 173, "al_nh": 69, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055014A2"]},
+        {"perm": 200, "al_nh": 80, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055017A2"]},
+        {"perm": 300, "al_nh": 120, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055015A2"]},
+        {"perm": 550, "al_nh": 220, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055016A2"]}
+      ]
+    },
+    {
+      "size": "OD 6.6 / ID 2.67 / HT 2.54 mm",
+      "printed_page": 159,
+      "pdf_page": 160,
+      "od_mm": 6.6, "id_mm": 2.67, "ht_mm": 2.54,
+      "od_mm_after_finish": 7.24, "id_mm_after_finish": 2.16, "ht_mm_after_finish": 3.18,
+      "geometry": {
+        "window_area_mm2": 3.63, "ae_mm2": 4.76, "le_mm": 13.6, "ve_mm3": 64.9,
+        "area_product_mm4": 17.3, "surface_area_unwound_core_mm2": 170, "surface_area_40pct_winding_factor_mm2": null,
+        "ve_mm3_from_ae_le": 64.7, "ve_selfcheck_ratio": 1.0025, "le_mm_log_mean_check": 13.64
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 6, "parts": ["0077243A7", "-", "-", "-", "-", "-", "-", "0058243A2", "0055243A2"]},
+        {"perm": 19, "al_nh": 8, "parts": ["0077247A7", "-", "-", "-", "-", "-", "-", "-", "0055247A2"]},
+        {"perm": 26, "al_nh": 11, "parts": ["0077242A7", "-", "-", "-", "-", "-", "-", "0058242A2", "0055242A2"]},
+        {"perm": 40, "al_nh": 17, "parts": ["0077246A7", "-", "-", "-", "-", "-", "-", "0058246A2", "0055246A2"]},
+        {"perm": 60, "al_nh": 26, "parts": ["0077241A7", "-", "-", "-", "-", "-", "-", "C058241A2", "C055241A2"]},
+        {"perm": 75, "al_nh": 32, "parts": ["0077245A7", "-", "-", "-", "-", "-", "-", "0058245A2", "0055245A2"]},
+        {"perm": 90, "al_nh": 39, "parts": ["0077244A7", "-", "-", "-", "-", "-", "-", "0058244A2", "0055244A2"]},
+        {"perm": 125, "al_nh": 54, "parts": ["0077240A7", "-", "-", "-", "-", "-", "-", "C058240A2", "C055240A2"]},
+        {"perm": 147, "al_nh": 64, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058239A2", "C055239A2"]},
+        {"perm": 160, "al_nh": 69, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058238A2", "C055238A2"]},
+        {"perm": 173, "al_nh": 75, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055234A2"]},
+        {"perm": 200, "al_nh": 86, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055237A2"]},
+        {"perm": 300, "al_nh": 130, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055235A2"]},
+        {"perm": 550, "al_nh": 242, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055236A2"]}
+      ]
+    },
+    {
+      "size": "OD 6.6 / ID 2.67 / HT 4.78 mm",
+      "printed_page": 160,
+      "pdf_page": 161,
+      "od_mm": 6.6, "id_mm": 2.67, "ht_mm": 4.78,
+      "od_mm_after_finish": 7.24, "id_mm_after_finish": 2.16, "ht_mm_after_finish": 5.41,
+      "geometry": {
+        "window_area_mm2": 3.63, "ae_mm2": 9.2, "le_mm": 13.6, "ve_mm3": 125,
+        "area_product_mm4": 33.4, "surface_area_unwound_core_mm2": 230, "surface_area_40pct_winding_factor_mm2": 260,
+        "ve_mm3_from_ae_le": 125.1, "ve_selfcheck_ratio": 0.999, "le_mm_log_mean_check": 13.64
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 12, "parts": ["0077273A7", "-", "-", "-", "-", "-", "-", "0058273A2", "0055273A2"]},
+        {"perm": 19, "al_nh": 16, "parts": ["0077877A7", "-", "-", "-", "-", "-", "-", "-", "0055877A2"]},
+        {"perm": 26, "al_nh": 21, "parts": ["0077272A7", "-", "-", "-", "-", "-", "-", "0058272A2", "0055272A2"]},
+        {"perm": 40, "al_nh": 33, "parts": ["0077876A7", "-", "-", "-", "-", "-", "-", "0058876A2", "0055876A2"]},
+        {"perm": 60, "al_nh": 50, "parts": ["0077271A7", "-", "-", "-", "-", "-", "-", "C058271A2", "C055271A2"]},
+        {"perm": 75, "al_nh": 62, "parts": ["0077875A7", "-", "-", "-", "-", "-", "-", "0058875A2", "0055875A2"]},
+        {"perm": 90, "al_nh": 74, "parts": ["0077874A7", "-", "-", "-", "-", "-", "-", "0058874A2", "0055874A2"]},
+        {"perm": 125, "al_nh": 103, "parts": ["0077270A7", "-", "-", "-", "-", "-", "-", "C058270A2", "C055270A2"]},
+        {"perm": 147, "al_nh": 122, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058269A2", "C055269A2"]},
+        {"perm": 160, "al_nh": 132, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058268A2", "C055268A2"]},
+        {"perm": 173, "al_nh": 144, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055264A2"]},
+        {"perm": 200, "al_nh": 165, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055267A2"]},
+        {"perm": 300, "al_nh": 247, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055265A2"]},
+        {"perm": 550, "al_nh": 466, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055266A2"]}
+      ]
+    },
+    {
+      "size": "OD 6.86 / ID 3.96 / HT 5.08 mm",
+      "printed_page": 161,
+      "pdf_page": 162,
+      "od_mm": 6.86, "id_mm": 3.96, "ht_mm": 5.08,
+      "od_mm_after_finish": 7.49, "id_mm_after_finish": 3.45, "ht_mm_after_finish": 5.72,
+      "geometry": {
+        "window_area_mm2": 9.35, "ae_mm2": 7.25, "le_mm": 16.5, "ve_mm3": 120,
+        "area_product_mm4": 67.8, "surface_area_unwound_core_mm2": 260, "surface_area_40pct_winding_factor_mm2": 330,
+        "ve_mm3_from_ae_le": 119.6, "ve_selfcheck_ratio": 1.0031, "le_mm_log_mean_check": 16.58
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 8, "parts": ["0077413A7", "-", "-", "-", "-", "-", "-", "0058413A2", "0055413A2"]},
+        {"perm": 19, "al_nh": 11, "parts": ["0077417A7", "-", "-", "-", "-", "-", "-", "-", "0055417A2"]},
+        {"perm": 26, "al_nh": 14, "parts": ["0077412A7", "-", "-", "-", "-", "-", "-", "0058412A2", "0055412A2"]},
+        {"perm": 40, "al_nh": 22, "parts": ["0077403A7", "-", "-", "-", "-", "-", "-", "0058403A2", "0055403A2"]},
+        {"perm": 60, "al_nh": 33, "parts": ["0077411A7", "-", "-", "-", "-", "-", "-", "C058411A2", "0055411A2"]},
+        {"perm": 75, "al_nh": 42, "parts": ["0077415A7", "-", "-", "-", "-", "-", "-", "0058415A2", "0055415A2"]},
+        {"perm": 90, "al_nh": 50, "parts": ["0077414A7", "-", "-", "-", "-", "-", "-", "0058414A2", "0055414A2"]},
+        {"perm": 125, "al_nh": 70, "parts": ["0077410A7", "-", "-", "-", "-", "-", "-", "C058410A2", "C055410A2"]},
+        {"perm": 147, "al_nh": 81, "parts": ["-", "-", "-", "-", "-", "-", "-", "0058409A2", "C055409A2"]},
+        {"perm": 160, "al_nh": 89, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058408A2", "C055408A2"]},
+        {"perm": 173, "al_nh": 95, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055404A2"]},
+        {"perm": 200, "al_nh": 112, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055407A2"]},
+        {"perm": 300, "al_nh": 166, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055405A2"]}
+      ]
+    },
+    {
+      "size": "OD 7.87 / ID 3.96 / HT 3.18 mm",
+      "printed_page": 162,
+      "pdf_page": 163,
+      "od_mm": 7.87, "id_mm": 3.96, "ht_mm": 3.18,
+      "od_mm_after_finish": 8.51, "id_mm_after_finish": 3.45, "ht_mm_after_finish": 3.81,
+      "geometry": {
+        "window_area_mm2": 9.35, "ae_mm2": 5.99, "le_mm": 17.9, "ve_mm3": 107,
+        "area_product_mm4": 56, "surface_area_unwound_core_mm2": 240, "surface_area_40pct_winding_factor_mm2": 310,
+        "ve_mm3_from_ae_le": 107.2, "ve_selfcheck_ratio": 0.9979, "le_mm_log_mean_check": 17.88
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 6, "parts": ["0077033A7", "-", "-", "-", "-", "-", "-", "0058033A2", "0055033A2"]},
+        {"perm": 19, "al_nh": 8, "parts": ["0077832A7", "-", "-", "-", "-", "-", "-", "-", "0055832A2"]},
+        {"perm": 26, "al_nh": 11, "parts": ["0077032A7", "-", "-", "-", "-", "-", "-", "0058032A2", "0055032A2"]},
+        {"perm": 40, "al_nh": 17, "parts": ["0077833A7", "-", "-", "-", "-", "-", "-", "0058833A2", "0055833A2"]},
+        {"perm": 60, "al_nh": 25, "parts": ["0077031A7", "-", "-", "-", "-", "-", "-", "CO58031A2", "C055031A2"]},
+        {"perm": 75, "al_nh": 31, "parts": ["0077835A7", "-", "-", "-", "-", "-", "-", "0058835A2", "0055835A2"]},
+        {"perm": 90, "al_nh": 37, "parts": ["0077834A7", "-", "-", "-", "-", "-", "-", "0058834A2", "0055834A2"]},
+        {"perm": 125, "al_nh": 52, "parts": ["0077030A7", "-", "-", "-", "-", "-", "-", "C058030A2", "C055030A2"]},
+        {"perm": 147, "al_nh": 62, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058029A2", "C055029A2"]},
+        {"perm": 160, "al_nh": 66, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058028A2", "C055028A2"]},
+        {"perm": 173, "al_nh": 73, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055024A2"]},
+        {"perm": 200, "al_nh": 83, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055027A2"]},
+        {"perm": 300, "al_nh": 124, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055025A2"]},
+        {"perm": 550, "al_nh": 229, "parts": ["-", "-", "-", null, "-", null, "-", "-", "C055026A2"]}
+      ]
+    },
+    {
+      "size": "OD 9.65 / ID 4.78 / HT 3.18 mm",
+      "printed_page": 163,
+      "pdf_page": 164,
+      "od_mm": 9.65, "id_mm": 4.78, "ht_mm": 3.18,
+      "od_mm_after_finish": 10.29, "id_mm_after_finish": 4.27, "ht_mm_after_finish": 3.81,
+      "geometry": {
+        "window_area_mm2": 14.3, "ae_mm2": 7.52, "le_mm": 21.8, "ve_mm3": 164,
+        "area_product_mm4": 107, "surface_area_unwound_core_mm2": 310, "surface_area_40pct_winding_factor_mm2": 410,
+        "ve_mm3_from_ae_le": 163.9, "ve_selfcheck_ratio": 1.0004, "le_mm_log_mean_check": 21.78
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 6, "parts": ["0077283A7", "-", "-", "-", "-", "-", "-", "0058283A2", "0055283A2"]},
+        {"perm": 19, "al_nh": 8, "parts": ["0077887A7", "-", "-", "-", "-", "-", "-", "-", "0055887A2"]},
+        {"perm": 26, "al_nh": 11, "parts": ["0077282A7", "-", "-", "-", "-", "-", "-", "0058282A2", "0055282A2"]},
+        {"perm": 40, "al_nh": 17, "parts": ["0077886A7", "-", "-", "-", "-", "-", "-", "0058886A2", "0055886A2"]},
+        {"perm": 60, "al_nh": 25, "parts": ["0077281A7", "-", "-", "-", "-", "-", "-", "C058281A2", "C055281A2"]},
+        {"perm": 75, "al_nh": 32, "parts": ["0077885A7", "-", "-", "-", "-", "-", "-", "0058885A2", "0055885A2"]},
+        {"perm": 90, "al_nh": 38, "parts": ["0077884A7", "-", "-", "-", "-", "-", "-", "0058884A2", "0055884A2"]},
+        {"perm": 125, "al_nh": 53, "parts": ["0077280A7", "-", "-", "-", "-", "-", "-", "C058280A2", "C055280A2"]},
+        {"perm": 147, "al_nh": 63, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058279A2", "C055279A2"]},
+        {"perm": 160, "al_nh": 68, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058278A2", "C055278A2"]},
+        {"perm": 173, "al_nh": 74, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055274A2"]},
+        {"perm": 200, "al_nh": 84, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055277A2"]},
+        {"perm": 300, "al_nh": 128, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055275A2"]},
+        {"perm": 550, "al_nh": 232, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055276A2"]}
+      ]
+    },
+    {
+      "size": "OD 9.65 / ID 4.78 / HT 3.96 mm",
+      "printed_page": 164,
+      "pdf_page": 165,
+      "od_mm": 9.65, "id_mm": 4.78, "ht_mm": 3.96,
+      "od_mm_after_finish": 10.29, "id_mm_after_finish": 4.27, "ht_mm_after_finish": 4.6,
+      "geometry": {
+        "window_area_mm2": 14.3, "ae_mm2": 9.45, "le_mm": 21.8, "ve_mm3": 206,
+        "area_product_mm4": 135, "surface_area_unwound_core_mm2": 350, "surface_area_40pct_winding_factor_mm2": null,
+        "ve_mm3_from_ae_le": 206, "ve_selfcheck_ratio": 1, "le_mm_log_mean_check": 21.78
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 7, "parts": ["0077293A7", "-", "-", "-", "-", "-", "-", "0058293A2", "0055293A2"]},
+        {"perm": 19, "al_nh": 10, "parts": ["0077297A7", "-", "-", "-", null, "-", "-", "-", "0055297A2"]},
+        {"perm": 26, "al_nh": 14, "parts": ["0077292A7", "-", "-", "-", "-", "-", "-", "0058292A2", "0055292A2"]},
+        {"perm": 40, "al_nh": 22, "parts": ["0077296A7", "-", "-", "-", "-", "-", "-", "0058296A2", "0055296A2"]},
+        {"perm": 60, "al_nh": 32, "parts": ["0077291A7", "-", "-", "-", "-", "-", "-", "C058291A2", "C055291A2"]},
+        {"perm": 75, "al_nh": 40, "parts": ["0077295A7", "-", "-", "-", "-", "-", "-", "0058295A2", "0055295A2"]},
+        {"perm": 90, "al_nh": 48, "parts": ["0077294A7", "-", "-", "-", "-", "-", "-", "0058294A2", "0055294A2"]},
+        {"perm": 125, "al_nh": 66, "parts": ["0077290A7", "-", "-", "-", "-", "-", "-", "C058290A2", "C055290A2"]},
+        {"perm": 147, "al_nh": 78, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058289A2", "C055289A2"]},
+        {"perm": 160, "al_nh": 84, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058288A2", "C055288A2"]},
+        {"perm": 173, "al_nh": 92, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055284A2"]},
+        {"perm": 200, "al_nh": 105, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055287A2"]},
+        {"perm": 300, "al_nh": 159, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055285A2"]},
+        {"perm": 550, "al_nh": 290, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055286A2"]}
+      ]
+    },
+    {
+      "size": "OD 10.16 / ID 5.08 / HT 3.96 mm",
+      "printed_page": 165,
+      "pdf_page": 166,
+      "od_mm": 10.16, "id_mm": 5.08, "ht_mm": 3.96,
+      "od_mm_after_finish": 10.8, "id_mm_after_finish": 4.57, "ht_mm_after_finish": 4.6,
+      "geometry": {
+        "window_area_mm2": 16.4, "ae_mm2": 9.57, "le_mm": 23, "ve_mm3": 220,
+        "area_product_mm4": 156, "surface_area_unwound_core_mm2": 370, "surface_area_40pct_winding_factor_mm2": 480,
+        "ve_mm3_from_ae_le": 220.1, "ve_selfcheck_ratio": 0.9995, "le_mm_log_mean_check": 23.02
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 7, "parts": ["0077043A7", "-", "-", "-", "-", "-", "-", "0058043A2", "0055043A2"]},
+        {"perm": 19, "al_nh": 10, "parts": ["0077843A7", "-", "-", "-", "-", "-", "-", "-", "0055843A2"]},
+        {"perm": 26, "al_nh": 14, "parts": ["0077042A7", "-", "-", "-", "-", "-", "-", "0058042A2", "0055042A2"]},
+        {"perm": 40, "al_nh": 21, "parts": ["0077846A7", "-", "-", "-", "-", "-", "-", "0058846A2", "0055846A2"]},
+        {"perm": 60, "al_nh": 32, "parts": ["0077041A7", "-", "-", "-", "-", "-", "-", "C058041A2", "C055041A2"]},
+        {"perm": 75, "al_nh": 40, "parts": ["0077845A7", "-", "-", "-", "-", "-", "-", "0058845A2", "0055845A2"]},
+        {"perm": 90, "al_nh": 48, "parts": ["0077844A7", "-", "-", "-", "-", "-", "-", "0058844A2", "0055844A2"]},
+        {"perm": 125, "al_nh": 66, "parts": ["0077040A7", "-", "-", "-", "-", "-", "-", "C058040A2", "C055040A2"]},
+        {"perm": 147, "al_nh": 78, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058039A2", "C055039A2"]},
+        {"perm": 160, "al_nh": 84, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058038A2", "C055038A2"]},
+        {"perm": 173, "al_nh": 92, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055034A2"]},
+        {"perm": 200, "al_nh": 105, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055037A2"]},
+        {"perm": 300, "al_nh": 159, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055035A2"]},
+        {"perm": 550, "al_nh": 290, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055036A2"]}
+      ]
+    },
+    {
+      "size": "OD 11.18 / ID 6.35 / HT 3.96 mm",
+      "printed_page": 166,
+      "pdf_page": 167,
+      "od_mm": 11.18, "id_mm": 6.35, "ht_mm": 3.96,
+      "od_mm_after_finish": 11.81, "id_mm_after_finish": 5.84, "ht_mm_after_finish": 4.6,
+      "geometry": {
+        "window_area_mm2": 26.8, "ae_mm2": 9.06, "le_mm": 26.9, "ve_mm3": 244,
+        "area_product_mm4": 243, "surface_area_unwound_core_mm2": 420, "surface_area_40pct_winding_factor_mm2": 600,
+        "ve_mm3_from_ae_le": 243.7, "ve_selfcheck_ratio": 1.0012, "le_mm_log_mean_check": 26.82
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 6, "parts": ["0077133A7", "-", "-", "-", "-", "-", "-", "0058133A2", "0055133A2"]},
+        {"perm": 19, "al_nh": 8, "parts": ["0077230A7", "-", "-", "-", "-", "-", "-", "-", "0055230A2"]},
+        {"perm": 26, "al_nh": 11, "parts": ["0077132A7", "-", "-", "-", "-", "-", "-", "0058132A2", "0055132A2"]},
+        {"perm": 40, "al_nh": 17, "parts": ["0077402A7", "-", "-", "-", "-", "-", "-", "0058402A2", "0055402A2"]},
+        {"perm": 60, "al_nh": 26, "parts": ["0077131A7", "-", "-", "-", "-", "-", "-", "C058131A2", "C055131A2"]},
+        {"perm": 75, "al_nh": 32, "parts": ["0077335A7", "-", "-", "-", "-", "-", "-", "0058335A2", "0055335A2"]},
+        {"perm": 90, "al_nh": 38, "parts": ["0077334A7", "-", "-", "-", "-", "-", "-", "0058334A2", "0055334A2"]},
+        {"perm": 125, "al_nh": 53, "parts": ["0077130A7", "-", "-", "-", "-", "-", "-", "C058130A2", "C055130A2"]},
+        {"perm": 147, "al_nh": 63, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058129A2", "C055129A2"]},
+        {"perm": 160, "al_nh": 68, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058128A2", "C055128A2"]},
+        {"perm": 173, "al_nh": 74, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055124A2"]},
+        {"perm": 200, "al_nh": 85, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055127A2"]},
+        {"perm": 300, "al_nh": 127, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055125A2"]}
+      ]
+    },
+    {
+      "size": "OD 12.7 / ID 7.62 / HT 4.75 mm",
+      "printed_page": 167,
+      "pdf_page": 168,
+      "od_mm": 12.7, "id_mm": 7.62, "ht_mm": 4.75,
+      "od_mm_after_finish": 13.46, "id_mm_after_finish": 6.99, "ht_mm_after_finish": 5.51,
+      "geometry": {
+        "window_area_mm2": 38.4, "ae_mm2": 10.9, "le_mm": 31.2, "ve_mm3": 340,
+        "area_product_mm4": 417, "surface_area_unwound_core_mm2": 560, "surface_area_40pct_winding_factor_mm2": 800,
+        "ve_mm3_from_ae_le": 340.1, "ve_selfcheck_ratio": 0.9998, "le_mm_log_mean_check": 31.24
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 6.4, "parts": ["0077053A7", "0079053A7", "-", "-", "-", "-", "0059053A2", "0058053A2", "0055053A2"]},
+        {"perm": 19, "al_nh": 9, "parts": ["0077057A7", "0079057A7", "-", "-", "0078057A7", "-", "0059057A2", "-", "0055057A2"]},
+        {"perm": 26, "al_nh": 12, "parts": ["0077052A7", "0079052A7", "0076052A7", "0070052A7", "0078052A7", "0074052A7", "0059052A2", "0058052A2", "0055052A2"]},
+        {"perm": 40, "al_nh": 18, "parts": ["0077056A7", "0079056A7", "0076056A7", "0070056A7", "0078056A7", null, "0059056A2", "0058056A2", "0055056A2"]},
+        {"perm": 60, "al_nh": 27, "parts": ["0077051A7", "0079051A7", "0076051A7", "0070051A7", "0078051A7", "0074051A7", "0059051A2", "C058051A2", "C055051A2"]},
+        {"perm": 75, "al_nh": 34, "parts": ["0077055A7", "0079055A7", "-", "-", "0078055A7", "-", "0059055A2", "0058055A2", "0055055A2"]},
+        {"perm": 90, "al_nh": 40, "parts": ["0077054A7", "0079054A7", "-", "-", "0078054A7", "-", "0059054A2", "C058054A2", "0055054A2"]},
+        {"perm": 125, "al_nh": 56, "parts": ["0077050A7", "-", "-", "-", "0078050A7", "-", "0059050A2", "C058050A2", "C055050A2"]},
+        {"perm": 147, "al_nh": 67, "parts": ["-", "-", "-", "-", "-", "-", "-", "0058049A2", "C055049A2"]},
+        {"perm": 160, "al_nh": 72, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058048A2", "C055048A2"]},
+        {"perm": 173, "al_nh": 79, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055044A2"]},
+        {"perm": 200, "al_nh": 90, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055047A2"]},
+        {"perm": 300, "al_nh": 134, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055045A2"]},
+        {"perm": 550, "al_nh": 255, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055046A2"]}
+      ]
+    },
+    {
+      "size": "OD 16.59 / ID 10.16 / HT 6.35 mm",
+      "printed_page": 168,
+      "pdf_page": 169,
+      "od_mm": 16.59, "id_mm": 10.16, "ht_mm": 6.35,
+      "od_mm_after_finish": 17.27, "id_mm_after_finish": 9.53, "ht_mm_after_finish": 7.11,
+      "geometry": {
+        "window_area_mm2": 71.2, "ae_mm2": 19.2, "le_mm": 41.2, "ve_mm3": 791,
+        "area_product_mm4": 1370.0, "surface_area_unwound_core_mm2": 920, "surface_area_40pct_winding_factor_mm2": 1300.0,
+        "ve_mm3_from_ae_le": 791, "ve_selfcheck_ratio": 0.9999, "le_mm_log_mean_check": 41.2
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 8, "parts": ["0077123A7", "0079123A7", "-", null, "-", null, "0059123A2", "0058123A2", "0055123A2"]},
+        {"perm": 19, "al_nh": 11, "parts": ["0077226A7", "0079226A7", "-", null, "0078226A7", null, "0059226A2", "-", "0055226A2"]},
+        {"perm": 26, "al_nh": 15, "parts": ["0077122A7", "0079122A7", "0076122A7", "0070122A7", "0078122A7", "0074122A7", "0059122A2", "0058122A2", "0055122A2"]},
+        {"perm": 40, "al_nh": 24, "parts": ["0077113A7", "0079113A7", "0076113A7", "0070113A7", "0078113A7", null, "0059113A2", "0058133A2", "0055113A2"]},
+        {"perm": 60, "al_nh": 35, "parts": ["0077121A7", "0079121A7", "0076121A7", "0070121A7", "0078121A7", "0074121A7", "0059121A2", "C058121A2", "C055121A2"]},
+        {"perm": 75, "al_nh": 43, "parts": ["0077225A7", "0079225A7", "-", null, "0078225A7", null, "0059225A2", "0058225A2", "0055225A2"]},
+        {"perm": 90, "al_nh": 52, "parts": ["0077224A7", "0079224A7", "-", null, "0078224A7", null, "0059224A2", "0058224A2", "0055224A2"]},
+        {"perm": 125, "al_nh": 72, "parts": ["0077120A7", "-", "-", null, "0078120A7", null, "0059120A2", "C058120A2", "C055120A2"]},
+        {"perm": 147, "al_nh": 88, "parts": ["-", "-", "-", null, "-", null, "-", "C058119A2", "C055119A2"]},
+        {"perm": 160, "al_nh": 92, "parts": ["-", "-", "-", null, "-", null, "-", "C058118A2", "C055118A2"]},
+        {"perm": 173, "al_nh": 104, "parts": ["-", "-", "-", null, "-", null, "-", "-", "C055114A2"]},
+        {"perm": 200, "al_nh": 115, "parts": ["-", "-", "-", null, "-", null, "-", "-", "C055117A2"]},
+        {"perm": 300, "al_nh": 173, "parts": ["-", "-", "-", null, "-", null, "-", "-", "C055115A2"]},
+        {"perm": 550, "al_nh": 317, "parts": ["-", "-", "-", null, "-", null, "-", "-", "C055116A2"]}
+      ]
+    },
+    {
+      "size": "OD 17.27 / ID 9.65 / HT 6.35 mm",
+      "printed_page": 169,
+      "pdf_page": 170,
+      "od_mm": 17.27, "id_mm": 9.65, "ht_mm": 6.35,
+      "od_mm_after_finish": 18.03, "id_mm_after_finish": 9.02, "ht_mm_after_finish": 7.11,
+      "geometry": {
+        "window_area_mm2": 63.8, "ae_mm2": 23.2, "le_mm": 41.4, "ve_mm3": 960,
+        "area_product_mm4": 1480.0, "surface_area_unwound_core_mm2": 990, "surface_area_40pct_winding_factor_mm2": 1400.0,
+        "ve_mm3_from_ae_le": 960.5, "ve_selfcheck_ratio": 0.9995, "le_mm_log_mean_check": 41.13
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 10, "parts": ["0077383A7", "0079383A7", "-", "-", "-", "-", "0059383A2", "0058383A2", "0055383A2"]},
+        {"perm": 19, "al_nh": 14, "parts": ["0077387A7", "0079387A7", "-", "-", "0078387A7", "-", "0059387A2", "-", "0055387A2"]},
+        {"perm": 26, "al_nh": 19, "parts": ["0077382A7", "0079382A7", "0076382A7", "0070382A7", "0078382A7", "0074382A7", "0059382A2", "0058382A2", "0055382A2"]},
+        {"perm": 40, "al_nh": 28, "parts": ["0077386A7", "0079386A7", "0076386A7", "0070386A7", "0078386A7", "-", "0059386A2", "0058386A2", "0055386A2"]},
+        {"perm": 60, "al_nh": 43, "parts": ["0077381A7", "0079381A7", "0076381A7", "0070381A7", "0078381A7", "0074381A7", "0059381A2", "C058381A2", "C055381A2"]},
+        {"perm": 75, "al_nh": 53, "parts": ["0077385A7", "0079385A7", "-", "-", "0078385A7", "-", "0059385A2", "0058385A2", "0055385A2"]},
+        {"perm": 90, "al_nh": 64, "parts": ["0077384A7", "0079384A7", "-", "-", "0078384A7", "-", "0059384A2", "C058384A2", "0055384A2"]},
+        {"perm": 125, "al_nh": 89, "parts": ["0077380A7", "-", "-", "-", "0078380A7", "-", "0059380A2", "C058380A2", "C055380A2"]},
+        {"perm": 147, "al_nh": 105, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058379A2", "C055379A2"]},
+        {"perm": 160, "al_nh": 114, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058378A2", "C055378A2"]},
+        {"perm": 173, "al_nh": 123, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055374A2"]},
+        {"perm": 200, "al_nh": 142, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055377A2"]},
+        {"perm": 300, "al_nh": 214, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055375A2"]}
+      ]
+    },
+    {
+      "size": "OD 20.32 / ID 12.7 / HT 6.35 mm",
+      "printed_page": 170,
+      "pdf_page": 171,
+      "od_mm": 20.32, "id_mm": 12.7, "ht_mm": 6.35,
+      "od_mm_after_finish": 21.08, "id_mm_after_finish": 12.07, "ht_mm_after_finish": 7.11,
+      "geometry": {
+        "window_area_mm2": 114, "ae_mm2": 22.1, "le_mm": 50.9, "ve_mm3": 1120.0,
+        "area_product_mm4": 2520.0, "surface_area_unwound_core_mm2": 1200.0, "surface_area_40pct_winding_factor_mm2": null,
+        "ve_mm3_from_ae_le": 1124.9, "ve_selfcheck_ratio": 0.9957, "le_mm_log_mean_check": 50.93
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 7.8, "parts": ["0077209A7", "0079209A7", "-", "-", "-", "-", "0059209A2", "0058209A2", "0055209A2"]},
+        {"perm": 19, "al_nh": 10, "parts": ["0077849A7", "0079849A7", "-", "-", "0078849A7", "-", "0059849A2", "-", "0055849A2"]},
+        {"perm": 26, "al_nh": 14, "parts": ["0077208A7", "0079208A7", "0076208A7", "0070208A7", "0078208A7", "0074208A7", "0059208A2", "0058208A2", "0055208A2"]},
+        {"perm": 40, "al_nh": 21, "parts": ["0077847A7", "0079847A7", "0076847A7", "0070847A7", "0078847A7", "-", "0059847A2", "0058847A2", "0055847A2"]},
+        {"perm": 60, "al_nh": 32, "parts": ["0077848A7", "0079848A7", "0076848A7", "0070848A7", "0078848A7", "0074848A7", "0059848A2", "C058848A2", "C055848A2"]},
+        {"perm": 75, "al_nh": 41, "parts": ["0077211A7", "0079211A7", "-", "-", "0078211A7", "-", "0059211A2", "0058211A2", "0055211A2"]},
+        {"perm": 90, "al_nh": 49, "parts": ["0077210A7", "0079210A7", "-", "-", "0078210A7", "-", "0059210A2", "C058210A2", "0055210A2"]},
+        {"perm": 125, "al_nh": 68, "parts": ["0077206A7", "-", "-", "-", "0078206A7", "-", "0059206A2", "C058206A2", "C055206A2"]},
+        {"perm": 147, "al_nh": 81, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058205A2", "C055205A2"]},
+        {"perm": 160, "al_nh": 87, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058204A2", "C055204A2"]},
+        {"perm": 173, "al_nh": 96, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055200A2"]},
+        {"perm": 200, "al_nh": 109, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055203A2"]},
+        {"perm": 300, "al_nh": 163, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055201A2"]},
+        {"perm": 550, "al_nh": 320, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055202A2"]}
+      ]
+    },
+    {
+      "size": "OD 22.86 / ID 13.97 / HT 7.62 mm",
+      "printed_page": 171,
+      "pdf_page": 172,
+      "od_mm": 22.86, "id_mm": 13.97, "ht_mm": 7.62,
+      "od_mm_after_finish": 23.62, "id_mm_after_finish": 13.34, "ht_mm_after_finish": 8.38,
+      "geometry": {
+        "window_area_mm2": 139, "ae_mm2": 31.7, "le_mm": 56.7, "ve_mm3": 1800.0,
+        "area_product_mm4": 4430.0, "surface_area_unwound_core_mm2": 1600.0, "surface_area_40pct_winding_factor_mm2": 2400.0,
+        "ve_mm3_from_ae_le": 1797.4, "ve_selfcheck_ratio": 1.0015, "le_mm_log_mean_check": 56.71
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 9.9, "parts": ["0077313A7", "0079313A7", "-", "-", "-", "-", "0059313A2", "0058313A2", "0055313A2"]},
+        {"perm": 19, "al_nh": 14, "parts": ["0077303A7", "0079303A7", "-", "-", "0078303A7", "-", "0059303A2", "-", "0055303A2"]},
+        {"perm": 26, "al_nh": 19, "parts": ["0077312A7", "0079312A7", "0076312A7", "0070312A7", "0078312A7", "0074312A7", "0059312A2", "0058312A2", "0055312A2"]},
+        {"perm": 40, "al_nh": 29, "parts": ["0077316A7", "0079316A7", "0076316A7", "0070316A7", "0078316A7", "-", "0059316A2", "0058316A2", "0055316A2"]},
+        {"perm": 60, "al_nh": 43, "parts": ["0077059A7", "0079059A7", "0076059A7", "0070059A7", "0078059A7", "0074059A7", "0059059A2", "C058059A2", "C055059A2"]},
+        {"perm": 75, "al_nh": 54, "parts": ["0077315A7", "0079315A7", "-", null, "0078315A7", "-", "0059315A2", "0058315A2", "0055315A2"]},
+        {"perm": 90, "al_nh": 65, "parts": ["0077314A7", "0079314A7", "-", "-", "0078314A7", "-", "0059314A2", "0058314A2", "0055314A2"]},
+        {"perm": 125, "al_nh": 90, "parts": ["0077310A7", "-", "-", "-", "0078310A7", "-", "0059310A2", "C058310A2", "C055310A2"]},
+        {"perm": 147, "al_nh": 106, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058309A2", "C055309A2"]},
+        {"perm": 160, "al_nh": 115, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058308A2", "C055308A2"]},
+        {"perm": 173, "al_nh": 124, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055304A2"]},
+        {"perm": 200, "al_nh": 144, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055307A2"]},
+        {"perm": 300, "al_nh": 216, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055305A2"]},
+        {"perm": 550, "al_nh": 396, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055306A2"]}
+      ]
+    },
+    {
+      "size": "OD 23.57 / ID 14.4 / HT 8.89 mm",
+      "printed_page": 172,
+      "pdf_page": 173,
+      "od_mm": 23.57, "id_mm": 14.4, "ht_mm": 8.89,
+      "od_mm_after_finish": 24.33, "id_mm_after_finish": 13.77, "ht_mm_after_finish": 9.65,
+      "geometry": {
+        "window_area_mm2": 149, "ae_mm2": 38.8, "le_mm": 58.8, "ve_mm3": 2280.0,
+        "area_product_mm4": 5770.0, "surface_area_unwound_core_mm2": 1800.0, "surface_area_40pct_winding_factor_mm2": 2700.0,
+        "ve_mm3_from_ae_le": 2281.4, "ve_selfcheck_ratio": 0.9994, "le_mm_log_mean_check": 58.46
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 12, "parts": ["0077353A7", "0079353A7", "-", "-", "-", "-", "0059353A2", "0058353A2", "0055353A2"]},
+        {"perm": 19, "al_nh": 16, "parts": ["0077357A7", "0079357A7", "-", "-", "0078357A7", "-", "0059357A2", "-", "0055357A2"]},
+        {"perm": 26, "al_nh": 22, "parts": ["0077352A7", "0079352A7", "0076352A7", "0070352A7", "0078352A7", "0074352A7", "0059352A2", "0058352A2", "0055352A2"]},
+        {"perm": 40, "al_nh": 34, "parts": ["0077356A7", "0079356A7", "0076356A7", "0070356A7", "0078356A7", "-", "0059356A2", "0058356A2", "0055356A2"]},
+        {"perm": 60, "al_nh": 51, "parts": ["0077351A7", "0079351A7", "0076351A7", "0070351A7", "0078351A7", "0074351A7", "0059351A2", "C058351A2", "C055351A2"]},
+        {"perm": 75, "al_nh": 62, "parts": ["0077355A7", "0079355A7", "-", "-", "0078355A7", "-", "0059355A2", "0058355A2", "0055355A2"]},
+        {"perm": 90, "al_nh": 76, "parts": ["0077354A7", "0079354A7", "-", "-", "0078354A7", "-", "0059354A2", "0058354A2", "0055354A2"]},
+        {"perm": 125, "al_nh": 105, "parts": ["0077350A7", "-", "-", "-", "0078350A7", "-", "0059350A2", "C058350A2", "C055350A2"]},
+        {"perm": 147, "al_nh": 124, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058349A2", "C055349A2"]},
+        {"perm": 160, "al_nh": 135, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058348A2", "C055348A2"]},
+        {"perm": 173, "al_nh": 146, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055344A2"]},
+        {"perm": 200, "al_nh": 169, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055347A2"]},
+        {"perm": 300, "al_nh": 253, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055345A2"]}
+      ]
+    },
+    {
+      "size": "OD 26.92 / ID 14.73 / HT 11.18 mm",
+      "printed_page": 173,
+      "pdf_page": 174,
+      "od_mm": 26.92, "id_mm": 14.73, "ht_mm": 11.18,
+      "od_mm_after_finish": 27.69, "id_mm_after_finish": 14.1, "ht_mm_after_finish": 11.94,
+      "geometry": {
+        "window_area_mm2": 156, "ae_mm2": 65.4, "le_mm": 63.5, "ve_mm3": 4150.0,
+        "area_product_mm4": 10200.0, "surface_area_unwound_core_mm2": 2400.0, "surface_area_40pct_winding_factor_mm2": 3500.0,
+        "ve_mm3_from_ae_le": 4152.9, "ve_selfcheck_ratio": 0.9993, "le_mm_log_mean_check": 63.51
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 18, "parts": ["0077933A7", "0079933A7", "-", "-", "-", "-", "0059933A2", "0058933A2", "0055933A2"]},
+        {"perm": 19, "al_nh": 23, "parts": ["0077937A7", "0079937A7", "-", "-", "0078937A7", "-", "0059937A2", "-", "0055937A2"]},
+        {"perm": 26, "al_nh": 32, "parts": ["0077932A7", "0079932A7", "0076932A7", "0070932A7", "0078932A7", "0074932A7", "0059932A2", "0058932A2", "0055932A2"]},
+        {"perm": 40, "al_nh": 50, "parts": ["0077936A7", "0079936A7", "0076936A7", "0070936A7", "0078936A7", "-", "0059936A2", "0058936A2", "0055936A2"]},
+        {"perm": 60, "al_nh": 75, "parts": ["0077894A7", "0079894A7", "0076894A7", "0070894A7", "0078894A7", "0074894A7", "0059894A2", "C058894A2", "C055894A2"]},
+        {"perm": 75, "al_nh": 94, "parts": ["0077935A7", "0079935A7", "-", "-", "0078935A7", "-", "0059935A2", "0058935A2", "0055935A2"]},
+        {"perm": 90, "al_nh": 113, "parts": ["0077934A7", "0079934A7", "-", "-", "0078934A7", "-", "0059934A2", "C058934A2", "C055934A2"]},
+        {"perm": 125, "al_nh": 157, "parts": ["0077930A7", "-", "-", "-", "0078930A7", "-", "0059930A2", "C058930A2", "C055930A2"]},
+        {"perm": 147, "al_nh": 185, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058929A2", "C055929A2"]},
+        {"perm": 160, "al_nh": 201, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058928A2", "C055928A2"]},
+        {"perm": 173, "al_nh": 217, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055924A2"]},
+        {"perm": 200, "al_nh": 251, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055927A2"]},
+        {"perm": 300, "al_nh": 377, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055925A2"]},
+        {"perm": 550, "al_nh": 740, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055926A2"]}
+      ]
+    },
+    {
+      "size": "OD 32.79 / ID 20.09 / HT 10.67 mm",
+      "printed_page": 174,
+      "pdf_page": 175,
+      "od_mm": 32.79, "id_mm": 20.09, "ht_mm": 10.67,
+      "od_mm_after_finish": 33.66, "id_mm_after_finish": 19.46, "ht_mm_after_finish": 11.43,
+      "geometry": {
+        "window_area_mm2": 297, "ae_mm2": 65.6, "le_mm": 81.4, "ve_mm3": 5340.0,
+        "area_product_mm4": 19500.0, "surface_area_unwound_core_mm2": 3100.0, "surface_area_40pct_winding_factor_mm2": 4900.0,
+        "ve_mm3_from_ae_le": 5339.8, "ve_selfcheck_ratio": 1, "le_mm_log_mean_check": 81.44
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 14, "parts": ["0077551A7", "0079551A7", "-", "-", "-", "-", "0059551A2", "0058551A2", "0055551A2"]},
+        {"perm": 19, "al_nh": 20, "parts": ["0077554A7", "0079554A7", "-", "-", "0078554A7", "-", "0059554A2", "-", "0055554A2"]},
+        {"perm": 26, "al_nh": 28, "parts": ["0077550A7", "0079550A7", "0076550A7", "0070550A7", "0078550A7", "0074550A7", "0059550A2", "0058550A2", "0055550A2"]},
+        {"perm": 40, "al_nh": 41, "parts": ["0077555A7", "0079555A7", "0076555A7", "0070555A7", "0078555A7", "-", "0059555A2", "0058555A2", "0055555A2"]},
+        {"perm": 60, "al_nh": 61, "parts": ["0077071A7", "0079071A7", "0076071A7", "0070071A7", "0078071A7", "0074071A7", "0059071A2", "C058071A2", "C055071A2"]},
+        {"perm": 75, "al_nh": 76, "parts": ["0077553A7", "0079553A7", "-", "-", "0078553A7", "-", "0059553A2", "0058553A2", "0055553A2"]},
+        {"perm": 90, "al_nh": 91, "parts": ["0077552A7", "0079552A7", "-", "-", "0078552A7", "-", "0059552A2", "C058552A2", "0055552A2"]},
+        {"perm": 125, "al_nh": 127, "parts": ["0077548A7", "-", "-", "-", "0078548A7", "-", "0059548A2", "C058548A2", "C055548A2"]},
+        {"perm": 147, "al_nh": 150, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058547A2", "C055547A2"]},
+        {"perm": 160, "al_nh": 163, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058546A2", "C055546A2"]},
+        {"perm": 173, "al_nh": 176, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055542A2"]},
+        {"perm": 200, "al_nh": 203, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055545A2"]},
+        {"perm": 300, "al_nh": 305, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055543A2"]},
+        {"perm": 550, "al_nh": 559, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055544A2"]}
+      ]
+    },
+    {
+      "size": "OD 34.29 / ID 23.37 / HT 8.89 mm",
+      "printed_page": 175,
+      "pdf_page": 176,
+      "od_mm": 34.29, "id_mm": 23.37, "ht_mm": 8.89,
+      "od_mm_after_finish": 35.18, "id_mm_after_finish": 22.56, "ht_mm_after_finish": 9.78,
+      "geometry": {
+        "window_area_mm2": 399, "ae_mm2": 46.4, "le_mm": 89.5, "ve_mm3": 4150.0,
+        "area_product_mm4": 18500.0, "surface_area_unwound_core_mm2": 2900.0, "surface_area_40pct_winding_factor_mm2": 5500.0,
+        "ve_mm3_from_ae_le": 4152.8, "ve_selfcheck_ratio": 0.9993, "le_mm_log_mean_check": 89.48
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 9, "parts": ["0077588A7", "0079588A7", "-", "-", "-", "-", "0059588A2", "0058588A2", "0055588A2"]},
+        {"perm": 19, "al_nh": 12, "parts": ["0077592A7", "0079592A7", "-", "-", "0078592A7", "-", "0059592A2", "-", "0055592A2"]},
+        {"perm": 26, "al_nh": 16, "parts": ["0077587A7", "0079587A7", "0076587A7", "0070587A7", "0078587A7", "0074587A7", "0059587A2", "0058587A2", "0055587A2"]},
+        {"perm": 40, "al_nh": 25, "parts": ["0077591A7", "0079591A7", "0076591A7", "0070591A7", "0078591A7", "-", "0059591A2", "0058591A2", "0055591A2"]},
+        {"perm": 60, "al_nh": 38, "parts": ["0077586A7", "0079586A7", "0076586A7", "0070586A7", "0078586A7", "0074586A7", "0059586A2", "C058586A2", "C055586A2"]},
+        {"perm": 75, "al_nh": 47, "parts": ["0077590A7", "0079590A7", "-", "-", "0078590A7", "-", "0059590A2", "0058590A2", "0055590A2"]},
+        {"perm": 90, "al_nh": 57, "parts": ["0077589A7", "0079589A7", "-", "-", "0078589A7", "-", "0059589A2", "0058589A2", "0055589A2"]},
+        {"perm": 125, "al_nh": 79, "parts": ["0077585A7", "-", "-", "-", "0078585A7", "-", "0059585A2", "C058585A2", "C055585A2"]},
+        {"perm": 147, "al_nh": 93, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058584A2", "C055584A2"]},
+        {"perm": 160, "al_nh": 101, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058583A2", "C055583A2"]},
+        {"perm": 173, "al_nh": 109, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055579A2"]},
+        {"perm": 200, "al_nh": 126, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055582A2"]},
+        {"perm": 300, "al_nh": 190, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055580A2"]},
+        {"perm": 550, "al_nh": 348, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055581A2"]}
+      ]
+    },
+    {
+      "size": "OD 35.81 / ID 22.35 / HT 10.46 mm",
+      "printed_page": 176,
+      "pdf_page": 177,
+      "od_mm": 35.81, "id_mm": 22.35, "ht_mm": 10.46,
+      "od_mm_after_finish": 36.7, "id_mm_after_finish": 21.54, "ht_mm_after_finish": 11.35,
+      "geometry": {
+        "window_area_mm2": 364, "ae_mm2": 67.8, "le_mm": 89.8, "ve_mm3": 6090.0,
+        "area_product_mm4": 24700.0, "surface_area_unwound_core_mm2": 3400.0, "surface_area_40pct_winding_factor_mm2": 5700.0,
+        "ve_mm3_from_ae_le": 6088.4, "ve_selfcheck_ratio": 1.0003, "le_mm_log_mean_check": 89.7
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 13, "parts": ["0077327A7", "0079327A7", "-", "-", "-", "-", "0059327A2", "0058327A2", "0055327A2"]},
+        {"perm": 19, "al_nh": 18, "parts": ["0077317A7", "0079317A7", "-", "-", "0078317A7", "-", "0059317A2", "-", "0055317A2"]},
+        {"perm": 26, "al_nh": 24, "parts": ["0077326A7", "0079326A7", "0076326A7", "0070326A7", "0078326A7", "0074326A7", "0059326A2", "0058326A2", "0055326A2"]},
+        {"perm": 40, "al_nh": 37, "parts": ["0077330A7", "0079330A7", "0076330A7", "0070330A7", "0078330A7", "-", "0059330A2", "0058330A2", "0058330A2"]},
+        {"perm": 60, "al_nh": 56, "parts": ["0077076A7", "0079076A7", "0076076A7", "0070076A7", "0078076A7", "0074076A7", "0059076A2", "C058076A2", "C055076A2"]},
+        {"perm": 75, "al_nh": 70, "parts": ["0077329A7", "0079329A7", "-", "-", "0078329A7", "-", "0059329A2", "0058329A2", "0055329A2"]},
+        {"perm": 90, "al_nh": 84, "parts": ["0077328A7", "0079328A7", "-", "-", "0078328A7", "-", "0059328A2", "0058328A2", "0055328A2"]},
+        {"perm": 125, "al_nh": 117, "parts": ["0077324A7", "-", "-", "-", "0078324A7", "-", "0059324A2", "C058324A2", "C055324A2"]},
+        {"perm": 147, "al_nh": 138, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058323A2", "C055323A2"]},
+        {"perm": 160, "al_nh": 150, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058322A2", "C055322A2"]},
+        {"perm": 173, "al_nh": 162, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055318A2"]},
+        {"perm": 200, "al_nh": 187, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055321A2"]},
+        {"perm": 300, "al_nh": 281, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055319A2"]},
+        {"perm": 550, "al_nh": 515, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055320A2"]}
+      ]
+    },
+    {
+      "size": "OD 39.88 / ID 24.13 / HT 14.48 mm",
+      "printed_page": 177,
+      "pdf_page": 178,
+      "od_mm": 39.88, "id_mm": 24.13, "ht_mm": 14.48,
+      "od_mm_after_finish": 40.77, "id_mm_after_finish": 23.32, "ht_mm_after_finish": 15.37,
+      "geometry": {
+        "window_area_mm2": 427, "ae_mm2": 107, "le_mm": 98.4, "ve_mm3": 10600.0,
+        "area_product_mm4": 45800.0, "surface_area_unwound_core_mm2": 4800.0, "surface_area_40pct_winding_factor_mm2": 7300.0,
+        "ve_mm3_from_ae_le": 10528.8, "ve_selfcheck_ratio": 1.0068, "le_mm_log_mean_check": 98.48
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 19, "parts": ["0077257A7", "0079257A7", "-", "-", "-", "-", "0059257A2", "0058257A2", "0055257A2"]},
+        {"perm": 19, "al_nh": 26, "parts": ["0077262A7", "0079262A7", "-", "-", "0078262A7", "-", "0059262A2", "-", "0055262A2"]},
+        {"perm": 26, "al_nh": 35, "parts": ["0077256A7", "0079256A7", "0076256A7", "0070256A7", "0078256A7", "0074256A7", "0059256A2", "0058256A2", "0055256A2"]},
+        {"perm": 40, "al_nh": 54, "parts": ["0077260A7", "0079260A7", "0076260A7", "0070260A7", "0078260A7", "-", "0059260A2", "0058260A2", "0055260A2"]},
+        {"perm": 60, "al_nh": 81, "parts": ["0077083A7", "0079083A7", "0076083A7", "0070083A7", "0078083A7", "0074083A7", "0059083A2", "C058083A2", "C055083A2"]},
+        {"perm": 75, "al_nh": 101, "parts": ["0077259A7", "0079259A7", "-", "-", "0078259A7", "-", "0059259A2", "0058259A2", "0055259A2"]},
+        {"perm": 90, "al_nh": 121, "parts": ["0077258A7", "0079258A7", "-", "-", "0078258A7", "-", "0059258A2", "0058258A2", "0055258A2"]},
+        {"perm": 125, "al_nh": 168, "parts": ["0077254A7", "-", "-", "-", "0078254A7", "-", "0059254A2", "C058254A2", "C055254A2"]},
+        {"perm": 147, "al_nh": 198, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058253A2", "C055253A2"]},
+        {"perm": 160, "al_nh": 215, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058252A2", "C055252A2"]},
+        {"perm": 173, "al_nh": 233, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055248A2"]},
+        {"perm": 200, "al_nh": 269, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055251A2"]},
+        {"perm": 300, "al_nh": 403, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055249A2"]},
+        {"perm": 550, "al_nh": 740, "parts": ["-", "-", "-", "-", "-", null, "-", "-", "C055250A2"]}
+      ]
+    },
+    {
+      "size": "OD 40.13 / ID 22.08 / HT 17 mm",
+      "printed_page": 178,
+      "pdf_page": 179,
+      "od_mm": 40.13, "id_mm": 22.08, "ht_mm": 17,
+      "od_mm_after_finish": 40.94, "id_mm_after_finish": 21.27, "ht_mm_after_finish": 17.89,
+      "geometry": {
+        "window_area_mm2": 355, "ae_mm2": 153, "le_mm": 94, "ve_mm3": 14600.0,
+        "area_product_mm4": 54315.0, "surface_area_unwound_core_mm2": 5400.0, "surface_area_40pct_winding_factor_mm2": 7500.0,
+        "ve_mm3_from_ae_le": 14382.0, "ve_selfcheck_ratio": 1.0152, "le_mm_log_mean_check": 94.91
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 28, "parts": ["0077388A7", "0079388A7", "-", "-", "-", "-", "0059388A2", "0058388A2", "0055388A2"]},
+        {"perm": 19, "al_nh": 39, "parts": ["0077389A7", "0079389A7", "-", "-", "0078389A7", "-", "0059389A2", "-", "0055389A2"]},
+        {"perm": 26, "al_nh": 53, "parts": ["0077390A7", "0079390A7", "0076390A7", "0070390A7", "0078390A7", "0074390A7", "0059390A2", "0058390A2", "0055390A2"]},
+        {"perm": 40, "al_nh": 81, "parts": ["0077391A7", "0079391A7", "0076391A7", "0070391A7", "0078391A7", "-", "0059391A2", "0058391A2", "0055391A2"]},
+        {"perm": 60, "al_nh": 122, "parts": ["0077392A7", "0079392A7", "0076392A7", "0070392A7", "0078392A7", "0074392A7", "0059392A2", "0058392A2", "0055392A2"]},
+        {"perm": 75, "al_nh": 153, "parts": ["0077393A7", "-", "-", "-", "0078393A7", "-", "0059393A2", "0058393A2", "0055393A2"]},
+        {"perm": 90, "al_nh": 183, "parts": ["0077394A7", "-", "-", "-", "0078394A7", "-", "0059394A2", "0058394A2", "0055394A2"]},
+        {"perm": 125, "al_nh": 254, "parts": ["0077395A7", "-", "-", "-", "0078395A7", "-", "-", "0058395A2", "0055395A2"]},
+        {"perm": 147, "al_nh": 299, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055396A2"]},
+        {"perm": 160, "al_nh": 325, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055397A2"]},
+        {"perm": 173, "al_nh": 351, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055398A2"]},
+        {"perm": 200, "al_nh": 406, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055399A2"]},
+        {"perm": 300, "al_nh": 609, "parts": ["-", "-", null, "-", null, "-", null, "-", "0055400A2"]}
+      ]
+    },
+    {
+      "size": "OD 42.9 / ID 24.21 / HT 16.26 mm",
+      "printed_page": 179,
+      "pdf_page": 180,
+      "od_mm": 42.9, "id_mm": 24.21, "ht_mm": 16.26,
+      "od_mm_after_finish": 43.84, "id_mm_after_finish": 23.39, "ht_mm_after_finish": 17.27,
+      "geometry": {
+        "window_area_mm2": 430, "ae_mm2": 147.5, "le_mm": 102, "ve_mm3": 15100.0,
+        "area_product_mm4": 63400.0, "surface_area_unwound_core_mm2": 5800.0, "surface_area_40pct_winding_factor_mm2": 8400.0,
+        "ve_mm3_from_ae_le": 15045.0, "ve_selfcheck_ratio": 1.0037, "le_mm_log_mean_check": 102.63
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 25, "parts": ["0077446A7", "0079446A7", "-", "-", "-", "-", "0059446A2", "0058446A2", "0055446A2"]},
+        {"perm": 19, "al_nh": 35, "parts": ["0077447A7", "0079447A7", "-", "-", "0078447A7", "-", "0059447A2", "-", "0055447A2"]},
+        {"perm": 26, "al_nh": 47, "parts": ["0077448A7", "0079448A7", "0076448A7", "0070448A7", "0078448A7", "0074448A7", "0059448A2", "0058448A2", "0055448A2"]},
+        {"perm": 40, "al_nh": 72, "parts": ["0077450A7", "0079450A7", "0076450A7", "0070450A7", "0078450A7", "-", "0059450A2", "0058450A2", "0055450A2"]},
+        {"perm": 60, "al_nh": 108, "parts": ["0077451A7", "0079451A7", "0076451A7", "0070451A7", "0078451A7", "0074451A7", "0059451A2", "0058451A2", "0055451A2"]},
+        {"perm": 75, "al_nh": 135, "parts": ["0077452A7", "-", "-", null, "0078452A7", null, "0059452A2", "0058452A2", "0055452A2"]},
+        {"perm": 90, "al_nh": 161, "parts": ["0077453A7", "-", "-", null, "0078453A7", null, "0059453A2", "0058453A2", "0055453A2"]},
+        {"perm": 125, "al_nh": 224, "parts": ["0077454A7", "-", "-", null, "0078454A7", null, "-", "0058454A2", "0055454A2"]},
+        {"perm": 147, "al_nh": 264, "parts": ["-", "-", "-", null, "-", null, "-", "0058455A2", "0055455A2"]},
+        {"perm": 160, "al_nh": 287, "parts": ["-", "-", "-", null, "-", null, "-", "0058456A2", "0055456A2"]},
+        {"perm": 173, "al_nh": 310, "parts": ["-", "-", "-", null, "-", null, "-", "-", "0055457A2"]},
+        {"perm": 200, "al_nh": 359, "parts": ["-", "-", "-", null, "-", null, "-", "-", "0055458A2"]},
+        {"perm": 300, "al_nh": 538, "parts": ["-", "-", "-", null, "-", null, "-", "-", "0055459A2"]}
+      ]
+    },
+    {
+      "size": "OD 46.74 / ID 28.7 / HT 15.24 mm",
+      "printed_page": 180,
+      "pdf_page": 181,
+      "od_mm": 46.74, "id_mm": 28.7, "ht_mm": 15.24,
+      "od_mm_after_finish": 47.63, "id_mm_after_finish": 27.89, "ht_mm_after_finish": 16.13,
+      "geometry": {
+        "window_area_mm2": 610, "ae_mm2": 134, "le_mm": 116, "ve_mm3": 15600.0,
+        "area_product_mm4": 81800.0, "surface_area_unwound_core_mm2": 6100.0, "surface_area_40pct_winding_factor_mm2": 9800.0,
+        "ve_mm3_from_ae_le": 15544.0, "ve_selfcheck_ratio": 1.0036, "le_mm_log_mean_check": 116.21
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 20, "parts": ["0077092A7", "0079092A7", "-", "-", "-", "-", "0059092A2", "0058092A2", "0055092A2"]},
+        {"perm": 19, "al_nh": 27, "parts": ["0077079A7", "0079079A7", "-", "-", "0078079A7", "-", "0059079A2", "-", "0055079A2"]},
+        {"perm": 26, "al_nh": 37, "parts": ["0077091A7", "0079091A7", "0076091A7", "0070091A7", "0078091A7", "0074091A7", "0059091A2", "0058091A2", "0055091A2"]},
+        {"perm": 40, "al_nh": 57, "parts": ["0077095A7", "0079095A7", "0076095A7", "0070095A7", "0078095A7", "-", "0059095A2", "0058095A2", "0055095A2"]},
+        {"perm": 60, "al_nh": 86, "parts": ["0077090A7", "0079090A7", "0076090A7", "0070090A7", "0078090A7", "0074090A7", "0059090A2", "C058090A2", "C055090A2"]},
+        {"perm": 75, "al_nh": 107, "parts": ["0077094A7", "-", "-", null, "0078094A7", "-", "0059094A2", "0058094A2", "0055094A2"]},
+        {"perm": 90, "al_nh": 128, "parts": ["0077093A7", "-", "-", null, "0078093A7", "-", "0059093A2", "C058093A2", "0055093A2"]},
+        {"perm": 125, "al_nh": 178, "parts": ["0077089A7", "-", "-", null, "0078089A7", "-", "-", "C058089A2", "C055089A2"]},
+        {"perm": 147, "al_nh": 210, "parts": ["-", "-", "-", null, "-", "-", "-", "0058088A2", "C055088A2"]},
+        {"perm": 160, "al_nh": 228, "parts": ["-", "-", "-", null, "-", "-", "-", "-", "C055087A2"]},
+        {"perm": 173, "al_nh": 246, "parts": ["-", "-", "-", null, "-", "-", "-", "-", "C055082A2"]},
+        {"perm": 200, "al_nh": 285, "parts": ["-", "-", "-", null, "-", "-", "-", "-", "C055086A2"]},
+        {"perm": 300, "al_nh": 427, "parts": ["-", "-", "-", null, "-", "-", "-", "-", "C055084A2"]}
+      ]
+    },
+    {
+      "size": "OD 46.74 / ID 24.13 / HT 18.03 mm",
+      "printed_page": 181,
+      "pdf_page": 182,
+      "od_mm": 46.74, "id_mm": 24.13, "ht_mm": 18.03,
+      "od_mm_after_finish": 47.63, "id_mm_after_finish": 23.32, "ht_mm_after_finish": 18.92,
+      "geometry": {
+        "window_area_mm2": 427, "ae_mm2": 199, "le_mm": 107, "ve_mm3": 21300.0,
+        "area_product_mm4": 85900.0, "surface_area_unwound_core_mm2": 6900.0, "surface_area_40pct_winding_factor_mm2": 9600.0,
+        "ve_mm3_from_ae_le": 21293.0, "ve_selfcheck_ratio": 1.0003, "le_mm_log_mean_check": 107.44
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 32, "parts": ["0077441A7", "0079441A7", "-", "-", "-", "-", "0059441A2", "0058441A2", "0055441A2"]},
+        {"perm": 19, "al_nh": 43, "parts": ["0077430A7", "0079430A7", "-", "-", "0078430A7", "-", "0059430A2", "-", "0055430A2"]},
+        {"perm": 26, "al_nh": 59, "parts": ["0077440A7", "0079440A7", "0076440A7", "0070440A7", "0078440A7", "0074440A7", "0059440A2", "0058440A2", "0055440A2"]},
+        {"perm": 40, "al_nh": 90, "parts": ["0077431A7", "0079431A7", "0076431A7", "0070431A7", "0078431A7", "-", "0059431A2", "0058431A2", "0055431A2"]},
+        {"perm": 60, "al_nh": 135, "parts": ["0077439A7", "0079439A7", "0076439A7", "0070439A7", "0078439A7", "0074439A7", "0059439A2", "C058439A2", "C055439A2"]},
+        {"perm": 75, "al_nh": 169, "parts": ["0077443A7", "-", "-", "-", "0078443A7", "-", "0059443A2", "0058443A2", "0055443A2"]},
+        {"perm": 90, "al_nh": 202, "parts": ["0077442A7", "-", "-", "-", "0078442A7", "-", "0059442A2", "0058442A2", "0055442A2"]},
+        {"perm": 125, "al_nh": 281, "parts": ["0077438A7", "-", "-", "-", "0078438A7", "-", "-", "C058438A2", "C055438A2"]},
+        {"perm": 147, "al_nh": 330, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058437A2", "C055437A2"]},
+        {"perm": 160, "al_nh": 360, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055436A2"]},
+        {"perm": 173, "al_nh": 390, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055432A2"]},
+        {"perm": 200, "al_nh": 450, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055435A2"]},
+        {"perm": 300, "al_nh": 674, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055433A2"]}
+      ]
+    },
+    {
+      "size": "OD 50.55 / ID 24.77 / HT 20.83 mm",
+      "printed_page": 182,
+      "pdf_page": 183,
+      "od_mm": 50.55, "id_mm": 24.77, "ht_mm": 20.83,
+      "od_mm_after_finish": 51.51, "id_mm_after_finish": 24, "ht_mm_after_finish": 21.59,
+      "geometry": {
+        "window_area_mm2": 452, "ae_mm2": 262, "le_mm": 113.5, "ve_mm3": 29700.0,
+        "area_product_mm4": 118000.0, "surface_area_unwound_core_mm2": 8300.0, "surface_area_40pct_winding_factor_mm2": 11500.0,
+        "ve_mm3_from_ae_le": 29737.0, "ve_selfcheck_ratio": 0.9988, "le_mm_log_mean_check": 113.54
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 41, "parts": ["0077728A7", "0079728A7", "-", "-", "-", "-", "0059728A2", "0058728A2", "0055728A2"]},
+        {"perm": 19, "al_nh": 56, "parts": ["0077750A7", "0079750A7", "-", "-", "0078750A7", "-", "0059750A2", "-", "0055750A2"]},
+        {"perm": 26, "al_nh": 76, "parts": ["0077727A7", "0079727A7", "0076727A7", "0070727A7", "0078727A7", "0074727A7", "0059727A2", "0058727A2", "0055727A2"]},
+        {"perm": 40, "al_nh": 117, "parts": ["0077733A7", "0079733A7", "0076733A7", "0070733A7", "0078733A7", "-", "0059733A2", "0058733A2", "0055733A2"]},
+        {"perm": 60, "al_nh": 175, "parts": ["0077726A7", "0079726A7", "0076726A7", "0070726A7", "0078726A7", "0074726A7", "0059726A2", "0058726A2", "0055726A2"]},
+        {"perm": 75, "al_nh": 219, "parts": ["0077729A7", "-", "-", "-", "0078729A7", "-", "0059729A2", "0058729A2", "0055729A2"]},
+        {"perm": 90, "al_nh": 263, "parts": ["0077730A7", "-", "-", "-", "0078730A7", "-", "0059730A2", "0058730A2", "0055730A2"]},
+        {"perm": 125, "al_nh": 366, "parts": ["0077725A7", "-", "-", "-", "0078725A7", "-", "-", "0058725A2", "0055725A2"]},
+        {"perm": 147, "al_nh": 426, "parts": ["-", "-", "-", "-", "-", "-", "-", "0058724A2", "0055724A2"]},
+        {"perm": 173, "al_nh": 504, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055722A2"]},
+        {"perm": 200, "al_nh": 582, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055731A2"]},
+        {"perm": 300, "al_nh": 873, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055732A2"]}
+      ]
+    },
+    {
+      "size": "OD 50.8 / ID 31.75 / HT 13.46 mm",
+      "printed_page": 183,
+      "pdf_page": 184,
+      "od_mm": 50.8, "id_mm": 31.75, "ht_mm": 13.46,
+      "od_mm_after_finish": 51.69, "id_mm_after_finish": 30.94, "ht_mm_after_finish": 14.35,
+      "geometry": {
+        "window_area_mm2": 751, "ae_mm2": 125, "le_mm": 127, "ve_mm3": 15900.0,
+        "area_product_mm4": 94000.0, "surface_area_unwound_core_mm2": 6400.0, "surface_area_40pct_winding_factor_mm2": 11000.0,
+        "ve_mm3_from_ae_le": 15875.0, "ve_selfcheck_ratio": 1.0016, "le_mm_log_mean_check": 127.33
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 17, "parts": ["0077718A7", "0079718A7", "-", "-", "-", "-", "0059718A2", "0058718A2", "0055718A2"]},
+        {"perm": 19, "al_nh": 23, "parts": ["0077708A7", "0079708A7", "-", "-", "0078708A7", "-", "0059708A2", "-", "0055708A2"]},
+        {"perm": 26, "al_nh": 32, "parts": ["0077717A7", "0079717A7", "0076717A7", "0070717A7", "0078717A7", "0074717A7", "0059717A2", "0058717A2", "0055717A2"]},
+        {"perm": 40, "al_nh": 49, "parts": ["0077721A7", "0079721A7", "0076721A7", "0070721A7", "0078721A7", "-", "0059721A2", "0058721A2", "0055721A2"]},
+        {"perm": 60, "al_nh": 73, "parts": ["0077716A7", "0079716A7", "0076716A7", "0070716A7", "0078716A7", "0074716A7", "0059716A2", "C058716A2", "C055716A2"]},
+        {"perm": 75, "al_nh": 91, "parts": ["0077720A7", "-", "-", "-", "0078720A7", "-", "0059720A2", "0058720A2", "0055720A2"]},
+        {"perm": 90, "al_nh": 109, "parts": ["0077719A7", "-", "-", "-", "0078719A7", "-", "0059719A2", "0058719A2", "0055719A2"]},
+        {"perm": 125, "al_nh": 152, "parts": ["0077715A7", "-", "-", "-", "0078715A7", "-", "-", "C058715A2", "C055715A2"]},
+        {"perm": 147, "al_nh": 179, "parts": ["-", "-", "-", "-", "-", "-", "-", "C058714A2", "C055714A2"]},
+        {"perm": 160, "al_nh": 195, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055713A2"]},
+        {"perm": 173, "al_nh": 210, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055709A2"]},
+        {"perm": 200, "al_nh": 243, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055712A2"]},
+        {"perm": 300, "al_nh": 365, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055710A2"]}
+      ]
+    },
+    {
+      "size": "OD 54 / ID 29 / HT 14.4 mm",
+      "printed_page": 184,
+      "pdf_page": 185,
+      "od_mm": 54, "id_mm": 29, "ht_mm": 14.4,
+      "od_mm_after_finish": 54.9, "id_mm_after_finish": 28.1, "ht_mm_after_finish": 15.3,
+      "geometry": {
+        "window_area_mm2": 620, "ae_mm2": 174, "le_mm": 126, "ve_mm3": 22000.0,
+        "area_product_mm4": 107880.0, "surface_area_unwound_core_mm2": 7500.0, "surface_area_40pct_winding_factor_mm2": 11000.0,
+        "ve_mm3_from_ae_le": 21924.0, "ve_selfcheck_ratio": 1.0035, "le_mm_log_mean_check": 126.33
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 24, "parts": ["0077533A7", "0079533A7", "-", "-", "-", "-", "0059533A2", "0058533A2", "0055533A2"]},
+        {"perm": 19, "al_nh": 33, "parts": ["0077534A7", "0079534A7", "-", "-", "0078534A7", "-", "0059534A2", "-", "0055534A2"]},
+        {"perm": 26, "al_nh": 45, "parts": ["0077535A7", "0079535A7", "0076535A7", "0070535A7", "0078535A7", "0074535A7", "0059535A2", "0058535A2", "0055535A2"]},
+        {"perm": 40, "al_nh": 69, "parts": ["0077536A7", "0079536A7", "0076536A7", "0070536A7", "0078536A7", "-", "0059536A2", "0058536A2", "0055536A2"]},
+        {"perm": 60, "al_nh": 104, "parts": ["0077537A7", "0079537A7", "0076537A7", "0070537A7", "0078537A7", "0074537A7", "0059537A2", "0058537A2", "0055537A2"]},
+        {"perm": 75, "al_nh": 130, "parts": ["0077538A7", "-", "-", "-", "0078538A7", "-", "0059538A2", "0058538A2", "0055538A2"]},
+        {"perm": 90, "al_nh": 156, "parts": ["0077539A7", "-", "-", "-", "0078539A7", "-", "0059539A2", "0058539A2", "0055539A2"]},
+        {"perm": 125, "al_nh": 217, "parts": ["0077540A7", "-", "-", "-", "0078540A7", "-", "0059540A2", "0058540A2", "0055540A2"]},
+        {"perm": 147, "al_nh": 255, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055531A2"]},
+        {"perm": 160, "al_nh": 278, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055532A2"]}
+      ]
+    },
+    {
+      "size": "OD 57.15 / ID 35.56 / HT 13.97 mm",
+      "printed_page": 185,
+      "pdf_page": 186,
+      "od_mm": 57.15, "id_mm": 35.56, "ht_mm": 13.97,
+      "od_mm_after_finish": 58.04, "id_mm_after_finish": 34.75, "ht_mm_after_finish": 14.86,
+      "geometry": {
+        "window_area_mm2": 948, "ae_mm2": 144, "le_mm": 143, "ve_mm3": 20700.0,
+        "area_product_mm4": 137000.0, "surface_area_unwound_core_mm2": 7700.0, "surface_area_40pct_winding_factor_mm2": 13000.0,
+        "ve_mm3_from_ae_le": 20592.0, "ve_selfcheck_ratio": 1.0052, "le_mm_log_mean_check": 142.96
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 18, "parts": ["0077112A7", "0079112A7", "-", "-", "-", "-", "0059112A2", "0058112A2", "0055112A2"]},
+        {"perm": 19, "al_nh": 24, "parts": ["0077215A7", "0079215A7", "-", "-", "0078215A7", "-", "0059215A2", "-", "0055215A2"]},
+        {"perm": 26, "al_nh": 33, "parts": ["0077111A7", "0079111A7", "0076111A7", "0070111A7", "0078111A7", "0074111A7", "0059111A2", "0058111A2", "0055111A2"]},
+        {"perm": 40, "al_nh": 50, "parts": ["0077212A7", "0079212A7", "0076212A7", "0070212A7", "0078212A7", "-", "0059212A2", "0058212A2", "0055212A2"]},
+        {"perm": 60, "al_nh": 75, "parts": ["0077110A7", "0079110A7", "0076110A7", "0070110A7", "0078110A7", "0074110A7", "0059110A2", "C058110A2", "C055110A2"]},
+        {"perm": 75, "al_nh": 94, "parts": ["0077214A7", "-", "-", "-", "0078214A7", "-", "0059214A2", "0058214A2", "0055214A2"]},
+        {"perm": 90, "al_nh": 112, "parts": ["0077213A7", "-", "-", "-", "0078213A7", "-", "0059213A2", "C058213A2", "0055213A2"]},
+        {"perm": 125, "al_nh": 156, "parts": ["0077109A7", "-", "-", "-", "0078109A7", "-", "-", "C058109A2", "C055109A2"]},
+        {"perm": 147, "al_nh": 185, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055108A2"]},
+        {"perm": 160, "al_nh": 200, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055107A2"]},
+        {"perm": 173, "al_nh": 218, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055103A2"]},
+        {"perm": 200, "al_nh": 250, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055106A2"]},
+        {"perm": 300, "al_nh": 374, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055104A2"]}
+      ]
+    },
+    {
+      "size": "OD 57.15 / ID 26.39 / HT 15.24 mm",
+      "printed_page": 186,
+      "pdf_page": 187,
+      "od_mm": 57.15, "id_mm": 26.39, "ht_mm": 15.24,
+      "od_mm_after_finish": 58.04, "id_mm_after_finish": 25.58, "ht_mm_after_finish": 16.13,
+      "geometry": {
+        "window_area_mm2": 514, "ae_mm2": 229, "le_mm": 125, "ve_mm3": 28600.0,
+        "area_product_mm4": 118000.0, "surface_area_unwound_core_mm2": 8500.0, "surface_area_40pct_winding_factor_mm2": 12000.0,
+        "ve_mm3_from_ae_le": 28625.0, "ve_selfcheck_ratio": 0.9991, "le_mm_log_mean_check": 125.06
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 32, "parts": ["0077190A7", "0079190A7", "-", "-", "-", "-", "0059190A2", "0058190A2", "0055190A2"]},
+        {"perm": 19, "al_nh": 44, "parts": ["0077188A7", "0079188A7", "-", "-", "0078188A7", "-", "0059188A2", "-", "0055188A2"]},
+        {"perm": 26, "al_nh": 60, "parts": ["0077191A7", "0079191A7", "0076191A7", "0070191A7", "0078191A7", "0074191A7", "0059191A2", "0058191A2", "0055191A2"]},
+        {"perm": 40, "al_nh": 92, "parts": ["0077189A7", "0079189A7", "0076189A7", "0070189A7", "0078189A7", "-", "0059189A2", "0058189A2", "0055189A2"]},
+        {"perm": 60, "al_nh": 138, "parts": ["0077192A7", "0079192A7", "0076192A7", "0070192A7", "0078192A7", "0074192A7", "0059192A2", "C058192A2", "C055192A2"]},
+        {"perm": 75, "al_nh": 172, "parts": ["0077193A7", "-", "-", "-", "0078193A7", "-", "0059193A2", "0058193A2", "0055193A2"]},
+        {"perm": 90, "al_nh": 207, "parts": ["0077194A7", "-", "-", "-", "0078194A7", "-", "0059194A2", "0058194A2", "0055194A2"]},
+        {"perm": 125, "al_nh": 287, "parts": ["0077195A7", "-", "-", "-", "0078195A7", "-", "-", "C058195A2", "C055195A2"]},
+        {"perm": 147, "al_nh": 306, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055196A2"]},
+        {"perm": 160, "al_nh": 333, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055197A2"]},
+        {"perm": 173, "al_nh": 360, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055198A2"]},
+        {"perm": 200, "al_nh": 417, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055199A2"]},
+        {"perm": 300, "al_nh": 626, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055186A2"]}
+      ]
+    },
+    {
+      "size": "OD 59.6 / ID 34 / HT 19.5 mm",
+      "printed_page": 187,
+      "pdf_page": 188,
+      "od_mm": 59.6, "id_mm": 34, "ht_mm": 19.5,
+      "od_mm_after_finish": 60.6, "id_mm_after_finish": 33, "ht_mm_after_finish": 20.5,
+      "geometry": {
+        "window_area_mm2": 855, "ae_mm2": 237, "le_mm": 143, "ve_mm3": 33900.0,
+        "area_product_mm4": 202635.0, "surface_area_unwound_core_mm2": 10000.0, "surface_area_40pct_winding_factor_mm2": 15000.0,
+        "ve_mm3_from_ae_le": 33891.0, "ve_selfcheck_ratio": 1.0003, "le_mm_log_mean_check": 143.28
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 29, "parts": ["0077603A7", "0079603A7", "-", "-", "-", "-", "0059603A2", "0058603A2", "0055603A2"]},
+        {"perm": 19, "al_nh": 39, "parts": ["0077602A7", "0079602A7", "-", "-", "0078602A7", "-", "0059602A2", "-", "0055602A2"]},
+        {"perm": 26, "al_nh": 54, "parts": ["0077601A7", "0079601A7", "0076601A7", "0070601A7", "0078601A7", "0074601A7", "0059601A2", "0058601A2", "0055601A2"]},
+        {"perm": 40, "al_nh": 83, "parts": ["0077600A7", "0079600A7", "0076600A7", "0070600A7", "0078600A7", "-", "0059600A2", "0058600A2", "0055600A2"]},
+        {"perm": 60, "al_nh": 125, "parts": ["0077599A7", "0079599A7", "0076599A7", "0070599A7", "0078599A7", "0074599A7", "0059599A2", "0058599A2", "0055599A2"]},
+        {"perm": 75, "al_nh": 156, "parts": ["0077598A7", "-", "-", "-", "0078598A7", "-", "0059598A2", "0058598A2", "0055598A2"]},
+        {"perm": 90, "al_nh": 187, "parts": ["0077597A7", "-", "-", "-", "0078597A7", "-", "0059597A2", "0058597A2", "0055597A2"]},
+        {"perm": 125, "al_nh": 259, "parts": ["0077596A7", "-", "-", "-", "-", "-", "-", "0058596A2", "0055596A2"]},
+        {"perm": 147, "al_nh": 305, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055595A2"]}
+      ]
+    },
+    {
+      "size": "OD 61.98 / ID 32.59 / HT 24.99 mm",
+      "printed_page": 188,
+      "pdf_page": 189,
+      "od_mm": 61.98, "id_mm": 32.59, "ht_mm": 24.99,
+      "od_mm_after_finish": 63.09, "id_mm_after_finish": 31.7, "ht_mm_after_finish": 25.91,
+      "geometry": {
+        "window_area_mm2": 789, "ae_mm2": 360, "le_mm": 144, "ve_mm3": 51800.0,
+        "area_product_mm4": 284000.0, "surface_area_unwound_core_mm2": 12000.0, "surface_area_40pct_winding_factor_mm2": 21000.0,
+        "ve_mm3_from_ae_le": 51840.0, "ve_selfcheck_ratio": 0.9992, "le_mm_log_mean_check": 143.64
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 44, "parts": ["0077614A7", "0079614A7", "-", "-", "-", "-", "0059614A2", "0058614A2", "0055614A2"]},
+        {"perm": 19, "al_nh": 60, "parts": ["0077612A7", "0079612A7", "-", "-", "0078612A7", "-", "0059612A2", "-", "0055612A2"]},
+        {"perm": 26, "al_nh": 82, "parts": ["0077615A7", "0079615A7", "0076615A7", "0070615A7", "0078615A7", "0074615A7", "0059615A2", "0058615A2", "0055615A2"]},
+        {"perm": 40, "al_nh": 126, "parts": ["0077616A7", "0079616A7", "0076616A7", "0070616A7", "0078616A7", "-", "0059616A2", "0058616A2", "0055616A2"]},
+        {"perm": 60, "al_nh": 189, "parts": ["0077617A7", "0079617A7", "0076617A7", "0070617A7", "0078617A7", "0074617A7", "0059617A2", "0058617A2", "0055617A2"]},
+        {"perm": 75, "al_nh": 237, "parts": ["0077618A7", "-", "-", "-", "0078618A7", "-", "0059618A2", "0058618A2", "0055618A2"]},
+        {"perm": 90, "al_nh": 284, "parts": ["0077619A7", "-", "-", "-", "0078619A7", "-", "0059619A2", "0058619A2", "0055619A2"]},
+        {"perm": 125, "al_nh": 394, "parts": ["0077620A7", "-", "-", "-", "-", "-", "-", "0058620A2", "0055620A2"]},
+        {"perm": 147, "al_nh": 465, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055624A2"]}
+      ]
+    },
+    {
+      "size": "OD 68 / ID 35.99 / HT 19.99 mm",
+      "printed_page": 189,
+      "pdf_page": 190,
+      "od_mm": 68, "id_mm": 35.99, "ht_mm": 19.99,
+      "od_mm_after_finish": 69.42, "id_mm_after_finish": 34.67, "ht_mm_after_finish": 21.41,
+      "geometry": {
+        "window_area_mm2": 945, "ae_mm2": 314, "le_mm": 158, "ve_mm3": 49700.0,
+        "area_product_mm4": 297000.0, "surface_area_unwound_core_mm2": 12700.0, "surface_area_40pct_winding_factor_mm2": 19000.0,
+        "ve_mm3_from_ae_le": 49612.0, "ve_selfcheck_ratio": 1.0018, "le_mm_log_mean_check": 158.05
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 35, "parts": ["0077075A7", "0079075A7", "-", "-", "-", "-", "0059075A2", "0058075A2", "0055075A2"]},
+        {"perm": 19, "al_nh": 48, "parts": ["0077067A7", "0079067A7", "-", "-", "0078067A7", "-", "0059067A2", "-", "0055067A2"]},
+        {"perm": 26, "al_nh": 65, "parts": ["0077074A7", "0079074A7", "0076074A7", "0070074A7", "0078074A7", "0074074A7", "0059074A2", "0058074A2", "0055074A2"]},
+        {"perm": 40, "al_nh": 100, "parts": ["0077073A7", "0079073A7", "0076073A7", "0070073A7", "0078073A7", "-", "0059073A2", "0058073A2", "0055073A2"]},
+        {"perm": 60, "al_nh": 143, "parts": ["0077072A7", "0079072A7", "0076072A7", "0070072A7", "0078072A7", "0074072A7", "0059072A2", "0058072A2", "0055072A2"]},
+        {"perm": 75, "al_nh": 187, "parts": ["0077069A7", "-", "-", "-", "0078069A7", "-", "0059069A2", "0058069A2", "0055069A2"]},
+        {"perm": 90, "al_nh": 225, "parts": ["0077068A7", "-", "-", "-", "0078068A7", "-", "0059068A2", "0058068A2", "0055068A2"]},
+        {"perm": 125, "al_nh": 312, "parts": ["0077070A7", "-", "-", "-", "-", "-", "-", "0058070A2", "0055070A2"]},
+        {"perm": 147, "al_nh": 367, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055066A2"]}
+      ]
+    },
+    {
+      "size": "OD 74.09 / ID 45.29 / HT 35 mm",
+      "printed_page": 190,
+      "pdf_page": 191,
+      "od_mm": 74.09, "id_mm": 45.29, "ht_mm": 35,
+      "od_mm_after_finish": 75.21, "id_mm_after_finish": 44.4, "ht_mm_after_finish": 35.92,
+      "geometry": {
+        "window_area_mm2": 1550.0, "ae_mm2": 497, "le_mm": 184, "ve_mm3": 91400.0,
+        "area_product_mm4": 769000.0, "surface_area_unwound_core_mm2": 19000.0, "surface_area_40pct_winding_factor_mm2": 33000.0,
+        "ve_mm3_from_ae_le": 91448.0, "ve_selfcheck_ratio": 0.9995, "le_mm_log_mean_check": 183.83
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 48, "parts": ["0077734A7", "0079734A7", "-", "-", "-", "-", "0059734A2", "0058734A2", "0055734A2"]},
+        {"perm": 19, "al_nh": 64, "parts": ["0077744A7", "0079744A7", "-", "-", "0078744A7", "-", "0059744A2", "-", "0055744A2"]},
+        {"perm": 26, "al_nh": 88, "parts": ["0077735A7", "0079735A7", "0076735A7", "0070735A7", "0078735A7", "0074735A7", "0059735A2", "0058735A2", "0055735A2"]},
+        {"perm": 40, "al_nh": 136, "parts": ["0077736A7", "0079736A7", "0076736A7", "0070736A7", "0078736A7", "-", "0059736A2", "0058736A2", "0055736A2"]},
+        {"perm": 60, "al_nh": 204, "parts": ["0077737A7", "0079737A7", "0076737A7", "0070737A7", "0078737A7", "0074737A7", "0059737A2", "0058737A2", "0055737A2"]},
+        {"perm": 75, "al_nh": 255, "parts": ["0077738A7", "-", "-", "-", "0078738A7", "-", "0059738A2", "0058738A2", "0055738A2"]},
+        {"perm": 90, "al_nh": 306, "parts": ["0077739A7", "-", "-", "-", "0078739A7", "-", "0059739A2", "0058739A2", "0055739A2"]},
+        {"perm": 125, "al_nh": 425, "parts": ["0077740A7", "-", "-", "-", "-", "-", "-", "0058740A2", "0055740A2"]},
+        {"perm": 147, "al_nh": 501, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055745A2"]}
+      ]
+    },
+    {
+      "size": "OD 77.8 / ID 49.23 / HT 12.7 mm",
+      "printed_page": 191,
+      "pdf_page": 192,
+      "od_mm": 77.8, "id_mm": 49.23, "ht_mm": 12.7,
+      "od_mm_after_finish": 78.94, "id_mm_after_finish": 48.21, "ht_mm_after_finish": 13.84,
+      "geometry": {
+        "window_area_mm2": 1820.0, "ae_mm2": 176, "le_mm": 196, "ve_mm3": 34500.0,
+        "area_product_mm4": 321000.0, "surface_area_unwound_core_mm2": 11000.0, "surface_area_40pct_winding_factor_mm2": 23000.0,
+        "ve_mm3_from_ae_le": 34496.0, "ve_selfcheck_ratio": 1.0001, "le_mm_log_mean_check": 196.13
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 16, "parts": ["0077869A7", "0079869A7", "-", "-", "-", "-", "0059869A2", "0058869A2", "0055869A2"]},
+        {"perm": 19, "al_nh": 22, "parts": ["0077873A7", "0079873A7", "-", "-", "0078873A7", "-", "0059873A2", "-", "0055873A2"]},
+        {"perm": 26, "al_nh": 30, "parts": ["0077868A7", "0079868A7", "0076868A7", "0070868A7", "0078868A7", "0074868A7", "0059868A2", "0058868A2", "0055868A2"]},
+        {"perm": 40, "al_nh": 45, "parts": ["0077872A7", "0079872A7", "-", "0070872A7", "0078872A7", "-", "0059872A2", "0058872A2", "0055872A2"]},
+        {"perm": 60, "al_nh": 68, "parts": ["0077867A7", "0079867A7", "-", "0070867A7", "0078867A7", "0074867A7", "0059867A2", "C058867A2", "C055867A2"]},
+        {"perm": 75, "al_nh": 85, "parts": ["0077871A7", "-", "-", "-", "0078871A7", "-", "0058871A2", "0058871A2", "0055871A2"]},
+        {"perm": 90, "al_nh": 102, "parts": ["0077870A7", "-", "-", "-", "0078870A7", "-", "0059870A2", "0058870A2", "0055870A2"]},
+        {"perm": 125, "al_nh": 142, "parts": ["0077866A7", "-", "-", "-", "-", "-", "-", "C058866A2", "C055866A2"]},
+        {"perm": 147, "al_nh": 166, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055865A2"]},
+        {"perm": 200, "al_nh": 225, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "C055863A2"]}
+      ]
+    },
+    {
+      "size": "OD 77.8 / ID 49.23 / HT 15.88 mm",
+      "printed_page": 192,
+      "pdf_page": 193,
+      "od_mm": 77.8, "id_mm": 49.23, "ht_mm": 15.88,
+      "od_mm_after_finish": 78.94, "id_mm_after_finish": 48.21, "ht_mm_after_finish": 17.02,
+      "geometry": {
+        "window_area_mm2": 1820.0, "ae_mm2": 221, "le_mm": 196, "ve_mm3": 43400.0,
+        "area_product_mm4": 403000.0, "surface_area_unwound_core_mm2": 13000.0, "surface_area_40pct_winding_factor_mm2": 24000.0,
+        "ve_mm3_from_ae_le": 43316.0, "ve_selfcheck_ratio": 1.0019, "le_mm_log_mean_check": 196.13
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 20, "parts": ["0077909A7", "0079909A7", "-", "-", "-", "-", "0059909A2", "0058909A2", "0055909A2"]},
+        {"perm": 19, "al_nh": 27, "parts": ["0077913A7", "0079913A7", "-", "-", "0078913A7", "-", "0059913A2", "-", "0055913A2"]},
+        {"perm": 26, "al_nh": 37, "parts": ["0077908A7", "0079908A7", "0076908A7", "0070908A7", "0078908A7", "0074908A7", "0059908A2", "0058908A2", "0055908A2"]},
+        {"perm": 40, "al_nh": 57, "parts": ["0077912A7", "0079912A7", "-", "0070912A7", "0078912A7", "-", "0059912A2", "0058912A2", "0055912A2"]},
+        {"perm": 60, "al_nh": 85, "parts": ["0077907A7", "0079907A7", "-", "0070907A7", "0078907A7", "0074907A7", "0059907A2", "C058907A2", "C055907A2"]},
+        {"perm": 75, "al_nh": 106, "parts": ["0077911A7", "-", "-", "-", "0078911A7", "-", "0059911A2", "0058911A2", "0055911A2"]},
+        {"perm": 90, "al_nh": 128, "parts": ["0077910A7", "-", "-", "-", "0078910A7", "-", "0059910A2", "0058910A2", "0055910A2"]},
+        {"perm": 125, "al_nh": 177, "parts": ["0077906A7", "-", "-", "-", "-", "-", "-", "C058906A2", "C055906A2"]},
+        {"perm": 147, "al_nh": 208, "parts": ["-", "-", "-", "-", null, "-", "-", "-", "0055905A2"]}
+      ]
+    },
+    {
+      "size": "OD 77.8 / ID 39.34 / HT 25.86 mm",
+      "printed_page": 193,
+      "pdf_page": 194,
+      "od_mm": 77.8, "id_mm": 39.34, "ht_mm": 25.86,
+      "od_mm_after_finish": 78.94, "id_mm_after_finish": 38.33, "ht_mm_after_finish": 26.85,
+      "geometry": {
+        "window_area_mm2": 1150.0, "ae_mm2": 492, "le_mm": 177.2, "ve_mm3": 81500.0,
+        "area_product_mm4": 550000.0, "surface_area_unwound_core_mm2": 17000.0, "surface_area_40pct_winding_factor_mm2": 25000.0,
+        "ve_mm3_from_ae_le": 87182.4, "ve_selfcheck_ratio": 0.9348, "le_mm_log_mean_check": 177.19
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 47, "parts": ["0077774A7", "0079774A7", "-", "-", "-", "-", "0059774A2", "0058774A2", "0055774A2"]},
+        {"perm": 19, "al_nh": 64, "parts": ["0077772A7", "0079772A7", "-", "-", "0078772A7", "-", "0059772A2", "-", "0055772A2"]},
+        {"perm": 26, "al_nh": 88, "parts": ["0077775A7", "0079775A7", "0076775A7", "0070775A7", "0078775A7", "0074775A7", "0059775A2", "0058775A2", "0055775A2"]},
+        {"perm": 40, "al_nh": 135, "parts": ["0077776A7", "0079776A7", "-", "0070776A7", "0078776A7", "-", "0059776A2", "0058776A2", "0055776A2"]},
+        {"perm": 60, "al_nh": 205, "parts": ["0077777A7", "0079777A7", "-", "0070777A7", "0078777A7", "0074777A7", "0059777A2", "0058777A2", "0055777A2"]},
+        {"perm": 75, "al_nh": 256, "parts": ["0077773A7", "-", "-", "-", "0078773A7", "-", "0059773A2", "0058773A2", "0055773A2"]},
+        {"perm": 90, "al_nh": 306, "parts": ["0077771A7", "-", "-", "-", "0078771A7", "-", "0059771A2", "0058771A2", "0055771A2"]},
+        {"perm": 125, "al_nh": 425, "parts": ["0077778A7", "-", "-", "-", "-", "-", "-", "0058778A2", "0055778A2"]},
+        {"perm": 147, "al_nh": 500, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055779A2"]}
+      ]
+    },
+    {
+      "size": "OD 101.6 / ID 57.15 / HT 16.51 mm",
+      "printed_page": 194,
+      "pdf_page": 195,
+      "od_mm": 101.6, "id_mm": 57.15, "ht_mm": 16.51,
+      "od_mm_after_finish": 103, "id_mm_after_finish": 55.75, "ht_mm_after_finish": 17.91,
+      "geometry": {
+        "window_area_mm2": 2470.0, "ae_mm2": 358, "le_mm": 243, "ve_mm3": 86900.0,
+        "area_product_mm4": 885000.0, "surface_area_unwound_core_mm2": 20000.0, "surface_area_40pct_winding_factor_mm2": 36000.0,
+        "ve_mm3_from_ae_le": 86994.0, "ve_selfcheck_ratio": 0.9989, "le_mm_log_mean_check": 242.71
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 26, "parts": ["0077101A7", "0079101A7", "-", "-", "-", "-", "0059101A2", "0058101A2", "0055101A2"]},
+        {"perm": 19, "al_nh": 35, "parts": ["0077097A7", "0079097A7", "-", "-", "0078097A7", "-", "0059097A2", "-", "0055097A2"]},
+        {"perm": 26, "al_nh": 48, "parts": ["0077102A7", "0079102A7", "0076102A7", "0070102A7", "0078102A7", "0074102A7", "0059102A2", "0058102A2", "0055102A2"]},
+        {"perm": 40, "al_nh": 74, "parts": ["0077100A7", "0079100A7", "-", "-", "0078100A7", "-", "0059100A2", "0058100A2", "0055100A2"]},
+        {"perm": 60, "al_nh": 111, "parts": ["0077099A7", "0079099A7", "-", "-", "0078099A7", "0074099A7", "0059099A2", "0058099A2", "0055099A2"]},
+        {"perm": 75, "al_nh": 138, "parts": ["0077159A7", "-", "-", "-", "0078159A7", "-", "-", "-", "0055159A2"]},
+        {"perm": 90, "al_nh": 167, "parts": ["0077096A7", "-", "-", "-", "0078096A7", "-", "-", "-", "0055096A2"]},
+        {"perm": 125, "al_nh": 232, "parts": ["0077098A7", "-", "-", "-", "-", "-", "-", "-", "0055098A2"]},
+        {"perm": 147, "al_nh": 273, "parts": ["-", "-", "-", "-", "-", "-", "-", "-", "0055160A2"]}
+      ]
+    },
+    {
+      "size": "OD 132.56 / ID 78.59 / HT 25.4 mm",
+      "printed_page": 195,
+      "pdf_page": 196,
+      "od_mm": 132.56, "id_mm": 78.59, "ht_mm": 25.4,
+      "od_mm_after_finish": 133.96, "id_mm_after_finish": 77.19, "ht_mm_after_finish": 26.8,
+      "geometry": {
+        "window_area_mm2": 4710.0, "ae_mm2": 678, "le_mm": 324, "ve_mm3": 220000.0,
+        "area_product_mm4": 3190000.0, "surface_area_unwound_core_mm2": 36000.0, "surface_area_40pct_winding_factor_mm2": 65000.0,
+        "ve_mm3_from_ae_le": 219672.0, "ve_selfcheck_ratio": 1.0015, "le_mm_log_mean_check": 324.32
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 37, "parts": ["0077336A7", "0079336A7", "-", "-", "-", "-", "0059336A2", "0058336A2", "0055336A2"]},
+        {"perm": 19, "al_nh": 50, "parts": ["0077342A7", "0079342A7", "-", "-", "0078342A7", "-", "0059342A2", "-", "0055342A2"]},
+        {"perm": 26, "al_nh": 68, "parts": ["0077337A7", "0079337A7", "0076337A7", "0070337A7", "0078337A7", "0074337A7", "0059337A2", "0058337A2", "0055337A2"]},
+        {"perm": 40, "al_nh": 105, "parts": ["0077338A7", "-", "-", "-", "0078338A7", "-", "-", "0058338A2", "0055338A2"]},
+        {"perm": 60, "al_nh": 158, "parts": ["0077339A7", "-", "-", "-", "0078339A7", "0074339A7", "-", "0058339A2", "0055339A2"]}
+      ]
+    },
+    {
+      "size": "OD 165.1 / ID 102.41 / HT 31.75 mm",
+      "printed_page": 196,
+      "pdf_page": 197,
+      "od_mm": 165.1, "id_mm": 102.41, "ht_mm": 31.75,
+      "od_mm_after_finish": 166.5, "id_mm_after_finish": 101.02, "ht_mm_after_finish": 33.15,
+      "geometry": {
+        "window_area_mm2": 8030.0, "ae_mm2": 987, "le_mm": 412, "ve_mm3": 407000.0,
+        "area_product_mm4": 7920000.0, "surface_area_unwound_core_mm2": 55000.0, "surface_area_40pct_winding_factor_mm2": 102000.0,
+        "ve_mm3_from_ae_le": 406644.0, "ve_selfcheck_ratio": 1.0009, "le_mm_log_mean_check": 412.4
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 42, "parts": ["0077164A7", "0079164A7", "-", "-", "-", "-", "-", "0058164A2", "0055164A2"]},
+        {"perm": 19, "al_nh": 57, "parts": ["0077163A7", "-", "-", "-", "0078163A7", "-", "-", "-", "0055163A2"]},
+        {"perm": 26, "al_nh": 78, "parts": ["0077165A7", "-", "-", "-", "0078165A7", "-", "-", "0058165A2", "0055165A2"]}
+      ]
+    },
+    {
+      "size": "OD 165.1 / ID 88.9 / HT 25.4 mm",
+      "printed_page": 197,
+      "pdf_page": 198,
+      "od_mm": 165.1, "id_mm": 88.9, "ht_mm": 25.4,
+      "od_mm_after_finish": 167.21, "id_mm_after_finish": 86.89, "ht_mm_after_finish": 27.31,
+      "geometry": {
+        "window_area_mm2": 5930.0, "ae_mm2": 948, "le_mm": 386.5, "ve_mm3": 366400.0,
+        "area_product_mm4": 5620000.0, "surface_area_unwound_core_mm2": 54000.0, "surface_area_40pct_winding_factor_mm2": 96000.0,
+        "ve_mm3_from_ae_le": 366402.0, "ve_selfcheck_ratio": 1, "le_mm_log_mean_check": 386.71
+      },
+      "rows": [
+        {"perm": 14, "al_nh": 42, "parts": ["-", "0079169A7", "-", "-", "-", "-", "-", "-", "-"]},
+        {"perm": 19, "al_nh": 58, "parts": ["-", "-", "-", null, "0078170A7", "-", "-", "-", "-"]},
+        {"perm": 26, "al_nh": 80, "parts": ["-", "-", "-", null, "0078171A7", "-", "-", "-", "-"]}
+      ]
+    }
+  ]
+}

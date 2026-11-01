@@ -1665,8 +1665,314 @@ def _bsat_at(material, temperature_c):
     return float(v), None
 
 
+# --------------------------------------------------------------------------
+# powder-core toroids: geometry and AL, kept in a second file
+#
+# data/powder_cores.json holds the 43 toroid sizes the 210-page powder catalog
+# prints (printed p.155-197), each with its permeability rows and the part number
+# that exists in each of the nine material columns. The MATERIAL half - Bsat,
+# density, Curie, and the loss fits - stays in data/magnetic_materials.json, so
+# neither file repeats the other: this one answers "which shapes exist and what AL
+# does each permeability give", that one answers "what is the material".
+#
+# Two structural facts about the printed pages are load-bearing here:
+#   * a combination the vendor does not make has NO printed cell (not a dash), so
+#     an absent part is '-' or null in the data and is never carried as a guess;
+#   * a powder core has no discrete gap - the gap is distributed through the
+#     volume - so AL cannot be trimmed by cutting one. select_core therefore
+#     refuses to invent a gap length for these parts and says to change the
+#     permeability instead.
+# --------------------------------------------------------------------------
+
+POWDER_PATH = os.path.join(os.path.dirname(DATA_PATH), "powder_cores.json")
+
+# The nine column headings the toroid pages print, mapped onto the material names
+# data/magnetic_materials.json already uses plus the variant label its loss_fit
+# rows use. Every column is a material (or a variant of one); a heading this code
+# does not know aborts the load rather than being folded onto a neighbour, because
+# the column IS the material and merging two would silently relabel 200 parts.
+POWDER_COLUMNS = {
+    "Kool M\u00b5": ("Kool Mu", None),
+    "Kool M\u00b5 MAX": ("Kool Mu", "MAX"),
+    "Kool M\u00b5 H\u0192": ("Kool Mu", "HF"),
+    "Kool M\u00b5 Ultra": ("Kool Mu", "Ultra"),
+    "XFlux": ("XFlux", None),
+    "XFlux Ultra": ("XFlux", "Ultra"),
+    "Edge": ("Edge", None),
+    "High Flux": ("High Flux", None),
+    "MPP": ("MPP", None),
+}
+
+POWDER_SCHEMA = "powder-core-toroid"
+
+# printed p.18: a C0 prefix grades the inductance into a 2 % band above 4.65 mm OD
+# and a 5 % band at or below it; an 00 prefix is the single printed value with the
+# +-8 % band stated above the column.
+POWDER_GRADE_OD_MM = 4.65
+
+def _load_powder_cores(path=None):
+    """(data, None) or (None, why-not). The table's shape is part of the contract."""
+    p = path or POWDER_PATH
+    if not os.path.exists(p):
+        return None, "powder-core table missing: " + p
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        return None, "powder-core table unreadable: %s" % exc
+    if data.get("schema") != POWDER_SCHEMA:
+        return None, ("powder-core table has schema %r, not %r; the shape of the table "
+                      "is checked rather than assumed, because a reader that guessed "
+                      "would answer from the wrong field"
+                      % (data.get("schema"), POWDER_SCHEMA))
+    if not data.get("sizes"):
+        return None, "powder-core table has no sizes"
+    cols = data.get("column_order") or []
+    if not cols:
+        return None, "powder-core table has no column_order"
+    unknown = [c for c in cols if c not in POWDER_COLUMNS]
+    if unknown:
+        return None, ("powder-core table has column headings this code cannot map onto "
+                      "a material: " + ", ".join(map(str, unknown)))
+    return data, None
+
+def _powder_tolerance(part, od_mm, rule):
+    """The AL band the part number's own prefix promises, or None if it promises none."""
+    if not part or not rule:
+        return None
+    head = part[:2].upper().replace("O", "0")
+    if head == "C0":
+        if od_mm is None:
+            return None
+        return (rule.get("od_le_4p65") if float(od_mm) <= POWDER_GRADE_OD_MM
+                else rule.get("od_gt_4p65"))
+    if head == "00":
+        return rule.get("default_without_c0")
+    return None
+
+def _powder_core_rows(data, material=None, permeability=None):
+    """One dict per purchasable part, shaped like a row of data["cores"].
+
+    The file is a printed-page transcription (size -> permeability row -> nine
+    columns), so this is the expansion of that grid into the flat "part" view
+    select_core works on. Nothing is computed except the mass estimate, and when
+    the printed density or the printed permeability factor is missing the mass is
+    None with the reason rather than an interpolation.
+    """
+    cols = data.get("column_order") or []
+    props = data.get("material_properties_printed_page_16") or {}
+    p10 = (data.get("material_comparison_printed_page_10") or {}).get("rows") or {}
+    density_rows = props.get("rows") or {}
+    factors = props.get("permeability_density_factors_60u") or {}
+    tol_rule = data.get("al_tolerance_pct_c0") or {}
+    vendor = (data.get("source") or {}).get("vendor")
+    want_mat = _norm_key(material) if material else None
+    want_mu = _f("permeability", permeability) if permeability is not None else None
+    out = []
+    for size in data.get("sizes") or []:
+        geo = size.get("geometry") or {}
+        ve_mm3 = geo.get("ve_mm3")
+        od = size.get("od_mm")
+        for r in size.get("rows") or []:
+            perm = r.get("perm")
+            if perm is None:
+                continue
+            perm_f = float(perm)
+            if want_mu is not None and abs(perm_f - want_mu) > 1e-9:
+                continue
+            for i, cell in enumerate(r.get("parts") or []):
+                if i >= len(cols) or not isinstance(cell, str):
+                    continue
+                part = cell.strip()
+                if not part or part == "-":
+                    continue
+                col = cols[i]
+                mname, variant = POWDER_COLUMNS[col]
+                if want_mat and _norm_key(mname) != want_mat:
+                    continue
+                dens = (density_rows.get(col) or {}).get("density_60u_g_cm3")
+                fac = factors.get("%g" % perm_f)
+                if dens is None:
+                    mass, mass_note = None, ("p.16 prints no density for the %s column"
+                                             % col)
+                elif fac is None:
+                    mass, mass_note = None, (
+                        "p.16 prints eleven density factors for fourteen permeabilities "
+                        "and %g u is one of the three without one, so the mass is "
+                        "refused rather than interpolated" % perm_f)
+                elif ve_mm3 is None:
+                    mass, mass_note = None, "this size carries no effective volume"
+                else:
+                    mass = float(ve_mm3) * 1e-3 * float(dens) * float(fac)
+                    mass_note = ("Ve x the %s column's 60u density (%g g/cm3) x the "
+                                 "printed %g u factor %g; the catalog defers the nominal "
+                                 "weight to the individual data sheet, so this is an "
+                                 "estimate and not the vendor's part weight"
+                                 % (col, dens, perm_f, fac))
+                out.append({
+                    "part": part,
+                    "vendor": vendor,
+                    "shape": "toroid",
+                    "material": mname,
+                    "material_variant": variant,
+                    "material_column": col,
+                    "permeability": _fmt(perm_f),
+                    "ae_mm2": geo.get("ae_mm2"),
+                    "le_mm": geo.get("le_mm"),
+                    "ve_mm3": ve_mm3,
+                    "al_nh": r.get("al_nh"),
+                    "gap_um": 0,
+                    "gap_is_distributed": True,
+                    "gap_note": ("distributed gap: a powder core's gap is spread through "
+                                 "the whole volume, so AL cannot be trimmed by cutting a "
+                                 "gap - change the permeability or the turns instead"),
+                    "aw_mm2": geo.get("window_area_mm2"),
+                    "mlt_mm": None,
+                    "mlt_note": ("the catalog prints no mean turn length for the "
+                                 "toroids, and a toroid's MLT depends on the winding "
+                                 "build, so copper resistance is not estimated here"),
+                    "mass_g": _fmt(mass) if mass is not None else None,
+                    "mass_basis": mass_note,
+                    "bsat_typical_t": (p10.get(col) or {}).get("sat_flux_density_t"),
+                    "bsat_basis": ("the catalog's comparison page (printed p.10) prints "
+                                   "this one saturation value for the %s column and no "
+                                   "temperature against it" % col),
+                    "al_tolerance_pct": _powder_tolerance(part, od, tol_rule),
+                    "finish": part[-2:],
+                    "od_mm": od,
+                    "id_mm": size.get("id_mm"),
+                    "ht_mm": size.get("ht_mm"),
+                    "size": size.get("size"),
+                    "printed_page": size.get("printed_page"),
+                    "loss_fit_lookup": {"material": mname,
+                                        "permeability": perm_f,
+                                        "shape": "toroid",
+                                        "variant": variant},
+                })
+    return out
+
+def _magnetic_data_powder(kind, material=None, permeability=None, limit=None,
+                          name=None, powder_data_path=None):
+    """Read back the powder-core table: the size blocks, or the flat part list.
+
+    Two shapes, because two questions are asked of this file. `powder_cores` is
+    the printed page as printed - 43 sizes, each with its permeability rows and
+    nine columns - and `powder_parts` is the same grid flattened to one row per
+    purchasable part, which is what a caller filtering by material and
+    permeability actually wants.
+    """
+    data, why = _load_powder_cores(powder_data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="data/powder_cores.json ships with the package; check that it "
+                        "is present and has schema %r" % POWDER_SCHEMA)
+    try:
+        lim = None
+        if limit is not None:
+            lim = int(limit)
+            if lim <= 0:
+                return err("limit must be >= 1", "ARG_RANGE")
+    except (TypeError, ValueError):
+        return err("limit must be an integer", "ARG_INVALID")
+    want_mat = _norm_key(material) if material else None
+    want_mu = _f("permeability", permeability) if permeability is not None else None
+
+    def col_kept(col):
+        if want_mat is None:
+            return True
+        mname, variant = POWDER_COLUMNS[col]
+        return _norm_key(mname) == want_mat or _norm_key(col) == want_mat
+
+    if kind == "powder_cores":
+        blocks = []
+        for size in data.get("sizes") or []:
+            rows = []
+            for r in size.get("rows") or []:
+                perm = r.get("perm")
+                if perm is None:
+                    continue
+                if want_mu is not None and abs(float(perm) - want_mu) > 1e-9:
+                    continue
+                cols = data.get("column_order") or []
+                keep = [i for i, c in enumerate(cols) if col_kept(c)]
+                if want_mat is not None and not any(
+                        isinstance(c, str) and c.strip() not in ("", "-")
+                        for i, c in enumerate(r.get("parts") or []) if i in keep):
+                    continue
+                entry = {"perm": perm, "al_nh": r.get("al_nh")}
+                entry["parts"] = {cols[i]: (r.get("parts") or [None] * len(cols))[i]
+                                  for i in keep}
+                rows.append(entry)
+            if not rows:
+                continue
+            blocks.append(dict(size, rows=rows))
+        if lim is not None:
+            blocks = blocks[:lim]
+        if not blocks:
+            return err("no size/row matches those filters", "NOT_FOUND",
+                       hint="drop material/permeability to see the whole grid",
+                       extra={"sizes_in_table": len(data.get("sizes") or [])})
+        return ok(
+            {"kind": "powder_cores", "count": len(blocks), "sizes": blocks,
+             "column_order": data.get("column_order"),
+             "material_comparison_printed_page_10":
+                 data.get("material_comparison_printed_page_10"),
+             "material_properties_printed_page_16":
+                 data.get("material_properties_printed_page_16"),
+             "part_number_reading": data.get("part_number_reading"),
+             "al_tolerance_pct_c0": data.get("al_tolerance_pct_c0"),
+             "printing_anomalies": data.get("printing_anomalies"),
+             "source": data.get("source"),
+             "table_retrieved": data.get("source", {}).get("retrieved"),
+             "table_caveats": data.get("what_this_is")},
+            "printed toroid sizes",
+            "transcription of the vendor's powder-core catalog, printed p.155-197",
+            "every size block carries the printed page it came from; the geometry is "
+            "printed, the mass estimate is the only computed field and it is absent "
+            "when a printed input is absent",
+            "as printed - the vendor's own typical values at the stated conditions",
+            {"cells": data.get("cells"),
+             "printing": "five vendor printing anomalies are listed in "
+                         "`printing_anomalies` and are kept verbatim, not corrected"},
+            {"table_path": POWDER_PATH})
+
+    rows = _powder_core_rows(data, material=material, permeability=permeability)
+    if name is not None:
+        key = _norm_key(name)
+        rows = [r for r in rows if _norm_key(r.get("part")) == key]
+    if not rows:
+        extra = {"parts_in_table": len(_powder_core_rows(data))}
+        if want_mu is not None:
+            same_mat = _powder_core_rows(data, material=material)
+            extra["permeabilities_printed"] = sorted(
+                {r["permeability"] for r in same_mat})
+        return err("no powder-core part matches those filters", "NOT_FOUND",
+                   hint="magnetic_data(kind='powder_parts') with no filters lists "
+                        "all of them",
+                   extra=extra)
+    total = len(rows)
+    if lim is not None:
+        rows = rows[:lim]
+    return ok(
+        {"kind": "powder_parts", "count": len(rows), "total_matching": total,
+         "rows": rows,
+         "source": data.get("source"),
+         "table_caveats": data.get("what_this_is")},
+        "powder-core parts",
+        "one row per purchasable part number: size geometry joined with the printed "
+        "AL and material column",
+        "geometry and AL printed on p.155-197; density and the permeability factor "
+        "printed on p.16; the mass is Ve x density x factor and is an estimate",
+        "as printed; only the mass is computed, and it is withheld when a printed "
+        "input is missing",
+        {"mass": "an estimate, not the vendor's nominal part weight",
+         "gap": "distributed - there is no discrete gap and AL cannot be trimmed",
+         "mlt": "not printed, so no copper estimate is made from this table"},
+        {"table_path": POWDER_PATH})
+
 def magnetic_data(kind="materials", name=None, material=None, shape=None,
-                  vendor=None, data_path=None):
+                  vendor=None, data_path=None, permeability=None, limit=None,
+                  powder_data_path=None):
     """Read back the vendor table: materials, cores, or both.
 
     Nothing here is computed - it is the transcription, with the source URL, so a
@@ -1677,6 +1983,12 @@ def magnetic_data(kind="materials", name=None, material=None, shape=None,
         return err(why, "DATA_UNAVAILABLE",
                    hint="fill data/magnetic_materials.json with verified rows")
     k = str(kind or "materials").strip().lower()
+    if k in ("powder_cores", "powder_core", "powder", "toroids", "toroid"):
+        return _magnetic_data_powder(k, material, permeability, limit, name,
+                                     powder_data_path)
+    if k in ("powder_parts", "powder_part"):
+        return _magnetic_data_powder("powder_parts", material, permeability, limit,
+                                     name, powder_data_path)
     if k in ("materials", "material"):
         rows = data.get("materials") or []
     elif k in ("cores", "core"):
@@ -2020,6 +2332,7 @@ def _core_loss_for(core, material, freq_hz, b_ac_t, exponents,
     on alpha, not on the amplitude.
     """
     ref = core.get("loss_ref")
+    lookup = core.get("loss_fit_lookup")
     if freq_hz is None or b_ac_t is None:
         return None, ("core loss needs the AC excitation: pass freq_hz and b_ac_t "
                       "(the AC flux amplitude, i.e. half the peak-to-peak swing)")
@@ -2039,7 +2352,30 @@ def _core_loss_for(core, material, freq_hz, b_ac_t, exponents,
             note += (" x iGSE shape ratio %g (triangle, duty %g, alpha %g)"
                      % (ratio, d, al))
         return pv * core["ve_mm3"] * 1e-9, note
-    # (2) the part's own measured reference point, scaled only with exponents
+    # (2) a vendor's own printed fit, looked up by the row this part belongs to
+    #     (permeability, shape, product line) - the catalog fits per permeability,
+    #     so the lookup is as narrow as the question and refuses when it cannot be
+    if lookup and core.get("ve_mm3"):
+        row, fit, why = _resolve_loss_fit(material, lookup.get("permeability"),
+                                         lookup.get("shape"), lookup.get("variant"),
+                                         freq_hz)
+        if row is None:
+            return None, ("no vendor loss fit could be resolved for this part: "
+                          + str(why))
+        sub = core_loss_steinmetz(freq_hz, b_ac_t, row["a"], row["c"], row["b"],
+                                  units="khz_t", ve_mm3=core["ve_mm3"],
+                                  waveform=waveform,
+                                  duty=(duty if waveform != "sine" else None))
+        if sub.get("status") != "ok":
+            return None, ("the vendor fit for %s could not be evaluated: %s"
+                          % (_loss_row_label(row), sub.get("message")))
+        pv = sub["value"]
+        note = ("vendor printed fit %s (a=%g, b=%g, c=%g; mW/cm3, T, kHz) x Ve"
+                % (_loss_row_label(row), row["a"], row["b"], row["c"]))
+        if waveform != "sine":
+            note += " x iGSE shape ratio %g" % pv.get("ratio_to_sine", 1.0)
+        return float(pv["core_loss_w"]), note
+    # (3) the part's own measured reference point, scaled only with exponents
     #     the caller supplied - the exponents are NOT invented here
     if not ref:
         return None, ("this part has no measured loss point in the table and its "
@@ -2082,7 +2418,8 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                 bsat_derate=BSAT_DERATE_TYPICAL, loss_exponents=None,
                 current_density_a_mm2=None, fill_factor=None, limit=None,
                 require_window_fit=False, data_path=None,
-                flux_waveform="sine", duty=None):
+                flux_waveform="sine", duty=None, include_powder_cores=False,
+                permeability=None, powder_data_path=None):
     """Choose a real core for an (L, Ipk) requirement, or say why none fits.
 
     The two constraints that decide the turns:
@@ -2104,6 +2441,18 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
     Steinmetz number is only right for the latter. The iGSE shape ratio is applied
     to `core_loss_w` alone - the turns, the flux limit and the gap do not care
     about the shape.
+
+    `include_powder_cores` (default False) adds the powder-core toroids from
+    data/powder_cores.json to the candidate pool, and `permeability` narrows them
+    to one printed permeability - a powder part's AL depends on a permeability the
+    part number does not spell out, so the material alone does not name a part.
+    Off by default: the pool, the ordering and every number for the solid cores are
+    then exactly what they were before this option existed.
+
+    Two things change for a powder part and neither is a guess: its Bsat comes from
+    the catalog's comparison page (one printed value per column, no temperature
+    against it), and it has no gap to compute because the gap is distributed
+    through the volume - AL can only be changed by choosing another permeability.
 
     What is refused rather than guessed: saturation at a temperature the material
     does not publish; a gap length when the material's mu_i is unknown; core loss
@@ -2184,7 +2533,28 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                        "period spent rising", "ARG_RANGE")
 
     mats = {m.get("name"): m for m in (data.get("materials") or [])}
-    cores = data.get("cores") or []
+    cores = list(data.get("cores") or [])
+    solids = len(cores)
+    powder_info = None
+    powder_mu = _f("permeability", permeability) if permeability is not None else None
+    if include_powder_cores:
+        pdata, pwhy = _load_powder_cores(powder_data_path)
+        if pdata is None:
+            return err(pwhy, "DATA_UNAVAILABLE",
+                       hint="data/powder_cores.json ships with the package; drop "
+                            "include_powder_cores if only the solid cores are wanted")
+        try:
+            powder = _powder_core_rows(pdata, material=material)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        cores = cores + powder
+        powder_info = {"parts": None, "solid_cores": solids,
+                       "table": POWDER_PATH,
+                       "retrieved": (pdata.get("source") or {}).get("retrieved")}
+    elif permeability is not None:
+        return err("permeability only applies to powder cores", "ARG_INVALID",
+                   hint="a solid core's AL is fixed by its part number; pass "
+                        "include_powder_cores=True to select a toroid by permeability")
 
     want_mat = _norm_key(material) if material else None
     want_shape = _norm_key(shape) if shape else None
@@ -2205,6 +2575,26 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                    hint="magnetic_data(kind='cores') lists the parts that are in it",
                    extra={"shapes_in_table": sorted(
                        {c.get("shape") for c in cores if c.get("shape")})})
+    if powder_mu is not None:
+        # the permeability narrows the powder column - it is not a statement that
+        # the material is absent, so it is applied after the two checks above
+        printed_mu = sorted({c.get("permeability") for c in cores
+                             if c.get("permeability") is not None})
+        cores = [c for c in cores if c.get("permeability") == powder_mu]
+        if not cores:
+            return err("no powder core is printed with permeability %g" % powder_mu,
+                       "NOT_FOUND",
+                       hint="the catalog prints one column per permeability; ask for "
+                            "one of the permeabilities this material prints, or drop "
+                            "permeability to see them all",
+                       extra={"permeabilities_printed": printed_mu,
+                              "material": material})
+    if powder_info is not None:
+        # the pool is counted after the narrow, so "parts" is the number of powder
+        # parts this call actually considered, not the whole table
+        powder_info["parts"] = sum(1 for c in cores if c.get("gap_is_distributed"))
+        if powder_mu is not None:
+            powder_info["permeability_filter"] = powder_mu
 
     considered, rejected = [], []
     for core in cores:
@@ -2227,6 +2617,11 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                "ve_mm3": core.get("ve_mm3"), "al_nh": core.get("al_nh"),
                "gap_um": core.get("gap_um"), "mass_g": core.get("mass_g"),
                "missing": []}
+        if core.get("permeability") is not None:
+            row["permeability"] = core.get("permeability")
+            row["al_tolerance_pct"] = core.get("al_tolerance_pct")
+        if core.get("material_variant"):
+            row["material_variant"] = core["material_variant"]
 
         ae_m2 = float(core["ae_mm2"]) * 1e-6
 
@@ -2240,6 +2635,15 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         # --- the flux limit for THIS part
         if b_lim is not None:
             limit_t, limit_note = b_lim, b_lim_basis
+        elif core.get("bsat_typical_t") is not None:
+            limit_t = float(core["bsat_typical_t"]) * derate
+            limit_note = ("%g%% of the %g T the catalog prints for the %s column "
+                          "(printed p.10); that page prints no temperature against it"
+                          % (derate * 100.0, float(core["bsat_typical_t"]),
+                             core.get("material_column")))
+            row["b_limit_temperature"] = ("not printed by the vendor - one typical "
+                                          "value per column, not a 25 C or a 100 C "
+                                          "number")
         else:
             bsat_mt, sat_note = _bsat_at(mat, temp)
             if bsat_mt is None:
@@ -2294,6 +2698,14 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                 row["saturation"] = "ok"
                 row["saturation_note"] = ("peak %g mT of the published %g mT at %g C"
                                           % (b_peak * 1e3, bsat_mt, temp))
+        elif core.get("bsat_typical_t") is not None:
+            b_sat = float(core["bsat_typical_t"])
+            row["bsat_t"] = _fmt(b_sat)
+            row["saturation"] = "over" if b_peak > b_sat else "ok"
+            row["saturation_note"] = ("peak %g mT of the %g mT the catalog prints for "
+                                      "the %s column (no temperature printed for it)"
+                                      % (b_peak * 1e3, b_sat * 1e3,
+                                         core.get("material_column")))
         elif b_lim is not None:
             row["saturation"] = "ok" if b_peak <= b_lim else "over"
             row["saturation_note"] = "judged against the caller's b_max_t only"
@@ -2313,7 +2725,11 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                                  or "AL is null in the table")
         mu_i = (mat or {}).get("mu_i")
         if row["gap_required"]:
-            if mu_i:
+            if core.get("gap_is_distributed"):
+                row["gap_mm"] = None
+                row["gap_because"] = core.get("gap_note") or (
+                    "a powder core's gap is distributed, so there is nothing to cut")
+            elif mu_i:
                 # standard gap estimate, no fringing correction: the gap's
                 # reluctance and the core's are in series
                 g = MU0 * ae_m2 * n ** 2 / L - (float(core["le_mm"]) * 1e-3
@@ -2380,7 +2796,8 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                                            "magnetics_winding_ac)" % temp)
             else:
                 rectx["p_copper_w"] = None
-                rectx["missing_wire"] = ("no mean turn length for this core in the "
+                rectx["missing_wire"] = (core.get("mlt_note") or
+                                         "no mean turn length for this core in the "
                                          "table, so the turn length is unknown")
                 row["missing"].append("p_copper_w")
             if fill_factor is not None and core.get("aw_mm2"):
@@ -2393,9 +2810,14 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                 rectx["window_area_mm2"] = core["aw_mm2"]
                 rectx["window_area_needed_mm2"] = _fmt(needed)
                 rectx["window_fits"] = bool(needed <= core["aw_mm2"])
-                rectx["window_basis"] = ("former winding area with fill factor %g; "
-                                         "the former geometry is the vendor's, the "
-                                         "fill factor is yours" % ku)
+                rectx["window_basis"] = (
+                    ("the toroid's window is its printed inside-bore area, with fill "
+                     "factor %g - a toroid is wound through the bore, so this is the "
+                     "area the wire has to pass, and the vendor's geometry, the fill "
+                     "factor is yours" % ku) if core.get("gap_is_distributed") else
+                    ("former winding area with fill factor %g; "
+                     "the former geometry is the vendor's, the "
+                     "fill factor is yours" % ku))
             else:
                 rectx["window_fits"] = None
                 rectx["window_because"] = (
@@ -2464,6 +2886,31 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
             "so a loss away from a measured point needs loss_exponents from you",
         ],
     }
+    if powder_info:
+        out["not_modelled"].extend([
+            "a powder core's DC-bias roll-off: a powder core's AL falls with DC "
+            "premagnetisation too, and the printed AL is the unbiased value - only the "
+            "Bsat point is judged, exactly as for the solid cores",
+            "copper loss for a toroid: the catalog prints no mean turn length, so this "
+            "build does not estimate one",
+            "fringing at a gap: a powder core has no discrete gap, so magnetics_fringing_loss "
+            "does not apply to these parts",
+        ])
+        out["not_modelled"].append(
+            "the mass column: Ve x density x permeability factor is an estimate, not the "
+            "vendor's nominal part weight")
+    if powder_info:
+        out["core_pool"] = powder_info
+        out["core_pool"]["note"] = ("powder parts carry a printed Bsat for their column "
+                                    "and no discrete gap; their loss comes from the "
+                                    "vendor's per-permeability toroid fit")
+    if not feasible and powder_info and any(
+            r.get("reason") == "saturation_unknown" for r in rejected):
+        out["powder_cores_unjudged"] = (
+            "no powder part could be judged on saturation: the catalog prints one "
+            "typical Bsat per column with no temperature, and this build only uses it "
+            "when the part carries `bsat_typical_t` - pass b_max_t to judge against a "
+            "limit of your own instead")
     if wf != "sine":
         out["flux_waveform"] = {
             "waveform": wf, "duty": _fmt(duty_v),

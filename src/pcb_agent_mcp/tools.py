@@ -3781,8 +3781,16 @@ def _capabilities(_args):
             "and magnetics_material_core_loss evaluates them. No material-level "
             "Steinmetz triple (k/alpha/beta) is stored, and the nine ferrite materials "
             "have no vendor fit here at all: their loss away from a measured point "
-            "still needs exponents from you. No powder CORE GEOMETRY is in the table "
-            "(the 16 cores are all ferrite), so select_core cannot yet pick a toroid. "
+            "still needs exponents from you. The powder CORE GEOMETRY arrived in "
+            "0.0.76: data/powder_cores.json holds the catalog's 43 toroid sizes x 14 "
+            "permeabilities x nine material columns (1923 purchasable part numbers, "
+            "printed p.155-197) and select_core picks them when "
+            "include_powder_cores=true (default false). What that table still does "
+            "NOT carry: a mean turn length (so no toroid copper estimate), a discrete "
+            "gap (a powder core has none - AL is the distributed-gap value), the "
+            "nominal part weight (only Ve x density x factor, an estimate), and a "
+            "Bsat per temperature (the catalog prints one value per column with no "
+            "temperature against it). "
             "No saturation CURVE of a real "
             "material: only a single Bsat per published temperature, never "
             "interpolated between them. Gapped-core fringing loss IS computed since "
@@ -7768,7 +7776,16 @@ _tool(
     "of AL, gap fringing, winding AC resistance, AL tolerance. flux_waveform="
     "'triangle' (+ duty) judges core_loss_w on the flux shape an inductor actually "
     "carries rather than on the sine the vendor point was measured with; it needs "
-    "loss_exponents, whose x plays alpha in the iGSE shape ratio.",
+    "loss_exponents, whose x plays alpha in the iGSE shape ratio. "
+    "include_powder_cores=true adds the powder-core toroids (43 sizes, 1923 part "
+    "numbers, printed p.155-197) to the pool; permeability narrows them, because a "
+    "toroid's AL depends on a permeability its part number does not spell out. Two "
+    "things are different for a powder part and neither is guessed: its Bsat is the "
+    "single value the catalog prints for its column (no temperature against it), and "
+    "it has no gap to compute - the gap is distributed, so AL can only be changed by "
+    "choosing another permeability. Its core loss comes from the vendor's own "
+    "per-permeability toroid fit. No mean turn length is printed for a toroid, so no "
+    "copper estimate is made for one.",
     {"type": "object", "properties": {
         "inductance_h": _num("the inductance you need, in HENRY (100 uH = 1e-4)"),
         "i_peak_a": _num("peak winding current, which sets the flux"),
@@ -7800,7 +7817,16 @@ _tool(
                               "inductor's ripple is)", ["sine", "triangle"], "sine"),
         "duty": _num("triangle only: fraction of the period spent rising (0.5 = "
                      "symmetric)"),
+        "include_powder_cores": _bool("also consider the powder-core toroids in "
+                                     "data/powder_cores.json (default false: the "
+                                     "pool and every number for the solid cores are "
+                                     "then unchanged)"),
+        "permeability": _num("powder cores only: one printed permeability in u - a "
+                             "toroid's AL depends on a permeability its part number "
+                             "does not spell out, so the material alone does not name "
+                             "a part"),
         "data_path": _str("override the table path (testing)"),
+        "powder_data_path": _str("override the powder-core table path (testing)"),
     }, "required": ["inductance_h", "i_peak_a"]},
     lambda a: _magnetics.select_core(
         a.get("inductance_h"), a.get("i_peak_a"),
@@ -7820,7 +7846,10 @@ _tool(
         require_window_fit=a.get("require_window_fit"),
         flux_waveform=(a.get("flux_waveform") or "sine"),
         duty=a.get("duty"),
-        data_path=a.get("data_path")),
+        data_path=a.get("data_path"),
+        include_powder_cores=bool(a.get("include_powder_cores")),
+        permeability=a.get("permeability"),
+        powder_data_path=a.get("powder_data_path")),
 )
 
 _tool(
@@ -7834,14 +7863,27 @@ _tool(
     "why. No material-level Steinmetz triple (k/alpha/beta) is stored: what the three "
     "powder vendors print instead - a fit per permeability and per core shape - is in "
     "`loss_fit` on those materials, with its catalog page, and "
-    "magnetics_material_core_loss evaluates it.",
+    "magnetics_material_core_loss evaluates it. The POWDER TOROIDS are a second table "
+    "with a second shape: kind='powder_cores' returns the vendor's printed pages as "
+    "printed (43 sizes x permeability rows x nine material columns, printed p.155-197) "
+    "and kind='powder_parts' returns the same grid flattened to one row per "
+    "purchasable part number (1923 of them), each with its geometry, printed AL, "
+    "permeability, AL tolerance band and a mass ESTIMATE (Ve x printed density x "
+    "printed permeability factor; withheld for 200/300/550 u, which the vendor prints "
+    "no factor for). Five vendor printing anomalies are carried in "
+    "`printing_anomalies` verbatim rather than corrected, including one part number "
+    "printed against two different sizes.",
     {"type": "object", "properties": {
-        "kind": _str("which table", ["materials", "cores", "all"], "materials"),
+        "kind": _str("which table", ["materials", "cores", "all", "powder_cores",
+                                      "powder_parts"], "materials"),
         "name": _str("exact material name or part number"),
         "material": _str("only cores of this material"),
         "shape": _str("only shapes containing this text"),
         "vendor": _str("only rows whose vendor contains this text"),
+        "permeability": _num("powder tables only: one printed permeability in u"),
+        "limit": _num("powder tables only: cap the number of rows returned"),
         "data_path": _str("override the table path (testing)"),
+        "powder_data_path": _str("override the powder-core table path (testing)"),
     }, "required": []},
     lambda a: _magnetics.magnetic_data(
         kind=(a.get("kind") or "materials"),
@@ -7849,7 +7891,10 @@ _tool(
         material=a.get("material"),
         shape=a.get("shape"),
         vendor=a.get("vendor"),
-        data_path=a.get("data_path")),
+        data_path=a.get("data_path"),
+        permeability=a.get("permeability"),
+        limit=a.get("limit"),
+        powder_data_path=a.get("powder_data_path")),
 )
 
 _tool(

@@ -4998,6 +4998,67 @@ def selftest():
                            ["description"].lower()),
           "%d tools" % len(_tools.TOOLS))
 
+    # ---- 0.0.76: the powder-core toroid geometry ---------------------------
+    _pw = _call("magnetics_data", {"kind": "powder_cores"}, 1881).get("value") or {}
+    _pw_sizes = _pw.get("sizes") or []
+    _pw_rows = sum(len(b.get("rows") or []) for b in _pw_sizes)
+    _pw_parts = (_call("magnetics_data", {"kind": "powder_parts", "limit": 1},
+                       1882).get("value") or {})
+    check("the powder table is the printed grid and nothing else: 43 toroid sizes, "
+          "500 permeability rows over nine material columns, 1923 purchasable part "
+          "numbers, five vendor printing anomalies kept verbatim - all readable "
+          "through magnetics_data",
+          _pw.get("count") == 43 and _pw_rows == 500
+          and _pw_parts.get("total_matching") == 1923
+          and len(_pw.get("printing_anomalies") or []) == 5,
+          "%s sizes, %d rows, %s parts, %d anomalies"
+          % (_pw.get("count"), _pw_rows, _pw_parts.get("total_matching"),
+             len(_pw.get("printing_anomalies") or [])))
+
+    _pbad = []
+    for _b in _pw_sizes:
+        _g = _b.get("geometry") or {}
+        if _g.get("ae_mm2") and _g.get("le_mm") and _g.get("ve_mm3"):
+            _r = _g["ve_mm3"] / (_g["ae_mm2"] * _g["le_mm"])
+            if abs(_r - 1.0) > 0.02:
+                _pbad.append((_b.get("printed_page"), round(_r, 4)))
+    check("the printed geometry checks itself: Ve = Ae x Le on 42 of the 43 sizes, "
+          "and the single page that disagrees is printed page 193, where the vendor's "
+          "own 81,500 mm3 is 6.5 % off its own 492 x 177.2 - kept as printed, and "
+          "named in printing_anomalies rather than smoothed",
+          _pbad == [(193, 0.9348)], str(_pbad))
+
+    _pdef = _call("magnetics_select_core", {"inductance_h": 100e-6,
+                                           "i_peak_a": 5.0, "limit": 1}, 1883)
+    _psel = _call("magnetics_select_core",
+                  {"inductance_h": 100e-6, "i_peak_a": 5.0,
+                   "include_powder_cores": True, "material": "MPP",
+                   "permeability": 60, "freq_hz": 100e3, "b_ac_t": 0.05,
+                   "limit": 1}, 1884)
+    _pdef_v = _pdef.get("value") or {}
+    _psel_v = _psel.get("value") or {}
+    _psel_c = ((_psel_v.get("candidates") or [{}])[0])
+    check("select_core can now pick a toroid, and the default path is untouched: "
+          "without include_powder_cores the pool is still the 16 solid cores with no "
+          "core_pool key; with it, 100 uH / 5 A on MPP 60u answers 0055141A2 at 601 "
+          "turns, 0.64 T of the 0.8 T printed for that column, no gap length (the gap "
+          "is distributed) and 1.1 mW of the vendor's own toroid fit at 100 kHz",
+          _pdef_v.get("table_rows") == 16
+          and _pdef_v.get("feasible_count") == 9
+          and "core_pool" not in _pdef_v
+          and _psel_v.get("core_pool", {}).get("parts") == 41
+          and _psel_c.get("part") == "0055141A2"
+          and _psel_c.get("turns") == 601
+          and _psel_c.get("b_limit_t") == 0.64
+          and _psel_c.get("saturation") == "ok"
+          and _psel_c.get("gap_mm") is None
+          and abs((_psel_c.get("core_loss_w") or 0.0) - 0.0011) < 1e-9
+          and "vendor printed fit" in (_psel_c.get("core_loss_basis") or ""),
+          "default rows %s / feasible %s; powder %s turns %s B %s loss %s"
+          % (_pdef_v.get("table_rows"), _pdef_v.get("feasible_count"),
+             _psel_c.get("part"), _psel_c.get("turns"),
+             _psel_c.get("b_limit_t"), _psel_c.get("core_loss_w")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
