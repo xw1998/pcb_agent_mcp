@@ -382,7 +382,9 @@ class TestTools(unittest.TestCase):
         # count, and silently growing the surface is how a tool list rots.
         # 0.0.72 does add one (magnetics_fringing_loss): 173 -> 174
         # 0.0.74 adds one more (magnetics_material_core_loss): 174 -> 175
-        self.assertEqual(len(tools.TOOLS), 177)
+        # 178 = 177 + magnetics_powder_curve in 0.0.80 (the vendor's printed B(H)
+        # and mu-vs-T curves are a different object from a single Bsat number)
+        self.assertEqual(len(tools.TOOLS), 178)
 
 
 if __name__ == "__main__":

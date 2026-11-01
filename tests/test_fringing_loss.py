@@ -394,7 +394,9 @@ class TestRegistration(unittest.TestCase):
 
     def test_tool_count(self):
         # 175 = 174 + magnetics_material_core_loss in 0.0.74
-        self.assertEqual(len(tools.TOOLS), 177)
+        # 178 = 177 + magnetics_powder_curve in 0.0.80 (the vendor's printed B(H)
+        # and mu-vs-T curves are a different object from a single Bsat number)
+        self.assertEqual(len(tools.TOOLS), 178)
 
     def test_the_capability_list_knows_it(self):
         h = tools.TOOLS["calc_capabilities"]["handler"]

@@ -392,13 +392,15 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
     def test_the_capabilities_list_it_and_stop_calling_mlt_missing(self):
         caps = tools._capabilities({})
         self.assertIn("magnetics_toroid_mlt", caps["available"])
-        self.assertEqual(len(caps["available"]), 171)
+        self.assertEqual(len(caps["available"]), 172)
         joined = json.dumps(caps)
         self.assertIn("toroid_mlt", joined)
         self.assertNotIn("(so no toroid copper estimate)", joined)
 
     def test_the_tool_count_is_one_higher_than_0_0_78(self):
-        self.assertEqual(len(tools.TOOLS), 177)
+        # 178 = 177 + magnetics_powder_curve in 0.0.80 (the vendor's printed B(H)
+        # and mu-vs-T curves are a different object from a single Bsat number)
+        self.assertEqual(len(tools.TOOLS), 178)
 
 if __name__ == "__main__":
     unittest.main()

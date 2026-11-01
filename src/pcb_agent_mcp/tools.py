@@ -54,6 +54,10 @@ from .adapters import detect_format as _detect_format
 from .adapters import open_board as _open_board
 
 
+def _curve_table_path():
+    """Where the printed-curve transcription lives (the self-test reads it back)."""
+    return _magnetics.CURVE_PATH
+
 def _arr(desc):
     return {"type": "array", "items": {"type": "string"}, "description": desc}
 
@@ -3691,7 +3695,7 @@ def _capabilities(_args):
             "magnetics_inductor", "magnetics_dcm", "magnetics_core_loss",
             "magnetics_material_core_loss",
             "magnetics_winding_ac", "magnetics_fringing_loss",
-            "magnetics_toroid_mlt",
+            "magnetics_toroid_mlt", "magnetics_powder_curve",
             "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
@@ -3816,9 +3820,20 @@ def _capabilities(_args):
             "data/toroid_mlt_reference.json) and reports an INTERVAL - plus "
             "R_dc, copper loss and the single-layer turn count the bore allows. It "
             "is an estimate and says so; nothing here is a printed length. "
-            "No saturation CURVE of a real "
-            "material: only a single Bsat per published temperature, never "
-            "interpolated between them. Gapped-core fringing loss IS computed since "
+            "The CURVE arrived in 0.0.80: data/powder_curve_fits.json carries the "
+            "catalog's printed magnetisation fit (B = [(a + bH + cH^2)/(1 + dH + "
+            "eH^2)]^x, 125 rows, printed pp.128-132) and its printed mu-vs-T fit "
+            "(a quartic against 25 C, 54 rows, printed pp.138-139), and "
+            "magnetics_powder_curve evaluates both. What that does NOT give: a Bsat "
+            "per temperature still (the temperature pages carry mu, not Bsat, and the "
+            "catalog prints one Bsat per material on p.10), so the Bsat path is still "
+            "one value per published temperature and is never interpolated between "
+            "them; the two fits disagree by up to 54 % on three rows at the ends of "
+            "the permeability scale and both numbers are reported rather than "
+            "reconciled; seven rows turn over inside the printed H band (MPP 550u "
+            "peaks at 23.8 Oe) and are flagged instead of clamped; H = 0 is refused "
+            "because B(0) = a^x is not zero; and the High DC Bias variant blocks carry "
+            "no temperature fit at all. Gapped-core fringing loss IS computed since "
             "0.0.72 (magnetics_fringing_loss: a 2-D magnetic-charge model of the gap, "
             "q from the closed form of the axial integral, an exact slab eddy factor) "
             "and its scope is its own: 2-D along the leg, perfectly permeable pole "
@@ -7964,6 +7979,74 @@ _tool(
         le_mm=a.get("le_mm"),
         bias_data_path=a.get("bias_data_path"),
         include_b=(True if a.get("include_b") is None else bool(a.get("include_b")))),
+)
+
+_tool(
+    "magnetics_powder_curve",
+    "The core's own CURVE, not a single number: the flux the printed magnetisation "
+    "fit gives at a magnetising force, and how far the permeability moves with "
+    "temperature - the two questions a powder core's data sheet answers with a graph "
+    "that a design tool cannot read. Both are transcribed from the vendor's printed "
+    "coefficients and evaluated exactly as printed: B = [(a + bH + cH^2)/(1 + dH + "
+    "eH^2)]^x (B[T], H[Oe], printed pp.128-132, 29 material x shape groups, 125 rows) "
+    "and dmu/mu = a + bT + cT^2 + dT^3 + eT^4 against 25 C (printed pp.138-139, 54 "
+    "rows), in data/powder_curve_fits.json. Per-row, not per-material: the "
+    "coefficients differ between the toroid / E-core / EQ-and-LP / block tables for "
+    "the same material, so a material printed in several shapes without shape_family "
+    "is refused with the list, an unprinted permeability is refused with the list, and "
+    "nothing is interpolated. Three independent checks came out before any of this was "
+    "written down: integrating the DC-bias fit of the same part is an independent route "
+    "to the same flux and agrees with this curve to a median 0.49 % at 100 Oe over the "
+    "61 toroid rows; the temperature fit predicts the catalog's own printed p.15 "
+    "dynamic range to 0.045 percentage points on all nine materials; and the catalog's "
+    "worked example (60u Kool Mu at 95 Oe = 0.441 T) comes out at 0.4413 T here. Where "
+    "the two printed fits disagree by more than 10 % - three rows, all at the ends of "
+    "the permeability scale - BOTH numbers are returned with fits_disagree=true, and "
+    "neither is picked (MPP 550u at 100 Oe: 0.234 T from this curve against 0.513 T "
+    "from the integral, 54 % apart, because its printed c makes the fit peak at 23.8 "
+    "Oe). Seven rows in the table turn over inside the printed H band; the H at which "
+    "each stops rising is carried in the data and a query past it is marked "
+    "past_fit_turnover with the falling branch reported as the falling branch. Refused "
+    "rather than answered: H <= 0 (B(0) = a^x is not zero, so this is not a "
+    "small-signal model - using it as one is a measured 36.9 % median error; ask "
+    "magnetics_dc_bias for the zero-bias answer) and temperature outside -50..200 C (a "
+    "quartic beyond the band the catalog tabulates is an extrapolation with no "
+    "measurement behind it); between 100 and 200 C the point is answered and flagged "
+    "as outside the tabulated band. include_evidence=true also returns the "
+    "cross-check numbers, the five printing anomalies kept as printed, and what the "
+    "catalog does not carry at all.",
+    {"type": "object", "properties": {
+        "material": _str("material as the catalog prints it, incl. the High DC Bias "
+                         "variants ('High DC Bias XFlux', 'High DC Bias Edge')"),
+        "permeability": _num("the row's nominal permeability in u (14, 26, 60, 125 ...). "
+                             "Part of the question: the vendor prints a different fit "
+                             "for each"),
+        "shape_family": _str("the core shape family the fit is printed for (Toroids, "
+                             "'E Cores, U Cores & EER Cores', 'EQ & LP Cores', "
+                             "'Blocks, Round Blocks & Cylinders'). Optional only when "
+                             "the material is printed for exactly one family"),
+        "h_oe": _num("magnetising force in oersteds, if you already have it"),
+        "turns": _num("or the winding: turns (used with dc_current_a and le_mm)"),
+        "dc_current_a": _num("the current the winding carries, in amperes"),
+        "le_mm": _num("the magnetic path length in mm, from the core's own data"),
+        "temperature_c": _num("temperature in degrees Celsius for the mu-vs-T fit "
+                              "(-50..200; the tabulated band is -50..100)"),
+        "include_evidence": _bool("also return the cross-check numbers, the printing "
+                                  "anomalies and what the catalog does not carry"),
+        "curve_data_path": _str("override the curve table path (testing)"),
+        "bias_data_path": _str("override the DC-bias table path (testing)"),
+    }, "required": ["material", "permeability"]},
+    lambda a: _magnetics.magnetics_powder_curve(
+        a.get("material"), a.get("permeability"),
+        h_oe=a.get("h_oe"),
+        temperature_c=a.get("temperature_c"),
+        shape_family=a.get("shape_family"),
+        turns=a.get("turns"),
+        dc_current_a=a.get("dc_current_a"),
+        le_mm=a.get("le_mm"),
+        curve_data_path=a.get("curve_data_path"),
+        bias_data_path=a.get("bias_data_path"),
+        include_evidence=bool(a.get("include_evidence"))),
 )
 
 _tool(

@@ -451,7 +451,9 @@ class TestTheFilledSaturationValues(unittest.TestCase):
     def test_the_tool_count_did_not_move(self):
         # 0.0.76 widens magnetics_data's kind and adds two arguments to
         # magnetics_select_core; it adds no tool, and the pool is opt-in.
-        self.assertEqual(len(tools.TOOLS), 177)
+        # 178 = 177 + magnetics_powder_curve in 0.0.80 (the vendor's printed B(H)
+        # and mu-vs-T curves are a different object from a single Bsat number)
+        self.assertEqual(len(tools.TOOLS), 178)
         props = tools.TOOLS["magnetics_select_core"]["inputSchema"]["properties"]
         self.assertIn("include_powder_cores", props)
         self.assertIn("permeability", props)

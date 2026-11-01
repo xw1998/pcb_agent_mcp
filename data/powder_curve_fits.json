@@ -1,0 +1,2651 @@
+{
+  "schema": "powder-curve-fits",
+  "version": "0.0.80",
+  "what_this_is": "The vendor's own two closed-form fit families for Magnetics powder cores, transcribed coefficient by coefficient: DC magnetization B(H) for 125 printed (material, core shape family, permeability) rows, and the permeability-versus-temperature polynomial for 54 printed (material, permeability) rows, plus the printed T/B/f stability columns as ranges. Every number is read off the PDF text layer and re-read off the rendered page for a sample; nothing here is digitised from a graph, interpolated between permeabilities, or filled in from memory.",
+  "source": {
+    "vendor": "Magnetics (a Spang & Company brand)",
+    "document": "Magnetics Powder Core Catalog",
+    "url": "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf",
+    "file_bytes": 12415449,
+    "pdf_pages": 210,
+    "pdf_pages_used": "130-134 (magnetization coefficients), 140-141 (temperature coefficients), 17 (printed stability table), 12 and 14 (High DC Bias variant coefficients)",
+    "printed_pages_used": "128-132 (magnetization coefficients), 138-139 (temperature coefficients), 15 (stability table), 10 and 12 (High DC Bias variants)",
+    "printed_page_offset": "printed page = pdf page - 2 on every page used here; read off each page's own folio (pdf 131 prints 129, pdf 135 prints 133, pdf 141 prints 139, pdf 18 prints 16)",
+    "retrieved": "2026-11-01",
+    "extraction": "pymupdf text layer. Group names come from the merged first column of each printed table (find_tables), numbers from a word-level pass anchored on the printed header row, so a page whose column order differs cannot shift the coefficients. The printed stability table is rebuilt character by character from glyph origins, because the cell text as extracted comes back with the decimal point detached (.29% reads as 29%/. ). A page that yields a row of the wrong arity aborts the build rather than guessing a column."
+  },
+  "formulas": {
+    "magnetization": {
+      "printed": "B = [ (a + b*H + c*H^2) / (1 + d*H + e*H^2) ]^x",
+      "printed_units": "where B = Tesla (T), H = Oersteds (Oe)",
+      "evaluated_as": "b_t = ((a + b*H + c*H**2) / (1 + d*H + e*H**2)) ** x",
+      "incremental_permeability": "mu_r,differential = (dB/dH) / (mu0 * 79.5771) with H in Oe and B in T; it is computed by a numerical central difference on the printed fit, 2 * 1e-4 * H apart",
+      "h_from_turns": "H[Oe] = 0.4 * pi * N * I[A] / le[cm]  (CGS, the catalog's own relation)"
+    },
+    "temperature": {
+      "printed": "change compared with 25 C:  dmu/mu = a + b*T + c*T^2 + d*T^3 + e*T^4, T in degrees Celsius",
+      "evaluated_as": "mu_change_fraction = a + b*T + c*T**2 + d*T**3 + e*T**4, times 100 for percent",
+      "reference_c": 25,
+      "sign_convention": "the printed coefficient a is negative for every material, so the curve starts by falling below 25 C"
+    }
+  },
+  "units": {
+    "permeability": "dimensionless, the vendor's nominal mu for that row",
+    "a_b_c_d_e_x": "coefficients exactly as printed (CGS scaling folded in)",
+    "h_oe": "Oersteds",
+    "b_t": "Tesla",
+    "temperature_c": "degrees Celsius",
+    "percent_columns": "percent, as printed"
+  },
+  "printed_ranges": {
+    "magnetization_graphs": {
+      "h_oe_axis_labels": [
+        1,
+        2,
+        3,
+        5,
+        7,
+        10,
+        20,
+        30,
+        50,
+        70,
+        100,
+        200,
+        300
+      ],
+      "b_t_axis_labels": [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8
+      ],
+      "note": "read off the axis labels in the text layer of the graph pages (pdf 125-129); the panels are log-spaced in H, some stop at 100 Oe and some at 300 Oe, and the page prints no numeric validity range for the fit, so this band is what the curves cover, not a promise from the vendor"
+    },
+    "temperature_graphs": {
+      "t_c_axis_labels": [
+        -60,
+        -40,
+        -20,
+        0,
+        20,
+        40,
+        60,
+        80,
+        100,
+        120,
+        140,
+        160,
+        180,
+        200
+      ],
+      "note": "the axis runs -60 to +200 C; the printed stability column on p.15 quotes the dynamic range over -50 to +100 C, and the running head of that column adds MATERIALS RATED TO 200 C"
+    }
+  },
+  "printing_anomalies": [
+    {
+      "what": "MPP temperature fit, 147u / 160u / 173u",
+      "detail": "all three rows print exactly a=-2.308E-03 b=8.497E-05 c=2.943E-07 d=0 e=0. Re-read off the rendered page at 200 dpi and identical there too, so this is how the catalog prints it.",
+      "kept_as_printed": true
+    },
+    {
+      "what": "MPP temperature fit, 200u / 300u",
+      "detail": "both rows print a=-2.528E-03 b=9.211E-05 c=3.601E-07 d=0 e=0, again identical on the page",
+      "kept_as_printed": true
+    },
+    {
+      "what": "Edge temperature fit, 90u",
+      "detail": "d=-2.000E-21 and e=1.000E-23. Over -60..200 C the d*T^3 term reaches 1e-14 and e*T^4 1.6e-14, i.e. they are padding digits rather than terms that shape the curve; kept as printed, not zeroed.",
+      "kept_as_printed": true
+    },
+    {
+      "what": "Edge magnetization, toroids 40u through 125u",
+      "detail": "these five rows collapse to a nearly linear form (a 1.000E-03, d 1.000E-03 or 1.011E-03, x 0.833-1.021) while every other row in the table runs a 0.0123-0.1285 and x 1.25-2.20. B(H) stays positive and finite on the printed band, so the numbers are usable, but the row does not share the shape of its neighbours and must not be read as one - the tool reports a measured turnover where one exists.",
+      "kept_as_printed": true
+    },
+    {
+      "what": "MPP magnetization, toroids 550u",
+      "detail": "c=1.118E-10, i.e. the quadratic numerator term is absent, and this is the only row whose fit peaks inside the plotted H band: dB/dH reaches zero at 23.8 Oe and the fit then falls (B(100 Oe) = 0.234 T). Its DC-bias twin of the same part integrates to 0.513 T at the same H, a 54 % difference - the largest disagreement in the table. Both numbers are printed by the vendor; this table reports both and picks neither.",
+      "kept_as_printed": true
+    }
+  ],
+  "cross_check": {
+    "magnetization_against_the_dc_bias_integral": {
+      "method": "data/dc_bias_fit.json carries the printed percent-of-mu_i fit of the same part; B[T] = 1e-4 * integral mu_r,differential dH over 0..H with mu_r,differential = permeability * percent/100. Two independent printed fits, one integrated and one evaluated.",
+      "all_125_rows": {
+        "h25_oe": {
+          "rows": 125,
+          "median_pct": 2.7,
+          "p90_pct": 8.32,
+          "max_pct": 21.51
+        },
+        "h50_oe": {
+          "rows": 125,
+          "median_pct": 0.76,
+          "p90_pct": 3.95,
+          "max_pct": 30.5
+        },
+        "h100_oe": {
+          "rows": 125,
+          "median_pct": 0.48,
+          "p90_pct": 2.21,
+          "max_pct": 54.34
+        },
+        "h200_oe": {
+          "rows": 125,
+          "median_pct": 0.58,
+          "p90_pct": 4.95,
+          "max_pct": 73.86
+        }
+      },
+      "toroids_only_61_rows": {
+        "h25_oe": {
+          "rows": 61,
+          "median_pct": 1.54,
+          "p90_pct": 8.03,
+          "max_pct": 19.23
+        },
+        "h50_oe": {
+          "rows": 61,
+          "median_pct": 0.79,
+          "p90_pct": 3.62,
+          "max_pct": 30.5
+        },
+        "h100_oe": {
+          "rows": 61,
+          "median_pct": 0.49,
+          "p90_pct": 3.01,
+          "max_pct": 54.34
+        },
+        "h200_oe": {
+          "rows": 61,
+          "median_pct": 1.05,
+          "p90_pct": 6.93,
+          "max_pct": 73.86
+        }
+      },
+      "per_material_at_100_oe": {
+        "Kool Mµ": {
+          "rows": 23,
+          "median_pct": 0.29,
+          "max_pct": 16.1
+        },
+        "Kool Mµ MAX": {
+          "rows": 15,
+          "median_pct": 0.24,
+          "max_pct": 1.22
+        },
+        "Kool Mµ Hƒ": {
+          "rows": 9,
+          "median_pct": 0.35,
+          "max_pct": 1.18
+        },
+        "Kool Mµ Ultra": {
+          "rows": 3,
+          "median_pct": 1.45,
+          "max_pct": 5.53
+        },
+        "XFlux": {
+          "rows": 18,
+          "median_pct": 0.66,
+          "max_pct": 2.4
+        },
+        "XFlux Ultra": {
+          "rows": 2,
+          "median_pct": 0.73,
+          "max_pct": 0.73
+        },
+        "High Flux": {
+          "rows": 16,
+          "median_pct": 0.44,
+          "max_pct": 2.21
+        },
+        "Edge": {
+          "rows": 18,
+          "median_pct": 0.36,
+          "max_pct": 2.38
+        },
+        "MPP": {
+          "rows": 15,
+          "median_pct": 1.95,
+          "max_pct": 54.34
+        },
+        "Kool Mµ MAX High Performance": {
+          "rows": 6,
+          "median_pct": 0.48,
+          "max_pct": 1.06
+        }
+      },
+      "rows_disagreeing_by_more_than_10pct_at_100_oe": [
+        {
+          "material": "MPP",
+          "shape_family": "Toroids",
+          "permeability": 550,
+          "b_from_fit_t": 0.2341,
+          "b_from_dc_bias_integral_t": 0.5128,
+          "delta_pct": 54.3
+        },
+        {
+          "material": "Kool Mµ",
+          "shape_family": "EQ & LP Cores",
+          "permeability": 75,
+          "b_from_fit_t": 0.5101,
+          "b_from_dc_bias_integral_t": 0.4394,
+          "delta_pct": 16.1
+        },
+        {
+          "material": "MPP",
+          "shape_family": "Toroids",
+          "permeability": 300,
+          "b_from_fit_t": 0.996,
+          "b_from_dc_bias_integral_t": 0.869,
+          "delta_pct": 14.6
+        }
+      ],
+      "reading": "on the bulk of the table the two printed fits agree to well under a percent at 100 Oe, which is what makes them usable as a mutual check. The disagreement is not uniform: it lives at the two ends of the permeability scale (MPP 550u/300u above, Kool Mu Ultra and Edge low permeability below) where the vendor fits the curve in pieces. The integral, not the chord, is the right way to get B from a percent-mu fit: at 95 Oe on the 60u Kool Mu curve the chord gives 0.285 T and the integral 0.442 T, against a printed 0.441 T."
+    },
+    "temperature_range_against_the_printed_stability_column": {
+      "method": "the printed p.15 table lists, per material, the mu-vs-T dynamic range over -50..+100 C as a single number; the temperature fit predicts both ends of that band, so their difference can be compared with it.",
+      "rows": [
+        {
+          "material": "Kool Mµ",
+          "fit_change_at_minus_50c_pct": -4.378,
+          "fit_change_at_plus_100c_pct": -1.433,
+          "fit_dynamic_range_pct": 2.945,
+          "printed_mu_vs_t_dynamic_range_pct": 2.9,
+          "abs_diff_pp": 0.045
+        },
+        {
+          "material": "High Flux",
+          "fit_change_at_minus_50c_pct": -1.3,
+          "fit_change_at_plus_100c_pct": 1.341,
+          "fit_dynamic_range_pct": 2.641,
+          "printed_mu_vs_t_dynamic_range_pct": 2.6,
+          "abs_diff_pp": 0.041
+        },
+        {
+          "material": "XFlux Ultra",
+          "fit_change_at_minus_50c_pct": 0.074,
+          "fit_change_at_plus_100c_pct": 0.734,
+          "fit_dynamic_range_pct": 0.66,
+          "printed_mu_vs_t_dynamic_range_pct": 0.7,
+          "abs_diff_pp": 0.04
+        },
+        {
+          "material": "Edge",
+          "fit_change_at_minus_50c_pct": -0.565,
+          "fit_change_at_plus_100c_pct": 0.675,
+          "fit_dynamic_range_pct": 1.24,
+          "printed_mu_vs_t_dynamic_range_pct": 1.2,
+          "abs_diff_pp": 0.04
+        },
+        {
+          "material": "MPP",
+          "fit_change_at_minus_50c_pct": -0.411,
+          "fit_change_at_plus_100c_pct": 0.622,
+          "fit_dynamic_range_pct": 1.032,
+          "printed_mu_vs_t_dynamic_range_pct": 1.0,
+          "abs_diff_pp": 0.032
+        },
+        {
+          "material": "Kool Mµ Ultra",
+          "fit_change_at_minus_50c_pct": -2.686,
+          "fit_change_at_plus_100c_pct": -2.262,
+          "fit_dynamic_range_pct": 0.424,
+          "printed_mu_vs_t_dynamic_range_pct": 0.4,
+          "abs_diff_pp": 0.024
+        },
+        {
+          "material": "Kool Mµ Hƒ",
+          "fit_change_at_minus_50c_pct": -3.6,
+          "fit_change_at_plus_100c_pct": -1.119,
+          "fit_dynamic_range_pct": 2.481,
+          "printed_mu_vs_t_dynamic_range_pct": 2.5,
+          "abs_diff_pp": 0.019
+        },
+        {
+          "material": "XFlux",
+          "fit_change_at_minus_50c_pct": -2.165,
+          "fit_change_at_plus_100c_pct": 0.817,
+          "fit_dynamic_range_pct": 2.981,
+          "printed_mu_vs_t_dynamic_range_pct": 3.0,
+          "abs_diff_pp": 0.019
+        },
+        {
+          "material": "Kool Mµ MAX",
+          "fit_change_at_minus_50c_pct": -2.283,
+          "fit_change_at_plus_100c_pct": -0.995,
+          "fit_dynamic_range_pct": 1.288,
+          "printed_mu_vs_t_dynamic_range_pct": 1.3,
+          "abs_diff_pp": 0.012
+        }
+      ],
+      "reading": "nine materials, nine agreements inside 0.05 percentage points (worst 0.045 pp on Kool Mu, i.e. 2.945 % predicted against 2.9 % printed) from two independently printed quantities. This is the reason the temperature coefficients are carried at all."
+    },
+    "printed_worked_example_page_25": {
+      "printed": "H = 95 Oe gives B = 0.441 T; H = 15.8 Oe gives B = 0.092 T (60u Kool Mu)",
+      "this_table": {
+        "b_at_15p8_oe_t": 0.09149,
+        "b_at_95_oe_t": 0.44126
+      },
+      "reading": "0.06 % from the printed 0.441 T at 95 Oe and 0.6 % at 15.8 Oe, so the magnetization family is the curve the catalog itself reads numbers off."
+    },
+    "method_rejected": {
+      "what": "recovering mu_r from the slope of B(H) at H -> 0",
+      "detail": "mu_r = x*a^(x-1)*(b - a*d) / (mu0*79.5771) does not reproduce the printed permeability: median error 36.9 % over the 61 toroid rows. The reason is that B(0) = a^x is not zero (5.3 mT for 60u Kool Mu), so this family is not a small-signal model and must not be used as one. Recorded here so that the rejection is not silently repeated.",
+      "median_error_pct": 36.9
+    },
+    "graphs_not_read_off_pixels": "the curve panels are vector art with the axis labels in the text layer but the curves themselves are paths; no per-curve pixel or path read-out is carried here, so the cross-checks above are fit against fit, not fit against graph."
+  },
+  "not_carried": [
+    "no temperature dependence of Bsat: the catalog prints one saturation flux density per material (p.10) and no curve of it",
+    "no Steinmetz core-loss coefficients for powder cores, and no DC-bias correction of the loss curve",
+    "no per-part nominal weight: p.16 says See individual data sheets",
+    "the mu-vs-B and mu-vs-f columns are printed ranges, not curves",
+    "the two Perm/a/b/c tables that follow the High DC Bias magnetization blocks are a different fit form (a about 443, b 2.015, c 1.31 for High DC Bias XFlux) whose equation is not printed on the page; they are not carried rather than guessed"
+  ],
+  "magnetization": {
+    "groups": [
+      {
+        "material": "Kool Mµ",
+        "shape_family": "Toroids",
+        "printed_page": 128,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": 0.03918,
+            "b": 0.01856,
+            "c": 0.0004812,
+            "d": 0.139,
+            "e": 0.0004478,
+            "x": 1.875
+          },
+          {
+            "permeability": 19,
+            "a": 0.01068,
+            "b": 0.01035,
+            "c": 0.0001366,
+            "d": 0.03981,
+            "e": 0.0001286,
+            "x": 1.775
+          },
+          {
+            "permeability": 26,
+            "a": 0.03763,
+            "b": 0.01712,
+            "c": 0.0005155,
+            "d": 0.0919,
+            "e": 0.0004909,
+            "x": 1.812
+          },
+          {
+            "permeability": 40,
+            "a": 0.03789,
+            "b": 0.01632,
+            "c": 0.0005355,
+            "d": 0.07365,
+            "e": 0.000511,
+            "x": 1.665
+          },
+          {
+            "permeability": 60,
+            "a": 0.03601,
+            "b": 0.01721,
+            "c": 0.0005401,
+            "d": 0.05624,
+            "e": 0.0005156,
+            "x": 1.577
+          },
+          {
+            "permeability": 75,
+            "a": 0.03111,
+            "b": 0.02286,
+            "c": 0.0005343,
+            "d": 0.05568,
+            "e": 0.0004982,
+            "x": 1.614
+          },
+          {
+            "permeability": 90,
+            "a": 0.02965,
+            "b": 0.02538,
+            "c": 0.0005142,
+            "d": 0.05305,
+            "e": 0.0004867,
+            "x": 1.578
+          },
+          {
+            "permeability": 125,
+            "a": 0.0273,
+            "b": 0.02946,
+            "c": 0.0005038,
+            "d": 0.05274,
+            "e": 0.0004639,
+            "x": 1.471
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ MAX",
+        "shape_family": "Toroids",
+        "printed_page": 128,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": 0.03945,
+            "b": 0.01922,
+            "c": 0.0004882,
+            "d": 0.143,
+            "e": 0.0004217,
+            "x": 1.895
+          },
+          {
+            "permeability": 19,
+            "a": 0.03915,
+            "b": 0.01866,
+            "c": 0.0005237,
+            "d": 0.1225,
+            "e": 0.0004368,
+            "x": 1.859
+          },
+          {
+            "permeability": 26,
+            "a": 0.06405,
+            "b": 0.01572,
+            "c": 0.0005541,
+            "d": 0.09685,
+            "e": 0.0004568,
+            "x": 1.813
+          },
+          {
+            "permeability": 40,
+            "a": 0.04927,
+            "b": 0.01443,
+            "c": 0.0005832,
+            "d": 0.07862,
+            "e": 0.0004579,
+            "x": 1.626
+          },
+          {
+            "permeability": 60,
+            "a": 0.03589,
+            "b": 0.01862,
+            "c": 0.0006201,
+            "d": 0.06341,
+            "e": 0.0004897,
+            "x": 1.63
+          },
+          {
+            "permeability": 75,
+            "a": 0.0391,
+            "b": 0.01532,
+            "c": 0.0006442,
+            "d": 0.05467,
+            "e": 0.0005139,
+            "x": 1.437
+          },
+          {
+            "permeability": 90,
+            "a": 0.02126,
+            "b": 0.0139,
+            "c": 0.0002144,
+            "d": 0.02365,
+            "e": 0.0001843,
+            "x": 1.259
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ Hƒ",
+        "shape_family": "Toroids",
+        "printed_page": 128,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.06666,
+            "b": 0.01606,
+            "c": 0.0004749,
+            "d": 0.08148,
+            "e": 0.0004021,
+            "x": 1.905
+          },
+          {
+            "permeability": 40,
+            "a": 0.06976,
+            "b": 0.01484,
+            "c": 0.0005132,
+            "d": 0.06291,
+            "e": 0.0004399,
+            "x": 1.773
+          },
+          {
+            "permeability": 60,
+            "a": 0.0419,
+            "b": 0.0121,
+            "c": 0.0006069,
+            "d": 0.05722,
+            "e": 0.0005174,
+            "x": 1.437
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ Ultra",
+        "shape_family": "Toroids",
+        "printed_page": 128,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.02167,
+            "b": 0.01082,
+            "c": 0.0001351,
+            "d": 0.03187,
+            "e": 0.0001136,
+            "x": 1.77
+          },
+          {
+            "permeability": 40,
+            "a": 0.02664,
+            "b": 0.01,
+            "c": 0.0001505,
+            "d": 0.02735,
+            "e": 0.0001239,
+            "x": 1.504
+          },
+          {
+            "permeability": 60,
+            "a": 0.03785,
+            "b": 0.01424,
+            "c": 0.0006078,
+            "d": 0.06109,
+            "e": 0.0005442,
+            "x": 1.471
+          }
+        ]
+      },
+      {
+        "material": "XFlux",
+        "shape_family": "Toroids",
+        "printed_page": 128,
+        "rows": [
+          {
+            "permeability": 19,
+            "a": 0.03986,
+            "b": 0.02164,
+            "c": 0.0005311,
+            "d": 0.1504,
+            "e": 0.0003344,
+            "x": 1.783
+          },
+          {
+            "permeability": 26,
+            "a": 0.04042,
+            "b": 0.02042,
+            "c": 0.0005962,
+            "d": 0.1164,
+            "e": 0.0003934,
+            "x": 1.872
+          },
+          {
+            "permeability": 40,
+            "a": 0.05119,
+            "b": 0.01602,
+            "c": 0.000664,
+            "d": 0.09034,
+            "e": 0.0004405,
+            "x": 1.679
+          },
+          {
+            "permeability": 60,
+            "a": 0.0388,
+            "b": 0.01648,
+            "c": 0.0006982,
+            "d": 0.06611,
+            "e": 0.0004705,
+            "x": 1.623
+          },
+          {
+            "permeability": 75,
+            "a": 0.04142,
+            "b": 0.01414,
+            "c": 0.0007119,
+            "d": 0.05584,
+            "e": 0.0004648,
+            "x": 1.461
+          },
+          {
+            "permeability": 90,
+            "a": 0.03621,
+            "b": 0.01987,
+            "c": 0.0006675,
+            "d": 0.04921,
+            "e": 0.0004657,
+            "x": 1.542
+          },
+          {
+            "permeability": 125,
+            "a": 0.03814,
+            "b": 0.01729,
+            "c": 0.0006277,
+            "d": 0.03363,
+            "e": 0.0004649,
+            "x": 1.307
+          }
+        ]
+      },
+      {
+        "material": "XFlux Ultra",
+        "shape_family": "Toroids",
+        "printed_page": 128,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.0218,
+            "b": 0.01088,
+            "c": 0.0001584,
+            "d": 0.03677,
+            "e": 0.0001,
+            "x": 1.821
+          },
+          {
+            "permeability": 60,
+            "a": 0.02335,
+            "b": 0.01,
+            "c": 0.0001774,
+            "d": 0.02102,
+            "e": 0.0001072,
+            "x": 1.374
+          }
+        ]
+      },
+      {
+        "material": "High Flux",
+        "shape_family": "Toroids",
+        "printed_page": 129,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": 0.03981,
+            "b": 0.02174,
+            "c": 0.0004745,
+            "d": 0.1733,
+            "e": 0.0003407,
+            "x": 1.749
+          },
+          {
+            "permeability": 26,
+            "a": 0.03969,
+            "b": 0.01964,
+            "c": 0.0005931,
+            "d": 0.1163,
+            "e": 0.0004025,
+            "x": 1.828
+          },
+          {
+            "permeability": 40,
+            "a": 0.04884,
+            "b": 0.01,
+            "c": 0.0002491,
+            "d": 0.03772,
+            "e": 0.0001607,
+            "x": 1.581
+          },
+          {
+            "permeability": 60,
+            "a": 0.03828,
+            "b": 0.018,
+            "c": 0.0007012,
+            "d": 0.07063,
+            "e": 0.0004502,
+            "x": 1.63
+          },
+          {
+            "permeability": 75,
+            "a": 0.0382,
+            "b": 0.01775,
+            "c": 0.0007012,
+            "d": 0.05929,
+            "e": 0.0004352,
+            "x": 1.554
+          },
+          {
+            "permeability": 90,
+            "a": 0.02303,
+            "b": 0.01,
+            "c": 0.0002272,
+            "d": 0.01803,
+            "e": 0.0001283,
+            "x": 1.156
+          },
+          {
+            "permeability": 125,
+            "a": 0.0379,
+            "b": 0.02126,
+            "c": 0.000708,
+            "d": 0.04139,
+            "e": 0.0004223,
+            "x": 1.433
+          },
+          {
+            "permeability": 147,
+            "a": 0.03237,
+            "b": 0.01736,
+            "c": 0.0003192,
+            "d": 0.01586,
+            "e": 0.0002147,
+            "x": 1.217
+          },
+          {
+            "permeability": 160,
+            "a": 0.01171,
+            "b": 0.02166,
+            "c": 2.712e-08,
+            "d": 0.007129,
+            "e": 2.718e-05,
+            "x": 1.206,
+            "turns_over_at_h_oe": 191.0
+          }
+        ]
+      },
+      {
+        "material": "Edge",
+        "shape_family": "Toroids",
+        "printed_page": 129,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": 0.1099,
+            "b": 0.02442,
+            "c": 0.0003465,
+            "d": 0.1154,
+            "e": 0.0002451,
+            "x": 2.18
+          },
+          {
+            "permeability": 19,
+            "a": 0.1285,
+            "b": 0.0169,
+            "c": 0.000245,
+            "d": 0.06471,
+            "e": 0.000169,
+            "x": 2.199
+          },
+          {
+            "permeability": 26,
+            "a": 0.05394,
+            "b": 0.01162,
+            "c": 0.0004921,
+            "d": 0.1108,
+            "e": 0.0002725,
+            "x": 1.533
+          },
+          {
+            "permeability": 40,
+            "a": 0.001,
+            "b": 0.002076,
+            "c": 2.454e-05,
+            "d": 0.002589,
+            "e": 1.299e-05,
+            "x": 0.833
+          },
+          {
+            "permeability": 60,
+            "a": 0.001,
+            "b": 0.004989,
+            "c": 2.155e-05,
+            "d": 0.001,
+            "e": 1.582e-05,
+            "x": 0.949,
+            "turns_over_at_h_oe": 852.6
+          },
+          {
+            "permeability": 75,
+            "a": 0.001,
+            "b": 0.006274,
+            "c": 3.108e-05,
+            "d": 0.001,
+            "e": 2.374e-05,
+            "x": 0.95,
+            "turns_over_at_h_oe": 613.7
+          },
+          {
+            "permeability": 90,
+            "a": 0.001,
+            "b": 0.007519,
+            "c": 4.266e-05,
+            "d": 0.001,
+            "e": 3.254e-05,
+            "x": 0.949,
+            "turns_over_at_h_oe": 496.9
+          },
+          {
+            "permeability": 125,
+            "a": 0.001,
+            "b": 0.01245,
+            "c": 3.626e-05,
+            "d": 0.001011,
+            "e": 3.857e-05,
+            "x": 1.021,
+            "turns_over_at_h_oe": 268.0
+          }
+        ]
+      },
+      {
+        "material": "MPP",
+        "shape_family": "Toroids",
+        "printed_page": 129,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": 0.03918,
+            "b": 0.01824,
+            "c": 0.0004911,
+            "d": 0.1331,
+            "e": 0.0004502,
+            "x": 1.938
+          },
+          {
+            "permeability": 19,
+            "a": 0.02974,
+            "b": 0.01232,
+            "c": 0.000435,
+            "d": 0.09999,
+            "e": 0.0003655,
+            "x": 1.729
+          },
+          {
+            "permeability": 26,
+            "a": 0.0534,
+            "b": 0.01144,
+            "c": 0.0005419,
+            "d": 0.08772,
+            "e": 0.0005,
+            "x": 1.699
+          },
+          {
+            "permeability": 40,
+            "a": 0.02725,
+            "b": 0.01068,
+            "c": 0.0005126,
+            "d": 0.06462,
+            "e": 0.000447,
+            "x": 1.513
+          },
+          {
+            "permeability": 60,
+            "a": 0.03933,
+            "b": 0.01371,
+            "c": 0.0005727,
+            "d": 0.051,
+            "e": 0.0005216,
+            "x": 1.528
+          },
+          {
+            "permeability": 75,
+            "a": 0.02534,
+            "b": 0.01166,
+            "c": 0.0005528,
+            "d": 0.04557,
+            "e": 0.0004991,
+            "x": 1.295
+          },
+          {
+            "permeability": 90,
+            "a": 0.01892,
+            "b": 0.01363,
+            "c": 0.0004776,
+            "d": 0.03614,
+            "e": 0.0004746,
+            "x": 1.261
+          },
+          {
+            "permeability": 125,
+            "a": 0.03423,
+            "b": 0.02092,
+            "c": 0.0005477,
+            "d": 0.03371,
+            "e": 0.0004941,
+            "x": 1.364
+          },
+          {
+            "permeability": 147,
+            "a": 0.02888,
+            "b": 0.02651,
+            "c": 0.000529,
+            "d": 0.03462,
+            "e": 0.0005025,
+            "x": 1.396
+          },
+          {
+            "permeability": 160,
+            "a": 0.02843,
+            "b": 0.02738,
+            "c": 0.0005121,
+            "d": 0.03243,
+            "e": 0.0005052,
+            "x": 1.365
+          },
+          {
+            "permeability": 173,
+            "a": 0.02933,
+            "b": 0.02707,
+            "c": 0.0004917,
+            "d": 0.02795,
+            "e": 0.000513,
+            "x": 1.325
+          },
+          {
+            "permeability": 200,
+            "a": 0.02257,
+            "b": 0.03252,
+            "c": 0.0005097,
+            "d": 0.0317,
+            "e": 0.0005225,
+            "x": 1.316,
+            "turns_over_at_h_oe": 1224.8
+          },
+          {
+            "permeability": 300,
+            "a": 0.00288,
+            "b": 0.05179,
+            "c": 0.0005787,
+            "d": 0.04904,
+            "e": 0.00051,
+            "x": 1.254
+          },
+          {
+            "permeability": 550,
+            "a": 0.001681,
+            "b": 0.07555,
+            "c": 1.118e-10,
+            "d": 0.09743,
+            "e": 0.001754,
+            "x": 1.1,
+            "turns_over_at_h_oe": 23.8
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ",
+        "shape_family": "E Cores, U Cores & EER Cores",
+        "printed_page": 129,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": 0.04618,
+            "b": 0.01617,
+            "c": 0.0004197,
+            "d": 0.1012,
+            "e": 0.0004718,
+            "x": 2.008
+          },
+          {
+            "permeability": 26,
+            "a": 0.02526,
+            "b": 0.008341,
+            "c": 0.0004021,
+            "d": 0.07653,
+            "e": 0.0004101,
+            "x": 1.475
+          },
+          {
+            "permeability": 40,
+            "a": 0.04676,
+            "b": 0.01636,
+            "c": 0.0005664,
+            "d": 0.07309,
+            "e": 0.0005493,
+            "x": 1.706
+          },
+          {
+            "permeability": 60,
+            "a": 0.04286,
+            "b": 0.01787,
+            "c": 0.0006044,
+            "d": 0.06335,
+            "e": 0.0005529,
+            "x": 1.586
+          },
+          {
+            "permeability": 90,
+            "a": 0.03157,
+            "b": 0.02186,
+            "c": 0.0006059,
+            "d": 0.0572,
+            "e": 0.0005696,
+            "x": 1.476
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ MAX",
+        "shape_family": "E Cores, U Cores & EER Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.02744,
+            "b": 0.009252,
+            "c": 0.0004056,
+            "d": 0.08043,
+            "e": 0.0003568,
+            "x": 1.504
+          },
+          {
+            "permeability": 40,
+            "a": 0.05065,
+            "b": 0.01473,
+            "c": 0.0005797,
+            "d": 0.07274,
+            "e": 0.0005247,
+            "x": 1.673
+          },
+          {
+            "permeability": 60,
+            "a": 0.04299,
+            "b": 0.01781,
+            "c": 0.0006154,
+            "d": 0.06433,
+            "e": 0.000532,
+            "x": 1.587
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ MAX High Performance",
+        "shape_family": "E Cores, U Cores & EER Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.07845,
+            "b": 0.01638,
+            "c": 0.0004508,
+            "d": 0.07246,
+            "e": 0.0003994,
+            "x": 2.017
+          },
+          {
+            "permeability": 40,
+            "a": 0.05286,
+            "b": 0.01423,
+            "c": 0.0005887,
+            "d": 0.07398,
+            "e": 0.0005058,
+            "x": 1.662
+          },
+          {
+            "permeability": 60,
+            "a": 0.02921,
+            "b": 0.01271,
+            "c": 0.0005805,
+            "d": 0.06092,
+            "e": 0.0004813,
+            "x": 1.393
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ Hƒ",
+        "shape_family": "E Cores, U Cores & EER Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.06399,
+            "b": 0.01,
+            "c": 0.0005288,
+            "d": 0.0903,
+            "e": 0.0004769,
+            "x": 1.626
+          },
+          {
+            "permeability": 40,
+            "a": 0.02918,
+            "b": 0.01439,
+            "c": 0.0005396,
+            "d": 0.07954,
+            "e": 0.0004542,
+            "x": 1.546
+          },
+          {
+            "permeability": 60,
+            "a": 0.02629,
+            "b": 0.01636,
+            "c": 0.0005534,
+            "d": 0.06624,
+            "e": 0.000484,
+            "x": 1.46
+          }
+        ]
+      },
+      {
+        "material": "XFlux",
+        "shape_family": "E Cores, U Cores & EER Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.07819,
+            "b": 0.02378,
+            "c": 0.0005099,
+            "d": 0.09677,
+            "e": 0.0003679,
+            "x": 2.121
+          },
+          {
+            "permeability": 40,
+            "a": 0.1318,
+            "b": 0.02607,
+            "c": 0.0007203,
+            "d": 0.08601,
+            "e": 0.0005547,
+            "x": 2.245
+          },
+          {
+            "permeability": 60,
+            "a": 0.08348,
+            "b": 0.01437,
+            "c": 0.0004492,
+            "d": 0.04456,
+            "e": 0.0003064,
+            "x": 1.67
+          }
+        ]
+      },
+      {
+        "material": "High Flux",
+        "shape_family": "E Cores, U Cores & EER Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 60,
+            "a": 0.02877,
+            "b": 0.01001,
+            "c": 0.0002726,
+            "d": 0.03018,
+            "e": 0.0001518,
+            "x": 1.387
+          }
+        ]
+      },
+      {
+        "material": "Edge",
+        "shape_family": "E Cores, U Cores & EER Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.08565,
+            "b": 0.007192,
+            "c": 0.0001677,
+            "d": 0.03379,
+            "e": 0.0001131,
+            "x": 1.701
+          },
+          {
+            "permeability": 40,
+            "a": 0.04875,
+            "b": 0.01,
+            "c": 0.0001835,
+            "d": 0.02952,
+            "e": 0.0001062,
+            "x": 1.619
+          },
+          {
+            "permeability": 60,
+            "a": 0.05156,
+            "b": 0.01004,
+            "c": 0.0002823,
+            "d": 0.02987,
+            "e": 0.0001527,
+            "x": 1.458
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ",
+        "shape_family": "EQ & LP Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.0391,
+            "b": 0.01469,
+            "c": 0.0005558,
+            "d": 0.09429,
+            "e": 0.0005063,
+            "x": 1.759
+          },
+          {
+            "permeability": 40,
+            "a": 0.0457,
+            "b": 0.01315,
+            "c": 0.0005518,
+            "d": 0.06907,
+            "e": 0.00052,
+            "x": 1.614
+          },
+          {
+            "permeability": 60,
+            "a": 0.03511,
+            "b": 0.01651,
+            "c": 0.0006165,
+            "d": 0.06543,
+            "e": 0.0005599,
+            "x": 1.511
+          },
+          {
+            "permeability": 75,
+            "a": 0.001082,
+            "b": 0.1074,
+            "c": 0.01171,
+            "d": 0.58,
+            "e": 0.0118,
+            "x": 2.069
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ MAX",
+        "shape_family": "EQ & LP Cores",
+        "printed_page": 130,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.04208,
+            "b": 0.01056,
+            "c": 0.0002018,
+            "d": 0.04144,
+            "e": 0.0001629,
+            "x": 1.755
+          },
+          {
+            "permeability": 40,
+            "a": 0.04356,
+            "b": 0.01,
+            "c": 0.0002157,
+            "d": 0.03214,
+            "e": 0.0001768,
+            "x": 1.566
+          },
+          {
+            "permeability": 60,
+            "a": 0.04168,
+            "b": 0.01225,
+            "c": 0.0002289,
+            "d": 0.02893,
+            "e": 0.0001822,
+            "x": 1.46
+          },
+          {
+            "permeability": 75,
+            "a": 0.0304,
+            "b": 0.01403,
+            "c": 0.0001076,
+            "d": 0.01777,
+            "e": 0.0001196,
+            "x": 1.393
+          }
+        ]
+      },
+      {
+        "material": "XFlux",
+        "shape_family": "EQ & LP Cores",
+        "printed_page": 131,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.1156,
+            "b": 0.01994,
+            "c": 0.0004793,
+            "d": 0.07722,
+            "e": 0.0004017,
+            "x": 2.219
+          },
+          {
+            "permeability": 40,
+            "a": 0.1217,
+            "b": 0.01672,
+            "c": 0.0003032,
+            "d": 0.04289,
+            "e": 0.0002315,
+            "x": 2.103
+          },
+          {
+            "permeability": 60,
+            "a": 0.05197,
+            "b": 0.01119,
+            "c": 0.0006435,
+            "d": 0.06316,
+            "e": 0.0004209,
+            "x": 1.428
+          },
+          {
+            "permeability": 75,
+            "a": 0.02413,
+            "b": 0.01,
+            "c": 0.0001469,
+            "d": 0.01526,
+            "e": 0.0001064,
+            "x": 1.234
+          }
+        ]
+      },
+      {
+        "material": "High Flux",
+        "shape_family": "EQ & LP Cores",
+        "printed_page": 131,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.0385,
+            "b": 0.01704,
+            "c": 0.0005445,
+            "d": 0.1175,
+            "e": 0.0003423,
+            "x": 1.665
+          },
+          {
+            "permeability": 40,
+            "a": 0.1005,
+            "b": 0.01354,
+            "c": 0.0005978,
+            "d": 0.07141,
+            "e": 0.0004303,
+            "x": 1.787
+          },
+          {
+            "permeability": 60,
+            "a": 0.05326,
+            "b": 0.009957,
+            "c": 0.0007338,
+            "d": 0.06889,
+            "e": 0.0004473,
+            "x": 1.418
+          },
+          {
+            "permeability": 75,
+            "a": 0.03836,
+            "b": 0.01,
+            "c": 0.0001444,
+            "d": 0.01296,
+            "e": 0.0001015,
+            "x": 1.308
+          }
+        ]
+      },
+      {
+        "material": "Edge",
+        "shape_family": "EQ & LP Cores",
+        "printed_page": 131,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.02178,
+            "b": 0.01014,
+            "c": 0.0003978,
+            "d": 0.07546,
+            "e": 0.0002646,
+            "x": 1.68
+          },
+          {
+            "permeability": 40,
+            "a": 0.09277,
+            "b": 0.006804,
+            "c": 0.0001519,
+            "d": 0.02061,
+            "e": 0.0001,
+            "x": 1.596
+          },
+          {
+            "permeability": 60,
+            "a": 0.02183,
+            "b": 0.01,
+            "c": 0.0004668,
+            "d": 0.04768,
+            "e": 0.000248,
+            "x": 1.389
+          },
+          {
+            "permeability": 75,
+            "a": 0.06936,
+            "b": 0.01,
+            "c": 0.0001524,
+            "d": 0.01285,
+            "e": 0.0001,
+            "x": 1.425
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 131,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": 0.02366,
+            "b": 0.01,
+            "c": 0.0001154,
+            "d": 0.03725,
+            "e": 0.0001141,
+            "x": 1.991
+          },
+          {
+            "permeability": 26,
+            "a": 0.02348,
+            "b": 0.01,
+            "c": 0.0001235,
+            "d": 0.02982,
+            "e": 0.0001103,
+            "x": 1.712
+          },
+          {
+            "permeability": 33,
+            "a": 0.02469,
+            "b": 0.01,
+            "c": 0.0001242,
+            "d": 0.02695,
+            "e": 0.0001152,
+            "x": 1.588
+          },
+          {
+            "permeability": 40,
+            "a": 0.02518,
+            "b": 0.01,
+            "c": 0.0001247,
+            "d": 0.02457,
+            "e": 0.0001156,
+            "x": 1.493
+          },
+          {
+            "permeability": 60,
+            "a": 0.02524,
+            "b": 0.01131,
+            "c": 0.0001647,
+            "d": 0.02412,
+            "e": 0.0001589,
+            "x": 1.357
+          },
+          {
+            "permeability": 90,
+            "a": 0.01884,
+            "b": 0.01482,
+            "c": 0.000138,
+            "d": 0.02083,
+            "e": 0.0001354,
+            "x": 1.275
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ MAX",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 131,
+        "rows": [
+          {
+            "permeability": 60,
+            "a": 0.01837,
+            "b": 0.0121,
+            "c": 0.0001397,
+            "d": 0.02529,
+            "e": 0.0001091,
+            "x": 1.358
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ MAX High Performance",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 131,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.0572,
+            "b": 0.00719,
+            "c": 0.0001583,
+            "d": 0.03243,
+            "e": 0.000127,
+            "x": 1.61
+          },
+          {
+            "permeability": 40,
+            "a": 0.05132,
+            "b": 0.009086,
+            "c": 0.0001674,
+            "d": 0.02709,
+            "e": 0.0001301,
+            "x": 1.535
+          },
+          {
+            "permeability": 60,
+            "a": 0.01986,
+            "b": 0.01132,
+            "c": 0.0003776,
+            "d": 0.04674,
+            "e": 0.0003001,
+            "x": 1.309
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ Hƒ",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 131,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.01917,
+            "b": 0.01223,
+            "c": 0.0003348,
+            "d": 0.06594,
+            "e": 0.0002682,
+            "x": 1.69
+          },
+          {
+            "permeability": 40,
+            "a": 0.02008,
+            "b": 0.01118,
+            "c": 0.000355,
+            "d": 0.05742,
+            "e": 0.000282,
+            "x": 1.446
+          },
+          {
+            "permeability": 60,
+            "a": 0.01986,
+            "b": 0.01132,
+            "c": 0.0003776,
+            "d": 0.04674,
+            "e": 0.0003001,
+            "x": 1.309
+          }
+        ]
+      },
+      {
+        "material": "XFlux",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 132,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.05899,
+            "b": 0.008234,
+            "c": 0.0001706,
+            "d": 0.03856,
+            "e": 0.0001042,
+            "x": 1.652
+          },
+          {
+            "permeability": 33,
+            "a": 0.01889,
+            "b": 0.01026,
+            "c": 0.0001564,
+            "d": 0.03252,
+            "e": 0.0001001,
+            "x": 1.609
+          },
+          {
+            "permeability": 40,
+            "a": 0.02086,
+            "b": 0.01,
+            "c": 0.0001654,
+            "d": 0.02832,
+            "e": 0.0001061,
+            "x": 1.54
+          },
+          {
+            "permeability": 60,
+            "a": 0.05739,
+            "b": 0.009995,
+            "c": 0.0002054,
+            "d": 0.02272,
+            "e": 0.0001368,
+            "x": 1.452
+          }
+        ]
+      },
+      {
+        "material": "High Flux",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 132,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.02809,
+            "b": 0.01,
+            "c": 0.0002061,
+            "d": 0.04237,
+            "e": 0.0001444,
+            "x": 1.738
+          },
+          {
+            "permeability": 60,
+            "a": 0.02876,
+            "b": 0.01,
+            "c": 0.0002448,
+            "d": 0.02775,
+            "e": 0.0001421,
+            "x": 1.379
+          }
+        ]
+      },
+      {
+        "material": "Edge",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 132,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.02721,
+            "b": 0.01085,
+            "c": 0.0002085,
+            "d": 0.04544,
+            "e": 0.0001296,
+            "x": 1.775
+          },
+          {
+            "permeability": 40,
+            "a": 0.0836,
+            "b": 0.00589,
+            "c": 0.0001776,
+            "d": 0.02468,
+            "e": 0.0001,
+            "x": 1.501
+          },
+          {
+            "permeability": 60,
+            "a": 0.08064,
+            "b": 0.007744,
+            "c": 0.0002735,
+            "d": 0.02674,
+            "e": 0.0001483,
+            "x": 1.429
+          }
+        ]
+      },
+      {
+        "material": "MPP",
+        "shape_family": "Blocks, Round Blocks & Cylinders",
+        "printed_page": 132,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": 0.02042,
+            "b": 0.01052,
+            "c": 0.0001086,
+            "d": 0.02349,
+            "e": 0.0001,
+            "x": 1.924
+          }
+        ]
+      }
+    ],
+    "variants_high_dc_bias": [
+      {
+        "material": "High DC Bias XFlux",
+        "printed_page": 12,
+        "permeability": 26,
+        "a": 0.06175,
+        "b": 0.01035,
+        "c": 0.000192,
+        "d": 0.04322,
+        "e": 0.0001167,
+        "x": 1.778
+      },
+      {
+        "material": "High DC Bias XFlux",
+        "printed_page": 12,
+        "permeability": 40,
+        "a": 0.06362,
+        "b": 0.01,
+        "c": 0.0002079,
+        "d": 0.03212,
+        "e": 0.0001276,
+        "x": 1.648
+      },
+      {
+        "material": "High DC Bias XFlux",
+        "printed_page": 12,
+        "permeability": 60,
+        "a": 0.06481,
+        "b": 0.01,
+        "c": 0.0002277,
+        "d": 0.02431,
+        "e": 0.0001361,
+        "x": 1.496
+      },
+      {
+        "material": "High DC Bias Edge",
+        "printed_page": 14,
+        "permeability": 26,
+        "a": 0.099,
+        "b": 0.46,
+        "c": 0.0061,
+        "d": 0.894,
+        "e": 0.00507,
+        "x": 4.97
+      },
+      {
+        "material": "High DC Bias Edge",
+        "printed_page": 14,
+        "permeability": 60,
+        "a": 0.04907,
+        "b": 0.01,
+        "c": 0.0002703,
+        "d": 0.02943,
+        "e": 0.0001342,
+        "x": 1.457
+      }
+    ]
+  },
+  "temperature": {
+    "groups": [
+      {
+        "material": "Kool Mµ",
+        "printed_page": 138,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": -0.001892,
+            "b": 9.866e-05,
+            "c": -1.966e-06,
+            "d": 5.728e-09,
+            "e": -8.706e-14
+          },
+          {
+            "permeability": 19,
+            "a": -0.002294,
+            "b": 0.0001259,
+            "c": -2.494e-06,
+            "d": 8.121e-09,
+            "e": -3.547e-12
+          },
+          {
+            "permeability": 26,
+            "a": -0.002857,
+            "b": 0.0001641,
+            "c": -3.233e-06,
+            "d": 1.147e-08,
+            "e": -8.391e-12
+          },
+          {
+            "permeability": 40,
+            "a": -0.003982,
+            "b": 0.0002404,
+            "c": -4.711e-06,
+            "d": 1.816e-08,
+            "e": -1.808e-11
+          },
+          {
+            "permeability": 60,
+            "a": -0.00559,
+            "b": 0.0003495,
+            "c": -6.822e-06,
+            "d": 2.772e-08,
+            "e": -3.192e-11
+          },
+          {
+            "permeability": 75,
+            "a": -0.006796,
+            "b": 0.0004313,
+            "c": -8.406e-06,
+            "d": 3.49e-08,
+            "e": -4.23e-11
+          },
+          {
+            "permeability": 90,
+            "a": -0.008002,
+            "b": 0.000513,
+            "c": -9.989e-06,
+            "d": 4.207e-08,
+            "e": -5.268e-11
+          },
+          {
+            "permeability": 125,
+            "a": -0.01082,
+            "b": 0.0007039,
+            "c": -1.368e-05,
+            "d": 5.88e-08,
+            "e": -7.69e-11
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ MAX",
+        "printed_page": 138,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": -0.0005884,
+            "b": 4.384e-05,
+            "c": -8.804e-07,
+            "d": 2.735e-09,
+            "e": -4.762e-13
+          },
+          {
+            "permeability": 19,
+            "a": -0.0007985,
+            "b": 5.95e-05,
+            "c": -1.195e-06,
+            "d": 3.711e-09,
+            "e": -6.463e-13
+          },
+          {
+            "permeability": 26,
+            "a": -0.001093,
+            "b": 8.142e-05,
+            "c": -1.635e-06,
+            "d": 5.079e-09,
+            "e": -8.844e-13
+          },
+          {
+            "permeability": 40,
+            "a": -0.001681,
+            "b": 0.0001253,
+            "c": -2.515e-06,
+            "d": 7.813e-09,
+            "e": -1.361e-12
+          },
+          {
+            "permeability": 60,
+            "a": -0.002522,
+            "b": 0.0001879,
+            "c": -3.773e-06,
+            "d": 1.172e-08,
+            "e": -2.041e-12
+          },
+          {
+            "permeability": 75,
+            "a": -0.0029,
+            "b": 0.00021,
+            "c": -3.85e-06,
+            "d": 1.07e-08,
+            "e": -9e-13
+          },
+          {
+            "permeability": 90,
+            "a": -0.008761,
+            "b": 0.0004292,
+            "c": -9.07e-06,
+            "d": 2.494e-08,
+            "e": 1.343e-11
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ Hƒ",
+        "printed_page": 138,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": -0.002268,
+            "b": 0.0001373,
+            "c": -2.055e-06,
+            "d": 1.755e-09,
+            "e": 1.316e-11
+          },
+          {
+            "permeability": 40,
+            "a": -0.0028,
+            "b": 0.000235,
+            "c": -4e-06,
+            "d": 1.125e-08,
+            "e": -4e-12
+          },
+          {
+            "permeability": 60,
+            "a": -0.005441,
+            "b": 0.0003217,
+            "c": -5.135e-06,
+            "d": 1.32e-08,
+            "e": 2.276e-12
+          }
+        ]
+      },
+      {
+        "material": "Kool Mµ Ultra",
+        "printed_page": 138,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": -0.0003733,
+            "b": 4.004e-05,
+            "c": -2.691e-06,
+            "d": 1.238e-08,
+            "e": -1.168e-11
+          },
+          {
+            "permeability": 40,
+            "a": -0.0001489,
+            "b": 6.337e-05,
+            "c": -3.89e-06,
+            "d": 1.846e-08,
+            "e": -2e-11
+          },
+          {
+            "permeability": 60,
+            "a": -0.0025,
+            "b": 0.0001426,
+            "c": -5.624e-06,
+            "d": 2.418e-08,
+            "e": -2.322e-11
+          }
+        ]
+      },
+      {
+        "material": "XFlux",
+        "printed_page": 138,
+        "rows": [
+          {
+            "permeability": 19,
+            "a": -0.0008147,
+            "b": 4.387e-05,
+            "c": -5.911e-07,
+            "d": 3.367e-09,
+            "e": -6.573e-12
+          },
+          {
+            "permeability": 26,
+            "a": -0.002,
+            "b": 8.887e-05,
+            "c": -6.792e-07,
+            "d": 2.949e-09,
+            "e": -4.823e-12
+          },
+          {
+            "permeability": 40,
+            "a": -0.003723,
+            "b": 0.0001578,
+            "c": -9.501e-07,
+            "d": 3.325e-09,
+            "e": -4.372e-12
+          },
+          {
+            "permeability": 60,
+            "a": -0.005585,
+            "b": 0.0002367,
+            "c": -1.425e-06,
+            "d": 4.988e-09,
+            "e": -6.558e-12
+          },
+          {
+            "permeability": 75,
+            "a": -0.006981,
+            "b": 0.0002959,
+            "c": -1.781e-06,
+            "d": 6.234e-09,
+            "e": -8.198e-12
+          },
+          {
+            "permeability": 90,
+            "a": -0.008377,
+            "b": 0.0003551,
+            "c": -2.138e-06,
+            "d": 7.481e-09,
+            "e": -9.837e-12
+          },
+          {
+            "permeability": 125,
+            "a": -0.01163,
+            "b": 0.0004931,
+            "c": -2.969e-06,
+            "d": 1.039e-08,
+            "e": -1.366e-11
+          }
+        ]
+      },
+      {
+        "material": "XFlux Ultra",
+        "printed_page": 138,
+        "rows": [
+          {
+            "permeability": 26,
+            "a": -0.003,
+            "b": 0.0001,
+            "c": -9e-07,
+            "d": 4e-10,
+            "e": 8e-12
+          },
+          {
+            "permeability": 60,
+            "a": -6e-05,
+            "b": 4e-06,
+            "c": 6e-07,
+            "d": 3e-09,
+            "e": -2e-11
+          }
+        ]
+      },
+      {
+        "material": "High Flux",
+        "printed_page": 139,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": -0.0025,
+            "b": 9.67e-05,
+            "c": 5.56e-08,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 26,
+            "a": -0.0033,
+            "b": 0.000129,
+            "c": 3.8e-08,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 60,
+            "a": -0.0044,
+            "b": 0.000174,
+            "c": 4.09e-08,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 125,
+            "a": -0.006,
+            "b": 0.00024,
+            "c": 3.22e-08,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 147,
+            "a": -0.0079,
+            "b": 0.000314,
+            "c": 7.31e-08,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 160,
+            "a": -0.0092,
+            "b": 0.000367,
+            "c": 1.75e-08,
+            "d": 0.0,
+            "e": 0.0
+          }
+        ]
+      },
+      {
+        "material": "Edge",
+        "printed_page": 139,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": -0.001307,
+            "b": 5.299e-05,
+            "c": 3.969e-08,
+            "d": -4.578e-10,
+            "e": 6.524e-13
+          },
+          {
+            "permeability": 19,
+            "a": -0.001397,
+            "b": 5.614e-05,
+            "c": 5.324e-08,
+            "d": -5.431e-10,
+            "e": 9.025e-13
+          },
+          {
+            "permeability": 26,
+            "a": -0.001532,
+            "b": 6.054e-05,
+            "c": 7.22e-08,
+            "d": -6.624e-10,
+            "e": 1.25e-12
+          },
+          {
+            "permeability": 40,
+            "a": -0.001775,
+            "b": 6.934e-05,
+            "c": 1.101e-07,
+            "d": -9.011e-10,
+            "e": 1.945e-12
+          },
+          {
+            "permeability": 60,
+            "a": -0.002134,
+            "b": 8.192e-05,
+            "c": 1.643e-07,
+            "d": -1.242e-09,
+            "e": 2.938e-12
+          },
+          {
+            "permeability": 75,
+            "a": -0.003,
+            "b": 0.0001,
+            "c": 5e-08,
+            "d": -4e-11,
+            "e": -9e-16
+          },
+          {
+            "permeability": 90,
+            "a": -0.0032,
+            "b": 0.0001,
+            "c": 1e-07,
+            "d": -2e-21,
+            "e": 1e-23
+          },
+          {
+            "permeability": 125,
+            "a": -0.0032,
+            "b": 0.00013,
+            "c": 5e-08,
+            "d": -4e-11,
+            "e": -9e-16
+          }
+        ]
+      },
+      {
+        "material": "MPP",
+        "printed_page": 139,
+        "rows": [
+          {
+            "permeability": 14,
+            "a": -0.0013,
+            "b": 4.75e-05,
+            "c": 1.3e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 26,
+            "a": -0.001431,
+            "b": 5.265e-05,
+            "c": 1.837e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 60,
+            "a": -0.001604,
+            "b": 5.945e-05,
+            "c": 1.875e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 125,
+            "a": -0.001939,
+            "b": 7.013e-05,
+            "c": 2.967e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 147,
+            "a": -0.002308,
+            "b": 8.497e-05,
+            "c": 2.943e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 160,
+            "a": -0.002308,
+            "b": 8.497e-05,
+            "c": 2.943e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 173,
+            "a": -0.002308,
+            "b": 8.497e-05,
+            "c": 2.943e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 200,
+            "a": -0.002528,
+            "b": 9.211e-05,
+            "c": 3.601e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 300,
+            "a": -0.002528,
+            "b": 9.211e-05,
+            "c": 3.601e-07,
+            "d": 0.0,
+            "e": 0.0
+          },
+          {
+            "permeability": 550,
+            "a": -0.01309,
+            "b": 0.0004716,
+            "c": 2.086e-06,
+            "d": 0.0,
+            "e": 0.0
+          }
+        ]
+      }
+    ]
+  },
+  "stability_printed_page_15": {
+    "what_this_is": "the printed PERMEABILITY vs. T, B, & f table: per material and permeability, the mu-vs-T dynamic range over -50..+100 C, the mu-vs-B dynamic range over 0..400 mT, and the frequency the permeability stays flat to. Ranges, not curves.",
+    "printed_page": 15,
+    "rows": [
+      {
+        "family": "Kool Mµ",
+        "permeability": 14,
+        "mu_vs_t_dynamic_range_pct": 0.6,
+        "mu_vs_b_dynamic_range_pct": 0.6,
+        "mu_vs_f_flat_to_mhz": 20.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 1.2,
+        "mu_vs_b_dynamic_range_pct": 1.1,
+        "mu_vs_f_flat_to_mhz": 13.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ",
+        "permeability": 40,
+        "mu_vs_t_dynamic_range_pct": 1.9,
+        "mu_vs_b_dynamic_range_pct": 1.7,
+        "mu_vs_f_flat_to_mhz": 9.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 2.9,
+        "mu_vs_b_dynamic_range_pct": 2.5,
+        "mu_vs_f_flat_to_mhz": 5.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ",
+        "permeability": 75,
+        "mu_vs_t_dynamic_range_pct": 3.7,
+        "mu_vs_b_dynamic_range_pct": 3.1,
+        "mu_vs_f_flat_to_mhz": 4.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ",
+        "permeability": 90,
+        "mu_vs_t_dynamic_range_pct": 4.4,
+        "mu_vs_b_dynamic_range_pct": 3.8,
+        "mu_vs_f_flat_to_mhz": 3.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ",
+        "permeability": 125,
+        "mu_vs_t_dynamic_range_pct": 6.2,
+        "mu_vs_b_dynamic_range_pct": 5.2,
+        "mu_vs_f_flat_to_mhz": 2.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ MAX",
+        "permeability": 14,
+        "mu_vs_t_dynamic_range_pct": 0.3,
+        "mu_vs_b_dynamic_range_pct": 0.9,
+        "mu_vs_f_flat_to_mhz": 27.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ MAX",
+        "permeability": 19,
+        "mu_vs_t_dynamic_range_pct": 0.4,
+        "mu_vs_b_dynamic_range_pct": 1.3,
+        "mu_vs_f_flat_to_mhz": 25.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ MAX",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 0.6,
+        "mu_vs_b_dynamic_range_pct": 1.7,
+        "mu_vs_f_flat_to_mhz": 22.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ MAX",
+        "permeability": 40,
+        "mu_vs_t_dynamic_range_pct": 0.9,
+        "mu_vs_b_dynamic_range_pct": 2.7,
+        "mu_vs_f_flat_to_mhz": 18.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ MAX",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 1.3,
+        "mu_vs_b_dynamic_range_pct": 4.0,
+        "mu_vs_f_flat_to_mhz": 13.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ MAX",
+        "permeability": 75,
+        "mu_vs_t_dynamic_range_pct": 1.5,
+        "mu_vs_b_dynamic_range_pct": 5.5,
+        "mu_vs_f_flat_to_mhz": 8.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ Hƒ",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 0.8,
+        "mu_vs_b_dynamic_range_pct": 0.8,
+        "mu_vs_f_flat_to_mhz": 23.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ Hƒ",
+        "permeability": 40,
+        "mu_vs_t_dynamic_range_pct": 2.0,
+        "mu_vs_b_dynamic_range_pct": 1.25,
+        "mu_vs_f_flat_to_mhz": 31.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ Hƒ",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 2.5,
+        "mu_vs_b_dynamic_range_pct": 1.8,
+        "mu_vs_f_flat_to_mhz": 16.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ Ultra",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 0.14,
+        "mu_vs_b_dynamic_range_pct": 5.0,
+        "mu_vs_f_flat_to_mhz": 3.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ Ultra",
+        "permeability": 40,
+        "mu_vs_t_dynamic_range_pct": 0.08,
+        "mu_vs_b_dynamic_range_pct": -2.0,
+        "mu_vs_f_flat_to_mhz": 3.5,
+        "printed_page": 15
+      },
+      {
+        "family": "Kool Mµ Ultra",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 0.4,
+        "mu_vs_b_dynamic_range_pct": 3.0,
+        "mu_vs_f_flat_to_mhz": 3.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux",
+        "permeability": 19,
+        "mu_vs_t_dynamic_range_pct": 0.5,
+        "mu_vs_b_dynamic_range_pct": 7.1,
+        "mu_vs_f_flat_to_mhz": 6.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 1.1,
+        "mu_vs_b_dynamic_range_pct": 10.2,
+        "mu_vs_f_flat_to_mhz": 5.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux",
+        "permeability": 40,
+        "mu_vs_t_dynamic_range_pct": 2.0,
+        "mu_vs_b_dynamic_range_pct": 13.2,
+        "mu_vs_f_flat_to_mhz": 4.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 3.0,
+        "mu_vs_b_dynamic_range_pct": 16.3,
+        "mu_vs_f_flat_to_mhz": 4.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux",
+        "permeability": 75,
+        "mu_vs_t_dynamic_range_pct": 3.7,
+        "mu_vs_b_dynamic_range_pct": 20.3,
+        "mu_vs_f_flat_to_mhz": 2.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux",
+        "permeability": 90,
+        "mu_vs_t_dynamic_range_pct": 4.5,
+        "mu_vs_b_dynamic_range_pct": 24.4,
+        "mu_vs_f_flat_to_mhz": 2.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux",
+        "permeability": 125,
+        "mu_vs_t_dynamic_range_pct": 6.2,
+        "mu_vs_b_dynamic_range_pct": 28.5,
+        "mu_vs_f_flat_to_mhz": 1.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux Ultra",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 1.3,
+        "mu_vs_b_dynamic_range_pct": 1.0,
+        "mu_vs_f_flat_to_mhz": 3.0,
+        "printed_page": 15
+      },
+      {
+        "family": "XFlux Ultra",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 0.7,
+        "mu_vs_b_dynamic_range_pct": 6.0,
+        "mu_vs_f_flat_to_mhz": 2.5,
+        "printed_page": 15
+      },
+      {
+        "family": "Edge",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 0.9,
+        "mu_vs_b_dynamic_range_pct": 0.8,
+        "mu_vs_f_flat_to_mhz": 22.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Edge",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 1.2,
+        "mu_vs_b_dynamic_range_pct": 1.9,
+        "mu_vs_f_flat_to_mhz": 15.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Edge",
+        "permeability": 75,
+        "mu_vs_t_dynamic_range_pct": 1.5,
+        "mu_vs_b_dynamic_range_pct": 0.2,
+        "mu_vs_f_flat_to_mhz": 10.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Edge",
+        "permeability": 90,
+        "mu_vs_t_dynamic_range_pct": 1.6,
+        "mu_vs_b_dynamic_range_pct": 0.3,
+        "mu_vs_f_flat_to_mhz": 5.0,
+        "printed_page": 15
+      },
+      {
+        "family": "Edge",
+        "permeability": 125,
+        "mu_vs_t_dynamic_range_pct": 2.0,
+        "mu_vs_b_dynamic_range_pct": 0.5,
+        "mu_vs_f_flat_to_mhz": 2.0,
+        "printed_page": 15
+      },
+      {
+        "family": "High Flux",
+        "permeability": 14,
+        "mu_vs_t_dynamic_range_pct": 1.5,
+        "mu_vs_b_dynamic_range_pct": 5.0,
+        "mu_vs_f_flat_to_mhz": 3.0,
+        "printed_page": 15
+      },
+      {
+        "family": "High Flux",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 2.0,
+        "mu_vs_b_dynamic_range_pct": 9.0,
+        "mu_vs_f_flat_to_mhz": 1.5,
+        "printed_page": 15
+      },
+      {
+        "family": "High Flux",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 2.6,
+        "mu_vs_b_dynamic_range_pct": 13.5,
+        "mu_vs_f_flat_to_mhz": 1.0,
+        "printed_page": 15
+      },
+      {
+        "family": "High Flux",
+        "permeability": 125,
+        "mu_vs_t_dynamic_range_pct": 3.6,
+        "mu_vs_b_dynamic_range_pct": 19.0,
+        "mu_vs_f_flat_to_mhz": 0.7,
+        "printed_page": 15
+      },
+      {
+        "family": "High Flux",
+        "permeability": 147,
+        "mu_vs_t_dynamic_range_pct": 4.8,
+        "mu_vs_b_dynamic_range_pct": 22.0,
+        "mu_vs_f_flat_to_mhz": 0.5,
+        "printed_page": 15
+      },
+      {
+        "family": "High Flux",
+        "permeability": 160,
+        "mu_vs_t_dynamic_range_pct": 5.5,
+        "mu_vs_b_dynamic_range_pct": 25.0,
+        "mu_vs_f_flat_to_mhz": 0.4,
+        "printed_page": 15
+      },
+      {
+        "family": "MPP",
+        "permeability": 14,
+        "mu_vs_t_dynamic_range_pct": 0.7,
+        "mu_vs_b_dynamic_range_pct": 0.4,
+        "mu_vs_f_flat_to_mhz": 4.0,
+        "printed_page": 15
+      },
+      {
+        "family": "MPP",
+        "permeability": 26,
+        "mu_vs_t_dynamic_range_pct": 0.9,
+        "mu_vs_b_dynamic_range_pct": 0.4,
+        "mu_vs_f_flat_to_mhz": 3.0,
+        "printed_page": 15
+      },
+      {
+        "family": "MPP",
+        "permeability": 60,
+        "mu_vs_t_dynamic_range_pct": 1.0,
+        "mu_vs_b_dynamic_range_pct": 0.8,
+        "mu_vs_f_flat_to_mhz": 2.0,
+        "printed_page": 15
+      },
+      {
+        "family": "MPP",
+        "permeability": 125,
+        "mu_vs_t_dynamic_range_pct": 1.3,
+        "mu_vs_b_dynamic_range_pct": 1.4,
+        "mu_vs_f_flat_to_mhz": 0.3,
+        "printed_page": 15
+      },
+      {
+        "family": "MPP",
+        "permeability": 147,
+        "mu_vs_t_dynamic_range_pct": 1.5,
+        "mu_vs_b_dynamic_range_pct": 1.9,
+        "mu_vs_f_flat_to_mhz": 0.2,
+        "printed_page": 15,
+        "printed_cell_spans": [
+          147,
+          160,
+          173
+        ]
+      },
+      {
+        "family": "MPP",
+        "permeability": 160,
+        "mu_vs_t_dynamic_range_pct": 1.5,
+        "mu_vs_b_dynamic_range_pct": 1.9,
+        "mu_vs_f_flat_to_mhz": 0.2,
+        "printed_page": 15,
+        "printed_cell_spans": [
+          147,
+          160,
+          173
+        ]
+      },
+      {
+        "family": "MPP",
+        "permeability": 173,
+        "mu_vs_t_dynamic_range_pct": 1.5,
+        "mu_vs_b_dynamic_range_pct": 1.9,
+        "mu_vs_f_flat_to_mhz": 0.2,
+        "printed_page": 15,
+        "printed_cell_spans": [
+          147,
+          160,
+          173
+        ]
+      },
+      {
+        "family": "MPP",
+        "permeability": 200,
+        "mu_vs_t_dynamic_range_pct": 1.6,
+        "mu_vs_b_dynamic_range_pct": 2.8,
+        "mu_vs_f_flat_to_mhz": 0.1,
+        "printed_page": 15
+      },
+      {
+        "family": "MPP",
+        "permeability": 300,
+        "mu_vs_t_dynamic_range_pct": 1.6,
+        "mu_vs_b_dynamic_range_pct": 4.5,
+        "mu_vs_f_flat_to_mhz": 0.09,
+        "printed_page": 15
+      },
+      {
+        "family": "MPP",
+        "permeability": 550,
+        "mu_vs_t_dynamic_range_pct": 8.7,
+        "mu_vs_b_dynamic_range_pct": 21.0,
+        "mu_vs_f_flat_to_mhz": 0.02,
+        "printed_page": 15
+      }
+    ]
+  }
+}

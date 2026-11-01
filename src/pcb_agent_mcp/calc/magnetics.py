@@ -4092,3 +4092,607 @@ def _magnetic_data_dc_bias(material=None, permeability=None, limit=None, path=No
         {"fits": "the fit is the vendor's; magnetics_dc_bias evaluates it",
          "curve": "no curve and no graph is carried here"},
         {"source_url": (data.get("source") or {}).get("url")})
+
+# --------------------------------------------------------------------------
+# 0.0.80: the vendor's own CURVES - magnetisation B(H) and mu versus T
+#
+# Everything up to here answers with ONE number per material (a saturation flux
+# density at one temperature) or with a small-signal percentage. The catalog
+# also prints, on its own pages, a closed-form curve for the magnetisation of
+# every permeability it sells and a closed-form curve for how that permeability
+# moves with temperature. Both are transcribed here exactly as printed, and the
+# two fits are cross-checked against each other and against the catalog's own
+# worked example:
+#
+#   * magnetisation  B = [(a + bH + cH^2)/(1 + dH + eH^2)]^x,  B[T], H[Oe]
+#     printed pp.128-132. Integrating the DC-bias fit of the same part
+#     (mu_r,diff * %mu/100, B = 1e-4 * int mu_r dH) is an independent route to
+#     the same flux: at 100 Oe the two agree to a median 0.49 % over the 61
+#     toroid rows, and disagree by more than 10 % on three rows, all of which
+#     sit at the ends of the permeability scale where the vendor fitted each
+#     range separately. Both numbers are printed; this module reports both.
+#   * temperature    dmu/mu = a + bT + cT^2 + dT^3 + eT^4,  T[degC], ref 25 C
+#     printed pp.138-139. The dynamic range this predicts over -50..+100 C
+#     matches the single number the catalog prints in its stability table
+#     (p.15) to 0.045 percentage points on all nine materials that have both.
+#   * the catalog's worked example on p.25 (60u Kool Mu at 95 Oe = 0.441 T)
+#     comes out of the transcription as 0.4413 T.
+#
+# What this section deliberately does NOT do:
+#
+#   * it does not interpolate between printed permeabilities, and it does not
+#     pick a shape family for the caller: the coefficients differ between the
+#     toroid / E-core / EQ-and-LP / block tables for the same material, so
+#     asking for a material printed in several shapes without naming one is
+#     refused with the list.
+#   * it does not evaluate H = 0. B(0) = a^x is not zero (5.3 mT for 60u Kool
+#     Mu), so this fit is not a small-signal model and reading mu_r off it near
+#     the origin is wrong by tens of percent - measured, see
+#     cross_check.method_rejected in the data file. A caller who wants the
+#     small-signal answer is pointed at magnetics_dc_bias instead.
+#   * it does not extrapolate the quartic in temperature beyond -50..+200 C
+#     (the printed dynamic range and the printed 200 C rating). Inside that
+#     range but outside -50..+100 C it answers and marks the point as outside
+#     the range the vendor actually tabulated.
+#   * it does not hide a fit that has turned over. Seven rows reach dB/dH <= 0
+#     inside the printed band; the H at which that happens is carried in the
+#     data row, and a query past it says so rather than returning a flux that
+#     is falling while H rises.
+# --------------------------------------------------------------------------
+
+CURVE_PATH = os.path.join(os.path.dirname(DATA_PATH), "powder_curve_fits.json")
+
+CURVE_SCHEMA = "powder-curve-fits"
+
+# The band the magnetisation graphs plot, read off their axis labels (1, 2, 3,
+# 5, ... 300 Oe). Some panels stop at 100 Oe and the catalog prints no numeric
+# validity range for the fit, so this is what the curves cover, not a promise.
+CURVE_H_PLOTTED_OE = (1.0, 300.0)
+
+# -50..+100 C is the band the printed stability table quotes its mu-vs-T
+# dynamic range over; 200 C is the rating printed in that column's head. A
+# temperature between 100 and 200 C is answered and marked as outside the
+# tabulated band; outside -50..200 C the quartic is refused.
+CURVE_T_PRINTED_DYNAMIC_C = (-50.0, 100.0)
+CURVE_T_RATING_C = 200.0
+CURVE_T_RANGE_C = (-50.0, 200.0)
+
+# How far the magnetisation fit and the integrated DC-bias fit may drift apart
+# before the answer says so. The whole-table median at 100 Oe is 0.49 % and the
+# worst row is 54 %, so 10 % separates the two populations instead of flagging
+# one of them; it is a reporting threshold, not a claim about which is right.
+CURVE_DISAGREE_PCT = 10.0
+
+# 4e-7*pi T/(A/m) is mu0; 79.5771 A/m per oersted; the product is 1.0000e-4
+# T/Oe, which is the CGS factor the catalog uses for B = mu_r * H * 1e-4.
+MU0_T_PER_OE = 4e-7 * math.pi * 79.5771
+
+def _load_curve_fits(path=None):
+    """(data, None) or (None, why-not). The shape of the table is the contract."""
+    p = path or CURVE_PATH
+    if not os.path.exists(p):
+        return None, "powder curve fit table missing: " + p
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        return None, "powder curve fit table unreadable: %s" % exc
+    if data.get("schema") != CURVE_SCHEMA:
+        return None, ("powder curve fit table has schema %r, not %r; the shape of the "
+                      "table is checked rather than assumed, because a reader that "
+                      "guessed would answer from the wrong field"
+                      % (data.get("schema"), CURVE_SCHEMA))
+    mag = data.get("magnetization") or {}
+    groups = mag.get("groups") or []
+    if not groups:
+        return None, "powder curve fit table carries no magnetization groups"
+    for g in groups:
+        rows = g.get("rows") or []
+        if not rows:
+            return None, ("magnetization group %r/%r has no rows"
+                          % (g.get("material"), g.get("shape_family")))
+        for r in rows:
+            try:
+                co = {k: float(r[k]) for k in ("a", "b", "c", "d", "e", "x")}
+                float(r["permeability"])
+            except Exception:  # noqa: BLE001
+                return None, ("magnetization row in %r/%r is not a "
+                              "(permeability, a, b, c, d, e, x) tuple: %r"
+                              % (g.get("material"), g.get("shape_family"), r))
+            # A column slip shows up here before it shows up in an answer: the
+            # printed rows all keep the denominator away from zero and the flux
+            # positive across the plotted band.
+            for h in (1.0, 10.0, 100.0, 1000.0):
+                den = 1.0 + co["d"] * h + co["e"] * h * h
+                num = co["a"] + co["b"] * h + co["c"] * h * h
+                if not (den > 0.0 and num > 0.0):
+                    return None, ("magnetization row %r of %r/%r is not a rising fit: "
+                                  "at H = %g Oe the numerator is %r and the denominator "
+                                  "%r. Every printed row stays positive there, so the "
+                                  "coefficients have shifted a column"
+                                  % (r.get("permeability"), g.get("material"),
+                                     g.get("shape_family"), h, num, den))
+    for r in mag.get("variants_high_dc_bias") or []:
+        try:
+            for k in ("a", "b", "c", "d", "e", "x"):
+                float(r[k])
+            float(r["permeability"])
+        except Exception:  # noqa: BLE001
+            return None, ("High DC Bias variant row is not a (permeability, a..e, x) "
+                          "tuple: %r" % (r,))
+    tgroups = (data.get("temperature") or {}).get("groups") or []
+    if not tgroups:
+        return None, "powder curve fit table carries no temperature groups"
+    for g in tgroups:
+        rows = g.get("rows") or []
+        if not rows:
+            return None, ("temperature group %r has no rows" % (g.get("material"),))
+        for r in rows:
+            try:
+                co = {k: float(r[k]) for k in ("a", "b", "c", "d", "e")}
+                float(r["permeability"])
+            except Exception:  # noqa: BLE001
+                return None, ("temperature row in %r is not a (permeability, a, b, c, "
+                              "d, e) tuple: %r" % (g.get("material"), r))
+            # The printed a is negative on every one of the 54 rows; a positive a
+            # means the sign column moved.
+            if not (co["a"] < 0.0):
+                return None, ("temperature row %r of %r carries a = %r, but every "
+                              "printed row carries a negative a; the transcription has "
+                              "shifted a column"
+                              % (r.get("permeability"), g.get("material"), co["a"]))
+    return data, None
+
+def powder_b_t(co, h_oe):
+    """The printed magnetisation fit, evaluated: flux density in tesla at H oersteds."""
+    h = float(h_oe)
+    num = float(co["a"]) + float(co["b"]) * h + float(co["c"]) * h * h
+    den = 1.0 + float(co["d"]) * h + float(co["e"]) * h * h
+    if den == 0.0 or num < 0.0:
+        raise ValueError("the printed fit is not usable at H = %g Oe "
+                         "(numerator %r, denominator %r)" % (h, num, den))
+    ratio = num / den
+    if ratio < 0.0:
+        raise ValueError("the printed fit turns negative inside its own root at "
+                         "H = %g Oe" % h)
+    return ratio ** float(co["x"])
+
+def powder_mu_differential(co, h_oe):
+    """dB/dH of the printed fit, as a relative permeability.
+
+    mu_r,diff = (dB/dH[T/Oe]) / (mu0 * 79.5771 T/Oe), i.e. divided by 1.0000e-4.
+    The derivative is a central difference 2e-4 * H wide, which is the same
+    convention the data file records under formulas.magnetization. It goes to
+    zero or below on the seven rows whose fit turns over; the caller decides what
+    to do with that rather than being handed an absolute value.
+    """
+    h = float(h_oe)
+    step = max(abs(h) * 1e-4, 1e-9)
+    lo = powder_b_t(co, max(h - step, 0.0))
+    hi = powder_b_t(co, h + step)
+    return (hi - lo) / ((h + step) - max(h - step, 0.0)) / MU0_T_PER_OE
+
+def powder_mu_change_pct(co, temperature_c):
+    """The printed temperature fit, evaluated: percent change in mu against 25 C."""
+    t = float(temperature_c)
+    frac = (float(co["a"]) + float(co["b"]) * t + float(co["c"]) * t * t
+            + float(co["d"]) * t ** 3 + float(co["e"]) * t ** 4)
+    return frac * 100.0
+
+def _curve_mag_groups(data, material):
+    return [g for g in (data.get("magnetization") or {}).get("groups") or []
+            if _dc_key(g.get("material")) == _dc_key(material)]
+
+def _curve_variant_rows(data, material):
+    return [r for r in (data.get("magnetization") or {}).get("variants_high_dc_bias")
+            or [] if _dc_key(r.get("material")) == _dc_key(material)]
+
+def _curve_temp_group(data, material):
+    for g in (data.get("temperature") or {}).get("groups") or []:
+        if _dc_key(g.get("material")) == _dc_key(material):
+            return g
+    return None
+
+def _curve_materials(data):
+    out = []
+    for m in ([(g.get("material")) for g in
+               (data.get("magnetization") or {}).get("groups") or []]
+              + [(r.get("material")) for r in
+                 (data.get("magnetization") or {}).get("variants_high_dc_bias") or []]
+              + [(g.get("material")) for g in
+                 (data.get("temperature") or {}).get("groups") or []]):
+        if m not in out:
+            out.append(m)
+    return out
+
+def _curve_stability(data, material, permeability):
+    """The printed p.15 row for this material/permeability, or None."""
+    rows = ((data or {}).get("stability_printed_page_15") or {}).get("rows") or []
+    for r in rows:
+        if _dc_key(r.get("family")) != _dc_key(material):
+            continue
+        try:
+            if int(r.get("permeability")) != int(permeability):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        out = {}
+        for k in ("mu_vs_t_dynamic_range_pct", "mu_vs_b_dynamic_range_pct",
+                  "mu_vs_f_flat_to_mhz"):
+            if r.get(k) is not None:
+                out[k] = r.get(k)
+        out["printed_page"] = r.get("printed_page")
+        if r.get("printed_cell_spans") is not None:
+            out["printed_cell_spans"] = r.get("printed_cell_spans")
+        return out
+    return None
+
+def magnetics_powder_curve(material, permeability, h_oe=None, temperature_c=None,
+                           shape_family=None, turns=None, dc_current_a=None,
+                           le_mm=None, curve_data_path=None, bias_data_path=None,
+                           include_evidence=False):
+    """Flux from the printed B(H) curve, and how mu moves with temperature."""
+    data, why = _load_curve_fits(curve_data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="restore data/powder_curve_fits.json")
+
+    have_h = h_oe is not None
+    have_geo = turns is not None or dc_current_a is not None or le_mm is not None
+    have_t = temperature_c is not None
+    if have_h and have_geo:
+        return err("give either h_oe or turns+dc_current_a+le_mm, not both - they are "
+                   "two ways of stating the same magnetising force and taking one "
+                   "silently would hide the other", "ARG_INVALID")
+    if not have_h and not have_geo and not have_t:
+        return err("give h_oe (or turns + dc_current_a + le_mm) for the flux at a "
+                   "magnetising force, or temperature_c for how mu moves with "
+                   "temperature - they are printed as two different fits and this "
+                   "tool will not invent one from the other", "ARG_INVALID")
+
+    materials = _curve_materials(data)
+    if material is None:
+        return err("material is required; the table prints %d material lines: %s"
+                   % (len(materials), ", ".join(materials)), "ARG_INVALID",
+                   extra={"materials_printed": materials})
+    mag_groups = _curve_mag_groups(data, material)
+    variant_rows = _curve_variant_rows(data, material)
+    temp_group = _curve_temp_group(data, material)
+    if not mag_groups and not variant_rows and temp_group is None:
+        return err("no printed curve fit for material %r; the table carries: %s"
+                   % (material, ", ".join(materials)), "NOT_FOUND",
+                   hint="magnetic_data(kind='powder_curve') is not carried; the table "
+                        "is data/powder_curve_fits.json",
+                   extra={"materials_printed": materials})
+
+    try:
+        perm = int(float(permeability))
+    except Exception:  # noqa: BLE001
+        return err("permeability must be a number (the vendor prints one fit per "
+                   "permeability)", "ARG_INVALID")
+
+    out = {"material": None}
+    warnings = []
+    worked_h = False
+    worked_t = False
+
+    # ---- the magnetisation curve ---------------------------------------------
+    if have_h or have_geo:
+        row = None
+        group = None
+        if variant_rows:
+            if shape_family is not None:
+                return err("%r is a High DC Bias variant block, which the catalog "
+                           "prints without a shape family; drop shape_family"
+                           % (variant_rows[0].get("material"),), "ARG_INVALID")
+            perms = [int(r["permeability"]) for r in variant_rows]
+            for r in variant_rows:
+                if int(r["permeability"]) == perm:
+                    row = r
+                    break
+            if row is None:
+                return err("%s prints no High DC Bias magnetisation fit for "
+                           "permeability %s" % (variant_rows[0].get("material"), perm),
+                           "NOT_FOUND",
+                           hint="printed permeabilities: "
+                                + ", ".join(str(x) for x in perms),
+                           extra={"permeabilities_printed": perms})
+            out["material"] = variant_rows[0].get("material")
+            out["shape_family"] = None
+            out["shape_family_note"] = ("the High DC Bias blocks print one table per "
+                                        "material with no shape family")
+        else:
+            if not mag_groups:
+                return err("%r has a printed temperature fit but no printed "
+                           "magnetisation curve" % (material,), "NOT_FOUND",
+                           hint="materials with a magnetisation curve: "
+                                + ", ".join(m for m in materials
+                                            if _curve_mag_groups(data, m)))
+            shapes = []
+            for g in mag_groups:
+                if g.get("shape_family") not in shapes:
+                    shapes.append(g.get("shape_family"))
+            if shape_family is None:
+                if len(shapes) == 1:
+                    group = mag_groups[0]
+                else:
+                    return err("%r is printed for %d core shape families (%s); name one "
+                               "with shape_family - the coefficients differ between "
+                               "them, so picking one would be an invention"
+                               % (material, len(shapes), ", ".join(shapes)),
+                               "ARG_INVALID",
+                               extra={"shape_families_printed": shapes})
+            else:
+                for g in mag_groups:
+                    if _dc_key(g.get("shape_family")) == _dc_key(shape_family):
+                        group = g
+                        break
+                if group is None:
+                    return err("%r has no magnetisation fit printed for shape family "
+                               "%r; it is printed for: %s"
+                               % (material, shape_family, ", ".join(shapes)),
+                               "NOT_FOUND",
+                               extra={"shape_families_printed": shapes})
+            perms = [int(r["permeability"]) for r in group.get("rows") or []]
+            for r in group.get("rows") or []:
+                if int(r["permeability"]) == perm:
+                    row = r
+                    break
+            if row is None:
+                return err("%s / %s prints no magnetisation fit for permeability %s"
+                           % (group.get("material"), group.get("shape_family"), perm),
+                           "NOT_FOUND",
+                           hint="printed permeabilities: "
+                                + ", ".join(str(x) for x in perms),
+                           extra={"permeabilities_printed": perms})
+            out["material"] = group.get("material")
+            out["shape_family"] = group.get("shape_family")
+
+        out["permeability"] = perm
+
+        if not have_h:
+            missing = [n for n, v in (("turns", turns), ("dc_current_a", dc_current_a),
+                                      ("le_mm", le_mm)) if v is None]
+            if missing:
+                return err("missing " + ", ".join(missing)
+                           + " (H[Oe] = 0.4*pi*N*I[A]/le[cm])", "ARG_INVALID")
+            try:
+                n_t = float(turns); i_a = float(dc_current_a); le = float(le_mm)
+            except Exception:  # noqa: BLE001
+                return err("turns, dc_current_a and le_mm must be numbers",
+                           "ARG_INVALID")
+            if n_t <= 0 or i_a <= 0 or le <= 0:
+                return err("turns, dc_current_a and le_mm must all be positive",
+                           "ARG_INVALID")
+            h_oe = 0.4 * math.pi * n_t * i_a / (le / 10.0)
+            h_source = "from turns and path length (CGS, the catalog's own relation)"
+        else:
+            h_source = "given"
+        try:
+            h = float(h_oe)
+        except Exception:  # noqa: BLE001
+            return err("h_oe must be a number", "ARG_INVALID")
+        if not (h > 0):
+            return err("h_oe must be positive: the printed fit gives B(0) = a^x, which "
+                       "is not zero (%s T for this row), so it is not a small-signal "
+                       "model and evaluating it at zero magnetising force would return "
+                       "a number the vendor never printed. For the zero-bias "
+                       "permeability use magnetics_dc_bias, which is pinned to 100 %% "
+                       "at H = 0" % _fmt(float(row["a"]) ** float(row["x"])),
+                       "ARG_INVALID",
+                       extra={"b_at_zero_h_t": _fmt(float(row["a"]) ** float(row["x"]))})
+
+        try:
+            b_t = powder_b_t(row, h)
+            mu_diff = powder_mu_differential(row, h)
+        except ValueError as exc:
+            return err(str(exc), "OUT_OF_VALIDITY",
+                       hint="the printed fit is only usable where it rises; see "
+                            "turns_over_at_h_oe on this row")
+        worked_h = True
+
+        out["h_oe"] = _fmt(h)
+        out["h_source"] = h_source
+        out["b_t"] = _fmt(b_t)
+        out["fit"] = {"a": row["a"], "b": row["b"], "c": row["c"],
+                      "d": row["d"], "e": row["e"], "x": row["x"],
+                      "printed_page": (group or {}).get("printed_page")
+                      if group is not None else row.get("printed_page"),
+                      "printed_formula": (data.get("formulas") or {}).get(
+                          "magnetization", {}).get("printed")}
+
+        lo, hi = CURVE_H_PLOTTED_OE
+        out["printed_plotted_band_oe"] = [_fmt(lo), _fmt(hi)]
+        out["inside_plotted_band"] = bool(lo <= h <= hi)
+        if not (lo <= h <= hi):
+            warnings.append(
+                "H = %.4g Oe lies outside the %.0f-%.0f Oe band the catalog's "
+                "magnetisation graphs plot (read off their axis labels); the page "
+                "prints no numeric validity range for the fit, so this answer is an "
+                "extrapolation of the vendor's fit" % (h, lo, hi))
+
+        turn = row.get("turns_over_at_h_oe")
+        if turn is not None:
+            out["turns_over_at_h_oe"] = turn
+            if h >= float(turn):
+                warnings.append(
+                    "the printed fit for this row stops rising at H = %g Oe and falls "
+                    "after that; %g Oe is past the peak, so B here is a falling branch "
+                    "of the fit and not a flux the material would reach. It is reported "
+                    "because it is what the printed coefficients give, not because it "
+                    "is physical" % (float(turn), h))
+                out["past_fit_turnover"] = True
+            else:
+                out["past_fit_turnover"] = False
+
+        if mu_diff <= 0.0:
+            out["mu_r_differential"] = None
+            out["mu_r_differential_note"] = (
+                "dB/dH of the printed fit is %s at this H, i.e. the fit is no longer "
+                "rising, so it has no relative permeability to report" % _fmt(mu_diff))
+        else:
+            out["mu_r_differential"] = _fmt(mu_diff)
+            out["mu_r_differential_basis"] = (
+                "dB/dH divided by 1.0000e-4 T/Oe (mu0 * 79.5771), central difference "
+                "2e-4*H wide on the printed fit")
+
+        # Independent route to the same flux: the DC-bias fit of the same part,
+        # integrated over 0..H. Skipped where there is no twin row to compare with,
+        # and says why rather than silently omitting the field.
+        xcheck_note = None
+        twin = None
+        if variant_rows:
+            xcheck_note = ("this is a High DC Bias variant block; the DC-bias fit "
+                           "table carries the standard grade of the same material, "
+                           "which is a different curve, so nothing is compared")
+        else:
+            bdata, bwhy = _load_dc_bias(bias_data_path)
+            if bdata is None:
+                xcheck_note = "DC-bias fit table unavailable (%s), no cross-check" % bwhy
+            else:
+                tw_g, tw_why = _dc_bias_group(bdata, out["material"],
+                                              out["shape_family"])
+                if tw_g is None:
+                    xcheck_note = "no DC-bias twin row: " + str(tw_why)
+                else:
+                    for r in tw_g.get("rows") or []:
+                        if int(r["permeability"]) == perm:
+                            twin = r
+                            break
+                    if twin is None:
+                        xcheck_note = ("the DC-bias fit table has this material but "
+                                       "not permeability %s" % perm)
+        if twin is not None:
+            b_int = dc_bias_b_t(twin["a"], twin["b"], twin["c"], perm, h)
+            delta = (b_t - b_int) / b_int * 100.0
+            out["b_t_from_dc_bias_integral"] = _fmt(b_int)
+            out["delta_pct_vs_dc_bias_integral"] = _fmt(delta)
+            out["fits_disagree"] = bool(abs(delta) > CURVE_DISAGREE_PCT)
+            if out["fits_disagree"]:
+                warnings.append(
+                    "the two printed fits for this part disagree at H = %.4g Oe: this "
+                    "curve gives %.4g T and the integrated DC-bias fit gives %.4g T "
+                    "(%.1f %%). Both are the vendor's own numbers on different pages; "
+                    "the disagreement is reported rather than averaged away"
+                    % (h, b_t, b_int, delta))
+        else:
+            out["b_t_from_dc_bias_integral"] = None
+            out["delta_pct_vs_dc_bias_integral"] = None
+            out["fits_disagree"] = None
+            out["cross_check_note"] = xcheck_note
+
+    # ---- the temperature curve ----------------------------------------------
+    if have_t:
+        try:
+            t = float(temperature_c)
+        except Exception:  # noqa: BLE001
+            return err("temperature_c must be a number", "ARG_INVALID")
+        if temp_group is None:
+            tmats = [g.get("material") for g in
+                     (data.get("temperature") or {}).get("groups") or []]
+            return err("%s has a printed magnetisation curve but no printed temperature "
+                       "fit; the temperature pages carry: %s"
+                       % (material, ", ".join(tmats)), "NOT_FOUND",
+                       hint="temperature fits printed: " + ", ".join(tmats),
+                       extra={"temperature_materials_printed": tmats})
+        trows = temp_group.get("rows") or []
+        tperms = [int(r["permeability"]) for r in trows]
+        trow = None
+        for r in trows:
+            if int(r["permeability"]) == perm:
+                trow = r
+                break
+        if trow is None:
+            return err("%s prints no temperature fit for permeability %s"
+                       % (temp_group.get("material"), perm), "NOT_FOUND",
+                       hint="printed permeabilities: "
+                            + ", ".join(str(x) for x in tperms),
+                       extra={"permeabilities_printed": tperms})
+        tlo, thi = CURVE_T_RANGE_C
+        if t < tlo or t > thi:
+            return err("temperature_c = %g is outside the %.0f..%.0f C range this tool "
+                       "will evaluate. The printed fit is a quartic: -50 C is the low "
+                       "end of the band the catalog's stability table quotes its "
+                       "dynamic range over, %g C is the rating printed in that column's "
+                       "head, and beyond either end a quartic is an extrapolation with "
+                       "no measurement behind it"
+                       % (t, tlo, thi, CURVE_T_RATING_C), "OUT_OF_VALIDITY",
+                       extra={"temperature_range_c": [_fmt(tlo), _fmt(thi)]})
+        pct = powder_mu_change_pct(trow, t)
+        worked_t = True
+        if "material" not in out or out.get("material") is None:
+            out["material"] = temp_group.get("material")
+        out["permeability"] = perm
+        out["temperature_c"] = _fmt(t)
+        out["mu_change_pct"] = _fmt(pct)
+        out["mu_ratio_vs_25c"] = _fmt(1.0 + pct / 100.0)
+        out["mu_r_at_t"] = _fmt(perm * (1.0 + pct / 100.0))
+        out["mu_r_at_25c"] = perm
+        out["temperature_fit"] = {
+            "a": trow["a"], "b": trow["b"], "c": trow["c"],
+            "d": trow["d"], "e": trow["e"],
+            "printed_page": temp_group.get("printed_page"),
+            "printed_formula": (data.get("formulas") or {}).get(
+                "temperature", {}).get("printed"),
+            "reference_c": (data.get("formulas") or {}).get(
+                "temperature", {}).get("reference_c")}
+        dlo, dhi = CURVE_T_PRINTED_DYNAMIC_C
+        out["inside_printed_dynamic_range"] = bool(dlo <= t <= dhi)
+        if not (dlo <= t <= dhi):
+            warnings.append(
+                "T = %.4g C is inside the range this tool evaluates but outside the "
+                "%.0f..%.0f C band the catalog's stability table tabulates its dynamic "
+                "range over; the fit is the vendor's, the point is not one they quote"
+                % (t, dlo, dhi))
+        stab = _curve_stability(data, temp_group.get("material"), perm)
+        if stab is not None:
+            out["printed_stability"] = stab
+            try:
+                rng = float(stab.get("mu_vs_t_dynamic_range_pct"))
+                got = abs(powder_mu_change_pct(trow, dhi)
+                          - powder_mu_change_pct(trow, dlo))
+                out["printed_stability_fit_dynamic_range_pct"] = _fmt(got)
+                out["printed_stability_gap_pp"] = _fmt(abs(got - rng))
+            except Exception:  # noqa: BLE001
+                pass
+
+    if not (worked_h or worked_t):
+        return err("nothing to evaluate", "ARG_INVALID")
+
+    out["warnings"] = warnings
+    extra = {"warnings": warnings,
+             "source_url": (data.get("source") or {}).get("url"),
+             "printed_pages_used": (data.get("source") or {}).get("printed_pages_used")}
+    if include_evidence:
+        extra["cross_check"] = data.get("cross_check")
+        extra["printing_anomalies"] = data.get("printing_anomalies")
+        extra["not_carried"] = data.get("not_carried")
+    return ok(
+        out,
+        "flux density in tesla from the printed B(H) fit, and percent change in mu "
+        "from the printed temperature fit",
+        (data.get("formulas") or {}).get("magnetization", {}).get("printed", "")
+        + "  /  "
+        + (data.get("formulas") or {}).get("temperature", {}).get("printed", ""),
+        "data/powder_curve_fits.json - Magnetics Powder Core Catalog, magnetisation "
+        "fits printed pp.128-132 (pdf 130-134) and temperature fits printed pp.138-139 "
+        "(pdf 140-141); every row carries the page it was transcribed from",
+        "the vendor's coefficients transcribed to their printed digits and evaluated "
+        "as printed; nothing here is re-fitted, and the cross-checks below say how far "
+        "the two printed fits agree",
+        {"units": "B[T], H[Oe], T[degC]; H[Oe] = 0.4*pi*N*I[A]/le[cm] when computed "
+                  "from the winding",
+         "permeability": "the vendor's nominal mu for that row; nothing is interpolated "
+                         "between printed permeabilities",
+         "h_zero": "H = 0 is refused: B(0) = a^x is not zero, so the fit is not a "
+                   "small-signal model (measured 36.9 % median error if used as one)",
+         "shape_family": "coefficients differ between shape families for the same "
+                         "material - that is a printed fact, not an artefact",
+         "temperature": "the fit is the one the catalog prints, referenced to 25 C; "
+                        "outside -50..200 C it is refused rather than extrapolated, and "
+                        "inside the range but outside -50..100 C the point is flagged",
+         "disagreement": "where the magnetisation fit and the integrated DC-bias fit "
+                         "differ by more than %.0f %%, both numbers are returned with "
+                         "fits_disagree = true; neither is picked"
+                         % CURVE_DISAGREE_PCT},
+        extra)

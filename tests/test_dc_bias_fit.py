@@ -436,7 +436,9 @@ class TestTheAnswer(unittest.TestCase):
 
 class TestTheTool(unittest.TestCase):
     def test_the_tool_is_registered_and_the_count_moved_by_one(self):
-        self.assertEqual(len(tools.TOOLS), 177)
+        # 178 = 177 + magnetics_powder_curve in 0.0.80 (the vendor's printed B(H)
+        # and mu-vs-T curves are a different object from a single Bsat number)
+        self.assertEqual(len(tools.TOOLS), 178)
         self.assertIn("magnetics_dc_bias", tools.TOOLS)
         spec = tools.TOOLS["magnetics_dc_bias"]
         props = spec["inputSchema"]["properties"]

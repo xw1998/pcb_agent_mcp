@@ -4814,9 +4814,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (177 tools now), so an agent that asks what can be computed is "
+          "table (178 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 177
+          len(_tools.TOOLS) == 178
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -4991,8 +4991,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (177 tools now)",
-          len(_tools.TOOLS) == 177
+          "table (178 tools now)",
+          len(_tools.TOOLS) == 178
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5256,9 +5256,10 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 177, "
-          "because 0.0.78 added arguments and no tool while 0.0.79 adds exactly one "
-          "(magnetics_toroid_mlt)",
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 178, "
+          "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
+          "(magnetics_toroid_mlt) and 0.0.80 adds exactly one "
+          "(magnetics_powder_curve)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5266,7 +5267,7 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 177,
+          and len(_tools.TOOLS) == 178,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -5408,12 +5409,201 @@ def selftest():
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 177,
+          and len(_tools.TOOLS) == 178,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
              _tm_woff.get("p_copper_w"), _tm_won.get("mlt_mm"),
              _tm_row_off.get("part"), _tm_row_on.get("part"), len(_tools.TOOLS)))
+
+    # ---- 0.0.80: the printed magnetisation and mu-vs-T curves -------------
+    _pc_we = _call("magnetics_powder_curve",
+                   {"material": "Kool Mu", "permeability": 60,
+                    "shape_family": "Toroids", "h_oe": 95.0}, 1914)
+    _pc_wev = _pc_we.get("value") or {}
+    check("the catalog's own worked example comes out of the transcription: 60u Kool Mu "
+          "at 95 Oe is 0.441 T printed on p.25 and 0.44126 T here, and the same row's "
+          "DC-bias fit integrated over 0..95 Oe gives 0.44214 T, so the two printed "
+          "fits agree to 0.20 %% on this part",
+          _pc_we.get("status") == "ok"
+          and abs((_pc_wev.get("b_t") or 0) - 0.44126) < 5e-5
+          and abs((_pc_wev.get("b_t") or 0) - 0.441) / 0.441 < 1e-2
+          and abs((_pc_wev.get("b_t_from_dc_bias_integral") or 0) - 0.442137) < 5e-5
+          and abs((_pc_wev.get("delta_pct_vs_dc_bias_integral") or 0) + 0.198) < 0.02
+          and _pc_wev.get("fits_disagree") is False
+          and _pc_wev.get("inside_plotted_band") is True,
+          "b %s, integral %s, delta %s %%" % (_pc_wev.get("b_t"),
+                                              _pc_wev.get("b_t_from_dc_bias_integral"),
+                                              _pc_wev.get("delta_pct_vs_dc_bias_integral")))
+
+    _pc_mats = ["Kool Mu", "Kool Mu MAX", "Kool Mu HF", "Kool Mu Ultra", "XFlux",
+                "XFlux Ultra", "High Flux", "Edge", "MPP"]
+    _pc_gaps = []
+    _pc_bad = []
+    for _pc_i, _pc_m in enumerate(_pc_mats):
+        _pc_r = _call("magnetics_powder_curve",
+                      {"material": _pc_m, "permeability": 60,
+                       "temperature_c": 100.0}, 1915 + _pc_i)
+        _pc_v = _pc_r.get("value") or {}
+        _g = _pc_v.get("printed_stability_gap_pp")
+        if _g is None:
+            _pc_bad.append(_pc_m)
+        else:
+            _pc_gaps.append(_g)
+    check("the temperature fit is checked against a number the catalog prints "
+          "separately: its predicted dynamic range over -50..+100 C matches the p.15 "
+          "stability column on all nine materials, worst gap %.3f pp (0.045 on 60u "
+          "Kool Mu)" % (max(_pc_gaps) if _pc_gaps else -1),
+          len(_pc_gaps) == 9 and not _pc_bad and max(_pc_gaps) < 0.05,
+          "gaps %s, missing %s" % (["%.3f" % g for g in _pc_gaps], _pc_bad))
+
+    _pc_int = []
+    with open(_tools._curve_table_path(), "r", encoding="utf-8") as _fh:
+        _json_data = json.load(_fh)
+    for _pc_g in (_json_data.get("magnetization") or {}).get("groups") or []:
+        if _pc_g.get("shape_family") != "Toroids":
+            continue
+        for _pc_row in _pc_g.get("rows") or []:
+            _pc_r = _call("magnetics_powder_curve",
+                          {"material": _pc_g.get("material"),
+                           "permeability": _pc_row.get("permeability"),
+                           "shape_family": "Toroids", "h_oe": 100.0}, 1930)
+            _pc_v = _pc_r.get("value") or {}
+            _d = _pc_v.get("delta_pct_vs_dc_bias_integral")
+            if _d is not None:
+                _pc_int.append(abs(_d))
+    _pc_int.sort()
+    _pc_med = _pc_int[len(_pc_int) // 2] if _pc_int else -1
+    check("the magnetisation curve and the DC-bias fit are two independent routes to "
+          "the same flux, and they agree over the whole toroid set: %d rows at 100 Oe, "
+          "median disagreement %.3f %% (the two are transcribed from different pages "
+          "of the same catalog)" % (len(_pc_int), _pc_med),
+          len(_pc_int) == 61 and _pc_med < 2.0,
+          "%d rows, median %.3f %%, worst %.3f %%" % (len(_pc_int), _pc_med,
+                                                      _pc_int[-1] if _pc_int else -1))
+
+    _pc_mpp = _call("magnetics_powder_curve",
+                    {"material": "MPP", "permeability": 550,
+                     "shape_family": "Toroids", "h_oe": 100.0}, 1940)
+    _pc_mppv = _pc_mpp.get("value") or {}
+    check("a vendor printing two fits that disagree is reported, not reconciled: MPP "
+          "550u at 100 Oe is 0.2341 T from the magnetisation curve against 0.5128 T "
+          "from the integrated DC-bias fit (54.3 %), fits_disagree is true, and the "
+          "row's printed turnover at 23.8 Oe is carried so a query past it is marked "
+          "past_fit_turnover instead of returning a falling branch as a flux",
+          _pc_mpp.get("status") == "ok"
+          and _pc_mppv.get("fits_disagree") is True
+          and abs((_pc_mppv.get("delta_pct_vs_dc_bias_integral") or 0) + 54.34) < 0.05
+          and abs((_pc_mppv.get("turns_over_at_h_oe") or 0) - 23.8) < 0.05
+          and _pc_mppv.get("past_fit_turnover") is True
+          and _pc_mppv.get("mu_r_differential") is None
+          and any("stops rising at H = 23.8 Oe" in w
+                  for w in _pc_mppv.get("warnings") or []),
+          "b %s, integral %s, delta %s, turnover %s" % (
+              _pc_mppv.get("b_t"), _pc_mppv.get("b_t_from_dc_bias_integral"),
+              _pc_mppv.get("delta_pct_vs_dc_bias_integral"),
+              _pc_mppv.get("turns_over_at_h_oe")))
+
+    def _pc_refuse(args, rid):
+        return _call("magnetics_powder_curve", args, rid)
+
+    _pc_h0 = _pc_refuse({"material": "Kool Mu", "permeability": 60,
+                         "shape_family": "Toroids", "h_oe": 0.0}, 1941)
+    _pc_shp = _pc_refuse({"material": "Kool Mu", "permeability": 60, "h_oe": 10.0},
+                         1942)
+    _pc_perm = _pc_refuse({"material": "Kool Mu", "permeability": 33,
+                           "shape_family": "Toroids", "h_oe": 10.0}, 1943)
+    _pc_mat = _pc_refuse({"material": "Sendust", "permeability": 60, "h_oe": 10.0},
+                         1944)
+    _pc_none = _pc_refuse({"material": "Kool Mu", "permeability": 60,
+                           "shape_family": "Toroids"}, 1945)
+    _pc_tlo = _pc_refuse({"material": "Kool Mu", "permeability": 60,
+                          "temperature_c": -51.0}, 1946)
+    _pc_thi = _pc_refuse({"material": "Kool Mu", "permeability": 60,
+                          "temperature_c": 201.0}, 1947)
+    _pc_ntab = _pc_refuse({"material": "Kool Mu", "permeability": 60,
+                           "h_oe": 10.0,
+                           "curve_data_path": "data/no_such_curve.json"}, 1948)
+    check("every way to ask a question the printed curves cannot answer is its own "
+          "refusal with the list that would answer it: H = 0 ARG_INVALID (and it names "
+          "B(0) = a^x = 0.00529 T, so the fit is not a small-signal model), a material "
+          "printed in four shapes ARG_INVALID listing them, an unprinted permeability "
+          "NOT_FOUND listing the printed ones, an unprinted material NOT_FOUND listing "
+          "the materials, no h and no temperature ARG_INVALID, -51 C and +201 C "
+          "OUT_OF_VALIDITY against a -50..200 C range, and a missing that "
+          "DATA_UNAVAILABLE",
+          _pc_h0.get("reason_code") == "ARG_INVALID"
+          and "0.00529" in json.dumps(_pc_h0, ensure_ascii=False)
+          and _pc_shp.get("reason_code") == "ARG_INVALID"
+          and len(_pc_shp.get("shape_families_printed") or []) == 4
+          and _pc_perm.get("reason_code") == "NOT_FOUND"
+          and 75 in (_pc_perm.get("permeabilities_printed") or [])
+          and _pc_mat.get("reason_code") == "NOT_FOUND"
+          and len(_pc_mat.get("materials_printed") or []) == 12
+          and _pc_none.get("reason_code") == "ARG_INVALID"
+          and _pc_tlo.get("reason_code") == "OUT_OF_VALIDITY"
+          and _pc_thi.get("reason_code") == "OUT_OF_VALIDITY"
+          and _pc_ntab.get("reason_code") == "DATA_UNAVAILABLE",
+          "h0 %s shape %s perm %s mat %s none %s tlo %s thi %s tab %s"
+          % (_pc_h0.get("reason_code"), _pc_shp.get("reason_code"),
+             _pc_perm.get("reason_code"), _pc_mat.get("reason_code"),
+             _pc_none.get("reason_code"), _pc_tlo.get("reason_code"),
+             _pc_thi.get("reason_code"), _pc_ntab.get("reason_code")))
+
+    _pc_edge = _call("magnetics_powder_curve",
+                     {"material": "Kool Mu", "permeability": 60,
+                      "shape_family": "Toroids", "temperature_c": 150.0}, 1949)
+    _pc_edgev = _pc_edge.get("value") or {}
+    _pc_end = _call("magnetics_powder_curve",
+                    {"material": "Kool Mu", "permeability": 60,
+                     "temperature_c": 200.0}, 1950)
+    _pc_far = _call("magnetics_powder_curve",
+                    {"material": "Kool Mu", "permeability": 60,
+                     "shape_family": "Toroids", "h_oe": 1000.0}, 1951)
+    check("the answered-but-flagged cases stay answered and flagged: 150 C is inside "
+          "the range this tool evaluates and OUTSIDE the -50..100 C band the catalog "
+          "tabulates, so it returns a number with inside_printed_dynamic_range=false; "
+          "200 C is accepted as the printed rating; and 1000 Oe is outside the "
+          "1-300 Oe the graphs plot, so inside_plotted_band is false rather than the "
+          "H being clamped",
+          _pc_edge.get("status") == "ok"
+          and _pc_edgev.get("inside_printed_dynamic_range") is False
+          and any("outside the -50..100 C band" in w
+                  for w in _pc_edgev.get("warnings") or [])
+          and _pc_end.get("status") == "ok"
+          and ((_pc_end.get("value") or {}).get("inside_printed_dynamic_range")
+               is False)
+          and ((_pc_far.get("value") or {}).get("inside_plotted_band") is False),
+          "150 C %s, 200 C %s, 1000 Oe inside %s"
+          % (_pc_edgev.get("inside_printed_dynamic_range"),
+             ((_pc_end.get("value") or {}).get("inside_printed_dynamic_range")),
+             ((_pc_far.get("value") or {}).get("inside_plotted_band"))))
+
+    _pc_var = _call("magnetics_powder_curve",
+                    {"material": "High DC Bias XFlux", "permeability": 26,
+                     "h_oe": 50.0}, 1952)
+    _pc_turn = _call("magnetics_powder_curve",
+                     {"material": "Kool Mu", "permeability": 60,
+                      "shape_family": "Toroids", "turns": 40,
+                      "dc_current_a": 2.0, "le_mm": 50.0}, 1953)
+    _pc_mix = _pc_refuse({"material": "Kool Mu", "permeability": 60,
+                          "shape_family": "Toroids", "h_oe": 10.0,
+                          "turns": 40, "dc_current_a": 2.0, "le_mm": 50.0}, 1954)
+    check("the winding route gives the same H the catalog's own relation gives "
+          "(0.4*pi*N*I/le = 20.106 Oe for 40 turns, 2 A, 50 mm) and is refused when "
+          "both routes are supplied; the High DC Bias variant blocks are reachable "
+          "without a shape family and are not cross-checked against the standard "
+          "grade's DC-bias fit, which is a different curve",
+          abs(((_pc_turn.get("value") or {}).get("h_oe") or 0) - 20.1062) < 1e-3
+          and _pc_mix.get("reason_code") == "ARG_INVALID"
+          and _pc_var.get("status") == "ok"
+          and (_pc_var.get("value") or {}).get("material") == "High DC Bias XFlux"
+          and (_pc_var.get("value") or {}).get("b_t_from_dc_bias_integral") is None
+          and "different curve" in ((_pc_var.get("value") or {})
+                                    .get("cross_check_note") or ""),
+          "H %s, mix %s, variant %s" % ((_pc_turn.get("value") or {}).get("h_oe"),
+                                        _pc_mix.get("reason_code"),
+                                        _pc_var.get("status")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
