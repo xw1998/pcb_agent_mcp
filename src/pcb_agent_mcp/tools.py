@@ -3691,6 +3691,7 @@ def _capabilities(_args):
             "magnetics_inductor", "magnetics_dcm", "magnetics_core_loss",
             "magnetics_material_core_loss",
             "magnetics_winding_ac", "magnetics_fringing_loss",
+            "magnetics_toroid_mlt",
             "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
@@ -3786,8 +3787,8 @@ def _capabilities(_args):
             "permeabilities x nine material columns (1923 purchasable part numbers, "
             "printed p.155-197) and select_core picks them when "
             "include_powder_cores=true (default false). What that table still does "
-            "NOT carry: a mean turn length (so no toroid copper estimate), a discrete "
-            "gap (a powder core has none - AL is the distributed-gap value), the "
+            "NOT carry: a mean turn length, a discrete gap (a powder core has none - "
+            "AL is the distributed-gap value), the "
             "nominal part weight (only Ve x density x factor, an estimate), and a "
             "Bsat per temperature (the catalog prints one value per column with no "
             "temperature against it). The DC-BIAS rolloff arrived in 0.0.77: "
@@ -3806,7 +3807,15 @@ def _capabilities(_args):
             "cannot reach L at the bias is rejected as dc_bias_unreachable with the "
             "maximum it does reach. A design landing outside the 10-800 Oe the curves "
             "are drawn over is flagged h_within_printed_band=false instead of being "
-            "presented as a reading. "
+            "presented as a reading. The TOROID copper that 0.0.76-0.0.78 refused "
+            "arrived in 0.0.79: no catalog prints a mean turn length for a toroid, "
+            "because a turn's length belongs to the winding, so magnetics_toroid_mlt "
+            "(and select_core(toroid_mlt='estimate')) multiplies the geometric "
+            "section perimeter 2*H + (OD-ID) by the ratio thirteen printed toroid "
+            "data sheets measure for a real winding (1.248-1.461, median 1.366, "
+            "data/toroid_mlt_reference.json) and reports an INTERVAL - plus "
+            "R_dc, copper loss and the single-layer turn count the bore allows. It "
+            "is an estimate and says so; nothing here is a printed length. "
             "No saturation CURVE of a real "
             "material: only a single Bsat per published temperature, never "
             "interpolated between them. Gapped-core fringing loss IS computed since "
@@ -7864,6 +7873,13 @@ _tool(
         "dc_bias_data_path": _str("override the DC-bias fit table path (testing)"),
         "dc_bias_turns_max": _num("how many turns the bias search will look at "
                                   "before calling a part unreachable", 1000),
+        "toroid_mlt": _str("off (default) or estimate. A toroid's catalog prints no "
+                           "mean turn length, so estimate multiplies the geometric "
+                           "section perimeter 2*H + (OD - ID) by the measured "
+                           "printed-MLT ratio band of thirteen toroids (1.248-1.461) "
+                           "and reports r_dc / copper loss as estimates WITH their "
+                           "range. Off is the 0.0.78 answer byte for byte",
+                           list(_magnetics.TOROID_MLT_MODES), "off"),
     }, "required": ["inductance_h", "i_peak_a"]},
     lambda a: _magnetics.select_core(
         a.get("inductance_h"), a.get("i_peak_a"),
@@ -7890,7 +7906,8 @@ _tool(
         dc_bias_current_a=a.get("dc_bias_current_a"),
         dc_bias_data_path=a.get("dc_bias_data_path"),
         dc_bias_turns_max=(a["dc_bias_turns_max"]
-                           if a.get("dc_bias_turns_max") is not None else 1000)),
+                           if a.get("dc_bias_turns_max") is not None else 1000),
+        toroid_mlt=(a.get("toroid_mlt") or "off")),
 )
 
 _tool(
@@ -7947,6 +7964,53 @@ _tool(
         le_mm=a.get("le_mm"),
         bias_data_path=a.get("bias_data_path"),
         include_b=(True if a.get("include_b") is None else bool(a.get("include_b")))),
+)
+
+_tool(
+    "magnetics_toroid_mlt",
+    "Mean length of one turn on a toroid, and the DC copper loss that follows - the "
+    "number a toroid's catalog does not print, because a turn's length belongs to the "
+    "WINDING (wire diameter, how the turns lie, how many layers) and not to the core. "
+    "So this is geometry plus a MEASURED band, never a lookup: the perimeter of the "
+    "core's section read as a rectangle, flat = 2*H + (OD - ID), times the ratio that "
+    "thirteen toroids with BOTH dimensions and MLT printed on their data sheets show "
+    "for a real winding (1.248 .. 1.461, median 1.366 - data/toroid_mlt_reference.json, "
+    "with the URL of every row). The answer is an interval and is marked as one; a "
+    "single number would be a guess in the vendor's clothes. It also returns the "
+    "geometry the dimensions imply, including the two relations that were checked "
+    "against those thirteen pages: le = pi*(OD+ID)/2 reproduces the printed path "
+    "length within 0.6 %, while Ae = H*(OD-ID)/2 runs 4-10 % above the printed Ae "
+    "because the printed section has rounded corners. With a wire: the single-layer "
+    "turn count the bore allows (N1 = pi*(ID-d)/d), the number of layers `turns` "
+    "implies, R_dc at temperature_c and, with i_rms_a, the copper loss and the "
+    "fill-factor window check - each carrying the MLT band as a range. NOT modelled: "
+    "enamel and reinforcement build (a real N1 is a little lower), multilayer length "
+    "growth (later layers are longer, so R_dc is a LOWER bound once turns > N1), skin "
+    "and proximity (magnetics_winding_ac), and any temperature rise.",
+    {"type": "object", "properties": {
+        "od_mm": _num("outside diameter of the bare core, mm (magnetic_data with "
+                      "kind='powder_parts' has it per part)"),
+        "id_mm": _num("inside diameter (the bore the wire has to pass), mm"),
+        "ht_mm": _num("height of the core, mm"),
+        "turns": _num("optional: turns, to get R_dc and the layer count"),
+        "wire_diameter_mm": _num("optional: bare copper diameter; required by turns, "
+                                 "i_rms_a and fill_factor"),
+        "i_rms_a": _num("optional: RMS current, to turn R_dc into a copper loss"),
+        "temperature_c": _num("copper temperature, which sets the resistivity "
+                              "(20 C = 1.724e-8 ohm m)", 100.0),
+        "fill_factor": _num("optional: copper fraction of the bore, to check the "
+                            "winding window"),
+        "mlt_data_path": _str("override the MLT reference table path (testing)"),
+    }, "required": ["od_mm", "id_mm", "ht_mm"]},
+    lambda a: _magnetics.magnetics_toroid_mlt(
+        a.get("od_mm"), a.get("id_mm"), a.get("ht_mm"),
+        turns=a.get("turns"),
+        wire_diameter_mm=a.get("wire_diameter_mm"),
+        i_rms_a=a.get("i_rms_a"),
+        temperature_c=(a["temperature_c"] if a.get("temperature_c") is not None
+                       else 100.0),
+        fill_factor=a.get("fill_factor"),
+        mlt_data_path=a.get("mlt_data_path")),
 )
 
 _tool(

@@ -436,7 +436,7 @@ class TestTheAnswer(unittest.TestCase):
 
 class TestTheTool(unittest.TestCase):
     def test_the_tool_is_registered_and_the_count_moved_by_one(self):
-        self.assertEqual(len(tools.TOOLS), 176)
+        self.assertEqual(len(tools.TOOLS), 177)
         self.assertIn("magnetics_dc_bias", tools.TOOLS)
         spec = tools.TOOLS["magnetics_dc_bias"]
         props = spec["inputSchema"]["properties"]

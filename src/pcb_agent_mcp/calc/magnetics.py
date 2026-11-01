@@ -1767,6 +1767,8 @@ def _powder_core_rows(data, material=None, permeability=None):
     """
     cols = data.get("column_order") or []
     props = data.get("material_properties_printed_page_16") or {}
+    _mlt_doc, _mlt_why = _load_toroid_mlt(None)
+    mlt_band = _toroid_mlt_band(_mlt_doc) if _mlt_doc is not None else None
     p10 = (data.get("material_comparison_printed_page_10") or {}).get("rows") or {}
     density_rows = props.get("rows") or {}
     factors = props.get("permeability_density_factors_60u") or {}
@@ -1834,9 +1836,26 @@ def _powder_core_rows(data, material=None, permeability=None):
                                  "gap - change the permeability or the turns instead"),
                     "aw_mm2": geo.get("window_area_mm2"),
                     "mlt_mm": None,
+                    "mlt_flat_rect_mm": (
+                        _fmt(toroid_flat_rect_mm(od, size["id_mm"], size["ht_mm"]))
+                        if (od and size.get("id_mm") and size.get("ht_mm"))
+                        else None),
+                    "mlt_estimate_mm": (
+                        _toroid_mlt_estimate(od, size["id_mm"], size["ht_mm"],
+                                             mlt_band)["estimate_mm"]
+                        if (mlt_band is not None and od and size.get("id_mm")
+                            and size.get("ht_mm")) else None),
+                    "mlt_range_mm": (
+                        _toroid_mlt_estimate(od, size["id_mm"], size["ht_mm"],
+                                             mlt_band)["range_mm"]
+                        if (mlt_band is not None and od and size.get("id_mm")
+                            and size.get("ht_mm")) else None),
                     "mlt_note": ("the catalog prints no mean turn length for the "
                                  "toroids, and a toroid's MLT depends on the winding "
-                                 "build, so copper resistance is not estimated here"),
+                                 "build, so copper resistance is not taken from this "
+                                 "table; mlt_estimate_mm is the geometric section "
+                                 "perimeter times a measured band (see "
+                                 "magnetics_toroid_mlt), not a printed value"),
                     "mass_g": _fmt(mass) if mass is not None else None,
                     "mass_basis": mass_note,
                     "bsat_typical_t": (p10.get(col) or {}).get("sat_flux_density_t"),
@@ -1975,6 +1994,341 @@ def _magnetic_data_powder(kind, material=None, permeability=None, limit=None,
          "gap": "distributed - there is no discrete gap and AL cannot be trimmed",
          "mlt": "not printed, so no copper estimate is made from this table"},
         {"table_path": POWDER_PATH})
+
+# --------------------------------------------------------------------------
+# 0.0.79: a toroid's mean length per turn, and the copper it costs
+#
+# data/magnetic_materials.json carries the coil former's "average length of turn"
+# for the pot and E cores, so select_core can turn a winding into a DC resistance
+# for them. The toroids have no such column, and the reason is not an oversight of
+# the catalog: a toroid's turn length is a property of the WINDING - wire diameter,
+# how the turns lie, how many layers - not of the core alone. The catalog prints
+# neither the length nor the winding it would belong to, so this build does not
+# invent one.
+#
+# What the geometry does give exactly is the perimeter of the core's own section
+# read as a rectangle,
+#
+#     flat = 2*H + (OD - ID)      [mm]
+#
+# which is the shortest closed loop that can enclose that section. A real turn is
+# longer: the wire stands off the surface by its own radius, the turns spread
+# around the ring and may go into several layers. How much longer is measurable,
+# which is what data/toroid_mlt_reference.json is for: thirteen powder toroids
+# whose data sheets print BOTH the dimensions and the MLT, so the ratio
+#
+#     mlt_printed / flat  =  1.248 .. 1.461, median 1.366   (n = 13)
+#
+# is a measured band on real windings rather than a formula. The calculators
+# therefore multiply the geometric perimeter by that band and say so: an interval,
+# never a single number dressed up as the vendor's own.
+#
+# Two relations used here are cross-checked on the same thirteen pages:
+# le = pi*(OD+ID)/2 reproduces the printed magnetic path length within 0.6 %, and
+# Ae = H*(OD-ID)/2 runs 4-10 % above the printed Ae because the printed section has
+# rounded corners and the rectangle over-fills it. Both are reported, neither is
+# used to replace a printed value that exists.
+
+TOROID_MLT_PATH = os.path.join(os.path.dirname(DATA_PATH),
+                               "toroid_mlt_reference.json")
+TOROID_MLT_SCHEMA = "toroid-mlt-reference"
+TOROID_MLT_MODES = ("off", "estimate")
+TOROID_MLT_SOURCE = ("Amidon / Profi-Electronic data-sheet pages for the T-type "
+                     "(Micrometals) powder toroids")
+
+
+def _load_toroid_mlt(path=None):
+    """(data, None) or (None, why-not). The schema is checked, not assumed."""
+    p = path or TOROID_MLT_PATH
+    if not os.path.exists(p):
+        return None, "toroid MLT reference table missing: " + p
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        return None, "toroid MLT reference table unreadable: %s" % exc
+    if data.get("schema") != TOROID_MLT_SCHEMA:
+        return None, ("toroid MLT reference table has schema %r, not %r"
+                      % (data.get("schema"), TOROID_MLT_SCHEMA))
+    if not data.get("rows"):
+        return None, "toroid MLT reference table has no rows"
+    return data, None
+
+
+def toroid_flat_rect_mm(od_mm, id_mm, ht_mm):
+    """2*H + (OD - ID): the perimeter of the core section read as a rectangle."""
+    return 2.0 * float(ht_mm) + (float(od_mm) - float(id_mm))
+
+
+def _toroid_mlt_band(data):
+    """The measured MLT / flat-rectangle ratio band, computed from the rows.
+
+    Computed here instead of being stored in the file, so that the summary cannot
+    drift away from the rows it summarises.
+    """
+    ratios = []
+    for row in data.get("rows") or []:
+        try:
+            od = float(row["od_mm"])
+            idm = float(row["id_mm"])
+            ht = float(row["ht_mm"])
+            mlt = float(row["mlt_mm"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        flat = toroid_flat_rect_mm(od, idm, ht)
+        if flat <= 0 or mlt <= 0:
+            continue
+        ratios.append((row.get("model"), mlt / flat))
+    if not ratios:
+        return None
+    vals = sorted(v for (_m, v) in ratios)
+    n = len(vals)
+    median = vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+    return {"n": n, "ratio_min": vals[0], "ratio_median": median,
+            "ratio_max": vals[-1], "models": [m for (m, _v) in ratios]}
+
+
+def _toroid_mlt_estimate(od_mm, id_mm, ht_mm, band):
+    """The geometric perimeter, the band, and the interval - never one number alone."""
+    flat = toroid_flat_rect_mm(od_mm, id_mm, ht_mm)
+    lo = flat * band["ratio_min"]
+    mid = flat * band["ratio_median"]
+    hi = flat * band["ratio_max"]
+    return {
+        "flat_rect_mm": _fmt(flat),
+        "estimate_mm": _fmt(mid),
+        "range_mm": [_fmt(lo), _fmt(hi)],
+        "ratio": {"min": _fmt(band["ratio_min"]),
+                  "median": _fmt(band["ratio_median"]),
+                  "max": _fmt(band["ratio_max"]), "n": band["n"]},
+        "is_estimate": True,
+        "basis": ("flat rectangle 2*H + (OD - ID) = %s mm, times the measured "
+                  "printed-MLT / flat ratio of %d toroids (%s .. %s, median %s)"
+                  % (_fmt(flat), band["n"], _fmt(band["ratio_min"]),
+                     _fmt(band["ratio_max"]), _fmt(band["ratio_median"]))),
+    }
+
+
+def copper_resistance_ohm(turns, mean_length_mm, wire_area_mm2, temperature_c):
+    """R = rho(T) * N * MLT / A_cu. The same expression the former path uses."""
+    rho = COPPER_RESISTIVITY_OHM_M * (1.0 + COPPER_TEMPCO_PER_K
+                                      * (float(temperature_c) - 20.0))
+    return (rho * float(turns) * float(mean_length_mm) * 1e-3
+            / (float(wire_area_mm2) * 1e-6))
+
+
+def magnetics_toroid_mlt(od_mm, id_mm, ht_mm, turns=None, wire_diameter_mm=None,
+                         i_rms_a=None, temperature_c=100.0, fill_factor=None,
+                         mlt_data_path=None):
+    """Mean length per turn of a toroid, and the DC copper loss that follows.
+
+    The catalog for a toroid prints no mean turn length, and the reason is real:
+    the length of one turn depends on the winding, not on the core. So this is not
+    a lookup - it is the geometry plus a MEASURED band:
+
+        flat = 2*H + (OD - ID)        the section read as a rectangle
+        MLT  = flat x (1.248 .. 1.461, median 1.366)
+
+    the interval coming from thirteen toroids whose data sheets print both the
+    dimensions and an MLT (data/toroid_mlt_reference.json). The answer is therefore
+    an interval and is marked as one; a single number would be a guess wearing the
+    vendor's clothes.
+
+    With a wire: the single-layer turn count the bore allows (N1 = pi*(ID-d)/d),
+    the layers implied by `turns`, R_dc at `temperature_c` and, with `i_rms_a`, the
+    copper loss - all three carrying the MLT band as a range. Not modelled: enamel
+    and reinforcement build, multilayer length growth (later layers are longer, so
+    R_dc is biased low for turns > N1), skin and proximity (magnetics_winding_ac),
+    and any temperature rise.
+    """
+    try:
+        od = _f("od_mm", od_mm)
+        idm = _f("id_mm", id_mm)
+        ht = _f("ht_mm", ht_mm)
+        temp = _f("temperature_c", temperature_c)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    if od <= 0 or idm <= 0 or ht <= 0:
+        return err("od_mm, id_mm and ht_mm must all be > 0", "ARG_RANGE")
+    if idm >= od:
+        return err("id_mm (%g) must be smaller than od_mm (%g)" % (idm, od),
+                   "ARG_RANGE",
+                   hint="the bore has to be a hole: with ID >= OD there is no core "
+                        "section for a turn to enclose")
+    data, why = _load_toroid_mlt(mlt_data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="data/toroid_mlt_reference.json ships with the package")
+    band = _toroid_mlt_band(data)
+    if band is None:
+        return err("the reference table has no row carrying od_mm, id_mm, ht_mm and "
+                   "mlt_mm together, so no band can be measured", "DATA_UNAVAILABLE")
+
+    le = math.pi * (od + idm) / 2.0
+    ae = ht * (od - idm) / 2.0
+    window = math.pi * (idm / 2.0) ** 2
+    mlt = _toroid_mlt_estimate(od, idm, ht, band)
+    value = {
+        "geometry": {
+            "od_mm": _fmt(od), "id_mm": _fmt(idm), "ht_mm": _fmt(ht),
+            "le_mm": _fmt(le), "ae_mm2": _fmt(ae), "ve_mm3": _fmt(le * ae),
+            "window_area_mm2": _fmt(window),
+            "le_basis": ("pi*(OD+ID)/2, which reproduces the printed Le of the %d "
+                         "reference toroids within 0.6 %%" % band["n"]),
+            "ae_basis": ("H*(OD-ID)/2, the rectangular view: the printed Ae of those "
+                         "same toroids runs 4-10 % lower because the section has "
+                         "rounded corners"),
+            "window_basis": ("pi*(ID/2)^2, the bore - a toroid is wound through the "
+                             "hole, so this is the window the wire has to pass"),
+        },
+        "mlt": mlt,
+        "not_modelled": [
+            "the wire build: bare copper only - enamel and reinforcement add to the "
+            "diameter that has to pass the bore, so a real single-layer count is a "
+            "little below N1",
+            "the winding spread: the band is thirteen printed (dimensions, MLT) pairs "
+            "of powder toroids; a loose or multilayer coil sits above the upper "
+            "bound, a tight single layer near the middle",
+            "skin and proximity: the resistance here is the ohmmeter value at "
+            "temperature_c (magnetics_winding_ac gives the AC/DC ratio)",
+            "temperature rise: nothing here says how hot the copper or the core gets",
+            "insulation, litz, foil and bundling",
+        ],
+    }
+
+    if wire_diameter_mm is None:
+        if turns is not None or i_rms_a is not None or fill_factor is not None:
+            return err("turns, i_rms_a and fill_factor all need a wire: pass "
+                       "wire_diameter_mm", "ARG_INVALID")
+        return ok(
+            value, "mm of wire per turn",
+            "MLT = (2*H + (OD - ID)) x measured printed-MLT ratio band",
+            "data/toroid_mlt_reference.json - thirteen powder toroids whose data "
+            "sheets print both the dimensions and the MLT (%s, fetched 2026-11-01)"
+            % TOROID_MLT_SOURCE,
+            "the geometry is exact arithmetic; the MLT is a measured band (%s .. %s "
+            "about the flat rectangle, median %s), so it is reported as an interval "
+            "and not as a point value"
+            % (_fmt(band["ratio_min"]), _fmt(band["ratio_max"]),
+               _fmt(band["ratio_median"])),
+            {"mlt": ("an estimate with a stated interval, never a vendor number: no "
+                     "catalog prints an MLT for a toroid"),
+             "dimensions": ("OD / ID / H of the bare core, which is what a turn has "
+                            "to enclose")})
+
+    try:
+        d = _f("wire_diameter_mm", wire_diameter_mm)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    if d <= 0:
+        return err("wire_diameter_mm must be > 0", "ARG_RANGE")
+    if d >= idm:
+        return err("a wire of %g mm will not pass a bore of %g mm" % (d, idm),
+                   "ARG_RANGE",
+                   hint="every turn has to go through the hole once")
+    area = math.pi * d * d / 4.0
+    n1 = int(math.floor(math.pi * (idm - d) / d))
+    if n1 < 1:
+        return err("a wire of %g mm leaves no room for even one turn in a bore of "
+                   "%g mm" % (d, idm), "ARG_RANGE")
+
+    winding = {
+        "wire_diameter_mm": _fmt(d),
+        "wire_area_mm2": _fmt(area),
+        "single_layer_max_turns": n1,
+        "single_layer_basis": ("N1 = pi*(ID - d)/d: one layer of round wire through "
+                               "the bore, so the turns share the inner circumference"),
+        "mlt_mm": mlt["estimate_mm"],
+        "mlt_range_mm": mlt["range_mm"],
+        "mlt_is_estimate": True,
+        "turns": None, "layers": None,
+        "r_dc_ohm": None, "r_dc_range_ohm": None,
+        "p_copper_w": None, "p_copper_range_w": None,
+    }
+    if turns is not None:
+        try:
+            n = _f("turns", turns)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if n < 1:
+            return err("turns must be >= 1", "ARG_RANGE")
+        if abs(n - round(n)) > 1e-9:
+            return err("turns must be a whole number, not %g" % n, "ARG_RANGE",
+                       hint="a winding has an integer number of turns")
+        n = int(round(n))
+        layers = int(math.ceil(n / float(n1)))
+        r_mid = copper_resistance_ohm(n, mlt["estimate_mm"], area, temp)
+        winding["turns"] = n
+        winding["layers"] = layers
+        winding["r_dc_ohm"] = _fmt(r_mid)
+        winding["r_dc_range_ohm"] = [
+            _fmt(copper_resistance_ohm(n, mlt["range_mm"][0], area, temp)),
+            _fmt(copper_resistance_ohm(n, mlt["range_mm"][1], area, temp))]
+        winding["r_dc_basis"] = ("rho at %g C x N x MLT / bare copper area; the range "
+                                 "is the MLT band, not a tolerance on rho" % temp)
+        if layers > 1:
+            winding["multilayer_note"] = (
+                "%d turns over %d layers: later layers are longer than the first, so "
+                "this r_dc is biased LOW - the band was measured on printed "
+                "single-winding values" % (n, layers))
+        if i_rms_a is not None:
+            try:
+                irms = _f("i_rms_a", i_rms_a)
+            except ValueError as exc:
+                return err(str(exc), "ARG_INVALID")
+            if irms <= 0:
+                return err("i_rms_a must be > 0", "ARG_RANGE")
+            winding["i_rms_a"] = _fmt(irms)
+            winding["p_copper_w"] = _fmt(irms ** 2 * r_mid)
+            winding["p_copper_range_w"] = [
+                _fmt(irms ** 2 * r) for r in winding["r_dc_range_ohm"]]
+            winding["p_copper_basis"] = ("i_rms^2 * r_dc, DC only (skin and proximity "
+                                         "are magnetics_winding_ac)")
+        if fill_factor is not None:
+            try:
+                ku = _f("fill_factor", fill_factor)
+            except ValueError as exc:
+                return err(str(exc), "ARG_INVALID")
+            if not (0 < ku <= 1):
+                return err("fill_factor must be in (0, 1]", "ARG_RANGE")
+            needed = n * area / ku
+            winding["fill_factor"] = ku
+            winding["window_area_mm2"] = _fmt(window)
+            winding["window_area_needed_mm2"] = _fmt(needed)
+            winding["window_fits"] = bool(needed <= window)
+            winding["window_basis"] = ("copper area / fill factor against the bore "
+                                       "area; the bore is the vendor's, the fill "
+                                       "factor is yours")
+            if not winding["window_fits"]:
+                winding["window_note"] = (
+                    "%d turns of %s mm wire need %s mm2 of window at fill factor %s "
+                    "against the %s mm2 the bore has, so this winding cannot be put "
+                    "on this core at all - the resistance above is what that many "
+                    "turns WOULD measure, not what can be wound"
+                    % (n, _fmt(d), _fmt(needed), _fmt(ku), _fmt(window)))
+    elif i_rms_a is not None or fill_factor is not None:
+        return err("i_rms_a and fill_factor need turns as well as a wire",
+                   "ARG_INVALID")
+    value["winding"] = winding
+
+    return ok(
+        value, "mm per turn, ohm, watt",
+        "MLT = (2*H + (OD - ID)) x measured printed-MLT ratio band; "
+        "R_dc = rho(T)*N*MLT/A_cu; P_cu = I_rms^2*R_dc",
+        "data/toroid_mlt_reference.json - thirteen powder toroids whose data sheets "
+        "print both the dimensions and the MLT (%s, fetched 2026-11-01); the "
+        "resistance is the same rho(T) expression select_core uses for a former"
+        % TOROID_MLT_SOURCE,
+        "exact arithmetic on the numbers given, except the MLT, which is a measured "
+        "band (%s .. %s about the flat rectangle) - so r_dc and p_copper are "
+        "reported with their range and are not point answers"
+        % (_fmt(band["ratio_min"]), _fmt(band["ratio_max"])),
+        {"mlt": ("an estimate with a stated interval, never a vendor number: no "
+                 "catalog prints an MLT for a toroid"),
+         "wire": "bare copper at temperature_c; build and enamel are not included",
+         "layers": ("later layers are longer than the first, so a multilayer answer "
+                    "is a lower bound on r_dc")})
+
 
 def magnetic_data(kind="materials", name=None, material=None, shape=None,
                   vendor=None, data_path=None, permeability=None, limit=None,
@@ -2429,7 +2783,7 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                 flux_waveform="sine", duty=None, include_powder_cores=False,
                 permeability=None, powder_data_path=None,
                 dc_bias_current_a=None, dc_bias_data_path=None,
-                dc_bias_turns_max=DC_BIAS_TURNS_MAX):
+                dc_bias_turns_max=DC_BIAS_TURNS_MAX, toroid_mlt="off"):
     """Choose a real core for an (L, Ipk) requirement, or say why none fits.
 
     The two constraints that decide the turns:
@@ -2477,6 +2831,17 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
     which more turns buy less inductance, and a part that cannot reach L at all is
     rejected as `dc_bias_unreachable` with the maximum it can reach rather than being
     given a turn count that does not work.
+
+    `toroid_mlt` (0.0.79, default "off") answers the copper question for a
+    TOROID, which 0.0.76-0.0.78 refused because the catalog prints no mean turn
+    length for one. The length of a turn on a toroid belongs to the winding, not to
+    the core, so it cannot be looked up - but the geometry gives the perimeter of
+    the core's section read as a rectangle, 2*H + (OD - ID), and thirteen toroids
+    whose data sheets print both the dimensions and the MLT measure how much longer
+    a real turn is (1.248 to 1.461 times, median 1.366). With "estimate" each toroid
+    row gets that interval, its r_dc, its copper loss and the single-layer turn
+    count the bore allows - all flagged as an estimate. Off is the 0.0.78 answer
+    byte for byte, which is why this is a flag and not a new default.
 
     What is refused rather than guessed: saturation at a temperature the material
     does not publish; a gap length when the material's mu_i is unknown; core loss
@@ -2579,6 +2944,28 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         return err("permeability only applies to powder cores", "ARG_INVALID",
                    hint="a solid core's AL is fixed by its part number; pass "
                         "include_powder_cores=True to select a toroid by permeability")
+
+    # --- 0.0.79: the toroid mean turn length. Loaded only when asked for, so the
+    # default path reads exactly the files 0.0.78 read.
+    if toroid_mlt is None:
+        toroid_mlt = "off"
+    if toroid_mlt not in TOROID_MLT_MODES:
+        return err("toroid_mlt must be one of %s"
+                   % ", ".join(repr(m) for m in TOROID_MLT_MODES), "ARG_INVALID",
+                   hint="off keeps the 0.0.78 answer byte for byte; estimate "
+                        "multiplies each toroid's geometric section perimeter by the "
+                        "measured printed-MLT ratio band and reports an interval")
+    mlt_band = None
+    if toroid_mlt == "estimate":
+        mlt_data, mlt_why = _load_toroid_mlt(None)
+        if mlt_data is None:
+            return err(mlt_why, "DATA_UNAVAILABLE",
+                       hint="data/toroid_mlt_reference.json ships with the package; "
+                            "drop toroid_mlt to keep the winding answer wire-free")
+        mlt_band = _toroid_mlt_band(mlt_data)
+        if mlt_band is None:
+            return err("the toroid MLT reference table has no row carrying od_mm, "
+                       "id_mm, ht_mm and mlt_mm together", "DATA_UNAVAILABLE")
 
     # --- 0.0.78: the DC-bias loop. Only the powder families have a printed fit,
     # so asking for a bias without them in the pool would silently answer the
@@ -2897,15 +3284,56 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
             rectx = {"i_rms_a": _fmt(irms), "current_density_a_mm2": j,
                      "wire_area_mm2": _fmt(a_wire),
                      "copper_area_mm2": _fmt(a_wire * n)}
-            if core.get("mlt_mm"):
+            mlt_mm = core.get("mlt_mm")
+            mlt_est = None
+            if not mlt_mm and mlt_band is not None and core.get("od_mm") \
+                    and core.get("id_mm") and core.get("ht_mm"):
+                mlt_est = _toroid_mlt_estimate(core["od_mm"], core["id_mm"],
+                                               core["ht_mm"], mlt_band)
+                mlt_mm = mlt_est["estimate_mm"]
+            if mlt_mm:
                 rho = COPPER_RESISTIVITY_OHM_M * (1.0 + COPPER_TEMPCO_PER_K
                                                   * (temp - 20.0))
-                r_dc = rho * n * float(core["mlt_mm"]) * 1e-3 / (a_wire * 1e-6)
+                r_dc = rho * n * float(mlt_mm) * 1e-3 / (a_wire * 1e-6)
                 rectx["r_dc_ohm"] = _fmt(r_dc)
                 rectx["p_copper_w"] = _fmt(irms ** 2 * r_dc)
                 rectx["p_copper_basis"] = ("rho at %g C, N * mean-turn-length / wire "
                                            "area, DC only (skin/proximity: "
                                            "magnetics_winding_ac)" % temp)
+                if mlt_est is not None:
+                    rectx["mlt_mm"] = mlt_mm
+                    rectx["mlt_range_mm"] = mlt_est["range_mm"]
+                    rectx["mlt_is_estimate"] = True
+                    rectx["mlt_basis"] = mlt_est["basis"]
+                    rectx["r_dc_range_ohm"] = [
+                        _fmt(rho * n * float(v) * 1e-3 / (a_wire * 1e-6))
+                        for v in mlt_est["range_mm"]]
+                    rectx["p_copper_basis"] += ("; the mean turn length is an "
+                                                "ESTIMATE - the band is in "
+                                                "mlt_range_mm, and r_dc_range_ohm "
+                                                "follows it")
+                    d_wire = math.sqrt(4.0 * a_wire / math.pi)
+                    rectx["wire_diameter_from_area_mm"] = _fmt(d_wire)
+                    rectx["single_layer_max_turns"] = None
+                    rectx["layers"] = None
+                    if d_wire < float(core["id_mm"]):
+                        n1 = int(math.floor(math.pi
+                                            * (float(core["id_mm"]) - d_wire)
+                                            / d_wire))
+                        if n1 >= 1:
+                            rectx["single_layer_max_turns"] = n1
+                            rectx["layers"] = int(math.ceil(n / float(n1)))
+                            rectx["layers_basis"] = (
+                                "N1 = pi*(ID - d)/d from the bore and the wire "
+                                "diameter implied by i_rms/current_density; a "
+                                "toroid is wound through the bore")
+                            if rectx["layers"] > 1:
+                                rectx["layers_note"] = (
+                                    "%d turns over %d layers: later layers are "
+                                    "longer than the first, so r_dc is biased LOW "
+                                    "and the printed band (measured on single "
+                                    "windings) is not an upper bound any more"
+                                    % (n, rectx["layers"]))
             else:
                 rectx["p_copper_w"] = None
                 rectx["missing_wire"] = (core.get("mlt_note") or
@@ -3006,8 +3434,13 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
             "a powder core's DC-bias roll-off: a powder core's AL falls with DC "
             "premagnetisation too, and the printed AL is the unbiased value - only the "
             "Bsat point is judged, exactly as for the solid cores",
-            "copper loss for a toroid: the catalog prints no mean turn length, so this "
-            "build does not estimate one",
+            ("copper loss for a toroid: the catalog prints no mean turn length, and "
+             "a turn's length belongs to the winding - pass toroid_mlt='estimate' to "
+             "multiply the geometric section perimeter by a measured band"
+             if toroid_mlt == "off" else
+             "copper loss for a toroid: estimated from the measured MLT band, not "
+             "from a printed length, so it carries an interval rather than one "
+             "number"),
             "fringing at a gap: a powder core has no discrete gap, so magnetics_fringing_loss "
             "does not apply to these parts",
         ])
@@ -3046,6 +3479,32 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         out["not_modelled"] = [
             t for t in out["not_modelled"]
             if not t.startswith("a powder core's DC-bias roll-off")]
+    if toroid_mlt == "estimate":
+        toroids = [r for r in shown
+                   if (r.get("winding") or {}).get("mlt_is_estimate")]
+        out["toroid_mlt"] = {
+            "mode": "estimate",
+            "how": ("MLT = (2*H + (OD - ID)) x the measured printed-MLT ratio band, "
+                    "then R_dc = rho(T)*N*MLT/A_cu"),
+            "ratio_band": {"min": _fmt(mlt_band["ratio_min"]),
+                           "median": _fmt(mlt_band["ratio_median"]),
+                           "max": _fmt(mlt_band["ratio_max"]),
+                           "n": mlt_band["n"],
+                           "source": TOROID_MLT_SOURCE},
+            "rows_with_an_estimate": len(toroids),
+            "rows_without_one": ([r["part"] for r in shown
+                                  if (r.get("winding") or {}).get("mlt_is_estimate")
+                                  is not True] if shown else []),
+            "why_only_toroids": ("a solid core in this table carries the coil "
+                                 "former's printed average turn length, which is the "
+                                 "vendor's own number and is used as such"),
+            "not_a_printed_value": ("no catalog prints an MLT for a toroid: the "
+                                    "band is a measurement of other toroids, so every "
+                                    "number derived from it is an estimate"),
+            "band_note": ("the band is 1.248 .. 1.461 about the rectangle, so r_dc and "
+                          "p_copper carry that spread; a multilayer winding sits "
+                          "above the top of it"),
+        }
     if powder_info:
         out["core_pool"] = powder_info
         out["core_pool"]["note"] = ("powder parts carry a printed Bsat for their column "
@@ -3105,8 +3564,9 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
 #     L(N) ~ N^2 / (a + b*(k*N)^c)    with k = 0.4*pi*I/le[cm]
 #
 # whose derivative changes sign at N^c = 2a/((c-2)*b*k^c) when c > 2: more turns
-# eventually buy LESS inductance, because mu falls faster than N^2 rises. 78 of
-# the 125 printed rows have c > 2, so this is the common case, not a corner. A
+# eventually buy LESS inductance, because mu falls faster than N^2 rises. 86 of
+# the 125 printed rows have c > 2 (39 are monotone), so this is the common case,
+# not a corner. A
 # naive fixed point on such a row can oscillate or walk to the wrong branch, so
 # the search below is bracketed instead: locate the peak, bisect for the first
 # turn count that reaches L, then step up only as far as the flux needs.

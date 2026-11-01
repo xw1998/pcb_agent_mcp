@@ -315,7 +315,7 @@ class WaveformAndRegistration(unittest.TestCase):
         self.assertNotIn("units", t["inputSchema"]["properties"])
         self.assertEqual(t["inputSchema"]["properties"]["shape"]["enum"],
                          sorted(M.LOSS_FIT_SHAPES))
-        self.assertEqual(len(tools.TOOLS), 176)
+        self.assertEqual(len(tools.TOOLS), 177)
         caps = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_material_core_loss", caps["available"])
 

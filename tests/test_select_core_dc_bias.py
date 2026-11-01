@@ -373,7 +373,7 @@ class TestTheToolSurface(unittest.TestCase):
         self.assertNotIn("a fixed point 0.0.77 does not", text)
 
     def test_the_tool_count_did_not_move(self):
-        self.assertEqual(len(tools.TOOLS), 176)
+        self.assertEqual(len(tools.TOOLS), 177)
 
 
 if __name__ == "__main__":

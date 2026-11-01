@@ -631,7 +631,7 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # 175 = 174 + magnetics_material_core_loss in 0.0.74 (a vendor's printed
         # per-permeability fit is a different object from a material-level
         # Steinmetz triple, so it is its own tool rather than a new argument)
-        self.assertEqual(len(tools.TOOLS), 176)
+        self.assertEqual(len(tools.TOOLS), 177)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

@@ -4814,9 +4814,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (176 tools now), so an agent that asks what can be computed is "
+          "table (177 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 176
+          len(_tools.TOOLS) == 177
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -4991,8 +4991,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (176 tools now)",
-          len(_tools.TOOLS) == 176
+          "table (177 tools now)",
+          len(_tools.TOOLS) == 177
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5256,8 +5256,9 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is still "
-          "176, because 0.0.78 adds arguments and no tool",
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 177, "
+          "because 0.0.78 added arguments and no tool while 0.0.79 adds exactly one "
+          "(magnetics_toroid_mlt)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5265,11 +5266,154 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 176,
+          and len(_tools.TOOLS) == 177,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
              _dcb_r5.get("reason_code"), len(_tools.TOOLS)))
+
+    # ---- 0.0.79: the toroid mean turn length and the copper it buys ------
+    from .calc import magnetics as _mg
+
+    _tm_free = _call("magnetics_toroid_mlt",
+                     {"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10}, 1900)
+    _tm_v = _tm_free.get("value") or {}
+    _tm_mlt = _tm_v.get("mlt") or {}
+    _tm_geo = _tm_v.get("geometry") or {}
+    _tm_printed = 43.9        # the T106-1 data sheet's own printed mlt, in mm
+    check("a toroid's mean turn length is geometry times a MEASURED band, never a "
+          "single number: T106-1 (OD 26.92 / ID 14.48 / H 11.10) gives the flat "
+          "section 34.64 mm, a band of 43.218817 .. 50.590750 mm about the median "
+          "1.365936 of 13 printed ratios, and the vendor's own printed 43.9 mm falls "
+          "INSIDE that band - which is the only way this may be quoted as an estimate",
+          _tm_free.get("status") == "ok"
+          and abs(_tm_mlt.get("flat_rect_mm", 0) - 34.64) < 1e-9
+          and abs(_tm_mlt.get("estimate_mm", 0) - 47.31602) < 1e-4
+          and _tm_mlt.get("range_mm") == [43.218817, 50.59075]
+          and _tm_mlt.get("ratio", {}).get("n") == 13
+          and _tm_mlt.get("is_estimate") is True
+          and _tm_mlt["range_mm"][0] <= _tm_printed <= _tm_mlt["range_mm"][1]
+          and abs(_tm_geo.get("le_mm", 0) - 65.030968) < 1e-5
+          and abs(_tm_geo.get("ae_mm2", 0) - 69.042) < 1e-5,
+          "flat %s estimate %s range %s n %s"
+          % (_tm_mlt.get("flat_rect_mm"), _tm_mlt.get("estimate_mm"),
+             _tm_mlt.get("range_mm"), _tm_mlt.get("ratio", {}).get("n")))
+
+    _tm_fake = _mg._toroid_mlt_band({"rows": [
+        {"model": "made-up", "od_mm": 10.0, "id_mm": 5.0, "ht_mm": 2.0,
+         "mlt_mm": 27.0}]})
+    check("the band is MEASURED from the rows on every call rather than stored in "
+          "the file: one fabricated row (flat 4 + 5 = 9 mm against a 27 mm turn) "
+          "moves the median to 3.0 and the count to 1, so a wrong table would move "
+          "the answer instead of hiding behind a cached summary",
+          _tm_fake is not None and _tm_fake["n"] == 1
+          and abs(_tm_fake["ratio_median"] - 3.0) < 1e-12
+          and abs(_tm_fake["ratio_min"] - 3.0) < 1e-12,
+          "n %s median %s" % ((_tm_fake or {}).get("n"),
+                              (_tm_fake or {}).get("ratio_median")))
+
+    _tm_w = _call("magnetics_toroid_mlt",
+                  {"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10, "turns": 54,
+                   "wire_diameter_mm": 1.0, "i_rms_a": 5.0,
+                   "fill_factor": 0.4}, 1901)
+    _tm_wv = (_tm_w.get("value") or {}).get("winding") or {}
+    # independent arithmetic, written here and not read from the answer:
+    # rho = 1.724e-8 * (1 + 0.00393*80), R = rho*N*MLT/A_cu
+    _tm_rho = 1.724e-8 * (1.0 + 0.00393 * 80.0)
+    _tm_r = _tm_rho * 54 * 47.31602e-3 / (_math.pi * 0.5 * 0.5 * 1e-6)
+    check("the copper follows from the estimated length and nothing else: 54 turns of "
+          "1.0 mm wire on that core give N1=42 through the bore, 2 layers (flagged as "
+          "a LOW bias), R_dc 0.073719 ohm against an independent rho(100 C)*N*MLT/A of "
+          "%.6f, and 1.842964 W at 5 A rms" % _tm_r,
+          abs(_tm_r - 0.073719) < 2e-6
+          and abs(_tm_wv.get("r_dc_ohm", 0) - 0.073719) < 1e-6
+          and _tm_wv.get("single_layer_max_turns") == 42
+          and _tm_wv.get("layers") == 2
+          and "biased LOW" in (_tm_wv.get("multilayer_note") or "")
+          and abs(_tm_wv.get("p_copper_w", 0) - 1.842964) < 1e-5
+          and _tm_wv.get("window_fits") is True
+          and _tm_wv["r_dc_range_ohm"][0] < _tm_wv["r_dc_ohm"]
+          < _tm_wv["r_dc_range_ohm"][1],
+          "r %s independent %.7f N1 %s layers %s p %s"
+          % (_tm_wv.get("r_dc_ohm"), _tm_r, _tm_wv.get("single_layer_max_turns"),
+             _tm_wv.get("layers"), _tm_wv.get("p_copper_w")))
+
+    _tm_cold = _call("magnetics_toroid_mlt",
+                     {"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10,
+                      "turns": 54, "wire_diameter_mm": 1.0,
+                      "temperature_c": 20.0}, 1902)
+    _tm_rc = ((_tm_cold.get("value") or {}).get("winding") or {}).get("r_dc_ohm") or 0
+    check("temperature enters as copper does and not as a fudge: the same winding at "
+          "20 C is 0.056085 ohm, exactly 1/1.3144 of the 100 C answer",
+          abs(_tm_rc - 0.056085) < 1e-6
+          and abs((_tm_wv.get("r_dc_ohm") or 0) / _tm_rc - (1.0 + 0.00393 * 80.0))
+          < 1e-3,
+          "20 C %s, ratio %.6f" % (_tm_rc, (_tm_wv.get("r_dc_ohm") or 0) / _tm_rc))
+
+    def _tm_refuse(args, rid):
+        return _call("magnetics_toroid_mlt", args, rid)
+
+    _tm_bore = _tm_refuse({"od_mm": 14.48, "id_mm": 26.92, "ht_mm": 11.10}, 1903)
+    _tm_wire = _tm_refuse({"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10,
+                           "wire_diameter_mm": 20.0}, 1904)
+    _tm_nowire = _tm_refuse({"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10,
+                             "turns": 10}, 1905)
+    _tm_nan = _tm_refuse({"od_mm": "big", "id_mm": 14.48, "ht_mm": 11.10}, 1906)
+    _tm_half = _tm_refuse({"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10,
+                           "turns": 10.5, "wire_diameter_mm": 1.0}, 1907)
+    _tm_noi = _tm_refuse({"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10,
+                          "wire_diameter_mm": 1.0, "i_rms_a": 5.0}, 1908)
+    _tm_notab = _tm_refuse({"od_mm": 26.92, "id_mm": 14.48, "ht_mm": 11.10,
+                            "mlt_data_path": "data/no_such_mlt.json"}, 1909)
+    check("every way to ask an impossible toroid question is its own refusal, never a "
+          "quiet number: ID>=OD ARG_RANGE, a wire wider than the bore ARG_RANGE, turns "
+          "without a wire ARG_INVALID, a non-numeric diameter ARG_INVALID, half a turn "
+          "ARG_RANGE, a current without turns ARG_INVALID, a missing band table "
+          "DATA_UNAVAILABLE",
+          _tm_bore.get("reason_code") == "ARG_RANGE"
+          and _tm_wire.get("reason_code") == "ARG_RANGE"
+          and _tm_nowire.get("reason_code") == "ARG_INVALID"
+          and _tm_nan.get("reason_code") == "ARG_INVALID"
+          and _tm_half.get("reason_code") == "ARG_RANGE"
+          and _tm_noi.get("reason_code") == "ARG_INVALID"
+          and _tm_notab.get("reason_code") == "DATA_UNAVAILABLE",
+          "bore %s wire %s nowire %s nan %s half %s noi %s notab %s"
+          % tuple(_tm.get("reason_code") for _tm in
+                  (_tm_bore, _tm_wire, _tm_nowire, _tm_nan, _tm_half, _tm_noi,
+                   _tm_notab)))
+
+    _tm_args = {"inductance_h": 1e-4, "i_peak_a": 5.0, "i_rms_a": 1.0,
+                "current_density_a_mm2": 4.0, "include_powder_cores": True,
+                "material": "MPP", "permeability": 60, "limit": 2}
+    _tm_off = _call("magnetics_select_core", dict(_tm_args), 1910)
+    _tm_omitted = _call("magnetics_select_core", dict(_tm_args), 1911)
+    _tm_on = _call("magnetics_select_core", dict(_tm_args, toroid_mlt="estimate"),
+                   1912)
+    _tm_bad = _call("magnetics_select_core", dict(_tm_args, toroid_mlt="maybe"), 1913)
+    _tm_row_off = (_tm_off.get("value") or {}).get("candidates", [{}])[0]
+    _tm_row_on = (_tm_on.get("value") or {}).get("candidates", [{}])[0]
+    _tm_woff = _tm_row_off.get("winding") or {}
+    _tm_won = _tm_row_on.get("winding") or {}
+    check("select_core(toroid_mlt='estimate') is the 0.0.78 answer plus a winding and "
+          "changes nothing else: passing 'off' is byte-identical to omitting the "
+          "argument, the off answer still has p_copper_w=null with the old sentence "
+          "naming the missing length, and the on answer adds an estimated MLT with its "
+          "range while the part, the turns and the flux are untouched",
+          json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted, sort_keys=True)
+          and _tm_woff.get("p_copper_w") is None
+          and "no mean turn length" in (_tm_woff.get("missing_wire") or "")
+          and _tm_won.get("mlt_is_estimate") is True
+          and _tm_won.get("r_dc_ohm") is not None
+          and _tm_won["mlt_range_mm"][0] < _tm_won["mlt_mm"] < _tm_won["mlt_range_mm"][1]
+          and _tm_row_on.get("part") == _tm_row_off.get("part")
+          and _tm_row_on.get("turns") == _tm_row_off.get("turns")
+          and _tm_bad.get("reason_code") == "ARG_INVALID"
+          and len(_tools.TOOLS) == 177,
+          "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
+          % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
+                                                              sort_keys=True),
+             _tm_woff.get("p_copper_w"), _tm_won.get("mlt_mm"),
+             _tm_row_off.get("part"), _tm_row_on.get("part"), len(_tools.TOOLS)))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
