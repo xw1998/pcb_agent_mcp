@@ -4353,6 +4353,141 @@ def selftest():
           "exponent %s, expectation %s" % (_ah_rq.get("dlnr_dlnrho"),
                                            _ah_rqc.get("beta_expectation")))
 
+    # ---- 0.0.69: a pulse train is not one frequency. Each harmonic dissipates
+    # I_k^2*R(f_k) in the SAME copper, so the POWERS add - and the DC term sees
+    # the whole cross-section while the top harmonic sees a skin. One harmonic
+    # must still be exactly the one-frequency answer, which is the check that
+    # says the new branch is the same arithmetic and not a re-derivation.
+    _h1 = _call("ac_self_heating", {"shape": "sheet", "length_mm": 20.0,
+                                   "width_mm": 1.0, "thickness_um": 35.0,
+                                   "frequency_hz": 1.0e6, "current_a": 3.0,
+                                   "rth_c_per_w": 20.0}, 1851).get("value") or {}
+    _h1s = _call("ac_self_heating", {"shape": "sheet", "length_mm": 20.0,
+                                    "width_mm": 1.0, "thickness_um": 35.0,
+                                    "harmonics": [{"frequency_hz": 1.0e6,
+                                                   "current_a": 3.0}],
+                                    "rth_c_per_w": 20.0}, 1852).get("value") or {}
+    check("one harmonic IS the one-frequency answer: dT 1.83292 K, P 0.0916456 W "
+          "and dlnR/dlnrho 0.986895 come out bit for bit identical, because the "
+          "sum uses the same (I^2*Rth)*R grouping and takes the exponent straight "
+          "from _beta_at when there is one term",
+          _h1.get("delta_t_c") == _h1s.get("delta_t_c")
+          and _h1.get("power_w") == _h1s.get("power_w")
+          and _h1.get("dlnr_dlnrho") == _h1s.get("dlnr_dlnrho")
+          and abs((_h1s.get("delta_t_c") or 0) - 1.83292) < 1e-5,
+          "dT %s vs %s, P %s vs %s"
+          % (_h1.get("delta_t_c"), _h1s.get("delta_t_c"),
+             _h1.get("power_w"), _h1s.get("power_w")))
+
+    # A buck's ripple on a 20 mm trace: 1 A DC carrying 84 % of the power plus
+    # four harmonics. Both simplifications are near the truth here, which is the
+    # control that keeps the two checks below from being "always large".
+    _buck = _call("ac_self_heating", {
+        "shape": "sheet", "length_mm": 20.0, "width_mm": 1.0,
+        "thickness_um": 35.0, "rth_c_per_w": 60.0, "dc_current_a": 1.0,
+        "harmonics": [{"frequency_hz": 5.0e5, "current_a": 0.4},
+                      {"frequency_hz": 1.5e6, "current_a": 0.13},
+                      {"frequency_hz": 2.5e6, "current_a": 0.07},
+                      {"frequency_hz": 3.5e6, "current_a": 0.04}]}, 1853)
+    _bv = _buck.get("value") or {}
+    _bc = _bv.get("checks") or {}
+    _bdc = [t for t in (_bv.get("terms") or []) if t.get("kind") == "dc"]
+    check("a buck ripple (1 A DC + 4 harmonics, 5 terms) answers 25.7157 C from "
+          "P = 0.0119286 W at 1.08784 A RMS; the DC term carries 84.44 % of the "
+          "power and sees R/R_dc = 1 exactly, while the 3.5 MHz term sees 1.07919",
+          _buck.get("status") == "ok"
+          and abs((_bv.get("t_final_c") or 0) - 25.7157) < 1e-3
+          and abs((_bv.get("power_w") or 0) - 0.0119286) < 1e-8
+          and abs((_bv.get("rms_current_a") or 0) - 1.08784) < 1e-4
+          and len(_bv.get("terms") or []) == 5
+          and len(_bdc) == 1 and _bdc[0].get("r_over_rdc_hot") == 1.0
+          and abs((_bdc[0].get("power_share") or 0) - 0.8444) < 1e-4,
+          "T %s C, P %s W, terms %s"
+          % (_bv.get("t_final_c"), _bv.get("power_w"),
+             len(_bv.get("terms") or [])))
+
+    # The same current all above 1 GHz: the exponent becomes exactly 1/2, and
+    # both simplifications are now badly wrong - 95 % for the DC model and
+    # 10 % LOW for one frequency, because the 2 GHz term is charged 1 GHz's R.
+    _hf = _call("ac_self_heating", {
+        "shape": "sheet", "length_mm": 20.0, "width_mm": 1.0,
+        "thickness_um": 35.0, "rth_c_per_w": 40.0,
+        "harmonics": [{"frequency_hz": 1.0e9, "current_a": 1.0},
+                      {"frequency_hz": 2.0e9, "current_a": 0.6}]}, 1854)
+    _hf = _hf.get("value") or {}
+    _hfc = _hf.get("checks") or {}
+    check("an all-skin spectrum (1 GHz 1 A + 2 GHz 0.6 A) gives dlnR/dlnrho = 0.5 "
+          "with beta_deviation 8e-11 against the power-weighted expectation, and "
+          "the two simpler models are 94.66 % off (all DC, and it UNDERSTATES) "
+          "and 10.05 % off (one frequency, also UNDERSTATES)",
+          abs((_hf.get("dlnr_dlnrho") or 0) - 0.5) < 1e-9
+          and _hfc.get("beta_expectation") == 0.5
+          and abs((_hfc.get("beta_deviation") or 1) - 0.0) < 1e-6
+          and abs((_hfc.get("all_dc_model_rel_diff") or 0) - 0.9466) < 5e-4
+          and abs((_hfc.get("single_frequency_model_rel_diff") or 0) - 0.1005) < 5e-4
+          and _hfc.get("single_frequency_model_direction") == "under",
+          "exponent %s, dev %s, dc %s, one-f %s (%s)"
+          % (_hf.get("dlnr_dlnrho"), _hfc.get("beta_deviation"),
+             _hfc.get("all_dc_model_rel_diff"),
+             _hfc.get("single_frequency_model_rel_diff"),
+             _hfc.get("single_frequency_model_direction")))
+
+    # The negative control for the whole branch: 9 A of DC and 9 A of 100 Hz
+    # current, EACH alone below the runaway threshold (gain 0.6272, settles at
+    # 436.5 K), together above it. Anything that looked at the largest term, or
+    # at the RMS current at one frequency, would call this safe.
+    _nar = {"shape": "sheet", "length_mm": 20.0, "width_mm": 0.1,
+            "thickness_um": 35.0, "rth_c_per_w": 20.0}
+    _one9 = _call("ac_self_heating", dict(_nar, frequency_hz=100.0,
+                                         current_a=9.0), 1855)
+    _both9 = _call("ac_self_heating", dict(_nar, dc_current_a=9.0,
+                                          harmonics=[{"frequency_hz": 100.0,
+                                                      "current_a": 9.0}]), 1856)
+    check("9 A DC plus 9 A at 100 Hz runs away (cold gain 1.2544) although EACH "
+          "alone settles (gain 0.6272 at 436.506 K): the loop gain of a spectrum "
+          "ADDS, and the message says g(dT) = dT - Rth*P(dT) instead of the "
+          "one-frequency formula",
+          abs((((_one9.get("value") or {}).get("delta_t_c")) or 0) - 436.506) < 1e-2
+          and _both9.get("reason_code") == "THERMAL_RUNAWAY"
+          and abs((_both9.get("runaway_gain_cold") or 0) - 1.2544) < 1e-4
+          and "Rth*P(dT)" in (_both9.get("message") or ""),
+          "alone dT %s, both %s gain %s"
+          % (((_one9.get("value") or {}).get("delta_t_c")),
+             _both9.get("reason_code"), _both9.get("runaway_gain_cold")))
+
+    # A spectrum is refused where it would have to be guessed at, and the
+    # exponent of the sum is an identity with the exponents of its parts - not a
+    # fit, so any drift there is a bug in the measurement and not physics.
+    _sp_both = _call("ac_self_heating", {"shape": "sheet", "length_mm": 20.0,
+                                        "width_mm": 1.0, "thickness_um": 35.0,
+                                        "rth_c_per_w": 20.0, "current_a": 1.0,
+                                        "frequency_hz": 1.0e6,
+                                        "harmonics": [{"frequency_hz": 1.0e6,
+                                                       "current_a": 1.0}]}, 1857)
+    _sp_dup = _call("ac_self_heating", {"shape": "sheet", "length_mm": 20.0,
+                                       "width_mm": 1.0, "thickness_um": 35.0,
+                                       "rth_c_per_w": 20.0,
+                                       "harmonics": [{"frequency_hz": 1.0e6,
+                                                      "current_a": 1.0},
+                                                     {"frequency_hz": 1.0e6,
+                                                      "current_a": 2.0}]}, 1858)
+    _sp_dc = _call("ac_self_heating", {"shape": "sheet", "length_mm": 20.0,
+                                      "width_mm": 1.0, "thickness_um": 35.0,
+                                      "rth_c_per_w": 20.0,
+                                      "dc_current_a": 3.0}, 1859)
+    check("a spectrum refuses current_a AND harmonics together, two entries at "
+          "one frequency (phasors, and this model has no phase) and a DC-only "
+          "call; the measured exponent of the sum equals the power-weighted mean "
+          "of its parts to 1e-9",
+          _sp_both.get("reason_code") == "ARG_INVALID"
+          and _sp_dup.get("reason_code") == "ARG_INVALID"
+          and _sp_dc.get("reason_code") == "ARG_INVALID"
+          and _hfc.get("dlnr_dlnrho") == _hfc.get("dlnP_dlnrho_weighted_check"),
+          "%s / %s / %s, weighted %s vs %s"
+          % (_sp_both.get("reason_code"), _sp_dup.get("reason_code"),
+             _sp_dc.get("reason_code"), _hfc.get("dlnr_dlnrho"),
+             _hfc.get("dlnP_dlnrho_weighted_check")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

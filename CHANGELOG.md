@@ -9,6 +9,80 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.69] - 2026-11-01
+
+**一个脉冲串不是一个频率**（`ac_self_heating` 新增 `harmonics` / `dc_current_a`）。0.0.68 让它接受
+"一个频率 + 一个电流"，但最需要问这句话的场合恰恰不是单频：buck 的纹波、PWM 方波的边沿、
+DC 偏置上叠一条几百 kHz。把这些折成"一个频率 + 一个 RMS 电流"是行业里常见的偷懒，这一版
+**把偷懒的代价量出来**并给出替代。
+
+一句话结论：**每个谐波在同一根铜里各自耗散 `I_k²·R(f_k)`，所以功率相加、温度不相加；
+buck 纹波偷懒只差 `0.0718 %`（可以偷懒），全 GHz 频谱差 `94.66 %`（全当 DC）与 `10.05 %`
+（全压最大那一项），而且两者都**低估**；9 A DC 与 9 A@100 Hz 各自稳到 `436.506 K`，
+合起来冷增益 `1.2544` 直接跑飞——回路增益是**相加**的。** 工具数棘轮**仍是 173**
+（同一个工具加参数，不是新工具）。
+
+### 判据为什么是这几条（每条都能失败）
+
+| 锚点 | 实测 | 它能抓住什么 |
+| --- | --- | --- |
+| **单谐波 ≡ 单频** | `dT 1.83292 K`、`P 0.0916456 W`、`β 0.986895` **逐位 `==`**；5 个形状维度全 `==`（sheet 1.58531 / 两面 0.788378 / 粗糙 1.61693 / 实心 0.506997 / 管 0.146779） | 任何"重新推一遍"而不是"同一套算术"的实现 |
+| 功率相加 | buck 5 项 `P = 0.0119286 W`、`I_rms = 1.08784 A`、`T = 25.7157 ℃` | 取最大项、或 RMS 乘单一电阻 |
+| DC 项看整个截面 | DC 项 `R/R_dc` **恰为 `1.0`**、功率占比 `0.8444`；3.5 MHz 项 `1.07919` | 给所有项乘同一个 `R/R_dc`（会让占 84 % 功率的那项凭空多 6.3 %） |
+| 指数是测量 + 恒等式 | 全高频 `β = 0.5`、`beta_deviation 7.97e-11`；`dlnP_dlnrho_weighted_check` 与实测恒等（容差 `1e-9`） | 硬编码 0.5、按项数平均、拿 `_sig` 后的功率加权 |
+| 两个简化模型 | buck `0.0718 %` / `0.0957 %`（**控制**：不是永远很大）；全高频 `94.66 %` / `10.05 %`，方向都是 `under` | 只报一个数不给方向；或把差读成误差棒 |
+| **负控制（增益相加）** | 9 A@100 Hz 单独：`gain 0.627201`、`dT 436.506 K`；**9 A DC + 9 A@100 Hz**：`THERMAL_RUNAWAY`、`gain_cold 1.2544`（= 两倍） | 只看最大一项、或先算 RMS 再查表——都会判成安全 |
+| transition 不猜 | 1 MHz / 35 µm：`regime transition` ⇒ `beta_expectation = null` + 说明（实测 β 0.987） | 把 0.987 就近说成 1 |
+| 14 条拒绝 | `current_a`+`harmonics` 同给、顶层 `frequency_hz`+`harmonics`、空表、**只给 `dc_current_a`**、**同频两条电流**、0 Hz、未知键、缺电流、缺频率、负幅值 ×2、非 list、条目非 object、>32 条 | 每一处都是"频谱可以被猜"的地方 |
+
+「同一频率两条电流」必须拒：两条同频电流要按**相量**相加，本模型没有相位；
+把幅值相加最多把损耗高估 2 倍。「只给 `dc_current_a`」也必须拒：那是
+`electrothermal_conductor` / `electrothermal_trace` 的活（这条的判断要排在
+`current_a` 必填检查**之前**，否则先报 `ARG_REQUIRED`）。
+
+### 逐位不变是怎么做到的
+
+`(a)` 多频用 `Σ (I_k²·Rth)·R_k` 逐项累加——**逐项的 `k` 与 `r` 与单频路径的数字一字不差**，
+只是多了一项；`(b)` 只有一项时 β 直接返回 `_beta_at()`，不走 `w·b/tot`（那会在末位漂 1 ulp）。
+DC 项走 `_r_dc()`，`R_dc ∝ ρ` 一次方 ⇒ 它的 `dlnR/dlnρ` **精确是 1.0**。
+
+### 单频行为的可见变化（只有三处，数值一个没动）
+
+这是同一个工具改了内部，所以必须自证"既有答案没变"。做法：从 `8c0f9dd` 取出旧模块注入
+同一进程，22 个案例两边跑 JSON 对比 —— **9/22 逐字相同，13 个 DIFF 全部落在下面三处**：
+全部数值（`dT`/`P`/`β`/增益/迭代数/熔点余量）、所有 `checks`、runaway 文案**逐字未变**。
+
+| 变化 | 内容 |
+| --- | --- |
+| 新键 | `value.model_kind = "one_frequency"`（频谱是 `"spectrum"`）——两种模式 `value` 形状不同，需要判别键 |
+| `limits[5]` 尾部 | 原文一字未删，只在后面追加 `(harmonics=[{frequency_hz, current_a}], dc_current_a=<A>)` |
+| required 消息 | `current_a is required` → `… (for a spectrum give harmonics and/or dc_current_a)` |
+
+### 语义决策
+
+- 多频**不输出** `resistance_*` / `r_over_rdc_*` / `skin_depth_*` / `regime_*` /
+  `unit_gain_current_a` / `headroom_current`：这些键在多频下**没有对应物**，置 `None`
+  会被读成"算不出来"，所以直接不出现；代之以 `terms[]`（13 字段）+
+  `unit_gain_current_scale = sqrt(1/cold_gain)`（把每个幅值乘上它，冷增益正好到 1）。
+- 「全当 DC」叫 `all_dc_model_rel_diff`，**不叫** `dc_linear_model_rel_diff`——后者的语义是
+  "保持同一冷电阻、只丢掉指数"，多频丢的东西更多（连频率差一起丢），同名不能指两件事；
+  频谱结果里不出现 `dc_linear_model_*`（测试用 `assertNotIn` 锁死）。
+- 多频 `beta_expectation` 是**逐项指数的功率加权平均**（dc/wall-limited ⇒ 1.0，
+  skin-dominated ⇒ 0.5）；任一项落 `transition` ⇒ `null` + 列出是哪几个频率。
+- `harmonics` / `dc_current_a` **追加在签名末尾**，位置调用不破；schema 的 `required`
+  从 `["shape","frequency_hz","current_a","rth_c_per_w","length_mm"]` 收窄为
+  `["shape","rth_c_per_w","length_mm"]`（`current_a` 与 `frequency_hz` 现在是二选一），
+  但函数内部仍然"都不给 ⇒ `ARG_REQUIRED`"，所以没有静默默认。
+
+### 口径
+
+- 同模块加参数：**没碰任何其他工具的输出**；`electrothermal_conductor` 读数逐位不变。
+- `tests/test_acthermal.py` **62 → 95 例**（+33：等价性 6 案例 ×2 条 / 功率 6 / 指数 4 /
+  模型对比 3 / runaway 4 / 拒绝 14）；selftest `242/242` → **`247/247`**（+5 条自检）。
+- 成本：buck 五项频谱 **1.8 ms**；每项一次 `_one()`，成本线性于项数。
+- `dependencies = []` 仍成立（只用 `math`）。
+- 逐条口径见 [docs/72](docs/72-谐波电流的自热.md)。
+
 ## [0.0.68] - 2026-11-01
 
 **铜在频率上的自热**（`ac_self_heating`）。`calc_capabilities` 里那条 "nothing here turns a loss

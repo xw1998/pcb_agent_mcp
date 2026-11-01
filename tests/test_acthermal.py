@@ -549,6 +549,320 @@ class TestEnvelope(unittest.TestCase):
         self.assertIn("x_wall_hot", w)
 
 
+class TestSpectrumEquivalent(unittest.TestCase):
+    """`harmonics=[{f, I}]` must BE the one-frequency path.
+
+    That is the strongest statement available here: it is not "the two agree to
+    within the physics", it is the same arithmetic. The multi-frequency branch
+    sums (I^2*Rth)*R, which for one term is bit-for-bit k*R, and it takes the
+    exponent straight from `_beta_at` when there is only one term - so a
+    difference in ANY reported digit means the new branch has an extra rounding
+    step somewhere, and that is the bug this class exists to catch.
+    """
+
+    CASES = [
+        ("1 MHz", dict(SHEET, frequency_hz=1e6, rth_c_per_w=20.0), 3.0),
+        ("1 GHz", dict(SHEET, frequency_hz=1e9, rth_c_per_w=20.0), 3.0),
+        ("via", dict(shape="round", length_mm=1.6, drill_mm=0.3,
+                     plating_um=25.0, frequency_hz=1e9, rth_c_per_w=200.0), 0.5),
+        ("rough", dict(SHEET, frequency_hz=1e9, rth_c_per_w=20.0,
+                       roughness_rq_um=1.0), 3.0),
+        ("hot", dict(SHEET, frequency_hz=1e6, rth_c_per_w=20.0,
+                     t_ambient_c=125.0), 3.0),
+        ("two faces", dict(SHEET, frequency_hz=1e9, rth_c_per_w=20.0,
+                           faces="two"), 3.0),
+    ]
+
+    def test_one_harmonic_reproduces_the_single_frequency_answer_exactly(self):
+        for name, kw, cur in self.CASES:
+            with self.subTest(name):
+                kw = dict(kw)
+                f = kw.pop("frequency_hz")
+                single = _ok(self, frequency_hz=f, current_a=cur, **kw)
+                spec = _ok(self, harmonics=[{"frequency_hz": f,
+                                             "current_a": cur}], **kw)
+                a, b = single["value"], spec["value"]
+                for key in ("t_final_c", "delta_t_c", "power_w", "dlnr_dlnrho",
+                            "dlnr_dlnrho_cold", "runaway_gain",
+                            "runaway_gain_cold", "iterations", "melt_margin_c"):
+                    self.assertEqual(a[key], b[key], key)
+
+    def test_the_shared_checks_are_identical_too(self):
+        single = _ok(self, frequency_hz=1e9, current_a=3.0, rth_c_per_w=20.0,
+                     **SHEET)["value"]["checks"]
+        spec = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 3.0}],
+                   rth_c_per_w=20.0, **SHEET)["value"]["checks"]
+        for key in ("energy_balance_residual_k", "energy_balance_ok",
+                    "dlnr_dlnrho", "runaway_gain_at_solution", "power_w",
+                    "delta_t_c", "t_final_c"):
+            self.assertEqual(single[key], spec[key], key)
+
+
+class TestSpectrumPower(unittest.TestCase):
+    """The physics of a spectrum: the POWERS add, on the same copper."""
+
+    BUCK = [{"frequency_hz": 5e5, "current_a": 0.4},
+            {"frequency_hz": 1.5e6, "current_a": 0.13},
+            {"frequency_hz": 2.5e6, "current_a": 0.07},
+            {"frequency_hz": 3.5e6, "current_a": 0.04}]
+
+    def _buck(self):
+        return _ok(self, harmonics=self.BUCK, dc_current_a=1.0,
+                   rth_c_per_w=60.0, **SHEET)
+
+    def test_power_is_the_sum_of_i2r_over_the_terms(self):
+        v = self._buck()["value"]
+        total = sum(t["power_hot_w"] for t in v["terms"])
+        self.assertAlmostEqual(v["power_w"], total, delta=1e-5 * total)
+        self.assertEqual(len(v["terms"]), 5)          # 4 harmonics + 1 DC
+
+    def test_energy_balance_holds_on_the_root(self):
+        c = self._buck()["value"]["checks"]
+        self.assertTrue(c["energy_balance_ok"], c["energy_balance_residual_k"])
+
+    def test_rms_current_is_the_root_sum_of_squares(self):
+        v = self._buck()["value"]
+        exact = math.sqrt(1.0 + sum(h["current_a"] ** 2 for h in self.BUCK))
+        self.assertAlmostEqual(v["rms_current_a"], exact, delta=1e-5 * exact)
+
+    def test_the_dc_term_sees_the_whole_cross_section(self):
+        """R_dc = rho*L/(w*t) is not a skin solution: it is the full section, and
+        it must be BELOW every AC term's R at the same temperature."""
+        v = self._buck()["value"]
+        dc = [t for t in v["terms"] if t["kind"] == "dc"][0]
+        # rho(25.7 C) * 20 mm / (1 mm * 0.035 mm), ohm*mm -> ohm
+        rho20, alpha = 1.724e-8, 0.00393
+        rho_mm = rho20 * (1.0 + alpha * (v["t_final_c"] - 20.0)) * 1e3
+        exact = rho_mm * 20.0 / (1.0 * 0.035)
+        self.assertAlmostEqual(dc["resistance_hot_ohm"], exact, delta=1e-5 * exact)
+        self.assertEqual(dc["r_over_rdc_hot"], 1.0)
+        self.assertEqual(dc["regime_hot"], "dc")
+        for t in v["terms"]:
+            if t["kind"] == "ac":
+                self.assertGreater(t["r_over_rdc_hot"], 1.0)
+
+    def test_the_power_shares_add_up(self):
+        v = self._buck()["value"]
+        shares = [t["power_share"] for t in v["terms"]]
+        self.assertAlmostEqual(sum(shares), 1.0, delta=1e-3)   # 4-digit rounding
+        self.assertAlmostEqual(max(shares), 0.8444, delta=1e-4)  # the DC term
+        self.assertEqual(v["terms"][-1]["kind"], "dc")
+
+    def test_zero_current_spectrum_is_zero_rise(self):
+        r = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 0.0}],
+                dc_current_a=0.0, rth_c_per_w=20.0, **SHEET)
+        self.assertEqual(r["value"]["delta_t_c"], 0.0)
+        self.assertEqual(r["value"]["power_w"], 0.0)
+        self.assertEqual(r["value"]["iterations"], 0)
+
+
+class TestSpectrumExponent(unittest.TestCase):
+    """The exponent that decides runaway is the power-weighted one, and it is
+    measured on the SUM - so a mixed spectrum must land strictly between 1/2 and
+    1, and a pure one must reproduce its own value."""
+
+    def test_all_skin_dominated_gives_the_half(self):
+        r = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 1.0},
+                                 {"frequency_hz": 2e9, "current_a": 0.6}],
+                rth_c_per_w=40.0, **SHEET)
+        c = r["value"]["checks"]
+        self.assertEqual(r["value"]["dlnr_dlnrho"], 0.5)
+        self.assertEqual(c["beta_expectation"], 0.5)
+        self.assertLess(c["beta_deviation"], 1e-6)
+
+    def test_the_dc_term_carries_exactly_one(self):
+        v = _ok(self, harmonics=[{"frequency_hz": 1e6, "current_a": 3.0}],
+                dc_current_a=3.0, rth_c_per_w=20.0, **SHEET)["value"]
+        dc = [t for t in v["terms"] if t["kind"] == "dc"][0]
+        self.assertEqual(dc["dlnr_dlnrho_term"], 1.0)
+        ac = [t for t in v["terms"] if t["kind"] == "ac"][0]
+        self.assertLess(ac["dlnr_dlnrho_term"], 1.0)
+        # and the sum's exponent sits between the two, weighted by power
+        self.assertGreater(v["dlnr_dlnrho"], ac["dlnr_dlnrho_term"])
+        self.assertLess(v["dlnr_dlnrho"], 1.0)
+
+    def test_the_sum_exponent_is_the_power_weighted_mean_of_its_parts(self):
+        """An identity, not a fit: any drift is a bug in beta_p."""
+        for kw in (dict(harmonics=[{"frequency_hz": 1e9, "current_a": 1.0},
+                                   {"frequency_hz": 2e9, "current_a": 0.6}],
+                        rth_c_per_w=40.0),
+                   dict(harmonics=[{"frequency_hz": 5e5, "current_a": 0.4}],
+                        dc_current_a=1.0, rth_c_per_w=60.0),
+                   dict(harmonics=[{"frequency_hz": 1e6, "current_a": 3.0}],
+                        dc_current_a=3.0, rth_c_per_w=20.0)):
+            with self.subTest(kw=kw):
+                c = _ok(self, **dict(SHEET, **kw))["value"]["checks"]
+                self.assertTrue(c["dlnP_dlnrho_weighted_ok"],
+                                (c["dlnP_dlnrho_weighted_check"],
+                                 c["dlnr_dlnrho"]))
+
+    def test_a_transition_term_suppresses_the_expectation(self):
+        """1 MHz on 35 um copper is in the transition region, where the exponent
+        is neither 1/2 nor 1 - so there is nothing to compare against and the
+        module must say so instead of picking the nearer one."""
+        c = _ok(self, harmonics=[{"frequency_hz": 1e6, "current_a": 3.0}],
+                rth_c_per_w=20.0, **SHEET)["value"]["checks"]
+        self.assertIsNone(c["beta_expectation"])
+        self.assertIn("transition", c["beta_expectation_note"])
+
+
+class TestSpectrumModels(unittest.TestCase):
+    """What the two simpler models would have said. Both are reported as
+    DIFFERENCES - neither is an error bar."""
+
+    def test_lumping_a_spectrum_into_one_frequency_is_wrong_by_10_percent(self):
+        c = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 1.0},
+                                 {"frequency_hz": 2e9, "current_a": 0.6}],
+                rth_c_per_w=40.0, **SHEET)["value"]["checks"]
+        # all the RMS current at 1 GHz, where R is lower than at 2 GHz -> the
+        # single-frequency answer is SHORT of the truth
+        self.assertEqual(c["single_frequency_model_direction"], "under")
+        self.assertAlmostEqual(c["single_frequency_model_rel_diff"], 0.1005,
+                               delta=2e-4)
+
+    def test_lumping_a_spectrum_into_dc_is_wrong_by_95_percent(self):
+        c = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 1.0},
+                                 {"frequency_hz": 2e9, "current_a": 0.6}],
+                rth_c_per_w=40.0, **SHEET)["value"]["checks"]
+        self.assertAlmostEqual(c["all_dc_model_rel_diff"], 0.9466, delta=2e-4)
+        self.assertIn("terms[]", c["all_dc_model_note"])
+        # and it is deliberately NOT called dc_linear_model_*, which in the
+        # one-frequency branch answers a narrower question (R held fixed)
+        self.assertNotIn("dc_linear_model_rel_diff", c)
+
+    def test_a_mildly_dispersive_spectrum_is_barely_wrong_either_way(self):
+        """The same tool on a buck's ripple: the DC term dominates (84 % of the
+        power), so both simplifications are near the truth - this is the control
+        that shows the two checks above are not just always large."""
+        c = _ok(self, harmonics=[
+            {"frequency_hz": 5e5, "current_a": 0.4},
+            {"frequency_hz": 1.5e6, "current_a": 0.13},
+            {"frequency_hz": 2.5e6, "current_a": 0.07},
+            {"frequency_hz": 3.5e6, "current_a": 0.04}],
+            dc_current_a=1.0, rth_c_per_w=60.0, **SHEET)["value"]["checks"]
+        self.assertLess(c["all_dc_model_rel_diff"], 0.002)
+        self.assertLess(c["single_frequency_model_rel_diff"], 0.002)
+
+
+class TestSpectrumRunaway(unittest.TestCase):
+    """A spectrum is not a sum of separate problems: the loop gain ADDS."""
+
+    NARROW = dict(shape="sheet", length_mm=20.0, width_mm=0.1, thickness_um=35.0)
+
+    def test_each_half_settles_but_together_they_do_not(self):
+        """The negative control for the whole branch: 9 A of DC and 9 A of
+        100 Hz current, each alone below the runaway threshold, together above
+        it. Any implementation that took the largest term, or the RMS current at
+        one frequency, would get this wrong in the SAFE direction."""
+        alone = _ok(self, frequency_hz=100.0, current_a=9.0, rth_c_per_w=20.0,
+                    **self.NARROW)
+        self.assertLess(alone["value"]["runaway_gain_cold"], 1.0)
+        self.assertAlmostEqual(alone["value"]["delta_t_c"], 436.5061, delta=1e-2)
+
+        both = _call(harmonics=[{"frequency_hz": 100.0, "current_a": 9.0}],
+                     dc_current_a=9.0, rth_c_per_w=20.0, **self.NARROW)
+        self.assertEqual(both["status"], "error")
+        self.assertEqual(both["reason_code"], "THERMAL_RUNAWAY")
+        self.assertGreater(both["runaway_gain_cold"], 1.2)
+        self.assertIn("Rth*P(dT)", both["message"])
+
+    def test_the_gain_of_a_single_ac_term_is_quadratic_in_its_current(self):
+        a = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 1.0}],
+                rth_c_per_w=20.0, **SHEET)["value"]["runaway_gain_cold"]
+        b = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 2.0}],
+                rth_c_per_w=20.0, **SHEET)["value"]["runaway_gain_cold"]
+        self.assertAlmostEqual(b / a, 4.0, delta=0.02)   # 4x the heat, 2x the R
+
+    def test_the_scale_that_reaches_unit_cold_gain_squares_to_the_inverse(self):
+        v = _ok(self, harmonics=[{"frequency_hz": 1e9, "current_a": 1.0},
+                                 {"frequency_hz": 2e9, "current_a": 0.6}],
+                rth_c_per_w=40.0, **SHEET)["value"]
+        self.assertAlmostEqual(v["unit_gain_current_scale"] ** 2
+                               * v["runaway_gain_cold"], 1.0, delta=1e-4)
+
+    def test_a_spectrum_running_away_carries_no_single_current(self):
+        r = _call(harmonics=[{"frequency_hz": 100.0, "current_a": 9.0}],
+                  dc_current_a=9.0, rth_c_per_w=20.0, **self.NARROW)
+        self.assertIsNone(r.get("unit_gain_current_a"))
+        self.assertGreater(r["unit_gain_current_scale"], 0.0)
+        self.assertGreater(r["rth_for_root_at_melt_c_per_w"], 0.0)
+
+
+class TestSpectrumRefusals(unittest.TestCase):
+    """Every one of these is a place where a spectrum could be guessed at."""
+
+    def _err(self, code, **kw):
+        r = _call(**kw)
+        self.assertEqual(r["status"], "error", r)
+        self.assertEqual(r["reason_code"], code, r.get("message"))
+        return r
+
+    def test_current_and_harmonics_are_not_interchangeable(self):
+        r = self._err("ARG_INVALID", frequency_hz=1e6, current_a=1.0,
+                      harmonics=[{"frequency_hz": 1e6, "current_a": 1.0}],
+                      rth_c_per_w=20.0, **SHEET)
+        self.assertIn("not both", r["message"])
+
+    def test_top_level_frequency_with_harmonics(self):
+        self._err("ARG_INVALID", frequency_hz=1e6,
+                  harmonics=[{"frequency_hz": 1e6, "current_a": 1.0}],
+                  rth_c_per_w=20.0, **SHEET)
+
+    def test_empty_spectrum(self):
+        self._err("ARG_INVALID", harmonics=[], rth_c_per_w=20.0, **SHEET)
+
+    def test_dc_only_is_not_this_tool(self):
+        r = self._err("ARG_INVALID", dc_current_a=3.0, rth_c_per_w=20.0, **SHEET)
+        self.assertIn("electrothermal_conductor", r["message"])
+
+    def test_two_currents_at_one_frequency(self):
+        r = self._err("ARG_INVALID", rth_c_per_w=20.0,
+                      harmonics=[{"frequency_hz": 1e6, "current_a": 1.0},
+                                 {"frequency_hz": 1e6, "current_a": 2.0}],
+                      **SHEET)
+        self.assertIn("phasor", r["message"])
+
+    def test_a_harmonic_at_zero_hz(self):
+        r = self._err("BAD_PARAMETER", rth_c_per_w=20.0,
+                      harmonics=[{"frequency_hz": 0.0, "current_a": 1.0}],
+                      **SHEET)
+        self.assertIn("dc_current_a", r["message"])
+
+    def test_an_unknown_key_in_a_harmonic(self):
+        r = self._err("BAD_PARAMETER", rth_c_per_w=20.0,
+                      harmonics=[{"frequency_hz": 1e6, "current_a": 1.0,
+                                  "phase_deg": 30.0}], **SHEET)
+        self.assertIn("phase_deg", r["message"])
+
+    def test_a_harmonic_without_a_current(self):
+        self._err("ARG_REQUIRED", rth_c_per_w=20.0,
+                  harmonics=[{"frequency_hz": 1e6}], **SHEET)
+
+    def test_negative_harmonic_current(self):
+        self._err("ARG_RANGE", rth_c_per_w=20.0,
+                  harmonics=[{"frequency_hz": 1e6, "current_a": -1.0}], **SHEET)
+
+    def test_negative_dc_current(self):
+        self._err("ARG_RANGE", rth_c_per_w=20.0, dc_current_a=-1.0,
+                  harmonics=[{"frequency_hz": 1e6, "current_a": 1.0}], **SHEET)
+
+    def test_not_a_list(self):
+        self._err("BAD_PARAMETER", rth_c_per_w=20.0, harmonics=1e6, **SHEET)
+
+    def test_entry_not_an_object(self):
+        self._err("BAD_PARAMETER", rth_c_per_w=20.0, harmonics=[1e6], **SHEET)
+
+    def test_too_many_harmonics(self):
+        r = self._err("ARG_RANGE", rth_c_per_w=20.0,
+                      harmonics=[{"frequency_hz": float(k + 1), "current_a": 1e-3}
+                                 for k in range(40)], **SHEET)
+        self.assertIn("32", r["message"])
+
+    def test_a_spectrum_still_needs_an_rth(self):
+        self._err("ARG_REQUIRED", harmonics=[{"frequency_hz": 1e6,
+                                              "current_a": 1.0}], **SHEET)
+
+
 class TestRegistration(unittest.TestCase):
     def test_registered_and_listed(self):
         self.assertIn("ac_self_heating", T.TOOLS)
@@ -559,15 +873,22 @@ class TestRegistration(unittest.TestCase):
         d = T.TOOLS["ac_self_heating"]
         sch = d.get("inputSchema") or d
         props = sch["properties"]
-        for k in ("shape", "frequency_hz", "current_a", "rth_c_per_w",
+        for k in ("shape", "frequency_hz", "current_a", "harmonics",
+                  "dc_current_a", "rth_c_per_w",
                   "length_mm", "width_mm", "thickness_um", "thickness_mm",
                   "faces", "diameter_mm", "drill_mm", "plating_um", "wall_um",
                   "t_ambient_c", "mu_r", "roughness_rq_um", "alpha_per_k",
                   "rho20_ohm_m"):
             self.assertIn(k, props)
+        # current_a and frequency_hz left the required list in 0.0.69: they are
+        # one of two ways to say what the current is, and a client that saw them
+        # as required could never send a spectrum. The function itself still
+        # refuses a call with neither, so nothing is silently defaulted.
         self.assertEqual(sorted(sch["required"]),
-                         ["current_a", "frequency_hz", "length_mm",
-                          "rth_c_per_w", "shape"])
+                         ["length_mm", "rth_c_per_w", "shape"])
+        self.assertEqual(sch["properties"]["harmonics"]["maxItems"], 32)
+        self.assertEqual(sorted(sch["properties"]["harmonics"]["items"]["required"]),
+                         ["current_a", "frequency_hz"])
         self.assertEqual(sorted(props["shape"]["enum"]), ["round", "sheet"])
         self.assertEqual(sorted(props["faces"]["enum"]), ["one", "two"])
 

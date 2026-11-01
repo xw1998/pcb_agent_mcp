@@ -4056,8 +4056,11 @@ def _capabilities(_args):
             "resistance, AC loss (skin/proximity) - ac_sheet_resistance gives the "
             "1-D skin term of a FLAT sheet and ac_round_conductor the exact term "
             "for a round wire, tube or via; ac_self_heating (0.0.68) is the one "
-            "that closes the loop at frequency, but it does ONE conductor at ONE "
-            "frequency with the Rth you hand it - this 2-D plate is still DC - "
+            "that closes the loop at frequency, and since 0.0.69 it takes a "
+            "whole SPECTRUM (harmonics=[{frequency_hz, current_a}] + "
+            "dc_current_a: the powers add, the temperature does not), but it is "
+            "still ONE conductor with ONE lump Rth shared by every harmonic - "
+            "this 2-D plate is still DC - "
             "device self-heating inside sim_spice, "
             "reading the conductors or the zones straight off a board "
             "file - board_electrothermal takes geometry, it does not open the "
@@ -5712,7 +5715,17 @@ _tool(
     "temperature; with 1/2 the loop always has a mathematical fixed point, it is "
     "just usually above the melting point, and those two failures come back with "
     "different messages and different numbers (root_beyond_melt_c vs no root at "
-    "all), because they are not the same thing. Geometry: shape='sheet' means "
+    "all), because they are not the same thing. A PULSE TRAIN IS NOT ONE "
+    "FREQUENCY: give harmonics=[{frequency_hz, current_a}, ...] (RMS "
+    "magnitudes) and optionally dc_current_a, and the loop becomes "
+    "g(dT) = dT - Rth*sum_k I_k^2*R_k(T) - every harmonic dissipates in the "
+    "SAME copper, so the powers add and the temperatures do not, and the DC "
+    "term sees the whole cross-section while the top harmonic sees a skin. "
+    "The exponent that decides runaway is then measured on the SUM, i.e. it "
+    "is the power-weighted dlnP/dlnrho, and both what a DC-only model and "
+    "what a single-frequency model would have said are reported as "
+    "differences (dc_linear_model_rel_diff / single_frequency_model_rel_diff) "
+    "rather than as error bars. Geometry: shape='sheet' means "
     "length_mm + width_mm + exactly one of thickness_mm/thickness_um and "
     "faces='one' (microstrip) or 'two' (stripline); shape='round' means a solid "
     "diameter_mm, a tube diameter_mm + wall_um, or a via drill_mm + plating_um "
@@ -5721,7 +5734,8 @@ _tool(
     "via_array_thermal, plate_temperature or a measurement), and the same is "
     "true of the frequency - ask electrothermal_conductor for DC. Reported "
     "besides the temperature: resistance hot and cold, the growth ratio, the "
-    "regime, the loop gain at the answer, the current at which the cold gain "
+    "regime, the loop gain at the answer, the current (or, for a spectrum, "
+    "the factor every magnitude must be scaled by) at which the cold gain "
     "reaches 1, the Rth that would keep the root below melting, and an "
     "energy-balance residual measured on the actual root rather than assumed.",
     {"type": "object", "properties": {
@@ -5734,7 +5748,32 @@ _tool(
                                  "geometries means different physics"},
         "frequency_hz": _num("frequency, Hz. Required: without it this is the DC "
                             "loop, which is electrothermal_conductor"),
-        "current_a": _num("RMS current, A. Required"),
+        "current_a": _num("RMS current, A. Required unless harmonics is "
+                            "given: one frequency, one current"),
+        "harmonics": {"type": "array", "maxItems": 32,
+                      "description": "the current spectrum, for a pulse "
+                                     "train or a switching waveform: a "
+                                     "list of {frequency_hz, current_a} "
+                                     "RMS magnitudes, at most 32, no "
+                                     "duplicate frequencies (two currents "
+                                     "at one frequency need phasors and "
+                                     "this model has no phase). Exclusive "
+                                     "with current_a/frequency_hz",
+                      "items": {"type": "object",
+                                "properties": {
+                                    "frequency_hz": _num("harmonic "
+                                                         "frequency, Hz "
+                                                         "(> 0)"),
+                                    "current_a": _num("RMS magnitude of "
+                                                      "this harmonic, A "
+                                                      "(>= 0)")},
+                                "required": ["frequency_hz",
+                                             "current_a"],
+                                "additionalProperties": False}},
+        "dc_current_a": _num("the DC component of the current, A: R_dc = "
+                            "rho*L/A sees the whole cross-section, while "
+                            "every harmonic sees its own skin depth. May "
+                            "accompany current_a or harmonics"),
         "rth_c_per_w": _num("thermal resistance ambient->junction of the lump "
                             "you are describing, K/W. Required: a made-up Rth "
                             "would be the only number in this answer that was "
@@ -5776,8 +5815,7 @@ _tool(
         "alpha_per_k": _num("temperature coefficient of resistance, 1/K; omit for "
                             "0.00393 (IACS copper, linear 0..100 C)"),
         "rho20_ohm_m": _num("resistivity at 20 C, ohm*m; omit for 1.724e-8"),
-    }, "required": ["shape", "frequency_hz", "current_a", "rth_c_per_w",
-                    "length_mm"]},
+    }, "required": ["shape", "rth_c_per_w", "length_mm"]},
     lambda a: _at.ac_self_heating(
         a.get("shape"),
         a.get("frequency_hz"),
@@ -5793,7 +5831,9 @@ _tool(
         mu_r=(a.get("mu_r") if a.get("mu_r") is not None else 1.0),
         roughness_rq_um=a.get("roughness_rq_um"),
         alpha_per_k=a.get("alpha_per_k"),
-        rho20_ohm_m=a.get("rho20_ohm_m")),
+        rho20_ohm_m=a.get("rho20_ohm_m"),
+        harmonics=a.get("harmonics"),
+        dc_current_a=a.get("dc_current_a")),
 )
 
 _tool(
