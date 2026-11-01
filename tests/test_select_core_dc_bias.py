@@ -373,9 +373,9 @@ class TestTheToolSurface(unittest.TestCase):
         self.assertNotIn("a fixed point 0.0.77 does not", text)
 
     def test_the_tool_count_did_not_move(self):
-        # 178 = 177 + magnetics_powder_curve in 0.0.80 (the vendor's printed B(H)
-        # and mu-vs-T curves are a different object from a single Bsat number)
-        self.assertEqual(len(tools.TOOLS), 178)
+        # 179 = 178 + magnetics_core_loss_audit in 0.0.81 (scoring a triple against
+        # the vendor's printed points is a different question from evaluating a fit)
+        self.assertEqual(len(tools.TOOLS), 179)
 
 
 if __name__ == "__main__":

@@ -4814,9 +4814,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (178 tools now), so an agent that asks what can be computed is "
+          "table (179 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 178
+          len(_tools.TOOLS) == 179
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -4991,8 +4991,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (178 tools now)",
-          len(_tools.TOOLS) == 178
+          "table (179 tools now)",
+          len(_tools.TOOLS) == 179
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5256,10 +5256,11 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 178, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 179, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
-          "(magnetics_toroid_mlt) and 0.0.80 adds exactly one "
-          "(magnetics_powder_curve)",
+          "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
+          "(magnetics_powder_curve) and 0.0.81 exactly one "
+          "(magnetics_core_loss_audit)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5267,7 +5268,7 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 178,
+          and len(_tools.TOOLS) == 179,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -5409,7 +5410,7 @@ def selftest():
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 178,
+          and len(_tools.TOOLS) == 179,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -5604,6 +5605,120 @@ def selftest():
           "H %s, mix %s, variant %s" % ((_pc_turn.get("value") or {}).get("h_oe"),
                                         _pc_mix.get("reason_code"),
                                         _pc_var.get("status")))
+
+    # ---- 0.0.81: the printed loss points and the triple audit ------------
+    _au_ok = _call("magnetics_core_loss_audit",
+                   {"material": "3C90", "k": 5.0e-7, "alpha": 1.6, "beta": 2.5},
+                   1960)
+    _au_v = _au_ok.get("value") or {}
+    _au_rows = _au_v.get("anchors") or []
+    check("a triple is scored against the points the vendor printed, and a satisfied "
+          "bound is not the same thing as a matching value: 3C90's three rows "
+          "(p.84: <=80 at 25 kHz/200 mT, <=80 at 100 kHz/100 mT, ~450 at 100 kHz/"
+          "200 mT) give 48.78 / 79.24 / 448.28 kW/m3 for k=5e-7, a=1.6, b=2.5 - the "
+          "first is 39 % BELOW its bound, which satisfies an upper bound and is "
+          "reported against it, while only 2 of 3 points fall inside the 10 % band",
+          _au_ok.get("status") == "ok"
+          and len(_au_rows) == 3
+          and abs(_au_rows[0]["computed_pv_kw_m3"] - 48.78081) < 5e-4
+          and abs(_au_rows[1]["computed_pv_kw_m3"] - 79.24466) < 5e-4
+          and abs(_au_rows[2]["computed_pv_kw_m3"] - 448.27549) < 5e-4
+          and abs(_au_rows[0]["deviation_pct"] - (-39.023988)) < 2e-3
+          and _au_rows[0]["within_10_percent"] is False
+          and _au_rows[0]["satisfies_the_printed_bound"] is True
+          and _au_rows[2]["satisfies_the_printed_bound"] is None
+          and _au_rows[2]["within_10_percent"] is True
+          and _au_v.get("points_in_band") == 2
+          and _au_v.get("bound_violations") == 0
+          and _au_v.get("verdict") == "consistent_with_every_printed_point"
+          and _au_v.get("solved_here") is False,
+          "Pv %s, dev %s, in band %s, verdict %s"
+          % ([r["computed_pv_kw_m3"] for r in _au_rows],
+             [r["deviation_pct"] for r in _au_rows],
+             _au_v.get("points_in_band"), _au_v.get("verdict")))
+
+    _au_bad = _call("magnetics_core_loss_audit",
+                    {"material": "N87", "k": 5.0e-7, "alpha": 1.6, "beta": 2.5},
+                    1961)
+    _au_badv = _au_bad.get("value") or {}
+    check("negative control: the same triple that satisfies 3C90 CONTRADICTS N87's "
+          "printed Max. 375 kW/m3 at 100 kHz / 200 mT / 100 C (it computes 448.3, "
+          "19.5 % above the bound), so the audit is able to fail and says "
+          "violates_a_printed_upper_bound rather than averaging the two grades",
+          _au_bad.get("status") == "ok"
+          and _au_badv.get("verdict") == "violates_a_printed_upper_bound"
+          and _au_badv.get("bound_violations") == 1
+          and abs((_au_badv.get("anchors") or [{}])[0].get("deviation_pct", 0)
+                  - 19.540131) < 2e-3
+          and (_au_badv.get("anchors") or [{}])[0].get(
+              "satisfies_the_printed_bound") is False,
+          "verdict %s, dev %s"
+          % (_au_badv.get("verdict"),
+             ((_au_badv.get("anchors") or [{}])[0]).get("deviation_pct")))
+
+    def _au_refuse(args, rid):
+        return _call("magnetics_core_loss_audit", args, rid)
+
+    _au_3b7 = _au_refuse({"material": "3B7", "k": 5e-7, "alpha": 1.6, "beta": 2.5},
+                         1962)
+    _au_n27 = _au_refuse({"material": "N27", "k": 5e-7, "alpha": 1.6, "beta": 2.5},
+                         1963)
+    _au_mat = _au_refuse({"material": "3F36", "k": 5e-7, "alpha": 1.6, "beta": 2.5},
+                         1964)
+    _au_unit = _au_refuse({"material": "3C90", "k": 5e-7, "alpha": 1.6, "beta": 2.5,
+                           "units": "cgs"}, 1965)
+    _au_temp = _au_refuse({"material": "3C90", "k": 5e-7, "alpha": 1.6, "beta": 2.5,
+                           "temperature_c": 25.0}, 1966)
+    _au_kneg = _au_refuse({"material": "3C90", "k": 0.0, "alpha": 1.6, "beta": 2.5},
+                          1967)
+    _au_tab = _au_refuse({"material": "3C90", "k": 5e-7, "alpha": 1.6, "beta": 2.5,
+                          "anchor_data_path": "data/no_such_anchors.json"}, 1968)
+    check("every way to ask the audit something it cannot answer is its own refusal: a "
+          "grade with a specification page but no PV row (3B7, N27) is "
+          "DATA_UNAVAILABLE with points_printed=0 instead of being fitted anyway, an "
+          "untranscribed material NOT_FOUND with the list, an unknown unit convention "
+          "ARG_INVALID (a k is meaningless without it), a temperature with no printed "
+          "point OUT_OF_VALIDITY with the list (100 C is the only one 3C90 prints), a "
+          "zero k ARG_RANGE, and a missing table DATA_UNAVAILABLE",
+          _au_3b7.get("reason_code") == "DATA_UNAVAILABLE"
+          and _au_3b7.get("points_printed") == 0
+          and _au_3b7.get("material") == "3B7"
+          and _au_n27.get("reason_code") == "DATA_UNAVAILABLE"
+          and _au_n27.get("points_printed") == 0
+          and _au_mat.get("reason_code") == "NOT_FOUND"
+          and len(_au_mat.get("materials_printed") or []) == 9
+          and _au_unit.get("reason_code") == "ARG_INVALID"
+          and _au_temp.get("reason_code") == "OUT_OF_VALIDITY"
+          and _au_temp.get("temperatures_printed") == [100.0]
+          and _au_kneg.get("reason_code") == "ARG_RANGE"
+          and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
+          and len(_tools.TOOLS) == 179,
+          "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
+          % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
+             _au_n27.get("reason_code"), _au_mat.get("reason_code"),
+             _au_unit.get("reason_code"), _au_temp.get("reason_code"),
+             _au_kneg.get("reason_code"), _au_tab.get("reason_code"),
+             len(_tools.TOOLS)))
+
+    _au_140 = _call("magnetics_core_loss_audit",
+                    {"material": "3C93", "k": 5e-7, "alpha": 1.6, "beta": 2.5,
+                     "temperature_c": 140.0}, 1969)
+    _au_140v = _au_140.get("value") or {}
+    _tm_fit = _call("magnetics_material_core_loss",
+                    {"material": "3C90", "freq_hz": 100000, "b_peak_t": 0.2}, 1970)
+    check("the temperature filter scores only the points printed at that temperature "
+          "(3C93 prints all three of its rows at 140 C, 3C90 prints none there) and "
+          "the refusal path that 0.0.80 left silent now points at this tool: a "
+          "ferrite still answers FIT_NOT_RESOLVED, and its hint names the 3 printed "
+          "points of 3C90 and magnetics_core_loss_audit",
+          _au_140.get("status") == "ok"
+          and _au_140v.get("points_evaluated") == 3
+          and _au_140v.get("temperatures_printed") == [140.0]
+          and _tm_fit.get("reason_code") == "FIT_NOT_RESOLVED"
+          and "magnetics_core_loss_audit" in (_tm_fit.get("hint") or "")
+          and "3 loss points" in (_tm_fit.get("hint") or ""),
+          "3C93 pts %s, fit %s"
+          % (_au_140v.get("points_evaluated"), _tm_fit.get("reason_code")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

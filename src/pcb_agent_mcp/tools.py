@@ -3696,6 +3696,7 @@ def _capabilities(_args):
             "magnetics_material_core_loss",
             "magnetics_winding_ac", "magnetics_fringing_loss",
             "magnetics_toroid_mlt", "magnetics_powder_curve",
+            "magnetics_core_loss_audit",
             "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
@@ -3833,7 +3834,20 @@ def _capabilities(_args):
             "reconciled; seven rows turn over inside the printed H band (MPP 550u "
             "peaks at 23.8 Oe) and are flagged instead of clamped; H = 0 is refused "
             "because B(0) = a^x is not zero; and the High DC Bias variant blocks carry "
-            "no temperature fit at all. Gapped-core fringing loss IS computed since "
+            "no temperature fit at all. The printed LOSS POINTS arrived in 0.0.81: "
+            "data/material_loss_anchors.json carries the 17 PV rows the vendors print "
+            "- Ferroxcube's specification pages for 3C90 / 3C92 / 3C93 / 3C94 / 3C96 "
+            "and its 2022 3C98 brochure, plus the single Max. TDK prints for N87 - "
+            "each with its printed page and its own qualifier (<= / ~ / Max. / a bare "
+            "number), and magnetics_core_loss_audit scores any k/alpha/beta you supply "
+            "against every one of them point by point, keeping a satisfied upper bound "
+            "apart from a missed typical value. What is still NOT offered is a vendor "
+            "triple: neither vendor prints one (Ferroxcube prints two or three "
+            "qualified PV rows per grade, TDK draws three curve families and no loss "
+            "number on the N87 sheet), so a triple solved back out of those rows would "
+            "be arithmetic wearing the vendor's name, and that is refused - which is "
+            "why magnetics_material_core_loss still answers FIT_NOT_RESOLVED for every "
+            "ferrite. Gapped-core fringing loss IS computed since "
             "0.0.72 (magnetics_fringing_loss: a 2-D magnetic-charge model of the gap, "
             "q from the closed form of the axial integral, an exact slab eddy factor) "
             "and its scope is its own: 2-D along the leg, perfectly permeable pole "
@@ -7648,7 +7662,9 @@ _tool(
     "magnetics_core_loss. The fit is a curve fit of the vendor's charts, not a "
     "guarantee: outside 5 kHz-2 MHz or above 0.5 T the answer carries a warning, and "
     "the ferrite materials have no vendor fit here at all (they refuse, naming "
-    "magnetics_core_loss as the way to pass your own triple).",
+    "magnetics_core_loss as the way to pass your own triple) - because the vendors "
+    "print points, not coefficients: magnetics_core_loss_audit scores a triple you "
+    "bring against all 17 printed PV rows.",
     {"type": "object", "properties": {
         "material": _str("material name as it appears in the table (14 materials; "
                          "five carry a vendor loss fit: Kool Mu, MPP, High Flux, "
@@ -8050,6 +8066,54 @@ _tool(
 )
 
 _tool(
+    "magnetics_core_loss_audit",
+    "Score YOUR Steinmetz triple against the loss numbers the vendor actually prints. "
+    "Neither ferrite vendor publishes a triple: Ferroxcube's 2013 data handbook prints "
+    "two or three PV rows per grade qualified with <= or ~ (no coefficient set - the "
+    "rest of the loss information is a graph), and TDK's SIFERRIT N87 sheet (12 pages, "
+    "June 2025) draws three curve families and prints no loss number at all. So a "
+    "triple always comes from somewhere else, and this tool evaluates it at every "
+    "point the vendor did print: data/material_loss_anchors.json carries 17 PV rows "
+    "transcribed from 3C90 (p.84), 3C92 (p.88), 3C93 (p.90), 3C94 (p.92), 3C96 (p.96), "
+    "the 2022 3C96/3C98 brochure (printed p.5) and TDK's product page for N87, each "
+    "with its printed page, the exact text printed and its qualifier. Per point you "
+    "get the printed Pv, the computed Pv, the signed deviation, whether it lands in a "
+    "10 % reporting band, and - only where the page printed an upper bound - whether "
+    "the bound is satisfied; a bound is satisfied by anything smaller, a typical value "
+    "is not, and the two are never compared as one kind of number. The verdict is "
+    "consistent_with_every_printed_point / does_not_match_every_printed_point / "
+    "violates_a_printed_upper_bound, and it is a statement about these points, not a "
+    "claim that the triple is the vendor's: two or three points cannot determine a "
+    "three-parameter fit. REFUSED on purpose: solving a triple out of the points. Two "
+    "of 3C90's three are upper bounds at the same temperature as a typical value, so "
+    "the solution would have to sit below both bounds and equal the typical value at "
+    "once - solved_here is always false and the reason travels with the answer. 3B7 "
+    "and N27 have a specification page but no PV row, so they answer DATA_UNAVAILABLE "
+    "with points_printed=0 instead of inventing one.",
+    {"type": "object", "properties": {
+        "material": _str("the grade as the vendor prints it: 3C90, 3C92, 3C93, 3C94, "
+                         "3C96, 3C98, N87 (3B7 and N27 have no printed point)"),
+        "k": _num("your Steinmetz coefficient, in the unit convention named below"),
+        "alpha": _num("your frequency exponent"),
+        "beta": _num("your flux-density exponent"),
+        "units": _str("the unit convention your k is in: khz_mt (mW/cm3 per kHz^a "
+                      "mT^b, the vendor style and the default), si (W/m3 per Hz^a "
+                      "T^b), khz_gauss (mW/cm3 per kHz^a G^b), khz_t (mW/cm3 per "
+                      "kHz^a T^b)",
+                      ["khz_mt", "si", "khz_gauss", "khz_t"], "khz_mt"),
+        "temperature_c": _num("score only the points printed at this temperature; a "
+                              "temperature with no printed point is refused with the "
+                              "list"),
+        "anchor_data_path": _str("override the anchor table path (testing)"),
+    }, "required": ["material", "k", "alpha", "beta"]},
+    lambda a: _magnetics.magnetics_core_loss_audit(
+        a.get("material"), a.get("k"), a.get("alpha"), a.get("beta"),
+        units=(a.get("units") or "khz_mt"),
+        temperature_c=a.get("temperature_c"),
+        anchor_data_path=a.get("anchor_data_path")),
+)
+
+_tool(
     "magnetics_toroid_mlt",
     "Mean length of one turn on a toroid, and the DC copper loss that follows - the "
     "number a toroid's catalog does not print, because a turn's length belongs to the "
@@ -8119,7 +8183,10 @@ _tool(
     "printed pp.63-65) which magnetics_dc_bias evaluates. Five vendor printing "
     "anomalies are carried in "
     "`printing_anomalies` verbatim rather than corrected, including one part number "
-    "printed against two different sizes.",
+    "printed against two different sizes. The ferrite grades' printed loss POINTS are "
+    "a fourth file (data/material_loss_anchors.json) and are not reachable through "
+    "this tool: magnetics_core_loss_audit returns them one per point, together with "
+    "what your own triple does at each.",
     {"type": "object", "properties": {
         "kind": _str("which table", ["materials", "cores", "all", "powder_cores",
                                       "powder_parts", "dc_bias_fit"], "materials"),

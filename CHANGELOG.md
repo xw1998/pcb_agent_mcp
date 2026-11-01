@@ -9,6 +9,102 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.81] - 2026-11-02
+
+**两家厂商都不印 Steinmetz 三元组——那就把厂商真印出来的东西入库，并给你带来的三元组一个能对账的裁判**
+（新工具 `magnetics_core_loss_audit`，工具数 **178 → 179**；`dependencies = []` 仍成立）。
+
+`not_implemented_yet` 里从 `0.0.55` 起就挂着「无 material-level 三元组」，`0.0.80` 之后这条是唯一挡住
+铁氧体损耗计算的东西。这一版去把「厂商到底印了什么」量清楚，结论是**没有一家印三元组**：
+
+- **Ferroxcube HB2013**（`download/11`，`FXC_HB2013.pdf`，10,439,076 B / 1108 页）：每个牌号规格页
+  只印 **2–3 个 PV 点**，而且带 `≤` 或 `≈`，其余全是图。
+- **Ferroxcube 2022 3C96/3C98 宣传册**（`download/90`，784,415 B / 8 页）：裸数字，与 2013 手册逐位相同
+  ——顺手当交叉校验用了。
+- **TDK SIFERRIT N87**（`download/528882/x/pdf.pdf`，12 页，June 2025）：损耗只画三族曲线，
+  **一个数都不印**；唯一数字是零件页上的 `Max. 375`。
+
+所以这一版**不编三元组**（拿 2–3 个点、其中还有上界，去解 3 个指数，是把算术冒充厂商数据），
+改成两件事：**把 17 个印刷点入库**，以及**让 `magnetics_core_loss_audit` 拿你手里的三元组逐点打分**。
+
+### 入库：`data/material_loss_anchors.json`
+
+9 个牌号 / **17 个点** / 3 个来源，每点带 `printed_page`、`pdf_page`、`printed_as`（原文，如 `<=80`）、
+`qualifier`。四类 qualifier **分开存、分开判**：
+
+| qualifier | 点数 | 含义 | 能判什么 |
+| --- | --- | --- | --- |
+| `at_most` | 2 | `≤` | 只能判「有没有越上界」 |
+| `approx` | 11 | `~` | 只能判「是否落在 10 % 带内」 |
+| `plain` | 3 | 裸数字 | 同上 |
+| `max` | 1 | `Max. 375` | 只能判上界 |
+
+**上界与典型值不可混比**——3C90 p84 同一列里就混着两类（`≤80` 与 `~450`），这也是「不能拟合」的
+直接理由。`3B7`（p74）与 `N27` 一个点都没印，登记在 `materials_without_points` 里，
+**不是漏抄**：查询它们得到 `points_printed = 0` 而不是错误。
+
+页号口径两处不同，写在表里：**HB2013 的 printed page == pdf page**（页脚 `2013 Jul 31`），
+而 3C96/3C98 宣传册**没有恒定偏移**（pdf 第 6 页印的是 "5"）⇒ 每点单独记 `pdf_page`。
+另登记一条厂商自身异常：HB2013 的 PDF metadata 标题写着 "Data Handbook 2009"，页脚却是 `2013 Jul 31`
+—— **原样保留，不顺手改**。
+
+三条交叉校验也写进 `cross_checks`：3C96 在三处被印了两次（2013 手册与 2022 宣传册逐位相同）、
+宣传册正文与它自己的表一致、以及列位移检查（按行号错位一列会让 3C90 的 β 从 2.49 变 2.5 上下、
+3C93 的 β 从 2.81 掉出去 ⇒ 现行对齐是对的）。
+
+### 新工具：`magnetics_core_loss_audit`
+
+输入 `material` + `k/alpha/beta` + `units`（默认 **`khz_mt`**，厂商风格；注意 `core_loss_steinmetz`
+的默认是 `si`，理由写在 schema 里）+ 可选 `temperature_c`。逐点复算并**把两种判据分开报**：
+
+- `within_10_percent`：`approx` / `plain` 点用
+- `satisfies_the_printed_bound`：`at_most` / `max` 点用
+- 另一类为 `null`（不可比就说不可比，不拿 0 冒充）
+
+判词三种：`consistent_with_every_printed_point`（无越界、无典型值出带）、
+`violates_a_printed_upper_bound`、`does_not_match_every_printed_point`。
+`value.solved_here` 恒为 `false`，并带 `why_not_solved` 与 `how_to_read_a_bound` 两段说明。
+
+`k=5e-7 / α=1.6 / β=2.5` 的实测读数（`khz_mt`）：
+
+```
+3C90 p84
+ 25 kHz/200 mT  ≤80   算出  48.78081  −39.023988 %  上界满足  带外
+100 kHz/100 mT  ≤80   算出  79.24466   −0.944175 %  上界满足  带内
+100 kHz/200 mT  ~450  算出 448.27549   −0.383225 %  典型值    带内
+→ consistent_with_every_printed_point (points_in_band=2, bound_violations=0, typical_value_misses=0)
+
+N87 100 kHz/200 mT Max.375 → 448.27549  +19.540131 %  → violates_a_printed_upper_bound
+```
+
+第二段是**负控制**：同一个三元组在另一个牌号上必须失败，否则「通过」没有信息量。
+
+### 拒绝臂（不是静默忽略）
+
+`3B7` / `N27`（有规格页但没印 PV 行）→ `DATA_UNAVAILABLE` + `points_printed = 0` + 一句
+「nothing to score a triple against」，**不改成拟合**；不在表里的牌号 → `NOT_FOUND` + 9 个可选牌号；
+`units` 拼错 → `ARG_INVALID`（不做 cgs 猜测）；`temperature_c` **只比厂商在该温度真印过的点**
+（问 3C93 的 25 °C、3C90 的 25 °C 都是 `OUT_OF_VALIDITY` + `temperatures_printed`，不做温度插值；
+3C93 问 140 °C 才得到 `points_evaluated=3`）；`k <= 0` → `ARG_RANGE`；表缺失/损坏 → `DATA_UNAVAILABLE`。
+
+### 7 种「篡改表」负控制
+
+`tests/test_loss_audit.py` 每次都现场写一份坏表：schema 错、负 Pv、qualifier 拼错、source id 指向不存在的
+来源、截断到 6 点、`materials_without_points` 里的牌号却带着点、缺 `printed_as` —— 七种都必须报错，
+**证明 loader 有牙**（否则「表是对的」这句话就没有证据）。
+
+### 唯一被改动的既有答案
+
+只有一处：`magnetics_material_core_loss` 对铁氧体报 `FIT_NOT_RESOLVED` 时的 **hint**，追加了
+「If you have a triple, magnetics_core_loss_audit scores it against the N loss points this grade's
+vendor actually printed」。`reason_code` 与 message **一个字都没动**（有测试钉住这两件事必须分开）。
+`--selftest` 从 295/295 → **299/299**；全量回归 **3248 → 3277 例**（实测 `Ran 3277 tests in 1024.718s` / `OK (skipped=5)`）。
+
+### 仍然没做的
+
+不**给**三元组（差额就是上面那些理由）；印点之间**不插值、不外推**；不覆盖 DC 偏置损耗；
+10 % 只是报告带，原始 `deviation_pct` 一律透出。
+
 ## [0.0.80] - 2026-11-02
 
 **粉末芯的磁化曲线与温度曲线：厂商印了 125 行 B(H) 和 54 行 Δµ/µ，两条自己的式子在端点上差 54 %**

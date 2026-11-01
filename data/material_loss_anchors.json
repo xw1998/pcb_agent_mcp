@@ -1,0 +1,292 @@
+{
+  "schema": "material-loss-anchors",
+  "version": "0.0.81",
+  "what_this_is": "Every specific power-loss point a vendor PRINTS for a material (as opposed to drawing the loss as a curve), with the qualifier exactly as printed (<= bound, approx typical, Max., or a bare number) and the page it is printed on. This is what a Steinmetz triple can be checked against; it is not a Steinmetz triple.",
+  "why_anchors_and_not_a_triple": "Checked 2026-11-02: neither vendor prints a Steinmetz triple for a material. The Ferroxcube handbook prints a PV row of two to three points per material and draws the rest as curves; the TDK SIFERRIT material sheet for N87 prints loss only as curves and quotes a single max value on the product page. Two or three printed points cannot determine three exponents, and two of them are upper bounds rather than typical values, so a triple solved here would be arithmetic dressed up as vendor data. Hence: store the anchors, audit a triple the caller supplies, and say plainly that no triple is issued.",
+  "qualifiers": {
+    "at_most": "printed as <= or < - an upper bound, so a computed value BELOW it satisfies it",
+    "approx": "printed as ~ (approximately) - a typical value, comparable in both directions",
+    "plain": "printed as a bare number on a specification sheet - read as a typical value, no bound implied",
+    "max": "printed as Max. - an upper bound on a part's guaranteed value"
+  },
+  "units": {
+    "pv": "kW/m^3",
+    "pv_equivalence": "1 kW/m^3 == 1 mW/cm^3, so these numbers feed the khz_t / khz_mt Steinmetz conventions unchanged",
+    "f": "kHz",
+    "b": "mT (peak, i.e. the amplitude, half the peak-to-peak swing)",
+    "temp": "degC"
+  },
+  "sources": [
+    {
+      "id": "ferroxcube-handbook-2013",
+      "what": "Ferroxcube 'Soft Ferrites and Accessories' data handbook, material specification pages",
+      "url": "https://www.ferroxcube.com/en-global/download/download/11",
+      "file_as_downloaded": "FXC_HB2013.pdf (10,439,076 bytes, 1108 pages)",
+      "printed_page_equals_pdf_page": true,
+      "date_printed": "2013 Jul 31",
+      "anomaly": "the PDF's own metadata title still says 'Ferroxcube Data Handbook 2009' while every page footer says 2013 Jul 31 - registered, not corrected"
+    },
+    {
+      "id": "ferroxcube-3c96-3c98-2022",
+      "what": "Ferroxcube brochure 'Best in class power conversion material: 3C96, 3C98'",
+      "url": "https://www.ferroxcube.com/en-global/download/download/90",
+      "file_as_downloaded": "3C96_3C98_web_MAR_2022.pdf (784,415 bytes, 8 pages)",
+      "printed_page_equals_pdf_page": false,
+      "page_note": "the 8-page brochure does not carry a constant offset (pdf page 4 prints '3', pdf page 6 prints '5'), so both are recorded",
+      "date_printed": "Mar 2022"
+    },
+    {
+      "id": "tdk-product-page",
+      "what": "TDK product centre part page - the only place a number (rather than a curve) is printed for N87",
+      "url": "https://product.tdk.cn/zh/search/ferrite/ferrite/ferrite-core/info?part_no=B67410A0105X087",
+      "date_printed": "2026-10-26 (page read date)",
+      "anomaly": "the same page also prints '0.1 W/set (200 mT, 100 kHz, 100 C)' for one specific part; a per-set loss is not a density, so only the kW/m^3 value is carried"
+    }
+  ],
+  "materials": {
+    "3C90": {
+      "source": "ferroxcube-handbook-2013",
+      "pdf_page": 84,
+      "printed_page": 84,
+      "points": [
+        {
+          "temp_c": 100,
+          "f_khz": 25,
+          "b_mt": 200,
+          "pv_kw_m3": 80,
+          "qualifier": "at_most",
+          "printed_as": "<= 80"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 100,
+          "pv_kw_m3": 80,
+          "qualifier": "at_most",
+          "printed_as": "<= 80"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 200,
+          "pv_kw_m3": 450,
+          "qualifier": "approx",
+          "printed_as": "~ 450"
+        }
+      ],
+      "note": "the same PV column mixes <= with ~, so these three points cannot all be fitted: a triple that hits the two bounds exactly would have to fall below the typical value"
+    },
+    "3C92": {
+      "source": "ferroxcube-handbook-2013",
+      "pdf_page": 88,
+      "printed_page": 88,
+      "points": [
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 100,
+          "pv_kw_m3": 50,
+          "qualifier": "approx",
+          "printed_as": "~ 50"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 200,
+          "pv_kw_m3": 350,
+          "qualifier": "approx",
+          "printed_as": "~ 350"
+        }
+      ],
+      "note": "two points; the sheet also prints Bsat at 140 C but no loss at 140 C"
+    },
+    "3C93": {
+      "source": "ferroxcube-handbook-2013",
+      "pdf_page": 90,
+      "printed_page": 90,
+      "points": [
+        {
+          "temp_c": 140,
+          "f_khz": 100,
+          "b_mt": 100,
+          "pv_kw_m3": 50,
+          "qualifier": "approx",
+          "printed_as": "~ 50"
+        },
+        {
+          "temp_c": 140,
+          "f_khz": 100,
+          "b_mt": 200,
+          "pv_kw_m3": 350,
+          "qualifier": "approx",
+          "printed_as": "~ 350"
+        },
+        {
+          "temp_c": 140,
+          "f_khz": 500,
+          "b_mt": 50,
+          "pv_kw_m3": 300,
+          "qualifier": "approx",
+          "printed_as": "~ 300"
+        }
+      ],
+      "note": "all three points are at 140 C, the temperature this grade is specified at"
+    },
+    "3C94": {
+      "source": "ferroxcube-handbook-2013",
+      "pdf_page": 92,
+      "printed_page": 92,
+      "points": [
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 100,
+          "pv_kw_m3": 50,
+          "qualifier": "approx",
+          "printed_as": "~ 50"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 200,
+          "pv_kw_m3": 350,
+          "qualifier": "approx",
+          "printed_as": "~ 350"
+        }
+      ],
+      "note": "same printed numbers as 3C92 at the same conditions - two grades, one column each"
+    },
+    "3C96": {
+      "source": "ferroxcube-handbook-2013",
+      "pdf_page": 96,
+      "printed_page": 96,
+      "points": [
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 100,
+          "pv_kw_m3": 40,
+          "qualifier": "approx",
+          "printed_as": "~ 40"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 200,
+          "pv_kw_m3": 300,
+          "qualifier": "approx",
+          "printed_as": "~ 300"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 500,
+          "b_mt": 50,
+          "pv_kw_m3": 250,
+          "qualifier": "approx",
+          "printed_as": "~ 250"
+        }
+      ],
+      "note": "printed twice: this 2013 handbook row and the 2022 brochure row agree to the digit"
+    },
+    "3C98": {
+      "source": "ferroxcube-3c96-3c98-2022",
+      "pdf_page": 6,
+      "printed_page": "5",
+      "points": [
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 100,
+          "pv_kw_m3": 40,
+          "qualifier": "plain",
+          "printed_as": "40"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 200,
+          "pv_kw_m3": 250,
+          "qualifier": "plain",
+          "printed_as": "250"
+        },
+        {
+          "temp_c": 100,
+          "f_khz": 500,
+          "b_mt": 50,
+          "pv_kw_m3": 250,
+          "qualifier": "plain",
+          "printed_as": "250"
+        }
+      ],
+      "note": "the brochure's own text states 250 mW/cm^3 at 100 kHz, 200 mT, which is the same number as the 250 kW/m^3 row (1 kW/m^3 == 1 mW/cm^3)"
+    },
+    "N87": {
+      "source": "tdk-product-page",
+      "pdf_page": null,
+      "printed_page": null,
+      "points": [
+        {
+          "temp_c": 100,
+          "f_khz": 100,
+          "b_mt": 200,
+          "pv_kw_m3": 375,
+          "qualifier": "max",
+          "printed_as": "Max. 375"
+        }
+      ],
+      "note": "one max value only: the N87 SIFERRIT material data sheet (12 pages, June 2025) draws loss as three curve families and prints no numbers"
+    },
+    "3B7": {
+      "source": "ferroxcube-handbook-2013",
+      "pdf_page": 74,
+      "printed_page": 74,
+      "points": [],
+      "note": "a filter grade: the specification page prints tan delta/mu_i and DF instead of any PV row, so it has no loss anchor at all"
+    },
+    "N27": {
+      "source": "tdk-product-page",
+      "pdf_page": null,
+      "printed_page": null,
+      "points": [],
+      "note": "the product page quotes 920 kW/m^3 without stating the (B, f, T) it belongs to, so it is a quote and not an anchor; magnetic_materials.json already carries it as pv_quoted_unconditioned_kw_m3"
+    }
+  },
+  "materials_without_points": [
+    "3B7",
+    "N27"
+  ],
+  "read_method": "The text stream of the handbook interleaves the PV condition column with the axis labels of the figure beside it, so every row was also re-read from word coordinates (condition column at one x, value column at another, figure labels beyond a third), and the two reads were compared; the 3C90 and 3C96 rows were additionally checked against the 2022 brochure.",
+  "cross_checks": {
+    "3C96_printed_twice": {
+      "handbook_2013": [
+        40,
+        300,
+        250
+      ],
+      "brochure_2022": [
+        40,
+        300,
+        250
+      ],
+      "reading": "two independent printings nine years apart agree on all three points"
+    },
+    "brochure_text_against_its_own_table": {
+      "text": "250 mW/cm^3 at 100 kHz, 200 mT",
+      "table": "250 kW/m^3 at 100 kHz, 200 mT",
+      "reading": "same number once the units are converted (1 kW/m^3 == 1 mW/cm^3)"
+    },
+    "column_shift_check": {
+      "method": "each material's printed grid was read as a power law (ratio at fixed f gives beta, ratio at fixed B gives alpha)",
+      "3C90": {
+        "beta": 2.49,
+        "alpha": 1.21,
+        "caveat": "mixes a bound with a typical value, so this is a shift check and not a fit"
+      },
+      "3C93": {
+        "beta": 2.81,
+        "alpha_note": "the 500 kHz row breaks the power law, as it should where the fit window ends"
+      },
+      "reading": "implied exponents land in the range MnZn power ferrites are published in, which is what a column shift would destroy; no exponents are stored because this is not a fit"
+    }
+  }
+}

@@ -2624,7 +2624,11 @@ def material_core_loss(material, freq_hz, b_peak_t, permeability=None, shape=Non
             return err(why, "FIT_NOT_RESOLVED",
                        hint="magnetics_core_loss takes k/alpha/beta from you for any "
                             "material; only a vendor's own printed fit can be looked "
-                            "up here, and inventing one is not an option")
+                            "up here, and inventing one is not an option. If you "
+                            "already have a triple, magnetics_core_loss_audit scores "
+                            "it against the %d loss points this grade's vendor "
+                            "actually printed" % _printed_point_count(
+                                mat.get("name") or material))
         return err(why, "FIT_NOT_RESOLVED",
                    hint="magnetic_data(kind='materials') lists every printed row; the "
                         "catalog page is in loss_fit.sources",
@@ -4695,4 +4699,411 @@ def magnetics_powder_curve(material, permeability, h_oe=None, temperature_c=None
                          "differ by more than %.0f %%, both numbers are returned with "
                          "fits_disagree = true; neither is picked"
                          % CURVE_DISAGREE_PCT},
+        extra)
+
+# --------------------------------------------------------------------------
+# 0.0.81: the vendor's PRINTED loss points, and an audit for the triple you bring
+#
+# The gap this fills is a gap in the vendor data, not in the code. Measured on
+# 2026-11-02 against both primary sources:
+#
+#   * Ferroxcube data handbook (FXC_HB2013.pdf, 10,439,076 bytes, 1108 pages,
+#     footer dated 2013 Jul 31) prints on each material's specification page two
+#     or three PV rows - a temperature, a frequency, a flux density and a loss -
+#     and prints them qualified with <= or ~, never as a coefficient set. The
+#     rest of the loss information on the page is a graph.
+#   * TDK SIFERRIT N87 material sheet (12 pages, June 2025) draws loss as three
+#     curve families and prints no number at all. The one number TDK prints for
+#     N87 sits on a part page and is a Max. at a single condition.
+#
+# So the honest answer to "what is 3C90's Steinmetz triple" is "the vendor does
+# not print one", which is why magnetics_material_core_loss refuses instead of
+# returning a fit. What this section adds is the two things that ARE answerable:
+#
+#   1. the printed points themselves, transcribed with their qualifier and the
+#      page they came from, so a caller can see what the vendor actually says;
+#   2. an audit of a triple the caller supplies - evaluate it at each printed
+#      point and report the deviation, whether it satisfies a printed upper
+#      bound, and whether it lands inside a reporting band. The band is 10 %,
+#      a reporting threshold and nothing more.
+#
+# Refused on purpose: solving a triple back out of the printed points. Two of
+# 3C90's three points are upper bounds (<=80 at 25 kHz/200 mT and at 100 kHz/
+# 100 mT) while the third is a typical value (~450 at 100 kHz/200 mT), so any
+# "fit" would be arithmetic wearing the vendor's name - it would have to be
+# below the two bounds and equal to the typical value at once.
+#
+# A bound and a typical value are not comparable and are never silently mixed
+# here: <=80 is satisfied by any smaller number, ~450 is not. Both are carried
+# as separate fields on every point, and the verdict keeps bound violations
+# apart from misses.
+# --------------------------------------------------------------------------
+
+LOSS_ANCHOR_PATH = os.path.join(os.path.dirname(DATA_PATH),
+                                "material_loss_anchors.json")
+
+LOSS_ANCHOR_SCHEMA = "material-loss-anchors"
+
+# Reporting band, per point, in percent of the printed value. Not a pass/fail
+# threshold: every raw deviation is reported alongside it so the caller can pick
+# their own. The printed values carry two significant digits, so a band tighter
+# than a few percent would flag rounding.
+AUDIT_BAND_PCT = 10.0
+
+# The four ways a vendor prints a loss number, kept apart because they do not
+# mean the same thing. at_most/max are upper bounds; approx/plain are typical
+# values.
+LOSS_QUALIFIERS = ("at_most", "approx", "plain", "max")
+LOSS_BOUND_QUALIFIERS = ("at_most", "max")
+
+def _load_loss_anchors(path=None):
+    """(data, None) or (None, why-not). The shape of the table is the contract.
+
+    Every structural failure is reported rather than worked around: a table with
+    a shifted column or a truncated material list would still parse, and the
+    only way to notice is to check the shape before answering from it.
+    """
+    p = path or LOSS_ANCHOR_PATH
+    if not os.path.exists(p):
+        return None, "printed loss anchor table missing: " + str(p)
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        return None, "printed loss anchor table unreadable: %s" % exc
+    if data.get("schema") != LOSS_ANCHOR_SCHEMA:
+        return None, ("printed loss anchor table has schema %r, not %r; the shape of "
+                      "the table is checked rather than assumed"
+                      % (data.get("schema"), LOSS_ANCHOR_SCHEMA))
+    srcs = data.get("sources") or []
+    ids = set()
+    for s in srcs:
+        sid = (s or {}).get("id")
+        if not sid or not str(sid).strip():
+            return None, "printed loss anchor table has a source without an id"
+        ids.add(sid)
+    mats = data.get("materials")
+    if not isinstance(mats, dict) or not mats:
+        return None, "printed loss anchor table carries no materials"
+    total = 0
+    for name, entry in mats.items():
+        if not isinstance(entry, dict):
+            return None, "material %r in the anchor table is not an object" % (name,)
+        pts = entry.get("points")
+        if not isinstance(pts, list):
+            return None, ("material %r in the anchor table has no points list"
+                          % (name,))
+        sid = entry.get("source")
+        if sid not in ids:
+            return None, ("material %r cites source %r, which is not in sources "
+                          "(a point with no provenance is not a printed point)"
+                          % (name, sid))
+        for i, pt in enumerate(pts):
+            if not isinstance(pt, dict):
+                return None, ("material %r point %d is not an object" % (name, i))
+            try:
+                t = float(pt["temp_c"])
+                f = float(pt["f_khz"])
+                b = float(pt["b_mt"])
+                pv = float(pt["pv_kw_m3"])
+            except Exception:  # noqa: BLE001
+                return None, ("material %r point %d is not a "
+                              "(temp_c, f_khz, b_mt, pv_kw_m3) tuple: %r"
+                              % (name, i, pt))
+            for nm, v in (("temp_c", t), ("f_khz", f), ("b_mt", b), ("pv_kw_m3", pv)):
+                if not math.isfinite(v):
+                    return None, ("material %r point %d has a non-finite %s"
+                                  % (name, i, nm))
+            if f <= 0 or b <= 0 or pv <= 0:
+                return None, ("material %r point %d has a non-positive f/b/Pv, which "
+                              "cannot be a printed loss point" % (name, i))
+            q = pt.get("qualifier")
+            if q not in LOSS_QUALIFIERS:
+                return None, ("material %r point %d has qualifier %r, which is not one "
+                              "of %s - the qualifier decides whether the number is a "
+                              "bound or a typical value and is never inferred"
+                              % (name, i, q, ", ".join(LOSS_QUALIFIERS)))
+            as_ = pt.get("printed_as")
+            if not isinstance(as_, str) or not as_.strip():
+                return None, ("material %r point %d does not carry printed_as, so "
+                              "there is no record of what the page said"
+                              % (name, i))
+            total += 1
+    # 17 points were transcribed from the two documents. Fewer means a column
+    # was dropped or a material lost its rows while the file still parses.
+    if total < 12:
+        return None, ("printed loss anchor table carries only %d points; %d were "
+                      "transcribed, so the file has been truncated or a column was "
+                      "lost" % (total, 17))
+    missing = data.get("materials_without_points") or []
+    for nm in missing:
+        if nm not in mats:
+            return None, ("material %r is listed as having no printed point but is "
+                          "not in the table at all" % (nm,))
+        if (mats.get(nm) or {}).get("points"):
+            return None, ("material %r is listed as having no printed point yet "
+                          "carries %d of them"
+                          % (nm, len(mats[nm]["points"])))
+    return data, None
+
+def _loss_anchor_material(data, material):
+    """(name, entry) for a case/space-insensitive name, or (None, why-not)."""
+    key = _norm_key(material)
+    for name, entry in (data.get("materials") or {}).items():
+        if _norm_key(name) == key:
+            return name, entry
+    return None, ("no printed loss point for %r; the table transcribes the "
+                  "specification pages of the materials it knows" % (material,))
+
+def _printed_point_count(material):
+    """How many printed loss points the anchor table has for this grade (0 if none).
+
+    Used only to make a refusal say something useful; a missing or broken table is
+    0 here rather than an error, because the caller is already on the error path
+    and the count is decoration, never an answer.
+    """
+    data, _why = _load_loss_anchors()
+    if data is None:
+        return 0
+    _name, entry = _loss_anchor_material(data, material)
+    if entry is None:
+        return 0
+    return len(entry.get("points") or [])
+
+def _st_pv_kw_m3(k, alpha, beta, units, f_hz, b_t):
+    """Steinmetz P_v in kW/m^3 from a triple in the caller's unit convention."""
+    if units not in STEINMETZ_UNITS:
+        raise ValueError("units must be one of " + ", ".join(sorted(STEINMETZ_UNITS)))
+    f_unit, b_unit, _k_unit, scale = STEINMETZ_UNITS[units]
+    pv_native = k * (f_hz / f_unit) ** alpha * (b_t / b_unit) ** beta
+    return pv_native * scale / 1000.0
+
+def magnetics_core_loss_audit(material, k, alpha, beta, units="khz_mt",
+                              temperature_c=None, anchor_data_path=None):
+    """Score YOUR Steinmetz triple against the loss numbers the vendor prints.
+
+    Neither Ferroxcube nor TDK publishes a Steinmetz triple for these grades -
+    3C90's specification page prints two `<=` rows and one `~` row, and N87's
+    material sheet prints no loss number at all - so a triple always comes from
+    somewhere other than the vendor: a curve fit you made, a competitor's
+    handbook, a paper. This tool does not judge where it came from. It evaluates
+    it at each printed point and tells you what it does there:
+
+        P_v = k * f^alpha * B^beta
+
+    `units` is the convention the triple is in, and it is part of the question:
+    si (Hz, T, W/m^3), khz_mt (kHz, mT, mW/cm^3 - what a vendor's printed fit
+    would be), khz_gauss (kHz, G, mW/cm^3), khz_t (kHz, T, mW/cm^3). The default
+    is khz_mt because that is how a ferrite fit is normally printed, but a k
+    entered in the wrong convention is off by ~10^6 and this tool will say so by
+    the deviation, not silently.
+
+    Per point you get the printed value, its qualifier, the computed value, the
+    signed deviation in percent, whether it falls inside a 10 % reporting band,
+    and - only for a printed upper bound - whether it satisfies the bound. A
+    bound and a typical value are never mixed: `<=80` is satisfied by anything
+    smaller, `~450` is not satisfied by being smaller.
+
+    The verdict is one of
+
+        consistent_with_every_printed_point
+        does_not_match_every_printed_point
+        violates_a_printed_upper_bound
+
+    and it is a statement about these points, not about the triple being the
+    vendor's: a triple can be consistent here and still be wrong everywhere
+    else, because two or three points do not determine a three-parameter fit.
+
+    What this does NOT do: solve a triple out of the printed points. Two of
+    three 3C90 points are bounds, so the "solution" would have to sit below both
+    bounds and equal the typical value at once - arithmetic, not vendor data.
+    `solved_here` is always false and the reason travels with the answer.
+
+    `temperature_c` restricts the audit to points printed at that temperature;
+    asking for a temperature that has no printed point is refused with the list
+    of temperatures the table does have.
+    """
+    data, why = _load_loss_anchors(anchor_data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="the printed points live in data/material_loss_anchors.json, "
+                        "transcribed with their page and their qualifier")
+    u = str(units or "khz_mt").strip().lower().replace("-", "_").replace("/", "_")
+    if u not in STEINMETZ_UNITS:
+        return err("units must be one of " + ", ".join(sorted(STEINMETZ_UNITS)),
+                   "ARG_INVALID",
+                   hint="the k in a Steinmetz fit is meaningless without its unit "
+                        "convention: si (Hz/T), khz_mt (kHz/mT), khz_gauss (kHz/G), "
+                        "khz_t (kHz/T)")
+    try:
+        kk = _f("k", k)
+        a = _f("alpha", alpha)
+        bb = _f("beta", beta)
+        tq = None if temperature_c is None else _f("temperature_c", temperature_c)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    if kk <= 0:
+        return err("k must be > 0 (a Steinmetz coefficient is never zero or negative)",
+                   "ARG_RANGE")
+    if a <= 0 or bb <= 0:
+        return err("alpha and beta are the fit's exponents and must be > 0",
+                   "ARG_RANGE")
+
+    name, entry = _loss_anchor_material(data, material)
+    if name is None:
+        have = sorted((data.get("materials") or {}).keys())
+        return err(entry, "NOT_FOUND",
+                   hint="materials the table transcribes: " + ", ".join(have),
+                   extra={"materials_printed": have})
+    points = entry.get("points") or []
+    temps = sorted({float(pt["temp_c"]) for pt in points})
+    if not points:
+        return err("%s has no printed loss point to audit against" % name,
+                   "DATA_UNAVAILABLE",
+                   hint="this grade has a specification page but no PV row on it, "
+                        "so there is nothing to score a triple against",
+                   extra={"material": name,
+                          "points_printed": 0,
+                          "why": entry.get("note"),
+                          "materials_without_points":
+                              data.get("materials_without_points") or []})
+    if tq is not None:
+        points = [pt for pt in points if abs(float(pt["temp_c"]) - tq) < 1e-6]
+        if not points:
+            return err("%s prints no loss point at %g C" % (name, tq),
+                       "OUT_OF_VALIDITY",
+                       hint="the audit only scores points the vendor actually printed "
+                            "at that temperature; interpolating between printed "
+                            "temperatures would be inventing data",
+                       extra={"material": name,
+                              "temperatures_printed": temps})
+
+    rows = []
+    n_in_band = 0
+    n_bound_violations = 0
+    n_miss = 0
+    for pt in points:
+        t = float(pt["temp_c"])
+        f_khz = float(pt["f_khz"])
+        b_mt = float(pt["b_mt"])
+        printed = float(pt["pv_kw_m3"])
+        q = pt["qualifier"]
+        comp = _st_pv_kw_m3(kk, a, bb, u, f_khz * 1e3, b_mt * 1e-3)
+        dev = (comp - printed) / printed * 100.0
+        in_band = abs(dev) <= AUDIT_BAND_PCT
+        row = {
+            "temp_c": _fmt(t),
+            "f_khz": _fmt(f_khz),
+            "b_mt": _fmt(b_mt),
+            "printed_pv_kw_m3": _fmt(printed),
+            "qualifier": q,
+            "printed_as": pt.get("printed_as"),
+            "computed_pv_kw_m3": _fmt(comp),
+            "deviation_pct": _fmt(dev),
+            "within_10_percent": bool(in_band),
+        }
+        if q in LOSS_BOUND_QUALIFIERS:
+            satisfies = comp <= printed * (1.0 + 1e-9)
+            row["satisfies_the_printed_bound"] = bool(satisfies)
+            if not satisfies:
+                n_bound_violations += 1
+                row["note"] = ("exceeds the printed upper bound by %.2f %%; the page "
+                               "says the loss is at most this" % dev)
+            elif not in_band:
+                row["note"] = ("below the printed upper bound, so the bound is "
+                               "satisfied; a bound cannot exclude a smaller value, so "
+                               "this point does not confirm the triple either")
+        else:
+            row["satisfies_the_printed_bound"] = None
+            if not in_band:
+                n_miss += 1
+                row["note"] = ("a typical value is printed here (not a bound), so "
+                               "both directions are comparable and this misses it by "
+                               "%.2f %%" % dev)
+        if in_band:
+            n_in_band += 1
+        rows.append(row)
+
+    if n_bound_violations:
+        verdict = "violates_a_printed_upper_bound"
+        verdict_note = ("at least one printed point is an upper bound and this triple "
+                        "computes a loss above it - that is a contradiction, not a "
+                        "tolerance question")
+    elif n_miss:
+        verdict = "does_not_match_every_printed_point"
+        verdict_note = ("no bound was violated, but at least one printed typical value "
+                        "is missed by more than %g %%" % AUDIT_BAND_PCT)
+    else:
+        verdict = "consistent_with_every_printed_point"
+        verdict_note = ("every printed point is either satisfied as a bound or inside "
+                        "%g %% of its printed value" % AUDIT_BAND_PCT)
+
+    val = {
+        "material": name,
+        "vendor": entry.get("vendor"),
+        "source_id": entry.get("source"),
+        "printed_page": entry.get("printed_page"),
+        "pdf_page": entry.get("pdf_page"),
+        "triple": {"k": _fmt(kk), "alpha": _fmt(a), "beta": _fmt(bb),
+                   "units": u,
+                   "k_in": STEINMETZ_UNITS[u][2],
+                   "form": "Pv = k * f^alpha * B^beta"},
+        "temperature_c": None if tq is None else _fmt(tq),
+        "temperatures_printed": temps,
+        "points_evaluated": len(rows),
+        "points_in_band": n_in_band,
+        "bound_violations": n_bound_violations,
+        "typical_value_misses": n_miss,
+        "band_pct": AUDIT_BAND_PCT,
+        "anchors": rows,
+        "verdict": verdict,
+        "verdict_note": verdict_note,
+        "solved_here": False,
+        "why_not_solved": ("the printed points are not a fit: a bound and a typical "
+                           "value at the same temperature cannot both be hit exactly, "
+                           "so any triple solved from them would be arithmetic "
+                           "presented as vendor data"),
+        "how_to_read_a_bound": ("an upper bound is satisfied by any smaller number, so "
+                                "a bound point confirms a triple only when the triple "
+                                "is close to it from below - the two fields are "
+                                "reported separately for that reason"),
+    }
+    src = None
+    for s in data.get("sources") or []:
+        if s.get("id") == entry.get("source"):
+            src = s
+            break
+    extra = {"sources": ([{"id": src.get("id"), "url": src.get("url"),
+                           "what": src.get("what"),
+                           "date_printed": src.get("date_printed")}]
+                         if src else []),
+             "printed_page_equals_pdf_page": (src or {}).get(
+                 "printed_page_equals_pdf_page"),
+             "qualifier_meanings": data.get("qualifiers"),
+             "units_note": data.get("units"),
+             "table_version": data.get("version")}
+    if entry.get("note"):
+        extra["material_note"] = entry.get("note")
+    return ok(
+        val,
+        "dimensionless deviation of a Steinmetz triple from the vendor's printed "
+        "loss points",
+        "Pv = k * f^alpha * B^beta evaluated at each printed (T, f, B) and compared "
+        "with the printed Pv",
+        "data/material_loss_anchors.json - Ferroxcube data handbook 2013 material "
+        "specification pages and Ferroxcube's 2022 3C96/3C98 brochure, plus the one "
+        "number TDK prints for N87; every point carries its page, its qualifier and "
+        "the text that was printed",
+        "the printed values carry two significant digits, so %.0f %% is a reporting "
+        "band and not a pass mark; every raw deviation is reported"
+        % AUDIT_BAND_PCT,
+        {"no_fit_done_here": "the triple is scored, never derived - see "
+                             "solved_here / why_not_solved",
+         "bounds_vs_typical": "at_most and max are upper bounds, approx and plain are "
+                              "typical values, and the two are never compared as if "
+                              "they were the same kind of number",
+         "units": "kW/m^3 and mW/cm^3 are the same number (1 kW/m^3 == 1 mW/cm^3), "
+                  "so the printed values need no conversion",
+         "scope": "these are the points the vendor printed; a triple consistent with "
+                  "them is not thereby the vendor's fit"},
         extra)

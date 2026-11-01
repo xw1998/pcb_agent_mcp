@@ -315,9 +315,9 @@ class WaveformAndRegistration(unittest.TestCase):
         self.assertNotIn("units", t["inputSchema"]["properties"])
         self.assertEqual(t["inputSchema"]["properties"]["shape"]["enum"],
                          sorted(M.LOSS_FIT_SHAPES))
-        # 178 = 177 + magnetics_powder_curve in 0.0.80 (the vendor's printed B(H)
-        # and mu-vs-T curves are a different object from a single Bsat number)
-        self.assertEqual(len(tools.TOOLS), 178)
+        # 179 = 178 + magnetics_core_loss_audit in 0.0.81 (scoring a triple against
+        # the vendor's printed points is a different question from evaluating a fit)
+        self.assertEqual(len(tools.TOOLS), 179)
         caps = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_material_core_loss", caps["available"])
 
