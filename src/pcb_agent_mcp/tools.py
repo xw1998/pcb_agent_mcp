@@ -18,6 +18,7 @@ from .calc import current as _current
 from .calc import currentfield as _cfield
 from .calc import skin as _skin
 from .calc import roundwire as _round
+from .calc import acthermal as _at
 from .calc import creepage as _creepage
 from .calc import diffpair as _diffpair
 from .calc import field2d as _field2d
@@ -3654,6 +3655,7 @@ def _capabilities(_args):
             "repetitive_pulse_rating", "current_density_field",
             "ac_sheet_resistance",
             "ac_round_conductor",
+            "ac_self_heating",
             "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "coplanar_field", "coplanar_pair_field", "crosstalk_coupled_lines",
@@ -4053,8 +4055,10 @@ def _capabilities(_args):
             "temperature-dependent emissivity, component thermal mass and contact "
             "resistance, AC loss (skin/proximity) - ac_sheet_resistance gives the "
             "1-D skin term of a FLAT sheet and ac_round_conductor the exact term "
-            "for a round wire, tube or via, but nothing here turns a loss into a "
-            "temperature at frequency - device self-heating inside sim_spice, "
+            "for a round wire, tube or via; ac_self_heating (0.0.68) is the one "
+            "that closes the loop at frequency, but it does ONE conductor at ONE "
+            "frequency with the Rth you hand it - this 2-D plate is still DC - "
+            "device self-heating inside sim_spice, "
             "reading the conductors or the zones straight off a board "
             "file - board_electrothermal takes geometry, it does not open the "
             ".kicad_pcb for "
@@ -4106,7 +4110,9 @@ def _capabilities(_args):
             "exact one for a round wire/tube/via, and current_density_field "
             "takes frequency_hz to scale its own sheet conductance, but a 2-D "
             "pattern whose current re-distributes across the sheet at frequency "
-            "is still not solved). The switch defaults OFF and the "
+            "is still not solved; ac_self_heating closes the thermal loop at "
+            "frequency for ONE conductor and the Rth it is given, which is not "
+            "the same thing as a patterned sheet). The switch defaults OFF and the "
             "answer without it is byte-identical to 0.0.63 - a pour-only net is still "
             "NOT_APPLICABLE/singular unless the caller asks for the sheet",
             "The plane-caps network is COMPUTED now (pdn_plane_with_caps: the cavity "
@@ -5570,7 +5576,10 @@ _tool(
     "conductance, but the PATTERN is unchanged - that is the limit of a uniform "
     "thickness correction, and it says so. For a ROUND conductor (a wire, a tube, "
     "a via barrel) this geometry is wrong: the curvature and the bore change the "
-    "answer, and ac_round_conductor solves that one exactly.",
+    "answer, and ac_round_conductor solves that one exactly. This is the "
+    "resistance only: if you have a current to go with it, ac_self_heating turns "
+    "this same R(f) into a temperature by closing the electro-thermal loop, where "
+    "the hot copper has a longer skin depth and therefore a different R again.",
     {"type": "object", "properties": {
         "frequency_hz": _num("frequency, Hz. Required: a skin depth without a "
                              "frequency is just a length"),
@@ -5637,7 +5646,10 @@ _tool(
     "above x ~ 15, so the answer is integrated from the Riccati log-derivative "
     "equation with RK4 + Richardson; the closed form is used only as an "
     "independent cross-check below x = 10, and when it is not run the checks say "
-    "closed_form_skipped instead of printing a number that looks like agreement.",
+    "closed_form_skipped instead of printing a number that looks like agreement. "
+    "R only: ac_self_heating takes exactly this R(f) and turns it into a "
+    "temperature at a given current and Rth, where the heating moves rho and rho "
+    "moves the wall/delta ratio again.",
     {"type": "object", "properties": {
         "frequency_hz": _num("frequency, Hz. Required: a skin depth without a "
                              "frequency is just a length"),
@@ -5682,6 +5694,106 @@ _tool(
                             if a.get("profile_samples") is not None else 9),
         fd_points=int(a.get("fd_points") if a.get("fd_points") is not None else 801),
         fd_verify=(a.get("fd_verify") if a.get("fd_verify") is not None else True)),
+)
+
+_tool(
+    "ac_self_heating",
+    "Temperature of a conductor carrying AC current, solved self-consistently - "
+    "the loop electrothermal_trace and electrothermal_conductor deliberately do "
+    "NOT close at frequency (their P = I^2*R uses the DC resistance). Hot copper "
+    "has a longer skin depth, a longer skin depth means a thinner effective "
+    "shell, so the resistance that made the heat depends on the heat. The single "
+    "number that decides the behaviour is dlnR/dlnrho, and it is MEASURED at the "
+    "solution (central difference through the same solver), not assumed: it is 1 "
+    "in a DC or wall-limited conductor (the wall is thinner than the skin depth) "
+    "and 1/2 once the current lives in a shell. That difference is the whole "
+    "answer to \"can this run away\": with exponent 1 the resistance grows exactly "
+    "as fast as the heat driving it and there is NO steady state at any "
+    "temperature; with 1/2 the loop always has a mathematical fixed point, it is "
+    "just usually above the melting point, and those two failures come back with "
+    "different messages and different numbers (root_beyond_melt_c vs no root at "
+    "all), because they are not the same thing. Geometry: shape='sheet' means "
+    "length_mm + width_mm + exactly one of thickness_mm/thickness_um and "
+    "faces='one' (microstrip) or 'two' (stripline); shape='round' means a solid "
+    "diameter_mm, a tube diameter_mm + wall_um, or a via drill_mm + plating_um "
+    "with the outer diameter at drill + 2*plating. Rth is the caller's, always: "
+    "there is no honest default for a thermal path (feed it thermal_stack, "
+    "via_array_thermal, plate_temperature or a measurement), and the same is "
+    "true of the frequency - ask electrothermal_conductor for DC. Reported "
+    "besides the temperature: resistance hot and cold, the growth ratio, the "
+    "regime, the loop gain at the answer, the current at which the cold gain "
+    "reaches 1, the Rth that would keep the root below melting, and an "
+    "energy-balance residual measured on the actual root rather than assumed.",
+    {"type": "object", "properties": {
+        "shape": {"type": "string", "enum": ["sheet", "round"],
+                  "description": "which 1-D problem this is: 'sheet' (flat "
+                                 "trace/plane, Cartesian) or 'round' (wire, "
+                                 "tube, via barrel; Bessel). Required - it is "
+                                 "never inferred from which arguments are "
+                                 "present, because the same thickness in the two "
+                                 "geometries means different physics"},
+        "frequency_hz": _num("frequency, Hz. Required: without it this is the DC "
+                            "loop, which is electrothermal_conductor"),
+        "current_a": _num("RMS current, A. Required"),
+        "rth_c_per_w": _num("thermal resistance ambient->junction of the lump "
+                            "you are describing, K/W. Required: a made-up Rth "
+                            "would be the only number in this answer that was "
+                            "not derived from something (thermal_stack, "
+                            "via_array_thermal and plate_temperature all return "
+                            "one)"),
+        "length_mm": _num("conductor length, mm. Required for both shapes: a "
+                          "temperature needs an absolute resistance, not ohms "
+                          "per square"),
+        "width_mm": _num("trace width, mm (sheet)"),
+        "thickness_mm": _num("copper thickness, mm (sheet). Exclusive with "
+                             "thickness_um"),
+        "thickness_um": _num("copper thickness, um (sheet): 35 is 1 oz, 17 is "
+                             "half an ounce, 70 is 2 oz"),
+        "faces": {"type": "string", "enum": ["one", "two"],
+                  "description": "'one' = return current on one side (microstrip, "
+                                 "a trace over a plane: the effective thickness "
+                                 "doubles), 'two' = symmetric (stripline, a plane "
+                                 "between two returns). It is a factor of two, "
+                                 "not a cosmetic choice"},
+        "diameter_mm": _num("outer diameter, mm (round): a solid wire alone, or a "
+                            "tube with wall_um. Exclusive with drill_mm"),
+        "wall_um": _num("wall thickness, um (round, with diameter_mm): a tube or "
+                        "a barrel whose copper you know"),
+        "drill_mm": _num("drilled hole diameter, mm (round, with plating_um): a "
+                         "via. The finished hole is drill_mm and the copper sits "
+                         "outside it, so OD = drill + 2*plating"),
+        "plating_um": _num("plating thickness, um (round, with drill_mm): 20-25 "
+                           "for a through hole, 8-12 for a microvia. A bare hole "
+                           "is not a conductor and is refused"),
+        "t_ambient_c": _num("ambient temperature the Rth refers to, C", 25.0),
+        "mu_r": _num("relative permeability of the conductor, 1.0 for copper", 1.0),
+        "roughness_rq_um": _num("RMS surface roughness Rq, um. Off by default "
+                                "(smooth copper is a lower bound): on, it enters "
+                                "the ANSWER here, unlike ac_sheet_resistance "
+                                "where it is a separate field - and it also "
+                                "lowers dlnR/dlnrho below 1/2, so the exponent "
+                                "expectation is suppressed instead of failed"),
+        "alpha_per_k": _num("temperature coefficient of resistance, 1/K; omit for "
+                            "0.00393 (IACS copper, linear 0..100 C)"),
+        "rho20_ohm_m": _num("resistivity at 20 C, ohm*m; omit for 1.724e-8"),
+    }, "required": ["shape", "frequency_hz", "current_a", "rth_c_per_w",
+                    "length_mm"]},
+    lambda a: _at.ac_self_heating(
+        a.get("shape"),
+        a.get("frequency_hz"),
+        a.get("current_a"),
+        a.get("rth_c_per_w"),
+        length_mm=a.get("length_mm"), width_mm=a.get("width_mm"),
+        thickness_um=a.get("thickness_um"), thickness_mm=a.get("thickness_mm"),
+        faces=(a.get("faces") if a.get("faces") is not None else "one"),
+        diameter_mm=a.get("diameter_mm"), drill_mm=a.get("drill_mm"),
+        plating_um=a.get("plating_um"), wall_um=a.get("wall_um"),
+        t_ambient_c=(a.get("t_ambient_c")
+                     if a.get("t_ambient_c") is not None else 25.0),
+        mu_r=(a.get("mu_r") if a.get("mu_r") is not None else 1.0),
+        roughness_rq_um=a.get("roughness_rq_um"),
+        alpha_per_k=a.get("alpha_per_k"),
+        rho20_ohm_m=a.get("rho20_ohm_m")),
 )
 
 _tool(

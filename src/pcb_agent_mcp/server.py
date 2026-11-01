@@ -4212,6 +4212,147 @@ def selftest():
           "%s / %s / %s" % (_rw_no.get("reason_code"), _rw_both.get("reason_code"),
                             _rw_f0.get("reason_code")))
 
+    # ---- 0.0.68: copper at 1 GHz has a RESISTANCE, and a resistance times a
+    # current times a lump Rth is a TEMPERATURE - but the loop is not linear in
+    # dT once the current lives in a shell, so it is solved as a root, not
+    # iterated to a fixed point. 35 um of copper at 3 A settles at 26.82 C at
+    # 100 Hz and at 56.77 C at 1 GHz.
+    _sh = {"shape": "sheet", "length_mm": 20.0, "width_mm": 1.0,
+           "thickness_um": 35.0, "current_a": 3.0, "rth_c_per_w": 20.0}
+    _ah_dc = _call("ac_self_heating", dict(_sh, frequency_hz=100.0), 1843)
+    check("at 100 Hz the AC loop IS the DC loop: 26.8208 C (dT 1.82079 K) against "
+          "electrothermal_conductor's own closed form to 3.0e-7 relative, and the "
+          "measured dlnR/dlnrho is exactly 1",
+          abs(((_ah_dc.get("value") or {}).get("t_final_c") or 0) - 26.8208) < 1e-4
+          and abs(((_ah_dc.get("value") or {}).get("delta_t_c") or 0) - 1.82079) < 1e-5
+          and (((_ah_dc.get("value") or {}).get("checks") or {})
+               .get("dc_linear_model_rel_diff") or 1) < 1e-6
+          and ((_ah_dc.get("value") or {}).get("dlnr_dlnrho") or 0) == 1.0,
+          "T %s C, DC rel %s" % ((_ah_dc.get("value") or {}).get("t_final_c"),
+                                 ((_ah_dc.get("value") or {}).get("checks") or {})
+                                 .get("dc_linear_model_rel_diff")))
+
+    # The same trace at 1 GHz: the copper is a shell, R goes up 16.6x, and the
+    # exponent is 1/2 - which is the single number that decides what a runaway
+    # MEANS. The DC model of this conductor is 7.9 % cold here, and that gap is
+    # reported, not hidden.
+    _ah_rf = _call("ac_self_heating", dict(_sh, frequency_hz=1.0e9), 1844)
+    _ahv = _ah_rf.get("value") or {}
+    check("the same 35 um trace at 1 GHz answers 56.7733 C with R_cold 0.166611 "
+          "ohm (16.5865x R_dc), R_hot 0.176518, dlnR/dlnrho = 0.5 measured, and "
+          "the DC model is off by 7.905 % - reported as a gap, not as an error bar",
+          abs((_ahv.get("t_final_c") or 0) - 56.7733) < 1e-4
+          and abs((_ahv.get("resistance_cold_ohm") or 0) - 0.166611) < 1e-6
+          and abs((_ahv.get("resistance_hot_ohm") or 0) - 0.176518) < 1e-6
+          and abs((_ahv.get("dlnr_dlnrho") or 0) - 0.5) < 1e-9
+          and abs((( _ahv.get("checks") or {}).get("dc_linear_model_rel_diff")
+                   or 0) - 0.07905) < 5e-5
+          and "skin-dominated" in (_ahv.get("regime_hot") or ""),
+          "T %s C, R_cold %s, DC rel %s" % (_ahv.get("t_final_c"),
+                                            _ahv.get("resistance_cold_ohm"),
+                                            (_ahv.get("checks") or {})
+                                            .get("dc_linear_model_rel_diff")))
+
+    # Two runaways exist and they are NOT the same answer. 12 A on a 0.1 mm
+    # trace at DC is algebra: the gain never falls below 1, so no temperature is
+    # a fixed point anywhere, and the answer says exactly that.
+    _nr = {"shape": "sheet", "length_mm": 20.0, "width_mm": 0.1,
+           "thickness_um": 35.0, "rth_c_per_w": 20.0}
+    _ah_no = _call("ac_self_heating", dict(_nr, frequency_hz=100.0,
+                                          current_a=12.0), 1845)
+    check("12 A on a 0.1 mm trace at 100 Hz is refused as THERMAL_RUNAWAY with "
+          "'no steady state at any temperature' (cold gain 1.11502, the unit-gain "
+          "current is 11.3642 A and Rth would have to be <= 14.4088 K/W), and it "
+          "does NOT hand back a made-up root",
+          _ah_no.get("reason_code") == "THERMAL_RUNAWAY"
+          and "no steady state at any temperature" in (_ah_no.get("message") or "")
+          and "root_beyond_melt_t_c" not in _ah_no
+          and abs((_ah_no.get("runaway_gain_cold") or 0) - 1.11502) < 1e-5
+          and abs((_ah_no.get("unit_gain_current_a") or 0) - 11.3642) < 1e-4,
+          "gain %s, I_unit %s" % (_ah_no.get("runaway_gain_cold"),
+                                  _ah_no.get("unit_gain_current_a")))
+
+    # Same copper at 1 GHz: the exponent is 1/2, so the fixed point EXISTS and
+    # saying "no steady state" would be a lie. It is at 37.3 kK, which is the
+    # honest way to say the design is impossible.
+    _ah_rb = _call("ac_self_heating", dict(_nr, frequency_hz=1.0e9,
+                                          current_a=10.0), 1846)
+    check("the same trace at 10 A and 1 GHz has exponent 0.5 and therefore DOES "
+          "have a fixed point - it is reported at 37325.8 C (dT 37300.8 K) as an "
+          "extrapolation, with 'ordering, not a reading' in the hint, because "
+          "'no steady state' and 'no buildable steady state' are different claims",
+          _ah_rb.get("reason_code") == "THERMAL_RUNAWAY"
+          and "above the melting point" in (_ah_rb.get("message") or "")
+          and abs((_ah_rb.get("root_beyond_melt_t_c") or 0) - 37325.8) < 0.05
+          and "ordering, not a reading" in (_ah_rb.get("hint") or "")
+          and "no steady state at any temperature"
+          not in (_ah_rb.get("message") or ""),
+          "root %s C" % (_ah_rb.get("root_beyond_melt_t_c"),))
+
+    # The negative control for the pair above, and the bug this release fixed:
+    # 11 A is BELOW the 11.3642 A unit-gain current, so an exponent-1 loop has a
+    # root (at dT 3854 K). The uncapped search used to be gated on exponent < 1,
+    # so this current came back as "no steady state at any temperature" about a
+    # loop that demonstrably settles somewhere.
+    _ah_edge = _call("ac_self_heating", dict(_nr, frequency_hz=100.0,
+                                            current_a=11.0), 1847)
+    check("11 A on the same trace is under the unit-gain current (cold gain "
+          "0.93693 < 1) and is therefore NOT 'no steady state at any temperature': "
+          "the root is found at dT 3854.27 K and reported as an extrapolation - "
+          "the exact wrong answer 0.0.67's gate would have produced",
+          _ah_edge.get("reason_code") == "THERMAL_RUNAWAY"
+          and "no steady state at any temperature"
+          not in (_ah_edge.get("message") or "")
+          and abs((_ah_edge.get("root_beyond_melt_dt_c") or 0) - 3854.27) < 0.05
+          and (_ah_edge.get("runaway_gain_cold") or 0) < 1.0,
+          "dT %s K, gain %s" % (_ah_edge.get("root_beyond_melt_dt_c"),
+                                _ah_edge.get("runaway_gain_cold")))
+
+    # Frequency does not make a thin wall into a skin. 0.5 um of plating at
+    # 1 GHz is wall-limited with an exponent of 0.9995 - the DC answer, which is
+    # the case "use the skin depth" gets wrong.
+    _ah_wall = _call("ac_self_heating", {"shape": "round", "frequency_hz": 1.0e9,
+                                        "current_a": 0.5, "rth_c_per_w": 200.0,
+                                        "length_mm": 1.6, "drill_mm": 0.3,
+                                        "plating_um": 0.5}, 1848).get("value") or {}
+    check("a 0.5 um plating at 1 GHz is REPORTED as wall-limited with "
+          "dlnR/dlnrho = 0.999454 and answers 28.0147 C - the current fills the "
+          "wall, so the exponent is the DC one even at a gigahertz",
+          "wall-limited" in (_ah_wall.get("regime_hot") or "")
+          and abs((_ah_wall.get("dlnr_dlnrho") or 0) - 0.999454) < 1e-6
+          and abs((_ah_wall.get("t_final_c") or 0) - 28.0147) < 1e-4,
+          "regime %s, exponent %s" % (_ah_wall.get("regime_hot"),
+                                      _ah_wall.get("dlnr_dlnrho")))
+
+    # Two faces is one face divided by two, but only where the far side cannot
+    # be seen - the surface term, not a factor of 2 applied blindly.
+    _ah_two = _call("ac_self_heating", dict(_sh, frequency_hz=1.0e9,
+                                           faces="two"), 1849).get("value") or {}
+    check("faces='two' halves the skin-dominated resistance (0.0833056 vs "
+          "0.0833055 for one face) and halves dT (15.4346 vs 31.7733 K) - the "
+          "surface term cannot see the far side, which is the only reason the "
+          "factor is exact",
+          abs((_ah_two.get("resistance_cold_ohm") or 0) - 0.0833056) < 1e-6
+          and abs((_ah_two.get("delta_t_c") or 0) - 15.4346) < 1e-4,
+          "R_cold %s, dT %s" % (_ah_two.get("resistance_cold_ohm"),
+                                _ah_two.get("delta_t_c")))
+
+    # Roughness depends on the skin depth, so it drags the exponent below 1/2 and
+    # there is no longer a prediction to compare against. Saying nothing is the
+    # only honest option; failing a check that was never valid there is not.
+    _ah_rq = _call("ac_self_heating", dict(_sh, frequency_hz=1.0e9,
+                                          roughness_rq_um=1.0), 1850).get("value") or {}
+    _ah_rqc = _ah_rq.get("checks") or {}
+    check("1 um Rq drops the exponent to 0.361116 (not 0.5) and the module sets "
+          "beta_expectation to null with a note instead of failing a comparison "
+          "that cannot apply once the roughness factor itself moves with rho",
+          abs((_ah_rq.get("dlnr_dlnrho") or 0) - 0.361116) < 1e-6
+          and _ah_rqc.get("beta_expectation") is None
+          and _ah_rqc.get("beta_deviation") is None
+          and "roughness" in (_ah_rqc.get("beta_expectation_note") or ""),
+          "exponent %s, expectation %s" % (_ah_rq.get("dlnr_dlnrho"),
+                                           _ah_rqc.get("beta_expectation")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

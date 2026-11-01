@@ -621,7 +621,10 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # NOT the same geometry: a bore is a Neumann surface with no net current
         # behind it, and a plated via needs the annulus, so this is a new tool
         # with its own solver, not a flag on ac_sheet_resistance)
-        self.assertEqual(len(tools.TOOLS), 172)
+        # 173 = 172 + ac_self_heating in 0.0.68 (R at a frequency is an INPUT to
+        # the thermal loop, not a separate calculation: the answer is a TEMPERATURE
+        # and the loop has to be solved for, so it is its own tool)
+        self.assertEqual(len(tools.TOOLS), 173)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

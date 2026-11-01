@@ -1,0 +1,682 @@
+"""AC electro-thermal: the current heats the copper, the hot copper has a bigger
+skin depth, and a bigger skin depth means a thinner effective shell.
+
+The DC loop (`electrothermal`) is linear in T, so it has a closed form and an
+exact runaway test. This loop is NOT linear: at high frequency the current is
+pushed into a shell of depth delta ~ sqrt(rho/(pi*f*mu)), so
+
+    R_ac ~ Rs = rho/delta ~ sqrt(rho)        (skin-dominated)
+    R_ac ~ rho*L/A                            (wall-limited: the wall is
+                                               thinner than delta)
+
+i.e. d lnR / d lnrho is 1/2 in the first case and 1 in the second, while the DC
+answer is the second one always. That single exponent decides whether the loop
+can run away at all:
+
+    dT = k*R(dT),   k = I^2 * Rth
+
+  * dlnR/dlnrho = 1  (DC / wall-limited): R is affine in dT, the gain
+    G = k*dR/dT is constant, and G >= 1 means NO steady state exists.
+  * dlnR/dlnrho = 1/2: R grows like sqrt(dT), and sqrt grows slower than dT, so
+    a steady state ALWAYS exists (for the linear rho(T) law) - it can just be
+    very hot. Calling that "runaway" would be wrong; the answer says which one
+    it is, and refuses above the melting point because past there the linear law
+    and the geometry are both gone.
+
+This module measures the exponent instead of assuming it: `dlnr_dlnrho` is a
+central difference on the actual solver at the solution point, and the checks
+compare it against 0.5 / 1.0 with the regime named.
+
+Rth is the caller's, always - same reason as in `electrothermal`: there is no
+honest default for a thermal path, and a made-up one would be the only number in
+this whole layer that was not derived from something.
+"""
+import math
+
+from .result import ok, err
+from . import power as _power
+from . import skin as _skin
+from . import roundwire as _round
+from .roughness import roughness_factor
+
+MU0 = 4e-7 * math.pi
+RHO20_CU = _power.RHO_CU_20      # ohm*m at 20 C
+ALPHA_CU = _power.ALPHA_CU       # 1/K
+T20 = 20.0                       # C
+
+MELT_CU_C = 1084.62              # C, copper melting point (1 atm)
+# The fixed point is searched below this temperature.  It is the melting point
+# itself, not a round number: above it the geometry (and the linear rho law)
+# describe a liquid.
+DT_CAP_C = MELT_CU_C
+
+# Used ONLY to answer "does the loop have a fixed point at all" when the exponent
+# is below 1. Past the melting point both the linear rho law and the geometry are
+# fiction, so the number that comes out of this bracket is reported as an
+# extrapolation and never as a temperature.
+_EXTRAP_CAP_C = 1.0e6
+
+_NEWTON_H = 1e-3                 # K, step for the numerical dlnR/dlnrho
+
+
+def _sig(x, digits=6):
+    if x is None:
+        return None
+    x = float(x)
+    if x == 0 or x != x:
+        return 0.0 if x == 0 else None
+    if abs(x) >= 1e-4 and abs(x) < 1e7:
+        n = digits - 1 - int(math.floor(math.log10(abs(x))))
+        return round(x, n) if n > 0 else float(round(x, n))
+    return float("%.*e" % (digits - 1, x))
+
+
+# ------------------------------------------------------------------ geometry
+def _geometry(shape, length_mm, width_mm, thickness_um, thickness_mm,
+              faces, diameter_mm, drill_mm, plating_um, wall_um):
+    """One dict per shape, or (None, err-envelope)."""
+    if shape not in ("sheet", "round"):
+        return None, err(
+            "shape must be 'sheet' or 'round', not %r. It is not inferred from "
+            "which arguments happen to be present: a sheet and a round wire at "
+            "the same thickness are two different problems (1-D Cartesian vs "
+            "Bessel) and the same numbers would mean different things"
+            % (shape,), "BAD_PARAMETER")
+
+    try:
+        L = float(length_mm)
+    except (TypeError, ValueError):
+        return None, err("length_mm is required and must be a number - a "
+                         "temperature needs an absolute resistance, not ohms per "
+                         "square", "ARG_REQUIRED")
+    if not (L > 0.0):
+        return None, err("length_mm must be > 0", "ARG_RANGE")
+
+    if shape == "sheet":
+        if (thickness_mm is None) == (thickness_um is None):
+            return None, err("give exactly one of thickness_mm or thickness_um "
+                             "(35 um is 1 oz, 17 um is half an ounce, and the "
+                             "skin term depends on which one the board has)",
+                             "ARG_REQUIRED")
+        try:
+            t = (float(thickness_mm) if thickness_mm is not None
+                 else float(thickness_um) / 1e3)
+            w = float(width_mm)
+        except (TypeError, ValueError):
+            return None, err("thickness and width_mm must be numbers",
+                             "BAD_PARAMETER")
+        if not (t > 0.0 and w > 0.0):
+            return None, err("thickness and width_mm must be > 0", "ARG_RANGE")
+        if diameter_mm is not None or drill_mm is not None:
+            return None, err("a sheet has width_mm + thickness, not a diameter "
+                             "or a drill", "ARG_INVALID")
+        if faces not in _skin._FACE_FACTOR:
+            return None, err("faces must be 'one' (return current on one side: "
+                             "microstrip, a plane over its return) or 'two' "
+                             "(symmetric: stripline, a plane between two "
+                             "returns), not %r - it is a factor of two in the "
+                             "effective thickness, not a cosmetic choice"
+                             % (faces,), "BAD_PARAMETER")
+        return {"kind": "sheet", "t_mm": t, "w_mm": w, "l_mm": L,
+                "faces": faces, "k_face": _skin._FACE_FACTOR[faces]}, None
+
+    # ---- round: exactly one of diameter_mm | (diameter_mm, wall_um) |
+    #      (drill_mm, plating_um)
+    if wall_um is not None and drill_mm is not None:
+        return None, err("wall_um goes with diameter_mm; a drill uses "
+                         "plating_um. Two descriptions of one wall is one too "
+                         "many", "ARG_INVALID")
+    if drill_mm is not None:
+        if diameter_mm is not None:
+            return None, err("give either diameter_mm or drill_mm, not both - "
+                             "they are two descriptions of the same outer "
+                             "diameter", "ARG_INVALID")
+        if plating_um is None:
+            return None, err("a drill needs plating_um: a bare hole is not a "
+                             "conductor", "ARG_REQUIRED")
+        try:
+            d = float(drill_mm)
+            p = float(plating_um)
+        except (TypeError, ValueError):
+            return None, err("drill_mm and plating_um must be numbers",
+                             "BAD_PARAMETER")
+        if not (d > 0.0 and p > 0.0):
+            return None, err("drill_mm and plating_um must be > 0", "ARG_RANGE")
+        if 2.0 * p / 1e3 >= d:
+            return None, err("plating %.3g um closes a %.4g mm drill" % (p, d),
+                             "ARG_RANGE",
+                             hint="check the hole convention: this reads "
+                                  "drill_mm as the FINISHED hole with the copper "
+                                  "outside it (OD = drill + 2*plating), which is "
+                                  "what ac_round_conductor uses")
+        a1 = d / 2.0
+        a2 = a1 + p / 1e3
+        return {"kind": "round", "a1": a1, "a2": a2, "l_mm": L,
+                "hollow": True}, None
+    try:
+        a2 = float(diameter_mm) / 2.0
+    except (TypeError, ValueError):
+        return None, err("a round conductor needs diameter_mm (or drill_mm + "
+                         "plating_um)", "ARG_REQUIRED")
+    if not (a2 > 0.0):
+        return None, err("diameter_mm must be > 0", "ARG_RANGE")
+    a1 = 0.0
+    if wall_um is not None:
+        try:
+            wall = float(wall_um) / 1e3
+        except (TypeError, ValueError):
+            return None, err("wall_um must be a number", "BAD_PARAMETER")
+        if not (wall > 0.0):
+            return None, err("wall_um must be > 0", "ARG_RANGE")
+        if wall >= a2:
+            return None, err("wall_um %.4g mm is not thinner than the radius "
+                             "%.4g mm" % (wall, a2), "ARG_RANGE")
+        a1 = a2 - wall
+    return {"kind": "round", "a1": a1, "a2": a2, "l_mm": L,
+            "hollow": a1 > 0.0}, None
+
+
+def _rho_ohm_mm(t_c, rho20=None, alpha=None):
+    """rho in ohm*mm at temperature t_c (the unit `skin`/`roundwire` take).
+
+    rho20/alpha are the caller's pair when given (annealed vs electro-deposited
+    copper, a different alloy) and the IACS constants when not. They travel
+    together: a rho20 without its alpha is a different metal with copper's
+    temperature coefficient.
+    """
+    rho20 = RHO20_CU if rho20 is None else rho20
+    alpha = ALPHA_CU if alpha is None else alpha
+    return rho20 * (1.0 + alpha * (float(t_c) - T20)) * 1e3
+
+
+def _one(geom, f, t_c, mur, rq_m, rho20=None, alpha=None):
+    """Resistance at one temperature: (ohms, dict of the local state).
+
+    This is the ONLY place the AC resistance is evaluated; the root finder and
+    the exponent measurement both come through here, so a fixed point and a
+    dlnR/dlnrho can never be computed from two slightly different models.
+    """
+    rho = _rho_ohm_mm(t_c, rho20, alpha)         # ohm*mm
+    rho_m = rho * 1e-3                           # ohm*m
+    delta_m = math.sqrt(rho_m / (math.pi * f * MU0 * mur))
+    delta_mm = delta_m * 1e3
+    k_rgh = 1.0
+    if geom["kind"] == "sheet":
+        t = geom["t_mm"]
+        s = (t * 1e-3) / (geom["k_face"] * delta_m)
+        r_ratio, _x_ratio = _skin._ratio_from_s(s)
+        r_dc_sq = rho / t                        # ohm per square
+        r = r_dc_sq * r_ratio * geom["l_mm"] / geom["w_mm"]
+        if rq_m:
+            k_rgh = roughness_factor(rq_m, delta_m)
+            r *= k_rgh
+        return r, {"delta_um": delta_mm * 1e3, "s": s, "r_over_rdc": r_ratio,
+                   "roughness_k": k_rgh, "x_out": None,
+                   "regime": ("dc" if s <= 0.5 else
+                              "transition" if s < 3.0 else "skin-dominated")}
+    a1, a2 = geom["a1"], geom["a2"]
+    x_out = a2 / delta_mm
+    x_in = a1 / delta_mm
+    if geom["hollow"]:
+        z = _round.riccati_ratio(x_out, x_in)[0]
+        x_wall = x_out - x_in
+        regime = ("wall-limited" if x_wall <= 1.0 else
+                  "transition" if x_out < 3.0 else "skin-dominated")
+    else:
+        z = _round._solid_ratio(x_out)
+        x_wall = x_out
+        regime = ("dc" if x_out <= 0.5 else
+                  "transition" if x_out < 3.0 else "skin-dominated")
+    area = math.pi * (a2 * a2 - a1 * a1)         # mm^2
+    # rho is ohm*mm here, so ohm*mm * mm / mm^2 is already ohm: the 1e3 that a
+    # ohm*m rho would need is the 1e3 that turns ohm*m into ohm*mm above
+    r = rho * geom["l_mm"] / area                # ohm
+    r *= z.real
+    if rq_m:
+        k_rgh = roughness_factor(rq_m, delta_m)
+        r *= k_rgh
+    return r, {"delta_um": delta_mm * 1e3, "s": None, "r_over_rdc": z.real,
+               "roughness_k": k_rgh, "x_out": x_out, "x_wall": x_wall,
+               "regime": regime}
+
+
+def _beta_at(geom, f, t_c, mur, rq_m, r0=None, rho20=None, alpha=None):
+    """dlnR/dlnrho at fixed T, by a central difference in T.
+
+    This is the measured exponent, not an assumed 1/2: T -> rho is affine, so
+    a +-h step in T is a +-alpha*h/rho step in ln(rho), and the slope between
+    the two resistances is the slope in rho.
+    """
+    r_hi, _ = _one(geom, f, t_c + _NEWTON_H, mur, rq_m, rho20, alpha)
+    r_lo, _ = _one(geom, f, t_c - _NEWTON_H, mur, rq_m, rho20, alpha)
+    r_mid = (r0 if r0 is not None
+             else _one(geom, f, t_c, mur, rq_m, rho20, alpha)[0])
+    dlr = math.log(r_hi) - math.log(r_lo)
+    # dlnrho/dT = alpha/(1+alpha*(T-20)) exactly, so chain back to rho
+    dlrho = (math.log(_rho_ohm_mm(t_c + _NEWTON_H, rho20, alpha))
+             - math.log(_rho_ohm_mm(t_c - _NEWTON_H, rho20, alpha)))
+    if dlrho == 0.0:
+        return 1.0, r_mid
+    return dlr / dlrho, r_mid
+
+
+# --------------------------------------------------------------------- solve
+def ac_self_heating(shape=None, frequency_hz=None, current_a=None,
+                    rth_c_per_w=None, length_mm=None, width_mm=None, thickness_um=None,
+                    thickness_mm=None, faces="one", diameter_mm=None,
+                    drill_mm=None, plating_um=None, wall_um=None,
+                    t_ambient_c=25.0, mu_r=1.0, roughness_rq_um=None,
+                    alpha_per_k=None, rho20_ohm_m=None, tol_c=1e-9,
+                    max_iter=400):
+    """Temperature of a conductor carrying AC current, solved self-consistently.
+
+    dT = I^2 * R_ac(f, rho(T_amb + dT)) * Rth, root-found by bisection on
+    g(dT) = dT - k*R(dT) in [0, melt].  Bisection, not a fixed-point iteration,
+    because the loop is not a contraction here: it is a root of a monotone
+    (convex) function, so a sign change IS the existence proof and no iterate
+    can be reported as an answer while the loop is still moving.
+    """
+    if shape is None:
+        return err("shape is required ('sheet' or 'round'): a sheet and a round "
+                   "conductor at the same thickness are two different problems "
+                   "and it is not inferred from which arguments are present",
+                   "ARG_REQUIRED")
+    if current_a is None:
+        return err("current_a is required", "ARG_REQUIRED")
+    if rth_c_per_w is None:
+        return err("rth_c_per_w is required: it is never assumed here (a default "
+                   "thermal resistance would be the only number in this answer "
+                   "that came from nowhere)", "ARG_REQUIRED")
+    try:
+        f = float(frequency_hz)
+    except (TypeError, ValueError):
+        return err("frequency_hz is required and must be a number: this is the AC "
+                   "loop, and without a frequency it is `electrothermal_conductor`"
+                   , "ARG_REQUIRED")
+    if not (f > 0.0):
+        return err("frequency_hz must be > 0 (for DC use electrothermal_trace / "
+                   "electrothermal_conductor, where the loop is linear in T)",
+                   "BAD_PARAMETER")
+    try:
+        i = float(current_a)
+        rth = float(rth_c_per_w)
+        ta = float(t_ambient_c)
+        mur = float(mu_r) if mu_r is not None else 1.0
+    except (TypeError, ValueError):
+        return err("current_a, rth_c_per_w, t_ambient_c and mu_r must be numbers",
+                   "BAD_PARAMETER")
+    if not (i >= 0.0):
+        return err("current_a must be >= 0", "ARG_RANGE")
+    if not (rth > 0.0):
+        return err("rth_c_per_w must be > 0: the thermal path is never assumed "
+                   "here, because a default Rth would be the only number in this "
+                   "answer that was not derived from something",
+                   "ARG_RANGE")
+    if not (mur >= 1.0):
+        return err("mu_r must be >= 1 (copper is 1.0)", "BAD_PARAMETER")
+
+    alpha = ALPHA_CU if alpha_per_k is None else float(alpha_per_k)
+    rho20 = RHO20_CU if rho20_ohm_m is None else float(rho20_ohm_m)
+    if not (alpha >= 0.0):
+        return err("alpha_per_k must be >= 0", "ARG_RANGE")
+    if not (rho20 > 0.0):
+        return err("rho20_ohm_m must be > 0", "ARG_RANGE")
+
+    geom, e = _geometry(shape, length_mm, width_mm, thickness_um, thickness_mm,
+                        faces, diameter_mm, drill_mm, plating_um, wall_um)
+    if e is not None:
+        return e
+
+    rq_m = None
+    if roughness_rq_um is not None:
+        try:
+            rq_m = float(roughness_rq_um) * 1e-6
+        except (TypeError, ValueError):
+            return err("roughness_rq_um must be a number (RMS height Rq, not Rz)",
+                       "BAD_PARAMETER")
+        if rq_m < 0.0:
+            return err("roughness_rq_um must be >= 0", "ARG_RANGE")
+        if rq_m == 0.0:
+            rq_m = None
+
+    # one model, one entry point: r_at() is a thin wrapper, so the bisection and
+    # the exponent measurement below cannot drift apart
+    def r_at(t_c):
+        return _one(geom, f, t_c, mur, rq_m, rho20, alpha)
+
+    k = i * i * rth                     # K per ohm
+    r_cold, st_cold = r_at(ta)
+    beta_cold, _ = _beta_at(geom, f, ta, mur, rq_m, r_cold, rho20, alpha)
+    # the loop gain AT AMBIENT: it is the only gain that is a property of the
+    # design rather than of a solution that may not exist. With an exponent of 1
+    # it decides existence outright; with 1/2 it only decides where "settles"
+    # starts to mean "settles above melting".
+    cold_gain = k * r_cold * alpha * beta_cold / (1.0 + alpha * (ta - T20))
+
+    def unit_gain_current(beta):
+        """I at which the COLD loop gain reaches 1.
+
+        A runaway threshold only when the exponent is 1: with the 1/2 of a
+        skin-dominated conductor the gain falls as the copper heats, so the loop
+        settles instead of diverging and this is just where "settles" starts to
+        mean "settles above melting".
+        """
+        if alpha <= 0.0 or beta <= 0.0:
+            return None
+        return math.sqrt((1.0 + alpha * (ta - T20))
+                         / (rth * r_cold * alpha * beta))
+
+    i_unit = unit_gain_current(beta_cold)
+
+    def g(dt):
+        return dt - k * r_at(ta + dt)[0]
+
+    g0 = g(0.0)
+    # A zero current is a legitimate, trivial answer: dT = 0.
+    if k == 0.0:
+        r_hot, st_hot = r_cold, st_cold
+        dt = 0.0
+        it = 0
+        bracket = None
+    else:
+        lo, hi = 0.0, 1.0
+        while g(hi) < 0.0:
+            lo = hi
+            hi *= 2.0
+            if hi > DT_CAP_C:
+                gain_cold = cold_gain
+                # Two different failures wear the same name. With exponent 1 the
+                # loop is linearly divergent and NO temperature is a fixed point.
+                # With exponent < 1, dT - k*R(dT) still runs off to +infinity, so
+                # a fixed point DOES exist - it is just beyond the melting point,
+                # where the model stops.
+                #
+                # So the uncapped search is run UNCONDITIONALLY. Gating it on
+                # "exponent < 1" was wrong: with an exponent of exactly 1 the loop
+                # is still algebraic, and whenever the cold gain is below 1 it has
+                # a root - at about k*r_cold/(1 - cold_gain) K, far above melting.
+                # That gate reported "no steady state at any temperature" for a
+                # loop that demonstrably has one (11 A on a 0.1 mm trace: gain
+                # 0.937, root near dT 3850 K). Finding the root first, and only
+                # then choosing the wording from the exponent, is the only order
+                # that cannot produce that wrong answer.
+                lo2, hi2 = DT_CAP_C, 2.0 * DT_CAP_C
+                while g(hi2) < 0.0 and hi2 < _EXTRAP_CAP_C:
+                    lo2 = hi2
+                    hi2 *= 2.0
+                dt_x = None
+                if g(hi2) >= 0.0:
+                    n = 0
+                    while n < 400 and (hi2 - lo2) > 1e-6 * hi2:
+                        mid = 0.5 * (lo2 + hi2)
+                        if g(mid) < 0.0:
+                            lo2 = mid
+                        else:
+                            hi2 = mid
+                        n += 1
+                    dt_x = 0.5 * (lo2 + hi2)
+                # The actionable number in every case: the Rth that would put the
+                # root at (not above) the melting point, i.e. the largest lump the
+                # copper can live with at this current and frequency.
+                dt_melt = MELT_CU_C - ta
+                r_melt = r_at(ta + dt_melt)[0]
+                rth_cap = (dt_melt / (i * i * r_melt)) if r_melt > 0.0 else None
+                extra = {"runaway_gain_cold": _sig(gain_cold),
+                         "dlnr_dlnrho_cold": _sig(beta_cold),
+                         "r_cold_ohm": _sig(r_cold),
+                         "checked_up_to_c": _sig(ta + DT_CAP_C),
+                         "unit_gain_current_a": (_sig(i_unit) if i_unit
+                                                 else None),
+                         "rth_for_root_at_melt_c_per_w": (_sig(rth_cap)
+                                                          if rth_cap else None)}
+                if dt_x is not None:
+                    extra["root_beyond_melt_dt_c"] = _sig(dt_x)
+                    extra["root_beyond_melt_t_c"] = _sig(ta + dt_x)
+                    msg = ("above the melting point: the self-consistent "
+                           "temperature would be %.0f C (dT %.0f K), far past "
+                           "the %.0f C where both the linear rho law and the "
+                           "geometry stop meaning anything"
+                           % (ta + dt_x, dt_x, MELT_CU_C))
+                    if beta_cold > 0.995:
+                        hint = ("dlnR/dlnrho = %.3f, so the resistance grows as "
+                                "fast as the heat that drives it: the loop sits "
+                                "ON the algebraic edge, and the root exists only "
+                                "because the cold-point gain (%.4f) is below 1. "
+                                "It therefore moves by orders of magnitude for a "
+                                "small change in current, and it is at dT = %.0f "
+                                "K, far past melting. Rth must be at most %.4g "
+                                "K/W or the current at most %.3f A. The %.0f C "
+                                "figure is extrapolated past melting: an "
+                                "ordering, not a reading"
+                                % (beta_cold, gain_cold, dt_x,
+                                   rth_cap if rth_cap else 0.0,
+                                   i_unit if i_unit else 0.0, ta + dt_x))
+                    else:
+                        hint = ("dlnR/dlnrho = %.3f, so the resistance grows "
+                                "slower than dT and the loop DOES have a fixed "
+                                "point - this is not the algebraic divergence of "
+                                "a DC trace. From here, Rth must be at most %.4g "
+                                "K/W or the current at most %.3f A. The %.0f C "
+                                "figure is extrapolated past melting: an "
+                                "ordering, not a reading"
+                                % (beta_cold, rth_cap if rth_cap else 0.0,
+                                   i_unit if i_unit else 0.0, ta + dt_x))
+                else:
+                    if beta_cold > 0.999:
+                        msg = ("no steady state at any temperature: g(dT) = dT - "
+                               "I^2*Rth*R(dT) is still negative at %.0f C (dT "
+                               "%.0f K), and with dlnR/dlnrho = %.4f it stays "
+                               "negative for ever"
+                               % (ta + DT_CAP_C, DT_CAP_C, beta_cold))
+                        hint = ("the cold loop gain I^2*Rth*dR/dT is %.3f with an "
+                                "exponent of 1: the resistance grows exactly as "
+                                "fast as the heat that drives it, so no fixed "
+                                "point exists at any temperature and a higher "
+                                "search ceiling cannot find one. Rth must be at "
+                                "most %.4g K/W, or the current at most %.3f A"
+                                % (gain_cold, rth_cap if rth_cap else 0.0,
+                                   i_unit if i_unit else 0.0))
+                    else:
+                        msg = ("no steady state below dT = %.0f K: the loop "
+                               "closes - dlnR/dlnrho = %.4f < 1 guarantees a "
+                               "fixed point - but it sits beyond the ceiling "
+                               "used to ask that question, and g(dT) is still "
+                               "negative at %.0f C"
+                               % (_EXTRAP_CAP_C, beta_cold, ta + DT_CAP_C))
+                        hint = ("with an exponent below 1 the loop cannot run "
+                                "away algebraically, so this is not the DC "
+                                "divergence; at this gain (%0.3f at the cold "
+                                "point) the fixed point exists only at a "
+                                "temperature this model has no business "
+                                "describing. Rth must be at most %.4g K/W, or "
+                                "the current at most %.3f A"
+                                % (gain_cold, rth_cap if rth_cap else 0.0,
+                                   i_unit if i_unit else 0.0))
+                return err(msg, "THERMAL_RUNAWAY", hint=hint, extra=extra)
+        it = 0
+        bracket = (lo, hi)
+        while it < int(max_iter):
+            mid = 0.5 * (lo + hi)
+            if g(mid) < 0.0:
+                lo = mid
+            else:
+                hi = mid
+            it += 1
+            if (hi - lo) <= tol_c:
+                break
+        dt = 0.5 * (lo + hi)
+        r_hot, st_hot = r_at(ta + dt)
+        if g(dt) > 0.0:
+            # belt and braces: the accepted point must be a real root
+            dt = lo
+            r_hot, st_hot = r_at(ta + dt)
+
+    t_final = ta + dt
+    p = i * i * r_hot
+    beta, _ = _beta_at(geom, f, t_final, mur, rq_m, r_hot, rho20, alpha)
+    gain = k * r_hot * alpha * beta / (1.0 + alpha * (t_final - T20))
+    # energy balance is an identity here, but it is the one thing a wrong
+    # bisection branch would break, so it is measured and reported
+    resid = abs(dt - k * r_hot)
+
+    checks = {
+        "energy_balance_residual_k": _sig(resid, 3),
+        "energy_balance_ok": bool(resid <= 1e-9 * max(1.0, dt)),
+        "dlnr_dlnrho": _sig(beta, 6),
+        "runaway_gain_at_solution": _sig(gain, 6),
+        "stability_margin": _sig(1.0 - gain, 6),
+        "resistance_cold_ohm": _sig(r_cold),
+        "resistance_hot_ohm": _sig(r_hot),
+        "resistance_gain": _sig(r_hot / r_cold, 6),
+        "r_over_rdc_hot": _sig(st_hot["r_over_rdc"], 6),
+        "r_over_rdc_cold": _sig(st_cold["r_over_rdc"], 6),
+        "skin_depth_um_hot": _sig(st_hot["delta_um"], 6),
+        "skin_depth_um_cold": _sig(st_cold["delta_um"], 6),
+        "power_w": _sig(p),
+        "delta_t_c": _sig(dt),
+        "t_final_c": _sig(t_final),
+        "iterations": it,
+        "bracket_k": ([_sig(bracket[0]), _sig(bracket[1])] if bracket else None),
+        "roughness_k_hot": _sig(st_hot["roughness_k"], 6),
+        "regime_hot": st_hot["regime"],
+        "regime_cold": st_cold["regime"],
+        "melt_margin_c": _sig(MELT_CU_C - t_final),
+        "above_100c_linear_law": bool(t_final > 120.0),
+        "dlnr_dlnrho_cold": _sig(beta_cold, 6),
+        "unit_gain_current_a": (_sig(i_unit) if i_unit else None),
+        "headroom_current": (_sig(i_unit / i, 4) if i_unit and i > 0.0
+                             else None),
+    }
+
+    # ---- the regime's own exponent, measured against what it should be
+    if rq_m:
+        # roughness_factor(delta) itself depends on rho, so the exponent is no
+        # longer the clean 1/2 - suppressing the expectation is the honest move
+        # (measured 0.349 for 1 um Rq at 1 GHz, i.e. better behaved than 1/2)
+        checks["beta_expectation"] = None
+        checks["beta_deviation"] = None
+        checks["beta_expectation_note"] = (
+            "roughness is in the answer: the multiplier itself falls as delta "
+            "grows (delta ~ sqrt(rho)), so dlnR/dlnrho is below the smooth 1/2 "
+            "and there is no prediction to compare against")
+    elif st_hot["regime"] == "skin-dominated":
+        checks["beta_expectation"] = 0.5
+        checks["beta_deviation"] = _sig(abs(beta - 0.5), 3)
+    elif st_hot["regime"] == "wall-limited":
+        checks["beta_expectation"] = 1.0
+        checks["beta_deviation"] = _sig(abs(beta - 1.0), 3)
+    elif st_hot["regime"] == "dc":
+        checks["beta_expectation"] = 1.0
+        checks["beta_deviation"] = _sig(abs(beta - 1.0), 3)
+    else:
+        checks["beta_expectation"] = None
+        checks["beta_deviation"] = None
+
+    # ---- the DC limit must reproduce electrothermal's closed form exactly
+    from . import electrothermal as _et
+    # electrothermal's closed form is parameterised by R at 20 C, not at Ta, and
+    # feeding it r_cold would inflate dT by the (1+alpha*(Ta-20)) factor - about
+    # 2 % at a 25 C ambient, which is exactly the size of a comparison that
+    # looks like physics but is a unit slip
+    r20c = r_at(T20)[0]
+    dc = _et.conductor_self_heating(r20c, i, rth, ta, alpha_per_k=alpha)
+    if dc.get("status") == "ok" and dt > 0.0:
+        # same fixed point when the exponent is 1; with beta = 1/2 the DC formula
+        # is the wrong model, so it is reported, not compared. The extra keys of
+        # an envelope are merged at the top level (result.ok), so dT is dc[...]
+        lin_dt = dc["delta_t_c"]
+        checks["dc_linear_model_delta_t_c"] = _sig(lin_dt)
+        checks["dc_linear_model_rel_diff"] = _sig(abs(lin_dt - dt) / dt, 4)
+        checks["dc_linear_model_note"] = (
+            "the linear-alpha DC loop solved at the SAME cold resistance; it is "
+            "the right model only when dlnR/dlnrho == 1 (DC or wall-limited). "
+            "Here dlnR/dlnrho = %.3f, so the difference is the physics, not an "
+            "error" % beta)
+
+    limits = [
+        "Rth is the caller's single lump - this is not a thermal solution, only "
+        "the electro-thermal feedback on top of one (feed it "
+        "thermal_stack / via_array_thermal / plate_temperature or a measurement)",
+        "one conductor, one frequency: no proximity effect from a neighbouring "
+        "trace or via, no coupling to a plane's return current",
+        "the linear rho(T) law is used past 100 C without a curve; alpha itself "
+        "grows with T in real copper, so a hot answer here is optimistic",
+        "no melting, no fusing, no electromigration: this reports a temperature, "
+        "not whether the copper survives it (fusing_current is the pulse model)",
+        "the melting point only caps the search - the geometry and the 1-D skin "
+        "solution both stop meaning anything long before it",
+        "single frequency: a pulse train with real harmonic content needs each "
+        "harmonic, and the DC term dominates the heating in most of them",
+    ]
+
+    value = {
+        "t_final_c": _sig(t_final),
+        "delta_t_c": _sig(dt),
+        "t_ambient_c": _sig(ta),
+        "current_a": _sig(i),
+        "frequency_hz": _sig(f),
+        "resistance_cold_ohm": _sig(r_cold),
+        "resistance_hot_ohm": _sig(r_hot),
+        "resistance_gain": _sig(r_hot / r_cold, 6),
+        "r_over_rdc_hot": _sig(st_hot["r_over_rdc"], 6),
+        "r_over_rdc_cold": _sig(st_cold["r_over_rdc"], 6),
+        "power_w": _sig(p),
+        "skin_depth_um_hot": _sig(st_hot["delta_um"], 6),
+        "dlnr_dlnrho": _sig(beta, 6),
+        "runaway_gain": _sig(gain, 6),
+        "runaway_gain_cold": _sig(cold_gain, 6),
+        "steady_state_unstable": bool(gain > 1.0),
+        "cold_loop_gain_above_one": bool(cold_gain >= 1.0),
+        "regime_hot": st_hot["regime"],
+        "regime_cold": st_cold["regime"],
+        "iterations": it,
+        "melt_margin_c": _sig(MELT_CU_C - t_final),
+        "roughness_k_hot": _sig(st_hot["roughness_k"], 6),
+        "roughness_in_the_answer": bool(rq_m),
+        "dlnr_dlnrho_cold": _sig(beta_cold, 6),
+        "unit_gain_current_a": (_sig(i_unit) if i_unit else None),
+        "checks": checks,
+        "limits": limits,
+    }
+    if geom["kind"] == "round":
+        value["x_outer_hot"] = _sig(st_hot["x_out"], 6)
+        value["x_wall_hot"] = _sig(st_hot["x_wall"], 6)
+
+    model = (
+        "self-consistent AC electro-thermal: R_ac(f, rho(T)) from the 1-D exact "
+        "skin solution (%s), rho(T) = rho20*(1+alpha*(T-20)), P = I^2*R, "
+        "T = T_amb + P*Rth, solved as the root of g(dT) = dT - I^2*Rth*R(dT) by "
+        "bisection on [0, %.0f C] - a sign change is the existence proof, so a "
+        "non-existent steady state comes back as THERMAL_RUNAWAY instead of an "
+        "iterate. dlnR/dlnrho is MEASURED at the solution (central difference), "
+        "not assumed: 1/2 in a skin-dominated conductor, 1 when the wall is "
+        "thinner than the skin depth"
+        % ("1-D Cartesian slab" if geom["kind"] == "sheet"
+           else "Bessel / Riccati walk in the annulus", MELT_CU_C))
+
+    basis = ("rho20 = 1.724e-8 ohm*m, alpha = 0.00393 /K (IACS copper, linear "
+             "0..100 C), delta = sqrt(rho/(pi*f*mu)); T is exact for the given "
+             "Rth and the given law - the Rth and the law are the caller's")
+
+    precision = (
+        "the root is located to %.0e K; the number inherits +-10..20 %% from the "
+        "caller's lump Rth, and grows optimistic above ~100 C where alpha(T) is "
+        "no longer 0.00393" % (tol_c,))
+
+    # result.ok() merges `extra` at the top level, so an extra key named
+    # "assumptions" would REPLACE the assumptions dict (that is how rth_source
+    # disappeared once). Everything that must stay in assumptions is put there,
+    # and only checks/value travel through extra.
+    return ok(_sig(t_final), "C", model, basis, precision,
+              {"rth_source": "caller-supplied single lump, not derived here",
+               "rho_law": "linear in T, one alpha, no curve",
+               "frequency": "one frequency, one conductor (no proximity)",
+               "shape": shape,
+               "current_a": _sig(i),
+               "rth_c_per_w": _sig(rth),
+               "t_ambient_c": _sig(ta),
+               "alpha_per_k": _sig(alpha),
+               "rho20_ohm_m": _sig(rho20),
+               "roughness_in_the_answer": bool(rq_m)},
+              extra={"checks": checks, "value": value})
+

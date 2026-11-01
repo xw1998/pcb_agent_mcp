@@ -135,7 +135,10 @@ _NOT_COMPUTED = [
     "this is not a thermal solution, only the electro-thermal feedback on top "
     "of one",
     "AC resistance: skin/proximity effect at high frequency, so P = I^2*R is "
-    "wrong for RF current distribution",
+    "wrong for RF current distribution (ac_self_heating closes this loop for one "
+    "conductor at one frequency, given the same lump Rth; it is a separate tool "
+    "because the loop stops being linear in T, and nothing in THIS module "
+    "changes)",
     "temperature-dependent alpha (the linear law is used past 100 C without "
     "warning, where it overstates dR)",
     "solder-joint and laminate limits - this module reports temperature, not "
@@ -280,7 +283,10 @@ _PLATE_NOT_COMPUTED = [
     "thermal vias",
     "component thermal mass and component-to-board contact resistance; a "
     "uniform_power_w is spread evenly and says nothing about where the parts are",
-    "AC resistance: skin and proximity effects, so I^2*R is wrong for RF current",
+    "AC resistance: skin and proximity effects, so I^2*R is wrong for RF current "
+    "- ac_sheet_resistance / ac_round_conductor give the R(f) and ac_self_heating "
+    "(0.0.68) closes the thermal loop at frequency, but for ONE conductor at ONE "
+    "frequency and with the Rth you hand it; THIS plate stays DC",
     "laminate limits (Tg, decomposition) - this reports temperature, not whether "
     "the board survives it",
 ]

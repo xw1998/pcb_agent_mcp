@@ -9,6 +9,58 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.68] - 2026-11-01
+
+**铜在频率上的自热**（`ac_self_heating`）。`calc_capabilities` 里那条 "nothing here turns a loss
+into a temperature at frequency" 是这一版收掉的最后一个明确缺口。
+
+一句话结论：**同一个 35 µm 铜、同一个 3 A，100 Hz 与 DC 闭式解差 `3.042e-07`，1 GHz 却比 DC 模型
+高 `7.905 %`；而"跑飞"其实是两个不同的答案——指数 1 是"任何温度都不自洽"，指数 1/2 是"有解，
+但解在 37325.8 ℃"。** 工具数棘轮 172 → **173**。
+
+### 判据为什么是这几条（每条都能失败）
+
+| 锚点 | 实测 | 它能抓住什么 |
+| --- | --- | --- |
+| 低频 = DC | `dT 1.82079 K` vs `electrothermal_conductor` 闭式，`rel 3.042e-07` | 任何 1000 倍量纲错 |
+| 同一条对账的反向控制 | 喂 **R@环境温度**（不是 R@20 ℃）⇒ `rel 1.97 %` | 一个"能通过"的对照不是对照 |
+| 自洽性 | `resid = dT − I²·Rth·R_hot`，5 个形状，`< 1e-9` | 只做一次乘法的实现 |
+| 指数实测 | 1.0 / 0.5000 / 0.999454 / 0.952475 / 0.50673 / 0.361116（粗糙） | 硬编码 β；薄壁仍报 0.5 |
+| 两面 | `R_cold 0.0833056` vs `0.0833055` | 盲目乘 0.5 |
+| `α = 0` | `dT = 9·20·0.00992013` 精确，`gain = 0`，`unit_gain_current = null` | `unit_gain` 写成 0 或 inf |
+| 两种 runaway | 12 A/100 Hz：`gain_cold 1.11502`，**无根**；10 A/1 GHz：`root 37325.8 ℃` + "ordering, not a reading" | 合并成一句文案 |
+| 边界那一对 | 11 A（`gain 0.93693 < 1`）**有根**（`dT 3854.27 K`），不能报"任何温度都不自洽" | 一个 `if` 把话说反 |
+| 单调 | T 随 f、随 I 单调升；`I = 0 ⇒ dT = 0, iterations = 0` | 符号/方向错 |
+| `Rth` 必须显式 | 缺参 ⇒ `ARG_REQUIRED`，文案写 "never assumed here" | 默认 Rth = 凭空来的数 |
+| `shape` 必须显式 | 缺参 ⇒ `ARG_REQUIRED`；`"wire"` ⇒ `BAD_PARAMETER` | 靠"传了哪个参数"推断几何 |
+
+### 这一轮修掉的四个真 bug（都会静默给错答案）
+
+1. `dc_linear_model_delta_t_c` 读 `dc["value"]["delta_t_c"]` ⇒ `TypeError`：`result.ok()` 的 `extra`
+   合并到**信封顶层**，正确读法是 `dc["delta_t_c"]`。
+2. 镀层单位 `2.0*p >= d`（µm vs mm 差 1000 倍）⇒ 合法的 0.3 mm 孔 + 0.5 µm 镀层被读成"镀层把孔封死"。
+3. 圆导体电阻 `rho*l_mm*1e3/area` 多乘 `1e3`（`ρ` 单位是 **Ω·mm**）⇒ 电阻大 1000 倍，
+   **所有小电流都"跑飞"**。DC 对账的负控制就是为这一类错准备的。
+4. DC 对照喂 `r_cold`（25 ℃）而不是 `r20c`（20 ℃）⇒ 1.97 % 假差异；修后 `3.0e-07`，
+   而那个 1.97 % 被保留成一条**必须失败**的测试。
+
+另加：`assumptions` 曾被 `extra` 里的同名键整体覆盖（`rth_source` 就此消失），现在
+`assumptions` 只走第六个位置参数、`checks`/`value` 只走 `extra`。
+
+### 语义变更（本版未发布，故不涉及兼容）
+
+- `runaway_possible`（解点 `gain >= 1`，解点上恒为 False）拆成两条**不同陈述**：
+  `steady_state_unstable`（解本身稳不稳）与 `cold_loop_gain_above_one`（环境点上增益是否已 ≥1），
+  外加 `runaway_gain_cold`。名字换了是因为旧名字在解点上是空话。
+
+### 口径
+
+- 新模块 + 新工具，**没碰任何既有工具的输出**；`electrothermal_conductor` 读数逐位不变，
+  只在 `not_computed` 第 2 条**追加**一句指向 `ac_self_heating`。
+- `tests/test_acthermal.py` **62 例**；selftest `234/234` → **`242/242`**（8 条新自检）。
+- 成本：单次 **2–5 ms**（求根 30–34 次二分；`fd_verify` 开关只省约 4 ms）。
+- 逐条口径见 [docs/71](docs/71-电流在频率上的自热.md)。
+
 ## [0.0.67] - 2026-11-01
 
 **圆不是方的**（`ac_round_conductor`）。0.0.66 的薄板解明写着一条边界："过孔场：孔壁的电流分布
