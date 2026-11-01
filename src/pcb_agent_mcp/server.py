@@ -4903,6 +4903,82 @@ def selftest():
               in zip(_lf_bad, _lf_bad_got)),
           "; ".join("%s" % g for _l, g in _lf_bad_got))
 
+    # ---- 0.0.75: XFlux / Edge, and the High DC Bias lines ------------------
+    _x_args = {
+        "xflux": {"material": "XFlux", "freq_hz": 50e3, "b_peak_t": 0.1,
+                  "permeability": 60, "shape": "toroid"},
+        "edge": {"material": "Edge", "freq_hz": 50e3, "b_peak_t": 0.1,
+                 "permeability": 60, "shape": "toroid"},
+        "xflux_hdb": {"material": "XFlux", "freq_hz": 100e3, "b_peak_t": 0.1,
+                      "permeability": 60, "shape": "toroid",
+                      "variant": "High DC Bias"},
+        "edge_hdb": {"material": "Edge", "freq_hz": 100e3, "b_peak_t": 0.1,
+                     "permeability": 60, "shape": "toroid",
+                     "variant": "High DC Bias"},
+    }
+    _x_val = {}
+    for _k in sorted(_x_args):
+        _x_val[_k] = (_call("magnetics_material_core_loss", dict(_x_args[_k]),
+                            1879).get("value") or {})
+    # the catalog's own summary table (printed p.10) gives the 60u toroid loss at
+    # 50 kHz / 1000 G for four materials; two of them are below. If Bpk were read
+    # as peak-to-peak these would be ~4x low, which is what makes this a check on
+    # the convention and not just on the arithmetic.
+    _x_pr = {"xflux": 575.0, "edge": 150.0}
+    check("the 0.0.75 materials reproduce the catalog's OWN summary table (printed "
+          "p.10, 60u toroid, 50 kHz / 1000 gauss): XFlux 575 and Edge 150 mW/cm3 - an "
+          "independent check on the transcription and on Bpk being HALF the swing, "
+          "since a peak-to-peak reading lands 4x low",
+          all(abs((_x_val[_k].get("P_v_mw_cm3") or 0.0) / _w - 1.0) < 5e-3
+              for _k, _w in _x_pr.items()),
+          ", ".join("%s %.2f vs printed %g" % (_k, _x_val[_k].get("P_v_mw_cm3") or 0.0,
+                                               _w) for _k, _w in sorted(_x_pr.items())))
+
+    _x_base = (_call("magnetics_material_core_loss",
+                     dict(_x_args["xflux_hdb"], variant=None), 1880)
+               .get("value") or {})
+    check("the High DC Bias product lines are their OWN printed rows, not an "
+          "interpolation of the base row: at the same 60u toroid / 100 kHz / 0.1 T "
+          "the High DC Bias XFlux row is 15 % above the base one and carries page 12 "
+          "(where it is printed) rather than page 109",
+          (_x_val["xflux_hdb"].get("P_v_mw_cm3") or 0.0)
+          / max(_x_base.get("P_v_mw_cm3") or 1e-30, 1e-30) > 1.10
+          and _x_val["xflux_hdb"].get("fit_printed_page") == 12
+          and _x_val["edge_hdb"].get("fit_printed_page") == 14
+          and (_x_val["edge_hdb"].get("P_v_mw_cm3") or 0.0) > 400.0,
+          "HDB XFlux %.1f vs base %.1f mW/cm3, pages %s / %s"
+          % (_x_val["xflux_hdb"].get("P_v_mw_cm3") or 0.0,
+             _x_base.get("P_v_mw_cm3") or 0.0,
+             _x_val["xflux_hdb"].get("fit_printed_page"),
+             _x_val["edge_hdb"].get("fit_printed_page")))
+
+    _x_mat = {}
+    for _n in ("XFlux", "Edge", "MPP"):
+        _r = _tools.TOOLS["magnetics_data"]["handler"]({"kind": "materials",
+                                                        "name": _n})
+        _x_mat[_n] = ((_r.get("value") or {}).get("rows") or [{}])[0]
+    _x_all = _tools.TOOLS["magnetics_data"]["handler"]({"kind": "materials"})
+    check("the material constants added in 0.0.75 are the vendor's printed ones: "
+          "XFlux 700 C / 6.9 g/cm3 / 1.6 T and Edge 500 C / 7.8 g/cm3 / 1.5 T "
+          "(printed p.16 and p.10), the table is 14 materials, 93 printed loss rows - "
+          "and MPP's move from 8700 to 7800 kg/m3 is recorded as a change with the "
+          "alloy density kept beside it instead of being swapped out",
+          _x_mat["XFlux"].get("tc_min_c") == 700
+          and _x_mat["XFlux"].get("density_kg_m3") == 6900
+          and _x_mat["XFlux"].get("bsat_mt_25c") == 1600
+          and _x_mat["Edge"].get("tc_min_c") == 500
+          and _x_mat["Edge"].get("density_kg_m3") == 7800
+          and _x_mat["Edge"].get("bsat_mt_25c") == 1500
+          and _x_mat["MPP"].get("density_kg_m3") == 7800
+          and _x_mat["MPP"].get("density_alloy_kg_m3") == 8700
+          and "CHANGED" in (_x_mat["MPP"].get("density_note") or "")
+          and (_x_all.get("value") or {}).get("count") == 14,
+          "%d materials, XFlux %s C %s kg/m3, MPP %s/%s"
+          % ((_x_all.get("value") or {}).get("count") or 0,
+             _x_mat["XFlux"].get("tc_min_c"), _x_mat["XFlux"].get("density_kg_m3"),
+             _x_mat["MPP"].get("density_kg_m3"),
+             _x_mat["MPP"].get("density_alloy_kg_m3")))
+
     _lf_wide = _call("magnetics_material_core_loss",
                      {"material": "High Flux", "freq_hz": 3e3, "b_peak_t": 0.6,
                       "permeability": 26, "shape": "toroid"}, 1878).get("value") or {}

@@ -3772,12 +3772,13 @@ def _capabilities(_args):
         },
         "not_implemented_yet": [
             "Power magnetics, and the parts question: magnetics_select_core does pick "
-            "a real part out of data/magnetic_materials.json (11 materials, 16 cores, "
-            "7 of them with one vendor loss point at 200 mT / 100 kHz / 100 C). The "
-            "three powder materials DO carry the vendor's own printed loss fit since "
-            "0.0.74 (loss_fit: a, b, c per permeability and per core shape, in "
-            "mW/cm3 / T / kHz, with the catalog page) and "
-            "magnetics_material_core_loss evaluates it - but no material-level "
+            "a real part out of data/magnetic_materials.json (14 materials, 16 cores, "
+            "7 of them with one vendor loss point at 200 mT / 100 kHz / 100 C). Five "
+            "powder materials carry the vendor's own printed loss fit - Kool Mu, MPP "
+            "and High Flux since 0.0.74, XFlux and Edge since 0.0.75 (with their High "
+            "DC Bias variants) - 93 printed rows of (a, b, c) per permeability, per "
+            "core shape and per variant, in mW/cm3 / T / kHz with the catalog page, "
+            "and magnetics_material_core_loss evaluates them. No material-level "
             "Steinmetz triple (k/alpha/beta) is stored, and the nine ferrite materials "
             "have no vendor fit here at all: their loss away from a measured point "
             "still needs exponents from you. No powder CORE GEOMETRY is in the table "
@@ -7601,8 +7602,9 @@ _tool(
     "the ferrite materials have no vendor fit here at all (they refuse, naming "
     "magnetics_core_loss as the way to pass your own triple).",
     {"type": "object", "properties": {
-        "material": _str("material name as it appears in the table (11 materials: "
-                         "Kool Mu, MPP, High Flux carry a vendor loss fit)"),
+        "material": _str("material name as it appears in the table (14 materials; "
+                         "five carry a vendor loss fit: Kool Mu, MPP, High Flux, "
+                         "XFlux, Edge)"),
         "freq_hz": _num("frequency in Hz"),
         "b_peak_t": _num("AC flux amplitude in tesla - HALF the peak-to-peak swing, "
                          "which is the vendor's own Bpk"),
@@ -7612,7 +7614,9 @@ _tool(
         "shape": _str("the core shape family the fit is printed for",
                       sorted(_magnetics.LOSS_FIT_SHAPES)),
         "variant": _str("the product line, where the vendor sells several under one "
-                        "material name: base (default), MAX, MAX-HP, HF or Ultra"),
+                        "material name: base (default), MAX, MAX-HP, HF, Ultra or "
+                        "High DC Bias - the last one is a separate printed fit on "
+                        "its own catalog page, not an interpolation of the base"),
         "waveform": _str("the flux shape over one period: sine (what the fit is), "
                          "triangle (needs duty) or piecewise (needs segments)",
                          ["sine", "triangle", "piecewise"], "sine"),

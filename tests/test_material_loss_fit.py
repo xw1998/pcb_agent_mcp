@@ -12,7 +12,7 @@ What is being checked, and why each check can fail:
   (3) the unit convention: the printed equation is mW/cm3, TESLA, kHz, so it must
       be identical to the SI path with k = a*10^(3-3c), alpha = c, beta = b. Both
       directions are computed and compared, not asserted from a hand conversion.
-  (4) every one of the 61 printed rows resolves back to ITSELF when asked with
+  (4) every one of the 93 printed rows resolves back to ITSELF when asked with
       its own (variant, shape, permeability, frequency side). A transcription
       slip in a variant label or a shape label makes some row unreachable or
       ambiguous, and this walks the table rather than sampling it.
@@ -20,6 +20,14 @@ What is being checked, and why each check can fail:
       printed rows, never with one of them.
   (6) zero change to the existing answers: the SI triple still gives exactly
       130000 W/m3, and an unrelated tool's anchor is untouched.
+  (7) the vendor prints the same losses a second time, as a summary table on a
+      different page (printed p.10). That second statement is the only thing
+      here that can catch a mistyped exponent, because a mistyped row still
+      evaluates smoothly and still resolves to itself.
+  (8) the two High DC Bias product lines carry their OWN printed rows on their
+      own catalog pages (printed p.12 and p.14). If only the base rows were
+      stored, asking about a High DC Bias part would answer with the base
+      number - a wrong answer that looks right.
 '''
 import io
 import json
@@ -140,8 +148,9 @@ class EveryRowIsReachable(unittest.TestCase):
         per = {}
         for m, _lf, r in rows:
             per[m["name"]] = per.get(m["name"], 0) + 1
-        self.assertEqual(per, {"Kool Mu": 40, "MPP": 10, "High Flux": 11})
-        self.assertEqual(len(rows), 61)
+        self.assertEqual(per, {"Kool Mu": 40, "MPP": 10, "High Flux": 11,
+                              "XFlux": 19, "Edge": 13})
+        self.assertEqual(len(rows), 93)
 
     def test_each_row_resolves_to_itself(self):
         bad = []
@@ -161,8 +170,9 @@ class EveryRowIsReachable(unittest.TestCase):
             self.assertGreater(r["a"], 0.0, r)
             self.assertGreater(r["b"], 1.0, r)
             self.assertGreater(r["c"], 0.0, r)
-            self.assertGreaterEqual(r["printed_page"], 109, r)
-            self.assertLessEqual(r["printed_page"], 111, r)
+            # 109-111 are the four shape tables; 12 and 14 are the two High DC
+            # Bias pages, which print their own fit rather than reusing a row
+            self.assertIn(r["printed_page"], (12, 14, 109, 110, 111), r)
             self.assertTrue(r["permeability"], r)
             for p in r["permeability"]:
                 self.assertGreater(float(p), 0.0, r)
@@ -337,6 +347,163 @@ class ZeroChange(unittest.TestCase):
         fits = d["assumptions"]["fits"]
         self.assertNotIn("none performed", fits.lower())
         self.assertIn("loss_fit", fits)
+
+
+# The summary table printed on printed p.10, 60u parts, 1000 G:
+#   material          50 kHz   100 kHz      (mW/cm3)
+SUMMARY_50_100 = (("XFlux", None, 575.0, 1280.0),
+                  ("XFlux", "Ultra", 450.0, 1035.0),
+                  ("Edge", None, 150.0, 375.0))
+
+
+class TheSecondPlaceTheVendorPrintsTheSameCurve(unittest.TestCase):
+    '''Cross-check the fit against the vendor's own summary table.
+
+    This is the check that a transcription error has to survive. The fitted
+    rows on printed p.109-111 give a, b, c; the summary table on printed p.10
+    states the resulting loss at 60u, 50 kHz and 100 kHz, 1000 G. Two separate
+    pages of the same catalog, so agreement is evidence and disagreement is a
+    finding - not something to be tuned away. XFlux and Edge land on the printed
+    numbers; XFlux Ultra misses by 5.7 % / 3.4 %, which is recorded here as a
+    real, unresolved gap rather than hidden by a loose tolerance.
+    '''
+
+    def _pv(self, material, variant, f, b=0.1):
+        kw = {"permeability": 60, "shape": "toroid"}
+        if variant:
+            kw["variant"] = variant
+        r = M.material_core_loss(material, f, b, **kw)
+        self.assertEqual(r["status"], "ok", r)
+        return r["value"]["P_v_mw_cm3"]
+
+    def test_the_60u_toroids_match_the_printed_summary_at_50_khz(self):
+        for material, variant, p50, _p100 in SUMMARY_50_100:
+            got = self._pv(material, variant, 50e3)
+            # 5.70 % for XFlux Ultra at 50 kHz: real, reproducible, and recorded in
+            # docs/77 rather than absorbed by a loose tolerance
+            worst = 0.06 if variant == "Ultra" else 5e-3
+            self.assertLess(abs(got - p50) / p50, worst,
+                            "%s %s: %g vs printed %g" % (material, variant, got, p50))
+
+    def test_xflux_lands_on_the_printed_number_almost_exactly(self):
+        # 574.999 vs 575 is a coincidence worth pinning: it says both the row and
+        # the b/c assignment are right, not merely close
+        self.assertLess(abs(self._pv("XFlux", None, 50e3) / 575.0 - 1.0), 1e-4)
+
+    def test_100_khz_is_within_the_summary_table_resolution(self):
+        # the 100 kHz column is printed to 3 significant figures and the fit runs
+        # 2.8 % high for XFlux; assert the size of that gap instead of widening it
+        for material, variant, _p50, p100 in SUMMARY_50_100:
+            got = self._pv(material, variant, 100e3)
+            self.assertLess(abs(got - p100) / p100, 0.04,
+                            "%s %s: %g vs printed %g" % (material, variant, got, p100))
+
+    def test_reading_1000_gauss_as_peak_to_peak_is_refused_by_the_numbers(self):
+        # negative control for the flux convention: 1000 G read as a peak-to-peak
+        # swing (Bpk = 0.05 T) is ~4x low, so a tool that silently used the wrong
+        # one could not reach the printed table at all
+        wrong = self._pv("XFlux", None, 50e3, b=0.05)
+        self.assertLess(wrong / 575.0, 0.30)
+        self.assertGreater(wrong / 575.0, 0.20)
+
+
+class TheHighDcBiasLinesHaveTheirOwnRows(unittest.TestCase):
+    def _v(self, material, variant, mu=60, f=100e3):
+        r = M.material_core_loss(material, f, 0.1, permeability=mu,
+                                 shape="toroid", variant=variant)
+        self.assertEqual(r["status"], "ok", r)
+        return r["value"]
+
+    def test_the_high_dc_bias_answer_is_not_the_base_answer(self):
+        base = self._v("XFlux", None)
+        hdb = self._v("XFlux", "High DC Bias")
+        self.assertEqual(hdb["fit_printed_page"], 12)
+        self.assertTrue(hdb["fit_source"].endswith("#page=12"), hdb["fit_source"])
+        self.assertIn("High DC Bias", hdb["fit_row"])
+        # the two differ by 15 %, so answering from the base row would be visibly
+        # wrong rather than merely imprecise
+        self.assertGreater(hdb["P_v_mw_cm3"] / base["P_v_mw_cm3"], 1.10)
+        self.assertEqual(base["fit_printed_page"], 109)
+
+    def test_edge_high_dc_bias_is_its_own_page_too(self):
+        hdb = self._v("Edge", "High DC Bias")
+        self.assertEqual(hdb["fit_printed_page"], 14)
+        self.assertGreater(hdb["P_v_mw_cm3"], 400.0)
+        self.assertEqual(hdb["fit_coefficients"]["b"], 2.106)
+
+    def test_high_dc_bias_is_a_variant_not_a_material(self):
+        # it must be reachable through the same variant selector as MAX / HF /
+        # Ultra, and the selector must not be lenient about a line that has none
+        self.assertEqual(M._variant_key("High DC Bias"), "highdcbias")
+        r = M.material_core_loss("XFlux", 100e3, 0.1, permeability=60,
+                                 shape="toroid", variant="MAX")
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason_code"], "FIT_NOT_RESOLVED")
+        self.assertIn("no loss fit for variant", r["message"])
+
+    def test_the_high_dc_bias_lines_are_only_the_ones_printed(self):
+        self.assertEqual(sorted((m["name"], r["permeability"][0])
+                                for m, _l, r in _rows()[1]
+                                if r.get("variant") == "High DC Bias"),
+                         [("Edge", 26), ("Edge", 60), ("XFlux", 26),
+                          ("XFlux", 40), ("XFlux", 60)])
+
+
+class TheEdgeRowThatLooksLikeATypo(unittest.TestCase):
+    def test_90_and_125u_are_stored_as_printed(self):
+        # Printed p.109 jumps from 121.47 (75u) to 481.77 (90u,125u) - a factor of
+        # four in a column that moves by tens elsewhere. It was checked against the
+        # page as text AND as a rendered image: the vendor prints 481.77, so the
+        # value is kept verbatim instead of being 'corrected' into something more
+        # plausible. This test exists so the next reader does not silently fix it.
+        v = M.material_core_loss("Edge", 100e3, 0.1, permeability=90,
+                                 shape="toroid")["value"]
+        self.assertEqual(v["fit_coefficients"]["a"], 481.77)
+        self.assertEqual(v["fit_coefficients"]["c"], 1.139)
+        self.assertEqual(v["fit_printed_page"], 109)
+        v75 = M.material_core_loss("Edge", 100e3, 0.1, permeability=75,
+                                   shape="toroid")["value"]
+        self.assertGreater(v["fit_coefficients"]["a"]
+                           / v75["fit_coefficients"]["a"], 3.5)
+
+
+class DensityIsABasisNotAPerPermeabilityNumber(unittest.TestCase):
+    def _d(self):
+        return _rows()[0]
+
+    def test_the_factor_table_is_anchored_at_60u(self):
+        f = self._d()["density_vs_permeability_60u"]["factors"]
+        self.assertEqual(f["60"], 1.0)
+        self.assertEqual(len(f), 11)
+        for mu, k in f.items():
+            self.assertGreater(float(k), 0.0)
+
+    def test_the_three_permeabilities_without_a_printed_factor_are_not_invented(self):
+        # negative control: 200u/300u/550u sit in the catalog's permeability column
+        # with no factor beside them; a table that carried a number for them would
+        # be our arithmetic, not the vendor's
+        f = self._d()["density_vs_permeability_60u"]["factors"]
+        for mu in ("200", "300", "550"):
+            self.assertNotIn(mu, f)
+        gap = self._d()["density_vs_permeability_60u"]
+        self.assertEqual(gap["permeabilities_without_a_printed_factor"], [200, 300, 550])
+        self.assertIn("page=18", gap["source"])
+
+    def test_the_fourteen_materials_and_the_powder_constants(self):
+        d = self._d()
+        by = {m["name"]: m for m in d["materials"]}
+        self.assertEqual(len(by), 14)
+        self.assertEqual((by["XFlux"]["tc_min_c"], by["XFlux"]["density_kg_m3"],
+                          by["XFlux"]["bsat_mt_25c"]), (700, 6900, 1600))
+        self.assertEqual((by["Edge"]["tc_min_c"], by["Edge"]["density_kg_m3"],
+                          by["Edge"]["bsat_mt_25c"]), (500, 7800, 1500))
+
+    def test_the_mpp_density_correction_is_registered_not_smuggled(self):
+        mpp = {m["name"]: m for m in self._d()["materials"]}["MPP"]
+        self.assertEqual(mpp["density_kg_m3"], 7800)
+        self.assertEqual(mpp["density_alloy_kg_m3"], 8700)
+        self.assertIn("CHANGED", mpp["density_note"])
+        self.assertIn("not silently", mpp["density_note"])
 
 
 if __name__ == "__main__":

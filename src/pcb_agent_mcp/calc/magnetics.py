@@ -1716,9 +1716,10 @@ def magnetic_data(kind="materials", name=None, material=None, shape=None,
         "every row carries `source`: the URL it was transcribed from",
         "as published - the vendor's own typical values at the condition stated",
         {"fits": "no material-level si triple (k/alpha/beta) is stored anywhere in "
-                 "the table; what the three powder vendors print instead - a fit per "
-                 "permeability and per core shape - is in `loss_fit`, and "
-                 "magnetics_material_core_loss evaluates it",
+                 "the table; what the powder vendor prints instead - a fit per "
+                 "permeability, per core shape and, for its High DC Bias lines, per "
+                 "variant - is in `loss_fit` (93 printed rows over five materials), "
+                 "and magnetics_material_core_loss evaluates it",
          "thermal": "no Rth for any part, so no temperature rise is offered"},
         {"table_path": data_path or DATA_PATH})
 
