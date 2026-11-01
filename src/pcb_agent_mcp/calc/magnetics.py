@@ -1623,6 +1623,12 @@ BSAT_DERATE_TYPICAL = 0.80
 # spread you already accept.
 GAP_NEEDED_BELOW = 0.90
 
+# 0.0.78: how many turns the DC-bias search will look at. A DESIGN cap, not a
+# material limit: a toroid that needs more than this many turns to reach the
+# inductance at the bias is refused with the maximum it can reach, because at
+# that point the answer is "change the core", not "wind 1000 turns".
+DC_BIAS_TURNS_MAX = 1000
+
 
 def _load_magnetic_data(path=None):
     p = path or DATA_PATH
@@ -2421,7 +2427,9 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                 current_density_a_mm2=None, fill_factor=None, limit=None,
                 require_window_fit=False, data_path=None,
                 flux_waveform="sine", duty=None, include_powder_cores=False,
-                permeability=None, powder_data_path=None):
+                permeability=None, powder_data_path=None,
+                dc_bias_current_a=None, dc_bias_data_path=None,
+                dc_bias_turns_max=DC_BIAS_TURNS_MAX):
     """Choose a real core for an (L, Ipk) requirement, or say why none fits.
 
     The two constraints that decide the turns:
@@ -2455,6 +2463,20 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
     the catalog's comparison page (one printed value per column, no temperature
     against it), and it has no gap to compute because the gap is distributed
     through the volume - AL can only be changed by choosing another permeability.
+
+    `dc_bias_current_a` (0.0.78) closes the loop the 0.0.77 tool would not: the
+    printed AL is the UNBIASED value, so a powder part chosen for L at zero current
+    delivers less than L at the current it carries. With this argument each part is
+    solved at that bias - H = 0.4*pi*N*I/le[cm] from the catalog's own relation, the
+    part's printed (a, b, c) row evaluated at that H, and the turns chosen so the
+    BIASED inductance still reaches `inductance_h` while the peak flux stays under
+    the limit. The solver is a bracketed search, not a fixed-point iteration,
+    because L(N) is not monotone: L ~ N^2 / (a + b*(kN)^c) peaks at
+    N^c = 2a/((c-2) b k^c) and FALLS afterwards whenever c > 2 - and 86 of the 125
+    printed rows do have c > 2. So at a high enough bias there is a turn count past
+    which more turns buy less inductance, and a part that cannot reach L at all is
+    rejected as `dc_bias_unreachable` with the maximum it can reach rather than being
+    given a turn count that does not work.
 
     What is refused rather than guessed: saturation at a temperature the material
     does not publish; a gap length when the material's mu_i is unknown; core loss
@@ -2557,6 +2579,37 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         return err("permeability only applies to powder cores", "ARG_INVALID",
                    hint="a solid core's AL is fixed by its part number; pass "
                         "include_powder_cores=True to select a toroid by permeability")
+
+    # --- 0.0.78: the DC-bias loop. Only the powder families have a printed fit,
+    # so asking for a bias without them in the pool would silently answer the
+    # unbiased question - that is a refusal, not a default.
+    dc_bias_a = None
+    dcb_data = None
+    if dc_bias_current_a is not None:
+        try:
+            dc_bias_a = _f("dc_bias_current_a", dc_bias_current_a)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if dc_bias_a <= 0:
+            return err("dc_bias_current_a must be > 0", "ARG_RANGE",
+                       hint="a zero bias is the unbiased answer: just omit the "
+                            "argument and the turns are the 0.0.77 ones, byte for "
+                            "byte")
+        if dc_bias_a > ipk:
+            return err("dc_bias_current_a must not exceed i_peak_a", "ARG_RANGE",
+                       hint="the bias is the current the core sits at; the peak is "
+                            "the largest current it ever sees, so a bias above it "
+                            "describes a different operating point")
+        if not include_powder_cores:
+            return err("no candidate in this pool carries a printed DC-bias fit",
+                       "ARG_INVALID",
+                       hint="the vendor's % mu_i fits are printed for the powder "
+                            "families only; pass include_powder_cores=True (and "
+                            "permeability to narrow the columns)")
+        dcb_data, dcb_why = _load_dc_bias(dc_bias_data_path)
+        if dcb_data is None:
+            return err(dcb_why, "DATA_UNAVAILABLE",
+                       hint="data/dc_bias_fit.json ships with the package")
 
     want_mat = _norm_key(material) if material else None
     want_shape = _norm_key(shape) if shape else None
@@ -2680,6 +2733,45 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         n = int(max(1, math.ceil(max(n_al if n_al is not None else 1.0, n_b))))
         b_peak = L * ipk / (n * ae_flux)
 
+        # --- 0.0.78: resolve the bias loop before anything downstream uses n
+        bias = None
+        if dc_bias_a is not None:
+            fit_row, fit_why = _dc_bias_fit_for(dcb_data, core)
+            if fit_row is None:
+                row["dc_bias"] = None
+                row["dc_bias_because"] = fit_why
+                row["missing"].append("dc_bias")
+            else:
+                bias, why_not = _dc_biased_design(
+                    core.get("al_nh"), L, ipk, dc_bias_a, limit_t, ae_flux,
+                    core.get("le_mm"), fit_row, turns_max=int(dc_bias_turns_max))
+                if bias is None:
+                    row["dc_bias"] = why_not
+                    row["dc_bias"]["status"] = "unreachable"
+                    row["turns"] = None
+                    row["verdict"] = "dc_bias_unreachable"
+                    row["reason"] = "dc_bias_unreachable"
+                    rejected.append(row)
+                    continue
+                n = bias["turns"]
+                b_peak = bias["b_peak_t"]
+                bias["turns_without_bias"] = int(max(
+                    1, math.ceil(max(n_al if n_al is not None else 1.0, n_b))))
+                bias["inductance_without_bias_h"] = _fmt(
+                    float(core["al_nh"]) * 1e-9 * n * n) if core.get("al_nh") else None
+                row["dc_bias"] = bias
+                row["turns_from_al_at_bias"] = _fmt(
+                    math.sqrt(L / (float(core["al_nh"]) * 1e-9
+                                   * bias["percent_initial_permeability"] / 100.0))
+                    if core.get("al_nh") else None)
+                row["turns_basis"] = (
+                    "turns chosen AT the DC bias: H = %s Oe at %s A, mu down to "
+                    "%s %% of mu_i, so this is the count that still reaches L - the "
+                    "count at zero bias would be %s"
+                    % (_fmt(bias["h_oe"]), _fmt(dc_bias_a),
+                       _fmt(bias["percent_initial_permeability"]),
+                       bias["turns_without_bias"]))
+
         row["turns_from_al"] = _fmt(n_al) if n_al is not None else None
         row["turns_from_flux"] = _fmt(n_b)
         row["turns"] = n
@@ -2717,10 +2809,28 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         al_req = L / float(n) ** 2 * 1e9
         row["al_required_nh"] = _fmt(al_req)
         if core.get("al_nh"):
-            ratio = al_req / float(core["al_nh"])
+            # at a bias the AL the winding actually sees is the printed one times
+            # the surviving fraction, so the margin has to be judged against THAT
+            al_at_bias = float(core["al_nh"])
+            if bias is not None:
+                al_at_bias = (al_at_bias
+                              * bias["percent_initial_permeability"] / 100.0)
+                row["al_at_bias_nh"] = _fmt(al_at_bias)
+            ratio = al_req / al_at_bias
             row["al_ratio"] = _fmt(ratio)
             row["l_at_n_ungapped_h"] = _fmt(float(core["al_nh"]) * 1e-9 * n * n)
-            row["gap_required"] = bool(ratio < GAP_NEEDED_BELOW)
+            if bias is not None:
+                # a distributed gap cannot be trimmed: the trade is turns vs mu,
+                # and the biased AL already carries the rolloff
+                row["gap_required"] = None
+                row["gap_because"] = (
+                    "judged at the biased AL (%s nH = printed %s nH x %s %%); a "
+                    "powder core's gap is distributed, so there is nothing to cut - "
+                    "the trade is turns against mu"
+                    % (_fmt(al_at_bias), _fmt(float(core["al_nh"])),
+                       _fmt(bias["percent_initial_permeability"])))
+            else:
+                row["gap_required"] = bool(ratio < GAP_NEEDED_BELOW)
         else:
             row["gap_required"] = None
             row["al_because"] = (core.get("al_note")
@@ -2875,8 +2985,11 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         "not_modelled": [
             "temperature rise: no part in the table has a published thermal "
             "resistance, so these are watts and nothing else",
-            "the DC-bias roll-off of AL (a gapped ferrite loses inductance long "
-            "before it saturates at Bsat) - only the Bsat point is judged",
+            ("the DC-bias roll-off was solved for the powder parts that print a fit; "
+             "a solid core here has none, so its AL is still judged only at the Bsat "
+             "point" if dc_bias_a is not None else
+             "the DC-bias roll-off of AL (a gapped ferrite loses inductance long "
+             "before it saturates at Bsat) - only the Bsat point is judged"),
             "fringing flux at the gap: the gap estimate is series reluctance only, "
             "and the extra copper loss near the gap is absent (magnetics_fringing_loss "
             "computes that copper loss; the flux, and with it the inductance, is not "
@@ -2901,6 +3014,38 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
         out["not_modelled"].append(
             "the mass column: Ve x density x permeability factor is an estimate, not the "
             "vendor's nominal part weight")
+    if dc_bias_a is not None:
+        judged = sum(1 for r in shown
+                     if isinstance(r.get("dc_bias"), dict)
+                     and r["dc_bias"].get("turns") is not None)
+        out["dc_bias"] = {
+            "current_a": _fmt(dc_bias_a),
+            "how": ("H = 0.4*pi*N*I/le[cm] (the catalog's own relation), mu from the "
+                    "part's printed (a, b, c) row, L = AL*N^2*mu/100, and the peak "
+                    "flux judged on THAT inductance"),
+            "listed_with_a_fit": "%d of the %d candidates listed" % (judged, len(shown)),
+            "found_by": ("a bracketed search over N, not by iterating the loop: "
+                         "L(N) ~ N^2/(a + b*(k*N)^c) peaks at N^c = 2a/((c-2)*b*k^c) "
+                         "and FALLS after it when c > 2, which is 86 of the 125 "
+                         "printed rows - so at a high bias more turns can buy less "
+                         "inductance and a fixed point would sit on the wrong branch"),
+            "loss_fit_is_unbiased": ("the vendor's loss rows are measured with no DC "
+                                     "premagnetisation, so core_loss_w is a lower "
+                                     "bound for a biased core"),
+            "unreachable": [r["part"] for r in rejected
+                            if r.get("reason") == "dc_bias_unreachable"],
+            "outside_the_printed_band": [
+                r["part"] for r in shown
+                if isinstance(r.get("dc_bias"), dict)
+                and r["dc_bias"].get("h_within_printed_band") is False],
+            "band_note": ("the fit pages are only drawn over %g-%g Oe; a design whose "
+                          "H lands outside that is listed with "
+                          "h_within_printed_band=false rather than silently treated "
+                          "as a reading" % DC_BIAS_PLOTTED_OE),
+        }
+        out["not_modelled"] = [
+            t for t in out["not_modelled"]
+            if not t.startswith("a powder core's DC-bias roll-off")]
     if powder_info:
         out["core_pool"] = powder_info
         out["core_pool"]["note"] = ("powder parts carry a printed Bsat for their column "
@@ -2941,6 +3086,178 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
          "unjudged": [r for r in rejected
                       if r.get("reason") == "saturation_unknown"],
          "feasible_parts": [r["part"] for r in feasible]})
+
+# --------------------------------------------------------------------------
+# 0.0.78: the DC-bias loop that 0.0.77 left open
+#
+# A powder core's printed AL is the UNBIASED value. At the current the winding
+# actually carries the vendor's own fit puts mu at a fraction of mu_i, so the
+# turns computed from AL deliver less inductance than the arithmetic promises.
+# The loop is:
+#
+#     H(N)  = 0.4*pi*N*I/le[cm]                    (the catalog's relation)
+#     mu(N) = 1 / (a + b*H^c)                      (percent of mu_i)
+#     L(N)  = AL_at_0 * N^2 * mu(N)/100
+#
+# and it is NOT solved by iterating L until it stops moving, because L(N) is not
+# monotone in N. Written out,
+#
+#     L(N) ~ N^2 / (a + b*(k*N)^c)    with k = 0.4*pi*I/le[cm]
+#
+# whose derivative changes sign at N^c = 2a/((c-2)*b*k^c) when c > 2: more turns
+# eventually buy LESS inductance, because mu falls faster than N^2 rises. 78 of
+# the 125 printed rows have c > 2, so this is the common case, not a corner. A
+# naive fixed point on such a row can oscillate or walk to the wrong branch, so
+# the search below is bracketed instead: locate the peak, bisect for the first
+# turn count that reaches L, then step up only as far as the flux needs.
+
+def _dc_bias_fit_for(data, core):
+    """The printed (a, b, c) row for one powder part, or (None, why-not).
+
+    The bias fits are printed per MATERIAL LINE (as the catalog spells it) and
+    per SHAPE FAMILY, so the part's printed column label is what is looked up,
+    not the folded material name used in the rest of the table.
+    """
+    if not core.get("gap_is_distributed"):
+        return None, ("no printed DC-bias fit covers this part: the vendor's fit "
+                      "pages carry the powder core families only")
+    mu = core.get("permeability")
+    if mu is None:
+        return None, ("this part carries no printed permeability, so the fit row "
+                      "that belongs to it cannot be identified")
+    names = []
+    for name in (core.get("material_column"), core.get("material")):
+        if name and name not in names:
+            names.append(name)
+    problems = []
+    for name in names:
+        group, why = _dc_bias_group(data, name, "Toroids")
+        if group is None:
+            problems.append(why)
+            continue
+        for row in group.get("rows") or []:
+            if abs(float(row.get("permeability", 0)) - float(mu)) < 1e-9:
+                # the printed page lives on the GROUP, not on each row; carry it
+                # onto a copy so the caller can cite it without touching the table
+                hit = dict(row)
+                hit["printed_page"] = group.get("printed_page")
+                hit["material"] = group.get("material")
+                hit["shape_family"] = group.get("shape_family")
+                return hit, None
+        problems.append(
+            "the %s / %s group prints %d rows (permeability %s) and this part is "
+            "%g u" % (group.get("material"), group.get("shape_family"),
+                      len(group.get("rows") or []),
+                      ", ".join("%g" % r.get("permeability")
+                                for r in group.get("rows") or []), mu))
+    return None, "; ".join(problems) if problems else "no fit row for this part"
+
+
+def _dc_biased_design(al_nh, inductance_h, i_peak_a, i_dc_a, b_limit_t,
+                      ae_m2, le_mm, fit_row, turns_max=DC_BIAS_TURNS_MAX):
+    """(design, None) or (None, why-not) - the turn count that still reaches L.
+
+    The bias fixes mu, and mu fixes the inductance each turn count delivers; the
+    flux is then judged on THAT inductance (a biased core stores less flux for
+    the same current, which is the whole point of the rolloff).
+    """
+    a = float(fit_row["a"])
+    b = float(fit_row["b"])
+    c = float(fit_row["c"])
+    al_h = float(al_nh) * 1e-9
+    le_cm = float(le_mm) / 10.0
+    if le_cm <= 0:
+        return None, {"status": "unreachable",
+                      "why": "the effective path length is not in the table, so H "
+                             "cannot be formed for this part"}
+    k = 0.4 * math.pi * i_dc_a / le_cm          # oersteds per turn
+    cap = int(turns_max)
+
+    def at(n):
+        h = k * n
+        pct = dc_bias_percent(a, b, c, h)
+        l_h = al_h * n * n * pct / 100.0
+        return h, pct, l_h, l_h * i_peak_a / (n * ae_m2)
+
+    # the peak of L(N): interior only when c > 2, else it rises all the way to cap
+    if c > 2.0:
+        denom = (c - 2.0) * b * (k ** c)
+        n_peak = cap
+        if denom > 0:
+            n_star = (2.0 * a / denom) ** (1.0 / c)
+            n_peak = int(min(cap, max(1.0, math.floor(n_star))))
+    else:
+        n_peak = cap
+    h_pk, pct_pk, l_pk, b_pk = at(n_peak)
+    diag = {"turns_max_scanned": cap,
+            "maximum_inductance_h": _fmt(l_pk),
+            "turns_at_maximum": n_peak,
+            "percent_at_maximum": _fmt(pct_pk),
+            "h_oe_at_maximum": _fmt(h_pk),
+            "fit": {"a": a, "b": b, "c": c,
+                    "printed_page": fit_row.get("printed_page")}}
+    if l_pk < inductance_h:
+        diag["why"] = (
+            "at %s A this part cannot reach %s H with any turn count up to %d: the "
+            "printed fit leaves %s %% of mu_i at %d turns (%s Oe), the most this "
+            "part gives is %s H, and %s"
+            % (_fmt(i_dc_a), _fmt(inductance_h), cap, _fmt(pct_pk), n_peak,
+               _fmt(h_pk), _fmt(l_pk),
+               ("c = %g > 2 for this row, so past %d turns the rolloff outruns N^2 "
+                "and more turns buy LESS inductance" % (c, n_peak)) if c > 2.0
+               else "L(N) rises all the way to the %d-turn cap" % cap))
+        return None, diag
+
+    # smallest N that reaches L (bisection: L is increasing on [1, n_peak])
+    if at(1)[2] >= inductance_h:
+        n_lo = 1
+    else:
+        lo, hi = 1, n_peak
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if at(mid)[2] >= inductance_h:
+                hi = mid
+            else:
+                lo = mid
+        n_lo = hi
+    # then step up until the peak flux fits; past the L window there is nothing
+    # to find, so the loop stops at the first n whose inductance no longer reaches L
+    for n in range(n_lo, cap + 1):
+        h, pct, l_h, b_t = at(n)
+        if l_h < inductance_h:
+            break
+        if b_t <= b_limit_t:
+            lo_oe, hi_oe = DC_BIAS_PLOTTED_OE
+            in_band = bool(lo_oe <= h <= hi_oe)
+            design = {"turns": n, "h_oe": _fmt(h),
+                    "percent_initial_permeability": _fmt(pct),
+                    "inductance_h": _fmt(l_h), "b_peak_t": _fmt(b_t),
+                    "b_peak_over_limit": _fmt(b_t / b_limit_t) if b_limit_t else None,
+                    "b_limit_t": _fmt(b_limit_t),
+                    "fit": {"a": a, "b": b, "c": c,
+                            "printed_page": fit_row.get("printed_page"),
+                            "printed_formula": "% initial permeability = "
+                                               "1 / (a + b*H^c), H in Oersteds"},
+                    "flux_basis": ("B = L_biased * Ipk / (N * Ae): the biased core "
+                                   "stores less flux for the same current, so this "
+                                   "is smaller than the unbiased turn count would "
+                                   "give"),
+                      "h_within_printed_band": in_band}
+            if not in_band:
+                design["h_band_note"] = (
+                    "the printed fit is only drawn for %g-%g Oe and this design sits "
+                    "at %s Oe, so the mu here is an EXTRAPOLATION of the vendor's "
+                    "curve, not a reading of it" % (lo_oe, hi_oe, _fmt(h)))
+            return design, None
+    diag["why"] = (
+        "the turns that reach %s H at %s A all exceed the %s T flux limit: at the "
+        "first working count (%d turns) the peak is %s T"
+        % (_fmt(inductance_h), _fmt(i_dc_a), _fmt(b_limit_t), n_lo,
+           _fmt(at(n_lo)[3])))
+    diag["turns_reaching_l"] = n_lo
+    diag["b_peak_at_that_turns_t"] = _fmt(at(n_lo)[3])
+    return None, diag
+
 
 # --------------------------------------------------------------------------
 # DC bias: how much of mu_i survives a DC magnetising force

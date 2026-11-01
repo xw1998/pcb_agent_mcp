@@ -5148,6 +5148,129 @@ def selftest():
           % (_dc_hi.get("percent_initial_permeability"),
              len(_dc_hi.get("warnings") or []), _dc_bad.get("reason_code")))
 
+    # ---- 0.0.78: the DC-bias loop inside select_core ---------------------
+    from .calc import magnetics as _mg
+
+    _dcb_args = {"inductance_h": 1e-4, "i_peak_a": 10.0, "permeability": 60,
+                 "include_powder_cores": True}
+    _dcb_free = _call("magnetics_select_core", dict(_dcb_args), 1890)
+    _dcb_8a = _call("magnetics_select_core",
+                    dict(_dcb_args, dc_bias_current_a=8.0, limit=3), 1891)
+    _dcb_v = _dcb_8a.get("value") or {}
+    _dcb_c = (_dcb_v.get("candidates") or [{}])[0]
+    _dcb_d = _dcb_c.get("dc_bias") or {}
+    _dcb_fit = _dcb_d.get("fit") or {}
+    _dcb_hand = _mg.dc_bias_percent(
+        _dcb_fit.get("a", 0.01), _dcb_fit.get("b", 0.0), _dcb_fit.get("c", 0.0),
+        _dcb_d.get("h_oe", 0.0)) if _dcb_fit else -1.0
+    check("the DC-bias loop closes inside select_core: 100 uH / 10 A on the 60u "
+          "powder pool at an 8 A bias lands on XFlux Ultra 0074121A7 at 82 turns "
+          "against 54 at zero bias, H = 200.09 Oe where the printed fit leaves "
+          "42.6005 % of mu_i - and that percentage is re-derived here from the same "
+          "row's own (a, b, c), so a fit read from any other page fails this",
+          _dcb_8a.get("status") == "ok"
+          and _dcb_c.get("part") == "0074121A7"
+          and _dcb_c.get("turns") == 82
+          and _dcb_d.get("turns_without_bias") == 54
+          and abs(_dcb_d.get("h_oe", 0.0) - 200.085901) < 0.01
+          and abs(_dcb_d.get("percent_initial_permeability", 0.0) - _dcb_hand) < 1e-6
+          and abs(_dcb_d.get("percent_initial_permeability", 0.0) - 42.600515) < 1e-4
+          and (_dcb_d.get("inductance_h") or 0.0) >= 1e-4
+          and (_dcb_d.get("b_peak_t") or 9.9) <= (_dcb_d.get("b_limit_t") or 0.0)
+          and abs((_dcb_c.get("al_ratio") or 0.0) - 1.0) < 0.01
+          and _dcb_d.get("h_within_printed_band") is True
+          and (_dcb_free.get("value") or {}).get("feasible_count") == 288,
+          "%s at %s turns (%s at zero bias), H %s Oe, mu %s %% vs fit %s %%, "
+          "L %s H, B %s T of %s"
+          % (_dcb_c.get("part"), _dcb_c.get("turns"),
+             _dcb_d.get("turns_without_bias"), _dcb_d.get("h_oe"),
+             _dcb_d.get("percent_initial_permeability"), "%.6f" % _dcb_hand,
+             _dcb_d.get("inductance_h"), _dcb_d.get("b_peak_t"),
+             _dcb_d.get("b_limit_t")))
+
+    _dcb_k = 0.4 * _math.pi * 8.0 / 4.12          # oersteds per turn on that part
+    _dcb_cap = 1000
+    _dcb_pct_cap = _mg.dc_bias_percent(0.01, _dcb_fit.get("b", 0.0),
+                                       _dcb_fit.get("c", 0.0), _dcb_k * _dcb_cap)
+    _dcb_l_cap = 35e-9 * _dcb_cap * _dcb_cap * _dcb_pct_cap / 100.0
+    _dcb_out_ = [r for r in (_dcb_v.get("rejected") or [])
+                 if r.get("reason") == "dc_bias_unreachable" and r.get("part") == "0077141A7"]
+    _dcb_out_d = (_dcb_out_[0].get("dc_bias") or {}) if _dcb_out_ else {}
+    check("L(N) is not monotone and the search does not pretend it is: on that same "
+          "part (c = 2.815 > 2) 82 turns reach 100.26 uH while the 1000-turn cap "
+          "reaches only 22.73 uH, so this is a bracketed search and not a fixed "
+          "point - 86 of the 125 printed rows have c > 2; and a part that cannot "
+          "reach L is refused by name with the maximum it does reach rather than "
+          "with a number that is not there",
+          abs(_dcb_l_cap - 2.2734148978434586e-05) / 2.2734148978434586e-05 < 1e-6
+          and _dcb_l_cap < (_dcb_d.get("inductance_h") or 0.0)
+          and "86 of the 125" in (_dcb_v.get("dc_bias") or {}).get("found_by", "")
+          and bool(_dcb_out_)
+          and (_dcb_out_[0].get("turns")) is None
+          and _dcb_out_[0].get("verdict") == "dc_bias_unreachable"
+          and _dcb_out_d.get("turns_at_maximum") == 1000
+          and abs((_dcb_out_d.get("maximum_inductance_h") or 0.0) - 1.53129e-06) < 1e-12
+          and abs((_dcb_out_d.get("percent_at_maximum") or 0.0) - 0.011779) < 1e-6
+          and "0077141A7" in ((_dcb_v.get("dc_bias") or {}).get("unreachable") or []),
+          "L(1000 turns) %s H vs L(82) %s H; 0077141A7 max %s H at %s turns, "
+          "mu %s %%, top-level unreachable %d parts"
+          % ("%.6g" % _dcb_l_cap, _dcb_d.get("inductance_h"),
+             _dcb_out_d.get("maximum_inductance_h"),
+             _dcb_out_d.get("turns_at_maximum"),
+             _dcb_out_d.get("percent_at_maximum"),
+             len((_dcb_v.get("dc_bias") or {}).get("unreachable") or [])))
+
+    _dcb_wide = _call("magnetics_select_core",
+                      dict(_dcb_args, dc_bias_current_a=8.0, limit=400), 1892)
+    _dcb_wv = _dcb_wide.get("value") or {}
+    _dcb_wd = _dcb_wv.get("dc_bias") or {}
+    _dcb_band = [c for c in (_dcb_wv.get("candidates") or [])
+                 if (c.get("dc_bias") or {}).get("h_within_printed_band") is False]
+    _dcb_one = (_dcb_band[0].get("dc_bias") or {}) if _dcb_band else {}
+    check("an H outside the 10-800 Oe the fit pages are drawn over is flagged, not "
+          "clamped and not presented as a reading: across the whole 232-candidate "
+          "pool at 8 A seven parts land out of band, the first at 1743.5 Oe, and "
+          "the note says EXTRAPOLATION",
+          len(_dcb_wd.get("outside_the_printed_band") or []) == 7
+          and "0077381A7" in (_dcb_wd.get("outside_the_printed_band") or [])
+          and _mg.DC_BIAS_PLOTTED_OE == (10.0, 800.0)
+          and len(_dcb_band) == 7
+          and "EXTRAPOLATION" in _dcb_one.get("h_band_note", "")
+          and (_dcb_one.get("h_oe") or 0.0) > 1743.0,
+          "%d out of band, first %s at %s Oe, mu %s %%"
+          % (len(_dcb_wd.get("outside_the_printed_band") or []),
+             (_dcb_band[0].get("part") if _dcb_band else None),
+             _dcb_one.get("h_oe"), _dcb_one.get("percent_initial_permeability")))
+
+    def _dcb_refuse(args, rid):
+        return _call("magnetics_select_core", args, rid)
+
+    _dcb_r1 = _dcb_refuse({"inductance_h": 1e-4, "i_peak_a": 10.0,
+                           "permeability": 60, "dc_bias_current_a": 8.0}, 1893)
+    _dcb_r2 = _dcb_refuse(dict(_dcb_args, dc_bias_current_a=12.0), 1894)
+    _dcb_r3 = _dcb_refuse(dict(_dcb_args, dc_bias_current_a=0.0), 1895)
+    _dcb_r4 = _dcb_refuse(dict(_dcb_args, dc_bias_current_a="x"), 1896)
+    _dcb_r5 = _dcb_refuse(dict(_dcb_args, dc_bias_current_a=8.0,
+                               dc_bias_data_path="data/no_such_fit.json"), 1897)
+    check("every way to ask for a bias that cannot be solved is its own refusal, "
+          "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
+          "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
+          "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is still "
+          "176, because 0.0.78 adds arguments and no tool",
+          _dcb_r1.get("reason_code") == "ARG_INVALID"
+          and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
+          and _dcb_r2.get("reason_code") == "ARG_RANGE"
+          and _dcb_r3.get("reason_code") == "ARG_RANGE"
+          and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
+          and _dcb_r4.get("reason_code") == "ARG_INVALID"
+          and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
+          and len(_tools.TOOLS) == 176,
+          "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
+          % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
+             _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
+             _dcb_r5.get("reason_code"), len(_tools.TOOLS)))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

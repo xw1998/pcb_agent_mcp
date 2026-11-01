@@ -3797,10 +3797,16 @@ def _capabilities(_args):
             "catalog's printed 80 %/50 % summary table and both worked examples. What "
             "that tool does NOT do: interpolate between printed permeabilities (it "
             "refuses with the list), depend on temperature (one fit, not one per "
-            "temperature), model saturation (% mu_i is small-signal; the flux is "
-            "reported beside it), or feed back into select_core's turn count (more "
-            "turns means more oersteds means less mu - a fixed point 0.0.77 does not "
-            "solve). "
+            "temperature), or model saturation (% mu_i is small-signal; the flux is "
+            "reported beside it). The turn-count feedback that 0.0.77 refused is "
+            "closed in 0.0.78 by select_core(dc_bias_current_a=...): turns are solved "
+            "on the biased inductance, by a bracketed search rather than a fixed "
+            "point, because L(N) peaks and then falls once c > 2 (86 of the 125 rows) "
+            "- so past that peak more turns buy less inductance, and a part that "
+            "cannot reach L at the bias is rejected as dc_bias_unreachable with the "
+            "maximum it does reach. A design landing outside the 10-800 Oe the curves "
+            "are drawn over is flagged h_within_printed_band=false instead of being "
+            "presented as a reading. "
             "No saturation CURVE of a real "
             "material: only a single Bsat per published temperature, never "
             "interpolated between them. Gapped-core fringing loss IS computed since "
@@ -7795,7 +7801,19 @@ _tool(
     "it has no gap to compute - the gap is distributed, so AL can only be changed by "
     "choosing another permeability. Its core loss comes from the vendor's own "
     "per-permeability toroid fit. No mean turn length is printed for a toroid, so no "
-    "copper estimate is made for one.",
+    "copper estimate is made for one. dc_bias_current_a (0.0.78) closes the bias "
+    "loop: the printed AL is the UNBIASED value, so with a bias given each powder "
+    "part's turns are solved at that current - H = 0.4*pi*N*I/le[cm] from the "
+    "catalog's relation, mu from the part's own printed (a, b, c) row, and the turns "
+    "chosen so the BIASED inductance still reaches your L while the peak flux stays "
+    "under the limit. It is a bracketed search, not a fixed point: L(N) ~ "
+    "N^2/(a + b*(kN)^c) peaks at N^c = 2a/((c-2)*b*k^c) and then FALLS when c > 2 - "
+    "which 86 of the 125 printed rows are - so at a high bias more turns can buy "
+    "LESS inductance, and a part that cannot reach L at all is rejected as "
+    "dc_bias_unreachable with the maximum it can reach instead of getting a turn "
+    "count that does not work. A design whose H lands outside the 10-800 Oe the fit "
+    "pages are drawn over is flagged h_within_printed_band=false, not passed off as "
+    "a reading.",
     {"type": "object", "properties": {
         "inductance_h": _num("the inductance you need, in HENRY (100 uH = 1e-4)"),
         "i_peak_a": _num("peak winding current, which sets the flux"),
@@ -7837,6 +7855,15 @@ _tool(
                              "a part"),
         "data_path": _str("override the table path (testing)"),
         "powder_data_path": _str("override the powder-core table path (testing)"),
+        "dc_bias_current_a": _num("the DC current the winding sits at (0.0.78): with "
+                                  "it the turns are solved on the BIASED inductance "
+                                  "instead of the printed no-current AL, using the "
+                                  "vendor's printed % mu_i fit. Powder parts only - "
+                                  "asking without include_powder_cores is refused "
+                                  "rather than answered unbiased"),
+        "dc_bias_data_path": _str("override the DC-bias fit table path (testing)"),
+        "dc_bias_turns_max": _num("how many turns the bias search will look at "
+                                  "before calling a part unreachable", 1000),
     }, "required": ["inductance_h", "i_peak_a"]},
     lambda a: _magnetics.select_core(
         a.get("inductance_h"), a.get("i_peak_a"),
@@ -7859,7 +7886,11 @@ _tool(
         data_path=a.get("data_path"),
         include_powder_cores=bool(a.get("include_powder_cores")),
         permeability=a.get("permeability"),
-        powder_data_path=a.get("powder_data_path")),
+        powder_data_path=a.get("powder_data_path"),
+        dc_bias_current_a=a.get("dc_bias_current_a"),
+        dc_bias_data_path=a.get("dc_bias_data_path"),
+        dc_bias_turns_max=(a["dc_bias_turns_max"]
+                           if a.get("dc_bias_turns_max") is not None else 1000)),
 )
 
 _tool(
