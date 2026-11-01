@@ -3777,9 +3777,13 @@ def _capabilities(_args):
             "that measured point needs exponents from you (Magnetics_NN vendor "
             "exponents are also not in the table). No saturation CURVE of a real "
             "material: only a single Bsat per published temperature, never "
-            "interpolated between them. No gapped-core fringing loss (which is usually "
-            "the biggest AC winding loss in a gapped inductor - magnetics_winding_ac "
-            "sees only the 1-D field through the stack). No litz strand model, no "
+            "interpolated between them. Gapped-core fringing loss IS computed since "
+            "0.0.72 (magnetics_fringing_loss: a 2-D magnetic-charge model of the gap, "
+            "q from the closed form of the axial integral, an exact slab eddy factor) "
+            "and its scope is its own: 2-D along the leg, perfectly permeable pole "
+            "faces (no saturation), the in-plane component NOT modelled (it is 0.32 of "
+            "the axial one a gap-width above the face), and it is added to Dowell's "
+            "proximity term as a power, with no cross term. No litz strand model, no "
             "DC-bias Steinmetz: magnetics_core_loss takes the AC swing and the WAVEFORM "
             "SHAPE (sine, triangle + duty, or a piecewise trajectory) through the iGSE, "
             "which is a function of the swing alone - a premagnetisation term is not "
@@ -7580,8 +7584,10 @@ _tool(
     "part of applying Dowell to round wire). F_R is split into its own-field and "
     "proximity terms, which is what makes 'more layers' visibly expensive. Give "
     "dc_resistance_ohm, or turns + mean_length_mm, to get ohms back. Not modelled: "
-    "gap/fringing field (usually the biggest AC winding loss in a gapped inductor), "
-    "litz, interleaved windings, non-sinusoidal current, end turns, core loss.",
+    "gap/fringing field (usually the biggest AC winding loss in a gapped inductor - "
+    "magnetics_fringing_loss computes that term separately, and it is added beside "
+    "this answer as a power, not inside it), litz, interleaved windings, "
+    "non-sinusoidal current, end turns, core loss.",
     {"type": "object", "properties": {
         "freq_hz": _num("frequency in Hz (the fundamental of the current, not the "
                         "switching frequency of some other converter)"),

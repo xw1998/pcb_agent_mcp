@@ -958,8 +958,9 @@ def winding_ac_resistance(freq_hz, layers, shape="foil", thickness_mm=None,
       * sinusoid at `freq_hz` only. A triangular ripple has harmonics: sum the
         losses, `P = SUM_k I_k^2 * R(f_k)`, not `I_total^2 * R(f_sw)`;
       * no gap/fringing field (in a gapped inductor that is usually the biggest
-        term - Dowell's method cannot see it), no litz strand-level effect, no
-        bundle-level skin, no end/lead effects, no self-resonance;
+        term - Dowell's method cannot see it; magnetics_fringing_loss computes
+        it separately and the two are added as powers), no litz strand-level
+        effect, no bundle-level skin, no end/lead effects, no self-resonance;
       * temperature enters only through the copper resistivity.
     """
     sh = str(shape or "foil").strip().lower()
@@ -1161,7 +1162,8 @@ def winding_ac_resistance(freq_hz, layers, shape="foil", thickness_mm=None,
 
     out["not_modelled"] = [
         "gap / fringing field (in a gapped inductor this is usually the largest "
-        "AC winding loss - Dowell's 1-D field cannot see it)",
+        "AC winding loss - Dowell's 1-D field cannot see it; magnetics_fringing_loss "
+        "computes that term, so add it beside this number rather than inside it)",
         "litz wire (strand-level skin and bundle-level effects need a different model)",
         "interleaved windings (the MMF staircase is not the one assumed; pass the "
         "layer count of a single block and the result is that block's)",
@@ -2153,7 +2155,9 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
             "the DC-bias roll-off of AL (a gapped ferrite loses inductance long "
             "before it saturates at Bsat) - only the Bsat point is judged",
             "fringing flux at the gap: the gap estimate is series reluctance only, "
-            "and fringing loss and the extra copper loss near the gap are absent",
+            "and the extra copper loss near the gap is absent (magnetics_fringing_loss "
+            "computes that copper loss; the flux, and with it the inductance, is not "
+            "corrected here)",
             "winding AC resistance (magnetics_winding_ac) and skin effect",
             "tolerance: AL is quoted +/-25% on many parts, so the turns from AL are "
             "a nominal value, not a guarantee",
