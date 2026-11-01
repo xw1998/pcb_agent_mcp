@@ -624,7 +624,11 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # 173 = 172 + ac_self_heating in 0.0.68 (R at a frequency is an INPUT to
         # the thermal loop, not a separate calculation: the answer is a TEMPERATURE
         # and the loop has to be solved for, so it is its own tool)
-        self.assertEqual(len(tools.TOOLS), 173)
+        # 174 = 173 + magnetics_fringing_loss in 0.0.72 (the field that leaks out
+        # of an air gap is a different field from the 1-D stack field: Dowell
+        # cannot see it at all, and its driver is the MMF in the gap, not the
+        # winding's own ampere-turns)
+        self.assertEqual(len(tools.TOOLS), 174)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

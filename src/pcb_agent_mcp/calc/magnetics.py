@@ -1187,6 +1187,401 @@ def winding_ac_resistance(freq_hz, layers, shape="foil", thickness_mm=None,
          "litz": "not modelled"})
 
 # --------------------------------------------------------------------------
+# the field that leaks out of an air gap, and what it does to the winding
+#
+# Dowell's 1-D stack field cannot see this term, and in a gapped inductor it is
+# often larger than the term it cannot see.  The field here is the one of two
+# oppositely charged strips standing in for the two pole faces: a 2-D magnetic
+# charge model, i.e. the pole faces are treated as perfect magnetically
+# conducting sheets of width 2a = leg width, separated by g, and the winding
+# sits outside them.  Nothing in this block is a fit and nothing is copied: the
+# two closed forms below are derived in docs/75 and each one is checked against
+# an independent numerical answer (Biot-Savart quadrature for the field,
+# complex 1-D solution for the slab factor) in tests/test_fringing_loss.py.
+#
+# Sign conventions: the strips carry q (A/m) and -q, so the axial field is
+# q/2 just outside either face and 0 at the mid plane far away.  Only |H| enters
+# the loss, so the overall sign is irrelevant here - but NOT interchangeable
+# with atan2: `atan((x+a)/c) - atan((x-a)/c)` is the continuous antiderivative of
+# `2a/((u^2+a^2))` for c of either sign, while atan2 wraps by pi once c < 0 and
+# silently gives a field that is wrong by a factor of ~300.
+# --------------------------------------------------------------------------
+
+# ring of the axial quadrature. The integrand is smooth away from z = +-g/2 and
+# decays like 1/z^4, so the fine grid is squared (dense at the gap) and the tail
+# geometric. 320/480 already agrees with 640/960 to 2e-5 relative.
+FRINGE_MESH_GAP = 400
+FRINGE_MESH_TAIL = 600
+
+# below this D = t/delta the closed slab factor cancels two cubes of O(D) and
+# loses digits; the series is exact to O(D^8) there
+SLAB_SERIES_BELOW = 1e-2
+
+
+def _fringe_hz(x, z, a, g, q):
+    """Axial field of the two charged strips, closed form (A/m)."""
+    def term(c):
+        if c == 0.0:
+            c = 1e-18
+        return math.atan((x + a) / c) - math.atan((x - a) / c)
+    return q * (term(z - g / 2.0) - term(z + g / 2.0)) / (2.0 * math.pi)
+
+
+def _fringe_hx(x, z, a, g, q):
+    """Radial field of the two charged strips, closed form (A/m).
+
+    Log-singular on the pole edge (x = a, z = +-g/2); both singularities are
+    guarded so a probe placed exactly there returns a large finite number
+    instead of raising.
+    """
+    def term(c):
+        c2 = c * c if c != 0.0 else 1e-36
+        u1 = (x + a) ** 2 + c2
+        u2 = (x - a) ** 2 + c2
+        if u1 <= 0.0:
+            u1 = 1e-300
+        if u2 <= 0.0:
+            u2 = 1e-300
+        return 0.5 * (math.log(u1) - math.log(u2))
+    return q * (term(z - g / 2.0) - term(z + g / 2.0)) / (2.0 * math.pi)
+
+
+def _fringe_gap_mmf(a, g):
+    """|int_{-g/2}^{g/2} H_z(0,z) dz| per unit pole density, closed form (m).
+
+    = (a*log(1+(g/a)^2) + 2g*atan(a/g))/pi.  For g << a it tends to g (an
+    infinitely wide pole leaks nothing); the shortfall below 1 IS the fringing,
+    i.e. the fraction of gap MMF that the pole face has to make up by carrying a
+    higher density than the 1-D NI/g.
+    """
+    return (a * math.log1p((g / a) ** 2) + 2.0 * g * math.atan(a / g)) / math.pi
+
+
+def _slab_eddy_factor(rho, freq_hz, thickness_m):
+    """p_vol / H_rms^2 for a slab of thickness t with the AC field normal to it.
+
+    Returns (factor, D, delta_m, series_factor) where `factor` is the exact 1-D
+    answer divided by the textbook thin-sheet factor
+    sigma*w^2*mu0^2*t^2/12, i.e. factor = 1 exactly in the thin limit and
+    factor ~ 3/(2D) once the foil is thicker than a few skin depths (the loss
+    then stops growing like t^2 - a thin-sheet formula over-states it by
+    ~1/factor, which is 36x at t = 1 mm / 100 kHz).
+
+    The exact answer is
+        p = sigma*w^2*mu0^2*t^2/12 * 3*(sinhD - sinD)/(D^3*(sinh^2(D/2)+cos^2(D/2)))
+    with D = t/delta.  Verified against an independent complex 1-D solution
+    (E = A sinh(kx), 4001-point integral) to 2e-7 relative.
+    """
+    om = 2.0 * math.pi * freq_hz
+    delta = math.sqrt(2.0 * rho / (om * MU0))
+    D = thickness_m / delta
+    if D < SLAB_SERIES_BELOW:
+        # 3*(sinhD-sinD)/(D^3*(sinh^2(D/2)+cos^2(D/2))) = 1 - D^4*(1/24 - 1/840) + O(D^8)
+        return 1.0 - D ** 4 * (1.0 / 24.0 - 1.0 / 840.0), D, delta
+    num = math.sinh(D) - math.sin(D)
+    den = 0.5 * (math.cosh(D) + math.cos(D))          # sinh^2(D/2)+cos^2(D/2)
+    return 3.0 * num / (D ** 3 * den), D, delta
+
+
+def _fringe_field_weight(x, a, g, q, height_m, n_gap=None, n_tail=None):
+    """int_{-H/2}^{H/2} H_z(x,z)^2 dz in A^2/m (H_z is odd in ... even in z)."""
+    ng = n_gap or FRINGE_MESH_GAP
+    nt = n_tail or FRINGE_MESH_TAIL
+    half = 0.5 * height_m
+    span = min(half, 6.0 * g)
+    zs = [span * (i / float(ng)) ** 2 for i in range(ng)]
+    if half > span:
+        ratio = half / span
+        zs.extend([span * ratio ** (i / float(nt)) for i in range(1, nt + 1)])
+    tot = 0.0
+    prev = zs[0]
+    fprev = _fringe_hz(x, prev, a, g, q) ** 2
+    for z in zs[1:]:
+        fz = _fringe_hz(x, z, a, g, q) ** 2
+        tot += 0.5 * (fprev + fz) * (z - prev)          # trapezoid
+        prev, fprev = z, fz
+    return 2.0 * tot
+
+
+def fringing_loss(freq_hz, gap_mm, leg_width_mm, leg_depth_mm, layers,
+                  thickness_mm, winding_height_mm, standoff_mm=0.0,
+                  insulation_mm=0.0, current_rms_a=None, ampere_turns=None,
+                  resistivity_ohm_m=None, temperature_c=None,
+                  probe_radii_mm=None):
+    """AC copper loss driven by the field that fringes out of the air gap.
+
+    Geometry: a leg of width `leg_width_mm` (the 2-D model is infinite in the
+    other direction, so `leg_depth_mm` only enters through the turn perimeter),
+    two pole faces separated by `gap_mm`, and `layers` concentric foil shells of
+    thickness `thickness_mm`, of height `winding_height_mm`, the innermost one
+    `standoff_mm` away from the leg surface and every further one a pitch
+    `thickness_mm + insulation_mm` further out.
+
+    One shell is one turn, so the MMF is `layers * current_rms_a`; if you want to
+    scale from a measured MMF instead, pass `ampere_turns` and leave the current
+    out.
+
+    Every number returned is the 2-D field of the two pole faces alone. It is
+    NOT the total winding loss: add Dowell's proximity term for the winding's own
+    field (`magnetics_winding_ac`). Adding the two powers rather than superposing
+    the two fields has no cross term - that is the honest limit of this model,
+    not an approximation that is corrected somewhere inside.
+    """
+    try:
+        f = _f("freq_hz", freq_hz)
+        g_mm = _f("gap_mm", gap_mm)
+        w_mm = _f("leg_width_mm", leg_width_mm)
+        d_mm = _f("leg_depth_mm", leg_depth_mm)
+        t_mm = _f("thickness_mm", thickness_mm)
+        h_mm = _f("winding_height_mm", winding_height_mm)
+        s_mm = _f("standoff_mm", standoff_mm)
+        ins_mm = _f("insulation_mm", insulation_mm)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    if f <= 0:
+        return err("freq_hz must be > 0", "ARG_RANGE",
+                   hint="there is no fringing LOSS without an alternating field; "
+                        "the DC field sees resistance only and that is the DC "
+                        "resistance")
+    if g_mm <= 0:
+        return err("gap_mm must be > 0", "ARG_RANGE",
+                   hint="with no gap there are no pole faces to fringe from; the "
+                        "gap-less case is magnetics_winding_ac's own field")
+    if w_mm <= 0 or d_mm <= 0:
+        return err("leg_width_mm and leg_depth_mm must be > 0", "ARG_RANGE")
+    if t_mm <= 0:
+        return err("thickness_mm must be > 0", "ARG_RANGE")
+    if h_mm <= 0:
+        return err("winding_height_mm must be > 0", "ARG_RANGE")
+    if s_mm < 0:
+        return err("standoff_mm must be >= 0", "ARG_RANGE",
+                   hint="a negative standoff would put the first shell inside the "
+                        "core leg; 0 means it touches the leg")
+    if ins_mm < 0:
+        return err("insulation_mm must be >= 0", "ARG_RANGE")
+    try:
+        n_layers = int(layers)
+    except (TypeError, ValueError):
+        return err("layers must be an integer", "ARG_INVALID")
+    if n_layers < 1:
+        return err("layers must be >= 1", "ARG_RANGE")
+    if n_layers > 200:
+        return err("layers=%d is outside this model" % n_layers, "ARG_RANGE",
+                   hint="200 shells is already 200 axial quadratures; a winding "
+                        "that deep is at the leg's own flux return and the 2-D "
+                        "pole-face field is not the field any more")
+
+    if (current_rms_a is None) == (ampere_turns is None):
+        return err("give exactly one of current_rms_a and ampere_turns",
+                   "ARG_MISSING",
+                   hint="layers x current_rms_a is the MMF of the stack; "
+                        "ampere_turns sets it directly when the current is not "
+                        "the quantity you know")
+    if current_rms_a is not None:
+        try:
+            i_rms = _f("current_rms_a", current_rms_a)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if i_rms <= 0:
+            return err("current_rms_a must be > 0", "ARG_RANGE")
+        ni = n_layers * i_rms
+    else:
+        try:
+            ni = _f("ampere_turns", ampere_turns)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if ni <= 0:
+            return err("ampere_turns must be > 0", "ARG_RANGE")
+        i_rms = ni / float(n_layers)
+
+    rho = COPPER_RESISTIVITY_OHM_M
+    temp_used = None
+    if resistivity_ohm_m is not None and temperature_c is not None:
+        return err("give resistivity_ohm_m or temperature_c, not both",
+                   "ARG_INVALID",
+                   hint="temperature_c already implies copper's rho(T)")
+    if resistivity_ohm_m is not None:
+        try:
+            rho = _f("resistivity_ohm_m", resistivity_ohm_m)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if rho <= 0:
+            return err("resistivity_ohm_m must be > 0", "ARG_RANGE")
+    elif temperature_c is not None:
+        try:
+            tc = _f("temperature_c", temperature_c)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if tc <= -273:
+            return err("temperature_c below absolute zero", "ARG_RANGE")
+        rho = COPPER_RESISTIVITY_OHM_M * (1.0 + COPPER_TEMPCO_PER_K * (tc - 20.0))
+        if rho <= 0:
+            return err("temperature_c=%g gives a non-physical resistivity" % tc,
+                       "ARG_RANGE")
+        temp_used = tc
+
+    a = w_mm * 1e-3 / 2.0
+    g = g_mm * 1e-3
+    t = t_mm * 1e-3
+    h = h_mm * 1e-3
+    depth = d_mm * 1e-3
+
+    warnings = []
+    if g > a:
+        warnings.append(
+            "gap_mm=%.4g exceeds half the leg width: the two pole faces are then "
+            "not facing each other over most of their area and the 2-D strip "
+            "model's premise (a thin gap) is gone" % g_mm)
+    if 0.5 * t > s_mm and s_mm > 0:
+        warnings.append(
+            "standoff_mm is smaller than half the foil thickness: the innermost "
+            "shell's mid-plane is inside the leg surface, so its field is read "
+            "at a radius that does not exist")
+
+    gap_mmf = _fringe_gap_mmf(a, g)          # metres per unit q
+    q = ni / gap_mmf                         # A/m on each pole face
+    h_mean = ni / g
+    factor, D, delta = _slab_eddy_factor(rho, f, t)
+    thin_factor = ((2.0 * math.pi * f) ** 2 * MU0 ** 2 * t ** 2 /
+                   (12.0 * rho))
+
+    rows = []
+    total = 0.0
+    r_dc = 0.0
+    for i in range(n_layers):
+        s = s_mm * 1e-3 + i * (t + ins_mm * 1e-3) + 0.5 * t
+        x = a + s
+        perim = 2.0 * ((w_mm * 1e-3 + 2.0 * s) + (depth + 2.0 * s))
+        weight = _fringe_field_weight(x, a, g, q, h)
+        p = thin_factor * factor * t * perim * weight
+        r_layer_dc = rho * perim / (h * t)
+        total += p
+        r_dc += r_layer_dc
+        rows.append({
+            "layer": i + 1,
+            "radius_mm": round(s * 1e3, 6),
+            "perimeter_mm": round(perim * 1e3, 4),
+            "field_weight_a2_m": float("%.6g" % weight),
+            "peak_field_a_m": round(abs(_fringe_hz(x, 0.0, a, g, q)), 1),
+            "loss_w": float("%.6g" % p),
+            "dc_resistance_ohm": float("%.6g" % r_layer_dc),
+        })
+
+
+    # measured size of the component this model does not carry: the radial one
+    s1 = s_mm * 1e-3 + 0.5 * t
+    hx_ratio = None
+    if s1 > 0:
+        hz_pt = _fringe_hz(a + s1, 0.2 * g, a, g, q)
+        hx_pt = _fringe_hx(a + s1, 0.2 * g, a, g, q)
+        if hz_pt:
+            hx_ratio = abs(hx_pt / hz_pt)
+
+    probes = []
+    if probe_radii_mm is not None:
+        try:
+            radii = list(probe_radii_mm)
+        except TypeError:
+            return err("probe_radii_mm must be a list of numbers", "ARG_INVALID")
+        for r_mm in radii:
+            try:
+                rr = _f("probe_radii_mm entry", r_mm)
+            except ValueError as exc:
+                return err(str(exc), "ARG_INVALID")
+            if rr < 0:
+                return err("probe_radii_mm entries must be >= 0", "ARG_RANGE")
+            xp = a + rr * 1e-3
+            wgt = _fringe_field_weight(xp, a, g, q, h)
+            probes.append({
+                "standoff_mm": round(rr, 6),
+                "field_weight_a2_m": float("%.6g" % wgt),
+                "peak_field_a_m": round(abs(_fringe_hz(xp, 0.0, a, g, q)), 1),
+                "loss_w_for_1mm_of_foil": float(
+                    "%.6g" % (thin_factor * factor * 1e-3 *
+                              2.0 * ((w_mm * 1e-3 + 2.0 * rr * 1e-3) +
+                                     (depth + 2.0 * rr * 1e-3)) * wgt)),
+            })
+
+    not_modelled = [
+        "the radial (in-plane) field component: it drives a circulating current "
+        "whose loop closes over the layer stack, so its factor depends on the "
+        "stack geometry and not on the foil thickness. Here it is %.2f of the "
+        "axial component one gap-width above the pole face - not small, and "
+        "simply absent from this number"
+        % (hx_ratio if hx_ratio is not None else float("nan")),
+        "the 3-D ends of the leg: the model is 2-D (infinite along leg_depth_mm), "
+        "so the two end faces of the winding see the field of a face that never "
+        "ends - this over-estimates there",
+        "superposition: Dowell's proximity loss of the winding's own field and "
+        "this one are added as powers, with no cross term. The true combined "
+        "loss is not exactly their sum",
+        "round wire: the transverse-field eddy factor of a cylinder needs Kelvin "
+        "functions. Pass probe_radii_mm and apply your own wire factor to "
+        "field_weight_a2_m rather than getting a foil answer for a round wire",
+        "permeability of the pole faces: they are perfect magnetic conductors "
+        "here, so no flux is lost INTO the core and no saturation shrinks the "
+        "fringing field (a saturated gap fringes more, not less)",
+        "the winding's own field inside the gap (it modifies the MMF the gap "
+        "sees when the winding is not concentric or the core is not symmetric)",
+        "non-sinusoidal current: sum P over the harmonics yourself, with "
+        "field_weight scaling as I_k^2",
+        "insulation between shells thicker than insulation_mm assumes a straight "
+        "radial stack (no spiral, no layer crossover)",
+    ]
+
+    out = {
+        "ampere_turns": round(ni, 6),
+        "turns_implied": n_layers,
+        "current_rms_a": float("%.6g" % i_rms),
+        "gap_field_uniform_a_m": round(h_mean, 1),
+        "pole_density_a_m": round(q, 1),
+        "pole_concentration": round(q * g / ni, 6),
+        "gap_mmf_fraction": round(gap_mmf / g, 6),
+        "skin_depth_um": round(delta * 1e6, 4),
+        "foil_over_delta": round(D, 5),
+        "slab_factor": round(factor, 6),
+        "thin_sheet_over_exact": round(1.0 / factor, 6),
+        "layers": rows,
+        "total_loss_w": float("%.6g" % total),
+        "fringe_resistance_ohm": float("%.6g" % (total / (i_rms * i_rms))),
+        "dc_resistance_ohm": float("%.6g" % r_dc),
+        "loss_over_dc": round(total / (i_rms * i_rms * r_dc), 6),
+        "radial_over_axial_at_0p2g": (round(hx_ratio, 4) if hx_ratio is not None
+                                      else None),
+        "warnings": warnings,
+        "not_modelled": not_modelled,
+    }
+    if probe_radii_mm is not None:
+        out["probes"] = probes
+
+    return ok(
+        out, "W (fringing-field copper loss in the layers)",
+        "2-D magnetic-charge (pole-face) field + exact 1-D slab eddy factor",
+        "H_z,H_x = closed forms of two oppositely charged strips of width 2a and "
+        "separation g; q set so that int_{-g/2}^{g/2} H_z dz = NI exactly "
+        "(closed form); per shell P = sigma*w^2*mu0^2*t^2/12 * "
+        "3(sinhD-sinD)/(D^3*(sinh^2(D/2)+cos^2(D/2))) * t * perimeter * "
+        "int H_z^2 dz, with D = t/delta",
+        "field: closed form checked against Biot-Savart quadrature (2e-6 "
+        "relative) and against div H = curl H = 0 by finite differences; gap "
+        "integral checked against that quadrature (3e-5) and against the exact "
+        "limit int/(q g) -> 1 as g/a -> 0 (2e-8); slab factor checked against an "
+        "independent complex 1-D solution (2e-7) and against the thin-sheet "
+        "limit. The model error that dominates in hardware is the one listed in "
+        "not_modelled, above all the radial field component and the 2-D ends",
+        {"geometry": "concentric foil shells, one shell = one turn, straight "
+                     "radial stack, no spiral",
+         "field": "2-D; the pole faces are perfect magnetic conductors and the "
+                  "winding does not perturb them",
+         "waveform": "sine at freq_hz, RMS amplitudes",
+         "temperature": ("via resistivity at %g C" % temp_used) if temp_used is not None
+                        else "20 C copper unless resistivity_ohm_m was given",
+         "field_sampled_at": "each shell's mid-radius, applied to the whole turn "
+                             "perimeter"},
+        None,
+    )
+
+# --------------------------------------------------------------------------
 # core selection against the vendor table
 #
 # data/magnetic_materials.json holds published material constants and effective

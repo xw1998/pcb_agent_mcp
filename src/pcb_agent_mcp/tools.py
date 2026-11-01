@@ -3689,7 +3689,7 @@ def _capabilities(_args):
             "link_fresnel",
             "board_antenna_keepout",
             "magnetics_inductor", "magnetics_dcm", "magnetics_core_loss",
-            "magnetics_winding_ac",
+            "magnetics_winding_ac", "magnetics_fringing_loss",
             "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
@@ -7613,6 +7613,68 @@ _tool(
         dc_resistance_ohm=a.get("dc_resistance_ohm"),
         temperature_c=a.get("temperature_c"),
         resistivity_ohm_m=a.get("resistivity_ohm_m")),
+)
+
+_tool(
+    "magnetics_fringing_loss",
+    "Fringing-field loss: the AC copper loss caused by the field that leaks out of "
+    "an air gap - the term Dowell's 1-D stack field cannot see, and in a gapped "
+    "inductor often bigger than the proximity term it competes with. The field is a 2-D magnetic-charge model of "
+    "the two pole faces (perfect magnetically conducting strips of the leg width, "
+    "separation gap_mm, pole density q set so that the axial field integrates to "
+    "exactly the MMF); each shell of the stack is a foil ring whose own eddy "
+    "shielding comes from the exact 1-D slab factor (so thick foil stops growing "
+    "like t^2 instead of being over-stated 18x by the thin-sheet form). Give "
+    "current_rms_a (MMF = layers x current) or ampere_turns, exactly one. Returns "
+    "per-shell field_weight_a2_m = int H_z^2 dz, which is the raw number to reuse "
+    "for a conductor shape this model does not carry, and probe_radii_mm prints it "
+    "at any standoff. NOT modelled: the radial field component (it drives a "
+    "circulating current over the stack - its measured size is printed), round "
+    "wire, the 2-D ends of the leg, the winding's own field (that is "
+    "magnetics_winding_ac, whose proximity term adds to this one as a power, with "
+    "no cross term), saturation of the pole faces, non-sinusoidal current.",
+    {"type": "object", "properties": {
+        "freq_hz": _num("frequency in Hz, the fundamental of the current"),
+        "gap_mm": _num("air gap between the two pole faces"),
+        "leg_width_mm": _num("width of the leg whose faces carry the gap (the 2-D "
+                             "model is infinite in the other direction)"),
+        "leg_depth_mm": _num("leg depth; only the turn perimeter uses it, unless the "
+                             "corner field matters to you, which this model does not "
+                             "carry"),
+        "layers": _num("number of concentric foil shells; one shell is one turn, so "
+                       "the MMF is layers x current_rms_a"),
+        "thickness_mm": _num("foil thickness"),
+        "winding_height_mm": _num("height of the winding along the leg (= the length "
+                                  "of each shell)"),
+        "standoff_mm": _num("radial distance from the leg surface to the first "
+                            "shell's inner face (default 0)"),
+        "insulation_mm": _num("insulation between neighbouring shells, so the pitch "
+                              "is thickness + insulation (default 0)"),
+        "current_rms_a": _num("RMS current in the winding; gives MMF = layers x I"),
+        "ampere_turns": _num("or set the MMF directly (not with current_rms_a)"),
+        "temperature_c": _num("copper temperature, which sets the resistivity "
+                              "(20 C = 1.724e-8 ohm m)"),
+        "resistivity_ohm_m": _num("or give the resistivity directly (not with "
+                                  "temperature_c)"),
+        "probe_radii_mm": {"type": "array",
+                           "description": "extra standoffs at which to print "
+                                          "field_weight_a2_m and the peak field, for "
+                                          "a conductor shape this model does not "
+                                          "carry (round wire, litz)",
+                           "items": {"type": "number"}},
+    }, "required": ["freq_hz", "gap_mm", "leg_width_mm", "leg_depth_mm", "layers",
+                    "thickness_mm", "winding_height_mm"]},
+    lambda a: _magnetics.fringing_loss(
+        a.get("freq_hz"), a.get("gap_mm"), a.get("leg_width_mm"),
+        a.get("leg_depth_mm"), a.get("layers"), a.get("thickness_mm"),
+        a.get("winding_height_mm"),
+        standoff_mm=(a.get("standoff_mm") if a.get("standoff_mm") is not None else 0.0),
+        insulation_mm=(a.get("insulation_mm") if a.get("insulation_mm") is not None else 0.0),
+        current_rms_a=a.get("current_rms_a"),
+        ampere_turns=a.get("ampere_turns"),
+        temperature_c=a.get("temperature_c"),
+        resistivity_ohm_m=a.get("resistivity_ohm_m"),
+        probe_radii_mm=a.get("probe_radii_mm")),
 )
 
 _tool(

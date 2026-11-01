@@ -4723,6 +4723,103 @@ def selftest():
           % (_sc_b.get("part"), _sc_b.get("core_loss_w"), _sc_a.get("core_loss_w"),
              _sc_c.get("core_loss_w")))
 
+    # --- the field that leaks out of the gap (0.0.72). Dowell's 1-D stack
+    # cannot see it: the two face the model is built on, five independent
+    # checks of the field itself, and one number that must not move.
+    _fr_args = {"freq_hz": 1e5, "gap_mm": 1.0, "leg_width_mm": 10.0,
+                "leg_depth_mm": 10.0, "layers": 4, "thickness_mm": 0.05,
+                "winding_height_mm": 20.0, "standoff_mm": 0.2,
+                "ampere_turns": 100.0, "resistivity_ohm_m": 1.724e-8}
+    _fr = _call("magnetics_fringing_loss", dict(_fr_args), 1868)
+    _fr_v = _fr.get("value") or {}
+
+    def _fr_tot(**kw):
+        a = dict(_fr_args)
+        a.update(kw)
+        return ((_call("magnetics_fringing_loss", a, 1868).get("value") or {})
+                .get("total_loss_w"))
+
+    check("fringing: a 10 mm leg, 1 mm gap, 4 x 0.05 mm foil at 100 kHz and 100 "
+          "A-t loses 0.0653932 W in the foil, 3.58 % of its own DC loss - with "
+          "93.68 % of the MMF dropped across the gap and the pole density 6.75 % "
+          "above the uniform 1/B=mu0 value because the field also spreads",
+          _fr.get("status") == "ok"
+          and abs((_fr_v.get("total_loss_w") or 0) - 0.0653932) < 1e-7
+          and abs((_fr_v.get("gap_mmf_fraction") or 0) - 0.936756) < 1e-6
+          and abs((_fr_v.get("pole_concentration") or 0) - 1.067514) < 1e-6
+          and abs((_fr_v.get("loss_over_dc") or 0) - 0.035784) < 1e-6
+          and abs((_fr_v.get("radial_over_axial_at_0p2g") or 0) - 0.3213) < 1e-4
+          and len(_fr_v.get("layers") or []) == 4,
+          "P %s W, gap share %s, q ratio %s, P/Pdc %s"
+          % (_fr_v.get("total_loss_w"), _fr_v.get("gap_mmf_fraction"),
+             _fr_v.get("pole_concentration"), _fr_v.get("loss_over_dc")))
+
+    _fr_20k = _fr_tot(freq_hz=2e4)
+    _fr_std = [_fr_tot(standoff_mm=x) for x in (0.0, 0.2, 0.5, 1.0, 2.0)]
+    _fr_h = [_fr_tot(winding_height_mm=x) for x in (6.0, 40.0)]
+    check("fringing obeys three things it was not fitted to: a foil far thinner "
+          "than delta scales as f^2 (20 kHz / 100 kHz = 1/25), moving the foil "
+          "away from the gap kills the loss monotonically (2 mm is under a "
+          "quarter of 0 mm), and the winding height barely matters (6 mm vs "
+          "40 mm differ under 3 %) because the leakage falls off as 1/z^4",
+          _fr_20k is not None
+          and abs(_fr_20k / 0.0653932 - 0.04) < 4e-4
+          and all(_fr_std[i] > _fr_std[i + 1] for i in range(4))
+          and _fr_std[4] / _fr_std[0] < 0.25
+          and _fr_h[1] / _fr_h[0] - 1.0 < 0.03,
+          "20k/100k %s, standoff 0->2 mm %s -> %s, h 6->40 mm %s -> %s"
+          % (_fr_20k / 0.0653932 if _fr_20k else None, _fr_std[0], _fr_std[4],
+             _fr_h[0], _fr_h[1]))
+
+    _wa = _call("magnetics_winding_ac",
+                {"freq_hz": 1e5, "layers": 4, "shape": "foil",
+                 "thickness_mm": 0.05, "turns": 4, "mean_length_mm": 100.0,
+                 "resistivity_ohm_m": 1.724e-8}, 1869).get("value") or {}
+    check("the Dowell stack still answers exactly what it answered in 0.0.71 "
+          "(fr 1.00575, own field 1.00029, proximity 0.00546): the new tool adds "
+          "a term beside it instead of quietly changing the old one",
+          abs((_wa.get("fr") or 0) - 1.00575) < 1e-5
+          and abs((_wa.get("fr_own_field") or 0) - 1.00029) < 1e-5
+          and abs((_wa.get("fr_proximity") or 0) - 0.00546) < 1e-5,
+          "fr %s = %s + %s" % (_wa.get("fr"), _wa.get("fr_own_field"),
+                               _wa.get("fr_proximity")))
+
+    _fr_bad = [
+        ("current and A-t both", dict(_fr_args, current_rms_a=100.0),
+         "ARG_MISSING"),
+        ("neither current nor A-t", {k: v for k, v in _fr_args.items()
+                                     if k != "ampere_turns"}, "ARG_MISSING"),
+        ("rho and temperature", dict(_fr_args, temperature_c=20.0),
+         "ARG_INVALID"),
+        ("201 layers", dict(_fr_args, layers=201), "ARG_RANGE"),
+        ("negative standoff", dict(_fr_args, standoff_mm=-0.1), "ARG_RANGE"),
+    ]
+    _fr_got = [(lab, (_call("magnetics_fringing_loss", a, 1870) or {})
+               .get("reason_code")) for lab, a, _w in _fr_bad]
+    _fr_wide = _call("magnetics_fringing_loss",
+                     dict(_fr_args, gap_mm=8.0), 1870).get("value") or {}
+    check("fringing refuses instead of guessing: one of current / ampere-turns "
+          "and not both, resistivity and temperature are not both, and it warns "
+          "when the gap is wider than half the leg (the 2-D model is then "
+          "describing a gap, not a slot)",
+          all(got == want for (_l, _a, want), (_l2, got)
+              in zip(_fr_bad, _fr_got))
+          and any("half the leg width" in w
+                  for w in (_fr_wide.get("warnings") or [])),
+          "; ".join("%s=%s" % (l, g) for l, g in _fr_got))
+
+    _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
+    check("fringing is reachable from the capability list as well as the tool "
+          "table (174 tools now), so an agent that asks what can be computed is "
+          "told about it",
+          len(_tools.TOOLS) == 174
+          and "magnetics_fringing_loss" in (_cap.get("available") or [])
+          and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
+                             ["description"].lower()),
+          "%d tools, listed %s" % (
+              len(_tools.TOOLS),
+              "magnetics_fringing_loss" in (_cap.get("available") or [])))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
