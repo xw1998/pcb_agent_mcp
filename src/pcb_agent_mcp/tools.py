@@ -15,6 +15,7 @@ from . import fidelity as _fidelity
 from . import oracle as _oracle
 from .fidelity import views as _fviews
 from .calc import current as _current
+from .calc import currentfield as _cfield
 from .calc import creepage as _creepage
 from .calc import diffpair as _diffpair
 from .calc import field2d as _field2d
@@ -3648,7 +3649,7 @@ def _capabilities(_args):
         "available": [
             "unit_convert", "width_for_current", "current_capacity",
             "via_current_allowed", "fusing_current", "fusing_current_taper",
-            "repetitive_pulse_rating",
+            "repetitive_pulse_rating", "current_density_field",
             "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "coplanar_field", "coplanar_pair_field", "crosstalk_coupled_lines",
@@ -4063,11 +4064,17 @@ def _capabilities(_args):
             "ends_c giving the terminals a temperature there is a steady threshold "
             "below which nothing melts. What that still leaves out: cooling to air "
             "and to the board (the taper model has axial conduction ONLY, so it has "
-            "no h at all), the transverse gradient inside a narrow neck, latent heat "
+            "no h at all), latent heat "
             "at the melt, skin effect inside a short pulse, electromigration (Black's "
             "equation needs a current density a fab will qualify), arc/plasma after "
             "the copper opens, and board_ir_drop's A/mm^2 verdict - that tool still "
-            "reports density with no criterion attached",
+            "reports density with no criterion attached. The transverse gradient in a "
+            "neck is measured separately (0.0.63, current_density_field): it solves "
+            "div(sigma*grad V)=0 on the copper and returns J at the hot spot WITH its "
+            "location, plus a singularity verdict, because a 270 degree inner corner "
+            "makes J ~ r^(-1/3) and the peak is then not a grid-independent number. "
+            "It is steady state, so it says where the crowding is, not when the neck "
+            "melts - those two answers still do not meet",
             "The plane-caps network is COMPUTED now (pdn_plane_with_caps: the cavity "
             "as an (N+1)-port Z matrix, each cap an R-L-C branch, port-reduced to "
             "Z_in), so the anti-resonance where a bank turns inductive and the plane "
@@ -5410,6 +5417,75 @@ _tool(
     }, "required": ["segments", "current_a"]},
     lambda a: _power.ir_drop(a.get("segments"), a.get("current_a"),
                              temp_c=a.get("temp_c") or 20),
+)
+
+_tool(
+    "current_density_field",
+    "2-D steady-state current density inside copper: solves div(sigma*grad V) = 0 on the "
+    "region you draw, so the number it gives is J AND WHERE. Everything else here is "
+    "one-dimensional (J = I/(w*t) on one segment), which is right on the straight part and "
+    "wrong exactly where boards fail: a 90 degree bend, a width step, a via neck, a "
+    "pad-to-track funnel. Copper is given as polygons and/or round-capped polylines in mm; "
+    "two contacts are Dirichlet (source 0 V, sink 1 V) and everything else is insulating, "
+    "so R and J for any current follow from one solve by linearity. Costs 3-60 s of pure "
+    "Python (no numpy: dependencies stay empty): the grid is chosen from max_unknowns and "
+    "the wall clock goes as cells^1.5, so pass h_mm when you want a specific resolution. "
+    "READ THE SINGULARITY WARNING: the inside of a bend is a 270 degree metal corner, "
+    "J ~ r^(-1/3) there, so the PEAK is not grid convergent (measured growth 1.266 per "
+    "halving of h, theory 2^(1/3) = 1.2599). The peak is still returned, with "
+    "peak_growth, with peak_is_grid_convergent, and with ring readings (max J in the "
+    "annuli 0.5h..1h, 1h..2h, 2h..4h around the peak) that DO hold still when the grid is "
+    "refined - quote those, or round the corner. A contact edge is singular for the same "
+    "reason, so a hot spot right at a pad is geometry, not a defect.",
+    {"type": "object", "properties": {
+        "paths": {"type": "array", "description":
+                  "round-capped polylines: [{points: [[x_mm, y_mm], ...], width_mm: w}]. "
+                  "A polyline is not copper until it is given a width", "items":
+                  {"type": "object"}},
+        "polygons": {"type": "array", "description":
+                     "filled polygons: [[[x_mm, y_mm], ...], ...] (>= 3 points each). "
+                     "Union with paths; even-odd inside one polygon",
+                     "items": {"type": "array"}},
+        "source": {"type": "object", "description":
+                   "the contact current enters: {x_mm, y_mm, radius_mm} for a round pad "
+                   "or {x0_mm, y0_mm, x1_mm, y1_mm} for a rectangle, in mm. A cell joins "
+                   "the contact when its square overlaps the region"},
+        "sink": {"type": "object", "description":
+                 "the contact current leaves: same forms as source. Must not overlap it"},
+        "thickness_mm": _num("copper thickness in mm (0.035 = 1 oz finished)", 0.035),
+        "temp_c": _num("copper temperature for rho, 20 C default (alpha 0.00393/K)", 20),
+        "rho_ohm_mm": _num("resistivity in ohm*mm; overrides temp_c. Copper 20 C is "
+                           "1.724e-5"),
+        "current_a": _num("DC current through the region (the field is linear in it)", 1.0),
+        "h_mm": _num("grid spacing of the finest level, mm. Omit and it is derived "
+                     "from max_unknowns"),
+        "max_unknowns": _num("unknown budget for the finest level when h_mm is omitted "
+                             "(40000 keeps the run under a minute)", 40000),
+        "levels": _num("grid levels, coarse to fine (each level re-rasterises the same "
+                       "geometry, so this is a real refinement)", 4),
+        "tol": _num("SOR convergence tolerance in volts, against 1 V applied", 1e-8),
+        "max_sweeps": _num("SOR sweep cap per level; hitting it returns NOT_CONVERGED "
+                           "instead of a number", 30000),
+        "omega": _num("SOR over-relaxation; omit for 1.97 (measured optimum on mixed "
+                      "Dirichlet/Neumann copper)"),
+    }, "required": ["source", "sink"]},
+    lambda a: _cfield.current_density_field(
+        paths=a.get("paths"), polygons=a.get("polygons"),
+        thickness_mm=(a.get("thickness_mm")
+                      if a.get("thickness_mm") is not None else 0.035),
+        rho_ohm_mm=(a.get("rho_ohm_mm") if a.get("rho_ohm_mm") is not None else
+                    _power._rho(a["temp_c"] if a.get("temp_c") is not None else 20.0)
+                    * 1e3),
+        source=a.get("source"), sink=a.get("sink"),
+        current_a=(a.get("current_a") if a.get("current_a") is not None else 1.0),
+        h_mm=a.get("h_mm"),
+        max_unknowns=int(a.get("max_unknowns")
+                         if a.get("max_unknowns") is not None else 40000),
+        levels=int(a.get("levels") if a.get("levels") is not None else 4),
+        tol=(a.get("tol") if a.get("tol") is not None else 1e-8),
+        max_sweeps=int(a.get("max_sweeps")
+                       if a.get("max_sweeps") is not None else 30000),
+        omega=a.get("omega")),
 )
 
 _tool(

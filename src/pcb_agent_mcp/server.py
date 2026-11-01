@@ -3792,6 +3792,61 @@ def selftest():
               (_oe_v.get("edge_extension_mm") or {}).get("x"),
               _oe_v.get("delta_f_over_f_pct"), _oe_y_v.get("delta_f_over_f")))
 
+    _cf_strip = _call("current_density_field", {
+        "polygons": [[[0.0, 0.0], [20.0, 0.0], [20.0, 2.0], [0.0, 2.0]]],
+        "source": {"x0_mm": -0.01, "y0_mm": -0.01, "x1_mm": 0.0, "y1_mm": 2.01},
+        "sink": {"x0_mm": 20.0, "y0_mm": -0.01, "x1_mm": 20.01, "y1_mm": 2.01},
+        "h_mm": 0.1, "levels": 2}, 1812)
+    _cf_strip_v = _cf_strip.get("value") or {}
+    check("a uniform 20x2 mm strip conducts as rho/t*L/W = 4.9257 mOhm (measured "
+          "4.9011, the 0.5 % is the contact sitting at the cell centre) and the "
+          "field is flat: peak/median 1.0000, crowding 1.0000",
+          _cf_strip.get("status") == "ok"
+          and abs(_cf_strip_v.get("resistance_ohm", -1) / 0.004925714 - 1.0) < 0.01
+          and abs(_cf_strip_v.get("peak_growth", -1) - 1.0) < 1e-3
+          and abs(_cf_strip_v.get("crowding_factor", -1) - 1.0) < 0.01
+          and not _cf_strip.get("warnings"),
+          "R %s, growth %s, crowding %s" % (
+              _cf_strip_v.get("resistance_ohm"), _cf_strip_v.get("peak_growth"),
+              _cf_strip_v.get("crowding_factor")))
+
+    _cf_bend = _call("current_density_field", {
+        "polygons": [[[0.0, 10.5], [10.5, 10.5], [10.5, 0.0], [9.5, 0.0],
+                      [9.5, 9.5], [0.0, 9.5]]],
+        "source": {"x0_mm": -0.01, "y0_mm": 9.49, "x1_mm": 0.0, "y1_mm": 10.51},
+        "sink": {"x0_mm": 9.49, "y0_mm": -0.01, "x1_mm": 10.51, "y1_mm": 0.0},
+        "h_mm": 0.05, "levels": 3}, 1813)
+    _cf_bend_v = _cf_bend.get("value") or {}
+    check("the 270 degree inner corner of a bend is singular: the peak grows by "
+          "2^(1/3) = 1.2599 per halving of h (measured 1.2660), so the tool says "
+          "peak_is_grid_convergent=false and points at the ring decay 0.7963 "
+          "(theory 0.7937) instead",
+          _cf_bend.get("status") == "ok"
+          and abs(_cf_bend_v.get("peak_growth", -1) - 2 ** (1.0 / 3.0)) < 0.05
+          and _cf_bend_v.get("peak_is_grid_convergent") is False
+          and any("NOT GRID CONVERGENT" in w for w in (_cf_bend.get("warnings") or []))
+          and abs((_cf_bend_v.get("rings") or {}).get(
+              "decay_2h_4h_over_0.5h_1h", -1) - 2 ** (-1.0 / 3.0)) < 0.05,
+          "growth %s, decay %s" % (
+              _cf_bend_v.get("peak_growth"),
+              (_cf_bend_v.get("rings") or {}).get("decay_2h_4h_over_0.5h_1h")))
+
+    _cf_split = _call("current_density_field", {
+        "paths": [{"layer_mm": [0, 0], "width_mm": 1.0,
+                   "points": [[0.0, 0.0], [2.0, 0.0]]},
+                  {"layer_mm": [0, 0], "width_mm": 1.0,
+                   "points": [[5.0, 0.0], [7.0, 0.0]]}],
+        "source": {"x0_mm": -0.01, "y0_mm": -0.6, "x1_mm": 0.0, "y1_mm": 0.6},
+        "sink": {"x0_mm": 7.0, "y0_mm": -0.6, "x1_mm": 7.01, "y1_mm": 0.6},
+        "h_mm": 0.1, "levels": 2}, 1814)
+    check("two islands that do not touch are refused instead of being solved as "
+          "whatever the mesh happens to connect: NOT_CONNECTED names the "
+          "component count, so a missing pour is diagnosable",
+          _cf_split.get("status") == "error"
+          and _cf_split.get("reason_code") == "NOT_CONNECTED"
+          and "Components found: 2" in (_cf_split.get("hint") or ""),
+          str(_cf_split.get("reason_code")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

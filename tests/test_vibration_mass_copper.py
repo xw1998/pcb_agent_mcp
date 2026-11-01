@@ -609,8 +609,10 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # parameter, because one width_mm cannot express a tapered geometry).
         from pcb_agent_mcp import tools
         # 168 = 162 + the three 0.0.56..0.0.59 additions + the three 0.0.60
-        # plane additions (roughness_huray, plane_radiation_q, plane_open_end)
-        self.assertEqual(len(tools.TOOLS), 168)
+        # plane additions (roughness_huray, plane_radiation_q, plane_open_end);
+        # 169 = 168 + current_density_field in 0.0.63 (a 2-D field solve is a new
+        # tool, not a flag on the 1-D ones: it needs a geometry, not a width)
+        self.assertEqual(len(tools.TOOLS), 169)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

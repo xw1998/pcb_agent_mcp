@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.62` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
+当前版本 `0.0.63` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -12,7 +12,7 @@ KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对
 
 | 层 | 做什么 | 状态 |
 |---|---|---|
-| **Calc** | 无板子的工程计算（载流/阻抗/差分阻抗/λ/20/爬电） | 已实现 |
+| **Calc** | 无板子的工程计算（载流/电流场/阻抗/差分阻抗/λ/20/爬电） | 已实现 |
 | **Fidelity** | 把整份板文件**转换**成 AI 可读的表达：每个节点都进树，事实从树里读，往返由 KiCad 自己验证 | 已实现（KiCad 侧已被 kicad-cli 判决） |
 | **Adapter** | 在保真树之上给一个 Canonical 便利视图（mm、Y 上、net 用名字） | 已实现（KiCad 侧：13 块真实板与 DRC 对账、412 个 pad 与 `pcbnew` 逐点对账；立创侧：194 个真实归档实测） |
 | **Oracle** | 在解析出的板子上做度量（clearance / free_space / 铺铜连通 / 跨分割 / 环路面积 / 单网 IR drop） | 已实现 |
@@ -62,6 +62,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 | **仿真（外部引擎 + 随包）** | `0.0.7` → `0.0.37` 随包 | 真 ngspice-47 逐节点对账（分压 5e-9 V）；随包副本与系统副本六类 deck 差 0 ~ 1 ulp | 只 Windows x86_64；`engine="auto"` **刻意不看随包**；不做 DLL 进程内 |
 | **热 / PDN / 振动 / 平面 / 电热** | `0.0.5`~`0.0.6`、`0.0.10` | 2-D 板温度 `73.393487 ℃` 对闭式 `73.39345`；Ritz 模态 SSSS 330.385 Hz、CCCC 602.382 Hz 与解析解吻合 | 1-D/2-D 稳态、薄板单模态、平面只有模频与导体/介质损耗的 Q 上界、电热单集中 `Rth` |
 | **熔断（沿长度）**：锥形/分段走线的温度梯度与单发熔断 | `0.0.59` | 均匀段 20.21 A 落在 **0.993269 s**（对解析绝热式 0.993880 差 −0.0614 %，对 Onderdonk 的 1 s 差 −0.6731 %）；分段数 n=1..40 **差 <1e-9**、均匀段剖面极差 0、`conduction_delay_pct` 精确 0（对照臂是真跑一遍 `k=0`）；颈部 0.5 mm 0.039764 s 对平均宽均匀段 0.419000 s ⇒ **10.5×**；端固定（`ends_c`）才有稳态阈值 3.049725 A，代回峰值 1083.0017 ℃ | 侧向散热**无 `h`**（绝热侧面）、段内横向等温、无潜热/集肤/电迁移/电弧；不熔只回 `value: null`；绝热端没有稳态阈值（回 `null` + 理由）；`precision` 里**不给统一误差符号**（两个方向相反） |
+| **电流场（2-D）**：拐角/瓶颈的 `J` 与热点位置 | `0.0.63` | 均匀条带 `R` **0.004901063** 对 `rho/t·L/W` **0.004925714**（−0.50 %，差值全来自触点在格胞中心）；直角弯的 270° 内角 `J ~ r^(-1/3)`，峰值随 h 减半按 **1.266 / 1.262** 涨（理论 `2^(1/3)`=1.2599）⇒ `peak_is_grid_convergent=false`，只有环衰减 **0.7963**（理论 0.7937）才是网格无关读数；45° 斜接 **−30 %**、内角补铜 −36 %、**切掉内角尖端的"倒角" +93 %** | 2-D 薄片、DC、均匀 `rho`/厚度（无 `I²R` 回馈）、接触是硬边等势块（其边缘本身奇异）、截面按轴投影 ⇒ `crowding_factor` 是**下界**；多连通直接报错并给 `Components found: N`；未收敛不给数字（`NOT_CONVERGED` + `failed_level`） |
 | **平面边缘**：开边辐射 Q、开边失谐、Huray 结节 | `0.0.60` | 50×50 mm/0.2 mm/εr 4.3 的 (1,0)：`Q_rad` **179.167** = 手算 `εr·a/(6h)`，`Qc` 115.071 ⇒ `Q_total` **70.0689**、(1,1) **134.375**；`k₀h=0.00606004` 过闸、`h=100 mm` 拒；开边 Δl **0.266086 mm** ⇒ 位移 **−1.05313 %**，1.6 mm 上 **−6.01208 %**，`(1,0)` 只开 y 边位移**精确 0**；Huray 1 GHz/r 0.5 µm/sr 1 给 `K` **1.11953**、knee **69.8767 GHz**（`δ = r/2`） | 辐射按窄缝 + 无限 PEC 法兰、无角点、介质与铜同时截止，对 3-D 求解器差**几十个百分点**；开边是大长宽比渐近式（`a/h ≥ 10`）、不改 Q；Huray 只乘铜的 `Rs`、不与 `Rq` 互推、`r > λ₀/100` 拒绝；三个工具都**不给 pass/fail** |
 | **立创真机写入**：`lceda_pcb_write` 的 create / delete / move / save | `0.0.61` | 在 V4.1.60 上：create 探针 `0 → 1`、save 让工程文件 **409600 → 569344 B** 且 sha 变、delete `1 → 0`、`modify(id,{startX:2})` 后被**两次重启**仍为 `(2,1)-(21,1)`；第二轮走工具层（`lceda_write_snippet` 生成 → `lceda_pcb_write` 执行）复现同一结论 | 只证明「写进去了」，不证明「写对了」：参数写错抓不住、屏幕未核对（`.epro` 归档那条另验于 `0.0.62`，走的是导入不是这条桥）；闸门按桥版本表放行，不传版本的答案与 0.0.60 **逐字相同** |
 | **立创归档写后重开**：`board_apply` 写出的 `.epro` 是否被应用接受 | `0.0.62` | 应用自己的导出件（控制臂）回读 `[[2,1,21,1,0.25],[1,5,21,5,0.3]]`；本模块改 `set_track e1 width 0.5 mm` 后回读 **`[[2,1,21,1,19.685],[1,5,21,5,0.3]]`**（19.685 mil = 0.499999 mm，没点名的线仍 0.3）；负控制 A（记录流换成垃圾）**导入仍返回 ok 但回读 `[]`**，负控制 B（不是 zip）导入返回 `undefined` | 只对 **V4.1.60（bridge `4.1.60.198f38ab`）**、只 ZIP、只 `ImportDocument` + `New Project` 这条门成立；屏幕未核对；`.esch` 与 `.eprj2` 仍拒写 |
@@ -117,11 +118,12 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.62
-python run_server.py --selftest         # 213/213
-python -m unittest discover -s tests    # 2684 例（实测 1575.615 s、skipped=3；0.0.61 是 2672 例 /
-                                        #   1197.812 s / skipped=5，本轮本机另有 lceda-pro 的 5~6 个进程，
-                                        #   所以秒数不能当作性能结论；哪两条不再跳过没有排查）
+python run_server.py --version          # 0.0.63
+python run_server.py --selftest         # 216/216
+python -m unittest discover -s tests    # 2703 例（实测 1190.706 s、skipped=5；0.0.62 是 2684 例 /
+                                        #   1575.615 s / skipped=3，本轮新增 19 例电流场用例；秒数不作
+                                        #   性能结论——本机当时另有其它进程；skipped 从 3 变 5 是哪两条重新
+                                        #   被跳过，没有排查，不当结论）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -199,7 +201,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 ## 工具（168 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -209,6 +211,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `current_capacity` | 线宽 → 载流 | 开窗时只取下界，不计锡层 |
 | `via_current_allowed` | 过孔载流（桶壁侧面积折算） | 标注 `not_standard_defined`，±30% |
 | `fusing_current_taper` | 一段走线（可锥形/分段）**沿长度**的温度梯度与单发熔断：1-D 轴向有限体积 + 后向 Euler + 逐段 Thomas；给 `ends_c` 另解稳态阈值，给 `t_melt_s` 则反解电流 | 侧向散热**没有 `h` 参数**（绝热侧面）、段内横向等温、无潜热/集肤/电迁移/电弧；`conduction_delay_pct` 由**真跑一遍的绝热对照臂**给出，均匀段精确 0；不熔只回 `value: null` + 峰值与余量 |
+| `current_density_field` | 铜区上的 2-D 稳态电流密度场 `div(sigma·grad V)=0`：给 `J` 的峰值与**位置**、`median`/`p99`/`mean`、最窄载流截面与 `crowding_factor`、三环 annulus 读数，以及 `peak_growth` 与 `peak_is_grid_convergent` | 薄层电导 `G = t/rho`（与格距无关 ⇒ 均匀条带精确给 `R = (rho/t)(L/W)`）、cascadic 多重网格 + SOR（`omega` 1.97）、纯 stdlib，3~60 s；**峰值在内角处不收敛**（`J ~ r^(-1/3)`，每减半 ×1.2599）⇒ 必须看 `peak_is_grid_convergent` 或改用环读数；2-D/DC、均匀厚度与 `rho`、无趋肤/邻近、接触边缘奇异是几何、`narrowest_section` 按轴投影（斜线高估 ⇒ 拥挤因子是下界）、不自动读 zone/铺铜 |
 | `trace_impedance` | 几何 → Z0（微带/带状线） | w/h 超出 0.05..3.0 标 `validity_note` |
 | `width_for_impedance` | Z0 → 线宽（二分反解） | 不可达时回 `UNREACHABLE` + 可达区间 |
 | `lambda_over_20` | λ/20 布线间距 | 与频率/εr 绑定，不给记忆值 |
@@ -370,10 +373,10 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.62
-python run_server.py --selftest      # 协议级自检，213/213（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问）
-python -m unittest discover -s tests # 2684 个用例（实测 1575.615 s、skipped=3，kicad-cli / pcbnew 与二维场解用例占大头；
-                                     #   0.0.55 那次同一工作量跑了 2031.147 s，本机另有 5 个 CPU 满载进程）
+python run_server.py --version       # 0.0.63
+python run_server.py --selftest      # 协议级自检，216/216（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问）
+python -m unittest discover -s tests # 2703 个用例（实测 1190.706 s、skipped=5，kicad-cli / pcbnew 与二维场解用例占大头；
+                                     #   0.0.62 同机 2684 例跑了 1575.615 s，秒数随机器负载浮动，不作性能结论）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -1062,7 +1065,7 @@ pcb_agent_mcp/
 ├── data/
 │   ├── iec60664_tables.json      # IEC 60664-1 阶梯（808 步 / 32 键）+ not_covered + sources，verified:true
 │   └── ipc2152_tables.json       # IPC-2152 闭式拟合系数 + 9 个锚点（points 故意为空，原因写在 why_empty）
-├── tests/                        # 2684 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 2703 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
@@ -1075,7 +1078,11 @@ pcb_agent_mcp/
 
 本项目是**计算与推导辅助工具**，不是标准文本、不是仿真器、不是替代评审的判决依据。
 
-- 载流、阻抗、λ/20 均为**闭式近似**，误差已在 `precision` 字段声明（±12%~±30%）。差分阻抗另有二维场解
+- 载流、阻抗、λ/20 均为**闭式近似**，误差已在 `precision` 字段声明（±12%~±30%）。**电流密度例外**：
+  从 0.0.63 起 `current_density_field` 解的是真 2-D 场（`div(sigma·grad V)=0`），给 `J` 的峰值**与位置**；
+  但拐角处它**不收敛**（270° 内角 `J ~ r^(-1/3)`，每减半 ×1.2599），所以峰值只在 `peak_is_grid_convergent`
+  为真时可引用，否则引用环读数或不那么尖的几何——**它测的是「挤在哪」，不是「什么时候熔」**（后者是
+  `fusing_current_taper` 的 1-D 温度轴，两者仍然不联动）。差分阻抗另有二维场解
   （`diff_impedance_field`），但紧间距耦合没有独立参考答案，那种几何下它会自己声明
   `reference_note`。共面线（cpw/gcpw）也有场解（`coplanar_field`），它在七个几何上都比共形映射
   **读低** 1.19%~3.39%，即共形映射是乐观的那一端；共面损耗现在由场解给出，但只有零厚度值

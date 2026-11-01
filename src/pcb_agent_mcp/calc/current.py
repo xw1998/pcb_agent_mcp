@@ -1598,7 +1598,9 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
                   "cooling to air/board is deleted (only axial conduction survives), "
                   "which makes the number low, while each cross-section is one "
                   "temperature, which misses the edge crowding at a narrow neck and "
-                  "makes it high. k_thermal_w_mk is yours (400 is bulk copper; a thin "
+                  "makes it high (current_density_field solves that 2-D crowding on "
+                  "the same neck, so if the neck is where it melts, measure it there "
+                  "and feed the result back as a geometry change). k_thermal_w_mk is yours (400 is bulk copper; a thin "
                   "film, a plated layer or a trace over a void is worse). Latent heat "
                   "is not modelled (melt point, not molten), and time is resolved to "
                   "dt_s - both melt times in the answer are interpolated within a step",
