@@ -4808,17 +4808,119 @@ def selftest():
                   for w in (_fr_wide.get("warnings") or [])),
           "; ".join("%s=%s" % (l, g) for l, g in _fr_got))
 
+    _si_ref_w_m3 = ((_call("magnetics_core_loss",
+                           {"f_hz": 100e3, "b_peak_t": 0.1, "k": 1.3,
+                            "alpha": 1.5, "beta": 2.5, "units": "si"}, 1876)
+                     .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (174 tools now), so an agent that asks what can be computed is "
+          "table (175 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 174
+          len(_tools.TOOLS) == 175
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
           "%d tools, listed %s" % (
               len(_tools.TOOLS),
               "magnetics_fringing_loss" in (_cap.get("available") or [])))
+
+    # ---- 0.0.74: the vendor's own printed loss fit -------------------------
+    _lf_base = {"material": "Kool Mu", "freq_hz": 100e3, "permeability": 60,
+                "shape": "toroid"}
+    _lf_want = [(0.014, 11.0), (0.055, 168.0), (0.092, 466.0)]
+    _lf_got = [(b, (_call("magnetics_material_core_loss",
+                          dict(_lf_base, b_peak_t=b), 1873).get("value") or {})
+               .get("P_v_mw_cm3")) for b, _w in _lf_want]
+    check("the powder-core catalog's own three worked examples come back to the "
+          "digits it prints (11.0 / 168 / 466 mW/cm3 at Bpk 0.014 / 0.055 / 0.092 T, "
+          "100 kHz, Kool Mu 60u toroid) - which also pins WHICH printed exponent is "
+          "the frequency one",
+          all(g is not None and abs(g - w) <= 5e-3 * w
+              for (_b, w), (_b2, g) in zip(_lf_want, _lf_got)),
+          "; ".join("%g T -> %s" % (b, g) for b, g in _lf_got))
+
+    _lf_f = [_call("magnetics_material_core_loss",
+                   dict(_lf_base, b_peak_t=0.05, freq_hz=f), 1874).get("value") or {}
+             for f in (10e3, 100e3)]
+    _lf_dec = (_lf_f[1].get("P_v_mw_cm3") or 0.0) / (_lf_f[0].get("P_v_mw_cm3") or 1.0)
+    # (parenthesised on purpose: `x or {}.get(k)` binds .get to the literal {})
+    _lf_hi = ((_call("magnetics_material_core_loss",
+                     dict(_lf_base, b_peak_t=0.10), 1875).get("value") or {})
+              .get("P_v_mw_cm3") or 0.0)
+    _lf_amp = _lf_hi / ((_call("magnetics_material_core_loss",
+                               dict(_lf_base, b_peak_t=0.05), 1875)
+                         .get("value") or {"P_v_mw_cm3": 1.0})["P_v_mw_cm3"])
+    check("the printed triple is read the right way round: c (1.541) is the "
+          "FREQUENCY exponent and b (1.988) the flux one, so a decade of frequency "
+          "multiplies the loss by 10^1.541 and a doubled flux amplitude by 2^1.988 - "
+          "swapping them would land on 10^1.988 / 2^1.541, a 2.8x error that still "
+          "looks like an answer",
+          abs(_lf_dec / 10.0 ** 1.541 - 1.0) < 1e-6
+          and abs(_lf_amp / 2.0 ** 1.988 - 1.0) < 1e-6
+          and abs(_lf_dec / 10.0 ** 1.988 - 1.0) > 0.5,
+          "decade ratio %.6f (10^1.541 = %.6f), 2x flux ratio %.6f"
+          % (_lf_dec, 10.0 ** 1.541, _lf_amp))
+
+    _lf_si = (_call("magnetics_core_loss",
+                    {"f_hz": 100e3, "b_peak_t": 0.05, "k": 1.0553675249259014,
+                     "alpha": 1.541, "beta": 1.988, "units": "si"}, 1876)
+              .get("value") or {})
+    _lf_cmp = (_call("magnetics_material_core_loss",
+                     dict(_lf_base, b_peak_t=0.05), 1876).get("value") or {})
+    check("the mW/cm3 + tesla + kHz convention is converted by arithmetic, not by "
+          "hand: the same row through the si path (k = a*10^(3-3c) = 1.0553675) "
+          "gives the identical W/m3, and the unchanged si answer for an unrelated "
+          "triple is still exactly 130000 W/m3",
+          abs((_lf_cmp.get("P_v_w_m3") or 0.0)
+              / max(_lf_si.get("P_v_w_m3") or 1e-30, 1e-30) - 1.0) < 1e-9
+          and abs(130000.0 / _si_ref_w_m3 - 1.0) < 1e-12,
+          "%r vs %r" % (_lf_cmp.get("P_v_w_m3"), _lf_si.get("P_v_w_m3")))
+
+    _lf_bad = [
+        ("a ferrite has no vendor fit in the table",
+         {"material": "N87", "freq_hz": 100e3, "b_peak_t": 0.05}, "FIT_NOT_RESOLVED"),
+        ("the question is narrower than the fit (no permeability, no shape)",
+         {"material": "Kool Mu", "freq_hz": 100e3, "b_peak_t": 0.05},
+         "FIT_NOT_RESOLVED"),
+        ("a shape the catalog prints no fit for",
+         dict(_lf_base, b_peak_t=0.05, shape="pot"), "FIT_NOT_RESOLVED"),
+        ("exactly ON the 100 kHz boundary the Ultra fit is split at (neither side "
+         "claims the boundary)",
+         {"material": "Kool Mu", "freq_hz": 100e3, "b_peak_t": 0.05,
+          "permeability": 26, "shape": "toroid", "variant": "Ultra"},
+         "FIT_NOT_RESOLVED"),
+        ("a material name that is not in the table",
+         {"material": "3F4", "freq_hz": 100e3, "b_peak_t": 0.05}, "NOT_FOUND"),
+        ("a negative frequency",
+         dict(_lf_base, b_peak_t=0.05, freq_hz=-1.0), "ARG_RANGE"),
+    ]
+    _lf_bad_got = [(lab, (_call("magnetics_material_core_loss", a, 1877) or {})
+                   .get("reason_code")) for lab, a, _w in _lf_bad]
+    check("the lookup refuses instead of picking: six under-specified or impossible "
+          "requests each come back with their own reason code, and none of them "
+          "silently lands on a neighbouring row",
+          all(got == want for (_l, _a, want), (_l2, got)
+              in zip(_lf_bad, _lf_bad_got)),
+          "; ".join("%s" % g for _l, g in _lf_bad_got))
+
+    _lf_wide = _call("magnetics_material_core_loss",
+                     {"material": "High Flux", "freq_hz": 3e3, "b_peak_t": 0.6,
+                      "permeability": 26, "shape": "toroid"}, 1878).get("value") or {}
+    check("a frequency below the vendor's own chart span and a flux above the top of "
+          "those charts are both flagged (the fit is a curve fit of charts, and "
+          "outside them it is extrapolation)",
+          len(_lf_wide.get("warnings") or []) == 2
+          and any("outside the 5-2000 kHz" in w for w in _lf_wide["warnings"])
+          and any("above the 0.5 T" in w for w in _lf_wide["warnings"]),
+          "%d warnings" % len(_lf_wide.get("warnings") or []))
+
+    check("the vendor fit is reachable from the capability list as well as the tool "
+          "table (175 tools now)",
+          len(_tools.TOOLS) == 175
+          and "magnetics_material_core_loss" in (_cap.get("available") or [])
+          and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
+                           ["description"].lower()),
+          "%d tools" % len(_tools.TOOLS))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

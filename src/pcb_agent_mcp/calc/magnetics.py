@@ -38,6 +38,11 @@ What it does, in four entry points:
                     Dowell's 1-D F_R = R_ac/R_dc for a layer stack (foil or round
                     wire), so the DC resistance an ohmmeter reads can be turned
                     into the resistance the switching frequency sees;
+  material_core_loss
+                    the same Steinmetz/iGSE machinery, but with the coefficients taken
+                    from the VENDOR's own printed fit in data/magnetic_materials.json
+                    (powder cores: P = a*Bpk^b*f^c per permeability and per shape) so
+                    nobody has to hand-convert a printed table into k/alpha/beta;
   select_core       pick a real core from data/magnetic_materials.json for an
                     (L, Ipk) requirement: turns from AL, turns from the flux
                     limit, the peak flux density, the gap it would need, the
@@ -503,6 +508,10 @@ STEINMETZ_UNITS = {
     "si": (1.0, 1.0, "W/m^3 per (Hz^alpha * T^beta)", 1.0),
     "khz_mt": (1e3, 1e-3, "mW/cm^3 per (kHz^alpha * mT^beta)", 1e3),
     "khz_gauss": (1e3, 1e-4, "mW/cm^3 per (kHz^alpha * Gauss^beta)", 1e3),
+    # Magnetics prints its powder-core fit as P = a*B^b*f^c with B in TESLA and f in
+    # kHz - tesla, not milli-tesla, which is why this is its own convention and not
+    # khz_mt. Feeding a printed coefficient in as khz_mt is off by 1000^b ~ 1e6.
+    "khz_t": (1e3, 1.0, "mW/cm^3 per (kHz^alpha * T^beta)", 1e3),
 }
 
 
@@ -1706,9 +1715,298 @@ def magnetic_data(kind="materials", name=None, material=None, shape=None,
         "data/magnetic_materials.json (as published by the vendor, not re-fitted here)",
         "every row carries `source`: the URL it was transcribed from",
         "as published - the vendor's own typical values at the condition stated",
-        {"fits": "none performed: no Steinmetz triple is stored anywhere in the table",
+        {"fits": "no material-level si triple (k/alpha/beta) is stored anywhere in "
+                 "the table; what the three powder vendors print instead - a fit per "
+                 "permeability and per core shape - is in `loss_fit`, and "
+                 "magnetics_material_core_loss evaluates it",
          "thermal": "no Rth for any part, so no temperature rise is offered"},
         {"table_path": data_path or DATA_PATH})
+
+# ---------------------------------------------------------------------------
+# the vendor's own loss fit: PL = a * Bpk^b * f^c   (mW/cm3, T, kHz)
+#
+# A powder-core vendor does not publish a material-level k/alpha/beta: the
+# coefficients depend on the permeability AND on the core shape, so "the loss of
+# Kool Mu" is not one number and every single-number answer to that question is
+# wrong by a factor the caller cannot see. The catalog prints a fit per
+# (permeability, shape) pair, and `loss_fit` in the table keeps every printed row
+# with the page it came from. What this section does is resolve a question that is
+# stated precisely enough for the fit, and REFUSE otherwise - it never picks a
+# permeability the caller did not name, because two rows two pages apart differ by
+# more than the answer's own accuracy.
+#
+# Three independent facts were checked against the catalog's worked examples
+# (printed p. 23-24): a = 44.30, b = 1.988, c = 1.541 at Bpk = 0.014 T / 100 kHz
+# gives 11.04 mW/cm3 where the catalog prints 11.0, and 0.055 T gives 167.6 where
+# it prints 168, and 0.092 T gives 466.03 where it prints 466. That both pins the
+# readings AND pins which exponent is which, which is the easy mistake here: in
+# P = a*B^b*f^c the SECOND exponent (c) is the frequency one, so c is alpha and b
+# is beta. Get them the wrong way round and the number stays plausible.
+# ---------------------------------------------------------------------------
+
+# The four shape families the catalog prints separate fits for, and the spellings
+# a caller may use for them.
+LOSS_FIT_SHAPES = {
+    "toroid": ("toroid", "toroids", "toroidal", "ring", "rings"),
+    "E/U/EER": ("E/U/EER", "e", "u", "eer", "e core", "u core", "eer core",
+                "e cores", "u cores", "eer cores"),
+    "EQ/LP": ("EQ/LP", "eq", "lp", "eq lp", "eq&lp", "eq cores", "lp cores"),
+    "block": ("block", "blocks", "cylinder", "cylinders", "round block",
+              "round blocks"),
+}
+
+# The axes of the catalog's own loss-density charts (printed p. 99-108): the fits
+# were made to those curves, so a frequency or a flux outside them is extrapolation
+# and is flagged. These are READINGS of the printed axes, not a vendor promise.
+LOSS_FIT_CHART_F_KHZ = (5.0, 2000.0)
+LOSS_FIT_CHART_B_T = 0.5
+
+def _loss_shape(name):
+    """Canonical shape family, or None when the name is not one of the four."""
+    key = _norm_key(name)
+    if not key:
+        return None
+    for canon in LOSS_FIT_SHAPES:
+        if key == _norm_key(canon):
+            return canon
+        for spell in LOSS_FIT_SHAPES[canon]:
+            if key == _norm_key(spell):
+                return canon
+    return None
+
+def _variant_key(v):
+    """Collapse the vendor's product-line names onto the table's own labels."""
+    key = _norm_key(v)
+    if key in ("", "base", "none", "plain", "standard"):
+        return ""
+    if key in ("hf", "maxhf"):
+        return "hf"
+    if key.startswith("max"):
+        return "maxhp" if ("hp" in key or "highperf" in key) else "max"
+    if key.startswith("ultra"):
+        return "ultra"
+    return key
+
+def _loss_fit_of(material):
+    """{'fit': the loss_fit block, 'rows': the usable rows} or None."""
+    lf = (material or {}).get("loss_fit")
+    if not isinstance(lf, dict):
+        return None
+    rows = []
+    for r in lf.get("rows") or []:
+        if not isinstance(r, dict):
+            continue
+        if not all(k in r for k in ("shape", "permeability", "a", "b", "c")):
+            continue
+        if not isinstance(r["permeability"], (list, tuple)):
+            continue
+        rows.append(r)
+    return {"fit": lf, "rows": rows}
+
+def _loss_row_label(r):
+    """One line that names a row precisely enough to look it up in the catalog."""
+    bits = [str(r.get("shape"))]
+    bits.append("/".join("%g" % p for p in r["permeability"]) + "u")
+    if r.get("variant"):
+        bits.append(str(r["variant"]))
+    if "frequency_khz_below" in r:
+        bits.append("<%g kHz" % r["frequency_khz_below"])
+    if "frequency_khz_above" in r:
+        bits.append(">%g kHz" % r["frequency_khz_above"])
+    return " ".join(bits)
+
+def _resolve_loss_fit(material, permeability, shape, variant, freq_hz):
+    """(row, fit, None) for one printed row, or (None, fit, why-not).
+
+    Every filter is a question the fit itself asks: which product line, which
+    shape, which permeability, and (for the rows the catalog splits) which side of
+    100 kHz. A question narrower than the fit gets one row; anything else is
+    refused with the list, never resolved by picking.
+    """
+    name = (material or {}).get("name") or "this material"
+    lf = _loss_fit_of(material)
+    if lf is None or not lf["rows"]:
+        return None, lf, ("%s carries no vendor loss fit in this table, so its core "
+                          "loss density cannot be looked up - pass k/alpha/beta to "
+                          "magnetics_core_loss if you have them from elsewhere" % name)
+    fit, rows = lf["fit"], lf["rows"]
+
+    want_variant = _variant_key(variant)
+    pool = [r for r in rows if _variant_key(r.get("variant")) == want_variant]
+    if not pool:
+        have = sorted({_variant_key(r.get("variant")) for r in rows})
+        return None, fit, ("%s has no loss fit for variant %r; the catalog prints "
+                           "one for %s" % (name, variant or "base",
+                                           ", ".join(v or "base" for v in have)))
+
+    if shape is not None:
+        canon = _loss_shape(shape)
+        if canon is None:
+            return None, fit, ("shape must be one of " + ", ".join(LOSS_FIT_SHAPES)
+                               + " (got %r)" % (shape,))
+        narrowed = [r for r in pool if _loss_shape(r.get("shape")) == canon]
+        if not narrowed:
+            have = sorted({str(r.get("shape")) for r in pool})
+            return None, fit, ("%s prints no %s fit for variant %r; it has %s"
+                               % (name, canon, variant or "base", ", ".join(have)))
+        pool = narrowed
+
+    if permeability is not None:
+        try:
+            mu = float(permeability)
+        except (TypeError, ValueError):
+            return None, fit, "permeability must be numeric (the vendor quotes it in u)"
+        narrowed = [r for r in pool if any(abs(float(p) - mu) < 1e-9
+                                           for p in r["permeability"])]
+        if not narrowed:
+            have = sorted({p for r in pool for p in r["permeability"]})
+            return None, fit, ("%s has no fit at %g u for that shape/variant; the "
+                               "printed rows cover %s u"
+                               % (name, mu, ", ".join("%g" % p for p in have)))
+        pool = narrowed
+
+    if freq_hz is not None:
+        f_khz = freq_hz / 1e3
+        keep = []
+        split_note = []
+        for r in pool:
+            lo = r.get("frequency_khz_below")
+            hi = r.get("frequency_khz_above")
+            if lo is not None and f_khz >= float(lo):
+                split_note.append("%s starts above %g kHz" % (_loss_row_label(r), lo))
+                continue
+            if hi is not None and f_khz <= float(hi):
+                split_note.append("%s stops below %g kHz" % (_loss_row_label(r), hi))
+                continue
+            keep.append(r)
+        if not keep:
+            return None, fit, ("no printed row covers %g kHz: %s - the catalog splits "
+                               "this fit at the boundary and neither side claims the "
+                               "boundary itself, so say which one you mean by using a "
+                               "frequency that is inside it"
+                               % (f_khz, "; ".join(split_note) or "no row matched"))
+        pool = keep
+
+    if len(pool) > 1:
+        return None, fit, ("%d printed rows match that and they are not the same fit; "
+                           "name permeability and shape: %s"
+                           % (len(pool), " | ".join(_loss_row_label(r) for r in pool)))
+    return pool[0], fit, None
+
+def material_core_loss(material, freq_hz, b_peak_t, permeability=None, shape=None,
+                       variant=None, waveform="sine", duty=None, segments=None,
+                       ve_mm3=None, data_path=None):
+    """Core loss density from a VENDOR's own printed fit, looked up by name.
+
+    This is magnetics_core_loss with the coefficients taken from the table instead
+    of from you, and the lookup is deliberately literal: the vendor fit is per
+    permeability AND per core shape, so `material`, `permeability`, `shape` and
+    (where the product line has variants) `variant` are all part of the question.
+    Name them; an under-specified question is refused with the list of printed rows
+    rather than answered with one of them.
+
+    The printed equation is
+
+        PL = a * Bpk^b * f^c        PL in mW/cm3, Bpk in TESLA, f in kHz
+
+    and it is evaluated in the `khz_t` unit convention, so nothing is converted by
+    hand. Note which exponent is which: in that form `c` is the FREQUENCY exponent
+    and `b` the flux exponent, so the Steinmetz triple this becomes is
+    (k, alpha, beta) = (a converted to W/m3, c, b). Swapping them keeps the answer
+    plausible and wrong, which is why the catalog's own worked examples are
+    reproduced in the test suite.
+
+    Bpk is HALF the AC swing (the amplitude), the same `b_peak_t` every other
+    Steinmetz call here takes. waveform/duty/segments work exactly as in
+    magnetics_core_loss (iGSE shape correction, alpha = the frequency exponent c).
+    """
+    data, why = _load_magnetic_data(data_path)
+    if data is None:
+        return err(why, "DATA_UNAVAILABLE",
+                   hint="fill data/magnetic_materials.json with verified rows")
+    mat = None
+    key = _norm_key(material)
+    for m in data.get("materials") or []:
+        if _norm_key(m.get("name")) == key:
+            mat = m
+            break
+    if mat is None:
+        have = [m.get("name") for m in (data.get("materials") or [])
+                if isinstance(m.get("loss_fit"), dict)]
+        return err("no material named %r in the table" % (material,), "NOT_FOUND",
+                   hint="materials with a vendor loss fit: "
+                        + (", ".join(have) if have else "none"))
+    try:
+        f = _f("freq_hz", freq_hz)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    if f <= 0:
+        return err("freq_hz must be > 0", "ARG_RANGE")
+
+    row, fit, why = _resolve_loss_fit(mat, permeability, shape, variant, f)
+    if row is None:
+        if fit is None or not fit.get("rows"):
+            return err(why, "FIT_NOT_RESOLVED",
+                       hint="magnetics_core_loss takes k/alpha/beta from you for any "
+                            "material; only a vendor's own printed fit can be looked "
+                            "up here, and inventing one is not an option")
+        return err(why, "FIT_NOT_RESOLVED",
+                   hint="magnetic_data(kind='materials') lists every printed row; the "
+                        "catalog page is in loss_fit.sources",
+                   extra={"material": mat.get("name"),
+                          "rows_available": [_loss_row_label(r)
+                                             for r in (fit or {}).get("rows") or []]})
+
+    # a = k, c = alpha (frequency), b = beta (flux) - see the note above
+    sub = core_loss_steinmetz(f, b_peak_t, row["a"], row["c"], row["b"],
+                              units="khz_t", ve_mm3=ve_mm3, waveform=waveform,
+                              duty=duty, segments=segments)
+    if sub.get("status") != "ok":
+        return sub
+    val = sub["value"]
+    src = (fit.get("sources") or [None])[0]
+    page = row.get("printed_page")
+    if page is not None:
+        src = "%s#page=%d" % (str(src).split("#")[0], page) if src else None
+    val.update({
+        "fit_material": mat.get("name"),
+        "fit_vendor": mat.get("vendor"),
+        "fit_row": _loss_row_label(row),
+        "fit_variant": row.get("variant"),
+        "fit_shape": row.get("shape"),
+        "fit_permeability_u": [float(p) for p in row["permeability"]],
+        "fit_coefficients": {"a": row["a"], "b": row["b"], "c": row["c"],
+                             "form": fit.get("form"),
+                             "b_is": fit.get("b_is")},
+        "fit_units": fit.get("units"),
+        "fit_printed_page": page,
+        "fit_source": src,
+        "fit_is_a_curve_fit_not_a_limit": fit.get("not_a_spec"),
+    })
+    warns = []
+    f_lo, f_hi = LOSS_FIT_CHART_F_KHZ
+    if f / 1e3 < f_lo or f / 1e3 > f_hi:
+        warns.append("%g kHz is outside the %g-%g kHz span of the vendor's loss "
+                     "charts that this fit was made from, so it is extrapolation"
+                     % (f / 1e3, f_lo, f_hi))
+    if val.get("b_peak_t") is not None and val["b_peak_t"] > LOSS_FIT_CHART_B_T:
+        warns.append("%g T is above the %g T top of the vendor's loss charts; a "
+                     "powder core is also close to its own saturation there, and this "
+                     "fit has no saturation term" % (val["b_peak_t"],
+                                                      LOSS_FIT_CHART_B_T))
+    if warns:
+        val["warnings"] = warns
+    val["not_modelled"].append(
+        "the fit's own validity: the vendor curve-fitted charts over %g-%g kHz and up "
+        "to %g T, and no fit is a guarantee even inside that window"
+        % (f_lo, f_hi, LOSS_FIT_CHART_B_T))
+    sub["assumptions"] = dict(sub.get("assumptions") or {}, **{
+        "coefficients": "the vendor's printed fit for %s (%s), page %s - not fitted "
+                        "or adjusted here" % (_loss_row_label(row),
+                                              mat.get("name"), page),
+        "b_peak": "half the AC swing, which is the vendor's own Bpk definition",
+    })
+    return sub
 
 
 def _core_loss_for(core, material, freq_hz, b_ac_t, exponents,

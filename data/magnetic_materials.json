@@ -4,7 +4,7 @@
   "retrieved": "2026-10-31",
   "what_this_is": "Soft-magnetic material constants and real core geometries, transcribed from the vendor pages named in every row's `source`. This is NOT a design rule: every number here is one vendor's published typical value at one condition, and the condition is stored with it.",
   "what_this_is_not": [
-    "Not a Steinmetz fit. No vendor coefficients (Cm/x/y) were reachable in a form that could be quoted here, so every `steinmetz` field is null on purpose. magnetics_core_loss already takes the caller's k/alpha/beta, and select_core will only extrapolate a core loss away from a measured reference point when YOU supply the two exponents.",
+    "Not a Steinmetz fit FOR YOU. Every `steinmetz` field is null on purpose, because that slot holds a material-level si triple (k/alpha/beta) and no vendor publishes one in that shape. What the three powder vendors DO publish - a curve fit PL = a*Bpk^b*f^c per permeability and per core shape, in mW/cm3 / T / kHz - is transcribed verbatim into `loss_fit` with its catalog page and its unit triple, and magnetics_material_core_loss evaluates it. The ferrite vendors' own fits were still unreachable in a quotable form on 2026-11-01, so those materials refuse rather than guess.",
     "Not a thermal model. No Rth (thermal resistance) was found for any part, so select_core reports watts and refuses a temperature rise.",
     "Not a B-H curve. `bsat` is one point (or two, if the vendor published two temperatures); the shape between the points, the DC-bias roll-off of AL, and the temperature coefficient of AL are all missing.",
     "Not every grade of every shape. The rows are the ones whose vendor page actually stated the numbers; absence is recorded as absence, not filled in."
@@ -198,7 +198,64 @@
       "resistivity_ohm_m": null,
       "pv_ref": null,
       "steinmetz": null,
-      "steinmetz_note": "not captured",
+      "steinmetz_note": "null on purpose: this slot holds a material-level si triple (k/alpha/beta) and the powder vendor does not publish one that way. Its actual curve fit - a, b, c per permeability and per core shape - is in `loss_fit` with its catalog page, and magnetics_material_core_loss evaluates it",
+      "loss_fit": {
+        "form": "PL = a * Bpk^b * f^c",
+        "units": {"PL": "mW/cm3", "Bpk": "T", "f": "kHz"},
+        "units_convention": "khz_t",
+        "b_is": "peak flux density = HALF the ac swing; the catalog defines Bpk = (B_ac_max - B_ac_min)/2",
+        "varies_with": "permeability AND core shape, not material alone - the catalog prints a separate fit for toroids, E/U/EER cores, EQ/LP cores and blocks",
+        "not_a_spec": "a curve fit of the vendor's measured loss curves, not a guaranteed limit; the vendor's own charts are the authority",
+        "frequency_khz_below": "the row applies only below this frequency - the catalog splits the Ultra fit at 100 kHz",
+        "frequency_khz_above": "the row applies only above this frequency",
+        "rows": [
+          {"variant": null, "shape": "toroid", "permeability": [14], "a": 64.43, "b": 1.988, "c": 1.541, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [19], "a": 137.17, "b": 1.988, "c": 1.348, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [26, 40], "a": 52.36, "b": 1.988, "c": 1.541, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [60, 75, 90, 125], "a": 44.3, "b": 1.988, "c": 1.541, "printed_page": 109},
+          {"variant": "MAX", "shape": "toroid", "permeability": [14, 19], "a": 144.49, "b": 2.072, "c": 1.379, "printed_page": 109},
+          {"variant": "MAX", "shape": "toroid", "permeability": [26, 40, 60, 75, 90], "a": 113.53, "b": 2.072, "c": 1.379, "printed_page": 109},
+          {"variant": "HF", "shape": "toroid", "permeability": [26], "a": 26.41, "b": 1.602, "c": 1.394, "printed_page": 109},
+          {"variant": "HF", "shape": "toroid", "permeability": [40, 60], "a": 49.54, "b": 1.602, "c": 1.209, "printed_page": 109},
+          {"variant": "Ultra", "shape": "toroid", "permeability": [26, 40], "a": 79.79, "b": 1.602, "c": 1.0, "printed_page": 109, "frequency_khz_below": 100},
+          {"variant": "Ultra", "shape": "toroid", "permeability": [26, 40], "a": 11.83, "b": 1.602, "c": 1.414, "printed_page": 109, "frequency_khz_above": 100},
+          {"variant": "Ultra", "shape": "toroid", "permeability": [60], "a": 67.08, "b": 1.602, "c": 1.0, "printed_page": 109, "frequency_khz_below": 100},
+          {"variant": "Ultra", "shape": "toroid", "permeability": [60], "a": 9.5, "b": 1.602, "c": 1.425, "printed_page": 109, "frequency_khz_above": 100},
+          {"variant": null, "shape": "E/U/EER", "permeability": [14], "a": 29.3, "b": 1.988, "c": 1.541, "printed_page": 110},
+          {"variant": null, "shape": "E/U/EER", "permeability": [26, 40], "a": 32.22, "b": 1.988, "c": 1.541, "printed_page": 110},
+          {"variant": null, "shape": "E/U/EER", "permeability": [60, 90], "a": 40.27, "b": 1.988, "c": 1.541, "printed_page": 110},
+          {"variant": "MAX", "shape": "E/U/EER", "permeability": [26, 40], "a": 32.22, "b": 1.988, "c": 1.541, "printed_page": 110},
+          {"variant": "MAX", "shape": "E/U/EER", "permeability": [60], "a": 36.25, "b": 1.988, "c": 1.541, "printed_page": 110},
+          {"variant": "MAX-HP", "shape": "E/U/EER", "permeability": [26, 40], "a": 32.22, "b": 1.988, "c": 1.541, "printed_page": 110},
+          {"variant": "MAX-HP", "shape": "E/U/EER", "permeability": [60], "a": 36.24, "b": 1.988, "c": 1.541, "printed_page": 110},
+          {"variant": "HF", "shape": "E/U/EER", "permeability": [26], "a": 18.01, "b": 1.602, "c": 1.401, "printed_page": 110},
+          {"variant": "HF", "shape": "E/U/EER", "permeability": [40], "a": 15.69, "b": 1.602, "c": 1.401, "printed_page": 110},
+          {"variant": "HF", "shape": "E/U/EER", "permeability": [60], "a": 18.01, "b": 1.602, "c": 1.401, "printed_page": 110},
+          {"variant": "Ultra", "shape": "E/U/EER", "permeability": [26], "a": 52.58, "b": 1.988, "c": 1.334, "printed_page": 110},
+          {"variant": "Ultra", "shape": "E/U/EER", "permeability": [40], "a": 40.84, "b": 1.988, "c": 1.399, "printed_page": 110},
+          {"variant": null, "shape": "EQ/LP", "permeability": [26, 40], "a": 35.75, "b": 1.912, "c": 1.49, "printed_page": 110},
+          {"variant": null, "shape": "EQ/LP", "permeability": [60, 75], "a": 298.96, "b": 1.893, "c": 1.058, "printed_page": 110},
+          {"variant": "MAX", "shape": "EQ/LP", "permeability": [26], "a": 5.73, "b": 2.059, "c": 2.0, "printed_page": 110},
+          {"variant": "MAX", "shape": "EQ/LP", "permeability": [40, 60], "a": 10.83, "b": 2.081, "c": 1.893, "printed_page": 110},
+          {"variant": "MAX", "shape": "EQ/LP", "permeability": [75], "a": 304.35, "b": 2.081, "c": 1.188, "printed_page": 110},
+          {"variant": null, "shape": "block", "permeability": [14], "a": 286.68, "b": 1.988, "c": 1.065, "printed_page": 111},
+          {"variant": null, "shape": "block", "permeability": [26, 33, 40, 60, 90], "a": 72.13, "b": 1.988, "c": 1.44, "printed_page": 111},
+          {"variant": "MAX", "shape": "block", "permeability": [60], "a": 180.89, "b": 1.988, "c": 1.215, "printed_page": 111},
+          {"variant": "MAX-HP", "shape": "block", "permeability": [26], "a": 200.0, "b": 1.988, "c": 1.234, "printed_page": 111},
+          {"variant": "MAX-HP", "shape": "block", "permeability": [40], "a": 180.59, "b": 1.988, "c": 1.2, "printed_page": 111},
+          {"variant": "MAX-HP", "shape": "block", "permeability": [60], "a": 176.51, "b": 1.988, "c": 1.202, "printed_page": 111},
+          {"variant": "HF", "shape": "block", "permeability": [26], "a": 81.9, "b": 1.602, "c": 1.007, "printed_page": 111},
+          {"variant": "HF", "shape": "block", "permeability": [40], "a": 29.17, "b": 1.602, "c": 1.239, "printed_page": 111},
+          {"variant": "HF", "shape": "block", "permeability": [60], "a": 16.6, "b": 1.602, "c": 1.373, "printed_page": 111},
+          {"variant": "Ultra", "shape": "block", "permeability": [26], "a": 87.5, "b": 1.602, "c": 1.0, "printed_page": 111},
+          {"variant": "Ultra", "shape": "block", "permeability": [40], "a": 77.97, "b": 1.602, "c": 1.064, "printed_page": 111}
+        ],
+        "sources": [
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=109",
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=110",
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=111"
+        ]
+      },
       "source": ["https://www.mag-inc.com/products/powder-cores/kool-mu-cores"]
     },
     {
@@ -214,7 +271,35 @@
       "resistivity_ohm_m": null,
       "pv_ref": null,
       "steinmetz": null,
-      "steinmetz_note": "not captured",
+      "steinmetz_note": "null on purpose: this slot holds a material-level si triple (k/alpha/beta) and the powder vendor does not publish one that way. Its actual curve fit - a, b, c per permeability and per core shape - is in `loss_fit` with its catalog page, and magnetics_material_core_loss evaluates it",
+      "mu_permeabilities": [14, 19, 26, 40, 60, 75, 90, 125, 147, 160, 173, 200, 300, 550],
+      "mu_permeabilities_note": "the permeabilities this material's loss fit covers in the catalog table - a subset of what is sold, not a full range",
+      "loss_fit": {
+        "form": "PL = a * Bpk^b * f^c",
+        "units": {"PL": "mW/cm3", "Bpk": "T", "f": "kHz"},
+        "units_convention": "khz_t",
+        "b_is": "peak flux density = HALF the ac swing; the catalog defines Bpk = (B_ac_max - B_ac_min)/2",
+        "varies_with": "permeability AND core shape, not material alone - the catalog prints a separate fit for toroids, E/U/EER cores, EQ/LP cores and blocks",
+        "not_a_spec": "a curve fit of the vendor's measured loss curves, not a guaranteed limit; the vendor's own charts are the authority",
+        "frequency_khz_below": "the row applies only below this frequency - the catalog splits the Ultra fit at 100 kHz",
+        "frequency_khz_above": "the row applies only above this frequency",
+        "rows": [
+          {"variant": null, "shape": "toroid", "permeability": [14, 19], "a": 266.22, "b": 2.103, "c": 1.316, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [26, 40], "a": 146.94, "b": 2.103, "c": 1.357, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [60], "a": 72.15, "b": 2.103, "c": 1.449, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [75], "a": 99.48, "b": 2.103, "c": 1.402, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [90], "a": 99.64, "b": 2.103, "c": 1.441, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [125], "a": 62.22, "b": 2.103, "c": 1.561, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [147, 160, 173], "a": 56.51, "b": 2.103, "c": 1.598, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [200, 300], "a": 53.71, "b": 2.103, "c": 1.624, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [550], "a": 74.76, "b": 2.103, "c": 1.645, "printed_page": 109},
+          {"variant": null, "shape": "block", "permeability": [26], "a": 289.7, "b": 2.103, "c": 1.122, "printed_page": 111}
+        ],
+        "sources": [
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=109",
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=111"
+        ]
+      },
       "source": ["https://www.mag-inc.com/products/powder-cores/mpp-cores"]
     },
     {
@@ -229,7 +314,37 @@
       "resistivity_ohm_m": null,
       "pv_ref": null,
       "steinmetz": null,
-      "steinmetz_note": "not captured",
+      "steinmetz_note": "null on purpose: this slot holds a material-level si triple (k/alpha/beta) and the powder vendor does not publish one that way. Its actual curve fit - a, b, c per permeability and per core shape - is in `loss_fit` with its catalog page, and magnetics_material_core_loss evaluates it",
+      "mu_permeabilities": [14, 26, 40, 60, 75, 90, 125, 147, 160],
+      "mu_permeabilities_note": "the permeabilities this material's loss fit covers in the catalog table - a subset of what is sold, not a full range",
+      "loss_fit": {
+        "form": "PL = a * Bpk^b * f^c",
+        "units": {"PL": "mW/cm3", "Bpk": "T", "f": "kHz"},
+        "units_convention": "khz_t",
+        "b_is": "peak flux density = HALF the ac swing; the catalog defines Bpk = (B_ac_max - B_ac_min)/2",
+        "varies_with": "permeability AND core shape, not material alone - the catalog prints a separate fit for toroids, E/U/EER cores, EQ/LP cores and blocks",
+        "not_a_spec": "a curve fit of the vendor's measured loss curves, not a guaranteed limit; the vendor's own charts are the authority",
+        "frequency_khz_below": "the row applies only below this frequency - the catalog splits the Ultra fit at 100 kHz",
+        "frequency_khz_above": "the row applies only above this frequency",
+        "rows": [
+          {"variant": null, "shape": "toroid", "permeability": [14], "a": 968.56, "b": 2.218, "c": 1.189, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [26], "a": 492.31, "b": 2.218, "c": 1.24, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [40], "a": 185.02, "b": 2.218, "c": 1.398, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [60], "a": 246.54, "b": 2.218, "c": 1.311, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [75], "a": 440.08, "b": 2.218, "c": 1.21, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [90], "a": 440.08, "b": 2.218, "c": 1.21, "printed_page": 109},
+          {"variant": null, "shape": "toroid", "permeability": [125, 147, 160], "a": 184.44, "b": 2.218, "c": 1.428, "printed_page": 109},
+          {"variant": null, "shape": "E/U/EER", "permeability": [60], "a": 73.92, "b": 2.218, "c": 1.652, "printed_page": 110},
+          {"variant": null, "shape": "EQ/LP", "permeability": [26, 40, 60, 75], "a": 307.94, "b": 2.204, "c": 1.247, "printed_page": 110},
+          {"variant": null, "shape": "block", "permeability": [26], "a": 725.25, "b": 2.218, "c": 1.0, "printed_page": 111},
+          {"variant": null, "shape": "block", "permeability": [60], "a": 579.78, "b": 2.218, "c": 1.16, "printed_page": 111}
+        ],
+        "sources": [
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=109",
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=110",
+          "https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Powder%20Core%20Literature/Magnetics-Powder-Core-Catalog.pdf#page=111"
+        ]
+      },
       "source": ["https://www.mag-inc.com/products/powder-cores/high-flux-cores"]
     }
   ],

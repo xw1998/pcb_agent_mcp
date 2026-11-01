@@ -628,7 +628,10 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # of an air gap is a different field from the 1-D stack field: Dowell
         # cannot see it at all, and its driver is the MMF in the gap, not the
         # winding's own ampere-turns)
-        self.assertEqual(len(tools.TOOLS), 174)
+        # 175 = 174 + magnetics_material_core_loss in 0.0.74 (a vendor's printed
+        # per-permeability fit is a different object from a material-level
+        # Steinmetz triple, so it is its own tool rather than a new argument)
+        self.assertEqual(len(tools.TOOLS), 175)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

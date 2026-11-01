@@ -381,7 +381,8 @@ class TestTools(unittest.TestCase):
         # 0.0.71 adds arguments to two existing tools, not tools: the ratchet is a
         # count, and silently growing the surface is how a tool list rots.
         # 0.0.72 does add one (magnetics_fringing_loss): 173 -> 174
-        self.assertEqual(len(tools.TOOLS), 174)
+        # 0.0.74 adds one more (magnetics_material_core_loss): 174 -> 175
+        self.assertEqual(len(tools.TOOLS), 175)
 
 
 if __name__ == "__main__":

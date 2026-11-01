@@ -3689,6 +3689,7 @@ def _capabilities(_args):
             "link_fresnel",
             "board_antenna_keepout",
             "magnetics_inductor", "magnetics_dcm", "magnetics_core_loss",
+            "magnetics_material_core_loss",
             "magnetics_winding_ac", "magnetics_fringing_loss",
             "stackup_material", "stackup_design",
             "rf_chain", "design_rules", "layout_review", "schematic_review",
@@ -3772,10 +3773,16 @@ def _capabilities(_args):
         "not_implemented_yet": [
             "Power magnetics, and the parts question: magnetics_select_core does pick "
             "a real part out of data/magnetic_materials.json (11 materials, 16 cores, "
-            "7 of them with one vendor loss point at 200 mT / 100 kHz / 100 C), but NO "
-            "material in that table carries a Steinmetz triple, so core loss away from "
-            "that measured point needs exponents from you (Magnetics_NN vendor "
-            "exponents are also not in the table). No saturation CURVE of a real "
+            "7 of them with one vendor loss point at 200 mT / 100 kHz / 100 C). The "
+            "three powder materials DO carry the vendor's own printed loss fit since "
+            "0.0.74 (loss_fit: a, b, c per permeability and per core shape, in "
+            "mW/cm3 / T / kHz, with the catalog page) and "
+            "magnetics_material_core_loss evaluates it - but no material-level "
+            "Steinmetz triple (k/alpha/beta) is stored, and the nine ferrite materials "
+            "have no vendor fit here at all: their loss away from a measured point "
+            "still needs exponents from you. No powder CORE GEOMETRY is in the table "
+            "(the 16 cores are all ferrite), so select_core cannot yet pick a toroid. "
+            "No saturation CURVE of a real "
             "material: only a single Bsat per published temperature, never "
             "interpolated between them. Gapped-core fringing loss IS computed since "
             "0.0.72 (magnetics_fringing_loss: a 2-D magnetic-charge model of the gap, "
@@ -7532,7 +7539,9 @@ _tool(
     "magnetics_core_loss",
     "Core loss for ONE period of a flux trajectory, with the coefficients YOU supply "
     "and the unit convention NAMED, because the published fits differ by ~10^12 in k "
-    "purely through units (si = Hz/T/W-per-m3, khz_mt = kHz/mT/mW-per-cm3, khz_gauss). "
+    "purely through units (si = Hz/T/W-per-m3, khz_mt = kHz/mT/mW-per-cm3, khz_gauss, "
+    "khz_t = kHz/T/mW-per-cm3, which is the convention the powder-core catalog "
+    "prints its coefficients in). "
     "waveform='sine' (default) is the plain Steinmetz P_v = k*f^alpha*B_peak^beta; "
     "waveform='triangle' (with duty, the rising fraction of the period) or "
     "waveform='piecewise' (segments=[[dB_t, dt_fraction], ...] summing to 1 in time "
@@ -7572,6 +7581,61 @@ _tool(
         units=(a.get("units") or "si"), ve_mm3=a.get("ve_mm3"),
         waveform=(a.get("waveform") or "sine"), duty=a.get("duty"),
         segments=a.get("segments")),
+)
+
+_tool(
+    "magnetics_material_core_loss",
+    "Core loss density from the VENDOR's own printed fit, looked up by material name - "
+    "the same Steinmetz/iGSE machinery as magnetics_core_loss, but with a, b and c "
+    "taken from the vendor's catalog instead of from you, and evaluated in the unit "
+    "convention the catalog prints them in (khz_t: mW/cm3, tesla, kilohertz). The "
+    "print is P = a*Bpk^b*f^c per PERMEABILITY and per CORE SHAPE, not per material, "
+    "so name the permeability and the shape family; an under-specified question is "
+    "refused with the list of printed rows rather than answered with one of them. "
+    "The catalog's three worked examples are reproduced to the printed 3 digits "
+    "(Kool Mu 60u toroid at 0.014 / 0.055 / 0.092 tesla and 100 kHz gives "
+    "11.04 / 167.6 / 466.0 mW/cm3 where it prints 11.0 / 168 / 466). Bpk is HALF the "
+    "AC swing. waveform/duty/segments correct the shape exactly as in "
+    "magnetics_core_loss. The fit is a curve fit of the vendor's charts, not a "
+    "guarantee: outside 5 kHz-2 MHz or above 0.5 T the answer carries a warning, and "
+    "the ferrite materials have no vendor fit here at all (they refuse, naming "
+    "magnetics_core_loss as the way to pass your own triple).",
+    {"type": "object", "properties": {
+        "material": _str("material name as it appears in the table (11 materials: "
+                         "Kool Mu, MPP, High Flux carry a vendor loss fit)"),
+        "freq_hz": _num("frequency in Hz"),
+        "b_peak_t": _num("AC flux amplitude in tesla - HALF the peak-to-peak swing, "
+                         "which is the vendor's own Bpk"),
+        "permeability": _num("the material's permeability in u (14, 26, 60, 125 ...). "
+                             "Part of the question: the vendor prints a different fit "
+                             "for each"),
+        "shape": _str("the core shape family the fit is printed for",
+                      sorted(_magnetics.LOSS_FIT_SHAPES)),
+        "variant": _str("the product line, where the vendor sells several under one "
+                        "material name: base (default), MAX, MAX-HP, HF or Ultra"),
+        "waveform": _str("the flux shape over one period: sine (what the fit is), "
+                         "triangle (needs duty) or piecewise (needs segments)",
+                         ["sine", "triangle", "piecewise"], "sine"),
+        "duty": _num("triangle only: fraction of the period spent rising (0.5 = "
+                     "symmetric)"),
+        "segments": {"type": "array",
+                     "description": "piecewise only: the trajectory as "
+                                    "[[dB_t, dt_fraction], ...] summing to 1 in time "
+                                    "and 0 in flux (a closed period)",
+                     "items": {"type": "array", "items": {"type": "number"}}},
+        "ve_mm3": _num("optional: core volume, to turn P_v into watts"),
+        "data_path": _str("override the table path (testing)"),
+    }, "required": ["material", "freq_hz", "b_peak_t"]},
+    lambda a: _magnetics.material_core_loss(
+        a.get("material"), a.get("freq_hz"), a.get("b_peak_t"),
+        permeability=a.get("permeability"),
+        shape=a.get("shape"),
+        variant=a.get("variant"),
+        waveform=(a.get("waveform") or "sine"),
+        duty=a.get("duty"),
+        segments=a.get("segments"),
+        ve_mm3=a.get("ve_mm3"),
+        data_path=a.get("data_path")),
 )
 
 _tool(
@@ -7763,7 +7827,10 @@ _tool(
     "length / one measured loss point with its condition). Nothing is computed here - "
     "this is the transcription with the source URL of every row, so a number can be "
     "checked instead of trusted. Absent values come back as null with a note saying "
-    "why, and no Steinmetz triple is stored anywhere in the table.",
+    "why. No material-level Steinmetz triple (k/alpha/beta) is stored: what the three "
+    "powder vendors print instead - a fit per permeability and per core shape - is in "
+    "`loss_fit` on those materials, with its catalog page, and "
+    "magnetics_material_core_loss evaluates it.",
     {"type": "object", "properties": {
         "kind": _str("which table", ["materials", "cores", "all"], "materials"),
         "name": _str("exact material name or part number"),
