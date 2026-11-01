@@ -4075,6 +4075,26 @@ def _capabilities(_args):
             "makes J ~ r^(-1/3) and the peak is then not a grid-independent number. "
             "It is steady state, so it says where the crowding is, not when the neck "
             "melts - those two answers still do not meet",
+            "The copper pour in board_ir_drop is a SHEET, not a solved fill "
+            "(model_zones=true, 0.0.64): every same-net zone is gridded at a pitch "
+            "planned from the area its fill covers (clamped to 0.2-2.0 mm), each cell "
+            "is one square of rho(T)/t and four-connected, and pads / track ends inside "
+            "the fill are tied to it with a 1 uOhm link. What that leaves out, by name: "
+            "THERMAL-RELIEF SPOKES ARE NOT MODELLED - a pad sitting in the fill is "
+            "treated as solid copper, so where a spoke is the real connection this "
+            "drop is a LOWER bound (the one place this answer can be optimistic); a "
+            "node within zone_link_mm of the fill but outside it is bridged with ONE "
+            "sheet square, an order-of-magnitude stand-in for a spoke or an unfilled "
+            "sliver and the crudest number in the answer; zone priority, minimum width "
+            "and the clearance ring to other nets are taken from the fill the file "
+            "already carries rather than solved for; pour islands the source cannot "
+            "reach are dropped (they carry no current) and the count is reported; a "
+            "pad covering more than 2000 cells is tied at its anchor only, which "
+            "over-states its spreading resistance; and the whole model is DC, so skin "
+            "effect, the plane's own resonance (pdn_plane_impedance) and any "
+            "frequency-dependent copper are not in it. The switch defaults OFF and the "
+            "answer without it is byte-identical to 0.0.63 - a pour-only net is still "
+            "NOT_APPLICABLE/singular unless the caller asks for the sheet",
             "The plane-caps network is COMPUTED now (pdn_plane_with_caps: the cavity "
             "as an (N+1)-port Z matrix, each cap an R-L-C branch, port-reduced to "
             "Z_in), so the anti-resonance where a bank turns inductive and the plane "
@@ -5861,6 +5881,22 @@ _tool(
         "plating_um": _num("via barrel wall thickness - required if the net has vias"),
         "quantize_mm": _num("nodes closer than this are merged", 0.01),
         "temp_c": _num("copper temperature", 20),
+        "model_zones": _bool("also model every copper pour on this net as a 2-D "
+                             "resistive sheet (rho/t per square) and solve the whole "
+                             "network by conjugate gradients. Off by default: turning "
+                             "it on changes the answer, and on a plane-heavy board it "
+                             "is often the difference between a number and "
+                             "NOT_APPLICABLE/singular, because the two halves of the "
+                             "pour-only net are joined by nothing else", default=False),
+        "zone_grid_mm": _num("pitch of the pour grid; omit to plan it from the area "
+                             "the fill covers (clamped to 0.2..2.0 mm). The sheet "
+                             "resistance does not depend on the pitch - only how "
+                             "finely the current spreads near a contact does"),
+        "max_zone_nodes": _num("cap on pour grid cells (a wall-clock ceiling, not an "
+                               "accuracy one)", 8000),
+        "zone_link_mm": _num("a node this close to the fill but not inside it is "
+                             "bridged to the nearest cell with ONE sheet square "
+                             "(a thermal-relief spoke, modelled to order)", 0.5),
     }, **_COMMON),
      "required": ["path", "net", "source", "sinks"]},
     _board_tool(lambda b, a: _oracle.board_ir_drop(
@@ -5868,7 +5904,13 @@ _tool(
         current_a=a.get("current_a"), copper_um=a.get("copper_um"),
         plating_um=a.get("plating_um"),
         quantize_mm=(a["quantize_mm"] if a.get("quantize_mm") is not None else 0.01),
-        temp_c=(a["temp_c"] if a.get("temp_c") is not None else 20.0)), derived=True),
+        temp_c=(a["temp_c"] if a.get("temp_c") is not None else 20.0),
+        model_zones=bool(a.get("model_zones")),
+        zone_grid_mm=a.get("zone_grid_mm"),
+        max_zone_nodes=(int(a["max_zone_nodes"])
+                        if a.get("max_zone_nodes") is not None else 8000),
+        zone_link_mm=(a["zone_link_mm"] if a.get("zone_link_mm") is not None
+                      else 0.5)), derived=True),
 )
 
 _tool(

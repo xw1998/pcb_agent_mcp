@@ -1409,9 +1409,19 @@ def _pad_xy(fp, pad):
         return float(fp.get("x") or 0.0), float(fp.get("y") or 0.0)
 
 
+# The conductance a pad/track-to-pour link uses. Mirrors calc.zonefield.LINK_OHM,
+# and `tests/test_ir_drop_zones.py` asserts the two stay equal - a silent drift
+# here would change the answer without changing any schema.
+_ZF_LINK_OHM = 1e-6
+# The gridding pitch is clamped to this window (see calc/zonefield.py). Kept here
+# too so the error message a caller reads states the same numbers the code uses.
+ZF_MIN_GRID_MM = 0.2
+ZF_MAX_GRID_MM = 2.0
+
 def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                   plating_um=None, quantize_mm=0.01, temp_c=20.0,
-                  max_nodes=1200):
+                  max_nodes=1200, model_zones=False, zone_grid_mm=None,
+                  max_zone_nodes=8000, zone_link_mm=0.5):
     """DC voltage drop across ONE net, out of the copper the board actually carries.
 
     This is "will 2 A make it from the regulator to the MCU without browning it
@@ -1429,9 +1439,14 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                their own share
 
     Refuses instead of guessing when a used layer has no copper thickness, when
-    the net has vias and `plating_um` is missing, or when nothing connects. A
-    copper pour on the same net is reported as a warning: it is in parallel, so
-    the drop is then an upper bound.
+    the net has vias and `plating_um` is missing, or when nothing connects.
+
+    `model_zones=True` also grids the copper pours on this net as 2-D resistive
+    sheets and solves the whole thing with conjugate gradients (see
+    `calc/zonefield.py`). That is what turns "the pour is in parallel, so this is
+    an upper bound" into a number, and on a plane-heavy board it is the
+    difference between a number and `NOT_APPLICABLE / singular`: the two halves of
+    such a net are often joined by NOTHING but the pour.
     """
     from .calc import power as PW
 
@@ -1443,6 +1458,32 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
         return err("quantize_mm must be a number", "ARG_INVALID")
     if q <= 0:
         return err("quantize_mm must be > 0", "ARG_RANGE")
+
+    # The pour knobs are validated here rather than inside the gridding code,
+    # because a pitch of 0 would otherwise be silently clamped to the 0.2 mm
+    # floor and the caller would never learn the number it passed meant nothing.
+    if zone_grid_mm is not None:
+        try:
+            zone_grid_mm = float(zone_grid_mm)
+        except (TypeError, ValueError):
+            return err("zone_grid_mm must be a number", "ARG_INVALID")
+        if zone_grid_mm <= 0:
+            return err("zone_grid_mm must be > 0", "ARG_RANGE",
+                       hint="omit it and the pitch is planned from the area the "
+                            "fill covers; a number is clamped to [%.1f, %.1f] mm"
+                            % (ZF_MIN_GRID_MM, ZF_MAX_GRID_MM))
+    try:
+        max_zone_nodes = int(max_zone_nodes)
+    except (TypeError, ValueError):
+        return err("max_zone_nodes must be an integer", "ARG_INVALID")
+    if max_zone_nodes <= 0:
+        return err("max_zone_nodes must be > 0", "ARG_RANGE")
+    try:
+        zone_link_mm = float(zone_link_mm)
+    except (TypeError, ValueError):
+        return err("zone_link_mm must be a number", "ARG_INVALID")
+    if zone_link_mm < 0:
+        return err("zone_link_mm must be >= 0", "ARG_RANGE")
 
     cu = _cu_um_by_layer(board)
     missing = []
@@ -1496,10 +1537,11 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             if pad.get("net") == net:
                 pads.append((fp, pad))
 
-    if not tracks:
+    if not tracks and not model_zones:
         return err("net %r has no tracks on this board" % (net,), "NOT_APPLICABLE",
                    hint="without tracks there is no path to measure; an IR drop "
-                        "answered from pad positions alone would be fiction")
+                        "answered from pad positions alone would be fiction. With "
+                        "model_zones=True a copper pour on this net is copper too")
 
     # ---- tracks
     for tr in tracks:
@@ -1571,16 +1613,44 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             warnings.append("via at (%.3f, %.3f) spans a single layer - ignored"
                             % (x, y))
             continue
-        add(node(x, y, layers[0]), node(x, y, layers[-1]), r_via, "via",
-            "via %.2gmm/%.3gum" % (drill, float(plating_um)),
-            layer="|".join([layers[0], layers[-1]]), drill_mm=drill,
-            plating_um=float(plating_um))
+        if model_zones and len(layers) > 2:
+            # A through via is a plated tube through EVERY layer it crosses, and a
+            # plane on an inner layer is copper that tube touches. With the pour
+            # modelled the barrel is therefore split one segment per layer
+            # boundary instead of being one edge from the top to the bottom. With
+            # the flag off the historical single edge is kept, so the default
+            # answer does not move.
+            n_seg = len(layers) - 1
+            r_seg = r_via / n_seg
+            for k in range(n_seg):
+                add(node(x, y, layers[k]), node(x, y, layers[k + 1]), r_seg, "via",
+                    "via %.2gmm/%.3gum %s" % (drill, float(plating_um),
+                                              layers[k]),
+                    layer=layers[k], drill_mm=drill,
+                    plating_um=float(plating_um), barrel_segment=1)
+        else:
+            add(node(x, y, layers[0]), node(x, y, layers[-1]), r_via, "via",
+                "via %.2gmm/%.3gum" % (drill, float(plating_um)),
+                layer="|".join([layers[0], layers[-1]]), drill_mm=drill,
+                plating_um=float(plating_um))
 
     # ---- pads: plated holes join their layers, SMD pads are just terminals
     pad_line = 1e-6
+    pad_boxes = []
     for fp, pad in pads:
         px, py = _pad_xy(fp, pad)
         layers = _item_layers(board, pad.get("layers"))
+        try:
+            pw = float(pad.get("w") or 0.0)
+            ph = float(pad.get("h") or 0.0)
+            prot = math.radians(float(pad.get("rotation") or 0.0))
+        except (TypeError, ValueError):
+            pw = ph = prot = 0.0
+        if pw > 0 and ph > 0:
+            ca = abs(math.cos(prot))
+            sa = abs(math.sin(prot))
+            pad_boxes.append((px, py, (pw * ca + ph * sa) * 0.5,
+                              (pw * sa + ph * ca) * 0.5, list(layers)))
         if not layers:
             continue
         for lay in layers:
@@ -1589,6 +1659,149 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             for k in range(len(layers) - 1):
                 add(node(px, py, layers[k]), node(px, py, layers[k + 1]),
                     pad_line, "pad_barrel", "plated hole %s" % (layers[k],))
+
+    # ---- copper pours: a 2-D sheet of the same copper, in parallel with all of
+    # the above. Off by default: turning it on changes the number.
+    base_nodes = len(names)
+    zone_summary = None
+    zone_bridged = []
+    zone_wide = []
+    zone_skipped = []
+    if model_zones:
+        from .calc import zonefield as ZF
+
+        def zthick(layer):
+            if explicit is not None:
+                return explicit
+            return cu.get(layer)
+
+        thick_by_layer = {}
+        sheets = []
+        for z in (board.zones or []):
+            if z.get("net") != net or z.get("keepout") or z.get("is_keepout"):
+                continue
+            for lay in ZF.zone_layer_list(z):
+                if lay in thick_by_layer or lay in [s["layer"] for s in sheets]:
+                    continue
+                t = zthick(lay)
+                if t is None:
+                    zone_skipped.append(lay)
+                else:
+                    thick_by_layer[lay] = t
+        if thick_by_layer:
+            sheets = ZF.build_sheets(board.zones, net, PW._rho(temp_c) * 1e3,
+                                     thick_by_layer, grid_mm=zone_grid_mm,
+                                     max_cells_total=max_zone_nodes)["layers"]
+        znodes = {}
+        for info in sheets:
+            lay = info["layer"]
+            h = info["h_mm"]
+            t_um = info["thick_um"]
+
+            def znode(key, _lay=lay):
+                k = (_lay,) + key
+                if k not in znodes:
+                    cx, cy = ZF.cell_xy(info, key)
+                    znodes[k] = node(cx, cy, _lay)
+                return znodes[k]
+
+            for (k1, k2, r) in ZF.sheet_edges(info):
+                add(znode(k1), znode(k2), r, "zone_sheet",
+                    "%s pour %.3gmm cell" % (lay, h),
+                    layer=lay, length_mm=h, width_mm=h, copper_um=t_um)
+            # every node already in the graph that sits on this pour is joined to
+            # it: same net, same layer, same metal. 1 uOhm, not 0, so the solver
+            # has a finite conductance to work with.
+            info["_zf"] = ZF
+            for rec in list(names)[:base_nodes]:
+                if rec["layer"] != lay:
+                    continue
+                x, y = rec["x_mm"], rec["y_mm"]
+                key = ZF.cell_index(info, x, y)
+                if key is not None:
+                    add(node(x, y, lay), znode(key), ZF.LINK_OHM, "zone_link",
+                        "in pour %s" % (lay,), layer=lay)
+                    continue
+                key, d = ZF.nearest_cell(info, x, y, float(zone_link_mm))
+                if key is not None:
+                    # One sheet square, not a short: the gap being crossed is a
+                    # thermal-relief spoke or an unfilled sliver, and a spoke of
+                    # length ~ width is one square. Small enough not to invent a
+                    # drop, large enough not to wreck the conditioning of the
+                    # matrix (a 1e-6 ohm link here costs CG a factor of ten).
+                    add(node(x, y, lay), znode(key), info["sheet_ohm_per_sq"],
+                        "zone_bridge", "bridged %.3gmm to pour %s" % (d, lay),
+                        layer=lay, bridged_mm=round(d, 6),
+                        width_mm=info["h_mm"], copper_um=t_um)
+                    zone_bridged.append({"layer": lay, "x_mm": x, "y_mm": y,
+                                         "gap_mm": round(d, 6)})
+        # A wide pad is not a point: a plane's current enters across the whole
+        # pad. Linking only the cell under the anchor would invent a spreading
+        # resistance that is not there.
+        for (px, py, hw, hh, plays) in pad_boxes:
+            for info in sheets:
+                lay = info["layer"]
+                if lay not in plays:
+                    continue
+                h = info["h_mm"]
+                i0 = int(math.floor((px - hw - info["x0"]) / h))
+                i1 = int(math.floor((px + hw - info["x0"]) / h))
+                j0 = int(math.floor((py - hh - info["y0"]) / h))
+                j1 = int(math.floor((py + hh - info["y0"]) / h))
+                n = (i1 - i0 + 1) * (j1 - j0 + 1)
+                if n <= 0:
+                    continue
+                if n > 2000:
+                    zone_wide.append((lay, px, py, n))
+                    continue
+                for j in range(max(j0, 0), min(j1, info["ny"] - 1) + 1):
+                    for i in range(max(i0, 0), min(i1, info["nx"] - 1) + 1):
+                        if not info["mask"][j * info["nx"] + i]:
+                            continue
+                        add(node(px, py, lay), znode((i, j)),
+                            ZF.LINK_OHM, "zone_link", "pad contact %s" % (lay,),
+                            layer=lay)
+
+        if sheets:
+            zone_summary = {
+                "zones_modelled": sum(1 for z in (board.zones or [])
+                                      if z.get("net") == net
+                                      and not (z.get("keepout") or z.get("is_keepout"))),
+                "sheets": [{"layer": s["layer"], "grid_mm": round(s["h_mm"], 6),
+                            "cells": s["cells"],
+                            "sheet_ohm_per_sq": round(s["sheet_ohm_per_sq"], 9),
+                            "thickness_um": s["thick_um"],
+                            "from_filled_polygons": s["fill_polygons"],
+                            "from_outline_only": s["outline_only"]}
+                           for s in sheets],
+                "cells_total": sum(s["cells"] for s in sheets),
+                "bridged_nodes": len(zone_bridged),
+                "wide_pads_left_point_linked": len(zone_wide),
+                "bridged_max_gap_mm": (max(b["gap_mm"] for b in zone_bridged)
+                                       if zone_bridged else 0.0),
+                "link_ohm": ZF.LINK_OHM,
+                "layers_skipped_no_thickness": sorted(set(zone_skipped)),
+            }
+            if zone_skipped:
+                warnings.append(
+                    "a copper pour on net %r sits on layer(s) %s, which the "
+                    "stackup does not give a copper thickness for - that pour is "
+                    "NOT in the answer" %
+                    (net, ", ".join(sorted(set(zone_skipped)))))
+            if zone_wide:
+                warnings.append(
+                    "%d pad(s) cover more than 2000 pour cells each; only the cell "
+                    "under their anchor was tied to the pour, so their contact "
+                    "spreading is over-stated (self-check: pass a coarser "
+                    "zone_grid_mm)" % len(zone_wide))
+            if zone_bridged:
+                warnings.append(
+                    "%d node(s) do not sit inside the filled pour but are within "
+                    "%.3g mm of it, so they were bridged to the nearest cell with "
+                    "ONE SHEET SQUARE: that is a thermal-relief spoke (or an "
+                    "unfilled sliver) modelled to order of magnitude, not measured "
+                    "- it is the single crudest number in this answer" %
+                    (len(zone_bridged), float(zone_link_mm)))
 
     # ---- terminals
     src_hits = [h for h in _pad_lookup(board, source) if h[1].get("net") == net]
@@ -1643,19 +1856,91 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
     if total_a <= 0:
         return err("the sink currents add up to <= 0", "ARG_RANGE")
 
-    if len(names) > max_nodes:
-        return err("the network has %d nodes (limit %d)" % (len(names), max_nodes),
+    # `max_nodes` guards the DENSE O(n^3) solve. With the pour modelled the same
+    # system is solved by conjugate gradients, and a through via then contributes
+    # one node per layer it crosses instead of two - so the ceiling moves from
+    # 1200 to 4096 for that path and stays exactly 1200 without it.
+    base_limit = max_nodes if not model_zones else max(max_nodes, 4096)
+    if base_nodes > base_limit:
+        return err("the network has %d nodes (limit %d)" % (base_nodes, base_limit),
                    "TOO_LARGE",
                    hint="raise quantize_mm - two nodes closer than that are "
                         "merged anyway, so a 0.01 mm mesh on a big net is mostly "
                         "noise")
+    zone_cells = len(names) - base_nodes
+    if zone_cells > max_zone_nodes:
+        return err("the pour grid has %d cells (limit %d)" % (zone_cells,
+                                                             max_zone_nodes),
+                   "TOO_LARGE",
+                   hint="raise max_zone_nodes or pass zone_grid_mm; the sheet "
+                        "resistance does not depend on the pitch, only how finely "
+                        "the current spreads near a contact does")
+
+    # Nothing on this net is copper at all: no tracks, and not one pour cell
+    # could be gridded. Then the honest answer is the one the track-only path
+    # gives - NOT_APPLICABLE, "there is nothing to measure" - rather than
+    # NOT_CONNECTED, which would blame the layout for a missing model.
+    if model_zones and not tracks and zone_cells == 0:
+        return err("net %r has no tracks on this board" % (net,), "NOT_APPLICABLE",
+                   hint="without tracks there is no path to measure; an IR drop "
+                        "answered from pad positions alone would be fiction. With "
+                        "model_zones=True a copper pour on this net is copper too")
 
     # ---- solve
     injections = {src_node: total_a}
     for s in sink_list:
         injections[s["node"]] = injections.get(s["node"], 0.0) - s["current_a"]
-    sol, why = PW.resistive_network([n["id"] for n in names], edges, injections,
-                                    src_node)
+    solver_info = None
+    if model_zones:
+        # A pour grid can leave floating islands (a sliver that touches nothing),
+        # and an isolated node makes the Laplacian singular. So the graph is cut
+        # down to what the source can actually reach FIRST, and a sink that falls
+        # outside says so instead of surfacing as a linear-algebra error.
+        adj = {}
+        for e in edges:
+            adj.setdefault(e["a"], []).append(e["b"])
+            adj.setdefault(e["b"], []).append(e["a"])
+        seen = {src_node}
+        stack = [src_node]
+        while stack:
+            k = stack.pop()
+            for nb in adj.get(k, ()):
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        stranded = [s["pad"] for s in sink_list if s["node"] not in seen]
+        if stranded:
+            return err("sink(s) %s are not connected to %s on net %r, even with "
+                       "the copper pours modelled - there is no copper path"
+                       % (", ".join(stranded), source, net), "NOT_CONNECTED",
+                       hint="check that the pour on this net actually overlaps "
+                            "the sink's copper and that no keepout isolates it")
+        dropped = len(names) - len(seen)
+        if dropped:
+            keep = seen
+            names = [n for n in names if n["id"] in keep]
+            edges = [e for e in edges if e["a"] in keep and e["b"] in keep]
+            warnings.append("%d node(s) of the pour are not connected to the "
+                            "source by any copper and were dropped: they carry no "
+                            "current" % dropped)
+        sol, why = PW.resistive_network_cg([n["id"] for n in names], edges,
+                                           injections, src_node, tol=1e-9)
+        if sol is not None:
+            solver_info = {"method": "%s_preconditioned_cg" % sol.get("precond",
+                                                                       "jacobi"),
+                           "iterations": sol["iterations"],
+                           "residual_rel": sol["residual_rel"],
+                           "converged": sol["converged"], "tol": 1e-9}
+            if not sol["converged"]:
+                return err("the copper network did not converge: residual %.3g "
+                           "after %d CG iterations" % (sol["residual_rel"],
+                                                       sol["iterations"]),
+                           "NOT_CONVERGED",
+                           hint="coarsen the pour with zone_grid_mm; a reported "
+                                "drop out of an unconverged solve is noise")
+    else:
+        sol, why = PW.resistive_network([n["id"] for n in names], edges,
+                                        injections, src_node)
     if sol is None:
         return err("could not solve the copper network: %s" % why, "NOT_APPLICABLE",
                    hint="the usual cause is a sink that no track on this net "
@@ -1708,11 +1993,16 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
 
     warnings.extend(layer_warnings)
     pour = [z for z in (board.zones or [])
-            if z.get("net") == net and not z.get("keepout")]
-    if pour:
+            if z.get("net") == net
+            and not (z.get("keepout") or z.get("is_keepout"))]
+    if pour and not model_zones:
         warnings.append("%d copper zone(s) on net %r are NOT modelled: they sit in "
                         "parallel with these tracks, so this drop is an UPPER "
                         "bound" % (len(pour), net))
+    if pour and model_zones and zone_summary is None:
+        warnings.append("%d copper zone(s) on net %r exist but none of them could "
+                        "be gridded, so this drop is still an UPPER bound"
+                        % (len(pour), net))
 
     max_drop = max(s["drop_mv"] for s in sink_out)
     worst_sink = max(sink_out, key=lambda s: s["drop_mv"])
@@ -1730,17 +2020,36 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                      "edge_count": len(edge_out),
                      "node_count": len(names),
                      "quantize_mm": q},
-              unit="mV", model="track_via_pad_resistor_graph",
-              basis="every track segment becomes rho(T)*L/(w*t) with t from the "
-                    "stackup copper weight, every via a barrel of "
-                    "pi*((d/2)^2 - (d/2-p)^2), plated pads join their layers; the "
-                    "graph is solved by nodal analysis with the source pad at 0 V",
-              precision="a DC answer, and a bound in the direction of missing "
-                        "copper: skin effect, pad/plane spreading and connector "
-                        "contact are not in it (so the real drop is worse), while "
-                        "a pour on the same net is not in it either (so this drop "
-                        "is an upper bound). Nodes closer than quantize_mm are "
-                        "merged, so a hairline gap below that is invisible",
+              unit="mV",
+              model=("track_via_pad_zone_resistor_graph" if zone_summary
+                     else "track_via_pad_resistor_graph"),
+              basis=("every track segment becomes rho(T)*L/(w*t) with t from the "
+                     "stackup copper weight, every via a barrel of "
+                     "pi*((d/2)^2 - (d/2-p)^2), plated pads join their layers"
+                     + (", and every copper pour on this net is a 2-D sheet of "
+                        "rho(T)/t per square gridded and four-connected, with the "
+                        "pitch stated per layer" if zone_summary else "")
+                     + "; the graph is solved by nodal analysis with the source "
+                       "pad at 0 V"
+                     + (" (conjugate gradients, residual reported)"
+                        if zone_summary else "")),
+              precision=("a DC answer, and a bound in the direction of missing "
+                         "copper: skin effect, pad/plane spreading and connector "
+                         "contact are not in it (so the real drop is worse)"
+                         + (". The pour IS in it, as a sheet gridded at the pitch "
+                            "in zone_summary - the sheet resistance does not depend "
+                            "on that pitch, the current spreading near a contact "
+                            "does. A pad joined to the pour is modelled as SOLID "
+                            "copper at %.0e ohm, so where a thermal-relief spoke "
+                            "is the real connection this drop is a LOWER bound. "
+                            "Zone priority, minimum width and the clearance ring to "
+                            "other nets are not solved for, they are taken from the "
+                            "fill the file already carries"
+                            % _ZF_LINK_OHM if zone_summary else
+                            ", while a pour on the same net is not in it either "
+                            "(so this drop is an upper bound)")
+                         + ". Nodes closer than quantize_mm are merged, so a "
+                           "hairline gap below that is invisible"),
               assumptions={"quantize_mm": q, "temp_c": float(temp_c),
                            "copper_um": explicit,
                            "copper_um_source": ("explicit" if explicit is not None
@@ -1748,12 +2057,23 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                            "plating_um": plating_um,
                            "net": net, "board_thickness_mm": board_th},
               extra={"warnings": warnings,
-                     "not_computed": ["copper pour / plane in parallel",
-                                      "skin effect",
-                                      "pad and plane spreading resistance",
-                                      "temperature rise feedback (rho uses temp_c)",
-                                      "current capacity / fusing (needs a "
-                                      "temperature-rise criterion, not a current)"]})
+                     "zone_summary": zone_summary,
+                     "solver": solver_info,
+                     "not_computed": (
+                         ["skin effect",
+                          "pad and plane spreading resistance at the contact",
+                          "thermal-relief spokes on a pad joined to the pour "
+                          "(modelled as solid copper)",
+                          "temperature rise feedback (rho uses temp_c)",
+                          "current capacity / fusing (needs a "
+                          "temperature-rise criterion, not a current)"]
+                         if zone_summary else
+                         ["copper pour / plane in parallel",
+                          "skin effect",
+                          "pad and plane spreading resistance",
+                          "temperature rise feedback (rho uses temp_c)",
+                          "current capacity / fusing (needs a "
+                          "temperature-rise criterion, not a current)"])})
 
 
 # ------------------------------------------------------------------------ DFM

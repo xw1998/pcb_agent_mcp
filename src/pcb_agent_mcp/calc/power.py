@@ -229,6 +229,249 @@ def resistive_network(nodes, edges, injections, ground):
             "net_a": total_in + total_out}, None
 
 
+def _ic0_factor(n, diag, adju):
+    """Incomplete Cholesky, zero fill-in, on the same sparsity pattern as A.
+
+    Jacobi preconditioning is not enough on a copper sheet: the matrix mixes
+    1e-3 ohm sheet squares with 1e-6 ohm contact links, and CG then needs
+    thousands of iterations because the eigenvalues span eight decades. IC(0)
+    keeps the pattern of A (about five entries a row on a grid) and cuts that to
+    a few dozen iterations. It can break down - a negative pivot - on an
+    indefinite or badly scaled matrix, and returns None so the caller can fall
+    back instead of returning a wrong answer.
+    """
+    rows = []
+    for i in range(n):
+        rows.append(sorted(j for j, _g in adju[i] if j < i))
+    Ld = [0.0] * n
+    Lv = [None] * n
+    cols = [[] for _ in range(n)]
+    for i in range(n):
+        ri = rows[i]
+        gd = {}
+        for jj, gg in adju[i]:
+            gd[jj] = gg
+        row = {}
+        for j in ri:
+            rj = rows[j]
+            acc = 0.0
+            lj = Lv[j]
+            a = 0
+            b = 0
+            while a < len(ri) and b < len(rj):
+                ka = ri[a]
+                kb = rj[b]
+                if ka == kb:
+                    if ka < j:
+                        va = row.get(ka)
+                        if va is not None:
+                            acc += va * lj.get(ka, 0.0)
+                    a += 1
+                    b += 1
+                elif ka < kb:
+                    a += 1
+                else:
+                    b += 1
+            v = (-gd.get(j, 0.0) - acc) / Ld[j]
+            row[j] = v
+            cols[j].append((i, v))
+        d = diag[i]
+        for v in row.values():
+            d -= v * v
+        if d <= 0.0:
+            return None
+        Ld[i] = math.sqrt(d)
+        Lv[i] = row
+    return Ld, Lv, cols
+
+def _ic0_solve(Ld, Lv, cols, r):
+    n = len(Ld)
+    y = [0.0] * n
+    for i in range(n):
+        s = r[i]
+        for j, v in Lv[i].items():
+            s -= v * y[j]
+        y[i] = s / Ld[i]
+    z = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        s = y[i]
+        for k, v in cols[i]:
+            s -= v * z[k]
+        z[i] = s / Ld[i]
+    return z
+
+def resistive_network_cg(nodes, edges, injections, ground, tol=1e-10,
+                         max_iter=20000, precond="auto"):
+    """Same answer as `resistive_network`, solved without forming the matrix.
+
+    The dense Kirchhoff solve above is O(n^3) and allocates an n x n list of
+    lists, which caps it at a few hundred nodes. A copper pour gridded at half a
+    millimetre is tens of thousands of nodes, so the same system is solved here
+    with Jacobi-preconditioned conjugate gradients on the ground-eliminated
+    Laplacian (symmetric positive definite, which is the only case CG is valid
+    for - and this network always is one).
+
+    The residual is returned, not hidden: `residual_rel` is
+    ||b - A x|| / ||b|| and `converged` says whether it made `tol`. A caller that
+    reports a number out of a non-converged solve is reporting noise, so it must
+    check `converged` itself.
+    """
+    names = list(nodes)
+    index = {n: i for i, n in enumerate(names)}
+    if ground not in index:
+        return None, "ground node %r is not in the node list" % (ground,)
+    n = len(names)
+    gi = index[ground]
+    diag = [0.0] * n
+    pair_a = [0] * len(edges)
+    pair_b = [0] * len(edges)
+    pair_g = [0.0] * len(edges)
+    adj = [[] for _ in range(n)]
+    for k, e in enumerate(edges):
+        ia = index.get(e["a"])
+        ib = index.get(e["b"])
+        if ia is None or ib is None:
+            return None, "edge references an unknown node"
+        r = e["resistance_ohm"]
+        if not (r > 0.0):
+            return None, "an edge has resistance %r" % (r,)
+        g = 1.0 / r
+        pair_a[k] = ia
+        pair_b[k] = ib
+        pair_g[k] = g
+        diag[ia] += g
+        diag[ib] += g
+        adj[ia].append((ib, g))
+        adj[ib].append((ia, g))
+    # Parallel edges are legitimate (a pad is welded to forty pour cells, two
+    # pours overlap) but they MUST be folded into one conductance first: the
+    # incomplete-Cholesky pattern below assumes one entry per (i, j), and a
+    # duplicated entry silently double-counted in the back substitution and cost
+    # CG ten times the iterations it needed.
+    for i in range(n):
+        if len(adj[i]) > 1:
+            fold = {}
+            for j, g in adj[i]:
+                fold[j] = fold.get(j, 0.0) + g
+            adj[i] = list(fold.items())
+    # unknown ordering: everything but the ground node, order preserved
+    umap = {}
+    unodes = []
+    for i in range(n):
+        if i == gi:
+            continue
+        umap[i] = len(unodes)
+        unodes.append(i)
+    N = len(unodes)
+    for i in unodes:
+        if diag[i] <= 0.0:
+            return None, ("node %r has no conductive path to ground (it carries "
+                          "no edge)" % (names[i],))
+    b = [0.0] * N
+    for k, amps in injections.items():
+        i = index.get(k)
+        if i is None or i == gi:
+            continue
+        b[umap[i]] += float(amps)
+    # neighbour lists with the ground mapped out (its voltage is 0 and it never
+    # appears as an unknown, so its contribution is already inside the diagonal)
+    adju = [None] * N
+    diagu = [0.0] * N
+    for u, i in enumerate(unodes):
+        diagu[u] = diag[i]
+        lst = []
+        for j, g in adj[i]:
+            if j == gi:
+                continue
+            lst.append((umap[j], g))
+        adju[u] = lst
+
+    def matvec(x):
+        y = [0.0] * N
+        for u in range(N):
+            s = diagu[u] * x[u]
+            for v, g in adju[u]:
+                s -= g * x[v]
+            y[u] = s
+        return y
+
+    def dot(p, q):
+        s = 0.0
+        for u in range(N):
+            s += p[u] * q[u]
+        return s
+
+    ic = None
+    if precond in ("auto", "ic0"):
+        ic = _ic0_factor(N, diagu, adju)
+    precond_used = "jacobi"
+    if ic is not None:
+        Ld, Lv, Lcol = ic
+        precond_used = "ic0"
+
+    def zin(rr):
+        if ic is not None:
+            return _ic0_solve(Ld, Lv, Lcol, rr)
+        return [rr[u] / diagu[u] for u in range(N)]
+
+    x = [0.0] * N
+    r = list(b)
+    nb = math.sqrt(dot(b, b))
+    if nb == 0.0:
+        v = [0.0] * n
+        return _cg_pack(names, n, pair_a, pair_b, pair_g, v, injections, 0, 0.0,
+                        True, precond_used), None
+    z = zin(r)
+    p = list(z)
+    rz = dot(r, z)
+    it = 0
+    rel = 1.0
+    for it in range(1, max_iter + 1):
+        Ap = matvec(p)
+        pAp = dot(p, Ap)
+        if pAp <= 0.0:
+            break
+        alpha = rz / pAp
+        for u in range(N):
+            x[u] += alpha * p[u]
+            r[u] -= alpha * Ap[u]
+        rel = math.sqrt(dot(r, r)) / nb
+        if rel <= tol:
+            break
+        z = zin(r)
+        rz_new = dot(r, z)
+        if rz == 0.0:
+            break
+        beta = rz_new / rz
+        rz = rz_new
+        for u in range(N):
+            p[u] = z[u] + beta * p[u]
+    v = [0.0] * n
+    for u, i in enumerate(unodes):
+        v[i] = x[u]
+    v[gi] = 0.0
+    return _cg_pack(names, n, pair_a, pair_b, pair_g, v, injections, it, rel,
+                    rel <= tol, precond_used), None
+
+def _cg_pack(names, n, pair_a, pair_b, pair_g, volts_list, injections,
+             iterations, residual_rel, converged, precond_used="jacobi"):
+    volts = {names[i]: volts_list[i] for i in range(n)}
+    cur = []
+    for k in range(len(pair_g)):
+        ia = pair_a[k]
+        ib = pair_b[k]
+        dv = volts_list[ia] - volts_list[ib]
+        i = dv * pair_g[k]
+        cur.append({"a": names[ia], "b": names[ib],
+                    "resistance_ohm": 1.0 / pair_g[k],
+                    "current_a": i, "power_w": dv * i, "drop_v": dv})
+    total_in = sum(float(x) for x in injections.values() if float(x) > 0)
+    total_out = sum(float(x) for x in injections.values() if float(x) < 0)
+    return {"voltages_v": volts, "edges": cur, "injected_a": total_in,
+            "drawn_a": -total_out, "net_a": total_in + total_out,
+            "iterations": iterations, "residual_rel": residual_rel,
+            "converged": converged, "precond": precond_used}
+
 def ir_drop(segments, current_a, temp_c=20.0):
     """Series IR drop along an ordered path of copper segments.
 

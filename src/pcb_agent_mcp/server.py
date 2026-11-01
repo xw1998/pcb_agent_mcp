@@ -3847,6 +3847,93 @@ def selftest():
           and "Components found: 2" in (_cf_split.get("hint") or ""),
           str(_cf_split.get("reason_code")))
 
+    # ---- 0.0.64: a copper pour is copper too. The fixture carries NO tracks at
+    # all - two 1x10 mm pads 20 mm apart joined only by a 30x10 mm pour - so the
+    # whole answer is a sheet resistance and nothing else, and it can be counted
+    # by hand. Two boards: one where the pour reaches both pads, one where it
+    # stops at the source, because "the pour is there" and "the pour connects
+    # these two" are different facts and only the second one is copper.
+    _pz_tmp = _tempfile.mkdtemp(prefix="pcbagent-pour-")
+
+    def _pour_board(name, x1):
+        path = os.path.join(_pz_tmp, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write((
+                '(kicad_pcb (version 20221018) (generator pcbnew)\n'
+                '  (general (thickness 1.6))\n'
+                '  (layers (0 "F.Cu" signal) (31 "B.Cu" signal)'
+                ' (44 "Edge.Cuts" user))\n'
+                '  (setup (stackup\n'
+                '      (layer "F.Cu" (type "copper") (thickness 0.035))\n'
+                '      (layer "dielectric 1" (type "core") (thickness 1.53))\n'
+                '      (layer "B.Cu" (type "copper") (thickness 0.035))))\n'
+                '  (net 0 "") (net 1 "VCC")\n'
+                '  (gr_rect (start 0 0) (end 50 30) (layer "Edge.Cuts")'
+                ' (width 0.1))\n'
+                '  (footprint "T:A" (layer "F.Cu") (at 10 10)\n'
+                '    (fp_text reference "U1" (at 0 -6) (layer "F.SilkS"))\n'
+                '    (pad "1" smd rect (at 0 0) (size 1 10) (layers "F.Cu")'
+                ' (net 1 "VCC")))\n'
+                '  (footprint "T:B" (layer "F.Cu") (at 30 10)\n'
+                '    (fp_text reference "U2" (at 0 -6) (layer "F.SilkS"))\n'
+                '    (pad "1" smd rect (at 0 0) (size 1 10) (layers "F.Cu")'
+                ' (net 1 "VCC")))\n'
+                '  (zone (net 1) (net_name "VCC") (layer "F.Cu") (tstamp 0)\n'
+                '    (hatch edge 0.508) (priority 0)\n'
+                '    (connect_pads (clearance 0.2))\n'
+                '    (min_thickness 0.25)\n'
+                '    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n'
+                '    (polygon (pts (xy 5 5) (xy %.6g 5) (xy %.6g 15)'
+                ' (xy 5 15)))\n'
+                '    (filled_polygon (layer "F.Cu")\n'
+                '      (pts (xy 5 5) (xy %.6g 5) (xy %.6g 15) (xy 5 15)))))\n'
+                ) % (x1, x1, x1, x1))
+        return path
+
+    _pz_full = _pour_board("pour_full.kicad_pcb", 35)
+    _pz_half = _pour_board("pour_half.kicad_pcb", 15)
+    _pz_off = _call("board_ir_drop", {"path": _pz_full, "net": "VCC",
+                                      "source": "U1.1", "sinks": ["U2.1"],
+                                      "current_a": 1.0}, 1815)
+    check("a net joined by nothing but its pour is still refused with the switch "
+          "OFF: the track-only graph is two halves that never meet, so 'no tracks "
+          "on this board' is the honest answer and the default path is unchanged",
+          _pz_off.get("status") == "error"
+          and _pz_off.get("reason_code") == "NOT_APPLICABLE",
+          str(_pz_off.get("reason_code")))
+
+    _pz_on = _call("board_ir_drop", {"path": _pz_full, "net": "VCC",
+                                     "source": "U1.1", "sinks": ["U2.1"],
+                                     "current_a": 1.0, "model_zones": True,
+                                     "zone_grid_mm": 0.5, "max_zone_nodes": 20000},
+                   1816)
+    _pz_v = _pz_on.get("value") or {}
+    check("with model_zones the pour IS the answer: 1.9 squares of rho/t = "
+          "0.9359 mV at 1 A, measured 0.935986 (0.01 %), while the naive "
+          "20 mm/10 mm reading of 2 squares = 0.9851 mV is the UPPER bound at "
+          "+5.3 % - the pads are 1 mm wide, so the current spreads",
+          _pz_on.get("status") == "ok"
+          and abs((_pz_v.get("max_drop_mv") or 0) - 0.935896) < 0.002
+          and (_pz_on.get("solver") or {}).get("converged") is True
+          and [x["layer"] for x in (_pz_on.get("zone_summary") or {}).get("sheets", [])]
+              == ["F.Cu"],
+          "drop %s mV, solver %s" % (_pz_v.get("max_drop_mv"),
+                                     (_pz_on.get("solver") or {}).get("iterations")))
+
+    _pz_cut = _call("board_ir_drop", {"path": _pz_half, "net": "VCC",
+                                      "source": "U1.1", "sinks": ["U2.1"],
+                                      "current_a": 1.0, "model_zones": True,
+                                      "zone_grid_mm": 0.5, "max_zone_nodes": 20000},
+                    1817)
+    check("a pour that stops 15 mm short does NOT make the net connected: the "
+          "answer is NOT_CONNECTED naming the sink, not a small drop from the "
+          "pour that happens to be nearby",
+          _pz_cut.get("status") == "error"
+          and _pz_cut.get("reason_code") == "NOT_CONNECTED"
+          and "U2.1" in (_pz_cut.get("message") or ""),
+          str(_pz_cut.get("reason_code")))
+    _shutil.rmtree(_pz_tmp, ignore_errors=True)
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
