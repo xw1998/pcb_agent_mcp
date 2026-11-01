@@ -4059,8 +4059,13 @@ def _capabilities(_args):
             "that closes the loop at frequency, and since 0.0.69 it takes a "
             "whole SPECTRUM (harmonics=[{frequency_hz, current_a}] + "
             "dc_current_a: the powers add, the temperature does not), but it is "
-            "still ONE conductor with ONE lump Rth shared by every harmonic - "
-            "this 2-D plate is still DC - "
+            "still ONE conductor with ONE lump Rth shared by every harmonic. "
+            "Board-level copper at a frequency IS answered since 0.0.70, but by "
+            "board_ir_drop(frequency_hz=...) - it scales every segment by the "
+            "ratio its OWN 1-D solve gives (slab for tracks and pours, Bessel "
+            "tube for vias) and still has no proximity effect, no lateral edge "
+            "crowding along a wide strip and no phase - so this 2-D THERMAL "
+            "plate is still excited at DC and there is no AC heat map - "
             "device self-heating inside sim_spice, "
             "reading the conductors or the zones straight off a board "
             "file - board_electrothermal takes geometry, it does not open the "
@@ -6254,7 +6259,15 @@ _tool(
     "via a barrel, plated pads join their layers, and nodes are (x, y, layer) - so two "
     "layers only touch where a via or a plated pad really joins them. That is the part a "
     "length-times-sheet-resistance estimate cannot see. Refuses when copper thickness or "
-    "via plating is unknown, or when no track connects a sink to the source.",
+    "via plating is unknown, or when no track connects a sink to the source. "
+    "Pass frequency_hz and the same graph becomes a ONE-FREQUENCY answer: copper is "
+    "not the same slab at 1 MHz as at DC (1 oz / 35 um is already 1 % off at 1 MHz "
+    "and 2x at ~30 MHz), so every track and pour square keeps its width and gets the "
+    "effective thickness of the exact 1-D slab solve (the number `skin` publishes), "
+    "and every via barrel is solved as the tube it is (the number "
+    "`ac_round_conductor` publishes). Only resistances change - topology, DC path and "
+    "the meaning of every other field do not. Left out, the answer is the plain DC "
+    "number, digit for digit.",
     {"type": "object", "properties": dict({
         "net": _str("the net to measure (name, as board_nets prints it)"),
         "source": _str("pad the current enters, as REF.PAD - e.g. U1.1"),
@@ -6282,6 +6295,19 @@ _tool(
         "zone_link_mm": _num("a node this close to the fill but not inside it is "
                              "bridged to the nearest cell with ONE sheet square "
                              "(a thermal-relief spoke, modelled to order)", 0.5),
+        "frequency_hz": _num("answer at this frequency instead of at DC: each "
+                             "conductor gets its own exact 1-D skin solve. Omit for "
+                             "the DC answer (the default, digit for digit)"),
+        "faces": {"type": "string", "enum": ["one", "two"], "description":
+                  "'one' (default) = the return current is on ONE side of this "
+                  "copper (a track over a plane); 'two' = symmetric (a stripline, a "
+                  "plane between two returns). A factor of two in t_eff, not a "
+                  "cosmetic choice"},
+        "mu_r": _num("relative permeability of the copper (1.0 for copper)", 1.0),
+        "roughness_rq_um": _num("RMS foil roughness height (Rq, not Rz); the "
+                                "Hammerstad-Jensen factor multiplies the AC "
+                                "resistance. Omit and the AC resistance is a LOWER "
+                                "bound once the skin depth is comparable"),
     }, **_COMMON),
      "required": ["path", "net", "source", "sinks"]},
     _board_tool(lambda b, a: _oracle.board_ir_drop(
@@ -6295,7 +6321,11 @@ _tool(
         max_zone_nodes=(int(a["max_zone_nodes"])
                         if a.get("max_zone_nodes") is not None else 8000),
         zone_link_mm=(a["zone_link_mm"] if a.get("zone_link_mm") is not None
-                      else 0.5)), derived=True),
+                      else 0.5),
+        frequency_hz=a.get("frequency_hz"),
+        faces=(a.get("faces") or "one"),
+        mu_r=(a["mu_r"] if a.get("mu_r") is not None else 1.0),
+        roughness_rq_um=a.get("roughness_rq_um")), derived=True),
 )
 
 _tool(

@@ -1421,7 +1421,8 @@ ZF_MAX_GRID_MM = 2.0
 def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                   plating_um=None, quantize_mm=0.01, temp_c=20.0,
                   max_nodes=1200, model_zones=False, zone_grid_mm=None,
-                  max_zone_nodes=8000, zone_link_mm=0.5):
+                  max_zone_nodes=8000, zone_link_mm=0.5, frequency_hz=None,
+                  faces="one", mu_r=1.0, roughness_rq_um=None):
     """DC voltage drop across ONE net, out of the copper the board actually carries.
 
     This is "will 2 A make it from the regulator to the MCU without browning it
@@ -1447,8 +1448,25 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
     an upper bound" into a number, and on a plane-heavy board it is the
     difference between a number and `NOT_APPLICABLE / singular`: the two halves of
     such a net are often joined by NOTHING but the pour.
+
+    `frequency_hz` turns the same graph into a one-frequency answer: at 1 MHz the
+    current in 1 oz copper has already stopped filling the thickness, so a DC
+    answer is optimistic exactly where a switching supply lives. Every track and
+    every pour square keeps its width and gets the effective thickness the exact
+    1-D slab solution gives (t_eff = t/(R_ac/R_dc), the same solve `skin`
+    publishes), and a via barrel is solved as the tube it is (the same Bessel
+    answer as `roundwire`). Only resistances change - the topology, the DC path
+    and the meaning of every other field do not.
+
+    What is still missing at a frequency is said out loud rather than absorbed:
+    no proximity effect from a neighbouring conductor, no lateral crowding along
+    the width of a wide strip, no phase (this is a magnitude, not an impedance).
+    Left out (the default) the answer is the plain DC number, digit for digit.
     """
     from .calc import power as PW
+    if frequency_hz is not None:
+        from .calc import skin as _SK
+        from .calc import roundwire as _RW
 
     if not net:
         return err("net is required", "ARG_REQUIRED")
@@ -1484,6 +1502,60 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
         return err("zone_link_mm must be a number", "ARG_INVALID")
     if zone_link_mm < 0:
         return err("zone_link_mm must be >= 0", "ARG_RANGE")
+
+    # ---- AC knobs (0.0.70). Validated before any copper is touched, so a bad
+    # value can never half-apply to a network that is already half built.
+    freq = None
+    if frequency_hz is not None:
+        try:
+            freq = float(frequency_hz)
+        except (TypeError, ValueError):
+            return err("frequency_hz must be a number", "ARG_INVALID")
+        if not freq > 0.0:
+            return err("frequency_hz must be > 0", "ARG_RANGE",
+                       hint="the DC answer is this same call WITHOUT frequency_hz "
+                            "- there is no skin depth at 0 Hz")
+    if faces is None:
+        faces = "one"
+    if faces not in ("one", "two"):
+        return err("faces must be 'one' or 'two', not %r - and it is not a "
+                   "cosmetic choice: 'one' means the return current runs on ONE "
+                   "side of this copper (a track over a plane), 'two' means it is "
+                   "symmetric (a stripline, a plane between two returns). The "
+                   "difference is a factor of two in the effective thickness."
+                   % (faces,), "ARG_INVALID")
+    try:
+        mur = 1.0 if mu_r is None else float(mu_r)
+    except (TypeError, ValueError):
+        return err("mu_r must be a number", "ARG_INVALID")
+    if not mur >= 1.0:
+        return err("mu_r must be >= 1 (copper is 1.0; a ferromagnetic plating "
+                   "would be given its real mu_r and also breaks the 1-D "
+                   "assumption)", "ARG_RANGE")
+    rq = None
+    if roughness_rq_um is not None:
+        try:
+            rq = float(roughness_rq_um)
+        except (TypeError, ValueError):
+            return err("roughness_rq_um must be a number (RMS height Rq, not Rz)",
+                       "ARG_INVALID")
+        if rq < 0.0:
+            return err("roughness_rq_um must be >= 0", "ARG_RANGE")
+    if freq is None:
+        # Accepting these and then answering at DC would be a wrong number told
+        # by omission, which is the one thing this server does not do.
+        stray = []
+        if faces != "one":
+            stray.append("faces=%r" % (faces,))
+        if mur != 1.0:
+            stray.append("mu_r=%g" % mur)
+        if rq is not None:
+            stray.append("roughness_rq_um=%g" % rq)
+        if stray:
+            return err("%s only mean something at a frequency, and frequency_hz "
+                       "was not given" % (" and ".join(stray),), "ARG_INVALID",
+                       hint="either pass frequency_hz, or leave these at their "
+                            "defaults and this is the plain DC answer")
 
     cu = _cu_um_by_layer(board)
     missing = []
@@ -1521,6 +1593,49 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                           "y_mm": key[1] * q, "layer": layer})
         return nodes[key]
 
+    # ---- AC scaling (0.0.70): one exact 1-D solve per distinct thickness, cached.
+    # A board has a handful of copper weights, not a thousand, and the solve is
+    # the same one `skin`/`roundwire` already publish - so this cannot drift away
+    # from the number those tools report for the same foil.
+    ac_fail = []
+    _slab_cache = {}
+    _barrel_cache = {}
+    ac_acc = {"track": [], "zone": [], "via": []}
+
+    def _slab(t_um):
+        """(r_ac_over_r_dc, skin_depth_um) for a slab of this thickness."""
+        key = round(float(t_um), 12)
+        if key not in _slab_cache:
+            env = _SK.ac_sheet_resistance(
+                freq, thickness_um=float(t_um),
+                rho_ohm_mm=PW._rho(temp_c) * 1e3, temp_c=temp_c, mu_r=mur,
+                faces=faces, roughness_rq_um=rq, profile_samples=9)
+            if env.get("status") != "ok":
+                ac_fail.append(env)
+                _slab_cache[key] = None
+            else:
+                v = env["value"]
+                k = v.get("roughness_k") or 1.0
+                _slab_cache[key] = (v["r_ac_over_r_dc"] * k, v["skin_depth_um"])
+        return _slab_cache[key]
+
+    def _barrel(drill, plate_um):
+        """(r_ac_over_r_dc, skin_depth_um) for a plated barrel at this frequency."""
+        key = (round(float(drill), 12), round(float(plate_um), 12))
+        if key not in _barrel_cache:
+            env = _RW.ac_round_conductor(
+                freq, drill_mm=float(drill), plating_um=float(plate_um),
+                rho_ohm_mm=PW._rho(temp_c) * 1e3, temp_c=temp_c, mu_r=mur,
+                roughness_rq_um=rq)
+            if env.get("status") != "ok":
+                ac_fail.append(env)
+                _barrel_cache[key] = None
+            else:
+                v = env["value"]
+                k = v.get("roughness_k") or 1.0
+                _barrel_cache[key] = (v["ac_over_dc"] * k, v["skin_depth_um"])
+        return _barrel_cache[key]
+
     def add(a, b, r, kind, label, **kw):
         if a == b or r <= 0:
             return None
@@ -1555,6 +1670,16 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             w = 0.0
         if w <= 0:
             return err("a track on net %r has width 0" % (net,), "INTERNAL")
+        # A track keeps its width and loses thickness: R_ac = rho*L/(w*t_eff).
+        # At DC t_eff IS t, so the expression below is the one it always was.
+        t_eff_um = t_um
+        t_ratio = 1.0
+        if freq is not None:
+            got = _slab(t_um)
+            if got is None:
+                return ac_fail[-1]
+            t_ratio = got[0]
+            t_eff_um = t_um / t_ratio
         pts = tr.get("_points") or [tr["start"], tr["end"]]
         for i in range(len(pts) - 1):
             x1, y1 = float(pts[i][0]), float(pts[i][1])
@@ -1562,10 +1687,14 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             L = math.hypot(x2 - x1, y2 - y1)
             if L <= 0:
                 continue
-            r = PW._rho(temp_c) * (L * 1e-3) / (w * 1e-3 * t_um * 1e-6)
+            r = PW._rho(temp_c) * (L * 1e-3) / (w * 1e-3 * t_eff_um * 1e-6)
             add(node(x1, y1, layer), node(x2, y2, layer), r, "track",
                 "%s %.4gmm x %.3gmm" % (layer, L, w),
-                layer=layer, length_mm=L, width_mm=w, copper_um=t_um)
+                layer=layer, length_mm=L, width_mm=w, copper_um=t_um,
+                **({"copper_eff_um": t_eff_um, "r_ac_over_rdc": t_ratio}
+                   if freq is not None else {}))
+            if freq is not None:
+                ac_acc["track"].append((r / t_ratio, r, t_ratio))
     if missing:
         return err("no copper thickness for layer(s) %s: the stackup does not "
                    "carry it and copper_um was not given" %
@@ -1607,6 +1736,16 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
         if vr.get("status") != "ok":
             return vr
         r_via = vr["value"]["single_via_ohm"]
+        v_ratio = 1.0
+        if freq is not None:
+            # A barrel is a TUBE, not a flat slab - and 0.0.67 measured that
+            # treating a round section as square is off by 5.26x at 1 GHz, so the
+            # tube solution is used rather than the slab one with a fudge.
+            got = _barrel(drill, float(plating_um))
+            if got is None:
+                return ac_fail[-1]
+            v_ratio = got[0]
+            r_via = r_via * v_ratio
         x, y = float(vi["x"]), float(vi["y"])
         layers = _layer_span(board, vi.get("from"), vi.get("to"))
         if len(layers) < 2:
@@ -1627,12 +1766,18 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                     "via %.2gmm/%.3gum %s" % (drill, float(plating_um),
                                               layers[k]),
                     layer=layers[k], drill_mm=drill,
-                    plating_um=float(plating_um), barrel_segment=1)
+                    plating_um=float(plating_um), barrel_segment=1,
+                    **({"r_ac_over_rdc": v_ratio} if freq is not None else {}))
+                if freq is not None:
+                    ac_acc["via"].append((r_seg / v_ratio, r_seg, v_ratio))
         else:
             add(node(x, y, layers[0]), node(x, y, layers[-1]), r_via, "via",
                 "via %.2gmm/%.3gum" % (drill, float(plating_um)),
                 layer="|".join([layers[0], layers[-1]]), drill_mm=drill,
-                plating_um=float(plating_um))
+                plating_um=float(plating_um),
+                **({"r_ac_over_rdc": v_ratio} if freq is not None else {}))
+            if freq is not None:
+                ac_acc["via"].append((r_via / v_ratio, r_via, v_ratio))
 
     # ---- pads: plated holes join their layers, SMD pads are just terminals
     pad_line = 1e-6
@@ -1676,6 +1821,11 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             return cu.get(layer)
 
         thick_by_layer = {}
+        # The sheet builder only knows rho and t, so at a frequency it is handed
+        # t_eff - but the PHYSICAL weight is what a current density is measured
+        # against, so it is kept separately and never quietly replaced.
+        phys_by_layer = {}
+        ratio_by_layer = {}
         sheets = []
         for z in (board.zones or []):
             if z.get("net") != net or z.get("keepout") or z.get("is_keepout"):
@@ -1687,7 +1837,16 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                 if t is None:
                     zone_skipped.append(lay)
                 else:
-                    thick_by_layer[lay] = t
+                    phys_by_layer[lay] = t
+                    if freq is None:
+                        thick_by_layer[lay] = t
+                        ratio_by_layer[lay] = 1.0
+                    else:
+                        got = _slab(t)
+                        if got is None:
+                            return ac_fail[-1]
+                        ratio_by_layer[lay] = got[0]
+                        thick_by_layer[lay] = t / got[0]
         if thick_by_layer:
             sheets = ZF.build_sheets(board.zones, net, PW._rho(temp_c) * 1e3,
                                      thick_by_layer, grid_mm=zone_grid_mm,
@@ -1705,10 +1864,16 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                     znodes[k] = node(cx, cy, _lay)
                 return znodes[k]
 
+            z_ratio = ratio_by_layer.get(lay, 1.0)
             for (k1, k2, r) in ZF.sheet_edges(info):
                 add(znode(k1), znode(k2), r, "zone_sheet",
                     "%s pour %.3gmm cell" % (lay, h),
-                    layer=lay, length_mm=h, width_mm=h, copper_um=t_um)
+                    layer=lay, length_mm=h, width_mm=h,
+                    copper_um=phys_by_layer.get(lay, t_um),
+                    **({"copper_eff_um": t_um, "r_ac_over_rdc": z_ratio}
+                       if freq is not None else {}))
+                if freq is not None:
+                    ac_acc["zone"].append((r / z_ratio, r, z_ratio))
             # every node already in the graph that sits on this pour is joined to
             # it: same net, same layer, same metal. 1 uOhm, not 0, so the solver
             # has a finite conductance to work with.
@@ -1732,7 +1897,15 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                     add(node(x, y, lay), znode(key), info["sheet_ohm_per_sq"],
                         "zone_bridge", "bridged %.3gmm to pour %s" % (d, lay),
                         layer=lay, bridged_mm=round(d, 6),
-                        width_mm=info["h_mm"], copper_um=t_um)
+                        width_mm=info["h_mm"],
+                        copper_um=phys_by_layer.get(lay, t_um),
+                        **({"copper_eff_um": t_um,
+                            "r_ac_over_rdc": ratio_by_layer.get(lay, 1.0)}
+                           if freq is not None else {}))
+                    if freq is not None:
+                        _zr = ratio_by_layer.get(lay, 1.0)
+                        ac_acc["zone"].append((info["sheet_ohm_per_sq"] / _zr,
+                                               info["sheet_ohm_per_sq"], _zr))
                     zone_bridged.append({"layer": lay, "x_mm": x, "y_mm": y,
                                          "gap_mm": round(d, 6)})
         # A wide pad is not a point: a plane's current enters across the whole
@@ -1763,17 +1936,28 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                             layer=lay)
 
         if sheets:
+            sheet_rows = []
+            for s_ in sheets:
+                row = {"layer": s_["layer"], "grid_mm": round(s_["h_mm"], 6),
+                       "cells": s_["cells"],
+                       "sheet_ohm_per_sq": round(s_["sheet_ohm_per_sq"], 9),
+                       "thickness_um": (phys_by_layer.get(s_["layer"],
+                                                          s_["thick_um"])
+                                        if freq is not None else s_["thick_um"]),
+                       "from_filled_polygons": s_["fill_polygons"],
+                       "from_outline_only": s_["outline_only"]}
+                if freq is not None:
+                    _r = ratio_by_layer.get(s_["layer"], 1.0)
+                    row["copper_eff_um"] = s_["thick_um"]
+                    row["r_ac_over_rdc"] = round(_r, 9)
+                    row["sheet_ohm_per_sq_dc"] = round(
+                        s_["sheet_ohm_per_sq"] / _r, 9)
+                sheet_rows.append(row)
             zone_summary = {
                 "zones_modelled": sum(1 for z in (board.zones or [])
                                       if z.get("net") == net
                                       and not (z.get("keepout") or z.get("is_keepout"))),
-                "sheets": [{"layer": s["layer"], "grid_mm": round(s["h_mm"], 6),
-                            "cells": s["cells"],
-                            "sheet_ohm_per_sq": round(s["sheet_ohm_per_sq"], 9),
-                            "thickness_um": s["thick_um"],
-                            "from_filled_polygons": s["fill_polygons"],
-                            "from_outline_only": s["outline_only"]}
-                           for s in sheets],
+                "sheets": sheet_rows,
                 "cells_total": sum(s["cells"] for s in sheets),
                 "bridged_nodes": len(zone_bridged),
                 "wide_pads_left_point_linked": len(zone_wide),
@@ -2007,79 +2191,157 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
     max_drop = max(s["drop_mv"] for s in sink_out)
     worst_sink = max(sink_out, key=lambda s: s["drop_mv"])
     loss = sum(e["power_mw"] for e in edge_out) / 1e3
-    return ok(value={"net": net,
-                     "source": source,
-                     "total_current_a": round(total_a, 9),
-                     "max_drop_mv": round(max_drop, 6),
-                     "worst_sink": worst_sink["pad"],
-                     "worst_sink_drop_pct_of_3v3": round(100.0 * max_drop / 3.3, 6),
-                     "sinks": sink_out,
-                     "total_copper_loss_w": round(loss, 9),
-                     "worst_current_density": (worst_j or {}),
-                     "edges": sorted(edge_out, key=lambda r: -r["current_a"])[:40],
-                     "edge_count": len(edge_out),
-                     "node_count": len(names),
-                     "quantize_mm": q},
+
+    # ---- AC bookkeeping (0.0.70). Every key below is added ONLY when a
+    # frequency was given, so the DC answer keeps its exact shape too. The sums
+    # are sums over segments ("how much copper does this net present at f"), not
+    # the network resistance, and they are named that way.
+    val = {"net": net,
+           "source": source,
+           "total_current_a": round(total_a, 9),
+           "max_drop_mv": round(max_drop, 6),
+           "worst_sink": worst_sink["pad"],
+           "worst_sink_drop_pct_of_3v3": round(100.0 * max_drop / 3.3, 6),
+           "sinks": sink_out,
+           "total_copper_loss_w": round(loss, 9),
+           "worst_current_density": (worst_j or {}),
+           "edges": sorted(edge_out, key=lambda r: -r["current_a"])[:40],
+           "edge_count": len(edge_out),
+           "node_count": len(names),
+           "quantize_mm": q}
+    assumptions = {"quantize_mm": q, "temp_c": float(temp_c),
+                   "copper_um": explicit,
+                   "copper_um_source": ("explicit" if explicit is not None
+                                        else ("stackup" if cu else None)),
+                   "plating_um": plating_um,
+                   "net": net, "board_thickness_mm": board_th}
+    ac_basis = ""
+    ac_note = ""
+    if freq is not None:
+        depths = [v[1] for v in _slab_cache.values() if v]
+        depths += [v[1] for v in _barrel_cache.values() if v]
+        summary = {}
+        max_ratio = 1.0
+        for kind in ("track", "zone", "via"):
+            rows = ac_acc[kind]
+            if not rows:
+                summary[kind] = {"segments": 0}
+                continue
+            ratios = [x[2] for x in rows]
+            max_ratio = max(max_ratio, max(ratios))
+            summary[kind] = {"segments": len(rows),
+                             "sum_r_dc_ohm": round(sum(x[0] for x in rows), 9),
+                             "sum_r_ac_ohm": round(sum(x[1] for x in rows), 9),
+                             "ratio_min": round(min(ratios), 9),
+                             "ratio_max": round(max(ratios), 9)}
+        val["frequency_hz"] = freq
+        val["ac_faces"] = faces
+        val["ac_skin_depth_um"] = round(min(depths), 9) if depths else None
+        val["ac_model"] = ("1-D exact skin solve per segment: a track or a pour "
+                           "square keeps its width and gets an effective thickness "
+                           "t_eff(f), a via barrel is solved as the tube it is, and "
+                           "only resistances change - the topology and the DC path "
+                           "do not. sum_r_* are sums over segments, not the network "
+                           "resistance. No proximity effect, no lateral (edge) "
+                           "crowding along a wide strip, no phase")
+        val["ac_summary"] = summary
+        ac_basis = (", and at %.6g Hz each of those resistances is multiplied by "
+                    "the ratio its own exact 1-D solve gives - a track or a pour "
+                    "square by the slab result (t becomes t_eff(f)), a barrel by "
+                    "the Bessel tube result; the DC topology is unchanged"
+                    % freq)
+        assumptions["frequency_hz"] = freq
+        assumptions["ac_faces"] = faces
+        assumptions["mu_r"] = mur
+        assumptions["roughness_rq_um"] = rq
+        ac_note = ("a ONE-FREQUENCY answer at %.6g Hz (faces=%r): the skin effect "
+                   "IS in it, but only through the THICKNESS of each conductor - "
+                   "there is no proximity effect, no lateral crowding along a wide "
+                   "strip, no connector contact and no phase, so the real |Z| at "
+                   "this frequency is worse than this number. A current that has "
+                   "both a DC part and a ripple needs two calls: the copper LOSS "
+                   "adds (I_dc^2*R_dc + I_ac^2*R_ac), a voltage drop does not"
+                   % (freq, faces))
+        if worst_j:
+            warnings.append(
+                "current_density_a_per_mm2 stays the DC average over the PHYSICAL "
+                "cross-section; at %.6g Hz the current rides near the surface, so "
+                "the local peak density is up to %.3g times higher on this net "
+                "(that is what r_ac_over_rdc in ac_summary says)" % (freq, max_ratio))
+
+    if zone_summary:
+        nc = ["pad and plane spreading resistance at the contact",
+              "thermal-relief spokes on a pad joined to the pour "
+              "(modelled as solid copper)",
+              "temperature rise feedback (rho uses temp_c)",
+              "current capacity / fusing (needs a "
+              "temperature-rise criterion, not a current)"]
+    else:
+        nc = ["copper pour / plane in parallel",
+              "pad and plane spreading resistance",
+              "temperature rise feedback (rho uses temp_c)",
+              "current capacity / fusing (needs a "
+              "temperature-rise criterion, not a current)"]
+    if freq is None:
+        nc.insert(0 if zone_summary else 1, "skin effect")
+    else:
+        nc.append("proximity effect (eddy currents in a neighbouring trace, or "
+                  "the return plane's own eddy currents)")
+        nc.append("lateral current crowding: a wide strip's current piles up at "
+                  "the edges, which a 1-D thickness solve cannot see")
+
+    if freq is None:
+        prec = ("a DC answer, and a bound in the direction of missing copper: "
+                "skin effect, pad/plane spreading and connector contact are not "
+                "in it (so the real drop is worse)")
+    else:
+        prec = ac_note
+    prec = (prec
+            + (". The pour IS in it, as a sheet gridded at the pitch "
+               "in zone_summary - the sheet resistance does not depend "
+               "on that pitch, the current spreading near a contact "
+               "does. A pad joined to the pour is modelled as SOLID "
+               "copper at %.0e ohm, so where a thermal-relief spoke "
+               "is the real connection this drop is a LOWER bound. "
+               "Zone priority, minimum width and the clearance ring to "
+               "other nets are not solved for, they are taken from the "
+               "fill the file already carries"
+               % _ZF_LINK_OHM if zone_summary else
+               ", while a pour on the same net is not in it either "
+               "(so this drop is an upper bound)")
+            + ". Nodes closer than quantize_mm are merged, so a hairline gap "
+              "below that is invisible")
+
+    basis = ("every track segment becomes rho(T)*L/(w*t) with t from the "
+             "stackup copper weight, every via a barrel of "
+             "pi*((d/2)^2 - (d/2-p)^2), plated pads join their layers"
+             + (", and every copper pour on this net is a 2-D sheet of "
+                "rho(T)/t per square gridded and four-connected, with the "
+                "pitch stated per layer" if zone_summary else "")
+             + ac_basis
+             + "; the graph is solved by nodal analysis with the source "
+               "pad at 0 V"
+             + (" (conjugate gradients, residual reported)"
+                if zone_summary else ""))
+
+    return ok(value=val,
               unit="mV",
               model=("track_via_pad_zone_resistor_graph" if zone_summary
                      else "track_via_pad_resistor_graph"),
-              basis=("every track segment becomes rho(T)*L/(w*t) with t from the "
-                     "stackup copper weight, every via a barrel of "
-                     "pi*((d/2)^2 - (d/2-p)^2), plated pads join their layers"
-                     + (", and every copper pour on this net is a 2-D sheet of "
-                        "rho(T)/t per square gridded and four-connected, with the "
-                        "pitch stated per layer" if zone_summary else "")
-                     + "; the graph is solved by nodal analysis with the source "
-                       "pad at 0 V"
-                     + (" (conjugate gradients, residual reported)"
-                        if zone_summary else "")),
-              precision=("a DC answer, and a bound in the direction of missing "
-                         "copper: skin effect, pad/plane spreading and connector "
-                         "contact are not in it (so the real drop is worse)"
-                         + (". The pour IS in it, as a sheet gridded at the pitch "
-                            "in zone_summary - the sheet resistance does not depend "
-                            "on that pitch, the current spreading near a contact "
-                            "does. A pad joined to the pour is modelled as SOLID "
-                            "copper at %.0e ohm, so where a thermal-relief spoke "
-                            "is the real connection this drop is a LOWER bound. "
-                            "Zone priority, minimum width and the clearance ring to "
-                            "other nets are not solved for, they are taken from the "
-                            "fill the file already carries"
-                            % _ZF_LINK_OHM if zone_summary else
-                            ", while a pour on the same net is not in it either "
-                            "(so this drop is an upper bound)")
-                         + ". Nodes closer than quantize_mm are merged, so a "
-                           "hairline gap below that is invisible"),
-              assumptions={"quantize_mm": q, "temp_c": float(temp_c),
-                           "copper_um": explicit,
-                           "copper_um_source": ("explicit" if explicit is not None
-                                                else ("stackup" if cu else None)),
-                           "plating_um": plating_um,
-                           "net": net, "board_thickness_mm": board_th},
+              basis=basis,
+              precision=prec,
+              assumptions=assumptions,
               extra={"warnings": warnings,
                      "zone_summary": zone_summary,
                      "solver": solver_info,
-                     "not_computed": (
-                         ["skin effect",
-                          "pad and plane spreading resistance at the contact",
-                          "thermal-relief spokes on a pad joined to the pour "
-                          "(modelled as solid copper)",
-                          "temperature rise feedback (rho uses temp_c)",
-                          "current capacity / fusing (needs a "
-                          "temperature-rise criterion, not a current)"]
-                         if zone_summary else
-                         ["copper pour / plane in parallel",
-                          "skin effect",
-                          "pad and plane spreading resistance",
-                          "temperature rise feedback (rho uses temp_c)",
-                          "current capacity / fusing (needs a "
-                          "temperature-rise criterion, not a current)"])})
-
+                     "not_computed": nc})
 
 # ------------------------------------------------------------------------ DFM
 # Design-for-manufacture: measure the facts a fab capability document talks
 # about, and hand them to calc/dfm.py. The limits never come from here - this
 # half of the job is only "what does the board actually carry".
+
+
 def _hole_list(board):
     """Every drilled hole on the board, vias and pads together.
 

@@ -4488,6 +4488,116 @@ def selftest():
              _sp_dc.get("reason_code"), _hfc.get("dlnr_dlnrho"),
              _hfc.get("dlnP_dlnrho_weighted_check")))
 
+    # ---- 0.0.70: copper is not one thickness. Give board_ir_drop a frequency
+    # and every conductor is scaled by the ratio its OWN 1-D solve gives - a
+    # 20 mm x 0.5 mm track plus the pads, 35 um, one face. The first check is the
+    # one that matters most: the DC answer must not move by a single digit,
+    # because a frequency that was never given cannot have changed anything.
+    _ac_tmp = _tempfile.mkdtemp(prefix="pcbagent-ac-")
+    _ac_path = os.path.join(_ac_tmp, "ac.kicad_pcb")
+    with open(_ac_path, "w", encoding="utf-8", newline="\n") as _fh:
+        _fh.write((
+            '(kicad_pcb (version 20221018) (generator pcbnew)\n'
+            '  (general (thickness 1.6))\n'
+            '  (layers (0 "F.Cu" signal) (31 "B.Cu" signal)'
+            ' (44 "Edge.Cuts" user))\n'
+            '  (setup (stackup\n'
+            '      (layer "F.Cu" (type "copper") (thickness 0.035))\n'
+            '      (layer "dielectric 1" (type "core") (thickness 1.53))\n'
+            '      (layer "B.Cu" (type "copper") (thickness 0.035))))\n'
+            '  (net 0 "") (net 1 "VCC")\n'
+            '  (gr_rect (start 0 0) (end 30 20) (layer "Edge.Cuts")'
+            ' (width 0.1))\n'
+            '  (footprint "T:A" (layer "F.Cu") (at 5 10)\n'
+            '    (fp_text reference "U1" (at 0 -3) (layer "F.SilkS"))\n'
+            '    (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu")'
+            ' (net 1 "VCC")))\n'
+            '  (footprint "T:B" (layer "F.Cu") (at 25 10)\n'
+            '    (fp_text reference "U2" (at 0 -3) (layer "F.SilkS"))\n'
+            '    (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu")'
+            ' (net 1 "VCC")))\n'
+            '  (segment (start 5 10) (end 25 10) (width 0.5) (layer "F.Cu")'
+            ' (net 1) (tstamp 1)))\n'
+        ))
+    _ac_base = {"path": _ac_path, "net": "VCC", "source": "U1.1",
+                "sinks": ["U2.1"], "current_a": 1.0}
+    _ac_dc = _call("board_ir_drop", dict(_ac_base), 1860)
+    _ac_dcv = _ac_dc.get("value") or {}
+    _ac_none = _call("board_ir_drop", dict(_ac_base, frequency_hz=None), 1860)
+    _ac_def = _call("board_ir_drop", dict(_ac_base, frequency_hz=None,
+                                         faces="one", mu_r=1.0,
+                                         roughness_rq_um=None), 1860)
+    _ac_nv = _ac_none.get("value") or {}
+    _ac_fv = _ac_def.get("value") or {}
+    check("leaving frequency_hz out is DC to the digit: 19.702857 mV / 0.019702857 W"
+          " come out identical whether the argument is absent, explicitly null, or"
+          " handed the defaults (faces='one', mu_r=1.0, Rq null), the"
+          " not_computed list stays the five-item DC list that still names the"
+          " skin effect, and no ac_summary key appears at all - the shape of the"
+          " DC answer is part of the DC answer",
+          _ac_dc.get("status") == "ok"
+          and _ac_dcv.get("max_drop_mv") == _ac_nv.get("max_drop_mv")
+          == _ac_fv.get("max_drop_mv")
+          and _ac_dcv.get("total_copper_loss_w")
+          == _ac_nv.get("total_copper_loss_w")
+          == _ac_fv.get("total_copper_loss_w")
+          and abs((_ac_dcv.get("max_drop_mv") or 0) - 19.702857) < 1e-6
+          and _ac_dc.get("not_computed") == _ac_none.get("not_computed")
+          == _ac_def.get("not_computed")
+          and "skin effect" in (_ac_dc.get("not_computed") or [])
+          and "ac_summary" not in _ac_dcv and "ac_summary" not in _ac_nv,
+          "drop %s / %s / %s mV" % (_ac_dcv.get("max_drop_mv"),
+                                    _ac_nv.get("max_drop_mv"),
+                                    _ac_fv.get("max_drop_mv")))
+
+    _ac_v = _call("board_ir_drop", dict(_ac_base, frequency_hz=1.0e6),
+                  1861).get("value") or {}
+    _ac_s = (_ac_v.get("ac_summary") or {}).get("track") or {}
+    check("1 MHz on 1 oz copper: 19.702857 -> 19.840259 mV (x1.006973727), skin "
+          "depth 66.0828 um against a 35 um foil, and the ratio in ac_summary is "
+          "the same number to nine places - the per-segment factor is the module "
+          "skin.ac_sheet_resistance's own answer, not a second implementation "
+          "that could drift",
+          _ac_v.get("frequency_hz") == 1.0e6
+          and abs((_ac_v.get("max_drop_mv") or 0) - 19.840259) < 1e-6
+          and abs((_ac_v.get("ac_skin_depth_um") or 0) - 66.082849628) < 1e-6
+          and _ac_s.get("segments") == 1
+          and abs((_ac_s.get("ratio_max") or 0) - 1.006973727) < 1e-9
+          and abs((_ac_s.get("sum_r_ac_ohm") or 0) - 0.019840259) < 1e-9,
+          "drop %s mV, depth %s um, ratio %s"
+          % (_ac_v.get("max_drop_mv"), _ac_v.get("ac_skin_depth_um"),
+             _ac_s.get("ratio_max")))
+
+    _ac_z = _call("board_ir_drop", dict(_ac_base, frequency_hz=0.0), 1862)
+    check("frequency_hz = 0 is refused with ARG_RANGE, not silently treated as "
+          "DC: a caller who typed 0 wanted a frequency answer and there is none "
+          "at zero",
+          _ac_z.get("status") == "error"
+          and _ac_z.get("reason_code") == "ARG_RANGE"
+          and "frequency_hz" in (_ac_z.get("message") or ""),
+          str(_ac_z.get("reason_code")))
+
+    _ac_t = _call("board_ir_drop", dict(_ac_base, frequency_hz=1.0e6,
+                                        faces="three"), 1862)
+    check("faces is refused unless it is 'one' or 'two': the factor of two is "
+          "the whole reason the argument exists, so a typo must not fall back to "
+          "one face",
+          _ac_t.get("status") == "error"
+          and _ac_t.get("reason_code") == "ARG_INVALID"
+          and "factor of two" in (_ac_t.get("message") or ""),
+          (str(_ac_t.get("reason_code")) + " / "
+           + (_ac_t.get("message") or "")[:60]))
+
+    _ac_o = _call("board_ir_drop", dict(_ac_base, faces="two"), 1862)
+    check("faces without a frequency is refused instead of ignored: accepting it "
+          "and answering the DC number would be lying by omission, and the "
+          "message names frequency_hz so the fix is obvious",
+          _ac_o.get("status") == "error"
+          and _ac_o.get("reason_code") == "ARG_INVALID"
+          and "frequency_hz" in (_ac_o.get("message") or ""),
+          str(_ac_o.get("reason_code")))
+    _shutil.rmtree(_ac_tmp, ignore_errors=True)
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
