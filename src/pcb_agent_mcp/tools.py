@@ -16,6 +16,7 @@ from . import oracle as _oracle
 from .fidelity import views as _fviews
 from .calc import current as _current
 from .calc import currentfield as _cfield
+from .calc import skin as _skin
 from .calc import creepage as _creepage
 from .calc import diffpair as _diffpair
 from .calc import field2d as _field2d
@@ -3650,6 +3651,7 @@ def _capabilities(_args):
             "unit_convert", "width_for_current", "current_capacity",
             "via_current_allowed", "fusing_current", "fusing_current_taper",
             "repetitive_pulse_rating", "current_density_field",
+            "ac_sheet_resistance",
             "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "coplanar_field", "coplanar_pair_field", "crosstalk_coupled_lines",
@@ -4047,8 +4049,10 @@ def _capabilities(_args):
             "thermal resistance are still not done. Still not done: "
             "3-D (as above, layered only), internal plane-to-plane radiation through the laminate, "
             "temperature-dependent emissivity, component thermal mass and contact "
-            "resistance, AC loss (skin/proximity), device self-heating inside "
-            "sim_spice, reading the conductors or the zones straight off a board "
+            "resistance, AC loss (skin/proximity) - ac_sheet_resistance gives the "
+            "1-D skin term of a FLAT sheet but nothing here turns a loss into a "
+            "temperature at frequency - device self-heating inside sim_spice, "
+            "reading the conductors or the zones straight off a board "
             "file - board_electrothermal takes geometry, it does not open the "
             ".kicad_pcb for "
             "you",
@@ -4094,7 +4098,11 @@ def _capabilities(_args):
             "pad covering more than 2000 cells is tied at its anchor only, which "
             "over-states its spreading resistance; and the whole model is DC, so skin "
             "effect, the plane's own resonance (pdn_plane_impedance) and any "
-            "frequency-dependent copper are not in it. The switch defaults OFF and the "
+            "frequency-dependent copper are not in it (ac_sheet_resistance is the "
+            "separate 1-D answer for one flat sheet, and current_density_field "
+            "takes frequency_hz to scale its own sheet conductance, but a 2-D "
+            "pattern whose current re-distributes across the sheet at frequency "
+            "is still not solved). The switch defaults OFF and the "
             "answer without it is byte-identical to 0.0.63 - a pour-only net is still "
             "NOT_APPLICABLE/singular unless the caller asks for the sheet",
             "The plane-caps network is COMPUTED now (pdn_plane_with_caps: the cavity "
@@ -5490,6 +5498,14 @@ _tool(
                            "instead of a number", 30000),
         "omega": _num("SOR over-relaxation; omit for 1.97 (measured optimum on mixed "
                       "Dirichlet/Neumann copper)"),
+        "frequency_hz": _num("OPTIONAL AC: reduce the sheet conductance to the AC "
+                             "value of this thickness (exact 1-D skin effect), so R "
+                             "and the power come back as AC ones. Omit and the "
+                             "answer is the DC one, byte for byte as before"),
+        "skin_faces": _str("with frequency_hz: 'one' (return current on one side: "
+                           "microstrip, plane over its return) or 'two' "
+                           "(symmetric: stripline, plane between two returns)",
+                           "one"),
     }, "required": ["source", "sink"]},
     lambda a: _cfield.current_density_field(
         paths=a.get("paths"), polygons=a.get("polygons"),
@@ -5507,7 +5523,66 @@ _tool(
         tol=(a.get("tol") if a.get("tol") is not None else 1e-8),
         max_sweeps=int(a.get("max_sweeps")
                        if a.get("max_sweeps") is not None else 30000),
-        omega=a.get("omega")),
+        omega=a.get("omega"),
+        frequency_hz=a.get("frequency_hz"),
+        skin_faces=(a.get("skin_faces") if a.get("skin_faces") is not None
+                    else "one")),
+)
+
+_tool(
+    "ac_sheet_resistance",
+    "Skin effect in a flat conductor: R_ac/R_dc, the skin depth, the effective "
+    "thickness and the J(z) profile, from the EXACT 1-D diffusion solution in the "
+    "thickness direction. Answers the question every DC copper tool here refuses: at "
+    "what frequency does this copper stop being DC, and by how much does the answer "
+    "move. Two face conditions, and they differ by a factor of two in effective "
+    "thickness - 'one' (return current on one side: microstrip, a plane over its "
+    "return) or 'two' (symmetric: stripline, a plane between two returns). Returns "
+    "the frequencies where R has grown 1 %, 10 % and 2x, which is the number that "
+    "decides whether the DC tools are still allowed. It is 1-D: no lateral "
+    "redistribution along the width, no edge crowding, no proximity effect from a "
+    "neighbouring trace or the return plane's own eddy currents, and roughness only "
+    "if you pass Rq (Hammerstad-Jensen multiplier). Feeds current_density_field: give "
+    "it the same frequency and it solves the same 2-D geometry with the reduced sheet "
+    "conductance, but the PATTERN is unchanged - that is the limit of a uniform "
+    "thickness correction, and it says so.",
+    {"type": "object", "properties": {
+        "frequency_hz": _num("frequency, Hz. Required: a skin depth without a "
+                             "frequency is just a length"),
+        "thickness_mm": _num("conductor thickness, mm (use this or thickness_um)"),
+        "thickness_um": _num("conductor thickness, um: 35 = 1 oz, 17.5 = half oz, "
+                             "12 = HVLP foil"),
+        "rho_ohm_mm": _num("resistivity, ohm*mm; omit for copper at temp_c "
+                           "(1.724e-5 at 20 C)"),
+        "temp_c": _num("copper temperature, C - only used when rho_ohm_mm is omitted",
+                       20.0),
+        "mu_r": _num("relative permeability of the conductor, 1.0 for copper", 1.0),
+        "faces": _str("'one' (return current on one side: microstrip, plane over a "
+                      "return) or 'two' (symmetric: stripline, plane between two "
+                      "returns). The effective thickness differs by 2x", "one"),
+        "length_mm": _num("conductor length, mm - with width_mm it turns the sheet "
+                          "numbers into an absolute ohm value"),
+        "width_mm": _num("conductor width, mm"),
+        "dc_resistance_ohm": _num("an already known DC resistance to scale instead of "
+                                  "a geometry (exclusive with length_mm/width_mm)"),
+        "roughness_rq_um": _num("RMS surface roughness Rq in um (NOT Rz): applies the "
+                                "Hammerstad-Jensen multiplier. Omit and the number is "
+                                "a smooth-copper lower bound"),
+        "profile_samples": _num("how many depths the J(z) profile is reported at "
+                                "(>= 2)", 9),
+    }, "required": ["frequency_hz"]},
+    lambda a: _skin.ac_sheet_resistance(
+        a.get("frequency_hz"),
+        thickness_mm=a.get("thickness_mm"), thickness_um=a.get("thickness_um"),
+        rho_ohm_mm=a.get("rho_ohm_mm"),
+        temp_c=(a.get("temp_c") if a.get("temp_c") is not None else 20.0),
+        mu_r=(a.get("mu_r") if a.get("mu_r") is not None else 1.0),
+        faces=(a.get("faces") if a.get("faces") is not None else "one"),
+        length_mm=a.get("length_mm"), width_mm=a.get("width_mm"),
+        dc_resistance_ohm=a.get("dc_resistance_ohm"),
+        roughness_rq_um=a.get("roughness_rq_um"),
+        profile_samples=(a.get("profile_samples")
+                         if a.get("profile_samples") is not None else 9)),
 )
 
 _tool(
@@ -6672,7 +6747,10 @@ _tool(
     "with the contraction gain dP/dT*Rth checked exactly - above 1 it returns "
     "THERMAL_RUNAWAY instead of a number. Rth is REQUIRED (one lump: from thermal_stack / "
     "via_array_thermal / plate_temperature, or measured); this module owns no default Rth. "
-    "DC only.",
+    "DC only: at a frequency the copper resistance is not rho*L/(w*t) any more "
+    "(ac_sheet_resistance is the 1-D answer), and that loss still has to become "
+    "heat here - electrothermal_conductor takes the cold resistance directly "
+    "instead of deriving it from geometry.",
     {"type": "object", "properties": {
         "length_mm": _num("trace length"),
         "width_mm": _num("trace width"),

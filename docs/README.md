@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这六十九篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这七十篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 > **完成度总账在仓库根 README 的「一页速查：做完了什么 / 还差什么」**（哪些做完、哪些结构上不做、
@@ -59,6 +59,7 @@
 | 66 | [电流场](66-电流场.md) | 宽度算得对，为什么电流密度算不对？拐角处那个峰值能不能引用？ | 「`J = I/(w·t)` 在几何变化处错得没有方向指示」——直角弯内侧是 270° 内角，`J ~ r^(-1/3)` **发散**，峰值随网格加密按 `2^(1/3)` 涨（实测 1.266 / 1.262 对理论 1.2599），所以峰值**只许在 `peak_is_grid_convergent` 为真时引用**，否则引用环读数（`decay = 0.7963` 对理论 0.7937，这个不随网格变）；「切掉内角尖端就降峰值」——**反了**，倒角造出一条 0.35 mm 的颈，峰值 **+93 %**（74.174 → 142.878）、电阻 +17 %；有效的是 45° 斜接（−30 %）与内角补铜（−36 %）；「接触边缘的 `J` 该改布局」——等势块与铜的交界按构造就奇异，能改的只有触点形状 |
 | 67 | [铺铜与 IR-Drop](67-铺铜与IR-Drop.md) | 大板上一量 `+3V3` 就 `singular at 21`，为什么这不是 bug？铺铜进网络以后那个数能信吗？ | 「只用走线建图就够了」——这块板的 `+3V3` 有 315 段走线但分成**两个互不相连的子图**，唯一连它们的是 `In2.Cu` 上一块 17832 mm² 的平面，于是判据不是「算得准不准」而是「有没有可解的对象」；「按包围盒规划栅距就行」——`B.Cu` 上 5 块 2×2 mm 小铺铜散在 112×79 mm 里，bbox 规划给 `h=1.816`、**整层 11 格**，改成 shoelace 填充面积立刻 `h=0.2`、1085 格；「焊盘是点接触」——点接触凭空造出扩展电阻，分布式接触给 **1.9 方块 = 0.9359 mV**（20 mm/10 mm 的 2 方块是上界，+5 %），实测 **0.935986 mV** 差 0.01 %；「换个求解器不改变答案」——无铺铜时 CG 与稠密解逐位相同（19.702857 / 20.979986 mV），7×7 薄片 `max|dv|` 2.6e-12；「IC(0) 装上就行」——平行边在邻接里被重复计入破坏 pattern，残差卡在 0.09、迭代 20000、跑 43 s，折叠后 **52 次迭代**、0.17 s |
 | 68 | [PDN 负载阶跃](68-PDN负载阶跃.md) | 负载跳了轨掉多深、多久回来？这和 |Z(f)| 是同一个问题吗？ | 「带内 |Z| 平就不会掉」——**不是同一张表**：一阶网络先掉 `I*ESR` 再指数回，`1 Ω`+`1 µF`+`10 mΩ` 的 `1 A` 阶跃在 1 µs 到 −0.6350 V（闭式 −0.6358，后向欧拉 0.13 %），而 DC 尾是 −1.000 V；「时间常数是 `C(R‖ESR)`」——**只决定起点**，速度由串联和 `C(R_s+ESR)` 定，写错就是 10 倍；「电容路都在同一节点」——全部 `at='die'` 时平面被静默丢掉，2 mΩ 板报 −10.00 mV 而真值 −30.00 mV，修完峰值 −32.52 vs bulk −52.94（1.63×），**摆位进的是峰值不是 DC 尾**；「理想阶跃进电感也能给个数」——`V=L·dI/dt` 由步长决定（0.25 ns/20 A ⇒ 16 V、`h_refine` 100 %），改成 `ARG_REQUIRED`；「振铃的首摆不会超过 DC 答案」——`ζ=0.25` 时 `undershoot 0.0604 V > |final| 0.0500 V`；「自己检自己就够了」——同一网络丢给 ngspice 逐点对表：一阶最大 0.126 %、LC 峰值低 1.27 %、bulk 0.42 %，**一律偏低**（反向欧拉的数值阻尼，所以报的 Q 是下界） |
+| 69 | [趋肤效应与交流电流分布](69-趋肤效应与交流电流分布.md) | 铜的电阻到多少频率就不该再按 DC 算了？板内电流沿厚度怎么分布？这个问题能闭式算准到什么程度？ | 「DC 铜就是铜」——1 oz 铜 `R` 高出 DC 1 % 的频率是 **1.198 MHz**、10 MHz 是 **1.5408 倍**，DC 答案在这一段上不是「精度差一点」；「越厚越晚进入趋肤」——`s = t/δ`，2 oz 的 `f_1%` 是 1 oz 的 **1/4**（299 564 Hz），且同一频率下越厚 `R_ac/R_dc` 越大（70 µm@1 MHz 1.1068 对 35 µm 1.0070），「厚铜有利」只对**绝对** `R_ac` 成立；「小 s 直接套公式」——`cosh2s − cos2s` 在 `s=0.01` 相消丢 8 位，把 `R−1=1.3e-9` 算成 `3e-5`（换半角恒等式）；「`s⁴` 系数是 2/15」——60 位 Decimal 实测 **4/45**，这条是被 `checks` 里那条能失败的残差抓出来的；「一个 δ 内占 63 % 电流」——那是**密度**比 `1−e⁻¹`，**电流**占比是 `\|1−e^{-(1+j)}\| = 0.8589`；「AC 下 `J` 和 DC 同一个量」——`G=t_eff/ρ` 让输出的 `J` 是**表面值**，毛厚度均值是它除以 `r`（20×2 mm 带 10 MHz：`peak_j` 上升 1.5408 倍，`peak_j_gross` 与 `crowding_factor` 不动）；「给 `current_density_field` 加个频率就完事」——只缩放电导，横向重分布/边沿拥挤/邻近效应都不在解里，`limits.not_modelled` 写了 6 条；「闭式解自己验自己就够」——另写复三对角 FD（n=501..8001），差 0.2004→0.0125 % 精确按 O(dz²) 减半 |
 | 61 | [电热的厚度方向](61-电热-层间三维与多平面耦合.md) | 板厚方向怎么耦合？内层平面为什么不算对流？一次 8.5 K 的静默错答案是怎么来的？ | 「一块均质板就够了」——热源在顶层、地板在另一面，厚度方向是一段必须解的串联；「z 方向也扫一下就行」——刚性耦合下第 1 次扫描就假收敛，`k_z=1e6` 返回 26.2468 而真值 34.77；「内部层也有对流」——埋进板里的平面确实没有空气 |
 | 43 | [随包 SPICE 内核：不重写引擎，把最小内核装进包里](43-随包SPICE内核.md) | 为什么不再自己实现 `A`、随包的那一份到底要哪些文件、`engine="auto"` 为什么不看它、混搭许可怎么和 MIT 共存？ | 「`A` 在本机 ngspice 上跑不了」——**错的**：模型名写成 `amp`（应为 `gain`）+ 手工树缺 `spinit`，同一份二进制补齐后 `gain(gain=2)` 读 2.000 V；「`spinit` 按 cwd 找」——按**可执行文件所在目录**找；「`lib/ngspice/*.cm` 是装饰」——把 `analog.cm` 写成垃圾文本立刻 `MIF-ERROR`；「设 `SPICE_LIB_DIR` 总没坏处」——它会**顶掉** `spinit` 的查找基准，对有 `spinit` 的树设它等于把引擎弄坏；「ngspice 是 GPL」——`COPYING` 默认是 Modified BSD，GPLv2+ 只管 `table.cm`，共存靠独立进程；「仓库里多 14 MB 会改 `auto` 的答案」——`auto` 走 `allow_bundled=False`，行为零变化 |
 
@@ -260,27 +261,8 @@
 - `64` → `lceda_write.VERIFIED_WRITES`（桥版本 → 该版本上真跑过的 op、日期、逐条读数、`still_not_verified`）与 `_gate()`/`run(..., op=, bridge_version=)`：`verified_against_app` 从硬编码 `false` 改成「版本命中 **且** op 在表里 **且** 这一次效应被读到」才为真，`lceda_pcb_write` 从 `client.identity`/`ping` 取桥版本、`precision` 与 `assumptions` 跟 `report` 走；`docs/64` 记下七条实测坑（`fn='run'` 收到的是函数体必须 `return`、空串要写 `"''"`、`SNIPPET_NO_RECEIVER` 因 callPath 是 `pcb_PrimitiveLine.`、save 异步落盘、重开后 `session.list` 可能为空、`JSON.stringify` 判空不可靠、Electron 不向 UIA 暴露控件）；`tests/test_lceda_live.py` 新增 `TheGateOpensOnlyWhereAMeasurementExists` **8 例**（正例 + 四条能失败的负控制 + 工具层两条）；工具数不变（**168**），selftest **213/213** 不变
 - `65` → `edit/epro_edit.ACCEPTED_ARCHIVES`（容器 → 实测条目：`measured_on` / `app` / `bridge` / `door` / 四条 run 带 `bytes`+`sha256`+`read_back` / `limits`）与 `_acceptance` / `_acceptance_report` / `_not_verified_text`：`apply_plan` 与 `propose` 新增 `app_acceptance`，`not_verified` 命中表时给出两条 sha256 + 两边回读 + 四件不覆盖的事，**未命中时逐字保留旧文案**；`verified_by_app` 语义未动（它说的是「这个 op 形态是厂商被观察到写过的」，与「应用接受这份归档」是两件事）；`tests/test_epro_edit.py` 新增 `TestAppAcceptance` **12 例**（表存在 / 四臂齐 / 差异只在那一条线 / `19.685×0.0254≈0.5` / 垃圾流回读为空 / 未知容器不宣称 / 旧文案逐字保留）；工具数不变（**168**）
 - `66` → `calc/currentfield.py`（**新文件**，约 940 行）：`current_density_field(paths, polygons, source, sink, ...)` 解 `div(sigma*grad V) = 0`，离散是**薄层电导 `G = t/rho`**（与格距无关 ⇒ 均匀条带精确给出 `R = (rho/t)(L/W)`，实测 −0.50 %，差值来自触点在列中心）；`_sor` + `_prolong` 的 cascadic 多重网格（`omega` 默认 **1.97**，注释带 omega 扫描表：1.85→7.0 s、1.93→5.6、1.95→4.5、1.97→3.1、≈2.0 振荡）；`_currents` **按边遍历**；`_narrowest_section` 取「载流 ≥ 90 % 最大载流」的切面里最小面积（第一版按列数格胞把胶囊端点锥尖当最窄截面，`crowding_factor` 掉到 0.435）；三环 annulus 读数 + `peak_growth` / `peak_is_grid_convergent`。四条解析锚点：均匀条带 `peak/median = growth = 1.0000`、4:1 阶跃窄段恰 4 倍、弯的 growth **1.266/1.262 对 `2^(1/3)` = 1.2599**、环 `decay` **0.7963 对 0.7937**；布局三条：45° 斜接 **−30 %**、内角补铜 −36 %、**倒角 +93 %**。`tests/test_currentfield.py` **19 例**（4 锚点 + 4 奇异性 + 9 条 fail-closed + 2 条信封诚实性），工具数 **168 → 169**，`fusing_current_taper` 的 precision 加一句指向它（都测同一个颈）。
-            "It is steady state, so it says where the crowding is, not when the neck "
-            "melts - those two answers still do not meet",
-            "The copper pour in board_ir_drop is a SHEET, not a solved fill "
-            "(model_zones=true, 0.0.64): every same-net zone is gridded at a pitch "
-            "planned from the area its fill covers (clamped to 0.2-2.0 mm), each cell "
-            "is one square of rho(T)/t and four-connected, and pads / track ends inside "
-            "the fill are tied to it with a 1 uOhm link. What that leaves out, by name: "
-            "THERMAL-RELIEF SPOKES ARE NOT MODELLED - a pad sitting in the fill is "
-            "treated as solid copper, so where a spoke is the real connection this "
-            "drop is a LOWER bound (the one place this answer can be optimistic); a "
-            "node within zone_link_mm of the fill but outside it is bridged with ONE "
-            "sheet square, an order-of-magnitude stand-in for a spoke or an unfilled "
-            "sliver and the crudest number in the answer; zone priority, minimum width "
-            "and the clearance ring to other nets are taken from the fill the file "
-            "already carries rather than solved for; pour islands the source cannot "
-            "reach are dropped (they carry no current) and the count is reported; a "
-            "pad covering more than 2000 cells is tied at its anchor only, which "
-            "over-states its spreading resistance; and the whole model is DC, so skin "
-            "effect, the plane's own resonance (pdn_plane_impedance) and any "
-            "frequency-dependent copper are not in it. The switch defaults OFF and the "
-            "answer without it is byte-identical to 0.0.63 - a pour-only net is still "
-            "NOT_APPLICABLE/singular unless the caller asks for the sheet",
+- `67` → `calc/zonefield.py`（**新文件**）：`board_ir_drop(model_zones=true)` 把同网络铺铜当**薄片**解——按填充面积（shoelace）规划栅距并夹在 0.2–2.0 mm，每格一个 `rho(T)/t` 方块四面连通，落在填充里的焊盘/走线端用 1 µΩ 链到格点上。三件判据：`B.Cu` 5 块 2×2 mm 小铺铜 bbox 规划给 `h=1.816`（整层 11 格）而面积规划给 `h=0.2`（1085 格）；1.9 方块 `0.9359 mV` 实测 `0.935986`（0.01 %）；无铺铜时 CG 与稠密解逐位相同。术语：THERMAL-RELIEF 辐条不建模（那里报的是**下界**）、铺铜外 `zone_link_mm` 内只用一个方块桥接（全表最粗的数）、整个模型仍是 DC。
+- `68` → `calc/power.py` 的 `pdn_step_response`（`_pdn_step_network` / 后向欧拉 / 波形 + 四条闭式锚）：时域 droop 与 `|Z(f)|` 是**两张表**，所以是新工具而不是开关。锚点：一阶网络 1 µs 到 −0.6350 V（闭式 −0.6358）、DC 尾 = `-I*(R_s+plane_r)`、纯电容对后向欧拉精确、LC 周期 `2π√(LC)`；换求解器：同一网络丢给 ngspice 逐点对表（一阶最大 0.126 %、LC 峰值低 1.27 %，**一律偏低**⇒ 报的 Q 是下界）。`rise_ns` 缺失时 `ARG_REQUIRED`，因为理想阶跃的 `V=L·dI/dt` 是步长，不是物理。
+- `69` → `calc/skin.py`（**新文件**，约 500 行）：`ac_sheet_resistance(frequency_hz, thickness_mm|thickness_um, faces='one'|'two', ...)` 是薄板内沿厚度 1-D 扩散的**精确解**，`R_ac/R_dc = s(sinh2s+sin2s)/(cosh2s−cos2s)`，`faces='two'` 只是把厚度折半（自检断言 `two@35 µm ≡ one@17.5 µm` 到 1e-12）。`_ratio_from_s` 用**半角恒等式**（`cosh2s−cos2s → 2(sinh²s+sin²s)`），否则 `s=0.01` 相消丢 8 位；`s ≥ 20` 走渐近 `(s, s)`。`current_density_field` 复用它的 `t_eff`（`G = t_eff/rho`），默认路径逐位不变，给 `frequency_hz` 时`R` 与 `peak_j` 同乘 `r_ac_over_r_dc`、`crowding_factor` 不动。`tests/test_skin.py` **44 例**（3 极限 + FD 跨解器 + face 恒等 + 2 oz 反直觉 + 粗糙度 + 温度 + 11 条 fail-closed + 信封 + 与 2-D 工具对表），工具数 **170 → 171**。
 
-- 代码里的每条"拒绝回答"分支，都能在这六十八篇里找到对应的判据来源。
+- 代码里的每条"拒绝回答"分支，都能在这七十篇里找到对应的判据来源。

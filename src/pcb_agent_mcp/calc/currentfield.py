@@ -601,8 +601,19 @@ def current_density_field(paths=None, polygons=None, thickness_mm=0.035,
                           rho_ohm_mm=CU_RHO_20_OHM_MM, source=None, sink=None,
                           current_a=1.0, h_mm=None,
                           max_unknowns=DEFAULT_MAX_UNKNOWNS, levels=4,
-                          tol=1e-8, max_sweeps=30000, omega=None):
-    """2-D steady current density field on a rasterised copper region."""
+                          tol=1e-8, max_sweeps=30000, omega=None,
+                          frequency_hz=None, skin_faces="one"):
+    """2-D current density field on a rasterised copper region.
+
+    DC unless `frequency_hz` is given.  With a frequency the sheet conductance is
+    reduced to the AC value of the same slab (skin.slab_surface_impedance, the
+    exact 1-D solution through the thickness), so R and the power come back as
+    the AC ones and the lateral field is unchanged - a uniform thickness
+    correction, which is what a 2-D sheet can honestly carry without solving a
+    complex-valued field.  The J values stay thickness-averaged so that they are
+    directly comparable with the DC answer; the surface density is that times
+    r_ac_over_r_dc.
+    """
     try:
         objs = _prep_objs(paths, polygons)
     except ValueError as e:
@@ -655,7 +666,34 @@ def current_density_field(paths=None, polygons=None, thickness_mm=0.035,
     span_y = (by1 - by0) + 2.0 * margin
 
     hs = [h_fine * (2.0 ** k) for k in range(lv - 1, -1, -1)]
-    G = t / rho   # sheet conductance of one square, siemens
+    t_eff = t
+    skin = None
+    if frequency_hz is not None:
+        from .skin import slab_surface_impedance
+        try:
+            f_hz = float(frequency_hz)
+        except (TypeError, ValueError):
+            return err("frequency_hz must be a number", "BAD_PARAMETER")
+        if not (f_hz > 0):
+            return err("frequency_hz must be > 0: leave it out for the DC answer, "
+                       "which is what every earlier release returned", "BAD_PARAMETER")
+        if skin_faces not in ("one", "two"):
+            return err("skin_faces must be 'one' (return on one side) or 'two' "
+                       "(symmetric return), not %r" % (skin_faces,), "BAD_PARAMETER")
+        st = slab_surface_impedance(f_hz, t, rho, 1.0, skin_faces)
+        t_eff = st["t_eff_mm"]
+        skin = {
+            "frequency_hz": f_hz,
+            "faces": skin_faces,
+            "skin_depth_um": st["delta_mm"] * 1e3,
+            "thickness_over_skin_depth": st["s"],
+            "r_ac_over_r_dc": st["r_over_rdc"],
+            "x_ac_over_r_dc": st["x_over_rdc"],
+            "effective_thickness_um": t_eff * 1e3,
+            "thickness_um": t * 1e3,
+        }
+
+    G = t_eff / rho   # sheet conductance of one square, siemens
 
     level_rows = []
     have_prev = False
@@ -853,8 +891,11 @@ def current_density_field(paths=None, polygons=None, thickness_mm=0.035,
     cons = abs(finest["i_in"] - finest["i_out"]) / finest["i_in"]
     power_ref = finest["i_in"] * finest["i_in"] * finest["resist"]
     pbal = abs(finest["power"] - power_ref) / power_ref if power_ref else None
+    # t_eff, not t, so that the section area is the copper that actually carries
+    # the current: with it the uniform density and the peak share one definition
+    # and crowding_factor stays a pure geometry number at any frequency.
     sec, sec_where = _narrowest_section(finest["state"], finest["V"], finest["nx"],
-                                       finest["ny"], finest["h"], t, G)
+                                       finest["ny"], finest["h"], t_eff, G)
     j_uniform = cur / sec if sec else None
     crowding = finest["peak"] / j_uniform if j_uniform else None
 
@@ -958,6 +999,56 @@ def current_density_field(paths=None, polygons=None, thickness_mm=0.035,
                        "(see board_electrothermal for that loop)",
         "current_source": "DC; no inductance, no skin effect, no displacement current",
     }
+    if skin is not None:
+        # Everything above is unchanged by the uniform thickness correction: the
+        # potential field does not move at all when G is scaled, so the LATERAL
+        # pattern and the crowding factor are the DC ones, exactly as documented.
+        value["frequency_hz"] = skin["frequency_hz"]
+        value["skin_faces"] = skin["faces"]
+        value["skin_depth_um"] = skin["skin_depth_um"]
+        value["thickness_over_skin_depth"] = skin["thickness_over_skin_depth"]
+        value["effective_thickness_um"] = skin["effective_thickness_um"]
+        value["r_ac_over_r_dc"] = skin["r_ac_over_r_dc"]
+        value["x_ac_over_r_dc"] = skin["x_ac_over_r_dc"]
+        value["sheet_conductance_s_per_square"] = G
+        # The potential field is bit-identical; the scaling to the caller's
+        # current is what moves.  With G = t_eff/rho the solver's J is the
+        # density in the layer that actually carries the current (I / (w*t_eff)),
+        # so at AC it IS the surface value, and the gross-thickness average -
+        # the number the DC answer gives - is that divided by the ratio.
+        value["peak_j_surface_a_per_mm2"] = finest["peak"]
+        value["peak_j_gross_a_per_mm2"] = (finest["peak"]
+                                          / skin["r_ac_over_r_dc"])
+        assumptions["sheet_conductance_s_per_square"] = G
+        assumptions["thickness_mm"] = t
+        assumptions["effective_thickness_mm"] = t_eff
+        assumptions["current_source"] = (
+            "AC at %g Hz, rms: the thickness direction is the exact 1-D diffusion "
+            "solution (r_ac/r_dc = %.6g), applied as a UNIFORM reduction of the "
+            "sheet conductance. The lateral pattern is therefore still the DC one "
+            "- no edge crowding, no proximity effect, no complex-valued field. The "
+            "J values are the density in the EFFECTIVE layer (I/(w*t_eff)), i.e. "
+            "the surface value; divide by r_ac_over_r_dc for the gross-thickness "
+            "average, which is the number the DC answer gives (peak_j_gross)."
+            % (skin["frequency_hz"], skin["r_ac_over_r_dc"]))
+        model += (" At %g Hz the sheet conductance is that of an effective "
+                  "thickness t/(r_ac/r_dc) = %.4g um (1-D skin effect through the "
+                  "thickness, faces=%s); the 2-D lateral solution is unchanged by "
+                  "it, and that is the model's limit, not its accuracy."
+                  % (skin["frequency_hz"], t_eff * 1e3, skin["faces"]))
+        basis += (" The AC sheet conductance comes from the exact 1-D slab solution "
+                  "(skin.slab_surface_impedance); R and the power are the AC ones, "
+                  "J stays thickness-averaged.")
+        precision += (" The skin correction is 1-D: it changes HOW MUCH copper "
+                      "carries the current, not WHERE along the width it goes.")
+        warnings.append(
+            "frequency_hz=%g is a UNIFORM thickness correction: the 2-D pattern "
+            "and the crowding factor are the DC ones, so a wide strip whose current "
+            "really crowds to its edges at this frequency is not modelled - use "
+            "r_ac_over_r_dc for the resistance and read the crowding as a DC "
+            "statement. The reported J and the narrowest section are the "
+            "effective-layer (surface) quantities, so crowding_factor stays a "
+            "geometry number" % skin["frequency_hz"])
     return ok(value, "mixed (see keys: ohm, A/mm^2, mm, mm^2, W)", model, basis,
               precision, assumptions,
               extra={

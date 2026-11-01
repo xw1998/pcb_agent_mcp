@@ -614,7 +614,10 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # tool, not a flag on the 1-D ones: it needs a geometry, not a width)
         # 170 = 169 + pdn_step_response in 0.0.65 (a time-domain answer, not a
         # flag on the frequency-domain one: it needs an edge rate and a regulator)
-        self.assertEqual(len(tools.TOOLS), 170)
+        # 171 = 170 + ac_sheet_resistance in 0.0.66 (the 1-D skin-effect answer
+        # for a sheet; current_density_field now CONSUMES it via frequency_hz,
+        # but the closed-form R(f)/delta/t_eff/loss question is its own tool)
+        self.assertEqual(len(tools.TOOLS), 171)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

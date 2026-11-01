@@ -4002,6 +4002,98 @@ def selftest():
           "no plane %s V, plane %s V" % (_st_bare.get("v_final_v"),
                                          _st_die.get("v_final_v")))
 
+    # ---- 0.0.66: DC copper is a low-frequency limit, not the answer. 1 oz at
+    # 1 MHz is already 0.70 % high in R and 10 MHz is 54 % high; the closed form
+    # is R/Rdc = s*(sinh2s+sin2s)/(cosh2s-cos2s) with s = t/delta, and the two
+    # limits (1+4s^4/45 and s) are the only reason to believe it.
+    _sk = (_call("ac_sheet_resistance", {"frequency_hz": 1.0e7,
+                                        "thickness_um": 35.0}, 1823).get("value") or {})
+    check("1 oz copper at 10 MHz is 1.5408x its DC resistance (delta 20.90 um, "
+          "t/delta 1.675, so it is NOT yet in the sqrt(f) regime) and it starts "
+          "being 1 % off at 1.1983 MHz",
+          abs((_sk.get("r_ac_over_r_dc") or 0) - 1.5408001) < 1e-6
+          and abs((_sk.get("skin_depth_um") or 0) - 20.90) < 0.02
+          and abs((_sk.get("thickness_over_skin_depth") or 0) - 1.6749) < 1e-3
+          and abs((_sk.get("f_at_r_1pct_over_dc_hz") or 0) - 1198257.2) < 5.0,
+          "R/Rdc %s, delta %s um, s %s, f_1%% %s Hz" % (
+              _sk.get("r_ac_over_r_dc"), _sk.get("skin_depth_um"),
+              _sk.get("thickness_over_skin_depth"),
+              _sk.get("f_at_r_1pct_over_dc_hz")))
+
+    # The face rule is a factor of two on the EFFECTIVE thickness, nothing more:
+    # a sheet with both faces free and thickness t is the same problem as a sheet
+    # against a plane with thickness t/2. If these two disagree the parametrisation
+    # is wrong somewhere.
+    _sk_two = (_call("ac_sheet_resistance", {"frequency_hz": 1.0e7,
+                                            "thickness_um": 35.0,
+                                            "faces": "two"}, 1824).get("value") or {})
+    _sk_half = (_call("ac_sheet_resistance", {"frequency_hz": 1.0e7,
+                                             "thickness_um": 17.5}, 1825).get("value") or {})
+    check("faces='two' on 35 um IS faces='one' on 17.5 um (a symmetric sheet sees "
+          "half the thickness), so the factor of two is in the geometry and not "
+          "bolted onto the answer",
+          abs((_sk_two.get("r_ac_over_r_dc") or 0)
+              - (_sk_half.get("r_ac_over_r_dc") or 0)) < 1e-12
+          and abs((_sk_two.get("x_ac_over_r_dc") or 0)
+                  - (_sk_half.get("x_ac_over_r_dc") or 0)) < 1e-12
+          and (_sk_two.get("effective_thickness_um") or 0) < 35.0,
+          "two %s vs half %s" % (_sk_two.get("r_ac_over_r_dc"),
+                                 _sk_half.get("r_ac_over_r_dc")))
+
+    # The default path must not move. Same arguments as the 0.0.63 check above,
+    # but read for bit equality against the no-frequency call, and the frequency
+    # call must differ from it by EXACTLY r_ac_over_r_dc (the solve is linear, so
+    # the pattern is untouched and only the conductance scale changes).
+    _cf_dc2 = _call("current_density_field", {
+        "polygons": [[[0.0, 0.0], [20.0, 0.0], [20.0, 2.0], [0.0, 2.0]]],
+        "source": {"x0_mm": -0.01, "y0_mm": -0.01, "x1_mm": 0.0, "y1_mm": 2.01},
+        "sink": {"x0_mm": 20.0, "y0_mm": -0.01, "x1_mm": 20.01, "y1_mm": 2.01},
+        "h_mm": 0.1, "levels": 2}, 1826).get("value") or {}
+    _cf_ac = _call("current_density_field", {
+        "polygons": [[[0.0, 0.0], [20.0, 0.0], [20.0, 2.0], [0.0, 2.0]]],
+        "source": {"x0_mm": -0.01, "y0_mm": -0.01, "x1_mm": 0.0, "y1_mm": 2.01},
+        "sink": {"x0_mm": 20.0, "y0_mm": -0.01, "x1_mm": 20.01, "y1_mm": 2.01},
+        "h_mm": 0.1, "levels": 2, "frequency_hz": 1.0e7}, 1827).get("value") or {}
+    check("asking current_density_field for 10 MHz scales the conductance by "
+          "t_eff/t and nothing else: R is exactly DC x 1.5408, peak J is exactly "
+          "DC x the same factor (it is the density in the EFFECTIVE layer, with "
+          "peak_j_gross = peak/r as the through-thickness mean), and crowding - a "
+          "pure geometry ratio - does not move at all",
+          _cf_dc2.get("frequency_hz") is None
+          and _cf_ac.get("r_ac_over_r_dc") is not None
+          and abs(_cf_ac.get("resistance_ohm", 0)
+                  / _cf_dc2.get("resistance_ohm", 1) - 1.5408001) < 1e-6
+          and abs(_cf_ac.get("peak_j_a_per_mm2", 0)
+                  / _cf_dc2.get("peak_j_a_per_mm2", 1) - 1.5408001) < 1e-6
+          and abs(_cf_ac.get("peak_j_gross_a_per_mm2", 0)
+                  - _cf_dc2.get("peak_j_a_per_mm2", 0)) < 1e-9
+          and abs(_cf_ac.get("crowding_factor", 0)
+                  - _cf_dc2.get("crowding_factor", 1)) < 1e-12,
+          "R %s -> %s, crowding %s -> %s" % (
+              _cf_dc2.get("resistance_ohm"), _cf_ac.get("resistance_ohm"),
+              _cf_dc2.get("crowding_factor"), _cf_ac.get("crowding_factor")))
+
+    # A frequency the model cannot mean, and a face count that does not exist,
+    # are REFUSED with a reason code instead of being clamped to DC / to 'one'.
+    _sk_zero = _call("ac_sheet_resistance", {"frequency_hz": 0.0,
+                                            "thickness_um": 35.0}, 1828)
+    _sk_face = _call("ac_sheet_resistance", {"frequency_hz": 1.0e6,
+                                            "thickness_um": 35.0,
+                                            "faces": "three"}, 1829)
+    _sk_thick = _call("ac_sheet_resistance", {"frequency_hz": 1.0e6}, 1830)
+    check("ac_sheet_resistance refuses f=0 (it would silently BE the DC answer), "
+          "a face count other than one/two (they differ by 2x in effective "
+          "thickness) and a call with no thickness at all",
+          _sk_zero.get("reason_code") == "BAD_PARAMETER"
+          and "frequency" in (_sk_zero.get("message") or "").lower()
+          and _sk_face.get("reason_code") == "BAD_PARAMETER"
+          and "one" in (_sk_face.get("message") or "").lower()
+          and "two" in (_sk_face.get("message") or "").lower()
+          and _sk_thick.get("reason_code") == "ARG_REQUIRED",
+          "%s / %s / %s" % (_sk_zero.get("reason_code"),
+                            _sk_face.get("reason_code"),
+                            _sk_thick.get("reason_code")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
