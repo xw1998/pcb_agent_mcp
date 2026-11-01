@@ -4094,6 +4094,124 @@ def selftest():
                             _sk_face.get("reason_code"),
                             _sk_thick.get("reason_code")))
 
+    # ---- 0.0.67: a ROUND conductor is not a flat sheet, and a tube is not a
+    # mirror half of a solid wire.  A 0.15 mm drill with 25 um of plating at
+    # 1 GHz is 10.58x R_dc of the annulus, and the DC number is off by an order
+    # of magnitude.
+    _rw = (_call("ac_round_conductor", {"frequency_hz": 1.0e9, "drill_mm": 0.15,
+                                       "plating_um": 25.0}, 1831).get("value") or {})
+    _rwc = (_call("ac_round_conductor", {"frequency_hz": 1.0e9, "drill_mm": 0.15,
+                                        "plating_um": 25.0}, 1832).get("checks") or {})
+    check("a 0.15 mm via with 25 um of plating at 1 GHz is 10.5781x its DC annulus "
+          "(delta 2.09 um, x = 47.85) - the barrel is a surface, not a wire",
+          abs((_rw.get("ac_over_dc") or 0) - 10.5781254) < 1e-6
+          and abs((_rw.get("skin_depth_um") or 0) - 2.0897) < 1e-3
+          and abs((_rw.get("x_outer") or 0) - 47.8532) < 1e-3
+          and "skin-dominated" in (_rw.get("regime") or ""),
+          "R/Rdc %s, delta %s um, x %s" % (_rw.get("ac_over_dc"),
+                                           _rw.get("skin_depth_um"),
+                                           _rw.get("x_outer")))
+
+    # The one place this could go wrong and still LOOK right: the tube's Bessel
+    # closed form is J0/J1/Y0/Y1 in cancellation and above x ~ 15 it returns the
+    # SOLID answer digit for digit.  At x = 40 with a1/a2 = 0.9 that is 20.2523
+    # against a truth of 3.8501 - a factor of 5.26, with no warning.
+    # ...and the answer it gives at exactly that geometry, end to end.
+    _cf = (_call("ac_round_conductor", {"frequency_hz": 698710882.3975614,
+                                       "diameter_mm": 0.2, "wall_um": 10.0},
+                 1833).get("value") or {})
+    check("the tube closed form is REFUSED above x = 10 and the answer says so: at "
+          "x = 40, a1/a2 = 0.9 that formula gives 20.2523 (the solid wire) where "
+          "the truth is 3.8501, and the tool answers 3.8501 with closed_form_skipped "
+          "in the envelope rather than a number that would look like agreement",
+          abs((_cf.get("ac_over_dc") or 0) - 3.8500959) < 1e-6
+          and abs((_cf.get("x_outer") or 0) - 40.0) < 1e-9
+          and _rwc.get("closed_form_skipped") is not None
+          and _rwc.get("closed_form_vs_riccati_rel") is None
+          and "20.2523" in (_rwc.get("closed_form_skipped") or ""),
+          "R/Rdc %s (the collapsed closed form would say 20.2523)" % (
+              _cf.get("ac_over_dc"),))
+
+    # The answer path must reproduce eight mpmath pins (80-900 dps, independent
+    # integrator).  Two of them are enough in a self test: the hardest (x = 71,
+    # a1/a2 = 0.845, which needs ~70 dps before the closed form gives 15 digits)
+    # and the DC anchor mu/(8 pi) = 50.0 nH/m, which does not depend on diameter.
+    _rwdc = (_call("ac_round_conductor", {"frequency_hz": 1.0e6,
+                                        "diameter_mm": 1.0}, 1834).get("checks") or {})
+    _rwsolid = (_call("ac_round_conductor", {"frequency_hz": 1.0e6,
+                                           "diameter_mm": 1.0},
+                      1835).get("value") or {})
+    check("the round wire's DC internal inductance is mu/(8*pi) = 50.0 nH/m at ANY "
+          "diameter (2.1e-11 here) and its DC series is 1 + x^4/48 - a flat sheet "
+          "would be 1 + 4x^4/45, so the two geometries cannot be confused",
+          abs((_rwdc.get("dc_internal_inductance_nh_per_m") or 0) - 50.0) < 1e-6
+          and (_rwdc.get("dc_series_r_rel_error") or 1) < 1e-12
+          and (_rwdc.get("dc_series_x_rel_error") or 1) < 1e-9,
+          "Ldc %s nH/m" % (_rwdc.get("dc_internal_inductance_nh_per_m"),))
+
+    # A wall thinner than one skin depth is not skin-limited at all: 0.5 um of
+    # plating at 1 GHz is 1.0003x R_dc, because the current uses all the copper
+    # there is.  This is the case where "use the skin depth" answers nonsense.
+    _rww = (_call("ac_round_conductor", {"frequency_hz": 1.0e9, "drill_mm": 0.1,
+                                       "plating_um": 0.5}, 1836).get("value") or {})
+    check("a 0.5 um plating at 1 GHz is 1.0003x R_dc and is REPORTED as "
+          "wall-limited (the current fills the wall), not as skin-dominated - "
+          "thickening the plating is what helps there, not widening the drill",
+          abs((_rww.get("ac_over_dc") or 0) - 1.0002898) < 1e-5
+          and "wall-limited" in (_rww.get("regime") or ""),
+          "R/Rdc %s, regime %s" % (_rww.get("ac_over_dc"),
+                                   (_rww.get("regime") or "")[:30]))
+
+    # The radial profile is a picture, and a plausible wrong picture is worse
+    # than an error: the closed form reports a FLAT 1.0 at x = 72.  The answer
+    # path must show a real decay, and the envelope must say which one it used.
+    _rwp = (_call("ac_round_conductor",
+                  {"frequency_hz": 2.263823e9, "diameter_mm": 0.2,
+                   "wall_um": 31.0}, 1837))
+    _pf = (_rwp.get("value") or {}).get("profile") or []
+    check("at x = 72 the radial profile decays over five decades inward instead of "
+          "reporting a flat 1.0 (which is what the Bessel evaluation returns there, "
+          "and why it is only used as a cross-check below x = 5)",
+          len(_pf) == 9 and (_pf[0].get("j_rel") or 1) < 1e-8
+          and abs((_pf[-1].get("j_rel") or 0) - 1.0) < 1e-12
+          and (_rwp.get("checks") or {}).get("profile_vs_closed_skipped") is not None,
+          "j(0)=%s" % (_pf[0].get("j_rel") if _pf else None,))
+
+    # Two hole conventions exist and they are 18 % apart. Neither is silently
+    # assumed: the AC tool's bore is the FINISHED hole (copper outside), and
+    # via_resistance gains a flag for the same drawing while its DEFAULT answer
+    # stays bit-identical.
+    _vo = (_call("via_resistance", {"drill_mm": 0.3, "plating_um": 25.0,
+                                    "length_mm": 1.6}, 1838).get("value") or {})
+    _vi = (_call("via_resistance", {"drill_mm": 0.3, "plating_um": 25.0,
+                                    "length_mm": 1.6,
+                                    "plating_outside": True}, 1839).get("value") or {})
+    check("the two via hole conventions are both available and 18 % apart "
+          "(0.021598 vs 0.025525 mm2 on a 0.3 mm hole with 25 um), the default is "
+          "unchanged, and each answer names the convention it used",
+          abs((_vo.get("barrel_area_mm2") or 0) - 0.021598) < 1e-6
+          and abs((_vi.get("barrel_area_mm2") or 0) - 0.025525) < 1e-6,
+          "inside %s mm2 / outside %s mm2" % (_vo.get("barrel_area_mm2"),
+                                              _vi.get("barrel_area_mm2")))
+
+    # A guessed bore is the way a via answer becomes wrong, so it is refused.
+    _rw_no = _call("ac_round_conductor", {"frequency_hz": 1.0e6,
+                                         "drill_mm": 0.3}, 1840)
+    _rw_both = _call("ac_round_conductor", {"frequency_hz": 1.0e6,
+                                           "diameter_mm": 1.0,
+                                           "drill_mm": 0.3}, 1841)
+    _rw_f0 = _call("ac_round_conductor", {"frequency_hz": 0.0,
+                                         "diameter_mm": 1.0}, 1842)
+    check("ac_round_conductor refuses a drill with no plating, a diameter AND a "
+          "drill (two descriptions of one outer diameter), and f = 0 (which would "
+          "silently BE the DC answer)",
+          _rw_no.get("reason_code") == "ARG_REQUIRED"
+          and _rw_both.get("reason_code") == "ARG_INVALID"
+          and _rw_f0.get("reason_code") == "BAD_PARAMETER"
+          and "via_resistance" in (_rw_f0.get("message") or ""),
+          "%s / %s / %s" % (_rw_no.get("reason_code"), _rw_both.get("reason_code"),
+                            _rw_f0.get("reason_code")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

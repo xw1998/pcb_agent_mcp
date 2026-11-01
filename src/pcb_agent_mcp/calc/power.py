@@ -70,8 +70,22 @@ def copper_resistance(length_mm, width_mm, thickness_um, temp_c=20.0,
                                       "contact resistance at the pad"]})
 
 
-def via_resistance(drill_mm, plating_um, length_mm, temp_c=20.0, count=1):
-    """Barrel resistance of a plated through via (or `count` of them in parallel)."""
+def via_resistance(drill_mm, plating_um, length_mm, temp_c=20.0, count=1,
+                   plating_outside=False):
+    """Barrel resistance of a plated through via (or `count` of them in parallel).
+
+    Two hole conventions exist and they are 15..20 % apart on a typical via, so
+    the caller has to say which drawing they are reading:
+
+      plating_outside=False (default, unchanged since 0.0.x): drill_mm is the
+        DRILLED hole and the plating grows INWARD, so the finished hole is
+        drill - 2*plating and the copper is inside drill_mm.  This is what this
+        function has always computed and the default answer is byte-identical.
+      plating_outside=True: drill_mm is the FINISHED hole and the copper is
+        OUTSIDE it, so the outer diameter is drill + 2*plating.  That is the
+        convention on a fabrication drawing ("finished hole size") and the one
+        ac_round_conductor uses for its bore.
+    """
     try:
         d = float(drill_mm) * 1e-3
         t = float(plating_um) * 1e-6
@@ -80,13 +94,27 @@ def via_resistance(drill_mm, plating_um, length_mm, temp_c=20.0, count=1):
         return err("drill_mm, plating_um and length_mm must be numbers", "ARG_INVALID")
     if d <= 0 or t <= 0 or L <= 0:
         return err("drill, plating and length must be > 0", "ARG_RANGE")
-    if 2 * t >= d:
+    if not plating_outside and 2 * t >= d:
         return err("plating %.1f um closes a %.3f mm drill" % (plating_um, drill_mm),
                    "ARG_RANGE")
-    a = math.pi * ((d / 2.0) ** 2 - (d / 2.0 - t) ** 2)
+    if plating_outside:
+        a = math.pi * ((d / 2.0 + t) ** 2 - (d / 2.0) ** 2)
+    else:
+        a = math.pi * ((d / 2.0) ** 2 - (d / 2.0 - t) ** 2)
     rho = _rho(temp_c)
     one = rho * L / a
     n = max(1, int(count))
+    extra = {"not_computed": ["non-uniform plating thickness",
+                              "pad / antipad spreading resistance",
+                              "via inductance (see power.trace_inductance)"]}
+    if plating_outside:
+        extra["hole_convention"] = (
+            "drill_mm is the FINISHED hole and the copper is outside it: A = "
+            "pi*((d/2+t)^2 - (d/2)^2), outer diameter d + 2t. The default "
+            "(plating_outside=false) reads drill_mm as the drilled hole with the "
+            "copper inside it; on a 0.3 mm hole with 25 um plating the two are "
+            "18 % apart in area and neither is wrong - they are different "
+            "drawings")
     return ok(value={"resistance_ohm": round(one / n, 9),
                      "single_via_ohm": round(one, 9),
                      "count": n,
@@ -94,16 +122,22 @@ def via_resistance(drill_mm, plating_um, length_mm, temp_c=20.0, count=1):
                      "copper_length_mm": round(L * 1e3, 4),
                      "current_share_a_per_via": None},
               unit="ohm", model="plated_barrel",
-              basis="R = rho(T) * L / A, A = pi*((d/2)^2 - (d/2 - t)^2) - the annular "
-                    "copper cross-section of the barrel, no pad or dogbone",
+              basis=("R = rho(T) * L / A, A = pi*((d/2+t)^2 - (d/2)^2) - the "
+                     "annulus of a finished hole with the plating OUTSIDE it"
+                     if plating_outside else
+                     "R = rho(T) * L / A, A = pi*((d/2)^2 - (d/2 - t)^2) - the "
+                     "annular copper cross-section of the barrel, no pad or "
+                     "dogbone"),
               precision="first order. Real vias are 20..30% worse because the "
                         "plating is thinner at the middle of the barrel and the pad "
                         "transition is not a perfect node; treat the number as a "
                         "lower bound on resistance",
-              assumptions={"temp_c": float(temp_c), "count": n},
-              extra={"not_computed": ["non-uniform plating thickness",
-                                      "pad / antipad spreading resistance",
-                                      "via inductance (see power.trace_inductance)"]})
+              assumptions={"temp_c": float(temp_c), "count": n,
+                           "hole_convention": ("finished hole = drill, plating "
+                                               "outside" if plating_outside else
+                                               "drilled hole = drill, plating "
+                                               "inside")},
+              extra=extra)
 
 
 def trace_inductance(length_mm, width_mm, height_mm, temp_c=20.0):

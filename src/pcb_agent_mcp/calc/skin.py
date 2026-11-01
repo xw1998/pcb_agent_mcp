@@ -460,7 +460,7 @@ def ac_sheet_resistance(frequency_hz, thickness_mm=None, thickness_um=None,
              "(roughness.skin_depth_m), so the two never disagree. This is the "
              "classical 'skin effect in a flat strip' closed form; it is derived "
              "from the diffusion equation here rather than quoted, and its two "
-             "limits (1 + 2s^4/15 and R = X = s) are checked on every call.")
+             "limits (1 + 4s^4/45 and R = X = s) are checked on every call.")
     precision = (
         "Exact closed form: the only numerical error in the ratio is double "
         "rounding (the series is used below s = 1e-4 with an error under 1e-12, "

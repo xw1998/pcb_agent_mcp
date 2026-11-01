@@ -203,9 +203,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（168 个）
+## 工具（172 个）
 
-下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
+下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
 
 | tool | 作用 | 关键约束 |
 |---|---|---|
@@ -216,6 +216,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `via_current_allowed` | 过孔载流（桶壁侧面积折算） | 标注 `not_standard_defined`，±30% |
 | `fusing_current_taper` | 一段走线（可锥形/分段）**沿长度**的温度梯度与单发熔断：1-D 轴向有限体积 + 后向 Euler + 逐段 Thomas；给 `ends_c` 另解稳态阈值，给 `t_melt_s` 则反解电流 | 侧向散热**没有 `h` 参数**（绝热侧面）、段内横向等温、无潜热/集肤/电迁移/电弧；`conduction_delay_pct` 由**真跑一遍的绝热对照臂**给出，均匀段精确 0；不熔只回 `value: null` + 峰值与余量 |
 | `current_density_field` | 铜区上的 2-D 稳态电流密度场 `div(sigma·grad V)=0`：给 `J` 的峰值与**位置**、`median`/`p99`/`mean`、最窄载流截面与 `crowding_factor`、三环 annulus 读数，以及 `peak_growth` 与 `peak_is_grid_convergent`；给 `frequency_hz` 时电导换成 `t_eff/rho`（`t_eff` 来自 `ac_sheet_resistance`），于是 `R` 是 AC 值、`peak_j` 是**表面值**、`peak_j_gross` 是毛厚度均值 | 薄层电导 `G = t/rho`（与格距无关 ⇒ 均匀条带精确给 `R = (rho/t)(L/W)`）、cascadic 多重网格 + SOR（`omega` 1.97）、纯 stdlib，3~60 s；**峰值在内角处不收敛**（`J ~ r^(-1/3)`，每减半 ×1.2599）⇒ 必须看 `peak_is_grid_convergent` 或改用环读数；2-D/DC、均匀厚度与 `rho`、接触边缘奇异是几何、`narrowest_section` 按轴投影（斜线高估 ⇒ 拥挤因子是下界）、不自动读 zone/铺铜；`frequency_hz` 只**缩放**电导，横向重分布/边沿拥挤/邻近效应仍不在解里（见 `ac_sheet_resistance`） |
+| `ac_round_conductor` | 圆导体的 AC 阻抗：**实心线**（`diameter_mm`）或**镀铜孔/圆管**（`drill_mm`+`plating_um`，或 `diameter_mm`+`wall_um`）；给 `R/Rdc`、`X/Rdc`、`R`/`X` Ω/m、内电感、`δ`、`x=a/δ`、`regime`、`f(+1%)`/`f(+10%)`/`f(2×)` 与 9 点径向剖面 | 孔是 **Neumann 面**（`E'(a1)=0`，孔内 `H_φ=0`），`R_dc` 按**环形截面**；实心走闭式、圆管走 **Riccati 走针**（教科书闭式在 `x≳15` 会返回实心答案，`x=40,ri=0.9` 差 5.26 倍，故只作 `x≤10` 复核）；无邻近效应/pad/反焊盘/端部扩散/温升/扫频；`drill` 是**成品孔**（铜在外），`via_resistance` 默认是另一约定（`plating_outside=true` 才对齐），两者差 18 % |
 | `trace_impedance` | 几何 → Z0（微带/带状线） | w/h 超出 0.05..3.0 标 `validity_note` |
 | `width_for_impedance` | Z0 → 线宽（二分反解） | 不可达时回 `UNREACHABLE` + 可达区间 |
 | `lambda_over_20` | λ/20 布线间距 | 与频率/εr 绑定，不给记忆值 |
@@ -1000,7 +1001,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 168 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 172 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）

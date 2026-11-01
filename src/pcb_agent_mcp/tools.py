@@ -17,6 +17,7 @@ from .fidelity import views as _fviews
 from .calc import current as _current
 from .calc import currentfield as _cfield
 from .calc import skin as _skin
+from .calc import roundwire as _round
 from .calc import creepage as _creepage
 from .calc import diffpair as _diffpair
 from .calc import field2d as _field2d
@@ -3652,6 +3653,7 @@ def _capabilities(_args):
             "via_current_allowed", "fusing_current", "fusing_current_taper",
             "repetitive_pulse_rating", "current_density_field",
             "ac_sheet_resistance",
+            "ac_round_conductor",
             "trace_impedance", "width_for_impedance",
             "diff_impedance", "diff_impedance_field", "diff_width", "lambda_over_20",
             "coplanar_field", "coplanar_pair_field", "crosstalk_coupled_lines",
@@ -4050,7 +4052,8 @@ def _capabilities(_args):
             "3-D (as above, layered only), internal plane-to-plane radiation through the laminate, "
             "temperature-dependent emissivity, component thermal mass and contact "
             "resistance, AC loss (skin/proximity) - ac_sheet_resistance gives the "
-            "1-D skin term of a FLAT sheet but nothing here turns a loss into a "
+            "1-D skin term of a FLAT sheet and ac_round_conductor the exact term "
+            "for a round wire, tube or via, but nothing here turns a loss into a "
             "temperature at frequency - device self-heating inside sim_spice, "
             "reading the conductors or the zones straight off a board "
             "file - board_electrothermal takes geometry, it does not open the "
@@ -4099,7 +4102,8 @@ def _capabilities(_args):
             "over-states its spreading resistance; and the whole model is DC, so skin "
             "effect, the plane's own resonance (pdn_plane_impedance) and any "
             "frequency-dependent copper are not in it (ac_sheet_resistance is the "
-            "separate 1-D answer for one flat sheet, and current_density_field "
+            "separate 1-D answer for one flat sheet, ac_round_conductor the "
+            "exact one for a round wire/tube/via, and current_density_field "
             "takes frequency_hz to scale its own sheet conductance, but a 2-D "
             "pattern whose current re-distributes across the sheet at frequency "
             "is still not solved). The switch defaults OFF and the "
@@ -5406,10 +5410,28 @@ _tool(
     "via_resistance",
     "DC resistance of plated via barrels: the cross-section is the copper ANNULUS, not the "
     "drill circle. Answers 'how many vias does this 3 A path need' in resistance terms - "
-    "current capacity is a separate question with a temperature-rise criterion.",
+    "current capacity is a separate question with a temperature-rise criterion. "
+    "Two hole conventions exist and they are 18 % apart on a typical via, so the "
+    "answer names the one it used: by default drill_mm is the DRILLED hole with "
+    "the plating inside it (unchanged since the first release); pass "
+    "plating_outside=true when your drawing gives the FINISHED hole and the copper "
+    "grows outward. DC "
+    "only: above a few MHz the barrel is not a DC annulus at all, and the AC answer "
+    "for the same drill_mm/plating_um is ac_round_conductor (it returns R/R_dc and "
+    "the frequency where the DC number stopped being allowed).",
     {"type": "object", "properties": {
-        "drill_mm": _num("finished hole diameter"),
+        "drill_mm": _num("hole diameter. WHICH hole depends on plating_outside: "
+                         "the drilled hole by default (copper inside it), the "
+                         "finished hole with plating_outside=true"),
         "plating_um": _num("barrel wall thickness (typically 20..25 um)"),
+        "plating_outside": _bool("false (default, unchanged): drill_mm is the "
+                                 "drilled hole and the copper lies INSIDE it, so "
+                                 "the finished hole is drill - 2*plating. true: "
+                                 "drill_mm is the FINISHED hole and the copper lies "
+                                 "OUTSIDE it, outer diameter = drill + 2*plating - "
+                                 "the fabrication-drawing convention, and the one "
+                                 "ac_round_conductor uses. The two differ by 18 % "
+                                 "in area on a 0.3 mm hole with 25 um plating"),
         "length_mm": _num("barrel length = board thickness"),
         "temp_c": _num("copper temperature", 20),
         "count": _num("how many vias in parallel", 1),
@@ -5417,7 +5439,8 @@ _tool(
     lambda a: _power.via_resistance(a.get("drill_mm"), a.get("plating_um"),
                                     a.get("length_mm"),
                                     temp_c=a.get("temp_c") or 20,
-                                    count=int(a.get("count") or 1)),
+                                    count=int(a.get("count") or 1),
+                                    plating_outside=bool(a.get("plating_outside"))),
 )
 
 _tool(
@@ -5545,7 +5568,9 @@ _tool(
     "if you pass Rq (Hammerstad-Jensen multiplier). Feeds current_density_field: give "
     "it the same frequency and it solves the same 2-D geometry with the reduced sheet "
     "conductance, but the PATTERN is unchanged - that is the limit of a uniform "
-    "thickness correction, and it says so.",
+    "thickness correction, and it says so. For a ROUND conductor (a wire, a tube, "
+    "a via barrel) this geometry is wrong: the curvature and the bore change the "
+    "answer, and ac_round_conductor solves that one exactly.",
     {"type": "object", "properties": {
         "frequency_hz": _num("frequency, Hz. Required: a skin depth without a "
                              "frequency is just a length"),
@@ -5583,6 +5608,80 @@ _tool(
         roughness_rq_um=a.get("roughness_rq_um"),
         profile_samples=(a.get("profile_samples")
                          if a.get("profile_samples") is not None else 9)),
+)
+
+_tool(
+    "ac_round_conductor",
+    "Skin effect in a ROUND conductor - a solid wire, a tube, or a plated via "
+    "barrel - from the exact 2-D axisymmetric diffusion equation "
+    "E'' + E'/r + k^2 E = 0, not from the flat-sheet approximation. Geometry is "
+    "exactly one of: diameter_mm (solid), diameter_mm + wall_um (tube), or "
+    "drill_mm + plating_um (a via, whose outer diameter is drill + 2*plating: the "
+    "bore is never guessed, and the wall is what carries the current). It returns "
+    "R(f), the INTERNAL reactance X(f), R/R_dc, X/R_dc, the skin depth, the "
+    "regime, and the frequencies at which R has grown 1 %, 10 % and 2x - the "
+    "number that decides whether via_resistance or copper_resistance is still "
+    "allowed. A via is not a thin wire: a 0.15 mm drill with 25 um plating at "
+    "1 GHz comes back R/R_dc = 10.58 with the whole 2.09 um skin depth inside the "
+    "wall, and reporting the DC number there is off by an order of magnitude. A "
+    "tube is also NOT a mirror half of a solid wire: the bore encloses no net "
+    "current, so H_phi = 0 on the inner surface (E'(a1) = 0) - a Neumann "
+    "condition, not a symmetry plane - and treating it as one half of a solid "
+    "wire is a different answer. Still axisymmetric and radial-only: no proximity "
+    "effect from a neighbouring barrel, no barrel-to-barrel or pad coupling, and "
+    "no external (partial) inductance - that second one is trace_inductance or a "
+    "2-D field tool, and this tool only reports the field INSIDE the metal. "
+    "Roughness is a Hammerstad-Jensen multiplier on the surface resistance, off "
+    "unless Rq is given (smooth copper is a lower bound). Numerics: the tube "
+    "closed form involves J0/J1/Y0/Y1 in cancellation and loses all its digits "
+    "above x ~ 15, so the answer is integrated from the Riccati log-derivative "
+    "equation with RK4 + Richardson; the closed form is used only as an "
+    "independent cross-check below x = 10, and when it is not run the checks say "
+    "closed_form_skipped instead of printing a number that looks like agreement.",
+    {"type": "object", "properties": {
+        "frequency_hz": _num("frequency, Hz. Required: a skin depth without a "
+                             "frequency is just a length"),
+        "diameter_mm": _num("outer diameter, mm - a solid wire on its own, or a "
+                            "tube with wall_um"),
+        "wall_um": _num("wall thickness of a tube, um (with diameter_mm). Omit for "
+                        "a solid wire"),
+        "drill_mm": _num("drilled hole diameter of a via, mm (with plating_um). "
+                         "Exclusive with diameter_mm"),
+        "plating_um": _num("plating thickness of a via barrel, um (with drill_mm); "
+                           "20-25 um is a standard through-hole, 8-12 um a microvia"),
+        "rho_ohm_mm": _num("resistivity, ohm*mm; omit for copper at temp_c "
+                           "(1.724e-5 at 20 C)"),
+        "temp_c": _num("conductor temperature, C - only used when rho_ohm_mm is "
+                       "omitted", 20.0),
+        "mu_r": _num("relative permeability of the conductor, 1.0 for copper", 1.0),
+        "length_mm": _num("conductor length, mm - turns the per-metre numbers into "
+                          "an absolute ohm value for that barrel or wire"),
+        "roughness_rq_um": _num("RMS surface roughness Rq in um (NOT Rz): applies "
+                                "the Hammerstad-Jensen multiplier. Omit and the "
+                                "number is a smooth-copper lower bound"),
+        "profile_samples": _num("how many radii the J(r) profile is reported at "
+                                "(>= 2; 9 is the default, and the profile is a "
+                                "Hermite cubic on the log-derivative walk, so 2 "
+                                "is legal but says almost nothing)", 9),
+        "fd_points": _num("grid points for the independent finite-difference "
+                          "cross-check; it is scaled up with x on its own", 801),
+        "fd_verify": _bool("run the finite-difference cross-check at all (it is "
+                           "skipped and says so above x = 200, where no "
+                           "practical grid resolves the wall)", True),
+    }, "required": ["frequency_hz"]},
+    lambda a: _round.ac_round_conductor(
+        a.get("frequency_hz"),
+        diameter_mm=a.get("diameter_mm"), wall_um=a.get("wall_um"),
+        drill_mm=a.get("drill_mm"), plating_um=a.get("plating_um"),
+        rho_ohm_mm=a.get("rho_ohm_mm"),
+        temp_c=(a.get("temp_c") if a.get("temp_c") is not None else 20.0),
+        mu_r=(a.get("mu_r") if a.get("mu_r") is not None else 1.0),
+        length_mm=a.get("length_mm"),
+        roughness_rq_um=a.get("roughness_rq_um"),
+        profile_samples=int(a.get("profile_samples")
+                            if a.get("profile_samples") is not None else 9),
+        fd_points=int(a.get("fd_points") if a.get("fd_points") is not None else 801),
+        fd_verify=(a.get("fd_verify") if a.get("fd_verify") is not None else True)),
 )
 
 _tool(
@@ -6748,7 +6847,8 @@ _tool(
     "THERMAL_RUNAWAY instead of a number. Rth is REQUIRED (one lump: from thermal_stack / "
     "via_array_thermal / plate_temperature, or measured); this module owns no default Rth. "
     "DC only: at a frequency the copper resistance is not rho*L/(w*t) any more "
-    "(ac_sheet_resistance is the 1-D answer), and that loss still has to become "
+    "(ac_sheet_resistance is the 1-D answer for a flat trace, ac_round_conductor "
+    "the exact one for a round conductor), and that loss still has to become "
     "heat here - electrothermal_conductor takes the cold resistance directly "
     "instead of deriving it from geometry.",
     {"type": "object", "properties": {
