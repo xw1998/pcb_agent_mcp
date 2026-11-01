@@ -3688,7 +3688,8 @@ def _capabilities(_args):
             "rf_chain", "design_rules", "layout_review", "schematic_review",
             "sim_spice", "trace_resistance", "via_resistance", "trace_inductance",
             "ir_drop_chain", "pdn_impedance", "pdn_plane_modes",
-            "pdn_plane_impedance", "pdn_plane_with_caps", "decoupling_check",
+            "pdn_plane_impedance", "pdn_plane_with_caps", "pdn_step_response",
+            "decoupling_check",
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_convection",
             "board_ir_drop",
@@ -3926,6 +3927,7 @@ def _capabilities(_args):
             "outside. Even with Q there is no verdict: a resonance is a problem only "
             "together with an excitation and a coupling. When that distinction "
             "decides the design, use a 3-D field solver",
+            "The PDN TRANSIENT is a board answer, not a converter answer: pdn_step_response integrates the caps, their ESR/ESL, the bulk-to-die path and the regulator's R + L with backward Euler, but the regulator is a Thevenin source - no loop bandwidth, no phase margin, no current limit, no droop sharing between rails - and the board is one or two lumped nodes, not a distributed plane. Where the caps sit and how fast the load ramps ARE in it; the control law is not, so a rail that passes here can still fail on a transient the loop itself causes. The load is one step (optionally slewed); any other profile is out of scope",
             "Safety-distance tables for standards other than IEC 60664-1: "
             "IEC 62368-1, IEC 61010-1 and the instrument standards each tabulate "
             "their own creepage/clearance, and this build only carries IEC 60664-1 "
@@ -5532,6 +5534,63 @@ _tool(
                                    plane_cap_farad=a.get("plane_cap_farad"),
                                    r_series_ohm=a.get("r_series_ohm") or 0.0,
                                    plane=a.get("plane")),
+)
+
+_tool(
+    "pdn_step_response",
+    "Rail droop in the TIME domain for a load step: how far the rail goes, when, and "
+    "how long until it is back - on the same network |Z(f)| describes, integrated with "
+    "backward Euler. |Z| answers 'is there a bad frequency'; a datasheet's load "
+    "transient row is this curve, and a good |Z| in band does not stop a step from "
+    "drooping by I*ESR. Every cap is a series R-L-C (`esr_ohm`, `esl_h`, `count`) and "
+    "can sit on the far side of `plane_r_ohm`/`plane_l_h` with at='bulk', which is what "
+    "makes 'the bulk caps are 30 mm from the die' a number instead of a hand wave. "
+    "`rise_ns` is REQUIRED once anything has inductance: on an ideal current step "
+    "V = L*dI/dt, so the peak would be set by the time step instead of by the board. "
+    "The tail is checked against I*R_path, the caps' charge against the current that "
+    "actually went past them, and the peak is re-run at half the step "
+    "(`h_refine_peak_delta_pct` - above 5% the peak is not a measurement).",
+    {"type": "object", "properties": {
+        "caps": {"type": "array", "description":
+                 "list of {c_farad, esr_ohm, esl_h, count, at:'die'|'bulk'}",
+                 "items": {"type": "object"}},
+        "step_a": _num("load step in amps (positive = the load increases)", 1.0),
+        "preload_a": _num("current already flowing before the step", 0.0),
+        "r_series_ohm": _num("regulator output resistance - the DC droop is I*R"),
+        "vr_series_h": _num("regulator output inductance; it is also the only thing "
+                            "that limits the regulator's dI/dt = dv/L"),
+        "plane_r_ohm": _num("resistance of the path between the bulk caps and the "
+                            "die; it is in the DC droop either way, because with no "
+                            "cap at 'bulk' it is folded into the regulator branch "
+                            "(the load current still has to cross it)"),
+        "plane_l_h": _num("inductance of the path between the bulk caps and the die; "
+                          "folded into the regulator branch when no cap is at 'bulk'"),
+        "rise_ns": _num("load edge rise time; required when there is any inductance"),
+        "t_stop_ns": _num("how long to integrate (default 20x the slowest time constant)"),
+        "samples": _num("steps in the tail of the adaptive grid", 1200),
+        "settle_band_pct": _num("band for settle_time_s, in % of the DC answer", 1.0),
+        "refine": _bool("re-run at half the step to bound the peak's grid error", True),
+        "probe_at_ns": {"type": "array", "description":
+                        "times (ns) to report the rail voltage at, linearly "
+                        "interpolated on the internal grid - the returned curve is "
+                        "decimated for reading, this is not",
+                        "items": {"type": "number"}},
+    }, "required": ["caps"]},
+    lambda a: _power.pdn_step_response(
+        a.get("caps"),
+        step_a=(a.get("step_a") if a.get("step_a") is not None else 1.0),
+        preload_a=a.get("preload_a") or 0.0,
+        r_series_ohm=a.get("r_series_ohm") or 0.0,
+        vr_series_h=a.get("vr_series_h") or 0.0,
+        plane_r_ohm=a.get("plane_r_ohm") or 0.0,
+        plane_l_h=a.get("plane_l_h") or 0.0,
+        rise_ns=a.get("rise_ns"),
+        t_stop_ns=a.get("t_stop_ns"),
+        samples=(a.get("samples") if a.get("samples") is not None else 1200),
+        settle_band_pct=(a.get("settle_band_pct")
+                         if a.get("settle_band_pct") is not None else 1.0),
+        refine=(a.get("refine") if a.get("refine") is not None else True),
+        probe_at_ns=a.get("probe_at_ns")),
 )
 
 _tool(

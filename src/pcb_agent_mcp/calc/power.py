@@ -2198,6 +2198,476 @@ def pdn_impedance(freqs_hz, caps, plane_cap_farad=None, r_series_ohm=0.0,
                                       "capacitor DC bias / temperature derating"]})
 
 
+# ------------------------------------------------------------------ time domain
+
+STEP_MODEL = "pdn_step_backward_euler"
+
+
+def pdn_step_response(caps, step_a=1.0, preload_a=0.0, r_series_ohm=0.0,
+                      vr_series_h=0.0, plane_r_ohm=0.0, plane_l_h=0.0,
+                      rise_ns=None, t_stop_ns=None, samples=1200,
+                      settle_band_pct=1.0, refine=True, probe_at_ns=None):
+    """Rail droop in the TIME domain for a load step, on the network |Z(f)| lives on.
+
+    `pdn_impedance` answers "is there a frequency where this bank looks bad". This
+    answers a different question: the load jumps, how far down does the rail go
+    before the caps catch it, and how long until it is back. A datasheet's "load
+    transient" row is about the second one, and the two are not interchangeable -
+    a bank with a good |Z| in the band still droops by I*ESR, and a bank that looks
+    bad at one frequency may never be excited at that frequency by a 100 A/us edge.
+
+    Topology (all branches are series R-L-C, one reference node, the port is
+    die-to-ground):
+
+        ref --[R_series, L_series]--+--[plane R, L]--+-- die   <-- load sink
+                                     |                |
+                                 bulk caps         die caps
+
+    `caps` carries `c_farad`, and optionally `esr_ohm`, `esl_h`, `count`, and
+    `at` ("die" or "bulk"). Caps at "bulk" sit on the far side of
+    `plane_r_ohm`/`plane_l_h` - that is what turns "the bulk caps are at the
+    connector, 30 mm from the die" into a number instead of a hand wave.
+
+    The VRM is a Thevenin source: R_series plus an optional series inductance.
+    That inductance is also the only thing that limits how fast the regulator's
+    current can rise (dI/dt = delta_v / L), which is the physical reason a step
+    is not supplied instantly - there is no separate "slew rate" knob, and adding
+    one would be the same number twice.
+
+    Integrated with backward Euler on an adaptive grid: the first step is the
+    fastest branch's own natural period / 40 and it grows 2% per step up to
+    t_stop/samples, so a 1 nH ESL ring at t~0 and a 1 ms bulk recovery are both
+    resolved without a 1e9-step march. Backward Euler is L-stable but dissipative
+    (it DAMPS a ring), so `h_refine_peak_delta_pct` re-runs the whole thing at
+    half the step - if that number is large, the peak is a grid artefact, not a
+    measurement.
+    """
+    # ---- arguments -------------------------------------------------------
+    if not caps:
+        return err("caps is empty", "ARG_REQUIRED",
+                   hint="each cap needs c_farad, and optionally esr_ohm / esl_h / "
+                        "count / at ('die' or 'bulk')")
+    try:
+        r_series_ohm = float(r_series_ohm or 0.0)
+        vr_series_h = float(vr_series_h or 0.0)
+        plane_r_ohm = float(plane_r_ohm or 0.0)
+        plane_l_h = float(plane_l_h or 0.0)
+        step_a = float(step_a)
+        preload_a = float(preload_a or 0.0)
+        band_pct = float(settle_band_pct)
+        samples = int(samples)
+    except (TypeError, ValueError):
+        return err("a scalar argument is not a number", "ARG_INVALID")
+    for name, val in (("r_series_ohm", r_series_ohm), ("vr_series_h", vr_series_h),
+                      ("plane_r_ohm", plane_r_ohm), ("plane_l_h", plane_l_h),
+                      ("preload_a", preload_a)):
+        if val != val or val < 0:
+            return err("%s must be >= 0" % name, "ARG_RANGE")
+    if abs(step_a) < 1e-15:
+        return err("step_a is zero: a zero step measures nothing", "ARG_INVALID")
+    if band_pct <= 0:
+        return err("settle_band_pct must be > 0", "ARG_RANGE")
+    if samples < 50:
+        return err("samples must be >= 50", "ARG_RANGE")
+    probes_s = []
+    if probe_at_ns is not None:
+        if not isinstance(probe_at_ns, (list, tuple)):
+            return err("probe_at_ns must be a list of times in ns", "ARG_INVALID")
+        for i, t in enumerate(probe_at_ns):
+            try:
+                tv = float(t) * 1e-9
+            except (TypeError, ValueError):
+                return err("probe_at_ns[%d] is not a number" % i, "ARG_INVALID")
+            if tv < 0:
+                return err("probe_at_ns[%d] is negative" % i, "ARG_RANGE")
+            probes_s.append(tv)
+    rise_s = 0.0
+    if rise_ns is not None:
+        rise_s = float(rise_ns) * 1e-9
+        if rise_s < 0:
+            return err("rise_ns must be >= 0", "ARG_RANGE")
+
+    # ---- group identical parallel caps -----------------------------------
+    groups = {}
+    has_bulk = False
+    c_total = 0.0
+    for i, cap in enumerate(caps):
+        if not isinstance(cap, dict):
+            return err("cap %d is not an object" % i, "ARG_INVALID")
+        if cap.get("c_farad") is None:
+            return err("cap %d has no c_farad" % i, "ARG_REQUIRED")
+        c = float(cap["c_farad"])
+        if c <= 0:
+            return err("cap %d has a non-positive capacitance" % i, "ARG_INVALID")
+        esr = float(cap.get("esr_ohm") or 0.0)
+        esl = float(cap.get("esl_h") or 0.0)
+        if esr < 0 or esl < 0:
+            return err("cap %d has a negative esr/esl" % i, "ARG_INVALID")
+        n = int(cap.get("count") or 1)
+        if n <= 0:
+            return err("cap %d has count <= 0" % i, "ARG_INVALID")
+        at = cap.get("at") or "die"
+        if at not in ("die", "bulk"):
+            return err("cap %d: at must be 'die' or 'bulk', not %r" % (i, at),
+                       "ARG_INVALID")
+        if at == "bulk":
+            has_bulk = True
+        key = (at, c, esr, esl)
+        groups[key] = groups.get(key, 0) + n
+        c_total += c * n
+    if has_bulk and plane_r_ohm <= 0.0 and plane_l_h <= 0.0:
+        return err("caps at 'bulk' with plane_r_ohm = 0 and plane_l_h = 0 are just "
+                   "die caps: the two nodes would be the same node", "ARG_INVALID",
+                   hint="give the R and L of the path between the bulk caps and the "
+                        "die, or put those caps at 'die'")
+    if (not has_bulk and r_series_ohm + plane_r_ohm <= 0.0
+            and vr_series_h + plane_l_h <= 0.0):
+        return err("r_series_ohm = vr_series_h = plane_r_ohm = plane_l_h = 0 means the "
+                   "rail is bolted to an ideal source: the droop would be zero by "
+                   "construction, which is not a measurement", "ARG_INVALID",
+                   hint="give the regulator's output resistance (the DC droop is "
+                        "I*R_series) and, if you know it, its output inductance")
+
+    # The plane is between the regulator and the die.  When every cap sits at the
+    # die there is no second node to put it on, but the load current still has to
+    # cross it: dropping it there would answer "0.01 V" to a board whose plane is
+    # 2 mohm, so it is folded into the regulator branch instead (same answer as a
+    # series sum, and nothing is silently ignored).
+    l_path = vr_series_h + plane_l_h
+    l_any = max([l_path] + [(k[3] + l_path) for k in groups])
+    if l_any > 0 and rise_s <= 0:
+        return err("rise_ns is required as soon as the network has inductance: an "
+                   "ideal current step into L gives V = L*dI/dt, so the peak would be "
+                   "set by the time step instead of by the board",
+                   "ARG_REQUIRED",
+                   hint="give the load edge as rise_ns (20 A/us = 50 ns per amp of "
+                        "step), or set every esl_h / vr_series_h / plane_l_h to 0 to "
+                        "ask the ESR-only question")
+
+    # ---- natural time scales ---------------------------------------------
+    r_path = r_series_ohm + plane_r_ohm
+    periods = []
+    rcs = []
+    for (at, c, esr, esl), n in groups.items():
+        ct = c * n
+        esr_t = esr / n
+        esl_t = (esl + l_path) / n
+        if esl_t > 0:
+            periods.append(2.0 * math.pi * math.sqrt(esl_t * ct))
+        rcs.append(esr_t * ct)
+    if l_path > 0 and c_total > 0:
+        periods.append(2.0 * math.pi * math.sqrt(l_path * c_total))
+    fast_period = min(periods) if periods else None
+    scales = [p / 40.0 for p in periods] + [t / 40.0 for t in rcs if t > 0]
+    if rise_s > 0:
+        scales.append(rise_s / 20.0)
+    tau_slow = r_path * c_total
+    auto_stop = max(20.0 * tau_slow, 20.0 * rise_s,
+                    20.0 * fast_period if fast_period else 0.0)
+    if auto_stop <= 0:
+        return err("no time scale to integrate over", "ARG_INVALID")
+    if t_stop_ns is not None:
+        t_stop = float(t_stop_ns) * 1e-9
+        if t_stop <= 0:
+            return err("t_stop_ns must be > 0", "ARG_RANGE")
+    else:
+        t_stop = auto_stop
+    h_last = t_stop / float(samples)
+    h_first = min(scales) if scales else h_last / 1000.0
+    if h_first > h_last:
+        h_first = h_last
+    if h_first <= 0:
+        return err("the adaptive step came out as zero", "ARG_INVALID")
+
+    def _count_steps(h0):
+        t, h, n = 0.0, h0, 0
+        while t < t_stop and n <= 400000:
+            n += 1
+            t += h
+            h = min(h * 1.02, h_last)
+        return n
+
+    n_steps = _count_steps(h_first)
+    if n_steps > 400000:
+        return err("this needs more than 400000 time steps", "TOO_LARGE",
+                   hint="raise samples (coarser tail), give t_stop_ns, or drop the "
+                        "smallest esl_h - the ESR/ESL of one small cap sets the step "
+                        "even when it carries no charge")
+
+    die = 0
+    bulk = 1 if has_bulk else None
+    n_nodes = 2 if has_bulk else 1
+
+    def _simulate(h0):
+        br = []
+        vrm_node = bulk if has_bulk else die
+        br.append({"a": None, "b": vrm_node,
+                   "R": r_path if not has_bulk else r_series_ohm,
+                   "L": l_path if not has_bulk else vr_series_h,
+                   "C": None, "tag": "vrm"})
+        if has_bulk:
+            br.append({"a": bulk, "b": die, "R": plane_r_ohm,
+                       "L": plane_l_h, "C": None, "tag": "plane"})
+        for (at, c, esr, esl), n in sorted(groups.items(),
+                                           key=lambda kv: (kv[0][0], -kv[0][1])):
+            br.append({"a": die if at == "die" else bulk, "b": None,
+                       "R": esr / n, "L": esl / n, "C": c * n, "tag": "cap"})
+        # initial state: DC at preload (caps open, inductors carry the load)
+        v0 = [0.0] * n_nodes
+        v0[die] = -preload_a * r_path
+        if has_bulk:
+            v0[bulk] = -preload_a * r_series_ohm
+        i_prev = [0.0] * len(br)
+        u_prev = [0.0] * len(br)
+        for k, b in enumerate(br):
+            if b["tag"] != "cap":
+                i_prev[k] = preload_a
+            else:
+                u_prev[k] = v0[b["a"]]
+        u_init = list(u_prev)
+        g_br = [0.0] * len(br)
+        kL = [0.0] * len(br)
+        ku = [0.0] * len(br)
+        ts, vs, il = [0.0], [v0[die]], [preload_a]
+        t, h, steps = 0.0, h0, 0
+        while t < t_stop:
+            t_next = min(t + h, t_stop)
+            hh = t_next - t
+            for k, b in enumerate(br):
+                if b["C"] is None:
+                    den = b["R"] + b["L"] / hh
+                    g_br[k] = 1.0 / den
+                    kL[k] = (b["L"] / hh) * g_br[k]
+                    ku[k] = 0.0
+                else:
+                    den = b["R"] + b["L"] / hh + hh / b["C"]
+                    g_br[k] = 1.0 / den
+                    kL[k] = (b["L"] / hh) * g_br[k]
+                    ku[k] = -g_br[k]
+            G = [[0.0] * n_nodes for _ in range(n_nodes)]
+            j = [0.0] * n_nodes
+            isrc = [0.0] * len(br)
+            for k, b in enumerate(br):
+                g = g_br[k]
+                isrc[k] = kL[k] * i_prev[k] + ku[k] * u_prev[k]
+                a, bb = b["a"], b["b"]
+                if a is not None:
+                    G[a][a] += g
+                if bb is not None:
+                    G[bb][bb] += g
+                if a is not None and bb is not None:
+                    G[a][bb] -= g
+                    G[bb][a] -= g
+                if isrc[k]:
+                    if a is not None:
+                        j[a] -= isrc[k]
+                    if bb is not None:
+                        j[bb] += isrc[k]
+            frac = 1.0 if rise_s <= 0 else min(t_next / rise_s, 1.0)
+            i_load = preload_a + step_a * frac
+            j[die] -= i_load
+            try:
+                if n_nodes == 1:
+                    v = [j[0] / G[0][0]]
+                else:
+                    v = _solve_linear(G, j)
+            except ZeroDivisionError:
+                return None, "the network is singular (no path from the die node)"
+            for k, b in enumerate(br):
+                va = v[b["a"]] if b["a"] is not None else 0.0
+                vb = v[b["b"]] if b["b"] is not None else 0.0
+                i_new = g_br[k] * (va - vb) + isrc[k]
+                if b["C"] is not None:
+                    u_prev[k] = u_prev[k] + (hh / b["C"]) * i_new
+                i_prev[k] = i_new
+            t = t_next
+            h = min(h * 1.02, h_last)
+            steps += 1
+            ts.append(t)
+            vs.append(v[die])
+            il.append(i_prev[0])
+        # ---- scalars from the waveform
+        v_final = vs[-1]
+        dc_expected = -preload_a * r_path - step_a * r_path
+        span = ts[-1] - ts[0]
+        if span <= 0:
+            return None, "the time grid collapsed"
+        if step_a > 0:
+            k_min = min(range(len(vs)), key=lambda i: vs[i])
+        else:
+            k_min = max(range(len(vs)), key=lambda i: vs[i])
+        peak_v = vs[k_min]
+        t_peak = ts[k_min]
+        scale = max(abs(dc_expected), abs(peak_v - vs[0]))
+        tol = band_pct / 100.0 * scale
+        settle = 0.0
+        for i in range(len(vs) - 1, -1, -1):
+            if abs(vs[i] - dc_expected) > tol:
+                settle = ts[i]
+                break
+        under = (dc_expected - peak_v) if step_a > 0 else (peak_v - dc_expected)
+        if under < 0:
+            under = 0.0
+        # charge bookkeeping: what the caps gave up vs what the load took net
+        # a cap that goes DOWN in voltage has delivered charge, and its branch
+        # current (bus -> ground) is negative, so the state term is -C*du.
+        q_cap_state = 0.0
+        for k, b in enumerate(br):
+            if b["C"] is not None:
+                q_cap_state -= b["C"] * (u_prev[k] - u_init[k])
+        # right-endpoint sums, NOT trapezoid: those are the quadrature the backward
+        # Euler state update itself uses, so this identity closes to round-off if
+        # (and only if) every branch made it into the node equation.
+        q_vrm = 0.0
+        q_load = 0.0
+        for i in range(1, len(ts)):
+            dh = ts[i] - ts[i - 1]
+            q_vrm += il[i] * dh
+            f1 = 1.0 if rise_s <= 0 else min(ts[i] / rise_s, 1.0)
+            q_load += (preload_a + step_a * f1) * dh
+        q_missing = q_load - q_vrm          # must have come out of the caps
+        di_max = 0.0
+        for i in range(1, len(ts)):
+            dh = ts[i] - ts[i - 1]
+            if dh > 0:
+                di_max = max(di_max, abs(il[i] - il[i - 1]) / dh)
+        return {"ts": ts, "vs": vs, "il": il, "steps": steps,
+                "peak_v": peak_v, "t_peak": t_peak, "v_final": v_final,
+                "dc_expected": dc_expected, "settle": settle, "under": under,
+                "q_missing": q_missing, "q_cap_state": q_cap_state,
+                "di_max": di_max,
+                "h_first": h0}, None
+
+    sim, why = _simulate(h_first)
+    if sim is None:
+        return err(why, "NOT_APPLICABLE")
+    peak = sim["peak_v"]
+    refine_pct = None
+    if refine:
+        sim2, why2 = _simulate(h_first / 2.0)
+        if sim2 is not None and abs(peak) > 0:
+            refine_pct = abs(sim2["peak_v"] - peak) / abs(peak) * 100.0
+    # ---- report
+    ts, vs = sim["ts"], sim["vs"]
+    keep = []
+    n = len(ts)
+    head, tail = 24, 12
+    for i in range(min(head, n)):
+        keep.append(i)
+    body = max(0, n - head - tail)
+    stride = max(1, body // max(1, 120))
+    for i in range(head, n - tail, stride):
+        keep.append(i)
+    for i in range(max(head, n - tail), n):
+        keep.append(i)
+    kp = min(range(len(vs)), key=lambda i: vs[i]) if step_a > 0 else \
+        max(range(len(vs)), key=lambda i: vs[i])
+    keep.append(kp)
+    keep = sorted(set(keep))
+    probes = None
+    if probes_s:
+        probes = []
+        for tv in probes_s:
+            if tv > ts[-1] * (1.0 + 1e-12):
+                return err("probe_at_ns asks for %s s but the answer stops at %s s"
+                           % ("%.6g" % tv, "%.6g" % ts[-1]), "ARG_RANGE",
+                           hint="raise t_stop_ns, or drop that probe")
+            lo, hi = 0, len(ts) - 1
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if ts[mid] <= tv:
+                    lo = mid
+                else:
+                    hi = mid
+            span = ts[hi] - ts[lo]
+            f = 0.0 if span <= 0 else (tv - ts[lo]) / span
+            probes.append({"t_s": _sig(tv),
+                           "v_v": round(vs[lo] + f * (vs[hi] - vs[lo]), 9)})
+    warnings = []
+    if refine_pct is not None and refine_pct > 5.0:
+        warnings.append("halving the time step moves the peak by %.1f%% - the peak "
+                        "is a grid artefact at this `samples`; raise it"
+                        % refine_pct)
+    if sim["settle"] >= 0.98 * ts[-1]:
+        warnings.append("the rail had not settled inside t_stop = %s s; the last "
+                        "point is still %.3g V from the DC answer"
+                        % ("%.6g" % ts[-1], vs[-1] - sim["dc_expected"]))
+    if sim["v_final"] != 0 and abs(vs[0] - sim["v_final"]) < 1e-12:
+        warnings.append("the waveform did not move: check that the caps are on the "
+                        "node the load pulls on")
+    tail_settled = sim["settle"] < 0.98 * ts[-1]
+    dc_err = (vs[-1] - sim["dc_expected"])
+    dc_rel = (abs(dc_err) / abs(sim["dc_expected"])) if sim["dc_expected"] else 0.0
+    value = {
+        "peak_v": round(peak, 9),
+        "peak_excursion_v": round(abs(peak - vs[0]), 9),
+        "t_peak_s": _sig(sim["t_peak"]),
+        "v_initial_v": round(vs[0], 9),
+        "v_final_v": round(sim["v_final"], 9),
+        "dc_expected_v": round(sim["dc_expected"], 9),
+        "dc_check_rel": _sig(dc_rel),
+        "tail_settled": tail_settled,
+        "settle_time_s": _sig(sim["settle"]),
+        "undershoot_v": round(sim["under"], 9),
+        "undershoot_pct_of_final": (round(100.0 * sim["under"] /
+                                          abs(sim["dc_expected"]), 4)
+                                    if sim["dc_expected"] else None),
+        "dq_from_caps_c": round(sim["q_missing"], 15),
+        "charge_balance_rel": _sig(
+            abs(sim["q_cap_state"] - sim["q_missing"]) /
+            max(abs(sim["q_missing"]), 1e-18)
+            if abs(sim["q_missing"]) > 1e-15 else 0.0),
+        "vrm_di_dt_a_per_us": _sig(sim["di_max"] * 1e-6),
+        "steps": sim["steps"],
+        "h_first_s": _sig(sim["h_first"]),
+        "h_last_s": _sig(h_last),
+        "h_refine_peak_delta_pct": (None if refine_pct is None
+                                    else round(refine_pct, 4)),
+        "t_stop_s": _sig(t_stop),
+        "nodes": n_nodes,
+        "branches": len(groups) + (2 if has_bulk else 1),
+        "c_total_farad": _sig(c_total),
+        "t_s": [_sig(ts[i]) for i in keep],
+        "v_rail_v": [round(vs[i], 9) for i in keep],
+        "probes": probes,
+    }
+    return ok(value=value, unit="V", model=STEP_MODEL,
+              basis="MNA on R-L-C branches (one or two nodes: the die, and the bulk "
+                    "cap bus when any cap says at='bulk'), backward Euler, "
+                    "v_end = -I_end*R_path checked against the simulated tail; the "
+                    "load is a current sink I(t) = preload + step*min(t/rise,1)",
+              precision="v_initial_v is the state BEFORE the step (the preload DC "
+                        "point), and for a monotone droop t_peak_s is the end of the "
+                        "window, because that is where the minimum is. First-order in "
+                        "the time step, and the step is adaptive "
+                        "(fastest branch period/40 growing 2%/step). The peak is "
+                        "re-run at half the step: `h_refine_peak_delta_pct` is the "
+                        "honest error bar, and above 5% the peak is not a "
+                        "measurement. Backward Euler DAMPING makes a ring decay "
+                        "faster than physics, so a measured Q is a lower bound",
+              assumptions={"step_a": step_a, "preload_a": preload_a,
+                           "r_series_ohm": r_series_ohm,
+                           "vr_series_h": vr_series_h,
+                           "rise_ns": (rise_s * 1e9 if rise_s else 0.0),
+                           "settle_band_pct": band_pct,
+                           "caps": len(caps), "c_total_farad": _sig(c_total)},
+              extra={
+                  "warnings": warnings,
+                  "not_computed": [
+                      "regulator LOOP (this VRM is a Thevenin R+L: no bandwidth, no "
+                      "phase margin, no current limit, no droop sharing with other "
+                      "rails)",
+                      "plane spreading as a distributed effect (the caps are lumped "
+                      "on two nodes; that is board_ir_drop / pdn_plane_impedance)",
+                      "die-package inductance and on-die capacitance",
+                      "capacitor DC bias / temperature / age derating",
+                      "measurement noise, and any load profile other than one step"],
+                  "the_dc_anchor": ("the tail is compared against -I*R_path, which is "
+                                    "what the same network must converge to: a wrong "
+                                    "companion sign or a drifting integrator shows up "
+                                    "as dc_check_rel, not as a plausible curve"),
+              })
+
 def decoupling_plan(vdd_v, load_current_a, ripple_mv, band_hz, caps,
                     r_series_ohm=0.0, regulator_bandwidth_hz=None):
     """Will this set of caps hold the rail inside `ripple_mv` over `band_hz`?

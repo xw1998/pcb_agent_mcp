@@ -612,7 +612,9 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # plane additions (roughness_huray, plane_radiation_q, plane_open_end);
         # 169 = 168 + current_density_field in 0.0.63 (a 2-D field solve is a new
         # tool, not a flag on the 1-D ones: it needs a geometry, not a width)
-        self.assertEqual(len(tools.TOOLS), 169)
+        # 170 = 169 + pdn_step_response in 0.0.65 (a time-domain answer, not a
+        # flag on the frequency-domain one: it needs an edge rate and a regulator)
+        self.assertEqual(len(tools.TOOLS), 170)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

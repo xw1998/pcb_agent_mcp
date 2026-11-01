@@ -1,0 +1,9 @@
+LC ring: 50 mohm reg, 10 nH reg L, 1uF no ESR, 1 A over 50 ns
+Vref ref 0 0
+R1 ref x 0.05
+L1 x b 10n
+C1 b 0 1u
+Iload b 0 PWL(0 0 50n 1)
+.tran 0.5n 3u 0
+.print tran v(b)
+.end

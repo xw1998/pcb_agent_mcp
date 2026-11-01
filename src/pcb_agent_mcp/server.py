@@ -3934,6 +3934,74 @@ def selftest():
           str(_pz_cut.get("reason_code")))
     _shutil.rmtree(_pz_tmp, ignore_errors=True)
 
+    # ---- 0.0.65: the same network, but stepped. |Z| and a load transient are
+    # different questions, so the checks are different too: a DC anchor the curve
+    # has to land on, a charge identity that only closes if every branch made it
+    # into the node equation, and the one thing the frequency domain cannot say -
+    # the same caps 30 mm away are worse.
+    _st_a = _call("pdn_step_response",
+                  {"caps": [{"c_farad": 100e-6, "esr_ohm": 0.01}],
+                   "step_a": 2.0, "r_series_ohm": 0.02}, 1818)
+    _st_v = _st_a.get("value") or {}
+    check("a 2 A step on 100 uF is checked against DC, not against a picture: the "
+          "tail lands on -I*R = -40.000 mV (dc_check_rel 1.2e-06, settled 12.7 us "
+          "inside 40 us), and the charge the caps gave up (-C*du) equals what went "
+          "past the regulator to within 8e-15 of it - an identity that only closes "
+          "if every branch is in the node equation",
+          _st_a.get("status") == "ok"
+          and abs((_st_v.get("v_final_v") or 0) + 0.04) < 1e-6
+          and (_st_v.get("dc_check_rel") or 1) < 1e-4
+          and (_st_v.get("charge_balance_rel") or 1) < 1e-9
+          and _st_v.get("tail_settled") is True,
+          "tail %s V, charge %s, settled %s" % (_st_v.get("v_final_v"),
+                                                _st_v.get("charge_balance_rel"),
+                                                _st_v.get("tail_settled")))
+
+    _st_b = _call("pdn_step_response",
+                  {"caps": [{"c_farad": 1e-6, "esl_h": 1e-9}],
+                   "r_series_ohm": 0.01}, 1819)
+    check("an IDEAL current step into 1 nH is refused, not answered: V = L*dI/dt "
+          "would be set by the time step (a 20 A step at 10 ns is 2000 V), so the "
+          "tool asks for rise_ns instead of reporting a number that is really the "
+          "grid",
+          _st_b.get("status") == "error"
+          and _st_b.get("reason_code") == "ARG_REQUIRED"
+          and "rise_ns" in (_st_b.get("message") or ""),
+          str(_st_b.get("reason_code")))
+
+    _st_o = {"step_a": 10.0, "r_series_ohm": 0.001, "plane_r_ohm": 0.002,
+             "plane_l_h": 1e-9, "rise_ns": 400.0}
+    _st_die = (_call("pdn_step_response",
+                     {"caps": [{"c_farad": 100e-6, "esr_ohm": 0.002,
+                                "at": "die"}], **_st_o}, 1820).get("value") or {})
+    _st_bulk = (_call("pdn_step_response",
+                      {"caps": [{"c_farad": 100e-6, "esr_ohm": 0.002,
+                                 "at": "bulk"}], **_st_o}, 1821).get("value") or {})
+    check("where the caps sit is in the answer, and it is in the PEAK, not in the "
+          "tail: the same 100 uF behind 2 mohm + 1 nH of board peaks at -52.94 mV "
+          "against -32.52 mV with the cap at the die (1.6x), while both tails land "
+          "on the same -30.00 mV because at DC the cap is open and the load current "
+          "crosses that plane either way",
+          abs((_st_die.get("peak_v") or 0) + 0.03252) < 3e-4
+          and abs((_st_bulk.get("peak_v") or 0) + 0.05294) < 3e-4
+          and abs((_st_die.get("v_final_v") or 0) + 0.03) < 1e-6
+          and abs((_st_bulk.get("v_final_v") or 0) + 0.03) < 1e-6,
+          "die %s V, bulk %s V" % (_st_die.get("peak_v"), _st_bulk.get("peak_v")))
+
+    _st_bare = (_call("pdn_step_response",
+                      {"caps": [{"c_farad": 100e-6, "esr_ohm": 0.002}],
+                       "step_a": 10.0, "r_series_ohm": 0.001,
+                       "rise_ns": 400.0}, 1822).get("value") or {})
+    check("the plane is NOT silently dropped when every cap says at='die': the same "
+          "network with no plane answers -10.00 mV and with 2 mohm of plane answers "
+          "-30.00 mV, because the regulator current has to cross that plane either "
+          "way - dropping it would have answered a 3x-too-small droop",
+          abs((_st_bare.get("v_final_v") or 0) + 0.01) < 1e-6
+          and abs((_st_die.get("v_final_v") or 0) + 0.03) < 1e-6
+          and _st_bare.get("nodes") == _st_die.get("nodes"),
+          "no plane %s V, plane %s V" % (_st_bare.get("v_final_v"),
+                                         _st_die.get("v_final_v")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

@@ -1,0 +1,11 @@
+bulk caps behind 2 mohm + 1 nH of board: 10 A over 400 ns
+Vref ref 0 0
+R1 ref v 0.001
+R2 v m 0.002
+L1 m d 1n
+R3 v c 0.002
+C1 c 0 100u
+Iload d 0 PWL(0 0 400n 10)
+.tran 1n 40u 0
+.print tran v(d)
+.end
