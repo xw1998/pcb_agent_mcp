@@ -4598,6 +4598,131 @@ def selftest():
           str(_ac_o.get("reason_code")))
     _shutil.rmtree(_ac_tmp, ignore_errors=True)
 
+    # ---- 0.0.71: the flux does not have to be a sine. The Steinmetz triple is
+    # the same one a sine would use; what changes is the SHAPE the period
+    # integrates over. The first check is the zero-change one: a call that does
+    # not name a waveform must still be the plain closed form, digit for digit.
+    _mag = {"f_hz": 1e5, "b_peak_t": 0.1, "k": 100.0, "alpha": 1.4, "beta": 2.7}
+    _ig_def = _call("magnetics_core_loss", dict(_mag), 1863).get("value") or {}
+    _ig_sin = _call("magnetics_core_loss", dict(_mag, waveform="sine"),
+                    1863).get("value") or {}
+    check("waveform is not an argument until you use it: the default answer is"
+          " 1995260 W/m^3 / 1995.262315 mW/cm^3 either way, the two value"
+          " dictionaries are equal key for key, no iGSE block appears, and"
+          " not_modelled still names the non-sinusoidal flux - the shape of the"
+          " sine answer is part of the sine answer",
+          _ig_def == _ig_sin
+          and abs((_ig_def.get("P_v_w_m3") or 0) - 1995260.0) < 1e-6
+          and abs((_ig_def.get("P_v_mw_cm3") or 0) - 1995.262315) < 1e-9
+          and "igse" not in _ig_def and "waveform" not in _ig_def
+          and any("non-sinusoidal" in n for n in (_ig_def.get("not_modelled") or [])),
+          "P_v %s W/m^3" % _ig_def.get("P_v_w_m3"))
+
+    _ig_tri = _call("magnetics_core_loss", dict(_mag, waveform="triangle"),
+                    1864).get("value") or {}
+    _ig_pw = _call("magnetics_core_loss",
+                   {"f_hz": 1e5, "k": 100.0, "alpha": 1.4, "beta": 2.7,
+                    "waveform": "piecewise",
+                    "segments": [[0.2, 0.5], [-0.2, 0.5]]}, 1864).get("value") or {}
+    _ig_ig = _ig_tri.get("igse") or {}
+    check("a symmetric triangle is 1859840 W/m^3 - 0.932129 of what the sine"
+          " formula would have said, so the plain Steinmetz number was an"
+          " OVER-estimate here - the swing is 0.2 T peak-to-peak, k_i comes out"
+          " 5.435667 from the sine-reduction identity (I_alpha 3.582087), the same"
+          " triangle given as two piecewise rows lands on the same number, and the"
+          " shortcut is printed next to the answer instead of replacing it",
+          _ig_tri.get("waveform") == "triangle"
+          and abs((_ig_tri.get("P_v_w_m3") or 0) - 1859840.0) < 1e-6
+          and abs((_ig_tri.get("ratio_to_sine") or 0) - 0.932129) < 1e-9
+          and abs((_ig_tri.get("P_v_sine_equiv_w_m3") or 0) - 1995260.0) < 1e-6
+          and _ig_tri.get("sine_equiv_is") == "overestimate"
+          and abs((_ig_tri.get("flux_swing_pp_t") or 0) - 0.2) < 1e-12
+          and abs((_ig_ig.get("k_i") or 0) - 5.435667) < 1e-9
+          and abs((_ig_ig.get("i_alpha") or 0) - 3.582087) < 1e-9
+          and len(_ig_tri.get("segments_used") or []) == 2
+          and abs(((_ig_tri.get("segments_used") or [{}])[0].get("dB_dt_t_s") or 0)
+                  - 4e4) < 1e-6
+          and abs((_ig_pw.get("P_v_w_m3") or 0) - (_ig_tri.get("P_v_w_m3") or -1))
+          < 1e-6 * (_ig_tri.get("P_v_w_m3") or 1),
+          "ratio %s, k_i %s, piecewise %s"
+          % (_ig_tri.get("ratio_to_sine"), _ig_ig.get("k_i"),
+             _ig_pw.get("P_v_w_m3")))
+
+    _ig_d3 = _call("magnetics_core_loss", dict(_mag, waveform="triangle",
+                                               duty=0.3), 1865).get("value") or {}
+    _ig_am = _call("magnetics_core_loss",
+                   {"f_hz": 2e5, "b_peak_t": 0.05, "k": 100.0, "alpha": 1.4,
+                    "beta": 2.7, "waveform": "triangle"}, 1865).get("value") or {}
+    check("a 30% duty triangle is 1953560 W/m^3 (ratio 0.979098) - an unbalanced"
+          " ramp is steeper on one side and therefore worse - while halving the"
+          " amplitude and doubling the frequency leaves the RATIO untouched at"
+          " 0.932129, which is what makes it a shape correction rather than a"
+          " second fit",
+          abs((_ig_d3.get("P_v_w_m3") or 0) - 1953560.0) < 1e-6
+          and abs((_ig_d3.get("ratio_to_sine") or 0) - 0.979098) < 1e-9
+          and abs((_ig_d3.get("duty") or 0) - 0.3) < 1e-12
+          and abs((_ig_am.get("ratio_to_sine") or 0) - 0.932129) < 1e-9,
+          "duty .3 ratio %s, other-point ratio %s"
+          % (_ig_d3.get("ratio_to_sine"), _ig_am.get("ratio_to_sine")))
+
+    _ig_bad = [
+        ("unknown shape", dict(_mag, waveform="sawtooth"), "ARG_INVALID"),
+        ("duty on a sine", dict(_mag, duty=0.5), "ARG_INVALID"),
+        ("segments on a triangle", dict(_mag, waveform="triangle",
+                                        segments=[[0.2, 0.5], [-0.2, 0.5]]),
+         "ARG_INVALID"),
+        ("duty = 0", dict(_mag, waveform="triangle", duty=0.0), "ARG_RANGE"),
+        ("time does not sum to 1", {"f_hz": 1e5, "k": 100.0, "alpha": 1.4,
+                                    "beta": 2.7, "waveform": "piecewise",
+                                    "segments": [[0.1, 0.4], [-0.1, 0.4]]},
+         "ARG_RANGE"),
+        ("trajectory does not close", {"f_hz": 1e5, "k": 100.0, "alpha": 1.4,
+                                       "beta": 2.7, "waveform": "piecewise",
+                                       "segments": [[0.1, 0.5], [-0.05, 0.5]]},
+         "ARG_RANGE"),
+    ]
+    _ig_got = [(label, (_call("magnetics_core_loss", args, 1866) or {}).get(
+        "reason_code")) for label, args, _want in _ig_bad]
+    check("every shape argument is refused when it cannot be honoured, rather"
+          " than ignored: an unknown waveform, a duty handed to a sine, segments"
+          " handed to a triangle, duty = 0, dt_fractions that do not add up, and a"
+          " trajectory that never returns to its starting flux",
+          all(got == want for (_l, _a, want), (_l2, got) in zip(_ig_bad, _ig_got)),
+          "; ".join("%s=%s" % (l, g) for l, g in _ig_got))
+
+    _sc_req = {"inductance_h": 100e-6, "i_peak_a": 3.0, "freq_hz": 1e5,
+               "b_ac_t": 0.1, "loss_exponents": [1.3, 2.5], "material": "N87"}
+    _sc_sin = _call("magnetics_select_core", dict(_sc_req), 1867).get("value") or {}
+    _sc_tri = _call("magnetics_select_core", dict(_sc_req,
+                                                 flux_waveform="triangle"),
+                    1867).get("value") or {}
+    _sc_noexp_args = {k: v for k, v in _sc_req.items() if k != "loss_exponents"}
+    _sc_noexp_args["flux_waveform"] = "triangle"
+    _sc_noexp = _call("magnetics_select_core", _sc_noexp_args,
+                      1867).get("value") or {}
+    _sc_a = (_sc_sin.get("candidates") or [{}])[0]
+    _sc_b = (_sc_tri.get("candidates") or [{}])[0]
+    _sc_c = (_sc_noexp.get("candidates") or [{}])[0]
+    check("select_core can judge the core loss on the shape an inductor actually"
+          " carries: the triangle scales core_loss_w by the iGSE ratio and leaves"
+          " the turns, the peak flux and the gap alone, and with no exponents to"
+          " take alpha from it refuses that one number (naming loss_exponents)"
+          " instead of quoting the sine one as if it were the answer",
+          "flux_waveform" not in _sc_sin
+          and (_sc_tri.get("flux_waveform") or {}).get("waveform") == "triangle"
+          and _sc_a.get("turns") == _sc_b.get("turns")
+          and _sc_a.get("b_peak_t") == _sc_b.get("b_peak_t")
+          and _sc_a.get("core_loss_w") is not None
+          and abs((_sc_b.get("core_loss_w") or 0)
+                  / (_sc_a.get("core_loss_w") or 1)
+                  - 0.950643) < 1e-5
+          and "iGSE shape ratio" in (_sc_b.get("core_loss_basis") or "")
+          and _sc_c.get("core_loss_w") is None
+          and "loss_exponents" in (_sc_c.get("core_loss_basis") or ""),
+          "%s -> %s W (sine %s W), no-exponent -> %s"
+          % (_sc_b.get("part"), _sc_b.get("core_loss_w"), _sc_a.get("core_loss_w"),
+             _sc_c.get("core_loss_w")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

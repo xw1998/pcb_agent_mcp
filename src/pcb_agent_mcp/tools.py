@@ -3770,19 +3770,27 @@ def _capabilities(_args):
                               "carries authoritative=false and names board_drc",
         },
         "not_implemented_yet": [
-            "Power magnetics beyond the electrical design point: no core SELECTION "
-            "and no material table (core_loss_steinmetz takes k/alpha/beta from you "
-            "and names the unit convention, because the same material fitted by two "
-            "vendors gives two triples), no saturation curve of a real material "
-            "(only a single Isat number), no gapped-core fringing loss (which is "
-            "usually the biggest AC winding loss in a gapped inductor - "
-            "magnetics_winding_ac sees only the 1-D field through the stack), no litz "
-            "strand model, no DC-bias Steinmetz, no loop compensation and no soft "
-            "start. magnetics_winding_ac closes the skin/proximity gap for foil and "
-            "round-wire layer stacks, so the DCR loss is no longer the whole winding "
-            "story - but it is a 1-D Dowell model, not a field solve of your winding. "
-            "The tool answers the electrical design point and refuses the parts "
-            "question unless an Isat is supplied",
+            "Power magnetics, and the parts question: magnetics_select_core does pick "
+            "a real part out of data/magnetic_materials.json (11 materials, 16 cores, "
+            "7 of them with one vendor loss point at 200 mT / 100 kHz / 100 C), but NO "
+            "material in that table carries a Steinmetz triple, so core loss away from "
+            "that measured point needs exponents from you (Magnetics_NN vendor "
+            "exponents are also not in the table). No saturation CURVE of a real "
+            "material: only a single Bsat per published temperature, never "
+            "interpolated between them. No gapped-core fringing loss (which is usually "
+            "the biggest AC winding loss in a gapped inductor - magnetics_winding_ac "
+            "sees only the 1-D field through the stack). No litz strand model, no "
+            "DC-bias Steinmetz: magnetics_core_loss takes the AC swing and the WAVEFORM "
+            "SHAPE (sine, triangle + duty, or a piecewise trajectory) through the iGSE, "
+            "which is a function of the swing alone - a premagnetisation term is not "
+            "modelled, and the narrow-pulse over-prediction of iGSE (the GSE/WGSE "
+            "period-averaged-slope term) is not corrected. No thermal resistance for "
+            "any part in the table, so no temperature rise. No loop compensation and no "
+            "soft start. magnetics_winding_ac closes the skin/proximity gap for foil "
+            "and round-wire layer stacks, so the DCR loss is no longer the whole "
+            "winding story - but it is a 1-D Dowell model, not a field solve of your "
+            "winding. The tools answer the electrical design point; the parts question "
+            "refuses to answer unless an Isat (or a b_max_t) is supplied",
             "Layout and schematic reviews do not read the design for you: they grade "
             "the facts they are given. board_* / schematic_* can produce some of those "
             "facts (clearance, nets, components), but nothing here parses a netlist "
@@ -7518,25 +7526,48 @@ _tool(
 
 _tool(
     "magnetics_core_loss",
-    "Steinmetz core loss P_v = k*f^alpha*B_peak^beta with the coefficients YOU supply "
+    "Core loss for ONE period of a flux trajectory, with the coefficients YOU supply "
     "and the unit convention NAMED, because the published fits differ by ~10^12 in k "
     "purely through units (si = Hz/T/W-per-m3, khz_mt = kHz/mT/mW-per-cm3, khz_gauss). "
-    "Both unit systems are printed on every answer so a unit slip shows up as an "
-    "absurd magnitude. B_peak is the AC amplitude (half the peak-to-peak swing). Not "
-    "modelled: DC bias, non-sinusoidal flux, temperature dependence, gap loss - and "
-    "nothing about the winding, which is a separate number.",
+    "waveform='sine' (default) is the plain Steinmetz P_v = k*f^alpha*B_peak^beta; "
+    "waveform='triangle' (with duty, the rising fraction of the period) or "
+    "waveform='piecewise' (segments=[[dB_t, dt_fraction], ...] summing to 1 in time "
+    "and 0 in flux) evaluates the iGSE instead, whose k_i is derived here from the "
+    "requirement that a sine must reproduce your own Steinmetz triple exactly - the "
+    "usual case, since an inductor's ripple is a triangle and the plain form is only "
+    "defined for a sine. Every non-sine answer also prints what the sine formula "
+    "would have said, the ratio and which way it errs. Both unit systems are printed "
+    "on every answer so a unit slip shows up as an absurd magnitude. B_peak is the AC "
+    "amplitude (half the peak-to-peak swing); iGSE's dB_pp is the full swing. Not "
+    "modelled: DC bias, temperature dependence, gap loss, iGSE's known narrow-pulse "
+    "over-prediction (GSE/WGSE) - and nothing about the winding.",
     {"type": "object", "properties": {
         "f_hz": _num("frequency in Hz"),
-        "b_peak_t": _num("AC flux amplitude in tesla"),
+        "b_peak_t": _num("AC flux amplitude in tesla (for waveform='piecewise' it may "
+                         "be omitted, or given as a check against the segments)"),
         "k": _num("the material's Steinmetz coefficient, in the units named below"),
         "alpha": _num("the material's frequency exponent"),
         "beta": _num("the material's flux exponent"),
         "units": _str("which convention k is in", sorted(_magnetics.STEINMETZ_UNITS)),
         "ve_mm3": _num("optional: core volume, to turn P_v into watts"),
-    }, "required": ["f_hz", "b_peak_t", "k", "alpha", "beta"]},
+        "waveform": _str("the flux shape over one period: sine (plain Steinmetz), "
+                         "triangle (needs duty) or piecewise (needs segments)",
+                         ["sine", "triangle", "piecewise"], "sine"),
+        "duty": _num("triangle only: fraction of the period spent rising (0.5 = "
+                     "symmetric)"),
+        "segments": {"type": "array",
+                     "description": "piecewise only: the trajectory as "
+                                    "[[dB_t, dt_fraction], ...]. dB_t is the signed "
+                                    "flux CHANGE over the row in tesla, dt_fraction "
+                                    "its share of the period. The rows must sum to 1 "
+                                    "in time and to 0 in flux (a closed period)",
+                     "items": {"type": "array", "items": {"type": "number"}}},
+    }, "required": ["f_hz", "k", "alpha", "beta"]},
     lambda a: _magnetics.core_loss_steinmetz(
         a.get("f_hz"), a.get("b_peak_t"), a.get("k"), a.get("alpha"), a.get("beta"),
-        units=(a.get("units") or "si"), ve_mm3=a.get("ve_mm3")),
+        units=(a.get("units") or "si"), ve_mm3=a.get("ve_mm3"),
+        waveform=(a.get("waveform") or "sine"), duty=a.get("duty"),
+        segments=a.get("segments")),
 )
 
 _tool(
@@ -7598,7 +7629,10 @@ _tool(
     "material's fit, which this server does not invent. Rejections are named "
     "(saturates / window_overflow / saturation_unknown / no_geometry / filter). NOT "
     "modelled: temperature rise (no part has a published Rth), the DC-bias roll-off "
-    "of AL, gap fringing, winding AC resistance, AL tolerance.",
+    "of AL, gap fringing, winding AC resistance, AL tolerance. flux_waveform="
+    "'triangle' (+ duty) judges core_loss_w on the flux shape an inductor actually "
+    "carries rather than on the sine the vendor point was measured with; it needs "
+    "loss_exponents, whose x plays alpha in the iGSE shape ratio.",
     {"type": "object", "properties": {
         "inductance_h": _num("the inductance you need, in HENRY (100 uH = 1e-4)"),
         "i_peak_a": _num("peak winding current, which sets the flux"),
@@ -7625,6 +7659,11 @@ _tool(
         "limit": _num("how many feasible cores to list (smallest Ve first)"),
         "require_window_fit": _bool("drop cores whose winding window could not be "
                                     "checked, instead of listing them"),
+        "flux_waveform": _str("the flux shape the core loss is judged on: sine (what "
+                              "the vendor's measured point is) or triangle (what an "
+                              "inductor's ripple is)", ["sine", "triangle"], "sine"),
+        "duty": _num("triangle only: fraction of the period spent rising (0.5 = "
+                     "symmetric)"),
         "data_path": _str("override the table path (testing)"),
     }, "required": ["inductance_h", "i_peak_a"]},
     lambda a: _magnetics.select_core(
@@ -7643,6 +7682,8 @@ _tool(
         fill_factor=a.get("fill_factor"),
         limit=a.get("limit"),
         require_window_fit=a.get("require_window_fit"),
+        flux_waveform=(a.get("flux_waveform") or "sine"),
+        duty=a.get("duty"),
         data_path=a.get("data_path")),
 )
 

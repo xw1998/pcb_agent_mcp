@@ -308,10 +308,10 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `match_bandwidth` | 单谐振匹配的带宽 `BW = f0/Q`，以及 VSWR≤S 圈内带宽（乘 `(S−1)/√S`） | 只对**单谐振**成立；多谐振匹配不服从这条关系 |
 | `magnetics_inductor` | CCM boost / buck / buck-boost：占空比、电感量、峰/谷/有效电流、CCM 结束点 | 不回答"哪个能买到的磁芯装得下"——那在 `magnetics_select_core`（真厂商表）；`ripple` 是**你的设计选择**；没给 Isat 时饱和判 `undetermined` |
 | `magnetics_dcm` | DCM 稳态：`K = 2Lfs/R`、boost 的 `D = √(K·M(M−1))`、CCM 边界负载（∝ 1/L） | 环路补偿、软启动、DC 偏置下的电感量跌落 |
-| `magnetics_core_loss` | Steinmetz `Pv = k·f^α·B^β`，`k/α/β` **由你给**并写清单位约定 | 不内建材料表——同一牌号被两家拟合出两组三元组；无 DC 偏置、无磁通波形修正 |
+| `magnetics_core_loss` | Steinmetz `Pv = k·f^α·B^β`（`waveform="sine"`，默认），或对**你给的轨迹**做 iGSE：`waveform="triangle"`+`duty`、`waveform="piecewise"`+`segments`。`k/α/β` **由你给**并写清单位约定；非正弦一律同时打印正弦公式会说多少、`ratio_to_sine` 与错的方向；`k_i` 由「正弦必须还原你的 Steinmetz」解出（α=2.7 三角高估 33 %、α=1.4 高估 6.8 %、α=0.7 低估 3.5 %、α=1 精确相等）——不给 `waveform` 时**逐字节不变** | 不内建材料表——同一牌号被两家拟合出两组三元组；无 DC 偏置（只有交流摆幅）、无气隙边缘损耗、`duty<0.05` 的窄脉冲 iGSE 已知高估（GSE/WGSE 项未实现）；`ΔB` 是**峰峰值**不是幅值 |
 | `magnetics_dcr` | 绕组直流电阻：每匝平均长度 × 匝数 × 电阻率/截面 | 只有 DC 部分：无趋肤、无邻近效应、无端接与焊点（薄板/走线的 1-D 趋肤是 `ac_sheet_resistance`，绕组的层叠趋肤是 `magnetics_winding_ac`） |
 | `magnetics_winding_ac` | Dowell 1-D 的 `F_R = R_ac/R_dc`：箔 / 圆线层叠，拆成自发场与邻近场两项，可回算欧姆 | 1-D 场看不见**气隙边缘场**（有气隙电感里最大的一项）；无 litz、无交错绕组的 MMF 图、无谐波叠加、无磁芯损耗 |
-| `magnetics_select_core` | 从 `data/magnetic_materials.json` 里挑磁芯：两条匝数约束取大、峰值磁密、要不要开气隙（串联磁阻差）、厂商**一个**实测损耗点（或按你给的指数外推）、绕组 DC 与窗口，每个候选都带 `verdict` 或具名出局原因 | 表不是全型号；饱和只在厂商公布过 Bsat 的温度上判（25 / 100 ℃，**不插值**，缺数据进 `unjudged`）；无 Rth（不报温升）、无 DC 偏置 AL 跌落、无气隙边缘场修正、窗口只有 1 个部件有骨架数据 |
+| `magnetics_select_core` | 从 `data/magnetic_materials.json` 里挑磁芯：两条匝数约束取大、峰值磁密、要不要开气隙（串联磁阻差）、厂商**一个**实测损耗点（或按你给的指数外推，`flux_waveform="triangle"`+`duty` 时按 iGSE 形状比只缩损耗、`turns`/`b_peak`/`gap` 不动）、绕组 DC 与窗口，每个候选都带 `verdict` 或具名出局原因 | 表不是全型号；饱和只在厂商公布过 Bsat 的温度上判（25 / 100 ℃，**不插值**，缺数据进 `unjudged`）；无 Rth（不报温升）、无 DC 偏置 AL 跌落、无气隙边缘场修正、窗口只有 1 个部件有骨架数据 |
 | `magnetics_data` | 把那张表读回来：材料的 μi / Bsat（各温度）/ Tc / 损耗密度，磁芯的 Ae·le·Ve·AL·Amin·质量·骨架窗口与平均匝长·实测损耗点，**每行带来源 URL** | 这里不算任何东西，只是带出处的转录；取不到的字段是 `null` + 说明；表里没有任何 Steinmetz 三元组 |
 | `stackup_material` | 这个频率该用哪种板材（er / tanδ / 适用频段 / 成本），以及它看不见什么 | 频段上限是**工程约定**；Dk-频率曲线、批次公差、工艺兼容性都不在表里 |
 | `stackup_design` | 4 / 6 层叠：层角色、铜厚、介质分配、**每信号层各自的 50Ω 线宽**、缝合孔 λ_g/20、铜对称性 | 介质分配是**等比**的，不是压合图；线宽必须回到板厂 er 上重解 |

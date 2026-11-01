@@ -506,10 +506,115 @@ STEINMETZ_UNITS = {
 }
 
 
-def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None):
-    """Steinmetz core loss for ONE sinusoidal excitation, in the caller's units.
+# ---------------------------------------------------------------------------
+# iGSE: the same Steinmetz triple, but the flux does not have to be a sine
+# ---------------------------------------------------------------------------
+# Li, J., Abdallah, T., Sullivan, C. R., "Improved calculation of core loss with
+# nonsinusoidal waveforms", IEEE Industry Applications Conference 2001 (IEEE
+# Xplore document 955931) - the definition of the improved form:
+#
+#     P_v = (1/T) * Int_0^T k_i |dB/dt|^alpha * (dB_pp)^(beta - alpha) dt
+#
+# dB_pp is the PEAK-TO-PEAK swing (max B - min B over one period), not the
+# amplitude: that is the paper's definition, and reading it as an amplitude moves
+# the answer by 2^(beta-alpha) - 2.5x at the usual beta-alpha = 1.3. The
+# normalization k_i is fixed by the one requirement that makes the form
+# "improved" rather than "different": a sine must give back the plain Steinmetz
+# answer the caller's k/alpha/beta were fitted for. Solving that identity,
+#
+#     sine:  dB/dt = 2*pi*f*B_p*cos(2*pi*f*t),  dB_pp = 2*B_p,
+#            (1/T) Int |cos|^alpha dt = I_alpha/(2*pi)
+#     -> P = k_i * (2*pi)^(alpha-1) * 2^(beta-alpha) * I_alpha * f^alpha * B_p^beta
+#     -> k_i = k / [ (2*pi)^(alpha-1) * 2^(beta-alpha) * I_alpha ]
+#        I_alpha = Int_0^2pi |cos|^alpha d_theta
+#                = 2*sqrt(pi)*Gamma((alpha+1)/2)/Gamma((alpha+2)/2)
+#
+# k_i is DERIVED here and then measured against a direct numerical integral of
+# B(t) (tests/test_core_loss_igse.py); it is not copied from a table, because the
+# paper's own constants are printed for its own example and the transcription was
+# not available to verify. The identity above is checkable, which is better.
+def _i_alpha(alpha):
+    """Int_0^2pi |cos|^alpha d_theta, in log space so a large alpha cannot overflow."""
+    return math.exp(math.log(2.0) + 0.5 * math.log(math.pi)
+                    + math.lgamma(0.5 * (alpha + 1.0))
+                    - math.lgamma(0.5 * (alpha + 2.0)))
+
+def _igse_ki(k, alpha, beta):
+    """The normalization that makes iGSE reduce to Steinmetz on a sine."""
+    return k / ((2.0 * math.pi) ** (alpha - 1.0) * 2.0 ** (beta - alpha)
+                * _i_alpha(alpha))
+
+def _igse_span(segs):
+    """Peak-to-peak flux swing of a closed piecewise trajectory (start at 0)."""
+    b = lo = hi = 0.0
+    for db, _dtf in segs:
+        b += db
+        if b < lo:
+            lo = b
+        if b > hi:
+            hi = b
+    return hi - lo
+
+def _igse_pv(k, alpha, beta, f_native, segs):
+    """iGSE over one period for a closed trajectory given as (dB, dt_fraction) rows.
+
+    Everything is in the caller's own unit convention: f in the unit k was fitted
+    for and dB in the unit k was fitted for, so k_i carries k's units and no
+    conversion leaks into the integral.
+    """
+    dbpp = _igse_span(segs)
+    acc = 0.0
+    for db, dtf in segs:
+        acc += (abs(f_native * db / dtf)) ** alpha * dtf
+    return _igse_ki(k, alpha, beta) * dbpp ** (beta - alpha) * acc, dbpp
+
+def _igse_shape_ratio(alpha, segs):
+    """P_v(iGSE) / P_v(sine) at the SAME peak-to-peak swing, from the shape alone.
+
+    dB and f both cancel out of that ratio (the two answers carry the same
+    dB_pp^beta and the same f^alpha), so any consistent dB unit works. What is left
+    is a pure number that answers one question: by how much does the plain
+    Steinmetz equation - which assumes a sine - miss this waveform?
+    """
+    dbpp = _igse_span(segs)
+    if dbpp <= 0:
+        return None
+    acc = 0.0
+    for db, dtf in segs:
+        acc += (abs(db / dtf)) ** alpha * dtf
+    return acc / (dbpp ** alpha * (2.0 * math.pi) ** (alpha - 1.0)
+                  * 2.0 ** (-alpha) * _i_alpha(alpha))
+
+_WAVEFORMS = {
+    # canonical id -> the spelling(s) accepted for it
+    "sine": ("sine", "sin", "sinusoid", "sinusoidal"),
+    "triangle": ("triangle", "tri", "triangular", "symmetric_triangle"),
+    "piecewise": ("piecewise", "piecewise_linear", "segments", "arbitrary"),
+}
+
+def _waveform_canon(name):
+    """Canonical waveform id, or None when the name is not one we model."""
+    key = str(name if name is not None else "sine").strip().lower()
+    for sep in ("-", " ", "/"):
+        key = key.replace(sep, "_")
+    for canon, spellings in _WAVEFORMS.items():
+        if key in spellings:
+            return canon
+    return None
+
+
+def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None,
+                        waveform="sine", duty=None, segments=None):
+    """Best-known core loss for ONE period of a flux trajectory, in the caller's units.
+
+    waveform="sine" (default) is the plain Steinmetz fit the caller supplied:
 
         P_v = k * f^alpha * B_peak^beta
+
+    waveform="triangle" or "piecewise" evaluates the iGSE on the trajectory you
+    declare instead of pretending it is a sine:
+
+        P_v = (1/T) * Int k_i * |dB/dt|^alpha * dB_pp^(beta-alpha) dt
 
     `k`, `alpha`, `beta` are the MATERIAL's fit and are never invented here: a
     Steinmetz fit is a curve fit valid inside a (frequency, flux) window, and the
@@ -524,11 +629,23 @@ def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None)
     shows up as an absurd magnitude instead of a plausible wrong number.
 
     `b_peak_t` is the AC amplitude (half of the peak-to-peak swing), which is what
-    every published fit uses. Not modelled: DC bias (a gapped or DC-biased core
-    loses MORE than this at the same AC amplitude - revised Steinmetz / iGSE
-    territory), non-sinusoidal waveforms, temperature dependence of the
-    coefficients, and the gap/fringing loss. Also not modelled: how much of the
-    total loss this is - core loss says nothing about the winding.
+    every published fit uses. For waveform="piecewise" it may be omitted (the
+    segments carry the swing) or given as a check, in which case it must agree
+    with 2*dB_pp; a disagreement is refused rather than resolved silently.
+
+    `duty` is the rising fraction of the period for a triangle (default 0.5, the
+    symmetric case). `segments` is a closed list of [dB_t, dt_fraction] rows whose
+    dt_fractions sum to 1: that is the waveform, so nothing is guessed about it.
+
+    Every non-sine answer also prints what the plain Steinmetz equation would have
+    said at the same amplitude, the ratio, and which way the shortcut errs.
+
+    Not modelled: DC bias (a gapped or DC-biased core loses MORE than this at the
+    same AC amplitude - a revised-Steinmetz bias term is not implemented),
+    temperature dependence of the coefficients, the gap/fringing loss, and the
+    narrow-pulse over-prediction that the GSE/WGSE variants exist to fix. Also not
+    modelled: how much of the total loss this is - core loss says nothing about
+    the winding.
     """
     units = str(units or "si").strip().lower().replace("-", "_").replace("/", "_")
     if units not in STEINMETZ_UNITS:
@@ -536,20 +653,35 @@ def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None)
                    "ARG_INVALID",
                    hint="the k in a Steinmetz fit is meaningless without its unit "
                         "convention: si (Hz/T), khz_mt (kHz/mT), khz_gauss (kHz/G)")
+    wf = _waveform_canon(waveform)
+    if wf is None:
+        return err("waveform must be one of sine, triangle, piecewise (got %r)"
+                   % (waveform,), "ARG_INVALID",
+                   hint="sine keeps the plain Steinmetz closed form; triangle takes "
+                        "duty (rising fraction, default 0.5); piecewise takes "
+                        "segments=[[dB_t, dt_fraction], ...] summing to 1 over a "
+                        "closed period")
+    if wf != "triangle" and duty is not None:
+        return err("duty only applies to waveform='triangle' (got waveform=%r)"
+                   % wf, "ARG_INVALID",
+                   hint="piecewise carries its own timing in the dt_fraction column; "
+                        "a sine has no duty. Ignoring it would answer a different "
+                        "question than the one asked")
+    if wf != "piecewise" and segments is not None:
+        return err("segments only apply to waveform='piecewise' (got waveform=%r)"
+                   % wf, "ARG_INVALID",
+                   hint="a triangle is two segments with the duty you named; if the "
+                        "trajectory is the real question, say waveform='piecewise'")
     try:
         f = _f("f_hz", f_hz)
-        b = _f("b_peak_t", b_peak_t)
         kk = _f("k", k)
         a = _f("alpha", alpha)
         bb = _f("beta", beta)
+        b = None if (wf == "piecewise" and b_peak_t is None) else _f("b_peak_t", b_peak_t)
     except ValueError as exc:
         return err(str(exc), "ARG_INVALID")
     if f <= 0:
         return err("f_hz must be > 0", "ARG_RANGE")
-    if b <= 0:
-        return err("b_peak_t must be > 0", "ARG_RANGE",
-                   hint="B_peak is the AC amplitude in tesla; a DC-only core has no "
-                        "Steinmetz loss")
     if kk <= 0:
         return err("k must be > 0 (a Steinmetz coefficient is never zero or "
                    "negative)", "ARG_RANGE")
@@ -558,7 +690,96 @@ def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None)
                    "ARG_RANGE")
 
     f_unit, b_unit, k_unit, scale = STEINMETZ_UNITS[units]
-    pv_native = kk * (f / f_unit) ** a * (b / b_unit) ** bb
+    f_native = f / f_unit
+
+    if wf == "sine":
+        if b <= 0:
+            return err("b_peak_t must be > 0", "ARG_RANGE",
+                       hint="B_peak is the AC amplitude in tesla; a DC-only core has "
+                            "no Steinmetz loss")
+        pv_native = kk * f_native ** a * (b / b_unit) ** bb
+        dbpp_t = 2.0 * b
+        rows_t = None
+    else:
+        if wf == "triangle":
+            if b <= 0:
+                return err("b_peak_t must be > 0", "ARG_RANGE",
+                           hint="B_peak is the AC amplitude in tesla; the flux swings "
+                                "between -B_peak and +B_peak")
+            if duty is None:
+                d = 0.5
+            else:
+                try:
+                    d = _f("duty", duty)
+                except ValueError as exc:
+                    return err(str(exc), "ARG_INVALID")
+                if not (0.0 < d < 1.0):
+                    return err("duty must be in (0, 1) - it is the fraction of the "
+                               "period spent rising", "ARG_RANGE",
+                               hint="duty=0 or duty=1 means one infinite slope, which "
+                                    "is a square wave; give it as two piecewise rows "
+                                    "with the finite edge time")
+            rows_t = [(2.0 * b, d), (-2.0 * b, 1.0 - d)]
+        else:
+            if not isinstance(segments, (list, tuple)) or len(segments) < 2:
+                return err("waveform='piecewise' needs segments=[[dB_t, "
+                           "dt_fraction], ...] with at least 2 rows", "ARG_INVALID",
+                           hint="dB_t is the flux CHANGE over the row in tesla "
+                                "(signed), dt_fraction is that row's share of the "
+                                "switching period; the rows must sum to 1 in time "
+                                "and to 0 in flux")
+            rows_t = []
+            for i, row in enumerate(segments):
+                if not isinstance(row, (list, tuple)) or len(row) != 2:
+                    return err("segments[%d] must be [dB_t, dt_fraction]" % i,
+                               "ARG_INVALID")
+                try:
+                    db = _f("segments[%d][0]" % i, row[0])
+                    dtf = _f("segments[%d][1]" % i, row[1])
+                except ValueError as exc:
+                    return err(str(exc), "ARG_INVALID")
+                if dtf <= 0:
+                    return err("segments[%d][1] (dt_fraction) must be > 0" % i,
+                               "ARG_RANGE",
+                               hint="a zero-length row has no defined dB/dt")
+                rows_t.append((db, dtf))
+            tsum = 0.0
+            for _db, dtf in rows_t:
+                tsum += dtf
+            if abs(tsum - 1.0) > 1e-6:
+                return err("the dt_fractions must sum to 1 (got %r)" % tsum,
+                           "ARG_RANGE",
+                           hint="the second number in each row is a FRACTION of the "
+                                "switching period, not a time in seconds")
+            net = 0.0
+            span = 0.0
+            for db, _dtf in rows_t:
+                net += db
+                span += abs(db)
+            if span <= 0:
+                return err("the segments carry no flux swing (every dB_t is 0)",
+                           "ARG_RANGE")
+            if abs(net) > 1e-6 * span:
+                return err("the trajectory does not close: the dB_t values sum to "
+                           "%r, not 0" % net, "ARG_RANGE",
+                           hint="a steady-state period returns to the flux it "
+                                "started at; an open trajectory is a transient, not "
+                                "a rated operating point")
+            dbpp_t = _igse_span(rows_t)
+            if dbpp_t <= 0:
+                return err("the flux swing is zero (dB_pp = 0)", "ARG_RANGE",
+                           hint="no swing, no core loss")
+            if b is not None and abs(2.0 * b - dbpp_t) > 1e-6 * max(2.0 * b, dbpp_t):
+                return err("b_peak_t (%r) contradicts the segments, whose peak-to-peak "
+                           "swing is %r" % (b, dbpp_t), "ARG_INVALID",
+                           hint="b_peak_t is HALF the swing; drop it and the segments "
+                                "speak for themselves, or correct one of the two")
+            b = 0.5 * dbpp_t
+        segs_native = [(db / b_unit, dtf) for db, dtf in rows_t]
+        pv_native, dbpp_native = _igse_pv(kk, a, bb, f_native, segs_native)
+        dbpp_t = dbpp_native * b_unit
+        pv_sine_native = kk * f_native ** a * (b / b_unit) ** bb
+
     pv_wm3 = pv_native * scale
     pv_mwcm3 = pv_wm3 * 1e-3
 
@@ -573,6 +794,26 @@ def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None)
         "alpha": a,
         "beta": bb,
     }
+    if wf != "sine":
+        ratio = pv_native / pv_sine_native
+        out["waveform"] = wf
+        out["flux_swing_pp_t"] = _fmt(dbpp_t)
+        out["segments_used"] = [
+            {"dB_t": _fmt(db), "dt_fraction": _fmt(dtf),
+             "dB_dt_t_s": _fmt(f * db / dtf)} for db, dtf in rows_t]
+        out["igse"] = {
+            "k_i": _fmt(_igse_ki(kk, a, bb)),
+            "k_i_in": k_unit,
+            "i_alpha": _fmt(_i_alpha(a)),
+            "dB_pp_t": _fmt(dbpp_t),
+            "k_i_from": "derived so that a sine reduces to P_v = k*f^alpha*B_peak^beta",
+        }
+        out["P_v_sine_equiv_w_m3"] = _fmt(pv_sine_native * scale)
+        out["ratio_to_sine"] = _fmt(ratio)
+        out["sine_equiv_is"] = ("underestimate" if ratio > 1.0 + 1e-12 else
+                                "overestimate" if ratio < 1.0 - 1e-12 else "equal")
+        if wf == "triangle":
+            out["duty"] = _fmt(rows_t[0][1])
     if ve_mm3 is not None:
         try:
             ve = _f("ve_mm3", ve_mm3)
@@ -583,26 +824,63 @@ def core_loss_steinmetz(f_hz, b_peak_t, k, alpha, beta, units="si", ve_mm3=None)
         out["ve_mm3"] = _fmt(ve)
         out["core_loss_w"] = _fmt(pv_wm3 * ve * 1e-9)
         out["core_loss_per_gram_mw"] = None
-    out["not_modelled"] = [
-        "DC bias / premagnetisation (the same AC amplitude on a biased core loses more)",
-        "non-sinusoidal flux (use an iGSE/GSE variant; the plain Steinmetz form is "
-        "defined for a sine)",
-        "temperature dependence of k, alpha, beta",
-        "gap and fringing loss",
-        "how this compares with the WINDING loss - that is a separate number",
-    ]
+    if wf == "sine":
+        not_modelled = [
+            "DC bias / premagnetisation (the same AC amplitude on a biased core loses more)",
+            "non-sinusoidal flux (use an iGSE/GSE variant; the plain Steinmetz form is "
+            "defined for a sine)",
+            "temperature dependence of k, alpha, beta",
+            "gap and fringing loss",
+            "how this compares with the WINDING loss - that is a separate number",
+        ]
+    else:
+        not_modelled = [
+            "DC bias / premagnetisation (iGSE here is a function of the AC swing only; "
+            "a revised Steinmetz with a bias term is not implemented)",
+            "a flux trajectory other than the one declared (iGSE uses exactly the path "
+            "you gave: a DC-biased minor loop, a resonant ring or a partial swing is a "
+            "different problem)",
+            "temperature dependence of k, alpha, beta",
+            "gap and fringing loss",
+            "how this compares with the WINDING loss - that is a separate number",
+            "narrow-pulse bias: iGSE is known to over-predict for very small duty (the "
+            "period-averaged-slope term that GSE/WGSE add is not implemented here), so "
+            "treat duty below ~0.05 as directional rather than quantitative",
+        ]
+    out["not_modelled"] = not_modelled
     out["fit_is_extrapolation_if"] = ("f or B sits outside the window the triple was "
                                       "fitted on; the fit's error grows fast outside it")
+    if wf == "sine":
+        return ok(out, "power loss density (W/m^3 and mW/cm^3)",
+                  "Steinmetz equation P_v = k*f^alpha*B^beta",
+                  "P_v = k*f^alpha*B_peak^beta with k, alpha, beta supplied by the "
+                  "caller and interpreted in the named unit convention",
+                  "as good as the caller's fit inside its own window: typically 10-20% "
+                  "there and unbounded outside it. Units are the dominant error source - "
+                  "the same triple read in the wrong convention is off by orders of "
+                  "magnitude, which is why both unit systems are printed",
+                  {"material": "caller-supplied k/alpha/beta for a named convention",
+                   "waveform": "sine, B_peak = AC amplitude",
+                   "dc_bias": "not modelled",
+                   "temperature": "not modelled"},
+                  out)
     return ok(out, "power loss density (W/m^3 and mW/cm^3)",
-              "Steinmetz equation P_v = k*f^alpha*B^beta",
-              "P_v = k*f^alpha*B_peak^beta with k, alpha, beta supplied by the "
-              "caller and interpreted in the named unit convention",
-              "as good as the caller's fit inside its own window: typically 10-20% "
-              "there and unbounded outside it. Units are the dominant error source - "
-              "the same triple read in the wrong convention is off by orders of "
-              "magnitude, which is why both unit systems are printed",
-              {"material": "caller-supplied k/alpha/beta for a named convention",
-               "waveform": "sine, B_peak = AC amplitude",
+              "iGSE, improved Generalized Steinmetz Equation (Li/Abdallah/Sullivan 2001)",
+              "P_v = (1/T)*Int k_i*|dB/dt|^alpha*dB_pp^(beta-alpha) dt over the declared "
+              "trajectory, with k_i = k/((2*pi)^(alpha-1)*2^(beta-alpha)*I_alpha) so "
+              "that a sine reproduces the caller's own Steinmetz triple exactly",
+              "the caller's fit on a sine is the anchor (iGSE reproduces it to 1e-10 in "
+              "this implementation, checked against a numerical integral); how far the "
+              "waveform correction is from the truth is NOT measured in this repo - it is "
+              "model output, and its usual stated validity is inside the fit window for "
+              "triangle/trapezoid flux. k_i is derived from the sine identity above and "
+              "verified numerically, not transcribed from a paper",
+              {"material": "caller-supplied k/alpha/beta for a named convention, same "
+                           "triple a sine would use",
+               "waveform": wf + " (declared, not inferred); dB_pp = " + repr(_fmt(dbpp_t))
+                          + " T",
+               "flux_swing": "peak-to-peak (max B - min B), as iGSE defines it - reading "
+                             "it as an amplitude is a 2^(beta-alpha) error",
                "dc_bias": "not modelled",
                "temperature": "not modelled"},
               out)
@@ -1036,20 +1314,35 @@ def magnetic_data(kind="materials", name=None, material=None, shape=None,
         {"table_path": data_path or DATA_PATH})
 
 
-def _core_loss_for(core, material, freq_hz, b_ac_t, exponents):
-    """Core loss in watts, or (None, why-not)."""
+def _core_loss_for(core, material, freq_hz, b_ac_t, exponents,
+                   waveform="sine", duty=None):
+    """Core loss in watts, or (None, why-not).
+
+    `waveform`/`duty` change the SHAPE of the flux only: the sine answer is what
+    the caller's k/alpha/beta (or the vendor's single measured point) is, and the
+    correction is the iGSE shape ratio, a pure number that depends on the shape and
+    on alpha, not on the amplitude.
+    """
     ref = core.get("loss_ref")
     if freq_hz is None or b_ac_t is None:
         return None, ("core loss needs the AC excitation: pass freq_hz and b_ac_t "
                       "(the AC flux amplitude, i.e. half the peak-to-peak swing)")
     if b_ac_t <= 0:
         return None, "b_ac_t must be > 0: a DC-only core has no core loss"
+    d = 0.5 if duty is None else duty
+    segs = [(2.0 * b_ac_t, d), (-2.0 * b_ac_t, 1.0 - d)]
     # (1) the material's own Steinmetz fit, if the table ever gets one
     st = (material or {}).get("steinmetz")
     if st and core.get("ve_mm3"):
-        pv = (float(st["k"]) * freq_hz ** float(st["alpha"])
-              * b_ac_t ** float(st["beta"]))
-        return pv * core["ve_mm3"] * 1e-9, "material Steinmetz fit, P_v * Ve"
+        al = float(st["alpha"])
+        pv = (float(st["k"]) * freq_hz ** al * b_ac_t ** float(st["beta"]))
+        note = "material Steinmetz fit, P_v * Ve"
+        if waveform != "sine":
+            ratio = _igse_shape_ratio(al, segs)
+            pv *= ratio
+            note += (" x iGSE shape ratio %g (triangle, duty %g, alpha %g)"
+                     % (ratio, d, al))
+        return pv * core["ve_mm3"] * 1e-9, note
     # (2) the part's own measured reference point, scaled only with exponents
     #     the caller supplied - the exponents are NOT invented here
     if not ref:
@@ -1058,29 +1351,42 @@ def _core_loss_for(core, material, freq_hz, b_ac_t, exponents):
                       "operating point is unknown (not zero)")
     f_ref = float(ref["f_khz"]) * 1e3
     b_ref = float(ref["b_mt"]) * 1e-3
+    x = y = None
+    if exponents:
+        x, y = exponents
+    ratio, shape_note = 1.0, ""
+    if waveform != "sine":
+        if x is None:
+            return None, ("a %s flux needs alpha to turn the sine loss into the iGSE "
+                          "one, and this part carries a single measured point: pass "
+                          "loss_exponents=(x, y) from the material's fit - its x is "
+                          "the frequency exponent and is used as alpha" % waveform)
+        ratio = _igse_shape_ratio(x, segs)
+        shape_note = (" x iGSE shape ratio %g (triangle, duty %g; alpha taken as the "
+                      "frequency exponent x=%g)" % (ratio, d, x))
     same = (abs(freq_hz - f_ref) <= 1e-6 * f_ref
             and abs(b_ac_t - b_ref) <= 1e-6 * b_ref)
     if same:
-        return float(ref["p_w"]), ("the vendor's own measured point: %g W/set at "
-                                   "%g mT / %g kHz / %g C"
-                                   % (ref["p_w"], ref["b_mt"], ref["f_khz"],
-                                      ref["temp_c"]))
+        return float(ref["p_w"]) * ratio, ("the vendor's own measured point: %g W/set "
+                                           "at %g mT / %g kHz / %g C"
+                                           % (ref["p_w"], ref["b_mt"], ref["f_khz"],
+                                              ref["temp_c"]) + shape_note)
     if not exponents:
         return None, ("the operating point is not the measured one (%g mT / %g kHz "
                       "/ %g C); scaling a single point away from its condition needs "
                       "loss_exponents=(x, y) from the material's fit"
                       % (ref["b_mt"], ref["f_khz"], ref["temp_c"]))
-    x, y = exponents
-    p = float(ref["p_w"]) * (freq_hz / f_ref) ** x * (b_ac_t / b_ref) ** y
+    p = float(ref["p_w"]) * (freq_hz / f_ref) ** x * (b_ac_t / b_ref) ** y * ratio
     return p, ("scaled from %g W/set at %g mT / %g kHz with the caller's "
-               "exponents x=%g y=%g" % (ref["p_w"], ref["b_mt"], ref["f_khz"], x, y))
-
+               "exponents x=%g y=%g" % (ref["p_w"], ref["b_mt"], ref["f_khz"], x, y)
+               + shape_note)
 
 def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                 b_max_t=None, material=None, shape=None, temperature_c=100.0,
                 bsat_derate=BSAT_DERATE_TYPICAL, loss_exponents=None,
                 current_density_a_mm2=None, fill_factor=None, limit=None,
-                require_window_fit=False, data_path=None):
+                require_window_fit=False, data_path=None,
+                flux_waveform="sine", duty=None):
     """Choose a real core for an (L, Ipk) requirement, or say why none fits.
 
     The two constraints that decide the turns:
@@ -1097,9 +1403,16 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
     temperatures the material publishes (25 C / 100 C). The derate is a DESIGN
     MARGIN, not a material property.
 
+    `flux_waveform`/`duty` (default sine / 0.5) decide the SHAPE the core loss is
+    judged on: an inductor carries a triangular flux, not a sine, and the plain
+    Steinmetz number is only right for the latter. The iGSE shape ratio is applied
+    to `core_loss_w` alone - the turns, the flux limit and the gap do not care
+    about the shape.
+
     What is refused rather than guessed: saturation at a temperature the material
     does not publish; a gap length when the material's mu_i is unknown; core loss
-    away from a measured point without caller-supplied exponents; copper loss or
+    away from a measured point without caller-supplied exponents; a non-sine
+    waveform when there is no alpha to compute the shape ratio from; copper loss or
     a winding-window verdict when the table has neither a former's winding area
     nor a mean turn length for that core; and any temperature rise at all, because
     no part in the table has a published thermal resistance.
@@ -1149,6 +1462,30 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                             "the material's own fit - they are not derived here")
         if expo[0] <= 0 or expo[1] <= 0:
             return err("loss_exponents must both be > 0", "ARG_RANGE")
+
+    wf = _waveform_canon(flux_waveform)
+    if wf is None:
+        return err("flux_waveform must be sine or triangle (got %r)"
+                   % (flux_waveform,), "ARG_INVALID",
+                   hint="an inductor's ripple is a triangle; a sine is the default "
+                        "the vendor loss fits are written for")
+    if wf == "piecewise":
+        return err("select_core judges a SHAPE, not an arbitrary trajectory: use "
+                   "flux_waveform='triangle', or evaluate magnetics_core_loss with "
+                   "segments= yourself and scale the watts", "ARG_INVALID")
+    if wf != "triangle" and duty is not None:
+        return err("duty only applies to flux_waveform='triangle'", "ARG_INVALID",
+                   hint="a sine has no duty; passing one and having it ignored would "
+                        "answer a different question than the one asked")
+    duty_v = 0.5
+    if duty is not None:
+        try:
+            duty_v = _f("duty", duty)
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        if not (0.0 < duty_v < 1.0):
+            return err("duty must be in (0, 1) - it is the fraction of the switching "
+                       "period spent rising", "ARG_RANGE")
 
     mats = {m.get("name"): m for m in (data.get("materials") or [])}
     cores = data.get("cores") or []
@@ -1308,7 +1645,8 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
                 row["gap_because"] = core.get("gap_note") or "gap not stated"
 
         # --- core loss
-        p_core, p_note = _core_loss_for(core, mat, freq_hz, b_ac_t, expo)
+        p_core, p_note = _core_loss_for(core, mat, freq_hz, b_ac_t, expo,
+                                        waveform=wf, duty=duty_v)
         row["core_loss_w"] = _fmt(p_core) if p_core is not None else None
         row["core_loss_basis"] = p_note
         if p_core is None:
@@ -1428,6 +1766,15 @@ def select_core(inductance_h, i_peak_a, i_rms_a=None, freq_hz=None, b_ac_t=None,
             "so a loss away from a measured point needs loss_exponents from you",
         ],
     }
+    if wf != "sine":
+        out["flux_waveform"] = {
+            "waveform": wf, "duty": _fmt(duty_v),
+            "applied_to": "core_loss_w only (turns, flux limit and gap do not "
+                          "depend on the shape)",
+            "shape_ratio_basis": "iGSE: the ratio depends on alpha, and alpha here is "
+                                 "the caller's loss_exponents[0] (x) - the same "
+                                 "exponent the F^alpha scaling already uses",
+        }
     return ok(
         out, "core sets, smallest effective volume first",
         "Faraday + inductance relation on vendor effective parameters "

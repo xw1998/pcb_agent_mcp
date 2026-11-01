@@ -9,6 +9,67 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.71] - 2026-11-01
+
+**正弦不是唯一形状**（`magnetics_core_loss` 新增 `waveform` / `duty` / `segments`；
+`magnetics_select_core` 新增 `flux_waveform` / `duty`）。`Pv = k·f^α·B^β` 是一条**正弦**的拟合曲线，
+而电感里的磁通基本都不是正弦（Buck / 反激是三角，PFC 是低频绝对正弦上叠高频三角）。
+这一版把那条曲线换成**对你给的那条轨迹逐段积分**的 iGSE，并且把它**归一到你自己的 Steinmetz 三元组**上。
+
+一句话结论：**三角波被正弦公式高估多少，由 α 决定，不是一个常数**——α=2.7 高估 **33 %**
+（`ratio_to_sine 0.666230`）、α=1.4 高估 **6.8 %**（`0.932129`）、α=0.7 **低估 3.5 %**
+（`1.035020`）、α=1 **精确相等**；流传的"三角是正弦的 0.378 倍"是**把 `ΔB` 当幅值读**，
+iGSE 的 `ΔB_pp` 是**峰峰值**，同峰值下正确值 `0.932129`。**工具数棘轮仍是 173**
+（两个工具都只是加参数，没有新工具）。
+
+### 判据为什么是这几条（每条都能失败）
+
+| 锚点 | 实测 | 它能抓住什么 |
+| --- | --- | --- |
+| **默认 = 正弦到每一位** | 不给 `waveform`：360/360 成功案例 + 12/12 错误案例与 `0.0.70` 逐字节相同；输出里**没有** `waveform` / `igse` / `ratio_to_sine` 这些键 | 把正弦路径也改成"走 iGSE、只是形状是正弦" |
+| **`k_i` 自证 I** | `I_α` 闭式对 `∫₀^{2π}\|cos\|^α dθ` 的 400001 点求积，相对差 <`1e-8`；`I_α(1)=4.0` 精确 | 闭式写错、或把 `Γ` 直接算（α 大时溢出） |
+| **`k_i` 自证 II** | 正弦时 iGSE 对 **B(t) 直接数值积分** vs Steinmetz 相对差 `5.7e-11`（断言 `1e-9`）| 归一化常数抄错/记错（文献正文没取到） |
+| 三角闭式 | `1859840.0 W/m³`，对轨迹数值积分 `1e-5`（受 `_fmt` 6 位有效数字限制）| 闭式与积分各写一遍、只验一处 |
+| **方向由 α 的凸性决定** | α=1.4 / 2.7 `overestimate`、α=0.7 `underestimate`、α=1 `equal`（`ratio=1.0`，断言 `1e-12`）| 无条件断言"三角比正弦低" |
+| 比率与 f、ΔB 无关 | 同形状换 `f`、换 `ΔB`，`ratio_to_sine` 不变（`1e-9`）| 把 `f`、`ΔB` 留在比率里（`α=1` 那条例检立刻失败）|
+| 分段 == 闭式 | duty 0.5 拆成两行 `[[0.2,0.5],[-0.2,0.5]]`，`P_v` 与三角**逐位相同**（`1e-12`）| 分段实现引入额外常数 |
+| 形状真的被看见 | 8 段阶梯占正弦的 `0.977559`（低 2.2 %）、带 5 % 边沿方波 `1.019154`（比三角 `1859840.0` 高 9.3 %），三者 `ΔB_pp` 都是 `0.2 T` | 只按峰峰值算（iGSE 退化成 Steinmetz）|
+| 单位约定仍一致 | `si` / `khz_mt` / `khz_gauss` 三角形同值（`1e-9`）| 换单位结论就变 |
+| `select_core` 只缩损耗 | B66283：`0.106066 → 0.100831`（比率 `0.9506439` = `_igse_shape_ratio(1.3, duty .5)`），`turns 25` / `b_peak_t 0.305344` / `gap 0.297616` **全不动** | 用形状去改匝数、改磁密限、改气隙 |
+| **负控制（拒绝而不是忽略）** | 未知 `waveform` / `duty` 配 sine / `segments` 配 triangle 或 sine ⇒ `ARG_INVALID`；`duty∉(0,1)` / dt 和不等于 1 / 轨迹不闭合 / `α,β≤0` ⇒ `ARG_RANGE`；只有 1 行、`b_peak_t` 与峰峰值矛盾 ⇒ `ARG_INVALID` | 接受一个参数然后按默认形状回答——靠遗漏说谎 |
+
+### 语义决策
+
+- **`k_i` 是解出来的，不是抄来的**：文献（Li/Abdallah/Sullivan 2001，Xplore `955931`）正文这一轮取不到，
+  所以按"正弦必须还原你的 Steinmetz"解 `k_i = k/[(2π)^(α−1)·2^(β−α)·I_α]`，再用对 `B(t)` 的独立数值积分
+  验到 `5.7e-11`。文档写的是"定义来自该文、归一化常数自行推导并数值验证"，**不写"照抄文献常数"**。
+- **`ΔB` 是峰峰值**：`flux_swing_pp_t` 与实际喂进积分的 `dB_pp_t` 一起打印，段表里每行带 `dB_dt_t_s`，
+  任何人可以自己复算 `Σ k_i\|dB/dt\|^α ΔB_pp^(β−α) Δt`。**不给单一"形状系数"**——它随 α 与 duty 变。
+- **非正弦必须同时打印"偷懒答案"**：`P_v_sine_equiv_w_m3` + `ratio_to_sine` + `sine_equiv_is`（`overestimate` /
+  `underestimate` / `equal`）。商业场景里用户会拿旧数字对比，方向与幅度必须出现在同一个信封里。
+- **`select_core` 只接受 sine / triangle**：`piecewise` 明确拒绝并指向 `magnetics_core_loss(segments=)`——
+  选型判的是**形状**，任意轨迹是一次具体计算，不是选型判据。
+- **`select_core` 的 α 取 `loss_exponents[0]`**：`core_loss_w` 本来就按 `f^x·B^y` 从参考点缩放，那个 `x`
+  就是 Steinmetz 的频率指数，与 iGSE 的 α 是同一个数。这件事写在 `flux_waveform.shape_ratio_basis` 里，不靠猜。
+- **没有 `loss_exponents` 时只拒损耗这一个数**：`core_loss_w` 置 `null` 且 `core_loss_basis` 点名
+  `loss_exponents`，但**选型本身照常回答**（`status` 仍 `ok`，turns / 饱和 / 气隙都在）。
+- **`not_modelled` 换掉一条、补一条**：非正弦时删掉"non-sinusoidal flux"（已经算了），补上
+  DC 偏置、窄脉冲高估（`duty<0.05` 只给方向）等具名条目；正弦路径的列表**逐字不变**。
+
+### 口径
+
+- 同模块加参数：不给 `waveform` 时 `core_loss_steinmetz` 的**每一个字段**与 `0.0.70` 完全相同
+  （`_scratch/cmp071.py` 自证 360/360 + 12 错误臂）；`select_core` 默认路径 240/240 逐字节相同
+  （`_scratch/cmp071b.py`）。`skin` / `roundwire` / `acthermal` / `oracle` **一行未改**。
+- `tests/test_core_loss_igse.py` **34 例**（`I_α` 2 / 正弦还原 2 / 三角 6 / 分段 4 / 单位 1 / 拒绝 9 /
+  `select_core` 5 / 工具 5）；selftest `252/252` → **`257/257`**（+5 条自检）。
+- 成本：纯算术无迭代，34 例测试文件总耗时 **1.9 s**；正弦路径零新增开销。
+- `dependencies = []` 仍成立（只用 `math`，`I_α` 走 `lgamma`）。
+- 顺手修正 `calc_capabilities.not_implemented_yet` 里一条**过期**的自述："no core SELECTION and no
+  material table"——`magnetics_select_core` 与 `data/magnetic_materials.json` 早就在（11 材料 / 16 磁芯），
+  真实缺口是**表里没有 Steinmetz 三元组**（只有 7/16 有单点实测损耗），已改成这句话。
+- 逐条口径见 [docs/74](docs/74-iGSE-非正弦磁通的磁芯损耗.md)。
+
 ## [0.0.70] - 2026-11-01
 
 **铜不是一个厚度**（`board_ir_drop` 新增 `frequency_hz` / `faces` / `mu_r` / `roughness_rq_um`）。
