@@ -29,6 +29,7 @@ from . import epro_edit
 from . import fsutil
 from . import ops
 from . import plan
+from . import pro_rules
 from . import sch_ops
 from . import sch_plan
 
@@ -47,11 +48,14 @@ from .plan import step_events
 from .plan import steps_root
 
 __all__ = [
-    "build", "checks", "epro_edit", "fsutil", "ops", "plan", "sch_ops", "sch_plan",
+    "build", "checks", "epro_edit", "fsutil", "ops", "plan", "pro_rules",
+    "sch_ops", "sch_plan",
     "EditError", "OpError", "_DryRunBlocked", "detect_format",
     "apply_plan", "apply_steps", "checkpoint_root", "create_board", "describe_ops",
+    "describe_project_rule_ops",
     "describe_epro_ops", "describe_sch_ops", "find_checkpoint",
     "list_checkpoints", "propose", "propose_schematic", "restore_checkpoint",
+    "read_project_rules", "write_project_rules",
     "new_schematic_file", "save_checkpoint", "schematic_hierarchy",
     "schematic_summary", "schematic_view",
     "step_control", "step_events", "steps_root",
@@ -111,6 +115,21 @@ def detect_format(path):
     if head.startswith(b"SQLite format 3"):
         return "epro"
     return None
+
+
+def read_project_rules(path):
+    """The net classes a `.kicad_pro` declares (read-only)."""
+    return pro_rules.read(path)
+
+
+def write_project_rules(path, operations, dry_run=False):
+    """Write net-class rules into the `.kicad_pro` - see `edit/pro_rules.py`."""
+    return pro_rules.apply(path, operations, dry_run=dry_run)
+
+
+def describe_project_rule_ops():
+    """The `.kicad_pro` operation catalogue."""
+    return pro_rules.describe()
 
 
 def propose(path, operations, options=None):

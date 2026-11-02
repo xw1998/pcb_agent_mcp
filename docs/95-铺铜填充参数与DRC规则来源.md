@@ -289,3 +289,135 @@ zone」必然 `GATE_BLOCKED`，报错只说 postcondition failed / `remaining_ma
 `RouteError` 有 `.message/.reason_code/.hint`，`jobs.JobError` 也有全套，`OpError` / `EditError`
 原来只有一个 `str`。现在补齐 `.message/.reason_code/.hint`（`.code` 保留为别名），
 调用方不必再按「这是哪一套」写三份 `except`。
+
+## 16. 净类规则在 `.kicad_pro` 里，所以要写就得证明一次 JSON 重写
+
+`set_netclass`（写 op）改的是**板文件里**的 `(net_class ...)`。那是 v5 时代的位置，KiCad 7+
+从**工程文件**读净类，板里那份它根本不看。于是「我改成功了」和「布线与 DRC 仍按 Default」
+可以同时成立——这就是 `board_rules_write` 存在的原因，也是 DRC 差集两半必须读同一份
+`.kicad_pro` 的同一个原因。
+
+### 16.1 文件形态是实测出来的，不是猜的
+
+KiCad 10.0.7 写出来的工程文件：2 空格缩进、**键按字母排序**、**非 ASCII 转义**
+（`"Référence"` 存成 `"R\u00e9f\u00e9rence"`）、末尾一个换行。拿真实 16 523 字节的工程文件来回测：
+
+| 写法 | 结果 |
+|---|---|
+| `json.dumps(indent=2, sort_keys=True, ensure_ascii=True) + "\n"` | **逐字节相同** |
+| `ensure_ascii=False` | 差 1 行（正好是 `sort_field` 那一行） |
+
+所以「能否往返」是一个真检查，不是形式主义：`edit/pro_rules.py::STYLE` 是唯一写下这个
+形态的地方，`dump()` 与闸门读的是同一个常量。
+
+### 16.2 往返不上就拒绝写，不重排别人的工程文件
+
+量出形态之后的第一反应是「那就按这个形态重写」，这正是要拒绝的做法：为了改一个 clearance
+去重排、重转义 900 行手写 JSON，是一个没人能 review 的 diff，而 `SaveBoard` 那一课已经说明
+KiCad 会拒绝「看起来对」的文件。所以：
+
+* 落笔前先证明**未改动的文本能自己串回自己**；串不回来 → `PRO_FORMAT_UNKNOWN`（一个字节都不写），
+  hint 让人在 KiCad 里重存一次工程把这个形态归一化；
+* 这个检查也出现在 `board_rules` 的 `writable` / `style_roundtrip` / `why_not_writable` 里，
+  读的人不必先试一次写才知道能不能写。
+
+### 16.3 五道闸门，一道在写前、四道在写后
+
+| 闸门 | 位置 | 判什么 |
+|---|---|---|
+| `format_roundtrip` | 写前 | 未改动的文本能逐字节串回自己 |
+| `diff_is_intended` | 写前 | 只有操作点名的键变了（`changed_keys` 全部落在允许前缀内，否则 `DIFF_NOT_INTENDED`） |
+| `bytes_written` | 写后 | 盘上的字节就是计划里的字节（`sha256` 与计划相等） |
+| `json_roundtrip` | 写后 | 重新读盘得到的 dict 与计划 dict 全等 |
+| `readback` | 写后 | `adapters.kicad_pcb.load_project_rules`（**DRC 用的同一个读法**）读到了新数值与新归属 |
+
+写后任一闸门不过 → 把原始字节写回（`restored: true`）并报 `GATE_BLOCKED`，措辞写明
+「这是本工具的缺陷，不是你的工程有问题」。写前先落 checkpoint，`dry_run` 不落 checkpoint。
+
+差分是按**类名**键的，不是按数组下标：新增一个类不会被读成「后面每个类都变了」，
+`changed_keys` 里出现的只有 `/net_settings/classes/HV/clearance` 这种路径。
+
+### 16.4 四个 op，以及它们拒绝的事
+
+| op | 写入 | 拒绝 |
+|---|---|---|
+| `set_netclass` | `net_settings.classes[<name>]` | 未知旋钮（`UNKNOWN_KNOB`，拼错的键不会被静默忽略）、非数字、`create:false` 时类不存在 |
+| `remove_netclass` | 类记录 + 归属 | 删 `Default`（`CANNOT_REMOVE_DEFAULT`，它是所有未归属网的兜底）；类还被网或 pattern 引用（`CLASS_STILL_IN_USE` / `PATTERN_REFERENCES_CLASS`） |
+| `assign_nets` | `netclass_assignments[<net>]` | 目标类不存在（`NO_SUCH_CLASS`——**不顺手建类**，那等于替调用方决定它的旋钮） |
+| `unassign_nets` | 同上 | 空的网名 |
+
+新类是 `Default` 的**整条记录**的拷贝再覆盖调用方给的旋钮，回包写
+`shape_copied_from: "Default"` + `inherited: [...]`——没点名的旋钮不是「我给了个默认值」，
+而是「它继承自 Default」，这两句话在别人读回包时不是一回事。
+
+归属是**集合**语义：一个网可以同时属于多个类（`"GND": ["Fanout", "HV"]`），单个类时 KiCad
+存成裸字符串。工具按现有形态写：一个类写字符串、多个类写数组，不把字符串改写成单元素数组。
+
+`netclass_patterns`（通配符）与 `board.design_settings.rules`（DRC 的最小值）**不写**：
+前者半改会让一整族网名解析到另一个类，后者不是一个「净类」问题，混进同一个 op 里
+就是替调用方决定他没说的事。`board_rules` 把 pattern 数量报出来，写工具报
+`patterns_are_read_only_here`。
+
+### 16.5 改完 KiCad 真的会按新规则判
+
+在参考工程上跑一遍（`set_netclass HV 0.5/0.3` + `assign_nets GND,+3V3 → HV` + 删掉
+`Fanout` 并把它的 52 个网归到 `Default`），然后用改后的工程跑 `kicad-cli pcb drc`：
+
+```
+改前（原工程）  118 violations / 0 unconnected
+改后（新工程）  126 violations / 0 unconnected      +8 正是 GND/+3V3 抬到 0.5 mm 之后多出来的
+```
+
+文件能被 KiCad 正常打开、DRC 正常跑、数字按预期变化——这是「写进去了」与「生效了」的区别。
+
+## 17. 设计取舍（写进文档而不改代码的那些）
+
+这一节是审计里「根本做不到」那档的剩余部分。它们的正确结局不是补一个工具，
+而是把边界写清楚，让调用方不必靠试。
+
+### 17.1 PLANS 是进程内的，所以 propose 与 apply 必须同一个进程
+
+`edit.plan.PLANS` 是一个模块级 dict：计划活在这个服务器进程的内存里，`board_apply` 按
+`plan_id` 去里面取。于是：
+
+* 换一个进程（重启服务器、换一个 MCP 会话的宿主）就取不到旧 plan → `PLAN_NOT_FOUND`；
+* 计划是**一次性**的（apply 成功即消费），且有 TTL（`PLAN_TTL = 1 小时`）与上限（`PLAN_MAX = 32`）；
+* 同一时刻**一个计划**在飞：这不是并发限制，是「一次改一处、改完验收」的协议——
+  两个计划同时写同一块板，第二个的差集是在第一个的中间态上量的。
+
+要跨进程就得把计划连同板 digest 落盘，那是另一种协议（谁能保证落盘的计划在执行时板子没被别人改过？
+digest 能查出来，但查出来之后仍然只能拒绝），所以没做，写在这里。
+
+### 17.2 六批布线的 DRC 占了大头
+
+布线本身是几何搜索，一次 `board_route` 的墙钟时间里大部分花在 `kicad-cli pcb drc` 上：
+每一批都要在写完之后问一次「这一批有没有新违规」，因为 DRC 是唯一权威，而这个问法没有
+增量接口（`kicad-cli` 只能整板跑一次）。所以六批 = 六次整板 DRC。
+
+省它的办法不是少跑 DRC（那就退回「我说它没违规」），而是调用方自己决定批次粒度：
+`options.step=N` 的步进写让每一批都是一个**完整可打开的板**，可以分批跑、可以中途停
+（`board_progress`），验收仍然是同一套闸门。
+
+### 17.3 `pcbnew.LoadBoard` 带 `filled_polygon` 的板会挂 300 秒
+
+这是 pcbnew 10 的实测行为：一个带真实填充多边形的大板（参考板 609 KB 级、386 个 zone 填充）
+交给 `LoadBoard` 会长时间不返回（挂到 300 s 量级）。这不是本服务器的 bug，是那条 Python 路径
+的性质——所以**填充相关的成败判断不靠 `LoadBoard`**：`board_fill_zones` 用 `kicad-cli` 的产物
+与文件字节判断，`in_place` 之后跑 DRC 也是 `kicad-cli`，只有明确需要 `ZONE_FILLER` 的对象模型
+时才进 pcbnew，并且那一步是对**副本**做的。
+
+推论（对调用方）：不要在一个大板上反复点「填充看看」；一次 `in_place=true` + 自动 DRC 的
+信息量，等于手工试五次的全部信息量。
+
+### 17.4 `tools._load_board({...})` 能直调，`tools.board_xxx()` 不能
+
+`board_*` 不是函数，是 `TOOLS` 表里的条目（`{"description", "inputSchema", "handler"}`），
+所以从 Python 里没有 `tools.board_zones(...)` 这个名字。两条可用路径：
+
+* `tools.call_tool("board_zones", {"path": ...})` —— 走真实入口，回包与 MCP 完全一致
+  （包括 `payload_is`、参数拼错时的 `warnings`）；
+* `tools._load_board({"path": ...})` —— 只要那块解析后的 board 对象，返回 `(board, err)`，
+  它是只读的、带缓存的，写路径从不经过它。
+
+这个不一致保留：把每个工具再包一个同名函数，等于给同一件事起两个名字，
+而这两个名字的**回包形态**迟早会不一样。

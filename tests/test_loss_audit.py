@@ -364,11 +364,11 @@ class TestTheSurfaceMovedOnce(unittest.TestCase):
         # against printed points is a different question from evaluating a fit)
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
-        self.assertEqual(len(tools.TOOLS), 188)
+        self.assertEqual(len(tools.TOOLS), 190)
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_core_loss_audit", cap["available"])
         # 174 = 173 + thermal_spreading in 0.0.85
-        self.assertEqual(len(cap["available"]), 182)
+        self.assertEqual(len(cap["available"]), 184)
 
     def test_the_capability_list_says_what_the_points_do_not_give(self):
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})

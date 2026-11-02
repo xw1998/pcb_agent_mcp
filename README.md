@@ -132,7 +132,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ```bash
 python run_server.py --version          # 0.0.95
 python run_server.py --selftest         # 329/329（本机 326/329：随包 ngspice 缺 spinit，见下）
-python -m unittest discover -s tests    # 3609 例（0.0.95 实测 1259.40 s、skipped=5；请读下面的历史累计，
+python -m unittest discover -s tests    # 3631 个用例（0.0.95 实测 22 分 08 秒、skipped=5；请读下面的历史累计，
                                         #   它们是我当时记的数，实测口径以这一条为准）
                                         #   （`tests/test_pulse_latent.py`）⇒ 3464；本轮再新增 29 例
                                         #   （`tests/test_taper_latent.py`）⇒ 3464 + 29 = 3493；
@@ -142,7 +142,8 @@ python -m unittest discover -s tests    # 3609 例（0.0.95 实测 1259.40 s、s
                                         #   （`tests/test_ledger.py` 的 `TestWhoRanIt`）⇒ 3522；0.0.95 再新增 13 例
                                         #   （`test_ops_edit.py::ZoneParams` 7 + `test_engine_drc_project.py` 6）
                                         #   ⇒ 3535 是当时记的数；0.0.95 补齐第一版没跑完的全量，实测收集 **3609**：
-                                        #   **3596 passed / 8 failed / 5 skipped**。那 8 条要看清口径——
+                                        #   **3596 passed / 8 failed / 5 skipped**；0.0.95 本轮再新增 22 例
+                                        #   （`tests/test_pro_rules.py`）⇒ 3631 收集。那 8 条要看清口径——
                                         #   全在 `tests/test_spice_bundled.py`：本机随包 ngspice 找不到 `spinit`，
                                         #   所以 `gain`/`limit`/`mult` 这些 A 卡报 MIF-ERROR。把工作区 stash 回 0.0.94
                                         #   后**逐条同样失败**，与本次改动无关；`--selftest` 的 3 条失败是同一件事
@@ -222,7 +223,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（188 个）
+## 工具（190 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` / `magnetics_dc_bias` /
 `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor` / `ac_self_heating` / `experience_recall` / `experience_check` / `experience_candidate` / `experience_promote` / `experience_outcome` / `experience_export` / `experience_import`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
@@ -409,9 +410,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 ```bash
 python run_server.py --version       # 0.0.95
 python run_server.py --selftest      # 协议级自检，329/329（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问、DC 偏置四问、DC 偏置接进选型四问、环型 MLT 与铜损六问、粉末磁化曲线七问、厂商损耗锚点审计四问、掩膜定义焊盘二问、随机振动模态叠加四问、热焊盘花三问、熔断潜热三问、脉冲串三电流四问、沿长度潜热三问、悬空铜三问、经验累积三问、铺铜填充参数一问）
-python -m unittest discover -s tests # 3609 个用例（0.0.95 实测 1259.40 s、skipped=5；3596 passed / 8 failed，那 8 条是随包 ngspice 缺 spinit，kicad-cli / pcbnew 与二维场解用例占大头；
-                                     #   秒数随机器负载浮动，不作性能结论；3522 例的实测秒数待全量回归回填，
-                                     #   只单跑了新增的 tests/test_experience.py 24/24）
+python -m unittest discover -s tests # 3631 个用例（0.0.95 实测 22 分 08 秒 = 1328.02 s、skipped=5；3618 passed / 8 failed，那 8 条是随包 ngspice 缺 spinit，kicad-cli / pcbnew 与二维场解用例占大头；
+                                     #   秒数随机器负载浮动，不作性能结论；同一次全量里 3609 收集里的 3522 例
+                                     #   已一并跑过，不再有待回填的旧数字）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -1033,7 +1034,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 188 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 190 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -1109,7 +1110,7 @@ pcb_agent_mcp/
 │   ├── powder_curve_fits.json    # 125 行 DC 磁化 B(H) + 54 行 Δµ/µ(T) + 49 行印刷稳定性表 + 5 行偏置变体，每行带印刷页与 URL（0.0.80 起）
 │   ├── material_loss_anchors.json # 9 个牌号 / 17 个厂商印刷 PV 点 / 3 个来源，每点带 printed_page、printed_as 与 qualifier（`≤` / `~` / `Max.` / 裸数字四分类，0.0.81 起）
 │   └── creepage_tables.json      # 电气间隙/爬电距离阶梯（schematic_review 的隔离间距用）
-├── tests/                        # 3609 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 3631 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）

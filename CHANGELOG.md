@@ -12,8 +12,9 @@
 ## [0.0.95] - 2026-11-02
 
 **铺铜的填充参数写在 KiCad 读它的地方：一块真实板 386 条假 clearance**
-（工具数 **188**（不变）/ 写路径 op **38 → 39** / `available` **182**（不变）/
-`--selftest` **328 → 329** / pytest **3522 → 3535** / `dependencies = []` 仍成立）
+**净类规则也终于有写入路径：`board_rules` / `board_rules_write` 改 `.kicad_pro`**
+（工具数 **188 → 190** / 写路径 op **38 → 40** / `available` **182 → 184** /
+`--selftest` **328 → 329** / pytest **3522 → 3631** / `dependencies = []` 仍成立）
 
 ### 1. 386 条 clearance 不在铜上，在文件少了一个字段
 
@@ -127,13 +128,71 @@ thermal zone 就不写词），旧解析层把这条读成了 `solid`，两处�
 `[x, y]`、KiCad 的 item 写 `{x, y}`，旧文案按 dict 读 ⇒ 阻塞路径自己抛 `TypeError`，
 错误码变成 `APPLY_FAILED` 而不是 `GATE_BLOCKED`）。
 
-### 5. 版本数字
+### 5. 净类规则写进 `.kicad_pro`：两个新工具，五道闸门（§16）
 
-工具数 **188**（不变）/ 写 op **39 → 40**（`delete_copper`）/ `available` **182**（不变）/
+`set_netclass`（写 op）改的是**板文件里**的 `(net_class ...)`，而 KiCad 7+ 从**工程文件**读净类、
+板里那份根本不看——于是「改成功了」与「布线与 DRC 仍按 Default」可以同时成立。这是审计里
+「根本做不到」那档的第一条，本轮补上：
+
+- **`board_rules`**（读）：工程声明了哪些类、每个类多少网、一个网归属哪个类、用的是
+  `netclass_assignments`（KiCad 7+）还是 `class.nets`（v6）形态、pattern 几条，以及
+  **能不能写**（`writable` / `style_roundtrip` / `why_not_writable`）。
+- **`board_rules_write`**（写）：`set_netclass` / `remove_netclass` / `assign_nets` /
+  `unassign_nets`，写前落 checkpoint、原子写、`dry_run` 只跑闸门不落盘。
+
+**文件形态是量出来的**：KiCad 10.0.7 写工程是 2 空格缩进 + **键按字母排序** + **非 ASCII 转义**
++ 末尾换行。真实 16 523 字节的工程文件用 `json.dumps(indent=2, sort_keys=True, ensure_ascii=True)+"\n"`
+**逐字节往返相同**，而 `ensure_ascii=False` 差 1 行（正好 `sort_field` 那行）。
+
+**往返不上就拒绝写**（`PRO_FORMAT_UNKNOWN`）：为了改一个 clearance 去重排、重转义 900 行手写 JSON
+是没人能 review 的 diff，而 `SaveBoard` 那一课已经说明 KiCad 会拒绝「看起来对」的文件。
+
+五道闸门：`format_roundtrip`（写前，未改动文本能自己串回自己）、`diff_is_intended`（写前，只有
+操作点名的键变了，差分按**类名**键而不是数组下标 ⇒ 新增一个类不会被读成「后面每个类都变了」）、
+`bytes_written`、`json_roundtrip`、`readback`（后三道在写后，其中读回用
+`adapters.kicad_pcb.load_project_rules`——**DRC 用的同一个读法**）。任一写后闸门不过就写回原字节
+（`restored: true`）并报 `GATE_BLOCKED`，措辞写明「这是本工具的缺陷，不是你的工程有问题」。
+
+拒绝面：删 `Default`（`CANNOT_REMOVE_DEFAULT`）、类还被网或 pattern 引用（`CLASS_STILL_IN_USE` /
+`PATTERN_REFERENCES_CLASS`，`reassign_to` 才放行）、拼错的旋钮（`UNKNOWN_KNOB`，不被静默忽略）、
+非数字（`KNOB_NOT_A_NUMBER`）、`assign_nets` 到不存在的类（`NO_SUCH_CLASS`，**不顺手建类**）。
+新类是 `Default` **整条记录**的拷贝再覆盖调用方给的旋钮，回包写 `shape_copied_from` + `inherited`。
+
+**改完 KiCad 真的按新规则判**（参考工程，`HV 0.5/0.3` + GND/+3V3 归 HV + 删 Fanout 并把 52 个网归 Default）：
+`kicad-cli pcb drc` 改前 **118 violations / 0 unconnected**、改后 **126 / 0**，+8 正是抬到 0.5 mm
+之后多出来的。文件能被 KiCad 打开、DRC 正常跑、数字按预期变化——「写进去了」与「生效了」的区别。
+
+判据：`tests/test_pro_rules.py`（新文件，**22 例**：字面量形式的工程文件必须先通过 `dump()` 证明
+这就是 KiCad 的形态、键序被打乱的工程被拒且**一个字节不动**、读回的类/归属/形态、新建类继承
+Default 的**全部键**且 `inherited` 说得对、五道闸门逐个 true 且 `changed_keys` 全在
+`/net_settings/` 下、一个网两类的字符串↔数组往返、`load_project_rules` 读到新 clearance、
+无改动的操作**不写**、`dry_run` 的 `measured_on` 指副本且临时文件被清掉、`Default` 删除被拒、
+在用类要 `reassign_to`、pattern 挡删除、未知旋钮/非数字/未知 op、走 `call_tool` 的
+`payload_is: top_level` 与错误回包的 `hint`）。
+
+### 6. 设计取舍写进文档，不改代码（§17）
+
+审计里剩下的部分是边界，不是缺陷，所以写进 [docs/95](docs/95-铺铜填充参数与DRC规则来源.md) §17：
+
+- **`PLANS` 是进程内的** ⇒ propose 与 apply 必须同一个进程；计划一次性、TTL 1 小时、上限 32，
+  同一时刻**一个**计划在飞（两个计划同时写一块板，第二个的差集是在第一个的中间态上量的）。
+- **六批布线的 DRC 占大头**：每批写完都要问一次「有没有新违规」，而 `kicad-cli` 只能整板跑一次、
+  没有增量接口 ⇒ 六批 = 六次整板 DRC。省它的办法是调用方决定批次粒度（`options.step=N` 的步进写
+  每批都是一个完整可打开的板），不是少跑 DRC。
+- **`pcbnew.LoadBoard` 带 `filled_polygon` 挂到 300 s 量级**（pcbnew 10 实测）⇒ 填充的成败判断
+  不靠 `LoadBoard`，`board_fill_zones` 用 kicad-cli 的产物与文件字节判断，只有需要 `ZONE_FILLER`
+  时才进 pcbnew 且对**副本**做。
+- **`tools._load_board({...})` 能直调，`tools.board_xxx()` 不能**：`board_*` 是 `TOOLS` 表里的条目，
+  从 Python 里走 `tools.call_tool("board_zones", {...})`（回包与 MCP 完全一致）；不存在的同名函数
+  故意不补，否则同一件事有两个名字、两种回包形态。
+
+### 7. 版本数字
+
+工具数 **188 → 190**（`board_rules` / `board_rules_write`）/ 写 op **38 → 40**
+（`set_zone_params` → 39、`delete_copper` → 40）/ `available` **182 → 184** /
 `--selftest` **329** 条（本轮不新增编号；本机 326/329 —— 3 条失败是随包 ngspice 找不到 `spinit`
 的环境问题，把工作区 stash 回 0.0.94 后同样失败，与本次改动无关）/
-`pytest` 实测 **3609 例收集：3596 passed / 8 failed / 5 skipped**（同样的 8 条是随包 ngspice 那一个问题，
-在干净 HEAD 上逐条复现）/ `dependencies = []` 仍成立。
+`pytest` 实测 **3631 收集 / 3618 passed / 8 failed / 5 skipped，1328.02 s（22 分 08 秒）**（同样 8 条 ngspice 失败在干净 HEAD 上逐条复现）/ `dependencies = []` 仍成立。
 
 ## [0.0.94] - 2026-11-02
 

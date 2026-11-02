@@ -2763,6 +2763,60 @@ _tool(
         verify_drc=bool(a.get("drc", True)))),
 )
 
+def _pro_rules_read(args):
+    from . import edit as _edit
+    try:
+        return _edit.read_project_rules(args.get("path"))
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+
+def _pro_rules_write(args):
+    from . import edit as _edit
+    try:
+        return _edit.write_project_rules(args.get("path"),
+                                         args.get("operations") or [],
+                                         dry_run=bool(args.get("dry_run")))
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+
+_tool(
+    "board_rules",
+    "Which net classes does this PROJECT declare, and what does a net resolve to? "
+    "KiCad 7+ keeps net classes in the .kicad_pro and IGNORES the (net_class ...) "
+    "blocks in the board, so 'the board has no net classes' and 'the project has five' "
+    "are both true at once - this reads the one that is in force. It also says whether "
+    "the file is writable by board_rules_write and why not when it is not. Read-only.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_pro (or the .kicad_pcb beside it)"),
+    }, "required": ["path"]},
+    _pro_rules_read,
+)
+
+_tool(
+    "board_rules_write",
+    "Write net-class rules into the .kicad_pro: set_netclass (creates a class as a copy "
+    "of Default, never invents one), remove_netclass (Default refused; a class still "
+    "named by a net or a pattern is refused unless reassign_to moves the nets), "
+    "assign_nets / unassign_nets. Five gates stand behind the write and a failure puts "
+    "the original bytes back: the untouched file must re-serialise byte-for-byte in "
+    "KiCad's own style (else PRO_FORMAT_UNKNOWN - a reformatted project is a diff "
+    "nobody can review), only the keys the operations name may differ, the bytes on "
+    "disk must equal the planned bytes, re-reading must give the planned document, and "
+    "load_project_rules (the reader the DRC uses) must see the new values and "
+    "ownership. dry_run=true runs every gate on a temporary copy and leaves the "
+    "project alone.",
+    {"type": "object", "properties": {
+        "path": _str("absolute path to the .kicad_pro (or the .kicad_pcb beside it)"),
+        "operations": {"type": "array", "description":
+            "[{op: set_netclass|remove_netclass|assign_nets|unassign_nets, ...}]; "
+            "call board_rules for the class list first",
+            "items": {"type": "object"}},
+        "dry_run": {"type": "boolean", "description":
+            "run every gate on a temporary copy and change nothing (default false)"},
+    }, "required": ["path", "operations"]},
+    _pro_rules_write,
+)
+
 def _parse_object_list(val, what):
     """A list of dicts, or a JSON string that decodes to one. Anything else fails."""
     if val is None or val == "":
@@ -3962,6 +4016,16 @@ def _capabilities(_args):
                         "carries verified_here=false. Asking for a named solver that is "
                         "not installed is an ERROR, never a silent fallback to the "
                         "closed-form starting geometry",
+            "write_project_rules": "the .kicad_pro holds the net classes and the rule "
+                                  "minimums a DRC applies; KiCad 7+ reads its net "
+                                  "classes from there and ignores the board's own "
+                                  "(net_class ...) blocks. board_rules_write edits "
+                                  "them with five gates and a checkpoint, and refuses "
+                                  "(PRO_FORMAT_UNKNOWN) when the file does not "
+                                  "re-serialise byte-for-byte in KiCad's style - "
+                                  "reformatting someone's project to change one "
+                                  "clearance is a diff nobody can review. Patterns "
+                                  "and board.design_settings.rules are NOT written",
             "write_schematic": "KiCad .kicad_sch only: propose (compute only) -> apply "
                                "(checkpoint, atomic write, five gates). The referee is "
                                "the netlister + ERC, not DRC: a schematic's product is "
@@ -4000,6 +4064,7 @@ def _capabilities(_args):
             "board_job",
             "board_ops", "board_create", "board_propose", "board_apply",
             "board_checkpoints", "board_restore", "board_progress",
+            "board_rules", "board_rules_write",
             "schematic_ops", "schematic_propose", "schematic_apply",
             "schematic_summary", "schematic_view",
             "schematic_hierarchy", "schematic_new_file",
@@ -5239,7 +5304,8 @@ def _board_stats(args):
 def _edit_error(exc):
     """Edit/Op errors carry a code and extra evidence; keep both, never flatten."""
     import json as _json
-    out = err(str(exc), getattr(exc, "code", "EDIT_FAILED"))
+    out = err(str(exc), getattr(exc, "code", "EDIT_FAILED"),
+              hint=getattr(exc, "hint", None))
     extra = getattr(exc, "extra", None) or {}
     for key, value in extra.items():
         try:

@@ -1689,7 +1689,8 @@ def _verify_set_netclass(ed, o):
 op("set_netclass", {"meta", "copper"},
    "Set design-rule numbers on a net class (clearance, track width, via size), "
    "creating the class if it does not exist. These are the rules later tools quote; "
-   "they are not a DRC run.",
+   "they are not a DRC run. KiCad 7+ reads net classes from the PROJECT file and "
+   "IGNORES the ones written here - for those, use board_rules_write.",
    dict({"name": "net class name (default 'Default')"},
         **{k: "mm" for k in _NETCLASS_KNOBS}),
    _run_set_netclass, _verify_set_netclass)
