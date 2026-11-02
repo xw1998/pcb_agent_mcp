@@ -1233,6 +1233,27 @@ def _select_tracks(ed, o):
         out.append(node)
     return out
 
+def _fixed_nodes(nodes):
+    """The ones of `nodes` the FILE marks `(locked)`.
+
+    Specctra spells this `(type fix)`; our own files spell it `(locked)`, and it
+    is the same claim: this copper is somebody's decision, not a candidate. It is
+    read from the file and never inferred, so a board that locks nothing behaves
+    exactly as before.
+    """
+    return [n for n in nodes if S.child(n, "locked") is not None]
+
+def _refuse_fixed(ed, what, fixed, total, o):
+    """Refuse a write that would move locked copper, unless told to explicitly."""
+    if fixed and not _bool(o, "allow_fixed", False):
+        raise OpError(
+            "%d of %d %s are LOCKED - the file marks them `(locked)`, the same "
+            "claim Specctra writes as `(type fix)`: this copper is not a candidate "
+            "for anything. First: %s. Pass allow_fixed=true if you really mean to "
+            "move it." % (len(fixed), total, what,
+                          ", ".join(ed.sp.id_of(n) for n in fixed[:6])),
+            "ARG_CONFLICT")
+
 def _run_delete_track(ed, o, seed):
     if not o.get("uuid") and o.get("near") is None:
         raise OpError("delete_track needs a selector: 'uuid' or 'near' "
@@ -1240,6 +1261,7 @@ def _run_delete_track(ed, o, seed):
     targets = _select_tracks(ed, o)
     if not targets:
         raise OpError("no track matches that selector", "TARGET_NOT_FOUND")
+    _refuse_fixed(ed, "selected segment(s)", _fixed_nodes(targets), len(targets), o)
     for node in targets:
         ed.remove(node)
     return {"nodes_removed": len(targets),
@@ -1256,7 +1278,8 @@ def _verify_delete_track(ed, o):
 op("delete_track", {"copper"},
    "Delete track segments by uuid, or by a point within 'tol' of an end point. "
    "Refuses without a selector.",
-   {"uuid": "segment uuid", "near": "[x, y] mm", "tol": "mm"},
+   {"uuid": "segment uuid", "near": "[x, y] mm", "tol": "mm",
+    "allow_fixed": "bool: also move copper the file marks (locked)"},
    _run_delete_track, _verify_delete_track)
 
 def _run_set_track_width(ed, o, seed):
@@ -1269,12 +1292,17 @@ def _run_set_track_width(ed, o, seed):
     code = ed.net_by_name.get(net) if net else None
     if net and code is None:
         raise OpError("net %r does not exist" % net, "NET_NOT_FOUND")
-    changed = 0
+    matched = []
     for node in ed.items("segment"):
         if code is not None and S.arg_text(S.child(node, "net"), 1) != code:
             continue
         if layer and S.arg_text(S.child(node, "layer"), 1) != layer:
             continue
+        matched.append(node)
+    _refuse_fixed(ed, "matching segment(s)", _fixed_nodes(matched),
+                  len(matched), o)
+    changed = 0
+    for node in matched:
         wnode = S.child(node, "width")
         if wnode is not None:
             for i, item in enumerate(node.items):
@@ -1305,7 +1333,8 @@ def _verify_set_track_width(ed, o):
 op("set_track_width", {"copper"},
    "Set the width of every track of one net and/or one layer. Refuses a bare call "
    "with neither filter.",
-   {"width": "mm > 0", "net": "net name", "layer": "copper layer"},
+   {"width": "mm > 0", "net": "net name", "layer": "copper layer",
+    "allow_fixed": "bool: also resize copper the file marks (locked)"},
    _run_set_track_width, _verify_set_track_width)
 
 def _run_add_via(ed, o, seed):

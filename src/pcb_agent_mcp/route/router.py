@@ -386,6 +386,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          pollution_degree=2, material_group="IIIa", insulation="basic",
          coating=False, altitude_m=0, length_groups=None,
          rip_up_rounds=1, second_sweep=True, incremental=False,
+         fixed_nets=None,
          congestion_rounds=2, congestion_max_rips=12, congestion_weight=1.0,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          return_path=True, return_path_net=None, topology="mst",
@@ -455,6 +456,71 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         keep = sorted(by_net, key=lambda n: -len(by_net[n]))[:int(max_nets)]
         by_net = dict((k, by_net[k]) for k in keep)
 
+    # ------------------------------------------------------------------ fixed
+    # What "fixed" means here, and what it does not.
+    #
+    # Specctra writes the claim as `(type fix)` and backs it with a rule of its
+    # own: the session file does not return fixed copper at all. This router
+    # never edits copper that is already on the board, so the only way a fixed
+    # net could move is by being ripped up and re-routed by this code. Three
+    # rules follow, and the last one is the honest half:
+    #
+    #   * never a rip-up candidate (neither pass, negotiation included);
+    #   * never re-routed, even when its pads look unconnected - routing it would
+    #     move copper that was declared immovable;
+    #   * a fixed net the board has NO copper for is reported, because "leave it
+    #     alone and call it fixed" is the one outcome that would quietly ship an
+    #     open net.
+    fixed = set(str(n) for n in (fixed_nets or ()))
+    fixed_copper = {}
+    if fixed:
+        # A name the board has never heard of gets no copper record: reporting
+        # six zeros for it would look like "we looked and found nothing", when
+        # the truth is that there is nothing to look at. It is listed under
+        # `unknown` instead.
+        pad_nets = set(p.get("net") for fp in board.footprints
+                        for p in (fp.get("pads") or []) if p.get("net"))
+        for net in sorted(fixed):
+            segs = [tr for tr in board.tracks if tr.get("net") == net]
+            vias = [v for v in board.vias if v.get("net") == net]
+            if not segs and not vias and net not in pad_nets:
+                continue
+            length = 0.0
+            for tr in segs:
+                pts = tr.get("_points") or [tr.get("start"), tr.get("end")]
+                for k in range(len(pts) - 1):
+                    length += math.hypot(pts[k + 1][0] - pts[k][0],
+                                         pts[k + 1][1] - pts[k][1])
+            fixed_copper[net] = {
+                "segments": len(segs), "vias": len(vias),
+                "length_mm": round(length, 3),
+                "locked_segments": sum(1 for tr in segs if tr.get("locked")),
+                "locked_vias": sum(1 for v in vias if v.get("locked"))}
+        # Coupling REPLACES the second net's copper and a meander REBUILDS a
+        # straight run: both move copper, so a fixed net inside either is refused
+        # rather than quietly dropped (a dropped pair would still be reported as
+        # a pair, and one of its two nets was never allowed to move).
+        moved = []
+        for pr in (bundle.get("diff_pairs") or []):
+            for side in ("p", "n"):
+                if str(pr.get(side) or "") in fixed:
+                    moved.append(str(pr.get(side)))
+        for grp in (length_groups or []):
+            if isinstance(grp, dict):
+                for n in (grp.get("nets") or []):
+                    if str(n) in fixed:
+                        moved.append(str(n))
+        if moved:
+            raise RouteError(
+                "a fixed net cannot be coupled or length-matched: %s. Both passes "
+                "MOVE copper (coupling rebuilds the second net as an offset copy of "
+                "the first, a meander rebuilds a straight run), which is exactly "
+                "what 'fixed' forbids. Drop it from the pair/group, or stop calling "
+                "it fixed." % ", ".join(sorted(set(moved))), "ARG_CONFLICT",
+                hint="fixed_nets is a promise about copper that is already on the "
+                     "board; a net you still want this router to shape must not be "
+                     "in it")
+
     results = {}
     work = []
     for net, plist in by_net.items():
@@ -467,6 +533,25 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                         "segments": 0, "blind_vias": 0, "edges": len(edges),
                         "reason": None,
                         "on_plane": plane_nets.get(net)}
+        if net in fixed:
+            have = fixed_copper.get(net) or {"segments": 0, "vias": 0,
+                                             "length_mm": 0.0,
+                                             "locked_segments": 0,
+                                             "locked_vias": 0}
+            results[net].update({"status": "fixed", "fixed": True,
+                                 "length_mm": have["length_mm"],
+                                 "segments": have["segments"],
+                                 "vias": have["vias"],
+                                 "locked_segments": have["locked_segments"],
+                                 "locked_vias": have["locked_vias"]})
+            if not have["segments"] and not have["vias"]:
+                results[net]["status"] = "fixed_missing_copper"
+                results[net]["reason"] = {
+                    "code": "fixed_missing_copper",
+                    "detail": "declared fixed, but the board carries no track and "
+                              "no via of this net; leaving it unrouted and calling "
+                              "it fixed would report an open net as settled"}
+            continue
         work.append((span, net, plist))
     work.sort(reverse=True)          # longest first - see the module docstring
 
@@ -766,7 +851,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         hits = {}
         for op in em.ops:
             other = op["net"]
-            if other == net or other in plane_nets:
+            if other == net or other in plane_nets or other in fixed:
                 continue
             if op["op"] == "add_via":
                 ox0 = ox1 = op["x"]
@@ -951,7 +1036,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 for cell in cells:
                     demand[cell] = demand.get(cell, 0) + 1
                 for other, n in named.items():
-                    if other in by_net and other not in plane_nets:
+                    if (other in by_net and other not in plane_nets
+                            and other not in fixed):
                         who[other] = who.get(other, 0) + n
             for cell, n in demand.items():
                 hist[cell] = hist.get(cell, 0.0) + float(n)
@@ -1027,18 +1113,21 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         if res["status"] == "pending":
             res["status"] = "failed"
             res.setdefault("reason", {"code": "not_attempted"})
-        res["segments"] = sum(1 for op in em.ops
-                              if op["op"] == "add_track" and op["net"] == net)
-        res["vias"] = sum(1 for op in em.ops
-                          if op["op"] == "add_via" and op["net"] == net)
+        if not res.get("fixed"):
+            res["segments"] = sum(1 for op in em.ops
+                                  if op["op"] == "add_track" and op["net"] == net)
+            res["vias"] = sum(1 for op in em.ops
+                              if op["op"] == "add_via" and op["net"] == net)
         out_nets.append(res)
     out_nets.sort(key=lambda r: (r["status"] != "failed", -(r.get("mst_mm") or 0)))
     routed_n = sum(1 for r in out_nets if r["status"] == "routed")
-    failed = [r for r in out_nets if r["status"] != "routed"]
+    fixed_n = sum(1 for r in out_nets if r["status"] == "fixed")
+    failed = [r for r in out_nets if r["status"] not in ("routed", "fixed")]
     stats["elapsed_s"] = round(time.time() - t0, 3)
     stats["nets_total"] = len(out_nets)
     stats["nets_routed"] = routed_n
     stats["nets_failed"] = len(failed)
+    stats["nets_fixed"] = fixed_n
     stats["ops"] = len(em.ops)
     stats["rejected_ops"] = len(em.bad)
     return {
@@ -1062,6 +1151,11 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         "congestion": congestion,
         "pour": _pour_report(board, em.ops, copper),
         "nets": out_nets,
+        "fixed": ({"nets": sorted(fixed), "copper": fixed_copper,
+                   "unknown": sorted(fixed - set(by_net)),
+                   "ops_emitted_for_fixed": sum(
+                       1 for op in em.ops if op.get("net") in fixed)}
+                  if fixed else None),
         "failed": [{"net": r["net"], "reason": r.get("reason")} for r in failed],
         "ops": em.ops,
         "rejected": em.bad[:20],

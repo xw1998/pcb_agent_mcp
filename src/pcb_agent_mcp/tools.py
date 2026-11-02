@@ -2101,6 +2101,15 @@ _tool(
                                     "adds (higher = more willing to detour)", 1.0),
          "incremental": _bool("treat the net's existing copper as already connected "
                               "and route only what is missing", False),
+         "fixed_nets": _str(
+             "comma separated nets whose existing copper must NOT move - the same "
+             "promise Specctra writes as `(type fix)`. A fixed net is never a "
+             "rip-up candidate, never re-routed and never passed to the coupling "
+             "or meander passes (a fixed net inside a diff pair or a length group "
+             "is REFUSED rather than quietly dropped); its copper is reported with "
+             "what the board already has. A net called fixed that has no copper on "
+             "the board comes back `fixed_missing_copper` - leaving it unrouted and "
+             "calling it fixed would report an open net as settled"),
          "allow_vias": _bool("may the search change layers", True),
          "second_sweep": _bool("retry the losers in reverse order", True),
          "ignore_zone_areas": _bool("do not treat pour outlines as obstacles", False),
@@ -2712,7 +2721,7 @@ def _board_route(args):
         kw["length_groups"] = lgroups
     if itargets:
         kw["impedance_targets"] = itargets
-    for key in ("layers", "nets"):
+    for key in ("layers", "nets", "fixed_nets"):
         val = args.get(key)
         if isinstance(val, str):
             val = [x.strip() for x in val.split(",") if x.strip()]
@@ -2782,7 +2791,8 @@ def _board_route(args):
     segs = [o for o in res["ops"] if o["op"] == "add_track"]
     out = ok(
         value={"nets_total": stats["nets_total"], "nets_routed": stats["nets_routed"],
-               "nets_failed": stats["nets_failed"], "ops": len(res["ops"]),
+               "nets_failed": stats["nets_failed"],
+               "nets_fixed": stats.get("nets_fixed", 0), "ops": len(res["ops"]),
                "vias": sum(1 for o in res["ops"] if o["op"] == "add_via"),
                "segments": len(segs),
                "track_length_mm": round(sum(math.hypot(o["x2"] - o["x1"],
@@ -2837,6 +2847,7 @@ def _board_route(args):
             "length_groups": res["length_groups"],
             "return_path": res.get("return_path"),
             "nets": res["nets"],
+            "fixed": res.get("fixed"),
             "failed": failed,
             "rejected_segments": res["rejected"],
             "stats": dict((k, v) for k, v in stats.items() if k != "rule_bundle"),

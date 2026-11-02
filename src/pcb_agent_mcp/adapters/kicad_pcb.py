@@ -1040,6 +1040,10 @@ def parse_board_text(text, path="<memory>", project_path=None):
             "width": num(child(seg, "width"), 1, 0.0),
             "start": list(xy(child(seg, "start"))),
             "end": list(xy(child(seg, "end"))),
+            # The file's own word on whether this copper may be moved. KiCad
+            # spells Specctra's `(type fix)` as a bare `(locked)`; False when the
+            # token is absent, which is what an unlocked board says.
+            "locked": child(seg, "locked") is not None,
         })
     for arc in children(tree, "arc"):
         s, m, e = child(arc, "start"), child(arc, "mid"), child(arc, "end")
@@ -1051,6 +1055,7 @@ def parse_board_text(text, path="<memory>", project_path=None):
                 "layer": atom(child(arc, "layer"), 1),
                 "width": num(child(arc, "width"), 1, 0.0),
                 "start": list(pts[0]), "end": list(pts[-1]),
+                "locked": child(arc, "locked") is not None,
                 "_arc": True,
                 "_points": [list(p) for p in pts],
             })
@@ -1069,6 +1074,7 @@ def parse_board_text(text, path="<memory>", project_path=None):
             "from": lname[0] if lname else None,
             "to": lname[-1] if len(lname) > 1 else (lname[0] if lname else None),
             "kind": vtype if vtype in ("blind", "micro") else "through",
+            "locked": child(via, "locked") is not None,
         })
 
     for gnode in tree:

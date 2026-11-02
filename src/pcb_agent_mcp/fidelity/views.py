@@ -292,6 +292,9 @@ class BoardView(object):
                 "width_mm": S.arg_num(S.child(node, "width"), 1),
                 "x1_mm": st[0], "y1_mm": st[1],
                 "x2_mm": en[0], "y2_mm": en[1],
+                # The file's own claim that this copper may not be moved
+                # (Specctra's `(type fix)`). Absent means movable.
+                "locked": S.child(node, "locked") is not None,
             }
             if h == "arc":
                 mid = self._xy(S.child(node, "mid"))
@@ -314,6 +317,7 @@ class BoardView(object):
                 "layers": [S.arg_text(S.child(node, "layers"), 1),
                            S.arg_text(S.child(node, "layers"), 2)],
                 "kind": S.arg_text(node, 1) or "through",
+                "locked": S.child(node, "locked") is not None,
             }
             out.append(self._wrap(node, path, **fields))
         return out
