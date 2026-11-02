@@ -5426,8 +5426,9 @@ def selftest():
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
-          "(magnetics_core_loss_audit), 0.0.82-0.0.84 arguments only, and 0.0.85 "
-          "exactly one (thermal_spreading)",
+          "(magnetics_core_loss_audit), 0.0.82-0.0.84 arguments only, 0.0.85 "
+          "exactly one (thermal_spreading), and 0.0.86 arguments only "
+          "(melting_model on fusing_current)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5972,6 +5973,76 @@ def selftest():
           "%s / %s / %s" % (_hs_a.get("rth_sa_budget_k_per_w"),
                             _hs_b.get("rth_sa_budget_k_per_w"),
                             _hs_c.get("reason_code")))
+
+    # ---- 0.0.86: the latent heat of fusion, and the promise that its arrival did
+    # not move the number that was already printed. The default path is checked
+    # against the literal it produced before the parameter existed; the new path
+    # against sqrt(1+beta) to floating point; and the naive thermal-mass answer
+    # (L_f/(c dT)) is checked to be WRONG by the factor the derivation predicts, so
+    # the check cannot pass on a model that skipped the resistivity ratio.
+    _fl_def = _call("fusing_current", {"width_mm": 0.5}, 860)
+    _fl_lat = _call("fusing_current", {"width_mm": 0.5,
+                                       "melting_model": "sensible_plus_latent"}, 8601)
+    _fl_bad = _call("fusing_current", {"width_mm": 0.5, "melting_model": "latent"}, 8602)
+    check("latent heat: leaving melting_model alone still prints the 0.0.85 answer "
+          "5.024 A (and 5.023718 in the unrounded extra key), asking for "
+          "sensible_plus_latent gives 5.624 A = 5.023718*sqrt(1+0.2530927), the "
+          "model name changes with it, and a made-up enum value is refused "
+          "ARG_INVALID with the +25.3 %/+11.9 % split in the hint",
+          _fl_def.get("value") == 5.024
+          and (_fl_def.get("fusing_current_sensible_only_a")) == 5.023718
+          and _fl_def.get("model") == "onderdonk_adiabatic_fusing"
+          and _fl_lat.get("value") == 5.624
+          and _fl_lat.get("model") == "onderdonk_adiabatic_fusing_plus_latent_heat"
+          and abs(_fl_lat.get("fusing_current_with_latent_a")
+                  - 5.023718 * _math.sqrt(1.0 + 0.25309271896982055)) < 2e-6
+          and _fl_bad.get("reason_code") == "ARG_INVALID"
+          and "11.9 %" in (_fl_bad.get("hint") or ""),
+          "%s / %s / %s / %s" % (_fl_def.get("value"), _fl_lat.get("value"),
+                                 _fl_lat.get("model"), _fl_bad.get("reason_code")))
+
+    _fl_cap = _call("fusing_current", {"width_mm": 0.5, "standard": "ipc2152"}, 861)
+    _fl_capl = _call("fusing_current", {"width_mm": 0.5, "standard": "ipc2152",
+                                        "melting_model": "sensible_plus_latent"}, 8611)
+    _fl_capv = _fl_cap.get("steady_rating") or {}
+    _fl_caplv = _fl_capl.get("steady_rating") or {}
+    check("latent heat reaches the steady comparison by the same factor and no "
+          "further: the adiabatic melt time at the IPC-2152 capacity stays "
+          "12.803135 s on the default path and becomes 16.043515 s when asked "
+          "(ratio 1.2530927 = 1+beta, not the 1.512 the naive L_f/(c dT) would "
+          "give), and capacity_a itself does not move",
+          _fl_capv.get("adiabatic_melt_time_at_capacity_s") == 12.803135
+          and _fl_caplv.get("adiabatic_melt_time_at_capacity_s") == 16.043515
+          and _fl_capv.get("capacity_a") == _fl_caplv.get("capacity_a"),
+          "%s / %s / cap %s" % (_fl_capv.get("adiabatic_melt_time_at_capacity_s"),
+                                _fl_caplv.get("adiabatic_melt_time_at_capacity_s"),
+                                _fl_capv.get("capacity_a")))
+
+    from .calc import current as _current
+    _fl_beta = [_current.latent_heat_share_of_i2t(_ta) for _ta in (0.0, 25.0, 50.0, 85.0, 100.0)]
+    _fl_lhs = (_current.COPPER_CP_J_PER_KGK * _current.COPPER_DENSITY_KG_M3
+               * (_current.ONDERDONK_REF_C + 25.0) / _current.COPPER_RHO20_OHM_M)
+    _fl_rhs = 1.0 / (_current.M2_PER_CMIL ** 2 * 33.0 * _math.log(10.0))
+    _fl_naive = (_current.COPPER_LATENT_HEAT_J_PER_KG
+                 / (_current.COPPER_CP_J_PER_KGK
+                    * (_current.ONDERDONK_MELT_C - 25.0)))
+    check("latent heat rests on copper's own constants, and the one place they can "
+          "be cross-checked agrees: beta = 0.238224 / 0.253093 / 0.268294 / "
+          "0.290285 / 0.300007 at 0/25/50/85/100 C (monotone), (c rho/rho20)(234+25) "
+          "lands within 1.35 % of 1/(CMIL^2*33*ln10), and beta is NOT the naive "
+          "L_f/(c dT) = 0.512361 - it is 2.0244x smaller, which is the factor the "
+          "rho(1083)/rho(25) = 5.08 speed-up predicts",
+          abs(_fl_beta[0] - 0.238223631682) < 1e-11
+          and abs(_fl_beta[1] - 0.253092718970) < 1e-11
+          and abs(_fl_beta[2] - 0.268294437784) < 1e-11
+          and abs(_fl_beta[3] - 0.290284624242) < 1e-11
+          and abs(_fl_beta[4] - 0.300006804551) < 1e-11
+          and all(_fl_beta[i] < _fl_beta[i + 1] for i in range(4))
+          and abs((_fl_lhs - _fl_rhs) / _fl_rhs) < 0.02
+          and abs(_fl_naive / _fl_beta[1] - 2.024400334534603) < 1e-9,
+          "beta %s, 33 rel %+.5f, naive/beta %.6f"
+          % (["%.6f" % b for b in _fl_beta], (_fl_lhs - _fl_rhs) / _fl_rhs,
+             _fl_naive / _fl_beta[1]))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

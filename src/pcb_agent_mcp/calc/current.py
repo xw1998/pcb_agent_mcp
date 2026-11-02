@@ -38,6 +38,28 @@ ONDERDONK_K = 33.0
 CMIL_PER_MIL2 = 4.0 / math.pi    # 1 cmil = pi/4 mil^2, so area_mil2 -> cmil is *4/pi
 ONDERDONK_SHORT_PULSE_S = 10.0   # beyond this the adiabatic assumption is a lie
 
+# --- copper's caloric constants: the ONE thing Onderdonk leaves out is fusion ---
+# Onderdonk's 33 folds density, specific heat and rho20 into one number, so it cannot
+# be asked "how much energy to actually melt". Two constants answer that, and both are
+# ordinary hand-book copper, not a vendor figure:
+#   c_p  = 24.440 J/(mol K) at 25 C / 63.546 g/mol = 384.6 J/(kg K)  -> 385
+#   L_f  = 13.26 kJ/mol     / 63.546 g/mol         = 208.7 kJ/kg     (also quoted
+#          as 210 J/g; the two differ by 0.6 % and the answer moves by 0.3 %)
+# The consistency check that these belong to the same copper as the 33: with
+# rho = 8960 kg/m3 and rho20 = 1.72e-8 ohm m, (c*rho/rho20)*(234+25) = 5.194e16
+# against 1/(5.0670748e-10^2 * 33 * ln10) = 5.126e16 implied by Onderdonk's own
+# constant -> 1.3 %. That 1.3 % is why this module uses 385 and not 400.
+COPPER_CP_J_PER_KGK = 385.0
+COPPER_LATENT_HEAT_J_PER_KG = 208700.0
+COPPER_DENSITY_KG_M3 = 8960.0        # only used by the consistency check above
+COPPER_RHO20_OHM_M = 1.72e-8         # ditto - never enters an answer
+M2_PER_CMIL = 5.067074790975e-10
+
+# Which melting criterion the caller wants. "sensible" is Onderdonk exactly, byte for
+# byte, because that is what every printed fusing table quotes; the other one adds the
+# energy the phase change itself absorbs. Not a choice this module makes for you.
+MELTING_MODELS = ("sensible", "sensible_plus_latent")
+
 # --- IPC-2152 closed-form fit: dT = K * I^a * W^b * Th^c  (W, Th in mil, I in A) ---
 # Copied verbatim from KiCad 10.0 common/track_width_calculations.cpp, which in turn
 # names D. G. Brooks and J. Adam, "Trace Currents and Temperatures Revisited" (2015),
@@ -425,9 +447,38 @@ def via_current_allowed(hole_mm, plating_um=25.0, count=1, delta_t_c=10.0, stand
         },
     )
 
+def latent_heat_share_of_i2t(t_ambient_c):
+    """How much of the fusing I^2t is the latent heat of fusion, as a fraction.
+
+    Derived, not fitted. The adiabatic balance is  C dT/dt = I^2 rho(T),  with
+    rho(T) = rho20 (234+T)/(234+Ta), so
+
+        (I^2 t)_sensible = (c rho_m A^2/rho20)(234+Ta) ln((234+Tm)/(234+Ta))
+
+    which is Onderdonk's log10 form times ln10. After T reaches Tm the temperature
+    stops rising and the same current pours its power into fusion instead:
+
+        (I^2 t)_latent   = rho_m L_f A^2/rho(Tm)
+
+    Divide one by the other and the geometry, the area and rho20 all cancel:
+
+        latent/sensible  = L_f / (c (234+Tm) ln(ratio))
+
+    Note what this is NOT: it is not L_f/(c dT) = 0.512. The last stretch to Tm is
+    travelled while rho is (234+Tm)/(234+Ta) = 5.08x its cold value, so a joule
+    spent there costs a fifth of the time it costs at the start; the latent stage
+    sits at the hottest point and is therefore cheap in TIME and expensive in
+    ENERGY. That is why the fraction is 0.253 and not 0.512.
+    """
+    ratio = (ONDERDONK_MELT_C - t_ambient_c) / (ONDERDONK_REF_C + t_ambient_c) + 1.0
+    return COPPER_LATENT_HEAT_J_PER_KG / (
+        COPPER_CP_J_PER_KGK * (ONDERDONK_REF_C + ONDERDONK_MELT_C)
+        * math.log(ratio))
+
+
 def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
                    t_ambient_c=25.0, delta_t_c=10.0, layer="external",
-                   standard=None):
+                   standard=None, melting_model="sensible"):
     """Current that melts a trace in t_s seconds, and how far that is from the rating.
 
     The question "what current fuses this trace" is NOT a steady-state question and
@@ -448,7 +499,12 @@ def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
         meaningless as t grows. Beyond ~10 s it is not a fusing time, it is a
         statement that nothing cools.
       * melt POINT, not molten: copper reaching 1083 C, without the latent heat of
-        fusion. Blowing apart takes a little more.
+        fusion. This is not "a little": fusion absorbs 208.7 kJ/kg against 407 kJ/kg
+        of sensible heat on the way up, and because the latent stage runs at
+        rho(1083)/rho(25) = 5.08x the cold power it adds 25.3 % to I^2t, i.e. the
+        real melting current is 11.9 % HIGHER (at 25 C). melting_model=
+        'sensible_plus_latent' returns that number; the default keeps Onderdonk so
+        that a quoted fusing table still reproduces.
       * the resistivity rise IS inside it (that is where 234 comes from), otherwise
         the number would be 3x optimistic.
       * Onderdonk was fitted to round wire. A rectangular trace is converted by
@@ -470,6 +526,14 @@ def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
         delta_t_c = float(delta_t_c)
     except (TypeError, ValueError):
         return err("numeric arguments required", "ARG_INVALID")
+    if melting_model is None:
+        melting_model = "sensible"
+    if melting_model not in MELTING_MODELS:
+        return err("melting_model must be one of %s" % (", ".join(MELTING_MODELS),),
+                   "ARG_INVALID",
+                   hint="'sensible' is Onderdonk as printed (melt point only); "
+                        "'sensible_plus_latent' adds copper's 208.7 kJ/kg of fusion "
+                        "energy, which is +25.3 % on I^2t and +11.9 % on the current")
     if thickness_um is None:
         thick_um = copper_oz * OZ_TO_UM
     else:
@@ -499,6 +563,13 @@ def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
     area_cmil = area_mil2 * CMIL_PER_MIL2
     ratio = (ONDERDONK_MELT_C - t_ambient_c) / (ONDERDONK_REF_C + t_ambient_c) + 1.0
     i_fuse = area_cmil * math.sqrt(math.log10(ratio) / (ONDERDONK_K * t_s))
+    # the same formula with (1 + latent share) inside the root: I^2 t is what the
+    # energy balance fixes, so the current moves by the SQUARE root
+    latent_share = latent_heat_share_of_i2t(t_ambient_c)
+    i_fuse_sensible = i_fuse
+    i_fuse_latent = i_fuse * math.sqrt(1.0 + latent_share)
+    if melting_model == "sensible_plus_latent":
+        i_fuse = i_fuse_latent
 
     out = {
         "fusing_current_a": round(i_fuse, 3),
@@ -513,6 +584,18 @@ def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
         "resistance_ratio_at_melt": round(ratio, 4),
         "adiabatic": True,
         "copper_only": True,
+        "melting_model": melting_model,
+        "fusing_current_sensible_only_a": round(i_fuse_sensible, 6),
+        "fusing_current_with_latent_a": round(i_fuse_latent, 6),
+        "latent_share_of_i2t": round(latent_share, 6),
+        "latent_heat_means": (
+            "copper needs 208.7 kJ/kg of fusion energy on top of 407 kJ/kg of sensible "
+            "heat, which is %+.2f %% of the fusing I^2t and %+.2f %% on the current at "
+            "%.1f C; the model below is the %s one"
+            % (100.0 * latent_share, 100.0 * (math.sqrt(1.0 + latent_share) - 1.0),
+               t_ambient_c,
+               "Onderdonk (melt point)" if melting_model == "sensible"
+               else "melt-through")),
     }
     if t_s > ONDERDONK_SHORT_PULSE_S:
         out["adiabatic_assumption"] = (
@@ -545,8 +628,18 @@ def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
         if cap.get("status") != "ok":
             return cap
         cap_a = cap["value"]
-        melt_at_cap_s = (math.log10(ratio) /
+        # I^2t is what the energy balance fixes, so the melt TIME scales by the same
+        # (1 + latent share) the current does not - and only when that stage is asked
+        # for. Writing this factor unconditionally made both models print 16.0435 s,
+        # which is a silent lie about which criterion was used.
+        melt_factor = (1.0 + latent_share
+                       if melting_model == "sensible_plus_latent" else 1.0)
+        melt_at_cap_s = (math.log10(ratio) * melt_factor /
                          (ONDERDONK_K * (cap_a / area_cmil) ** 2))
+        out["steady_rating_latent_note"] = (
+            "adiabatic_melt_time_at_capacity_s uses the same melting criterion as the "
+            "current above, so it carries the 1 + %.4f latent factor when "
+            "melting_model='sensible_plus_latent'" % latent_share)
         out["steady_rating"] = {
             "computed": True,
             "standard": std,
@@ -563,18 +656,32 @@ def fusing_current(width_mm, t_s=1.0, copper_oz=1.0, thickness_um=None,
     return ok(
         value=round(i_fuse, 3),
         unit="A",
-        model="onderdonk_adiabatic_fusing",
+        model=("onderdonk_adiabatic_fusing" if melting_model == "sensible"
+               else "onderdonk_adiabatic_fusing_plus_latent_heat"),
         basis="Onderdonk (1928): I = A_cmil * sqrt(log10((1083 - Ta)/(234 + Ta) + 1)"
-              " / (33*t)), A in circular mils, t in seconds; copper's constants",
+              " / (33*t)), A in circular mils, t in seconds; copper's constants"
+              + ("" if melting_model == "sensible" else
+                 "; times sqrt(1 + L_f/(c_p (234+1083) ln(ratio))) for the fusion "
+                 "energy, L_f = 208.7 kJ/kg and c_p = 385 J/(kg K)"),
         precision="+/-30% at best and one-sided: adiabatic (no cooling), stops at the "
-                  "melt point (no latent heat), equal-area conversion from a rectangle "
+                  "melt point (no latent heat unless melting_model says otherwise), "
+                  "equal-area conversion from a rectangle "
                   "to a round wire. Every one of those makes the real fusing current "
                   "HIGHER, so treat this as the lowest current that can melt it in t",
         assumptions={
             "material": "copper (1083 C, 234 C reference, k = 33) - other metals are "
                         "not covered",
             "cooling": "none (adiabatic)",
-            "phase_change": "not modelled (melt point only)",
+            "phase_change": ("not modelled (melt point only): the answer is the "
+                             "current that REACHES 1083 C, not the current that melts "
+                             "through; pass melting_model='sensible_plus_latent' for "
+                             "the latter (+%.1f %% at %.0f C)"
+                             % (100.0 * (math.sqrt(1.0 + latent_share) - 1.0),
+                                t_ambient_c)
+                             if melting_model == "sensible" else
+                             "fusion energy included: 208.7 kJ/kg on top of the "
+                             "sensible heat, so this is the current that melts "
+                             "THROUGH, not the current that just reaches 1083 C"),
             "waveform": "constant current for t seconds; a pulse of the same RMS is "
                         "not equivalent once skin effect matters",
             "geometry": "rectangle converted to circular mils by equal area",
