@@ -4980,9 +4980,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (179 tools now), so an agent that asks what can be computed is "
+          "table (180 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 179
+          len(_tools.TOOLS) == 180
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -5157,8 +5157,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (179 tools now)",
-          len(_tools.TOOLS) == 179
+          "table (180 tools now)",
+          len(_tools.TOOLS) == 180
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5422,11 +5422,12 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 179, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 180, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
-          "(magnetics_powder_curve) and 0.0.81 exactly one "
-          "(magnetics_core_loss_audit)",
+          "(magnetics_powder_curve), 0.0.81 exactly one "
+          "(magnetics_core_loss_audit), 0.0.82-0.0.84 arguments only, and 0.0.85 "
+          "exactly one (thermal_spreading)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5434,7 +5435,7 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 179,
+          and len(_tools.TOOLS) == 180,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -5576,7 +5577,7 @@ def selftest():
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 179,
+          and len(_tools.TOOLS) == 180,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -5858,7 +5859,7 @@ def selftest():
           and _au_temp.get("temperatures_printed") == [100.0]
           and _au_kneg.get("reason_code") == "ARG_RANGE"
           and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 179,
+          and len(_tools.TOOLS) == 180,
           "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
           % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
              _au_n27.get("reason_code"), _au_mat.get("reason_code"),
@@ -5885,6 +5886,92 @@ def selftest():
           and "3 loss points" in (_tm_fit.get("hint") or ""),
           "3C93 pts %s, fit %s"
           % (_au_140v.get("points_evaluated"), _tm_fit.get("reason_code")))
+
+    # ---- 0.0.85: the spreading (constriction) resistance of a rectangular source
+    # on a plate. Two limits of this series are known exactly, so they are checked
+    # as identities rather than tolerances, and the brackets that must always hold
+    # are checked on a source that is off-centre, small, and not square.
+    _rs_whole = _call("thermal_spreading", {
+        "plate_width_mm": 10.0, "plate_length_mm": 10.0, "thickness_mm": 1.0,
+        "k_w_mk": 200.0, "source_x0_mm": 0.0, "source_x1_mm": 10.0,
+        "source_y0_mm": 0.0, "source_y1_mm": 10.0}, 850)
+    _rs_wv = _rs_whole.get("value") or {}
+    _rs_wc = _call("thermal_spreading", {
+        "plate_width_mm": 10.0, "plate_length_mm": 10.0, "thickness_mm": 1.0,
+        "k_w_mk": 200.0, "source_x0_mm": 0.0, "source_x1_mm": 10.0,
+        "source_y0_mm": 0.0, "source_y1_mm": 10.0,
+        "far_face": "convective", "h_w_m2k": 1000.0}, 8501)
+    check("spreading: the two limits that can be written down are identities, not "
+          "tolerances - a source covering the whole plate leaves R = t/(k*A) = "
+          "0.05 K/W with zero excess (measured 0.05 exactly), and the same plate "
+          "with a convective far face adds the 1-D wall 1/(h*A) = 10.0 to give "
+          "10.05 exactly, which is the check that caught the missing k/h term in "
+          "the m = n = 0 limit",
+          _rs_wv.get("rth_k_per_w") == 0.05
+          and _rs_wv.get("spreading_excess_k_per_w") == 0.0
+          and (_rs_wc.get("value") or {}).get("rth_k_per_w") == 10.05,
+          "%s / %s / %s" % (_rs_wv.get("rth_k_per_w"),
+                            _rs_wv.get("spreading_excess_k_per_w"),
+                            (_rs_wc.get("value") or {}).get("rth_k_per_w")))
+
+    _rs_def = _call("thermal_spreading", {
+        "plate_width_mm": 10.0, "plate_length_mm": 10.0, "thickness_mm": 1.0,
+        "k_w_mk": 200.0, "source_x0_mm": 3.0, "source_x1_mm": 7.0,
+        "source_y0_mm": 3.0, "source_y1_mm": 7.0}, 851)
+    _rs_dv = _rs_def.get("value") or {}
+    _rs_small = _call("thermal_spreading", {
+        "plate_width_mm": 10.0, "plate_length_mm": 10.0, "thickness_mm": 1.0,
+        "k_w_mk": 200.0, "source_x0_mm": 1.0, "source_x1_mm": 2.5,
+        "source_y0_mm": 6.0, "source_y1_mm": 9.5, "terms": 400}, 852)
+    _rs_sv = _rs_small.get("value") or {}
+    _rs_half = _call("thermal_spreading", {
+        "plate_width_mm": 10.0, "plate_length_mm": 10.0, "thickness_mm": 1.0,
+        "k_w_mk": 200.0, "source_x0_mm": 3.0, "source_x1_mm": 7.0,
+        "source_y0_mm": 3.0, "source_y1_mm": 7.0, "terms": 25.5}, 853)
+    _rs_big = _call("thermal_spreading", {
+        "plate_width_mm": 10.0, "plate_length_mm": 10.0, "thickness_mm": 1.0,
+        "k_w_mk": 200.0, "source_x0_mm": 3.0, "source_x1_mm": 7.0,
+        "source_y0_mm": 3.0, "source_y1_mm": 7.0, "terms": 500}, 854)
+    check("spreading: 4x4 mm on 10x10x1 mm, k = 200 gives 0.236046830818 K/W at the "
+          "default 120 terms (convergence 1.1e-4 against the same series at 240), "
+          "the brackets 0.05 <= 0.568797535268 <= 0.952380952381 hold on an "
+          "off-centre 1.5x3.5 mm source at 400 terms, and the cutoff refuses "
+          "25.5 terms by name instead of truncating it to 25",
+          _rs_dv.get("far_face") == "isothermal"
+          and _rs_dv.get("terms") == 120
+          and abs(_rs_dv.get("rth_k_per_w") - 0.236046830818) < 1e-12
+          and abs(_rs_dv.get("convergence_rel") - 1.1e-4) < 2e-6
+          and _rs_sv.get("rth_1d_plate_k_per_w") <= _rs_sv.get("rth_k_per_w")
+          and _rs_sv.get("rth_k_per_w") <= _rs_sv.get("rth_1d_source_column_k_per_w")
+          and _rs_half.get("reason_code") == "ARG_INVALID"
+          and _rs_big.get("reason_code") == "ARG_RANGE",
+          "%s / conv %s / %s / %s" % (_rs_dv.get("rth_k_per_w"),
+                                      _rs_dv.get("convergence_rel"),
+                                      _rs_half.get("reason_code"),
+                                      _rs_big.get("reason_code")))
+
+    _hs_base = {"power_w": 5.0, "t_j_max_c": 100.0, "t_ambient_c": 40.0,
+                "rth_jc_k_per_w": 2.0}
+    _hs_a = _call("thermal_heatsink", dict(_hs_base), 855).get("value") or {}
+    _hs_b = _call("thermal_heatsink", dict(_hs_base,
+                 rth_spread_k_per_w=0.186078529798), 856).get("value") or {}
+    _hs_c = _call("thermal_heatsink", {"power_w": 100.0, "t_j_max_c": 100.0,
+                                       "t_ambient_c": 40.0, "rth_jc_k_per_w": 0.5,
+                                       "rth_spread_k_per_w": 0.186078529798}, 857)
+    check("spreading is an input to the heatsink budget, not a hidden correction: "
+          "the same 5 W / 60 K case leaves 10.0 K/W for the sink with the term "
+          "omitted (the old, optimistic answer) and 9.81392147 when 0.1860785 is "
+          "passed in, and a case where case + spreading alone are 0.686 of a "
+          "0.600 budget is refused as INFEASIBLE naming both",
+          abs(_hs_a.get("rth_sa_budget_k_per_w") - 10.0) < 1e-12
+          and abs(_hs_a.get("rth_sa_target_k_per_w") - 8.0) < 1e-12
+          and abs(_hs_b.get("rth_sa_budget_k_per_w") - 9.81392147) < 1e-9
+          and abs(_hs_b.get("rth_sa_target_k_per_w") - 7.851137176) < 1e-9
+          and _hs_c.get("reason_code") == "INFEASIBLE"
+          and "spreading" in (_hs_c.get("message") or ""),
+          "%s / %s / %s" % (_hs_a.get("rth_sa_budget_k_per_w"),
+                            _hs_b.get("rth_sa_budget_k_per_w"),
+                            _hs_c.get("reason_code")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

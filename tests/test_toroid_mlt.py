@@ -392,7 +392,8 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
     def test_the_capabilities_list_it_and_stop_calling_mlt_missing(self):
         caps = tools._capabilities({})
         self.assertIn("magnetics_toroid_mlt", caps["available"])
-        self.assertEqual(len(caps["available"]), 173)
+        # 174 = 173 + thermal_spreading in 0.0.85
+        self.assertEqual(len(caps["available"]), 174)
         joined = json.dumps(caps)
         self.assertIn("toroid_mlt", joined)
         self.assertNotIn("(so no toroid copper estimate)", joined)
@@ -400,7 +401,9 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
     def test_the_tool_count_is_one_higher_than_0_0_78(self):
         # 179 = 178 + magnetics_core_loss_audit in 0.0.81 (scoring a triple against
         # the vendor's printed points is a different question from evaluating a fit)
-        self.assertEqual(len(tools.TOOLS), 179)
+        # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
+        # spreading resistance is its own question; thermal_stack stays strictly 1-D)
+        self.assertEqual(len(tools.TOOLS), 180)
 
 if __name__ == "__main__":
     unittest.main()

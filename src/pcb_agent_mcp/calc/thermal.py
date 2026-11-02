@@ -755,13 +755,244 @@ def thermal_transient(rth_k_per_w, cth_j_per_k, power_w, t_end_s,
                                       "the self-heating feedback into the loss"]})
 
 
+# ------------------------------------------------- spreading (constriction)
+
+def _cos_integral(a_m, b_m, size_m, m):
+    """int_a^b cos(m*pi*x/size) dx, in metres - the source's footprint on one
+    eigenfunction.  Zero is returned exactly when the integral IS zero."""
+    if m == 0:
+        return b_m - a_m
+    c = m * math.pi / size_m
+    return (math.sin(c * b_m) - math.sin(c * a_m)) / c
+
+
+def _z12(x):
+    """round to 12 places, and turn -0.0 into 0.0 so JSON does not print "-0.0"."""
+    y = round(x, 12)
+    return 0.0 if y == 0.0 else y
+
+
+def _spread_series(W, L, t, k, x0, x1, y0, y1, far, h, terms):
+    """The one series both the answer and its convergence check are built on."""
+    As = (x1 - x0) * (y1 - y0)
+    ix = [_cos_integral(x0, x1, W, m) for m in range(terms + 1)]
+    iy = [_cos_integral(y0, y1, L, n) for n in range(terms + 1)]
+    wx = [(m / W) ** 2 for m in range(terms + 1)]
+    wy = [(n / L) ** 2 for n in range(terms + 1)]
+    total = 0.0
+    for m in range(terms + 1):
+        if ix[m] == 0.0:
+            continue
+        ex = 1.0 if m == 0 else 2.0
+        for n in range(terms + 1):
+            if iy[n] == 0.0:
+                continue
+            lam = math.pi * math.sqrt(wx[m] + wy[n])
+            if lam == 0.0:
+                # the m = n = 0 term IS the 1-D path.  Isothermal far face:
+                # tanh(lam*t)/lam -> t.  Robin far face the 1-D solution is
+                # q*z/k + q/h, so the limit is t + k/h, NOT t - taking t here
+                # loses the whole convective term (20 K/W per square metre of
+                # plate at h=10, which swamps the spreading).
+                fo = t if far == "isothermal" else t + k / h
+            else:
+                # exp(-2*lam*t) form, so a thick plate cannot overflow cosh
+                E = math.exp(-2.0 * lam * t)
+                if far == "isothermal":
+                    fo = ((1.0 - E) / (1.0 + E)) / lam          # tanh(lam t)/lam
+                else:
+                    g = h / (k * lam)
+                    num = (1.0 + E) + g * (1.0 - E)
+                    den = (1.0 - E) + g * (1.0 + E)
+                    fo = (num / den) / lam
+            fxy = ix[m] * iy[n]
+            total += fxy * fxy * ex * (1.0 if n == 0 else 2.0) * fo
+    return total / (k * As * As * W * L)
+
+
+def spreading_resistance(plate_width_mm, plate_length_mm, thickness_mm, k_w_mk,
+                         source_x0_mm, source_x1_mm, source_y0_mm, source_y1_mm,
+                         far_face="isothermal", h_w_m2k=None, terms=120):
+    """Constriction (spreading) resistance of a rectangular heat source on a
+    rectangular plate: how much resistance the plate adds because the heat
+    enters through a PATCH instead of through the whole face.
+
+    Model, exactly: steady conduction, one isotropic layer of thickness t and
+    conductivity k, 0 <= x <= W, 0 <= y <= L, lateral faces ADIABATIC, the source
+    rectangle [x0,x1] x [y0,y1] on z = 0 carrying a UNIFORM flux, zero flux on
+    the rest of that face, and z = t either isothermal (far_face="isothermal",
+    the plate sits on an isothermal base) or convective with a stated h
+    (far_face="convective": the plate faces the ambient through h; the edges stay
+    adiabatic, which is the conservative end).
+
+    The answer is the average source temperature per watt:
+        R = (1/k) * sum_mn  I_mn^2 * e_m * e_n * f(lam_mn) / (A_s^2 * W * L)
+        I_mn = int_source cos(m pi x/W) cos(n pi y/L) dA
+        lam_mn = pi*sqrt((m/W)^2 + (n/L)^2),  f = tanh(lam t)/lam  (isothermal)
+        f = lam^-1 * ((1+E) + g(1-E)) / ((1-E) + g(1+E)), E = exp(-2 lam t),
+            g = h/(k lam)                                        (convective)
+    Two limits are exact and are the reason to trust the algebra: the m = n = 0
+    term is the 1-D path, so a source covering the whole plate returns exactly
+    t/(k*A) with no spreading, and a vanishing thickness returns t/(k*A) too.
+
+    What it does NOT model: an ISOTHERMAL source (uniform flux is assumed - on a
+    half-space the two differ by 8/(3*pi^2) vs 1/4, i.e. 8 %, so a copper pad
+    reads a few percent high); a circular source; lateral edges that convect or
+    are held at a temperature; several layers; temperature-dependent k; through
+    vias; contact resistance; radiation.
+    """
+    W = _num(plate_width_mm)
+    L = _num(plate_length_mm)
+    t = _num(thickness_mm)
+    k = _num(k_w_mk)
+    x0 = _num(source_x0_mm)
+    x1 = _num(source_x1_mm)
+    y0 = _num(source_y0_mm)
+    y1 = _num(source_y1_mm)
+    for name, v in (("plate_width_mm", W), ("plate_length_mm", L),
+                    ("thickness_mm", t), ("k_w_mk", k),
+                    ("source_x0_mm", x0), ("source_x1_mm", x1),
+                    ("source_y0_mm", y0), ("source_y1_mm", y1)):
+        if v is None:
+            return err("%s must be a number" % name, "ARG_INVALID")
+    for name, v in (("plate_width_mm", W), ("plate_length_mm", L),
+                    ("thickness_mm", t), ("k_w_mk", k)):
+        if v <= 0:
+            return err("%s must be > 0" % name, "ARG_RANGE")
+    if not (x0 < x1) or not (y0 < y1):
+        return err("the source rectangle must have x1 > x0 and y1 > y0",
+                   "ARG_RANGE",
+                   hint="a source with no area puts a finite power into zero "
+                        "square millimetres, and the temperature of that is not "
+                        "a number this model has")
+    tol = 1e-9 * max(W, L)
+    if x0 < -tol or y0 < -tol or x1 > W + tol or y1 > L + tol:
+        return err("the source rectangle [%g, %g] x [%g, %g] mm is not inside the "
+                   "%g x %g mm plate" % (x0, x1, y0, y1, W, L), "ARG_RANGE",
+                   hint="move the source in, or grow the plate: heat that enters "
+                        "outside the plate has no path modelled here")
+    if far_face not in ("isothermal", "convective"):
+        return err("far_face must be 'isothermal' or 'convective'", "ARG_INVALID",
+                   hint="an adiabatic far face with adiabatic edges has no sink "
+                        "at all - steady state does not exist, so it is refused "
+                        "rather than answered")
+    h = 0.0
+    if far_face == "convective":
+        h = _num(h_w_m2k)
+        if h is None or h <= 0:
+            return err("far_face='convective' needs h_w_m2k > 0", "ARG_REQUIRED",
+                       hint="thermal_convection turns an airflow into this "
+                            "number; it is not guessed here")
+    else:
+        h = 0.0
+    try:
+        n_terms_f = float(terms)
+    except (TypeError, ValueError):
+        return err("terms must be an integer", "ARG_INVALID")
+    # int() alone would silently floor 25.5 to 25 and answer anyway - the
+    # caller asked for a cutoff they cannot have, so say so.
+    if n_terms_f != int(n_terms_f):
+        return err("terms must be an integer (got %r)" % (terms,), "ARG_INVALID",
+                   hint="the series cutoff counts terms, so 25.5 has no meaning")
+    n_terms = int(n_terms_f)
+    if n_terms < 20 or n_terms > 400:
+        return err("terms must be in 20..400 (it is the series cutoff, not an "
+                   "accuracy promise - the convergence check is reported)",
+                   "ARG_RANGE")
+
+    Wm, Lm, tm = W * 1e-3, L * 1e-3, t * 1e-3
+    r = _spread_series(Wm, Lm, tm, k, x0 * 1e-3, x1 * 1e-3, y0 * 1e-3, y1 * 1e-3,
+                       far_face, h, n_terms)
+    r2 = _spread_series(Wm, Lm, tm, k, x0 * 1e-3, x1 * 1e-3, y0 * 1e-3, y1 * 1e-3,
+                        far_face, h, 2 * n_terms)
+    a_s = (x1 - x0) * (y1 - y0)          # mm^2
+    a_p = W * L
+    # Two 1-D references, and they bracket the answer:
+    #   plate floor  t/(k*A_plate)  - the m = n = 0 term, i.e. the value when the
+    #                  source covers the whole face; spreading only ADDS to it
+    #   column bound t/(k*A_source) - a plate that is a straight column under the
+    #                  patch and spreads nothing; the answer is below it
+    r_floor = (t * 1e-3) / (k * a_p * 1e-6)
+    r_col = (t * 1e-3) / (k * a_s * 1e-6)
+    conv = abs(r2 - r) / r if r else 0.0
+    # r - r_floor is 0 when the source IS the plate, but only to within the
+    # series' own round-off (which can leave -1e-17), and round() then prints
+    # "-0.0" in JSON. Normalise both signed zeros.
+    exc = _z12(r - r_floor)
+    rel = _z12(r_col - r)
+    side = math.sqrt(a_s) * 1e-3
+    return ok(value={"rth_k_per_w": round(r, 12),
+                     "rth_1d_plate_k_per_w": round(r_floor, 12),
+                     "rth_1d_source_column_k_per_w": round(r_col, 12),
+                     "spreading_excess_k_per_w": exc,
+                     "spreading_relief_k_per_w": rel,
+                     "psi": round(r * k * side, 9),
+                     "source_area_mm2": round(a_s, 9),
+                     "plate_area_mm2": round(a_p, 9),
+                     "coverage": round(a_s / a_p, 9),
+                     "thickness_mm": t, "k_w_mk": k,
+                     "far_face": far_face,
+                     "h_w_m2k": (h if far_face == "convective" else None),
+                     "terms": n_terms,
+                     "rth_at_terms_k_per_w": round(r, 12),
+                     "rth_at_2terms_k_per_w": round(r2, 12),
+                     "convergence_rel": round(conv, 12)},
+              unit="K/W", model="spreading_resistance_rectangular",
+              basis="uniform flux over the source patch on one face of a single "
+                    "isotropic plate, adiabatic lateral edges, the far face "
+                    "isothermal or convective with h; eigenfunction series in "
+                    "cos(m pi x/W) cos(n pi y/L), R = average source temperature "
+                    "per watt",
+              precision="the series is exact for those boundary conditions; the "
+                        "cutoff is stated and the same series at TWICE the cutoff "
+                        "is reported as a convergence check. The bigger number is "
+                        "the model: uniform flux instead of an isothermal pad "
+                        "(8 % apart on a half-space), and adiabatic edges",
+              assumptions={"plate_mm": [W, L], "thickness_mm": t, "k_w_mk": k,
+                           "source_mm": [x0, x1, y0, y1],
+                           "far_face": far_face},
+              extra={"um": "psi = R*k*sqrt(A_source) is the dimensionless "
+                           "form of the constriction resistance",
+                     "brackets": "rth_1d_plate_k_per_w <= rth_k_per_w <= "
+                                 "rth_1d_source_column_k_per_w always hold (the "
+                                 "series is the exact first one plus positive "
+                                 "terms, and spreading beats the column) - if you "
+                                 "ever see them crossed, the model is being asked "
+                                 "something it does not describe",
+                     "not_computed": ["an isothermal source patch (uniform flux "
+                                      "is assumed)",
+                                      "a circular or annular source",
+                                      "convecting or isothermal lateral edges",
+                                      "a stack of layers (copper foil over FR4, "
+                                      "a baseplate under a die)",
+                                      "thermal vias through the plate",
+                                      "contact resistance at either face",
+                                      "temperature-dependent k",
+                                      "radiation from the plate"],
+                     "vs_plate_temperature": "plate_temperature solves the "
+                                             "in-plane problem with the thickness "
+                                             "LUMPED (k*t*lap(T)), so the plate is "
+                                             "isothermal through its thickness and "
+                                             "a small source shows no constriction "
+                                             "at all. This function resolves the "
+                                             "through-thickness direction and "
+                                             "consequently reports the part "
+                                             "plate_temperature cannot see"})
+
 # ------------------------------------------------------------------ heatsink
 
 def heatsink_select(power_w, t_j_max_c, t_ambient_c, rth_jc_k_per_w,
-                    rth_cs_k_per_w=0.0, safety_margin=0.8):
+                    rth_cs_k_per_w=0.0, safety_margin=0.8,
+                    rth_spread_k_per_w=0.0):
     """What Rth(junction-to-air) do I need, and therefore what heatsink?
 
-    Rth_sa_required = (Tj_max - Tamb)/P - Rth_jc - Rth_cs
+    Rth_sa_required = (Tj_max - Tamb)/P - Rth_jc - Rth_cs - Rth_spread
+
+    rth_spread_k_per_w is the constriction resistance of the package footprint
+    spreading into the sink base, i.e. the number spreading_resistance returns:
+    a small package on a big base is not the uniform-flux case a heatsink
+    datasheet is measured in. It defaults to 0, which is the answer this
+    function gave before it existed.
     then the selection target is `safety_margin` times that, because a heatsink
     datasheet number is for a flat plate in free air, on a lab bench, at one
     orientation - none of which is the inside of the user's enclosure.
@@ -775,13 +1006,15 @@ def heatsink_select(power_w, t_j_max_c, t_ambient_c, rth_jc_k_per_w,
     ta = _num(t_ambient_c)
     rjc = _num(rth_jc_k_per_w)
     rcs = _num(rth_cs_k_per_w)
+    rsp = _num(rth_spread_k_per_w)
     for name, v in (("power_w", p), ("t_j_max_c", tj), ("t_ambient_c", ta),
-                    ("rth_jc_k_per_w", rjc), ("rth_cs_k_per_w", rcs)):
+                    ("rth_jc_k_per_w", rjc), ("rth_cs_k_per_w", rcs),
+                    ("rth_spread_k_per_w", rsp)):
         if v is None:
             return err("%s must be a number" % name, "ARG_INVALID")
     if p <= 0:
         return err("power_w must be > 0", "ARG_RANGE")
-    if rjc < 0 or rcs < 0:
+    if rjc < 0 or rcs < 0 or rsp < 0:
         return err("thermal resistances cannot be negative", "ARG_RANGE")
     try:
         margin = float(safety_margin)
@@ -794,16 +1027,17 @@ def heatsink_select(power_w, t_j_max_c, t_ambient_c, rth_jc_k_per_w,
         return err("t_j_max_c is not above t_ambient_c - there is no cooling that "
                    "fixes this", "ARG_RANGE")
     allowed_total = headroom / p
-    r_sa = allowed_total - rjc - rcs
+    r_sa = allowed_total - rjc - rcs - rsp
     if r_sa <= 0:
-        return err("the junction-to-case and case-to-sink resistances alone use "
+        return err("junction-to-case, case-to-sink and spreading alone use "
                    "%.3f of the %.3f K/W budget: no heatsink can help, the "
-                   "package or the power has to change" %
-                   (rjc + rcs, allowed_total), "INFEASIBLE")
+                   "package, the footprint or the power has to change" %
+                   (rjc + rcs + rsp, allowed_total), "INFEASIBLE")
     target = safety_margin * r_sa
     return ok(value={"required_rth_total_k_per_w": round(allowed_total, 9),
                      "rth_sa_budget_k_per_w": round(r_sa, 9),
                      "rth_sa_target_k_per_w": round(target, 9),
+                     "rth_spread_k_per_w": round(rsp, 9),
                      "safety_margin": margin,
                      "headroom_k": round(headroom, 6),
                      "power_w": p},
@@ -816,10 +1050,14 @@ def heatsink_select(power_w, t_j_max_c, t_ambient_c, rth_jc_k_per_w,
                         "on TIM area and pressure, and P must be the real loss "
                         "(switching included), not V*I of the wrong state",
               assumptions={"t_j_max_c": tj, "t_ambient_c": ta,
-                           "rth_jc_k_per_w": rjc, "rth_cs_k_per_w": rcs},
+                           "rth_jc_k_per_w": rjc, "rth_cs_k_per_w": rcs,
+                           "rth_spread_k_per_w": rsp},
               extra={"not_computed": ["heatsink part selection (no table here)",
                                       "airflow derating",
-                                      "altitude", "radiation"],
+                                      "altitude", "radiation",
+                                      "the spreading resistance itself: pass it "
+                                      "in from thermal_spreading, it is not "
+                                      "estimated here"],
                      "next_step": "compare rth_sa_target_k_per_w against the "
                                   "heatsink datasheet value measured at the same "
                                   "airflow and mounting orientation"})

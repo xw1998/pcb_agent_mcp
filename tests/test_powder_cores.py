@@ -453,7 +453,9 @@ class TestTheFilledSaturationValues(unittest.TestCase):
         # magnetics_select_core; it adds no tool, and the pool is opt-in.
         # 179 = 178 + magnetics_core_loss_audit in 0.0.81 (scoring a triple against
         # the vendor's printed points is a different question from evaluating a fit)
-        self.assertEqual(len(tools.TOOLS), 179)
+        # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
+        # spreading resistance is its own question; thermal_stack stays strictly 1-D)
+        self.assertEqual(len(tools.TOOLS), 180)
         props = tools.TOOLS["magnetics_select_core"]["inputSchema"]["properties"]
         self.assertIn("include_powder_cores", props)
         self.assertIn("permeability", props)

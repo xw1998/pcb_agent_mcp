@@ -451,10 +451,13 @@ class TestTheSurfaceMovedOnce(unittest.TestCase):
         self.assertIn("magnetics_powder_curve", tools.TOOLS)
         # 179 = 178 + magnetics_core_loss_audit in 0.0.81 (scoring a triple against
         # the vendor's printed points is a different question from evaluating a fit)
-        self.assertEqual(len(tools.TOOLS), 179)
+        # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
+        # spreading resistance is its own question; thermal_stack stays strictly 1-D)
+        self.assertEqual(len(tools.TOOLS), 180)
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_powder_curve", cap["available"])
-        self.assertEqual(len(cap["available"]), 173)
+        # 174 = 173 + thermal_spreading in 0.0.85
+        self.assertEqual(len(cap["available"]), 174)
 
     def test_the_capability_list_no_longer_claims_there_is_no_curve(self):
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})

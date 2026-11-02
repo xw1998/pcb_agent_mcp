@@ -438,7 +438,9 @@ class TestTheTool(unittest.TestCase):
     def test_the_tool_is_registered_and_the_count_moved_by_one(self):
         # 179 = 178 + magnetics_core_loss_audit in 0.0.81 (scoring a triple against
         # the vendor's printed points is a different question from evaluating a fit)
-        self.assertEqual(len(tools.TOOLS), 179)
+        # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
+        # spreading resistance is its own question; thermal_stack stays strictly 1-D)
+        self.assertEqual(len(tools.TOOLS), 180)
         self.assertIn("magnetics_dc_bias", tools.TOOLS)
         spec = tools.TOOLS["magnetics_dc_bias"]
         props = spec["inputSchema"]["properties"]

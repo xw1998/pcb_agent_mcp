@@ -3704,7 +3704,8 @@ def _capabilities(_args):
             "pdn_plane_impedance", "pdn_plane_with_caps", "pdn_step_response",
             "decoupling_check",
             "thermal_stack", "thermal_via_array", "thermal_plate",
-            "thermal_transient", "thermal_heatsink", "thermal_convection",
+            "thermal_transient", "thermal_heatsink", "thermal_spreading",
+            "thermal_convection",
             "board_ir_drop",
             "dfm_capability", "dfm_check",
             "vibration_plate_modes", "vibration_plate_outline",
@@ -4237,7 +4238,9 @@ def _capabilities(_args):
             "area, thickness and k you state), and board_electrothermal's thermal_vias "
             "takes the same profile. Still not done: a plating-bath or IPC-4761 via "
             "structure model (the profile is YOUR numbers, not a process model), "
-            "pad/plane spreading at the barrel ends, solder wicking, voiding / "
+            "pad/plane spreading AT THE BARREL ENDS themselves (thermal_spreading "
+            "now answers a rectangular patch on a plate, but the via barrel is "
+            "still a column with no end-spreading term), solder wicking, voiding / "
             "pump-out or mounting pressure in the interface layer, rth_cs (still an "
             "input you must supply), and heatsink selection - thermal_heatsink returns "
             "the BUDGET, there is deliberately no heatsink table in this server",
@@ -6216,8 +6219,9 @@ _tool(
 _tool(
     "thermal_stack",
     "1-D thermal resistance through a stack of layers: Rth = sum(t/(k*A)), plus the "
-    "temperature rise for a stated power. Strictly 1-D - it cannot see spreading, which is "
-    "why thermal_plate exists.",
+    "temperature rise for a stated power. Strictly 1-D - it cannot see spreading: "
+    "thermal_spreading answers that for a rectangular patch on a plate, and "
+    "thermal_plate for the in-plane problem with the thickness lumped.",
     {"type": "object", "properties": {
         "layers": {"type": "array", "description":
                    "list of {name, thickness_mm, k_w_mk} - k may be the string "
@@ -6333,6 +6337,10 @@ _tool(
         "t_ambient_c": _num("ambient inside the enclosure, not the room"),
         "rth_jc_k_per_w": _num("junction-to-case from the datasheet"),
         "rth_cs_k_per_w": _num("case-to-sink: TIM area and pressure matter", 0.0),
+        "rth_spread_k_per_w": _num("constriction resistance of the package "
+                                   "footprint spreading into the sink base - the "
+                                   "number thermal_spreading returns. Omit and it "
+                                   "is 0, exactly as before this parameter existed"),
         "safety_margin": _num("fraction of the budget you are willing to use", 0.8),
     }, "required": ["power_w", "t_j_max_c", "t_ambient_c", "rth_jc_k_per_w"]},
     lambda a: _thermal.heatsink_select(
@@ -6341,7 +6349,56 @@ _tool(
         rth_cs_k_per_w=(a["rth_cs_k_per_w"] if a.get("rth_cs_k_per_w") is not None
                         else 0.0),
         safety_margin=(a["safety_margin"] if a.get("safety_margin") is not None
-                       else 0.8)),
+                       else 0.8),
+        rth_spread_k_per_w=(a["rth_spread_k_per_w"]
+                            if a.get("rth_spread_k_per_w") is not None else 0.0)),
+)
+
+_tool(
+    "thermal_spreading",
+    "Constriction (spreading) resistance of a rectangular heat source on a "
+    "rectangular plate: how much resistance the plate ADDS because the heat enters "
+    "through a patch instead of through the whole face. Solved exactly - an "
+    "eigenfunction series in cos(m*pi*x/W)cos(n*pi*y/L) for uniform flux over the "
+    "patch, adiabatic lateral edges, and a far face that is either ISOTHERMAL (the "
+    "plate sits on a base) or CONVECTIVE with a stated h (it faces ambient). The "
+    "answer is the average source temperature per watt, and two exact limits bracket "
+    "it: a patch covering the whole face returns t/(k*A_plate) with no spreading at "
+    "all, and a vanishing thickness returns the same. thermal_plate cannot see this "
+    "number - it lumps the thickness away, so a small pad on a plate is isothermal "
+    "through the plate by construction there. Uniform flux, not an isothermal patch "
+    "(8 % apart on a half-space), and a single layer: it is not a stack, not a via "
+    "field and not a circular source.",
+    {"type": "object", "properties": {
+        "plate_width_mm": _num("plate extent in x"),
+        "plate_length_mm": _num("plate extent in y"),
+        "thickness_mm": _num("plate thickness (the direction the heat crosses)"),
+        "k_w_mk": _num("conductivity of the plate (200 for 6063 aluminium, 385 "
+                       "copper, 0.3 FR4)"),
+        "source_x0_mm": _num("source patch, x from"), "source_x1_mm": _num("x to"),
+        "source_y0_mm": _num("y from"), "source_y1_mm": _num("y to"),
+        "far_face": _str("isothermal = the far face is held (a base, a cold "
+                         "plate); convective = it loses heat to ambient through "
+                         "h_w_m2k", enum=["isothermal", "convective"],
+                         default="isothermal"),
+        "h_w_m2k": _num("far-face h; required for far_face='convective', and "
+                        "thermal_convection turns an airflow into it"),
+        "terms": _num("series cutoff in each direction (20..400, default 120); the "
+                      "same series at twice the cutoff is reported as a "
+                      "convergence check, so this is not an accuracy promise", 120),
+    }, "required": ["plate_width_mm", "plate_length_mm", "thickness_mm", "k_w_mk",
+                    "source_x0_mm", "source_x1_mm", "source_y0_mm", "source_y1_mm"]},
+    lambda a: _thermal.spreading_resistance(
+        a.get("plate_width_mm"), a.get("plate_length_mm"), a.get("thickness_mm"),
+        a.get("k_w_mk"),
+        a.get("source_x0_mm"), a.get("source_x1_mm"),
+        a.get("source_y0_mm"), a.get("source_y1_mm"),
+        far_face=(a.get("far_face") or "isothermal"),
+        h_w_m2k=a.get("h_w_m2k"),
+        # NOT int(a["terms"]): that would floor 25.5 to 25 and answer, which is
+        # the silent-correction this project does not do. The calc layer checks
+        # integrality and refuses by name.
+        terms=(a["terms"] if a.get("terms") is not None else 120)),
 )
 
 _tool(
