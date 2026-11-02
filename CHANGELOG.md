@@ -9,6 +9,132 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.95] - 2026-11-02
+
+**铺铜的填充参数写在 KiCad 读它的地方：一块真实板 386 条假 clearance**
+（工具数 **188**（不变）/ 写路径 op **38 → 39** / `available` **182**（不变）/
+`--selftest` **328 → 329** / pytest **3522 → 3535** / `dependencies = []` 仍成立）
+
+### 1. 386 条 clearance 不在铜上，在文件少了一个字段
+
+STM32F412RG 核心板（199 412 B，两个内层铺铜 GND / In1.Cu 与 +3V3 / In2.Cu）报
+**386 条 `clearance` error**，描述的原文都一样：「填充区 间距 0.2500 mm; 实际 0.2005 mm」。
+同一时刻我自己的几何 pass 量的是 **0.2505 mm**（polygon 边缘到过孔半径，5780 + 6059 个顶点逐条算），
+所以差的那 0.05 mm 不在铜上。
+
+真因是 `(filled_areas_thickness no)`：缺这个字段时 KiCad 把 `filled_polygon` 当成**中心线**，
+用 `min_thickness/2` 沿它描边；这块板 `min_thickness = 0.1` ⇒ 每条边外扩 0.05 mm ⇒
+`0.2505 − 0.05 = 0.2005`，逐位对上。三档对照（同一份字节、同一个 `.kicad_pro`、同一台 kicad-cli 10.0.7）：
+
+| 字段 | violations | error | 其中 clearance |
+|---|---|---|---|
+| 缺失（KiCad 缺省当 yes） | 536 | 386 | 200 × 「0.2500 / 0.2005」 |
+| `yes` | 536 | 386 | 200 |
+| `no` | 150 | **0** | **0** |
+
+补上字段并**重填**之后整块板 DRC：`violations_total` **504 → 150**、`clearance` **386 → 0**，
+剩下的全是 warning（via_dangling 2 / silk_edge_clearance 2 / holes_co_located 28 /
+hole_to_hole 16 / lib_footprint_issues 32 / text_height 32 / silk_overlap 14 /
+silk_over_copper 24）。**警告条数一条没少**——这不是「放宽规则」，是把该报的留住了、不该报的拿掉。
+
+### 2. `set_zone_params`：第 39 个写 op
+
+改的是一个铺铜**意味着什么**，不是一个数字：`filled_areas_thickness`（yes/no，bool 也收）、
+`clearance`（写进 `connect_pads`，不是 zone 顶层）、`min_thickness`；字段位置照 KiCad 自己写的顺序
+（`connect_pads` → `min_thickness` → `filled_areas_thickness`），这样「本工具写的」与「KiCad 写的」
+只差值本身。三条硬规矩：
+
+- **旧填充必须作废**：`filled_polygon` 是旧参数下的铜，留着就是「文件说一套、板说另一套」；
+  丢几个如实回 `dropped_filled_polygons`，并回 `refill_required=true` —— 之后要么 `board_fill_zones`，
+  要么让 EDA 自己填。
+- **keep-out 没有填充参数**：命中的是 keep-out 就 `ARG_INVALID` 并说明，不硬塞 `clearance`。
+- **一个参数都不给是拒绝**（`ARG_MISSING`），selector 打空是 `TARGET_NOT_FOUND`；
+  参数已经等于要的值时仍会重铺，所以 `zones_changed` 与 `zones_matched` 分开报，
+  「0 changed / 2 matched / 2 dropped」是一个真实状态，不是失败。
+
+### 3. DRC 的判决要对着同一套规则读
+
+`fidelity.engine.drc(path, project=...)`；不给时自动去板旁边找同名 `.kicad_pro`，找到就连板带 pro
+一起拷进临时目录（**still 不往用户目录写一个字节**），并在信封里说清这次读的是哪套：
+`project_file_used` / `rule_source`（`project` 或 `kicad_defaults`）/ `rule_source_note`。
+
+为什么必须说：同一份 199 KB 字节，旁边没有 `.kicad_pro` 时 **665 violations / 515 error**
+（drill_out_of_range 158、track_width 199、via_diameter 158，再加 14 条 silk_overlap 从 warning
+翻成 error），旁边有 pro 时 **150 / 0 error**。写路径的 DRC 差集里，「改前」那一半是 checkpoint 副本、
+住在服务自己的 home 里、旁边没有 pro ⇒ 两半读数不同源，14 条老丝印会被算成 14 条新错误。
+现在两半都显式对着 target 旁边的 pro 读（`_project_beside`），checkpoint 副本旁没有 pro 时**如实说**
+「这份判决用的是 KiCad 缺省规则」，而不是让它看起来像工程规则。
+
+判据：`tests/test_ops_edit.py::ZoneParams` 7 例（字段落点 / yes 拼写 / 旧填充作废 / clearance 进
+`connect_pads` / 空参数 / 选择器打空 / keep-out 拒绝）、`tests/test_engine_drc_project.py` 6 例
+（暂存配对、跨目录显式 pro、自动配对、无 pro 要明说、输入不被写、差集用的是哪套），
+自检 **328 → 329**（一条串起 propose → apply → 读回文件里的三个字段 + keep-out 拒绝）。
+
+### 4. 一轮实测审计：13 条「会造成错误结论」与「根本做不到」
+
+审计原文的两句判词决定了这一轮的次序：**「如果只补一处，我建议补 `set_zone_params`，并让 `add_zone`
+直接照 KiCad 原生头部写全字段——顺带把 `board_fill_zones(in_place=True)` 改成填完自动跑一次 DRC，
+把'铺铜不合格'当场报出来，而不是留给用户去发现 386 个 error。」** 以及「其余都是从这两条衍生出来的绕路成本」。
+所以先做那两条（§2 与 §6–§7），再做被它们拖出来的七条。
+
+**写出的 zone 就是 KiCad 的 zone（§7）**：`add_zone` 现在写 `connect_pads` 模式词、
+`(fill yes [(thermal_gap)] [(thermal_bridge_width)] (island_removal_mode 0))` 和
+`(filled_areas_thickness no)`，冒烟验证三档模式词 → pcbnew 读回 `ZONE_CONNECTION` 2 / 1 / 0。
+
+**`connect_pads` 不猜（§6）**：文件写了什么（`connect_pads`，无模式词时 `null`）与 KiCad 读成什么
+（`connect_pads_effective` + `connect_pads_source`）分开报。**无模式词 = 热焊盘**（KiCad 自己保存
+thermal zone 就不写词），旧解析层把这条读成了 `solid`，两处都反了；`tests/test_thermal_relief.py`
+的三条旧错断言随之重写（32 例）。
+
+**填充成功 ≠ 铺铜合格（§8）**：`fill(..., verify_drc=True)` 填完自己跑一次 KiCad DRC，写进
+`value.drc_after_fill`；测量模式（不写文件）把 DRC 跑在**临时副本**上，因为原文件那时还是轮廓；
+工具层 `drc` 开关默认 true；写路径的 `gates.zone_fill` 只对**新增**错误阻塞
+（`drc_errors_before_the_pour` / `drc_errors_added_by_the_pour`）。
+
+**DRC 违规终于带几何量（§9）**：`fidelity/drc_geometry.py`（新文件）从**本地化的描述文本**里读
+「要求多少 / 实测多少」，给每条违规补 `geometry{constraint_mm, actual_mm, shortfall_mm, ratio, order, source}`；
+没有数字的描述给 `geometry: null` + `geometry_absent_because`，没有 `actual` 词时标
+`order: "assumed"` —— 不补 0、不猜。同一个量透到 `drc_policy` 的阻塞条目、写路径的 DRC 差集与
+`board_fill_zones` 的 `top_errors`，所以阻塞文案现在是
+`clearance at (12.34, -5.67) (wanted 0.25 mm, got 0.2005 mm)` 而不是一个数量。
+
+**同 net/layer 删了再加不是错误（§10）**：`delete_zone` 的后置条件从「selector 不再匹配」改成
+**按 uuid 判**（它删的是一批具体对象），同一次 apply 里删旧 zone + 加新 zone 现在通过；`propose`
+仍然把这类组合先说出来（`plan_conflicts: delete_then_add_same_zone` + `what_to_do`），
+后置条件失败时带 `failed_detail`。
+
+**删除是一批对象（§10）**：新 op `delete_copper`（第 40 个写 op）按 `net` / `layer` / `region`
+（mm，Y 向上）批量删 `tracks` / `vias` / `zones`，不必再 ripup 出 528 个 op；zone 只有**整个 outline
+都在 region 内**才删，跨界的进 `zones_skipped_partial`，`locked` 一律不删。
+
+**`dry_run`（§11）**：走同一条写入 + 全部门禁 + 还原字节的路径，被拦时返回
+`status: ok, dry_run: true, would_write: false` + 原样 `blocking`，而不是抛异常堆栈；不消耗 plan。
+
+**回包自己说清形态（§12）**：`payload_is`（`value` / `top_level`）+ `where_to_read`，一个业务字段都没动。
+
+**两条读错的读数被纠正**：`board_pour_connectivity` 标 `authoritative: false` + `use_instead`，
+并默认连带跑一次 DRC（`value.drc_cross_check`）；`rule_bundle` 之外加 `rules_in_effect`
+（`per_net_summary` 按实际生效的 (clearance, track, via, drill, source) 分组），
+并明说 `clearance_mm` / `track_mm` / `via_mm` 是**板级缺省**。
+
+**三套异常接口对齐（§15）**：`OpError` / `EditError` 补 `.message` / `.reason_code` / `.hint`（`.code` 保留）。
+
+判据：`tests/test_drc_geometry.py`（新文件，19 例：三条真实描述样本的 `parse`、无数字给 `null` + 原因、
+`assumed` 标注、`summarise` 按差量排序、`payload_is` 四例、`board_zones` / `board_propose` 走
+`call_tool` 两例、`pour_connectivity` 的非权威标注）、`tests/test_zone_fill.py` 14 → **17 例**
+（填完的 `drc_after_fill`、测量模式测的是副本、`verify_drc=false` 就什么都不说）、
+`tests/test_edit.py` 加一条位置断言（它同时抓到阻塞文案里的一个真 bug：`drc_policy` 写 `pos` 是
+`[x, y]`、KiCad 的 item 写 `{x, y}`，旧文案按 dict 读 ⇒ 阻塞路径自己抛 `TypeError`，
+错误码变成 `APPLY_FAILED` 而不是 `GATE_BLOCKED`）。
+
+### 5. 版本数字
+
+工具数 **188**（不变）/ 写 op **39 → 40**（`delete_copper`）/ `available` **182**（不变）/
+`--selftest` **329** 条（本轮不新增编号；本机 326/329 —— 3 条失败是随包 ngspice 找不到 `spinit`
+的环境问题，把工作区 stash 回 0.0.94 后同样失败，与本次改动无关）/
+`pytest` 实测 **3609 例收集：3596 passed / 8 failed / 5 skipped**（同样的 8 条是随包 ngspice 那一个问题，
+在干净 HEAD 上逐条复现）/ `dependencies = []` 仍成立。
+
 ## [0.0.94] - 2026-11-02
 
 **跑台账认得自己的主人：一条 run 记下它是哪个后台作业做的**

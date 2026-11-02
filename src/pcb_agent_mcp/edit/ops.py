@@ -17,15 +17,27 @@ a coordinate read from a view can be passed straight back in.
 Anything that is not in `OPS` is refused. Anything whose layer or net is not in
 the file is refused (a typo'd layer name silently creates a drawing on nothing).
 """
+import inspect as _inspect
 import os
 
 from ..fidelity import sexpr as S
 from . import build as B
 
 class OpError(ValueError):
-    def __init__(self, message, code="OP_INVALID", **extra):
+    """A refusal from one operation.
+
+    Carries the same four attributes as `jobs.JobError` and `RouteError`
+    (`message` / `reason_code` / `hint` / `extra`) so a caller can handle all
+    three the same way. `code` stays as an alias of `reason_code`: it is the name
+    the write path already used, and renaming a public attribute to make three
+    exceptions LOOK alike would break the callers it is meant to help.
+    """
+    def __init__(self, message, code="OP_INVALID", hint=None, **extra):
         ValueError.__init__(self, message)
+        self.message = message
         self.code = code
+        self.reason_code = code
+        self.hint = hint
         self.extra = extra
 
 OUTLINE_LAYER = "Edge.Cuts"
@@ -1492,17 +1504,54 @@ def _run_add_zone(ed, o, seed):
     clearance = _num(o, "clearance", required=False, default=None)
     if clearance is None:
         clearance = (_default_netclass(ed) or {}).get("clearance") or 0.2
+    connection = ("thermal" if o.get("connect_pads") is None
+                  else _zone_connection_word(o.get("connect_pads")))
+    thermal_gap = _num(o, "thermal_gap", required=False, default=None)
+    thermal_bridge = _num(o, "thermal_bridge_width", required=False, default=None)
     ed.append(B.zone_polygon_conf(code, net, layer, points, ed.sp, B.new_id(seed),
                                   clearance=clearance,
                                   min_thickness=_num(o, "min_thickness",
                                                      required=False, default=0.25),
-                                  priority=o.get("priority")))
+                                  priority=o.get("priority"),
+                                  pad_connection=connection,
+                                  thermal_gap=thermal_gap,
+                                  thermal_bridge_width=thermal_bridge))
+    # What the header holds is reported back as WRITTEN, and anything left to the
+    # engine is named as left to the engine: a caller who asks "did you choose my
+    # thermal gap" deserves to know it did not.
     return {"nodes_added": 1, "layer": layer, "net": net, "vertices": len(points),
-            "fill_pending": True}
+            "fill_pending": True,
+            "header": {
+                "connect_pads": None if connection == "thermal" else connection,
+                "connect_pads_effective": connection,
+                "connect_pads_note": (
+                    "a thermal relief is spelled by writing no mode word - that "
+                    "is the form KiCad itself saves (verified: pcbnew 10.0.7 "
+                    "reads (connect_pads (clearance X)) as "
+                    "ZONE_CONNECTION_THERMAL)"
+                    if connection == "thermal" else
+                    "the mode word is written explicitly, because a solid pour "
+                    "and a thermal relief are different copper"),
+                "filled_areas_thickness": "no",
+                "filled_areas_thickness_note": (
+                    "written because this board declares an older format "
+                    "generation, where a filled_polygon without this token is "
+                    "read as the centreline of a min_thickness-wide stroke and "
+                    "KiCad DRC then measures min_thickness/2 further out than "
+                    "the copper is"),
+                "thermal_gap": thermal_gap,
+                "thermal_bridge_width": thermal_bridge,
+                "thermal_source": ("caller" if thermal_gap is not None
+                                   or thermal_bridge is not None else
+                                   "eda_default: not written; KiCad applies its "
+                                   "own 0.5 mm / 0.5 mm (measured on 10.0.7)"),
+            }}
 
 def _verify_add_zone(ed, o):
     net = _str(o, "net")
     layer = _str(o, "layer")
+    want = ("thermal" if o.get("connect_pads") is None
+            else _zone_connection_word(o.get("connect_pads")))
     for node in ed.items("zone"):
         if S.child(node, "keepout") is not None:
             continue
@@ -1510,18 +1559,43 @@ def _verify_add_zone(ed, o):
             continue
         if S.arg_text(S.child(node, "layer"), 1) != layer:
             continue
-        if S.child(node, "polygon") is not None:
-            return {"ok": True,
-                    "filled_polygon_present": S.child(node, "filled_polygon") is not None}
+        if S.child(node, "polygon") is None:
+            continue
+        written, effective, source = _zone_connection_mode(node)
+        fat = S.arg_text(S.child(node, "filled_areas_thickness"), 1)
+        # The promise is the HEADER, not just "a zone exists": a zone written
+        # without `(filled_areas_thickness ...)` is the file that produced 386
+        # clearance errors on a real board, so it must not pass silently.
+        #
+        # It is NOT checked against `want` exactly, because postconditions are
+        # re-read from the FINAL tree: a plan may legitimately add a zone and then
+        # call set_zone_params on it (that is the whole point of the pair), and a
+        # postcondition that demanded the value this op wrote would fail on a plan
+        # that did exactly what was asked. "The header states its fill
+        # interpretation and its pad connection at all" is what this op owns.
+        return {"ok": fat in ("yes", "no") and S.child(node, "connect_pads") is not None,
+                "connect_pads": written,
+                "connect_pads_effective": effective,
+                "connect_pads_source": source,
+                "connect_pads_asked_for": want,
+                "filled_areas_thickness": fat,
+                "filled_polygon_present":
+                    S.child(node, "filled_polygon") is not None}
     return {"ok": False}
 
 op("add_zone", {"copper"},
-   "Add a copper pour on one layer. The fill result is NOT computed here: the file "
-   "gets (fill yes) and no filled_polygon, so the vendor engine fills it on open or "
-   "plot. Reply carries fill_pending=true, and board_pour_connectivity will say "
-   "outline_only until KiCad has filled it.",
+   "Add a copper pour on one layer, written in the form KiCad itself saves: "
+   "(connect_pads [yes|no|thru_hole_only] (clearance X)), (min_thickness T), "
+   "(filled_areas_thickness no), (fill yes [(thermal_gap G)] "
+   "[(thermal_bridge_width W)]). No filled_polygon: the vendor engine pours it on "
+   "open, plot, or when board_fill_zones is called. Reply carries fill_pending=true "
+   "and a `header` block saying exactly what was written versus left to the EDA's "
+   "own defaults.",
    {"points": "[[x,y], ...] or x0/y0/x1/y1", "layer": "copper layer",
-    "net": "net name", "clearance": "mm", "min_thickness": "mm", "priority": "int"},
+    "net": "net name", "clearance": "mm", "min_thickness": "mm", "priority": "int",
+    "connect_pads": "thermal (default) | solid | none | thru_hole_only",
+    "thermal_gap": "mm (left to the EDA's own default when not given)",
+    "thermal_bridge_width": "mm (same)"},
    _run_add_zone, _verify_add_zone)
 
 # --- connectivity / setup ---------------------------------------------
@@ -1928,25 +2002,244 @@ def _zone_label(ed, node):
             "layer": S.arg_text(S.child(node, "layer"), 1),
             "uuid": ed.sp.id_of(node)}
 
+def _zone_uuids(ed, nodes):
+    """The object ids of these zones, in whichever spelling the file uses.
+
+    A pre-v7 board writes `(tstamp ...)` and KiCad 10 writes `(uuid ...)`; the
+    postcondition is about *these objects*, so it has to read both - an id reader
+    that only knows `uuid` reports "deleted 0" and then verifies nothing.
+    """
+    out = []
+    for node in nodes:
+        uid = ed.sp.id_of(node)
+        if uid:
+            out.append(uid)
+    return out
+
 def _run_delete_zone(ed, o, seed):
     targets = _select_zones(ed, o)
     if not targets:
         raise OpError("no zone matches that selector", "TARGET_NOT_FOUND")
     gone = [_zone_label(ed, n) for n in targets]
+    uuids = _zone_uuids(ed, targets)
     for node in targets:
         ed.remove(node)
-    return {"zones_removed": len(gone), "zones": gone}
+    return {"zones_removed": len(gone), "zones": gone, "deleted_uuids": uuids}
 
-def _verify_delete_zone(ed, o):
+def _zones_by_uuid(ed, uuids):
+    want = set(u or "" for u in uuids)
+    out = []
+    for node in S.children(ed.doc.tree, "zone"):
+        if ed.sp.id_of(node) in want:
+            out.append(node)
+    return out
+
+def _verify_delete_zone(ed, o, record=None):
+    """Did the zones THIS operation removed actually go?
+
+    Checked by uuid, not by "does the selector still match anything". The
+    selector form breaks a legitimate plan - delete the GND pour and add a new
+    one on the same net/layer in the same apply recorded `remaining_matches: 1`
+    and was reported as a failed postcondition, with a message that named neither
+    the cause nor the cure. The zones this operation deleted are known objects,
+    so their absence is the postcondition; a zone added afterwards by a later
+    operation is not this operation's business.
+    """
     try:
         left = _select_zones(ed, o)
     except OpError:
         left = []
-    return {"ok": not left, "remaining_matches": len(left)}
+    deleted = ((record or {}).get("detail") or {}).get("deleted_uuids") or []
+    if not deleted:
+        # no record (older caller): fall back to the selector, and say which
+        # reading was used so a false red is not mistaken for a real one
+        return {"ok": not left, "remaining_matches": len(left),
+                "checked_by": "selector (no run record was supplied)"}
+    still = _zones_by_uuid(ed, deleted)
+    return {"ok": not still,
+            "checked_by": "uuid of the zone(s) this operation removed",
+            "deleted_uuids": len(deleted),
+            "still_present": len(still),
+            "remaining_matches": len(left),
+            "remaining_matches_are_other_zones": len(left) if not still else 0}
+
+# ------------------------------------------------------------------ bulk deletes
+# Why a bulk delete exists at all: ripping up a pour region or clearing every
+# track of a net used to mean one `delete_track(uuid=...)` per object - a real
+# session emitted 528 of them for one board. A plan with 528 operations is not
+# more auditable than one; it is 528 chances for an index to be off by one, and
+# it makes the plan unreadable to a person.
+#
+# The rules are the same as the single-object deletes, only the selector is
+# wider: at least one selector (net / layer / region) is REQUIRED, a bare
+# "delete all copper" is still not an operation, locked copper still refuses,
+# and the postcondition is checked against the uuids that were actually removed.
+
+def _region(o):
+    r = o.get("region")
+    if r is None:
+        return None
+    if not isinstance(r, (list, tuple)) or len(r) != 4:
+        raise OpError("'region' must be [x1, y1, x2, y2] in mm, Y up",
+                      "ARG_INVALID",
+                      hint="the frame is the one board_view reports: millimetres, "
+                           "Y up, origin at the board's own origin")
+    x1, y1, x2, y2 = [float(v) for v in r]
+    return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+def _xy_in(rect, x, y):
+    return rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
+
+def _node_xy(node):
+    """Every (x, y) this node spells, in mm Y up - the frame the caller uses.
+
+    The file stores Y DOWN (`(at 10 -20)` is y = +20 mm up), so every point is
+    negated on the way out. Only the tags that carry points are read; a `(width)`
+    or a `(layer)` has no coordinate and must never be mistaken for one.
+    """
+    out = []
+    for tag in ("start", "end", "mid", "at", "center"):
+        n = S.child(node, tag)
+        if n is None:
+            continue
+        x, y = S.arg_num(n, 1), S.arg_num(n, 2)
+        if x is not None and y is not None:
+            out.append((x, -y))
+    for path, sub in S.walk(node):
+        if S.head(sub) == "xy":
+            x, y = S.arg_num(sub, 1), S.arg_num(sub, 2)
+            if x is not None and y is not None:
+                out.append((x, -y))
+    return out
+
+def _node_layers(node):
+    got = []
+    for tag in ("layer", "layers"):
+        n = S.child(node, tag)
+        if n is None:
+            continue
+        for i in range(1, len(n.items)):
+            text = S.arg_text(n, i)
+            if text:
+                got.append(str(text))
+    return got
+
+def _code_name(ed, node):
+    code = S.arg_text(S.child(node, "net"), 1)
+    if not code:
+        return None
+    return ed.name_by_code.get(code, code)
+
+def _select_copper(ed, o):
+    kinds = o.get("kinds") or "all"
+    if isinstance(kinds, str):
+        kinds = [kinds]
+    kinds = [str(k).lower() for k in kinds]
+    if "all" in kinds:
+        kinds = ["tracks", "vias", "zones"]
+    unknown = [k for k in kinds if k not in ("tracks", "vias", "zones")]
+    if unknown:
+        raise OpError("unknown kind(s) %s" % ", ".join(unknown), "ARG_INVALID",
+                      hint="kinds is any of tracks, vias, zones, all")
+    net = o.get("net")
+    layer = o.get("layer")
+    rect = _region(o)
+    if not net and not layer and rect is None:
+        raise OpError("delete_copper needs at least one selector: 'net', 'layer' "
+                      "or 'region' (a bare 'delete all copper' is not an "
+                      "operation)", "ARG_MISSING")
+    if net and net not in ed.net_by_name:
+        raise OpError("net %r does not exist" % net, "NET_NOT_FOUND")
+    heads = {"tracks": ("segment", "arc"), "vias": ("via",), "zones": ("zone",)}
+    out, zones_not_inside = [], 0
+    for kind in kinds:
+        for head in heads[kind]:
+            for node in ed.items(head):
+                if net and _code_name(ed, node) != net:
+                    continue
+                if layer and layer not in _node_layers(node):
+                    continue
+                if rect is not None:
+                    pts = _node_xy(node)
+                    if not pts:
+                        continue
+                    if kind == "zones":
+                        # A zone is deleted WHOLE or not at all: deleting a pour
+                        # that merely crosses the region would take copper the
+                        # caller never saw. Partial overlap is counted and
+                        # reported instead of being acted on.
+                        if not all(_xy_in(rect, x, y) for x, y in pts):
+                            zones_not_inside += 1
+                            continue
+                    elif not any(_xy_in(rect, x, y) for x, y in pts):
+                        continue
+                out.append((kind, node))
+    return out, zones_not_inside
+
+def _run_delete_copper(ed, o, seed):
+    targets, zones_not_inside = _select_copper(ed, o)
+    if not targets:
+        raise OpError("no copper matches those selectors", "TARGET_NOT_FOUND",
+                      hint=("a zone is only deleted when its WHOLE outline is "
+                            "inside 'region'; %d zone(s) crossed it" % zones_not_inside
+                            if zones_not_inside else None))
+    nodes = [n for _, n in targets]
+    _refuse_fixed(ed, "selected copper object(s)", _fixed_nodes(nodes),
+                  len(nodes), o)
+    by_kind = {}
+    uuids = []
+    for kind, node in targets:
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        uid = ed.sp.id_of(node)
+        if uid:
+            uuids.append(uid)
+        ed.remove(node)
+    return {"nodes_removed": len(nodes), "by_kind": by_kind,
+            "uuids": uuids,
+            "zones_skipped_partial": zones_not_inside}
+
+def _verify_delete_copper(ed, o, record=None):
+    """Did the objects THIS operation removed go? Checked by uuid, never by
+    re-running the selector: a later operation may legitimately add copper back
+    in the same region."""
+    deleted = ((record or {}).get("detail") or {}).get("uuids") or []
+    if not deleted:
+        left, _ = _select_copper(ed, o)
+        return {"ok": not left, "remaining_matches": len(left),
+                "checked_by": "selectors (no run record was supplied)"}
+    alive = set()
+    for kind, heads in (("tracks", ("segment", "arc")), ("vias", ("via",)),
+                        ("zones", ("zone",))):
+        for head in heads:
+            for node in ed.items(head):
+                uid = ed.sp.id_of(node)
+                if uid:
+                    alive.add(uid)
+    still = [u for u in deleted if u in alive]
+    return {"ok": not still, "checked_by": "uuid of the object(s) this operation "
+                                          "removed",
+            "deleted": len(deleted), "still_present": len(still),
+            "remaining_matches": len(_select_copper(ed, o)[0]),
+            "remaining_matches_are_other_objects": not still}
+
+op("delete_copper", {"copper"},
+   "Delete copper in BULK by net / layer / region, instead of one uuid per "
+   "operation (ripping up a region used to need one delete_track per segment). At "
+   "least one selector is required. A zone is deleted only when its whole outline "
+   "is inside 'region'. Locked copper refuses unless allow_fixed=true. The "
+   "postcondition is checked against the uuids actually removed.",
+   {"net": "net name", "layer": "layer name",
+    "region": "[x1, y1, x2, y2] mm, Y up - segment/via end points, zone outline",
+    "kinds": "tracks | vias | zones | all (default all); list allowed",
+    "allow_fixed": "bool: also delete copper the file marks (locked)"},
+   _run_delete_copper, _verify_delete_copper)
 
 op("delete_zone", {"copper"},
    "Delete copper zones (pours or keep-outs) by net, layer, uuid or a combination. "
-   "Refuses without a selector - 'delete every zone' is not an operation.",
+   "Refuses without a selector - 'delete every zone' is not an operation. Safe to "
+   "combine with add_zone on the same net/layer in one plan: the postcondition "
+   "checks the uuids this operation removed, not 'nothing matches the selector any "
+   "more' (use delete_copper for a bulk/region delete).",
    {"net": "net name", "layer": "layer name", "uuid": "zone uuid"},
    _run_delete_zone, _verify_delete_zone)
 
@@ -1987,6 +2280,265 @@ op("set_zone_priority", {"copper"},
    {"priority": "integer >= 0", "net": "net name", "layer": "layer name",
     "uuid": "zone uuid"},
    _run_set_zone_priority, _verify_set_zone_priority)
+
+def _zone_flag(raw):
+    """yes/no as KiCad spells it; booleans are accepted as the same thing."""
+    if isinstance(raw, bool):
+        return "yes" if raw else "no"
+    text = str(raw).strip().lower()
+    if text in ("yes", "no"):
+        return text
+    raise OpError("filled_areas_thickness takes yes/no (or true/false), not %r"
+                  % (raw,), "ARG_INVALID")
+
+def _zone_set_child(zone, name, value_node, after=None):
+    """Replace `(name ...)` in place, or insert it right after `after`.
+
+    Position matters only for diffs, not for the parser, but keeping the field
+    where KiCad itself writes it (after `min_thickness`) means a file written
+    by this server and a file written by KiCad differ in exactly the values.
+    """
+    node = S.child(zone, name)
+    if node is not None:
+        zone.items[list(zone.items).index(node)] = value_node
+        return
+    anchor = S.child(zone, after) if after else None
+    if anchor is None:
+        S.append_child(zone, value_node)
+    else:
+        zone.items.insert(list(zone.items).index(anchor) + 1, value_node)
+
+def _zone_connection_mode(node):
+    """What the file states about pad connection, and what KiCad reads out of it.
+
+    `(connect_pads yes ...)` is SOLID copper, `no` is no connection,
+    `thru_hole_only` is the third mode, and a THERMAL relief is spelled by
+    writing no mode word at all - that is what KiCad 10.0.7's own `SaveBoard`
+    emits for `SetPadConnection(ZONE_CONNECTION_THERMAL)`. Loading each spelling
+    back in pcbnew and asking `GetPadConnection()` returns THERMAL for the
+    word-less form, so "nothing written" is a fact about the meaning, not a
+    guess about a default.
+    """
+    conn = S.child(node, "connect_pads")
+    if conn is None:
+        return None, "thermal", "absent"
+    words = [item.text for item in conn.items[1:] if isinstance(item, S.Atom)]
+    for word, mode in (("yes", "solid"), ("no", "none"),
+                       ("thru_hole_only", "thru_hole_only")):
+        if word in words:
+            return mode, mode, "file"
+    return None, "thermal", "kicad_default"
+
+_ZONE_CONNECTION_MODES = {"thermal": None, "solid": "yes", "yes": "yes",
+                          "none": "no", "no": "no",
+                          "thru_hole_only": "thru_hole_only"}
+
+def _zone_connection_word(raw):
+    text = str(raw).strip().lower()
+    if text not in _ZONE_CONNECTION_MODES:
+        raise OpError("connect_pads takes thermal / solid / none / thru_hole_only "
+                      "(got %r). A thermal relief is the word-less form; `yes` is "
+                      "solid copper" % (raw,), "ARG_INVALID")
+    return text
+
+def _run_set_zone_params(ed, o, seed):
+    given = {}
+    if o.get("filled_areas_thickness") is not None:
+        given["filled_areas_thickness"] = _zone_flag(o.get("filled_areas_thickness"))
+    for key in ("clearance", "min_thickness", "thermal_gap",
+                "thermal_bridge_width"):
+        if o.get(key) is not None:
+            value = _num(o, key)
+            if value <= 0:
+                raise OpError("%s must be > 0 (got %r)" % (key, value),
+                              "ARG_INVALID")
+            given[key] = value
+    if o.get("connect_pads") is not None:
+        given["connect_pads"] = _zone_connection_word(o.get("connect_pads"))
+    if not given:
+        raise OpError("set_zone_params needs at least one of: "
+                      "filled_areas_thickness, clearance, min_thickness, "
+                      "connect_pads, thermal_gap, thermal_bridge_width",
+                      "ARG_MISSING")
+    targets = _select_zones(ed, o)
+    if not targets:
+        raise OpError("no zone matches that selector", "TARGET_NOT_FOUND")
+    changed = []
+    dropped = 0
+    for node in targets:
+        if S.child(node, "keepout") is not None:
+            raise OpError(
+                "the zone on %s is a keep-out, not a pour; a keep-out has no "
+                "fill parameters" % (_zone_label(ed, node)["layer"],),
+                "ARG_INVALID")
+        before = _zone_params(node)
+        if "filled_areas_thickness" in given:
+            _zone_set_child(node, "filled_areas_thickness",
+                            B.L(B.A("filled_areas_thickness"),
+                                B.A(given["filled_areas_thickness"])),
+                            after="min_thickness")
+        if "min_thickness" in given:
+            _zone_set_child(node, "min_thickness",
+                            B.L(B.A("min_thickness"),
+                                B.A(B.num(given["min_thickness"]))))
+        if "connect_pads" in given:
+            _zone_set_connection(node, given["connect_pads"],
+                                 given.get("clearance"))
+        elif "clearance" in given:
+            conn = S.child(node, "connect_pads")
+            if conn is None:
+                S.append_child(node, B.L(
+                    B.A("connect_pads"),
+                    B.L(B.A("clearance"), B.A(B.num(given["clearance"])))))
+            else:
+                _zone_set_child(conn, "clearance",
+                                B.L(B.A("clearance"),
+                                    B.A(B.num(given["clearance"]))))
+        for key in ("thermal_gap", "thermal_bridge_width"):
+            if key in given:
+                _zone_set_fill_number(node, key, given[key])
+        # The filled polygons describe the copper of the OLD parameters. Keeping
+        # them would leave the file claiming a pour that the new rules do not
+        # produce - the exact "intermediate layer says one thing, the board says
+        # another" failure this project exists to avoid.
+        for poly in list(S.children(node, "filled_polygon")):
+            S.remove_child(node, poly)
+            dropped += 1
+        after = _zone_params(node)
+        if after != before:
+            changed.append(_zone_label(ed, node))
+    # `zones_matched` is reported separately from `zones_changed` because a zone
+    # already carrying the asked-for value is still re-poured (its fill is
+    # dropped below), so "0 changed / 2 matched" is a real state and not a
+    # contradiction - the counts would otherwise read as "nothing happened".
+    return {"zones_changed": len(changed), "zones": changed,
+            "zones_matched": len(targets),
+            "params": given, "dropped_filled_polygons": dropped,
+            "refill_required": True}
+
+def _zone_set_connection(node, mode, clearance=None):
+    """Rewrite `connect_pads` with an explicit mode word (or none, for thermal).
+
+    Rebuilt rather than patched because the mode word lives at a variable
+    position: KiCad writes at most one, and a second one would be a mode this
+    server invented. A zone that states no `connect_pads` at all can only be
+    given one when the caller also says what clearance it asks for - the
+    clearance is not the EDA's default to invent here.
+    """
+    word = _ZONE_CONNECTION_MODES[mode]
+    conn = S.child(node, "connect_pads")
+    if clearance is None and conn is not None:
+        clearance = S.arg_num(S.child(conn, "clearance"), 1)
+    if clearance is None:
+        raise OpError("this zone states no connect_pads (its clearance is not in "
+                      "the file either), so pass clearance with connect_pads",
+                      "ARG_INVALID")
+    head = [B.A("connect_pads")] + ([B.A(word)] if word else [])
+    head.append(B.L(B.A("clearance"), B.A(B.num(clearance))))
+    new = B.L(*head)
+    if conn is not None:
+        S.reformat(new, conn.lead)
+        node.items[list(node.items).index(conn)] = new
+    else:
+        S.append_child(node, new)
+
+
+def _zone_set_fill_number(node, key, value):
+    """Put `(key value)` inside the zone's `(fill ...)` block.
+
+    The thermal numbers live there, not next to `min_thickness`. A zone that
+    does not fill (`(fill no)`, or no `fill` node at all) has no thermal relief
+    to describe, so asking for one is refused rather than written into a block
+    KiCad will ignore.
+    """
+    fill = S.child(node, "fill")
+    if fill is None or (S.arg_text(fill, 1) or "").lower() in ("no", "false"):
+        raise OpError("%s only describes a thermal relief, and this zone does not "
+                      "fill (no `(fill yes ...)`), so there is nothing to write it "
+                      "into" % (key,), "ARG_INVALID")
+    existing = S.child(fill, key)
+    node_new = B.L(B.A(key), B.A(B.num(value)))
+    if existing is not None:
+        S.reformat(node_new, existing.lead)
+        fill.items[list(fill.items).index(existing)] = node_new
+    else:
+        S.append_child(fill, node_new)
+
+
+def _zone_params(node):
+    conn = S.child(node, "connect_pads")
+    fill = S.child(node, "fill")
+    written, effective, source = _zone_connection_mode(node)
+    return {
+        "filled_areas_thickness": S.arg_text(
+            S.child(node, "filled_areas_thickness"), 1),
+        "clearance": (S.arg_num(S.child(conn, "clearance"), 1)
+                      if conn is not None else None),
+        "min_thickness": S.arg_num(S.child(node, "min_thickness"), 1),
+        "connect_pads": written,
+        "connect_pads_effective": effective,
+        "connect_pads_source": source,
+        "thermal_gap": S.arg_num(S.child(fill, "thermal_gap"), 1)
+                       if fill is not None else None,
+        "thermal_bridge_width": S.arg_num(
+            S.child(fill, "thermal_bridge_width"), 1)
+            if fill is not None else None,
+    }
+
+def _verify_set_zone_params(ed, o):
+    want = {}
+    if o.get("filled_areas_thickness") is not None:
+        want["filled_areas_thickness"] = _zone_flag(o.get("filled_areas_thickness"))
+    for key in ("clearance", "min_thickness", "thermal_gap",
+                "thermal_bridge_width"):
+        if o.get(key) is not None:
+            want[key] = float(_num(o, key))
+    if o.get("connect_pads") is not None:
+        want["connect_pads"] = _zone_connection_word(o.get("connect_pads"))
+    checked = []
+    ok = True
+    for node in _select_zones(ed, o):
+        got = _zone_params(node)
+        row = dict(_zone_label(ed, node))
+        for key, value in want.items():
+            if key == "filled_areas_thickness":
+                row[key] = got[key]
+                ok = ok and got[key] == value
+            elif key == "connect_pads":
+                # the postcondition is about the COPPER KiCad will pour, so it is
+                # checked on what pcbnew reads out of the spelling, not on which
+                # word happens to be written
+                row["connect_pads"] = got["connect_pads"]
+                row["connect_pads_effective"] = got["connect_pads_effective"]
+                ok = ok and got["connect_pads_effective"] == value
+            else:
+                have = got.get(key)
+                row[key] = have
+                ok = ok and have is not None and abs(have - value) < 1e-9
+        # Whatever the previous fill said, it described the old parameters.
+        row["filled_polygons"] = len(S.children(node, "filled_polygon"))
+        ok = ok and row["filled_polygons"] == 0
+        checked.append(row)
+    return {"ok": bool(checked) and ok, "zones": checked}
+
+op("set_zone_params", {"copper"},
+   "Change a pour's fill parameters in place - filled_areas_thickness (yes/no), "
+   "clearance, min_thickness, connect_pads (thermal/solid/none/thru_hole_only), "
+   "thermal_gap, thermal_bridge_width. No delete-and-re-add: the zone keeps its "
+   "outline, uuid and priority. The zones' filled_polygon children are dropped, "
+   "because they were computed from the old parameters; call fill afterwards. "
+   "filled_areas_thickness=no tells KiCad the stored polygon IS the copper edge "
+   "instead of a centreline to be stroked by min_thickness/2 - without it DRC "
+   "reads every pour as half a line thicker than the polygon in the file. "
+   "connect_pads=thermal is the word-less spelling KiCad itself writes; `solid` "
+   "writes `yes`, which is a different pour.",
+   {"filled_areas_thickness": "yes/no (bool accepted)", "clearance": "mm",
+    "min_thickness": "mm",
+    "connect_pads": "thermal | solid | none | thru_hole_only",
+    "thermal_gap": "mm (only a pouring zone has a relief to describe)",
+    "thermal_bridge_width": "mm",
+    "net": "net name", "layer": "layer name", "uuid": "zone uuid"},
+   _run_set_zone_params, _verify_set_zone_params)
 
 def _netclass_members(ed, node):
     return [S.arg_text(n, 1) for n in S.children(node, "add_net")]
@@ -2738,15 +3290,25 @@ def run_all(doc, ops, seed_base="op", index_offset=0):
                         sorted(OPS[name]["affects"]), "detail": detail})
     return records
 
-def verify_all(doc, ops):
-    """Re-read postconditions on a document loaded from the written file."""
+def verify_all(doc, ops, records=None):
+    """Re-read postconditions on a document loaded from the written file.
+
+    `records` is what `run_all` returned. A postcondition that has to know WHICH
+    objects the operation touched needs it: "delete every zone with net GND on
+    In1.Cu" cannot be re-checked from the final tree alone when the same plan
+    also adds one back, and that is a real use (replace a pour, not grow one).
+    Verifiers that take only (ed, op) are unaffected.
+    """
     ed = Editor(doc)
     out = []
     ok = True
     for idx, op in enumerate(ops):
         name = validate(op)
+        record = None
+        if records and idx < len(records):
+            record = records[idx]
         try:
-            res = OPS[name]["verify"](ed, op) or {"ok": False}
+            res = _call_verify(OPS[name]["verify"], ed, op, record) or {"ok": False}
         except OpError as exc:
             res = {"ok": False, "error": "%s: %s" % (exc.code, exc)}
         except Exception as exc:  # noqa: BLE001
@@ -2756,6 +3318,14 @@ def verify_all(doc, ops):
         out.append({"index": idx, "op": name, "verified": bool(res.get("ok")),
                     "detail": res})
     return {"all_verified": ok, "operations": out}
+
+def _call_verify(fn, ed, op, record):
+    """Call a verifier with the record when it asks for one."""
+    try:
+        wants = len(_inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        wants = 2
+    return fn(ed, op, record) if wants >= 3 else fn(ed, op)
 
 def affects(ops):
     out = set()

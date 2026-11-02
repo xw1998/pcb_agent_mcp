@@ -72,13 +72,42 @@ def version():
         return None
 
 
+def _user_env(scratch):
+    """Environment for a `kicad-cli` call, or None when the real one works.
+
+    `kicad-cli` dies with 0xC0000005 (and puts up a Windows crash dialog) when it
+    cannot create `~/Documents/KiCad`; measured under a restricted account where
+    that path was not writable - the process crashed before reading the board,
+    which then looked like "the DRC is broken". Redirect HOME/USERPROFILE at a
+    writable directory only in that case: a user's own KiCad settings are theirs
+    and must not be swapped out silently when they work.
+    """
+    home = os.path.expanduser("~")
+    probe_dir = os.path.join(home, "Documents", "KiCad")
+    try:
+        os.makedirs(probe_dir, exist_ok=True)
+        probe = os.path.join(probe_dir, ".pcb_agent_write_test")
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+        return None
+    except OSError:
+        pass
+    alt = os.path.join(scratch, "user")
+    os.makedirs(alt, exist_ok=True)
+    env = dict(os.environ)
+    env["HOME"] = alt
+    env["USERPROFILE"] = alt
+    return env
+
 def _run(args, cwd, timeout=180):
     exe = find_kicad_cli()
     if not exe:
         return {"ok": False, "error": "KICAD_CLI_NOT_FOUND"}
     try:
         proc = subprocess.run([exe] + args, cwd=cwd, capture_output=True,
-                              text=True, timeout=timeout)
+                              text=True, timeout=timeout,
+                              env=_user_env(cwd))
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "TIMEOUT", "timeout_s": timeout}
     return {"ok": proc.returncode == 0, "returncode": proc.returncode,
@@ -92,8 +121,32 @@ def _run(args, cwd, timeout=180):
 # because the right answer to a slow call is an id, not a longer wait.
 DRC_TIMEOUT_S = 900
 
-def drc(path, severity="all", timeout=None):
-    """Authoritative DRC. Reports only; never writes beside the input."""
+def drc(path, severity="all", timeout=None, project=None):
+    """Authoritative DRC. Reports only; never writes beside the input.
+
+    `project` is the `.kicad_pro` the verdict has to be read against. It is not
+    decoration: KiCad takes the *design rule minimums* (min track width, min via
+    drill, min clearance) and the **rule severities** from the project file next
+    to the board, and silently falls back to its own defaults when there is none.
+    A board copied to a directory without its project therefore gets a different
+    verdict than the same board in place.  Measured on the STM32F412 core board,
+    same 199 KB of bytes, kicad-cli 10.0.7:
+
+        no .kicad_pro beside it   665 violations, 515 of them ERROR
+                                  (drill_out_of_range 158, track_width 199,
+                                   via_diameter 158, silk_overlap 14 error)
+        project beside it         150 violations, 0 error (all four above are
+                                  gone or demoted to warning)
+
+    So a DRC diff whose two halves disagree about which project they were read
+    against reports phantom errors: on the same board the "before" half (a
+    checkpoint copy, no project) called 14 silkscreen overlaps errors while the
+    "after" half called the identical 14 warnings.
+
+    When `project` is given, the board AND that project are copied into the
+    scratch directory under their own basenames, so the verdict is read against
+    the real rule set and nothing is written beside the input.
+    """
     timeout = DRC_TIMEOUT_S if timeout is None else timeout
     exe = find_kicad_cli()
     if not exe:
@@ -104,10 +157,30 @@ def drc(path, severity="all", timeout=None):
                 "message": "this tool never creates files: %s" % path}
     tmp = tempfile.mkdtemp(prefix="pcb_agent_drc_")
     try:
+        target_path = os.path.abspath(path)
+        project_used = None
+        if project and os.path.isfile(project):
+            base = os.path.basename(path)
+            staged = os.path.join(tmp, base)
+            shutil.copyfile(path, staged)
+            pro_copy = os.path.splitext(staged)[0] + ".kicad_pro"
+            shutil.copyfile(project, pro_copy)
+            target_path = staged
+            project_used = os.path.basename(project)
+        if os.path.isfile(os.path.splitext(os.path.abspath(path))[0] + ".kicad_pro") \
+                and project_used is None:
+            project_used = os.path.basename(
+                os.path.splitext(os.path.abspath(path))[0] + ".kicad_pro")
+            base = os.path.basename(path)
+            staged = os.path.join(tmp, base)
+            shutil.copyfile(path, staged)
+            shutil.copyfile(os.path.splitext(os.path.abspath(path))[0] + ".kicad_pro",
+                            os.path.splitext(staged)[0] + ".kicad_pro")
+            target_path = staged
         report = os.path.join(tmp, "drc.json")
         args = ["pcb", "drc", "-o", report, "--format", "json"]
         args.append("--severity-all" if severity == "all" else "--severity-error")
-        args.append(os.path.abspath(path))
+        args.append(target_path)
         res = _run(args, cwd=tmp, timeout=timeout)
         if not os.path.isfile(report):
             return {"status": "error", "reason_code": "ENGINE_FAILED",
@@ -125,15 +198,34 @@ def drc(path, severity="all", timeout=None):
             "unconnected_total": len(data.get("unconnected_items") or []),
             "by_severity": _count(data.get("violations") or [], "severity"),
             "by_type": _count(data.get("violations") or [], "type"),
-            "violations": _slim_violations(data.get("violations") or []),
+            "violations": _with_geometry(
+                _slim_violations(data.get("violations") or [])),
             "unconnected": _slim_unconnected(data.get("unconnected_items") or []),
             "included_severities": data.get("included_severities"),
             "schematic_parity": data.get("schematic_parity"),
+            "project_file_used": project_used,
+            "rule_source": "project" if project_used else "kicad_defaults",
+            "rule_source_note": None if project_used else (
+                "no .kicad_pro was found beside this board, so this verdict was "
+                "read against KiCad's built-in rule minimums and severities, not "
+                "the project's. The same bytes can be 515 errors here and 0 "
+                "next to their project file: pass project= or keep the board "
+                "beside its .kicad_pro before trusting a clearance count"),
             "not_written": "no file was created or modified beside %s" % os.path.basename(path),
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+def _with_geometry(items):
+    """Add the constraint/actual millimetre pair to every violation.
+
+    KiCad's JSON has no geometry fields for a violation, so the only source is
+    its description text; see `drc_geometry` for the sample strings and for what
+    happens when a rule states no numbers.
+    """
+    from . import drc_geometry
+    return drc_geometry.annotate(items)
 
 def _count(items, key):
     out = {}

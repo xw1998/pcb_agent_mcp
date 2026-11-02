@@ -141,11 +141,51 @@ def _zone_rows(board_node):
                 pts_list = [(S.arg_num(p, 1), S.arg_num(p, 2))
                             for p in S.children(pts, "xy")]
                 outline = [p for p in pts_list if p[0] is not None]
+        # Fields the file does not state are reported as None AND listed in
+        # `not_stated_in_file`, so a summary can say "I do not know" instead of
+        # answering with something that merely looks like a default. The one
+        # value that is not the file's is the pad connection: KiCad spells a
+        # thermal relief by writing no mode word at all, so `connect_pads` stays
+        # None (the file said nothing) while `connect_pads_effective` says how
+        # KiCad reads it.
+        conn = S.child(node, "connect_pads")
+        fat_node = S.child(node, "filled_areas_thickness")
+        fat = S.arg_text(fat_node, 1) if fat_node is not None else None
+        words = ([w.text for w in conn.items[1:] if isinstance(w, S.Atom)]
+                 if conn is not None else [])
+        written = None
+        for word, mode in (("yes", "solid"), ("no", "none"),
+                           ("thru_hole_only", "thru_hole_only")):
+            if word in words:
+                written = mode
+        fill_node = S.child(node, "fill")
+        thermal_gap = (S.arg_num(S.child(fill_node, "thermal_gap"), 1)
+                       if fill_node is not None else None)
+        thermal_bridge = (S.arg_num(S.child(fill_node, "thermal_bridge_width"), 1)
+                          if fill_node is not None else None)
+        not_stated = [name for name, value in (
+            ("min_thickness", S.arg_num(S.child(node, "min_thickness"), 1)),
+            ("connect_pads", written),
+            ("filled_areas_thickness", fat),
+            ("thermal_gap", thermal_gap),
+            ("thermal_bridge_width", thermal_bridge)) if value is None]
         rows.append({
             "net": net_name or None,
             "layer": layer or None,
             "keepout": keepout,
             "fill_flag": fill_atom or None,
+            "min_thickness_mm": S.arg_num(S.child(node, "min_thickness"), 1),
+            "connect_pads": written,
+            "connect_pads_effective": (written if written is not None
+                                       else ("thermal" if conn is not None
+                                             else None)),
+            "connect_pads_source": ("file" if written is not None else
+                                    "kicad_default" if conn is not None else
+                                    "absent"),
+            "filled_areas_thickness": fat,
+            "thermal_gap_mm": thermal_gap,
+            "thermal_bridge_width_mm": thermal_bridge,
+            "not_stated_in_file": not_stated,
             "outline_area_mm2": (round(abs(G.polygon_area(outline)), 3)
                                  if outline and len(outline) >= 3 else None),
             "filled_polygons": len(polys),
@@ -185,6 +225,25 @@ def _zones_ok(rows):
                          "engine filled it; any later track/pad change makes them "
                          "stale until the zones are filled again",
             "unfillable": [r["layer"] for r in rows if r["keepout"]],
+            "not_stated_in_file": {
+                "meaning": "a field listed in a zone's `not_stated_in_file` is "
+                           "ABSENT from the file: the answer for it is null, not a "
+                           "default this server believes in",
+                "fields": sorted({k for r in rows
+                                  for k in r["not_stated_in_file"]}),
+            },
+            "connect_pads": (
+                "`connect_pads` is what the file writes and may be null: a thermal "
+                "relief is spelled by writing NO mode word, which is how KiCad "
+                "itself saves one. `connect_pads_effective` is how pcbnew reads it "
+                "(verified on 10.0.7: the word-less form comes back as "
+                "ZONE_CONNECTION_THERMAL, `yes` as SOLID, `no` as NONE)"),
+            "filled_areas_thickness": (
+                "when the file states it, `no` means the filled polygons ARE the "
+                "copper edge and `yes` means they are a centreline that KiCad "
+                "strokes by min_thickness/2 - on a file this server writes the "
+                "token is always present, because a pre-v7 zone without it made "
+                "DRC report 386 clearance errors on a real board"),
         },
     )
 
@@ -212,7 +271,7 @@ def _without_previous_fill(doc):
     return dropped
 
 # ------------------------------------------------------------------- filling
-def fill(path, in_place=False, timeout=300):
+def fill(path, in_place=False, timeout=300, verify_drc=True):
     """Ask the vendor engine to pour the zones; measure it, optionally keep it.
 
     `in_place=False` (default): the input file is never touched. The fill runs on
@@ -221,6 +280,16 @@ def fill(path, in_place=False, timeout=300):
     `in_place=True`: the polygons KiCad produced are transplanted into the file,
     which keeps its own version header and every other byte. A checkpoint is
     written first, so the previous bytes can be restored.
+
+    `verify_drc=True`: once the file carries the new copper, run the vendor DRC
+    on it and report the verdict as `drc_after_fill`. This exists because a
+    poured zone is not the same thing as a legal pour: on the reference board
+    the engine reported "filled" and the file still held 386 clearance errors
+    (a pre-v7 zone with no `filled_areas_thickness` is read as a stroked
+    centreline, so DRC measures min_thickness/2 closer than the copper really
+    is). Measured there: 386 errors absent the token, 0 with `(filled_areas_thickness no)`.
+    Leaving that discovery to the caller is how a "fill ok" reply becomes a
+    wrong conclusion, so the gate is on by default.
     """
     path = os.path.abspath(path)
     if not os.path.isfile(path):
@@ -276,10 +345,19 @@ def fill(path, in_place=False, timeout=300):
 
         after_rows = _zone_rows(_kdoc.KiCadDocument.from_path(path).board()) \
             if written else rows_after
-        return _fill_ok(after_rows, rows_before, build, written, checkpoint,
-                        path, stale_dropped,
-                        _format_generation_note(before, after_rows)
-                        if written else None)
+        result = _fill_ok(after_rows, rows_before, build, written, checkpoint,
+                          path, stale_dropped,
+                          _format_generation_note(before, after_rows)
+                          if written else None)
+        if verify_drc:
+            # Measuring mode writes nothing, so `path` still holds an OUTLINE:
+            # running the DRC on it would describe the board before the pour and
+            # blame nothing. Check the file that actually carries the copper.
+            _attach_drc_gate(result, path,
+                             None if written else dst,
+                             "the written file" if written
+                             else "a temporary copy (this call wrote nothing)")
+        return result
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -431,6 +509,68 @@ def _fill_ok(rows, rows_before, build, written, checkpoint, path,
         },
     )
 
+
+def _attach_drc_gate(result, path, drc_path=None, measured_on=None):
+    """Run the vendor DRC on the poured file and say whether the pour is legal.
+
+    Two different questions, deliberately kept apart:
+      * did the filler produce copper?      -> `written_to_file` / `poured_zones`
+      * is that copper a legal pour?        -> `drc_after_fill.verdict`
+    A board can answer yes to the first and no to the second (386 errors on the
+    reference pour), so a single boolean would be a lie.
+    """
+    from ..edit import plan as _plan          # `_project_beside` lives there
+    from . import engine as _engine
+    value = result.get("value") or {}
+    notes = result.setdefault("assumptions", {})
+    pro = _plan._project_beside(path)
+    drc = _engine.drc(drc_path or path, severity="all", project=pro)
+    if drc.get("status") != "ok":
+        value["drc_after_fill"] = {
+            "ran": False,
+            "verdict": "unknown",
+            "reason_code": drc.get("reason_code"),
+            "message": drc.get("message"),
+            "why_it_matters": ("the pour was produced but never checked, so this "
+                               "reply says nothing about whether it is legal"),
+        }
+        notes["fill_is_not_a_drc_pass"] = (
+            "the DRC could not run, so `written_to_file` reports the filler's "
+            "output only; it is not a statement that the pour passes DRC")
+        return
+    by_sev = drc.get("by_severity") or {}
+    errors = int(by_sev.get("error") or 0)
+    warnings = int(by_sev.get("warning") or 0)
+    unconnected = int(drc.get("unconnected_total") or 0)
+    clean = errors == 0 and unconnected == 0
+    top = [v for v in (drc.get("violations") or [])
+           if str(v.get("severity")).lower() == "error"][:10]
+    value["drc_after_fill"] = {
+        "ran": True,
+        "verdict": "clean" if clean else "not_clean",
+        "errors": errors,
+        "warnings": warnings,
+        "unconnected_total": unconnected,
+        "violations_total": drc.get("violations_total"),
+        "by_type": drc.get("by_type") or {},
+        "top_errors": top,
+        "rule_source": drc.get("rule_source"),
+        "project_file_used": drc.get("project_file_used"),
+        "authoritative": True,
+        "verdict_source": drc.get("verdict_source"),
+        "measured_on": measured_on or "the written file",
+    }
+    notes["fill_success_is_not_pour_quality"] = (
+        "`written_to_file` answers 'did the engine pour'; `drc_after_fill` "
+        "answers 'is that pour legal'. They are different questions and this "
+        "call keeps them apart on purpose")
+    if not clean:
+        value["drc_after_fill"]["what_to_do"] = (
+            "read `top_errors[].description` (it carries the constraint and the "
+            "measured value), fix the zone header first (clearance / "
+            "min_thickness / `filled_areas_thickness`) before touching geometry - "
+            "on the reference board every one of the 386 clearance errors was a "
+            "pre-v7 stroke reading, not missing copper")
 
 def _err(code, message):
     from ..calc.result import err

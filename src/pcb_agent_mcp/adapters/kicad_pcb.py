@@ -786,18 +786,35 @@ def _zone(node):
     # reported next to the answer, never silently adopted.
     #   (connect_pads [yes|thru_hole_only|no] (clearance X))
     #   (fill yes (thermal_gap G) (thermal_bridge_width W))
+    #
+    # `connect_pads` is reported TWICE on purpose, because the file and the
+    # engine do not say the same thing:
+    #
+    #   * `connect_pads` - what the FILE states, or None when it states nothing.
+    #     `yes` is SOLID copper, `no` is no connection, `thru_hole_only` is the
+    #     third mode; a zone that wants a thermal relief writes NO mode word at
+    #     all (that is how KiCad itself saves one - measured on KiCad 10.0.7:
+    #     `SetPadConnection(ZONE_CONNECTION_THERMAL)` then `SaveBoard` emits
+    #     `(connect_pads (clearance X))`, while FULL emits `yes` and NONE `no`).
+    #   * `connect_pads_effective` - what KiCad reads out of it, with
+    #     `connect_pads_source` saying where that reading came from. ==
+    #     Loading `(connect_pads (clearance X))` in pcbnew 10.0.7 gives
+    #     `GetPadConnection() == ZONE_CONNECTION_THERMAL` (1 of FULL=2,
+    #     THERMAL=1, NONE=0), so "no mode word" means thermal relief, and the
+    #     previous version of this reader answered the opposite both ways round
+    #     (`yes` -> "thermal", no word -> "solid").
     pad_connection = None
     cp = child(node, "connect_pads")
     if cp is not None:
         words = [w for w in cp[1:] if not isinstance(w, list)]
         if "yes" in words:
-            pad_connection = "thermal"
+            pad_connection = "solid"
         elif "thru_hole_only" in words:
             pad_connection = "thru_hole_only"
         elif "no" in words:
             pad_connection = "none"
-        else:
-            pad_connection = "solid"
+    pad_effective = pad_connection if pad_connection is not None else "thermal"
+    pad_source = "file" if pad_connection is not None else "kicad_default"
     thermal_gap = num(child(fill, "thermal_gap"), 1) if fill is not None else None
     thermal_bridge = (num(child(fill, "thermal_bridge_width"), 1)
                       if fill is not None else None)
@@ -812,6 +829,8 @@ def _zone(node):
         "is_keepout": keepout is not None,
         "min_thickness": num(child(node, "min_thickness"), 1),
         "connect_pads": pad_connection,
+        "connect_pads_effective": pad_effective,
+        "connect_pads_source": pad_source,
         "thermal_gap_mm": thermal_gap if thermal_gap not in (None, "") else None,
         "thermal_bridge_width_mm": (thermal_bridge
                                     if thermal_bridge not in (None, "") else None),

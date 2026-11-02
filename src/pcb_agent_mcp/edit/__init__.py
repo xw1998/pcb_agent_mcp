@@ -34,6 +34,7 @@ from . import sch_plan
 
 from .ops import OpError
 from .plan import EditError
+from .plan import _DryRunBlocked
 from .plan import apply_steps
 from .plan import checkpoint_root
 from .plan import create_board
@@ -47,7 +48,7 @@ from .plan import steps_root
 
 __all__ = [
     "build", "checks", "epro_edit", "fsutil", "ops", "plan", "sch_ops", "sch_plan",
-    "EditError", "OpError", "detect_format",
+    "EditError", "OpError", "_DryRunBlocked", "detect_format",
     "apply_plan", "apply_steps", "checkpoint_root", "create_board", "describe_ops",
     "describe_epro_ops", "describe_sch_ops", "find_checkpoint",
     "list_checkpoints", "propose", "propose_schematic", "restore_checkpoint",

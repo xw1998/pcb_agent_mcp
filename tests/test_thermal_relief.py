@@ -238,23 +238,40 @@ class TestTheFileValueIsReportedNeverAdopted(unittest.TestCase):
         return zone(5, 5, 35, 15).replace("(connect_pads (clearance 0.2))",
                                           connect_pads)
 
-    def test_a_solid_pour_is_reported_as_solid(self):
+    def test_a_wordless_pour_is_a_thermal_relief_and_is_flagged_not_adopted(self):
+        # MEASURED on KiCad 10.0.7: a zone that writes NO mode word comes back
+        # from pcbnew's GetPadConnection() as ZONE_CONNECTION_THERMAL (1) - that
+        # is how KiCad itself saves a thermal zone. So the file states nothing
+        # (`connect_pads` is None) and KiCad reads "thermal".
         r = ok(run({}, body=self._board_with("(connect_pads (clearance 0.2))")))
         st = r["zone_summary"]["board_file_states"]
         self.assertEqual(len(st), 1)
-        self.assertEqual(st[0]["connect_pads"], "solid")
+        self.assertIsNone(st[0]["connect_pads"])
+        self.assertEqual(st[0]["connect_pads_effective"], "thermal")
         self.assertEqual(st[0]["layers"], ["F.Cu"])
         self.assertAlmostEqual(st[0]["thermal_gap_mm"], 0.5)
         self.assertAlmostEqual(st[0]["thermal_bridge_width_mm"], 0.5)
-
-    def test_a_thermal_pour_is_reported_and_flagged_not_adopted(self):
-        r = ok(run({}, body=self._board_with("(connect_pads yes (clearance 0.2))")))
-        st = r["zone_summary"]["board_file_states"]
-        self.assertEqual(st[0]["connect_pads"], "thermal")
         warns = " ".join(r.get("warnings") or [])
         self.assertIn("THERMAL RELIEF", warns)
         self.assertIn("OPTIMISTIC", warns)
         self.assertIn("Pass thermal_relief", warns)
+
+    def test_a_solid_pour_is_reported_as_solid(self):
+        # `(connect_pads yes ...)` is SOLID (pcbnew ZONE_CONNECTION_FULL = 2).
+        r = ok(run({}, body=self._board_with("(connect_pads yes (clearance 0.2))")))
+        st = r["zone_summary"]["board_file_states"]
+        self.assertEqual(st[0]["connect_pads"], "solid")
+        self.assertEqual(st[0]["connect_pads_effective"], "solid")
+        self.assertEqual(st[0]["connect_pads_source"], "file")
+        # solid copper is what the answer assumes anyway, so nothing to flag
+        self.assertNotIn("THERMAL RELIEF", " ".join(r.get("warnings") or []))
+
+    def test_no_connection_is_reported_as_none(self):
+        # `(connect_pads no ...)` is ZONE_CONNECTION_NONE = 0.
+        r = ok(run({}, body=self._board_with("(connect_pads no (clearance 0.2))")))
+        st = r["zone_summary"]["board_file_states"]
+        self.assertEqual(st[0]["connect_pads"], "none")
+        self.assertEqual(st[0]["connect_pads_effective"], "none")
         # and the answer is NOT the relief answer: the file said so, we did not act
         self.assertAlmostEqual(r["value"]["max_drop_mv"], 0.935986, places=6)
 

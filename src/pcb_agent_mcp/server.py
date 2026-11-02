@@ -407,6 +407,60 @@ def selftest():
         check("board_ops advertises the 6 .epro operations",
               len(epro_ops) == 6, ",".join(o["op"] for o in epro_ops))
 
+        # ---- a pour's fill parameters, written where KiCad reads them. Without
+        # (filled_areas_thickness no) KiCad strokes the stored filled_polygon by
+        # min_thickness/2, which reads every pour 0.05 mm thicker than the file:
+        # measured 386 clearance errors on the STM32F412 core board, 0 with it.
+        r = handle({"jsonrpc": "2.0", "id": 201, "method": "tools/call",
+                    "params": {"name": "board_propose", "arguments": {
+                        "path": board,
+                        "operations": [
+                            {"op": "add_net", "name": "VPOUR"},
+                            {"op": "add_zone", "layer": "F.Cu", "net": "VPOUR",
+                             "x0": 2, "y0": 2, "x1": 12, "y1": 12,
+                             "clearance": 0.2},
+                            {"op": "set_zone_params", "net": "VPOUR",
+                             "layer": "F.Cu",
+                             "filled_areas_thickness": False,
+                             "clearance": 0.3, "min_thickness": 0.1}]}}})
+        zprop = json.loads(r["result"]["content"][0]["text"])
+        zdet = (((zprop.get("operations") or [{}] * 3)[2] or {}).get("detail")
+                or {})
+        rz = handle({"jsonrpc": "2.0", "id": 202, "method": "tools/call",
+                     "params": {"name": "board_apply", "arguments": {
+                         "plan_id": zprop.get("plan_id"), "confirm": True,
+                         "options": {"engine": False}}}})
+        zapp = json.loads(rz["result"]["content"][0]["text"])
+        with open(board, "r", encoding="utf-8") as fh:
+            ztext = fh.read()
+        i0 = ztext.find('(zone ')
+        zseg = " ".join(ztext[i0:i0 + 900].split())
+        rz2 = handle({"jsonrpc": "2.0", "id": 203, "method": "tools/call",
+                      "params": {"name": "board_propose", "arguments": {
+                          "path": board, "operations": [
+                              {"op": "add_keepout", "layer": "F.Cu",
+                               "points": [[1, 1], [2, 1], [2, 2], [1, 2]]},
+                              {"op": "set_zone_params", "layer": "F.Cu",
+                               "clearance": 0.3}]}}})
+        zko = json.loads(rz2["result"]["content"][0]["text"])
+        check("a pour's fill parameters are written where KiCad reads them, and "
+              "a keep-out is refused instead of being given fill parameters",
+              zapp.get("status") == "ok"
+              and zdet.get("zones_changed") == 1
+              and zdet.get("zones_matched") == 1
+              and zdet.get("refill_required") is True
+              and "(filled_areas_thickness no)" in zseg
+              and "(connect_pads (clearance 0.3)" in zseg
+              and "(min_thickness 0.1)" in zseg
+              and zko.get("status") == "error"
+              and zko.get("reason_code") == "ARG_INVALID"
+              and "keep-out" in (zko.get("message") or ""),
+              "changed %s matched %s fat %s clr %s ko %s"
+              % (zdet.get("zones_changed"), zdet.get("zones_matched"),
+                 "(filled_areas_thickness no)" in zseg,
+                 "(connect_pads (clearance 0.3)" in zseg,
+                 zko.get("reason_code")))
+
         # ---- schematic write path (no engine: this must stay fast)
         sch_text = (
             '(kicad_sch\n'

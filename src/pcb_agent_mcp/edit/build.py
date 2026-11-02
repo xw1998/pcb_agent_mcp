@@ -146,14 +146,43 @@ def via(x, y_up, dia, drill, net_code, sp, uid, layers=("F.Cu", "B.Cu")):
 
 def zone_polygon_conf(net_code, net_name, layer, points, sp, uid,
                       clearance=0.2, min_thickness=0.25, priority=None,
-                      hatch=0.5, keepout=None):
+                      hatch=0.5, keepout=None, pad_connection=None,
+                      thermal_gap=None, thermal_bridge_width=None):
     """A zone: keepout when `keepout` is given, copper pour otherwise.
 
     A pour written this way carries `(fill yes)` but no `filled_polygon`: the
     fill result is computed by the vendor engine when it opens or plots the
     board, and this server refuses to invent one. Callers are told that with
     `fill_pending`.
+
+    The header is written the way KiCad 10.0.7 writes one (`SaveBoard` on a zone
+    whose defaults were not touched was read back token by token):
+
+        (connect_pads [yes|no|thru_hole_only] (clearance X))
+        (min_thickness T)
+        (filled_areas_thickness no)
+        (fill yes [(thermal_gap G)] [(thermal_bridge_width W)])
+
+    Three of those are not decoration:
+
+    * `filled_areas_thickness no` says the stored `filled_polygon` IS the copper
+      edge. Every board this server writes declares format 20221018, and a
+      pre-v7 zone without that token is read as the CENTRELINE of a
+      min_thickness-wide stroke - KiCad 10 DRC then measures `min_thickness/2`
+      further out than the copper is. Measured on a real 199 KB board: the same
+      polygons gave 386 clearance ERRORS without the token and 0 with it.
+    * the mode word is written only when `pad_connection` says so, because that
+      is what KiCad does: a thermal relief is spelled by writing NOTHING (`yes`
+      is solid copper, `no` is no connection - verified by loading each spelling
+      in pcbnew and reading `GetPadConnection()` back).
+    * `thermal_gap` / `thermal_bridge_width` are written ONLY when the caller
+      gave them. Left out, KiCad applies its own defaults (measured: 0.5 mm /
+      0.5 mm), so this function never invents a number a caller did not ask for.
     """
+    if pad_connection not in (None, "thermal", "solid", "yes", "none", "no",
+                              "thru_hole_only"):
+        raise ValueError("pad_connection %r is not thermal/solid/none/thru_hole_only"
+                         % (pad_connection,))
     items = [A("zone"), L(A("net"), A(str(net_code))),
              L(A("net_name"), A(net_name, True)), L(A("layer"), A(layer, True))]
     if priority is not None:
@@ -164,9 +193,22 @@ def zone_polygon_conf(net_code, net_name, layer, points, sp, uid,
         items.append(L(A("keepout"),
                        *[L(A(rule), A("not_allowed")) for rule in keepout]))
     else:
-        items.append(L(A("connect_pads"), L(A("clearance"), A(num(clearance)))))
+        # a thermal relief is spelled by writing no mode word at all
+        words = {"solid": "yes", "yes": "yes", "none": "no", "no": "no",
+                 "thru_hole_only": "thru_hole_only", "thermal": None, None: None}
+        mode = words.get(pad_connection)
+        head = [A("connect_pads")] + ([A(mode)] if mode else [])
+        head.append(L(A("clearance"), A(num(clearance))))
+        items.append(L(*head))
         items.append(L(A("min_thickness"), A(num(min_thickness))))
-        items.append(L(A("fill"), A("yes")))
+        # see the docstring: without this a pre-v7 zone's polygons are stroked
+        items.append(L(A("filled_areas_thickness"), A("no")))
+        fill = [A("fill"), A("yes")]
+        if thermal_gap is not None:
+            fill.append(L(A("thermal_gap"), A(num(thermal_gap))))
+        if thermal_bridge_width is not None:
+            fill.append(L(A("thermal_bridge_width"), A(num(thermal_bridge_width))))
+        items.append(L(*fill))
     items.append(L(A("polygon"), pts(points)))
     return L(*items)
 

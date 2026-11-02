@@ -2673,15 +2673,57 @@ _tool(
     lambda a: _guarded(lambda: _board_run_ledger(a)),
 )
 
+def _board_pour_connectivity(b, args):
+    """A centre-in-polygon test, then the authoritative answer beside it."""
+    out = _oracle.pour_connectivity(b, args.get("zone_index", 0))
+    if out.get("status") != "ok" or args.get("cross_check", True) is False:
+        return out
+    from .fidelity import engine as _engine
+    from .edit import plan as _plan
+    drc = _engine.drc(args["path"], severity="all",
+                      project=_plan._project_beside(args["path"]))
+    value = out.setdefault("value", {})
+    if drc.get("status") == "ok":
+        value["drc_cross_check"] = {
+            "authoritative": True,
+            "unconnected_total": drc.get("unconnected_total"),
+            "errors": (drc.get("by_severity") or {}).get("error", 0),
+            "rule_source": drc.get("rule_source"),
+            "verdict_source": drc.get("verdict_source"),
+            "read_it_like_this": (
+                "if unconnected_total is 0 then no pad of this net is isolated, no "
+                "matter what `isolated` above says: a pad-centre test cannot see "
+                "spokes, vias, tracks or the pad's own copper"),
+            "unconnected": (drc.get("unconnected") or [])[:20],
+        }
+    else:
+        value["drc_cross_check"] = {
+            "authoritative": False,
+            "ran": False,
+            "reason_code": drc.get("reason_code"),
+            "message": drc.get("message"),
+            "why": "the authoritative check could not run; `isolated` stays unverified",
+        }
+    return out
+
 _tool(
     "board_pour_connectivity",
-    "Do the pads of the pour's net actually land inside the filled copper? A pour that "
-    "looks connected in the file can be isolated in fact.",
+    "Do the pads of the pour's net actually land inside the filled copper? This is a "
+    "pad-CENTRE-in-polygon test and it is NOT authoritative: it cannot see thermal "
+    "spokes, vias, tracks or the pad's own copper, and on the reference board it called "
+    "13 pads isolated that the DRC proved connected. The reply says so "
+    "(`authoritative: false`) and carries `drc_cross_check` - KiCad's own connectivity "
+    "verdict, whose unconnected_total is the answer to trust. cross_check=false turns "
+    "that second run off (it needs kicad-cli).",
     {"type": "object",
-     "properties": dict({"zone_index": _num("which zone (0-based)", 0)}, **_COMMON),
+     "properties": dict({"zone_index": _num("which zone (0-based)", 0),
+                         "cross_check": {"type": "boolean",
+                                         "description": "also run KiCad's DRC and "
+                                                        "return unconnected_total "
+                                                        "(default true)"}},
+                        **_COMMON),
      "required": ["path"]},
-    _board_tool(lambda b, a: _oracle.pour_connectivity(b, a.get("zone_index", 0)),
-                derived=True),
+    _board_tool(_board_pour_connectivity, derived=True),
 )
 
 _tool(
@@ -2700,14 +2742,25 @@ _tool(
     "polygons, zones that poured nothing and why). By default it fills a COPY and only "
     "measures; in_place=true transplants KiCad's polygons into your file, which keeps "
     "its own version header, and writes a checkpoint first. Not a KiCad board? Refuses. "
-    "A fill is a SNAPSHOT: any later track/pad/outline change makes it stale.",
+    "A fill is a SNAPSHOT: any later track/pad/outline change makes it stale. "
+    "The reply separates 'the engine poured copper' from 'that copper is legal': "
+    "`drc_after_fill.verdict` is KiCad's own DRC verdict on the poured file (errors, "
+    "unconnected, top_errors with their descriptions), and it is not_clean whenever "
+    "the pour still holds DRC errors.",
     {"type": "object",
      "properties": dict({
          "in_place": {"type": "boolean",
                       "description": "write KiCad's polygons into this file (default "
                                      "false: measure on a copy, touch nothing)"},
+         "drc": {"type": "boolean",
+                 "description": "after filling, run KiCad's DRC and report "
+                                "`drc_after_fill.verdict` (default true). A pour that "
+                                "the engine built is not automatically a legal pour: "
+                                "turn this off only if you can check it yourself"},
      }, **_COMMON, **{"required": ["path"]})},
-    lambda a: _guarded(lambda: _fill.fill(a["path"], in_place=bool(a.get("in_place")))),
+    lambda a: _guarded(lambda: _fill.fill(
+        a["path"], in_place=bool(a.get("in_place")),
+        verify_drc=bool(a.get("drc", True)))),
 )
 
 def _parse_object_list(val, what):
@@ -2968,6 +3021,8 @@ def _board_route(args):
                  else "plan only"),
     })
     segs = [o for o in res["ops"] if o["op"] == "add_track"]
+    from .route import rules as _rrules
+    rules_in_effect = _rrules.per_net_summary(stats["rule_bundle"])
     out = ok(
         value={"nets_total": stats["nets_total"], "nets_routed": stats["nets_routed"],
                "nets_failed": stats["nets_failed"],
@@ -2995,6 +3050,12 @@ def _board_route(args):
         assumptions={
             "clearance_mm": res["rules"]["clearance_mm"],
             "track_mm": res["rules"]["track_mm"],
+            "these_are_the_board_defaults_not_the_nets": (
+                "clearance_mm / track_mm / via_mm above are the BOARD-wide defaults. "
+                "The numbers the router actually used for a given net are in "
+                "`rules_in_effect.groups` (grouped per net class / impedance target / "
+                "diff pair); reading the defaults as 'what this board was routed "
+                "with' is wrong whenever the nets carry their own class"),
             "via_mm": [res["rules"]["via_diameter_mm"],
                        res["rules"]["via_drill_mm"]],
             "creepage_mm": res["rules"]["creepage_mm"],
@@ -3019,6 +3080,7 @@ def _board_route(args):
             "writes_nothing": args.get("apply") is not True,
             "intent": intent_report,
             "pour": res.get("pour"),
+            "rules_in_effect": rules_in_effect,
         },
         extra={
             "diff_pairs": res["diff_pairs"],
@@ -5322,10 +5384,25 @@ def _board_propose(args):
         return _edit_error(exc)
 
 def _board_apply(args):
+    """Write the plan - or, with options.dry_run, only find out whether it would."""
     from . import edit as _edit
+    options = args.get("options") or {}
     try:
         return _edit.apply_plan(args.get("plan_id"), args.get("confirm") is True,
-                                args.get("options") or {})
+                                options)
+    except getattr(_edit, "_DryRunBlocked", ()) as exc:   # dry run + a gate said no
+        out = _edit_error(exc)
+        out["status"] = "ok"
+        out.pop("reason_code", None)
+        out["dry_run"] = True
+        out["would_write"] = False
+        out["file_unchanged"] = True
+        out["message"] = ("DRY RUN: this plan WOULD be refused - nothing was left "
+                          "on disk. The reasons are in `blocking`; each entry names "
+                          "the violation's position and the constraint/measured pair "
+                          "where KiCad states one")
+        out["plan_still_open"] = True
+        return out
     except _edit.EditError as exc:
         return _edit_error(exc)
 
@@ -5480,6 +5557,11 @@ _tool(
                          "change can be watched in the EDA and stopped between steps. "
                          "Omit it for the one-shot atomic write."),
             "max_chunks": _num("stepped write: chunks per call (default 1)"),
+            "dry_run": _bool("write it, run every gate, then put the original bytes "
+                             "back and report what WOULD have happened (default "
+                             "false). The plan stays open. A blocking gate comes "
+                             "back as would_write=false with the reasons, instead of "
+                             "an exception", False),
         }},
     }, "required": ["plan_id"]},
     _board_apply,
@@ -9690,7 +9772,43 @@ def call_tool(name, arguments):
         return err("missing required argument: %s" % exc, "ARG_MISSING")
     except Exception as exc:  # noqa: BLE001
         return err("tool raised: %s: %s" % (type(exc).__name__, exc), "TOOL_RAISED")
-    return _flag_unread_arguments(spec, args, out)
+    return _uniform_envelope(_flag_unread_arguments(spec, args, out))
+
+
+def _uniform_envelope(out):
+    """Say where the business fields of THIS reply are, so nobody has to guess.
+
+    Two shapes are in use and both are kept:
+
+      * ``value``     - the calc.result envelope: the answer is under `value`,
+                        beside `unit` / `model` / `basis` / `precision`. This is
+                        what board_zones, board_fill_zones, board_drc and
+                        board_pour_connectivity return.
+      * ``top_level`` - the write path's own reply: `plan_id`, `gates`,
+                        `blocking`, `operations` sit at the top. This is what
+                        board_propose / board_apply return.
+
+    Renaming either would break every caller written against it, so nothing is
+    moved. Instead each reply carries `payload_is` and a one-line
+    `where_to_read`: a reader that assumed one shape and got the other read 0
+    zones where the file had 2 - a wrong reading of a correct answer, which is
+    the worst kind of wrong.
+    """
+    if not isinstance(out, dict):
+        return out
+    value = out.get("value")
+    if isinstance(value, dict) and "status" in out:
+        out.setdefault("payload_is", "value")
+        out.setdefault("where_to_read",
+                       "business fields are under `value`; the envelope around it "
+                       "carries status/unit/model/basis/precision/assumptions")
+    elif out.get("status") in ("ok", "error"):
+        out.setdefault("payload_is", "top_level")
+        out.setdefault("where_to_read",
+                       "business fields are at the TOP level of this reply (this is "
+                       "the write path's shape: plan_id / gates / blocking / "
+                       "operations); there is no `value` object")
+    return out
 
 
 def _flag_unread_arguments(spec, args, out):

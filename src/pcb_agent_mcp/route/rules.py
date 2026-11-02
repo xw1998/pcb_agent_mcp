@@ -620,6 +620,46 @@ def for_net(bundle, net):
     return got
 
 
+def per_net_summary(bundle, limit=12):
+    """The numbers the router actually used, grouped by what they are.
+
+    Why this exists: `bundle["clearance_mm"] / ["track_mm"]` are the BOARD
+    defaults, and on a board where every net belongs to a class they are numbers
+    no net uses. Reported alone they are a wrong answer that looks authoritative:
+    on the reference board the reply printed the Default class (0.15 / 0.25 /
+    0.6-0.3) while every routed net was Fanout (0.15 / 0.15 / 0.45-0.2).
+    """
+    per_net = bundle.get("per_net") or {}
+    groups = {}
+    for net, got in per_net.items():
+        key = (got.get("clearance_mm"), got.get("track_mm"),
+               got.get("via_diameter_mm"), got.get("via_drill_mm"),
+               got.get("source"))
+        groups.setdefault(key, []).append(net)
+    out = []
+    for key, nets in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        out.append({
+            "clearance_mm": key[0], "track_mm": key[1],
+            "via_mm": [key[2], key[3]],
+            "source": key[4],
+            "nets": sorted(nets)[:20],
+            "net_count": len(nets),
+        })
+    default = bundle.get("default") or {}
+    return {
+        "groups": out[:limit],
+        "groups_total": len(out),
+        "nets_with_an_entry": len(per_net),
+        "board_default": {
+            "clearance_mm": default.get("clearance_mm"),
+            "track_mm": default.get("track_mm"),
+            "via_mm": [default.get("via_diameter_mm"), default.get("via_drill_mm")],
+            "source": default.get("source"),
+            "used_by": "only the nets with no entry of their own; every net listed "
+                       "in `groups` overrides it",
+        },
+    }
+
 def pair_clearance(bundle, a, b):
     """Clearance required between net `a` and net `b`.
 

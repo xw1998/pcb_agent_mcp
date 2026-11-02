@@ -393,7 +393,7 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
         caps = tools._capabilities({})
         self.assertIn("magnetics_toroid_mlt", caps["available"])
         # 174 = 173 + thermal_spreading in 0.0.85
-        self.assertEqual(len(caps["available"]), 174)
+        self.assertEqual(len(caps["available"]), 182)
         joined = json.dumps(caps)
         self.assertIn("toroid_mlt", joined)
         self.assertNotIn("(so no toroid copper estimate)", joined)
@@ -403,7 +403,7 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
         # the vendor's printed points is a different question from evaluating a fit)
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
-        self.assertEqual(len(tools.TOOLS), 180)
+        self.assertEqual(len(tools.TOOLS), 188)
 
 if __name__ == "__main__":
     unittest.main()

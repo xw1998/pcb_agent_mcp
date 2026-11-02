@@ -389,6 +389,93 @@ class Zones(EditBase):
         self.assertEqual(int(S.arg_num(S.child(gnd, "priority"), 1)), 0)
 
 
+class ZoneParams(EditBase):
+    """`set_zone_params` changes what the pour MEANS, not just a number.
+
+    `filled_areas_thickness no` is the field KiCad 10 reads to decide whether a
+    stored filled_polygon is the copper's edge or a centreline to be stroked by
+    min_thickness/2.  Without it the same polygon is judged 0.125 mm thicker on
+    every side than the file shows, which is what made 386 clearance errors on
+    the F412RG board - so the test asserts the written token, and (when KiCad is
+    installed) asks pcbnew whether it agrees.
+    """
+
+    def zone(self, net):
+        for z in self.editor().items("zone"):
+            if S.arg_text(S.child(z, "net_name"), 1) == net:
+                return z
+        raise AssertionError("no zone on %r" % net)
+
+    def _add_filled_polygon(self, net):
+        doc = K.KiCadDocument.from_text(
+            open(self.board, "rb").read().decode("utf-8"), self.board)
+        for z in S.children(doc.board(), "zone"):
+            if S.arg_text(S.child(z, "net_name"), 1) != net:
+                continue
+            pts = S.Seq([S.Atom("pts")] + [
+                S.Seq([S.Atom("xy"), S.Atom(str(x)), S.Atom(str(y))])
+                for x, y in ((3, 3), (10, 3), (10, 10), (3, 10))])
+            S.append_child(z, S.Seq([S.Atom("filled_polygon"),
+                                     S.Seq([S.Atom("layer"), S.Atom("F.Cu", True)]),
+                                     pts]))
+        with open(self.board, "wb") as fh:
+            fh.write(doc.to_bytes())
+
+    def test_filled_areas_thickness_is_written_where_kicad_reads_it(self):
+        plan, _ = self.apply({"op": "set_zone_params", "net": "GND",
+                              "filled_areas_thickness": False})
+        detail = plan["operations"][0]["detail"]
+        self.assertEqual(detail["zones_changed"], 1)
+        self.assertTrue(detail["refill_required"])
+        gnd = self.zone("GND")
+        self.assertEqual(S.arg_text(S.child(gnd, "filled_areas_thickness"), 1), "no")
+        # the other zone is not touched by a net selector
+        self.assertIsNone(S.child(self.zone("VCC"), "filled_areas_thickness"))
+
+    def test_yes_is_the_other_spelling_and_is_accepted(self):
+        self.apply({"op": "set_zone_params", "net": "GND",
+                    "filled_areas_thickness": "yes"})
+        self.assertEqual(S.arg_text(S.child(self.zone("GND"),
+                                            "filled_areas_thickness"), 1), "yes")
+
+    def test_old_fill_is_dropped_because_it_described_old_parameters(self):
+        self._add_filled_polygon("GND")
+        self.assertEqual(len(S.children(self.zone("GND"), "filled_polygon")), 1)
+        plan, _ = self.apply({"op": "set_zone_params", "net": "GND",
+                              "min_thickness": 0.1})
+        detail = plan["operations"][0]["detail"]
+        self.assertEqual(detail["dropped_filled_polygons"], 1)
+        self.assertEqual(S.children(self.zone("GND"), "filled_polygon"), [])
+        self.assertEqual(S.arg_num(S.child(self.zone("GND"), "min_thickness"), 1),
+                         0.1)
+
+    def test_clearance_goes_into_connect_pads(self):
+        self.apply({"op": "set_zone_params", "net": "GND", "clearance": 0.375})
+        conn = S.child(self.zone("GND"), "connect_pads")
+        self.assertAlmostEqual(S.arg_num(S.child(conn, "clearance"), 1), 0.375)
+
+    def test_a_call_with_no_parameter_is_refused(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_zone_params", "net": "GND"})
+        self.assertEqual(ctx.exception.code, "ARG_MISSING")
+
+    def test_a_selector_that_matches_nothing_is_refused(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_zone_params", "layer": "F.SilkS",
+                        "clearance": 0.3})
+        self.assertEqual(ctx.exception.code, "TARGET_NOT_FOUND")
+
+    def test_a_keep_out_has_no_fill_parameters(self):
+        self.apply({"op": "add_keepout", "layer": "F.Cu",
+                    "points": [[1, 1], [2, 1], [2, 2], [1, 2]]})
+        keepout = [z for z in self.editor().items("zone")
+                   if S.child(z, "keepout") is not None][0]
+        uid = self.editor().sp.id_of(keepout)
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_zone_params", "uuid": uid, "clearance": 0.3})
+        self.assertEqual(ctx.exception.code, "ARG_INVALID")
+
+
 class NetClasses(EditBase):
     def classes(self):
         out = {}
@@ -904,3 +991,122 @@ class TeardropAgainstPcbnew(EditBase):
         for bad in ("clearance", "shorting_items", "copper_edge_clearance"):
             self.assertEqual(a.get(bad, 0), b.get(bad, 0),
                              "teardrop changed %s: %r -> %r" % (bad, b, a))
+
+
+class BulkDeleteAndReplace(EditBase):
+    """Deleting copper in bulk, and re-creating what was deleted in one plan.
+
+    Both exist because of the same session: ripping up a region emitted one
+    `delete_track` per segment (528 operations for one board), and replacing a
+    pour by `delete_zone` + `add_zone` on the same net/layer in one apply was
+    refused with `postcondition check failed` because the delete's postcondition
+    asked "does anything still match net+layer" on the FINAL tree - where the
+    zone the plan had just added answered yes.
+    """
+
+    def zones_for(self, net):
+        return [z for z in self.editor().items("zone")
+                if S.arg_text(S.child(z, "net_name"), 1) == net]
+
+    def test_a_pour_can_be_deleted_and_re_created_in_one_plan(self):
+        plan = E.propose(self.board, [
+            {"op": "delete_zone", "net": "GND", "layer": "F.Cu"},
+            {"op": "add_zone", "net": "GND", "layer": "F.Cu",
+             "points": [[3, 3], [17, 3], [17, 17], [3, 17]]},
+        ])
+        self.assertEqual(plan["blocking"], [], plan["blocking"])
+        # the conflict is REPORTED (it is about the same object) and allowed
+        kinds = [c["kind"] for c in plan["plan_conflicts"]]
+        self.assertEqual(kinds, ["delete_then_add_same_zone"])
+        self.assertTrue(plan["plan_conflicts"][0]["allowed"])
+        report = E.apply_plan(plan["plan_id"], confirm=True,
+                              options=dict(engine=False))
+        self.assertEqual(report["status"], "ok")
+        self.assertTrue(report["gates"]["postconditions"]["all_verified"])
+        # exactly one GND pour on F.Cu, and it is the NEW one
+        gnd = self.zones_for("GND")
+        self.assertEqual(len(gnd), 1)
+        # the file stores y DOWN, so the outline given as (3, 3) mm Y up is
+        # written `(xy 3 -3)` - the round trip through the caller's frame is what
+        # is being checked here, not the spelling
+        pts = [(S.arg_text(n, 1), S.arg_text(n, 2))
+               for _p, n in S.walk(gnd[0]) if S.head(n) == "xy"]
+        self.assertIn(("3", "-3"), pts)
+
+    def test_the_delete_postcondition_is_checked_by_uuid(self):
+        detail = O.run_all(
+            K.KiCadDocument.from_path(self.board),
+            [{"op": "delete_zone", "net": "GND", "layer": "F.Cu"}])[0]["detail"]
+        self.assertEqual(len(detail["deleted_uuids"]), 1)
+        res = O._verify_delete_zone(
+            O.Editor(K.KiCadDocument.from_path(self.board)),
+            {"op": "delete_zone", "net": "GND", "layer": "F.Cu"},
+            {"detail": detail})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["checked_by"].split(" of ")[0], "uuid")
+
+    def test_delete_copper_needs_a_selector(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "delete_copper", "kinds": "all"})
+        self.assertEqual(ctx.exception.code, "ARG_MISSING")
+
+    def test_delete_copper_by_net_takes_the_tracks_and_the_via(self):
+        plan, _ = self.apply({"op": "delete_copper", "net": "VCC"})
+        detail = plan["operations"][0]["detail"]
+        self.assertEqual(detail["by_kind"], {"tracks": 1, "vias": 1, "zones": 1})
+        ed = self.editor()
+        self.assertEqual([n for n in ed.items("segment")
+                          if S.arg_text(S.child(n, "net"), 1) == "2"], [])
+        self.assertEqual([n for n in ed.items("via")
+                          if S.arg_text(S.child(n, "net"), 1) == "2"], [])
+
+    def test_a_region_selector_deletes_only_what_is_inside_it(self):
+        # the via is `(at 14 10)` in the FILE, which is y = -10 mm in the frame
+        # this server reports (mm, Y up) - so the region is stated negatively.
+        plan, _ = self.apply({"op": "delete_copper",
+                              "region": [13, -11, 15, -9], "kinds": ["vias"]})
+        self.assertEqual(plan["operations"][0]["detail"]["by_kind"], {"vias": 1})
+        self.assertEqual(self.editor().items("via"), [])
+
+    def test_a_zone_that_merely_crosses_the_region_is_not_deleted(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "delete_copper", "region": [0, 0, 5, 5],
+                        "kinds": ["zones"]})
+        self.assertEqual(ctx.exception.code, "TARGET_NOT_FOUND")
+        self.assertIn("WHOLE outline", str(ctx.exception.hint))
+        self.assertEqual(len(self.zones_for("GND")), 1)
+
+    def test_delete_copper_postcondition_survives_a_later_add(self):
+        plan = E.propose(self.board, [
+            {"op": "delete_copper", "net": "VCC"},
+            {"op": "add_track", "net": "VCC", "layer": "F.Cu",
+             "x1": 11, "y1": 10, "x2": 12.5, "y2": 10},
+        ])
+        self.assertEqual(plan["blocking"], [], plan["blocking"])
+        report = E.apply_plan(plan["plan_id"], confirm=True,
+                              options=dict(engine=False))
+        verified = report["gates"]["postconditions"]["operations"]
+        self.assertTrue(verified[0]["verified"], verified[0])
+        self.assertEqual(len(self.editor().items("segment")), 1)
+
+
+class DryRun(EditBase):
+    def test_a_dry_run_proves_the_gates_and_leaves_no_byte(self):
+        with open(self.board, "rb") as fh:
+            before = fh.read()
+        plan = E.propose(self.board, [{"op": "add_track", "net": "GND",
+                                       "layer": "F.Cu",
+                                       "x1": 5, "y1": 5, "x2": 8, "y2": 5}])
+        out = E.apply_plan(plan["plan_id"], confirm=True,
+                           options=dict(engine=False, dry_run=True))
+        self.assertTrue(out["dry_run"])
+        self.assertTrue(out["would_write"])
+        self.assertTrue(out["file_restored_byte_for_byte"])
+        self.assertTrue(out["plan_still_open"])
+        with open(self.board, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        # the plan is still usable: a real write of the same plan must work
+        done = E.apply_plan(plan["plan_id"], confirm=True,
+                            options=dict(engine=False))
+        self.assertEqual(done["status"], "ok")
+        self.assertEqual(len(self.editor().items("segment")), 2)

@@ -153,6 +153,33 @@ class TestFillingInPlace(ZoneBase):
         self.assertEqual(self.bytes(), before)
         self.assertEqual(FILL.zones(self.board)["value"]["poured_zones"], 0)
 
+    def test_the_fill_reports_the_pour_s_own_drc(self):
+        """'Filled' and 'the copper is legal' are two different yes/no answers."""
+        self.pour()
+        out = FILL.fill(self.board, in_place=True)
+        gate = out["value"]["drc_after_fill"]
+        self.assertTrue(gate["ran"], gate)
+        self.assertIn(gate["verdict"], ("clean", "not_clean"))
+        self.assertEqual(gate["measured_on"], "the written file")
+        self.assertTrue(gate["authoritative"])
+        self.assertIn("fill_success_is_not_pour_quality", out["assumptions"])
+
+    def test_measuring_mode_checks_the_poured_copy_not_the_outline(self):
+        """Nothing is written, so the file still holds an outline: DRC'ing that
+        file would describe the board BEFORE the pour and blame nothing."""
+        self.pour()
+        before = self.bytes()
+        out = FILL.fill(self.board)
+        gate = out["value"]["drc_after_fill"]
+        self.assertTrue(gate["ran"], gate)
+        self.assertIn("temporary copy", gate["measured_on"])
+        self.assertEqual(self.bytes(), before)
+
+    def test_the_gate_can_be_turned_off_and_then_says_nothing(self):
+        self.pour()
+        out = FILL.fill(self.board, in_place=True, verify_drc=False)
+        self.assertNotIn("drc_after_fill", out["value"])
+
     def test_a_keepout_really_takes_the_copper_away(self):
         self.pour()
         full = FILL.fill(self.board)["value"]["fill_area_mm2"]
@@ -177,7 +204,14 @@ class TestTheWritePathClosesTheLoop(ZoneBase):
                          options={"engine": False, "fill_zones": True})
         gate = r["gates"]["zone_fill"]
         self.assertTrue(gate["ok"], gate)
-        self.assertFalse(gate["drc_rechecked"])
+        # The pour is re-checked by the engine's own DRC, so "filled" and "the
+        # copper is clean" are the same statement: on the reference board the
+        # filler returned ok while the file held 386 clearance errors.
+        self.assertTrue(gate["drc_rechecked"], gate)
+        after = gate["drc_after_fill"]
+        self.assertIn(after["verdict"], ("clean", "not_clean"), after)
+        self.assertTrue(after["authoritative"])
+        self.assertIn("project_file_used", after)
         self.assertGreaterEqual(gate["poured_zones"], 1)
         poured = FILL.zones(self.board)["value"]["poured_zones"]
         self.assertEqual(poured, 2, "both zones should be copper now")

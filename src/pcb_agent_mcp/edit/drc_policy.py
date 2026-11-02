@@ -98,6 +98,17 @@ def classify(items, strict=False, limit=20):
                  "description": item.get("description")}
         if item.get("pos") is not None:
             entry["pos"] = item.get("pos")
+        # WHERE it is, not only WHAT it is: a count with no position leaves the
+        # caller to re-run the DRC and match descriptions by hand.
+        if item.get("items"):
+            entry["at"] = [i.get("pos") for i in item["items"][:4]]
+        # The constraint/actual pair only ever existed in the description text;
+        # engine.drc parses it (see fidelity/drc_geometry) and it must survive
+        # into the blocking list, or the caller re-does that work too.
+        if item.get("geometry") is not None:
+            entry["geometry"] = item.get("geometry")
+        elif item.get("numbers_mm"):
+            entry["numbers_mm"] = item.get("numbers_mm")
         hint = hint_for(item)
         if hint:
             entry["fix"] = hint

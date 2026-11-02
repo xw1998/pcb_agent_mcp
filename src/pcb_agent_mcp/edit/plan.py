@@ -31,6 +31,7 @@ Any blocking gate failure restores the checkpoint and says so.
 """
 import collections
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -53,10 +54,23 @@ PLAN_TTL = 60 * 60          # a proposal goes stale after an hour of thinking
 PLAN_MAX = 32
 
 class EditError(Exception):
-    def __init__(self, message, code="EDIT_FAILED", **extra):
+    """The same four attributes as `OpError`, `jobs.JobError` and `RouteError`.
+
+    The three used to expose different ones (`OpError` only had `.code` and
+    `.extra`, nothing else had `.code`), so a caller that needed "the machine
+    readable reason" had to branch on the exception class. `code` is kept as an
+    alias of `reason_code` for the existing call sites.
+    """
+    def __init__(self, message, code="EDIT_FAILED", hint=None, **extra):
         Exception.__init__(self, message)
+        self.message = message
         self.code = code
+        self.reason_code = code
+        self.hint = hint
         self.extra = extra
+
+class _DryRunBlocked(EditError):
+    """`dry_run` + a blocking gate: the answer is 'it would be refused'."""
 
 # --------------------------------------------------------------- paths/home
 # `home()` and the sha256 helper come from .fsutil so that the two write paths
@@ -277,17 +291,116 @@ def propose(path, operations, options=None):
                                "before it is allowed to become a plan"},
         "blocking": blocking,
         "warnings": warnings,
+        "plan_conflicts": _plan_conflicts(operations),
         "expires_in_seconds": PLAN_TTL,
         "next": ("board_apply(plan_id=%r, confirm=true) - that call takes a "
                  "checkpoint, writes atomically, then has KiCad and the file's own "
                  "re-read check the result" % plan_id),
     }
 
+def _verify_all(ops_module, doc, operations, records):
+    """Postconditions, with the run records when the module understands them.
+
+    The schematic module has no run records (its rewrites are not per-node), so
+    passing `records=` there is a TypeError, not a richer answer. Asking the
+    function what it takes keeps the two surfaces able to differ.
+    """
+    try:
+        params = inspect.signature(ops_module.verify_all).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "records" in params:
+        return ops_module.verify_all(doc, operations, records=records)
+    return ops_module.verify_all(doc, operations)
+
+
+def _pos_text(v):
+    """Where a violation is, whatever shape the caller's policy layer used.
+
+    `drc_policy.classify` writes `pos` as [x, y]; KiCad's own items carry
+    `{"x":, "y":}`. Formatting one of them as the other raised a TypeError
+    inside the blocking message, i.e. the gate failed for a reason that had
+    nothing to do with the edit.
+    """
+    pos = v.get("pos")
+    if not pos and v.get("at"):
+        pos = v["at"][0] if isinstance(v["at"], list) and v["at"] else v["at"]
+    if isinstance(pos, dict):
+        try:
+            return "(%.2f, %.2f)" % (float(pos["x"]), float(pos["y"]))
+        except (KeyError, TypeError, ValueError):
+            return "no position"
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        try:
+            return "(%.2f, %.2f)" % (float(pos[0]), float(pos[1]))
+        except (TypeError, ValueError):
+            return "no position"
+    return "no position"
+
+
+def _plan_conflicts(operations):
+    """Plans whose operations talk about the same object, spelled out.
+
+    The one that cost real time: `delete_zone(net=GND, layer=In1.Cu)` followed by
+    `add_zone(net=GND, layer=In1.Cu)` in the SAME apply. That is a legitimate
+    plan (replace a pour) and it used to fail, because the delete's postcondition
+    asked "does anything still match net+layer" on the FINAL tree and the zone
+    the plan just added answered yes. The refusal read `postcondition check
+    failed`, which names neither the cause nor the cure.
+
+    The postcondition is now checked by uuid (see ops._verify_delete_zone), so
+    this plan is allowed; the conflict list stays because "these two operations
+    touch the same object" is something the caller should see before writing, not
+    something it should have to infer from two op dicts.
+    """
+    conflicts = []
+    for i, d in enumerate(operations):
+        if (d.get("op") or "") != "delete_zone" or d.get("uuid"):
+            continue
+        for j, a in enumerate(operations):
+            if j <= i or (a.get("op") or "") != "add_zone":
+                continue
+            same_net = d.get("net") and a.get("net") == d.get("net")
+            same_layer = d.get("layer") and a.get("layer") == d.get("layer")
+            if not (same_net and same_layer):
+                continue
+            conflicts.append({
+                "kind": "delete_then_add_same_zone",
+                "delete_at": i, "add_at": j,
+                "net": d.get("net"), "layer": d.get("layer"),
+                "why": "the same net/layer is removed and re-created inside one "
+                       "plan, so the two operations are about the same object",
+                "allowed": True,
+                "what_was_fixed": ("the delete's postcondition is checked against "
+                                   "the uuids it removed, not against 'nothing "
+                                   "matches this selector any more', so the zone "
+                                   "added later does not fail it"),
+                "what_to_do": ("nothing, unless you meant to REPLACE the zone: then "
+                               "prefer set_zone_params, which keeps the outline, "
+                               "uuid and priority and does not need a fill "
+                               "afterwards"),
+            })
+    return conflicts
+
 def _is_kicad(raw):
     head = raw.lstrip(b"\xef\xbb\xbf \t\r\n")
     return head.startswith(b"(kicad_pcb") or head.startswith(b"(kicad_sch")
 
 # --------------------------------------------------------------- apply
+def _project_beside(path):
+    """The `.kicad_pro` that carries the rule minimums and rule severities.
+
+    Both halves of the DRC diff have to be read against the same rule set or the
+    comparison invents violations: the checkpoint copy lives in the server's own
+    home, so without this the "before" half ran with KiCad's defaults while the
+    "after" half ran with the project's, and 14 pre-existing silk overlaps were
+    reported as 38 new errors caused by a copper edit.
+    """
+    if not path:
+        return None
+    pro = os.path.splitext(path)[0] + ".kicad_pro"
+    return pro if os.path.isfile(pro) else None
+
 def _drc_keys(result):
     if not isinstance(result, dict) or result.get("status") != "ok":
         return None
@@ -319,8 +432,19 @@ def _drc_diff(before, after, limit=10, strict=False):
     ca, cb = collections.Counter(a), collections.Counter(b)
     new = list((cb - ca).elements())
     gone = list((ca - cb).elements())
+    # The constraint/actual pair only exists in the description text; engine.drc
+    # already parsed it, so carry it through instead of making the caller redo it.
+    geo = {}
+    for v in (after or {}).get("violations") or []:
+        pos = (v.get("items") or [{}])[0].get("pos") or None
+        k = (v.get("type"), v.get("severity"), v.get("description"),
+             round(pos["x"], 2) if pos else None,
+             round(pos["y"], 2) if pos else None)
+        geo[k] = v.get("geometry")
     new_items = [{"type": t, "severity": s, "description": d,
-                  "pos": [x, y]} for t, s, d, x, y in new]
+                  "pos": [x, y],
+                  "geometry": geo.get((t, s, d, x, y))}
+                 for t, s, d, x, y in new]
     policy = _drcp.classify(new_items, strict=strict, limit=limit)
     return {"comparable": True,
             "new": new_items[:limit],
@@ -395,10 +519,11 @@ def apply_plan(plan_id, confirm=False, options=None):
             "note": "re-parsing the file that is now on disk reproduces exactly the "
                     "tree that was planned (every atom, every quoting)"}
 
-        post = _ops.verify_all(re_doc, plan["operations"])
+        post = _ops.verify_all(re_doc, plan["operations"], records=plan["records"])
         gates["postconditions"] = dict(post)
         gates["postconditions"]["ok"] = bool(post.get("all_verified"))
 
+        pre_fill_errors = None
         if options.get("engine", True):
             before_file = checkpoint["body"]
             cmp_which = ["stats", "gerbers"]
@@ -420,12 +545,17 @@ def apply_plan(plan_id, confirm=False, options=None):
             # this whole layer exists to prevent.
             eng["ok"] = bool(eng.get("status") in ("ok", "skipped") and not silent
                              and (comparable or eng.get("status") == "skipped"))
-            drc_before = _engine.drc(before_file)
-            drc_after = _engine.drc(target)
+            pro_beside = _project_beside(target)
+            drc_before = _engine.drc(before_file, project=pro_beside)
+            drc_after = _engine.drc(target, project=pro_beside)
             gates["drc"] = _drc_diff(drc_before, drc_after,
                                      strict=bool(options.get("strict_drc")))
             if gates["drc"].get("comparable"):
                 gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")
+            # The pour happens AFTER this DRC, so its errors have to be compared
+            # against this baseline or a pre-existing error would block a fill
+            # that did not cause it.
+            pre_fill_errors = int((drc_after.get("by_severity") or {}).get("error") or 0)
         else:
             gates["engine"] = {"status": "skipped", "reason_code": "NOT_REQUESTED",
                                "ok": None}
@@ -439,8 +569,17 @@ def apply_plan(plan_id, confirm=False, options=None):
             blocking.append("re-parsing the written file does not reproduce the plan")
         if not gates["postconditions"]["all_verified"]:
             bad = [o for o in gates["postconditions"]["operations"] if not o["verified"]]
-            blocking.append("postcondition check failed for %d operation(s): %s"
-                            % (len(bad), ", ".join(o["op"] for o in bad)))
+            gates["postconditions"]["failed_detail"] = [
+                {"op": o["op"], "index": o["index"], "what_was_checked": o["detail"]}
+                for o in bad]
+            blocking.append(
+                "postcondition check failed for %d operation(s): %s - each entry in "
+                "gates.postconditions.failed_detail says which one and what it "
+                "re-read from the written file (a delete that reports "
+                "`remaining_matches` > 0 while you also re-created the object is the "
+                "delete-then-add plan; that is now checked by uuid, so a positive "
+                "count there means OTHER objects match the selector)"
+                % (len(bad), ", ".join(o["op"] for o in bad)))
         eng = gates.get("engine") or {}
         if eng.get("status") == "ok":
             if eng.get("identical") and set(plan["affected"]) <= {"mech", "meta", "silk"}:
@@ -451,10 +590,25 @@ def apply_plan(plan_id, confirm=False, options=None):
         drc = gates.get("drc") or {}
         if drc.get("comparable") and drc.get("new_blocking_total") and \
                 not options.get("allow_new_violations"):
-            blocking.append("%d NEW DRC error(s) appear after this edit (%s); "
-                            "pass allow_new_violations=true to accept them"
-                            % (drc["new_blocking_total"], ", ".join(
-                                sorted({v["type"] for v in drc["new_blocking"]})) ))
+            # A count alone forces the caller to re-run the DRC and match
+            # descriptions by hand, so the message carries the first few places
+            # and the numbers the engine stated.
+            where = []
+            for v in drc["new_blocking"][:5]:
+                geo = v.get("geometry") or {}
+                where.append(("%s at %s (wanted %s mm, got %s mm)"
+                              % (v.get("type"), _pos_text(v),
+                                 geo.get("constraint_mm", "?"),
+                                 geo.get("actual_mm", "?")))
+                             if geo else "%s at %s"
+                             % (v.get("type"), _pos_text(v)))
+            blocking.append("%d NEW DRC error(s) appear after this edit (%s): %s%s; "
+                            "pass allow_new_violations=true to accept them, or use "
+                            "board_drc(options) to see every one"
+                            % (drc["new_blocking_total"],
+                               ", ".join(sorted({v["type"] for v in drc["new_blocking"]})),
+                               "; ".join(where),
+                               (" ..." if drc["new_blocking_total"] > 5 else "")))
         plan_outline = _checks.outline_report(re_doc)
         if "outline" in plan["affected"] and not plan_outline["closed"] and \
                 not options.get("allow_open_outline"):
@@ -484,17 +638,54 @@ def apply_plan(plan_id, confirm=False, options=None):
                     "fill_area_mm2": val.get("fill_area_mm2"),
                     "poured_nothing": val.get("poured_nothing"),
                     "checkpoint_id": val.get("checkpoint_id"),
-                    "drc_rechecked": False,
+                    "drc_rechecked": (val.get("drc_after_fill") or {}).get("ran") is True,
+                    "drc_after_fill": val.get("drc_after_fill"),
                     "note": ("the engine poured the zones after the DRC comparison "
                              "ran, so the DRC above does not describe this copper; "
-                             "call board_drc to judge the poured board"),
+                             "`drc_after_fill` is the DRC of the POURED board"),
                 }
+                # The pour must not be reported as "filled" while the board does
+                # not pass DRC: on the reference board the filler succeeded and
+                # the file still held 386 clearance errors.
+                df = val.get("drc_after_fill") or {}
+                if df.get("ran"):
+                    filled_errors = int(df.get("errors") or 0)
+                    added = (filled_errors - pre_fill_errors
+                             if pre_fill_errors is not None else None)
+                    gates["zone_fill"]["drc_errors_before_the_pour"] = pre_fill_errors
+                    gates["zone_fill"]["drc_errors_added_by_the_pour"] = added
+                    if df.get("verdict") == "not_clean" and (added is None or added > 0):
+                        gates["zone_fill"]["ok"] = False
+                        blocking.append(
+                            "the zones were filled but the poured board is not DRC "
+                            "clean: %d error(s), %d unconnected, added by the pour: %s "
+                            "(types: %s)"
+                            % (filled_errors, df.get("unconnected_total") or 0,
+                               "unknown (the pre-pour DRC did not run)"
+                               if added is None else added,
+                               ", ".join(sorted((df.get("by_type") or {})))))
+                    elif df.get("verdict") == "not_clean":
+                        gates["zone_fill"]["warning"] = (
+                            "the poured board has %d DRC error(s), but they were "
+                            "already there before the pour (0 added), so the fill is "
+                            "not what broke them" % filled_errors)
+                else:
+                    gates["zone_fill"]["note"] += ("; the DRC of the pour could not "
+                                                   "run, so the pour is UNVERIFIED")
                 if not gates["zone_fill"]["ok"]:
                     blocking.append("the zones were not filled: %s"
                                     % (res.get("message") or res.get("reason_code")))
 
+        dry_run = bool(options.get("dry_run"))
         if blocking:
             rollback_reason = "; ".join(blocking)
+            if dry_run:
+                # A dry run exists to ASK whether the write would go through, so
+                # "it would have been refused" is the answer, not an exception.
+                # The file was restored by the caller's own write path below.
+                raise _DryRunBlocked("apply WOULD be blocked: " + rollback_reason,
+                                     "GATE_BLOCKED", gates=gates,
+                                     blocking=blocking)
             raise EditError("apply blocked and rolled back: " + rollback_reason,
                             "GATE_BLOCKED", gates=gates, blocking=blocking)
 
@@ -503,6 +694,30 @@ def apply_plan(plan_id, confirm=False, options=None):
         # was written - so re-read rather than quote a hash from before
         with open(target, "rb") as _fh:
             gates["bytes_written"]["sha256"] = _sha256(_fh.read())
+        if dry_run:
+            # Same code path, same gates, same writes - then the original bytes go
+            # back. That is what makes the verdict worth anything: a "dry run" that
+            # skipped the write would skip the gates that only exist after it.
+            _atomic_write(target, current)
+            with open(target, "rb") as _fh:
+                back_again = _fh.read()
+            return {
+                "status": "ok",
+                "dry_run": True,
+                "plan_id": plan_id,
+                "would_write": True,
+                "target": target,
+                "sha256_unchanged": _sha256(back_again) == _sha256(current),
+                "file_restored_byte_for_byte": back_again == current,
+                "gates": gates,
+                "gates_passed": sorted(k for k, v in gates.items()
+                                       if isinstance(v, dict) and v.get("ok") is True),
+                "decision": ("DRY RUN: the plan was applied for real, every gate ran "
+                             "against the written file, and the original bytes were "
+                             "then put back. Nothing on disk changed. The plan is "
+                             "still open (not consumed)"),
+                "plan_still_open": True,
+            }
         PLANS.pop(plan_id, None)
         return {
             "status": "ok",
@@ -669,7 +884,7 @@ def _final_gates_board(plan, target, session, options):
         "ok": S.signature(re_doc.tree) == plan["new_signature"],
         "note": "the stepped result re-parses into exactly the tree the original "
                 "plan described"}
-    post = _ops.verify_all(re_doc, plan["operations"])
+    post = _ops.verify_all(re_doc, plan["operations"], records=plan["records"])
     gates["postconditions"] = dict(post)
     gates["postconditions"]["ok"] = bool(post.get("all_verified"))
     blocking = []
@@ -693,7 +908,9 @@ def _final_gates_board(plan, target, session, options):
         eng["ok"] = bool(eng.get("status") in ("ok", "skipped")
                          and (comparable or eng.get("status") == "skipped"))
         gates["engine"] = eng
-        gates["drc"] = _drc_diff(_engine.drc(before_file), _engine.drc(target),
+        pro_beside = _project_beside(target)
+        gates["drc"] = _drc_diff(_engine.drc(before_file, project=pro_beside),
+                                 _engine.drc(target, project=pro_beside),
                                  strict=bool(options.get("strict_drc")))
         if gates["drc"].get("comparable"):
             gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")
@@ -879,7 +1096,7 @@ def steps_apply(plan_id, registry, schema="pcb", confirm=False, options=None):
             fh.write(new_bytes)
 
         re_doc = loader.from_path(session["target"])
-        post = d["ops"].verify_all(re_doc, subset)
+        post = _verify_all(d["ops"], re_doc, subset, records)
         session["index"] = hi
         session["seq"] = seq
         session["sha256"] = _sha256(new_bytes)

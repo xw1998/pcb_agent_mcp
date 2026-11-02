@@ -440,6 +440,10 @@ class TestEngineGate(EditTestBase):
         self.assertEqual(ctx.exception.code, "GATE_BLOCKED")
         blocking = " ".join(ctx.exception.extra["blocking"])
         self.assertIn("DRC", blocking)
+        # A count alone made the caller re-run the DRC and match descriptions by
+        # hand, so the message has to carry where the new error is.
+        self.assertRegex(blocking, r"at \(-?\d+\.\d\d, -?\d+\.\d\d\)")
+        self.assertIn("board_drc", blocking)
         self.assertEqual(self.read(), before, "a blocked apply must roll back")
 
     def test_engine_gate_passes_a_clean_edit(self):

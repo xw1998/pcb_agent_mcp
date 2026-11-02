@@ -1087,16 +1087,37 @@ def pour_connectivity(board, zone_index=0):
     return ok(
         value={"zone_net": net, "layers": zone.get("layers"),
                "connected_pads": len(inside), "isolated_pads": len(outside),
-               "isolated": outside[:40], "polygon_source": source},
+               "isolated": outside[:40], "polygon_source": source,
+               "authoritative": False,
+               "this_is_not_a_connectivity_verdict": (
+                   "the word 'isolated' here means 'this pad's CENTRE is not inside "
+                   "the pour polygon'. It does not mean the pad is unconnected: the "
+                   "pad's own copper, a thermal spoke, a via to a same-net plane on "
+                   "another layer, and a track that leaves the pad are all invisible "
+                   "to a centre-in-polygon test"),
+               "measured_on_the_reference_board": (
+                   "this test reported 10 GND and 3 +3V3 pads 'isolated' on a board "
+                   "whose DRC had 0 unconnected items - every one of them was a false "
+                   "alarm, not a defect"),
+               "use_instead": ("board_drc().unconnected_total - KiCad's connectivity "
+                               "engine. That is the authoritative answer"),
+               },
         unit="count",
-        model="point_in_polygon_per_pad",
+        model="point_in_polygon_per_pad (NOT a connectivity verdict)",
         basis="pad centre tested against the pour polygon(s) with ray casting; "
               "boundary counts as inside",
         precision="approximate: a pad partially covered by pour copper is treated as "
-                  "connected by its centre only; thermal spoke count and isolated "
-                  "islands inside the pour are NOT evaluated",
+                  "connected by its centre only; thermal spoke count, isolated "
+                  "islands inside the pour, and every other-layer connection are NOT "
+                  "evaluated. `authoritative` is false: do not conclude 'this net is "
+                  "broken' from `isolated`",
         assumptions={"zone_index": int(zone_index), "net": net,
-                     "polygons": len(polygons)},
+                     "polygons": len(polygons),
+                     "authoritative": False,
+                     "verdict_available_from": "board_drc (unconnected_total)",
+                     "why_not_authoritative": (
+                         "pad-centre-in-polygon cannot see spokes, vias, tracks or "
+                         "the pad's own copper; only the DRC connectivity engine can")},
     )
 
 
@@ -2132,27 +2153,33 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             for z in (board.zones or []):
                 if z.get("net") != net or z.get("keepout") or z.get("is_keepout"):
                     continue
-                if z.get("connect_pads") is None:
+                state = (z.get("connect_pads_effective")
+                         or z.get("connect_pads"))
+                if state is None:
                     continue
                 file_states.append({
                     "layers": list(ZF.zone_layer_list(z)),
                     "connect_pads": z.get("connect_pads"),
+                    "connect_pads_effective": state,
+                    "connect_pads_source": z.get("connect_pads_source"),
                     "thermal_gap_mm": z.get("thermal_gap_mm"),
                     "thermal_bridge_width_mm": z.get("thermal_bridge_width_mm"),
                 })
             if file_states:
                 zone_summary["board_file_states"] = file_states
-                if tr_geo is None and any(f["connect_pads"] in ("thermal",
-                                                            "thru_hole_only")
-                                      for f in file_states):
+                if tr_geo is None and any(f["connect_pads_effective"] in
+                                          ("thermal", "thru_hole_only")
+                                          for f in file_states):
                     warnings.append(
-                        "the board file states a THERMAL RELIEF for a pour on this "
-                        "net (connect_pads=%s, thermal_gap=%s mm, "
-                        "thermal_bridge_width=%s mm) but thermal_relief was not "
-                        "passed, so those pads are joined at 1 uOhm (solid) and this "
-                        "answer is OPTIMISTIC there. Pass thermal_relief with the "
-                        "same three numbers to model it"
-                        % (", ".join(sorted(set(f["connect_pads"]
+                        "KiCad reads a THERMAL RELIEF for a pour on this net "
+                        "(connect_pads=%s, thermal_gap=%s mm, "
+                        "thermal_bridge_width=%s mm); a zone that writes no mode "
+                        "word IS the thermal spelling, which is how KiCad itself "
+                        "saves one. thermal_relief was not passed, so those pads "
+                        "are joined at 1 uOhm (solid) and this answer is "
+                        "OPTIMISTIC there. Pass thermal_relief with the same three "
+                        "numbers to model it"
+                        % (", ".join(sorted(set(f["connect_pads_effective"]
                                                 for f in file_states))),
                            ", ".join(sorted(set("%.3g" % f["thermal_gap_mm"]
                                                 for f in file_states
