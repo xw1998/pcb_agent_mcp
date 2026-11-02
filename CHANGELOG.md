@@ -9,6 +9,85 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.89] - 2026-11-02
+
+**Specctra（DSN/SES）评估：判决「不接交换」，只借五条机制**
+（**只加文档**：新增 `docs/91-Specctra评估-DSN与SES交换格式.md`（174 行 / 10 059 字符 / 17 339 字节）；
+运行代码**零改动** ⇒ 工具数**仍 180**、`calc_capabilities.available` **174**、`not_implemented_yet` **23**、
+`--selftest` **321/321**、用例 **3493** 全部不变；`dependencies = []` 仍成立）
+
+### 问的是什么
+
+「用一个行业标准的板级交换格式（Specctra DSN/SES）能不能帮到我们 PCB 绘制这一层」——
+具体是布线器、写路径、规则来源这三处。查完的答案是：**格式不接，机制借五条**。
+
+### 怎么查的（一手文件，不是博客综述）
+
+一手规范**没拿到**：Cadence 的 *SPECCTRA Design Language Reference* 在 KiCad 注释里指向早年
+Yahoo group 的 `specctra.pdf`，现在取不到正文 ⇒ 文档里凡只有一处实现印证的结论**都标了「单侧」**，
+没有一句是「规范说」。实际取证是四个来源：
+
+- **KiCad**（GPL-3.0）`pcbnew/specctra_import_export/`：`specctra.cpp` 4051 行、`specctra.h` 4024 行、
+  `specctra_export.cpp` 1878 行、`specctra_import.cpp` 574 行、`specctra.keywords` **388 个非注释 token（全唯一）**。
+- **FreeRouting**（GPL-3.0，SPDX 已核）：`SesWriter.java`、`DsnWriter.java`、`RulesReader.java`、`RulesWriter.java`。
+- 一个真实 DSN（LibrePCB 2.0.0 导出）：**541 行**、2 层、9 网、**48 段铜**、6 个过孔、7 个 padstack、9 个 image。
+- 一个真实 SES（KiCad 5.1.5 写）：**701 行 / 14 421 字节**、12 网、**93 段铜**、10 个过孔。
+
+### 判决：不接交换，三条理由
+
+1. **判据错位**：我们的价值是「精确几何 + 外部裁判（`kicad-cli` DRC / 立创自己）」。收外部布线器的候选，
+   要付整套 IO 保真责任（往返不丢东西、锁定的铜不许回流、规则映射可解释），换来的只是「多一个候选」。
+2. **零依赖红线**：FreeRouting 是 Java 程序、KiCad 的布线器长在 PCB editor 里，两者都不能当 runtime 依赖。
+3. **许可证**：两个参考实现都是 **GPL-3.0**，本仓库是 MIT ⇒ **一行都不能抄**，只能读机制、自己写。
+
+### 借五条（A1–A5），其中两条我们**确实缺**，本版**记账未实施**
+
+| | 机制 | 我们现在 |
+|---|---|---|
+| A1 | `(type fix)` 的铜**不回流**：导入侧先删所有未锁定 track/via，再加会话内容 | `route/router.py` 有 `incremental`/`_existing_tree`，但**没有「这块铜不许动」的一等公民** ⇒ 记账未实施 |
+| A2 | 合并 = **替换未锁定**，不是 diff；每段铜有 owner 归属 | `ledger.py` 没有 owner 一栏 ⇒ 记账未实施 |
+| A3 | 规则优先级（`pcb < layer < class < … < net region`）的「**特异性**」与我们的「**最严者胜**」是**两条正交的轴** | 不改语义，只改文档表述：DRC 问「不许违反哪条」，布线问「用户想多宽」；`class_class` 与爬电的「两网较严者」是可对照的等价关系 |
+| A4 | 文件**自声明词法**（`(parser (string_quote ") (space_in_quoted_tokens on))`） | 我们的保真层已在树里带口径，但没有「文件自己说怎么读」的显式段 ⇒ 只作表述参考 |
+| A5 | **量子**（`(resolution um 10)` = 100 nm）与**打印精度**（`%.6g` 浮点）分开登记 | 我们的 `precision` 已分开，但没把「输入量子」写进信封 ⇒ 只作表述参考 |
+
+### 不抄五条
+
+- **QARC/弧**：FreeRouting 自己不支持弧（源码注释两处），KiCad 把圆/弧**一律折线化** ⇒ 抄了等于抄一个降级。
+- **逐项 try/catch + `m_skippedCount`**：KiCad 导入是「能读的读、读不了的跳过、末尾报一次 warning」；
+  我们 fail-closed，正确形态是「**条数上限 + 全量清单落盘**」，不是静默跳过。
+- **让 session 的 polygon 接管铺铜**：KiCad 自己也忽略（板上已有 zone），我们 `refill_pours` 委派 ZONE_FILLER，同侧。
+- **388 个 keyword 当能力清单**：两个成熟实现**共同只有** `width` / `clearance` / `use_via` 三样。
+- **GPL 代码**。
+
+### 顺带坐实的两件事
+
+- **KiCad 的 `.kicad_pcb` 语法本来就是 DSN 方言**：官方 dev-docs 原句
+  「Syntax is based on the Specctra DSN file format.」（已 curl 核实原文）。
+- **DSN/SES 传的是「几何与宽度」，不是电气意图**：KiCad 的 `exportNETCLASS()` 一个网类只写
+  `(width)` / `(clearance)` / `(use_via)`；FreeRouting 的 `RulesReader` 只认 `WidthRule` / `ClearanceRule` + via infos
+  ⇒ 我们最值钱的那层（差分对真耦合、等长蛇形、阻抗、爬电、回流缝合）在 DSN 里**没有承载**。
+  另有一条独立收敛：DSN 的 `(grid (via_grid …) (wire_grid …))` 两个栅格与我们 `docs/27` 的
+  「两套栅格不能合并」是同一个结论。
+
+### 同时做了的：装 `rea`（结论是**这一步没用到它**）
+
+- 包名 `rea-agents`（npm），装到 **6.8.0**。首次不带 `--ignore-scripts` 的安装在 postinstall 挂住 >7 min
+  （日志只停在 150 字节的 `prebuild-install` deprecation），终止后改用
+  `npm i -g rea-agents@6.8.0 --ignore-scripts --no-audit --no-fund`（27 s）成功。
+- `rea doctor` 实测：`healthy: false`，本机 `node 24.17.0` 被判 `missing_dependency`
+  （要求 `^22.23.4 || ^24.22.1 || >=26.12.1`）；**五个分析引擎全缺**（hopper / ghidra / ida / jadx / kuna），
+  REA 不下载也不安装它们；4 个客户端注册全 missing。能力计数 `cli_commands 153 / mcp_tools 207 / mcp_prompts 6`。
+- **不升级宿主的 node**（那是 Agent 运行时，属越界）；本步也没有用到它——Specctra 是**纯文本 S 表达式**，
+  不需要反汇编 ⇒ 如实写进 `docs/91` §10，并写清「若将来真做二进制取证」要先满足什么。
+
+### 不动的东西（自证）
+
+- 运行代码、`data/*.json`、`tests/` **零改动**；`dependencies = []` 仍成立。
+- 工具数 **180** / `available` **174** / `not_implemented_yet` **23** / `--selftest` **321/321** / 用例 **3493** 不变。
+- **本版没有跑全量回归**（按既定口径：功能全部做完后集中跑一次）。
+
+---
+
 ## [0.0.88] - 2026-11-02
 
 **沿长度这一路的熔化潜热：`fusing_current_taper` 从「到 1083 °C」变成「熔穿」**
