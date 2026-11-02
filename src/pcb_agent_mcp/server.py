@@ -3661,6 +3661,70 @@ def selftest():
           str(_hole_nc[0].get("verdict") if _hole_nc else "missing"))
     _shutil.rmtree(_sm_tmp, ignore_errors=True)
 
+    # --- 0.0.82: mask-defined pads, the one mask defect that is NOT a gap -----
+    # An opening SMALLER than its copper (a negative mask margin) is decided by
+    # the pad's own expansion, so the two refusals a fab can make are different
+    # questions: a COUNT of zero ("we do not do them at all") and a MINIMUM
+    # overlap ("we can, down to this much"). Two 1.0 mm pads at 2.0 mm pitch, with
+    # margins -0.05 and -0.03, are 2 pads whose tightest overlap is 0.03 mm.
+    _md_tmp = _tempfile.mkdtemp(prefix="pcbagent-maskdef-")
+    _md_board = os.path.join(_md_tmp, "mask_defined.kicad_pcb")
+    with open(_md_board, "wb") as fh:
+        fh.write(b'(kicad_pcb (version 20221018) (generator pcbnew)\n'
+                 b'  (general (thickness 1.6))\n'
+                 b'  (net 0 "")\n'
+                 b'  (gr_rect (start 0 0) (end 30 20) (stroke (width 0.05)'
+                 b' (type solid)) (layer "Edge.Cuts"))\n'
+                 b'  (footprint "T:M" (layer "F.Cu") (at 10 10)\n'
+                 b'    (property "Reference" "J1")\n'
+                 b'    (pad "1" smd rect (at 0 0) (size 1 1)'
+                 b' (layers "F.Cu" "F.Mask") (solder_mask_margin -0.05))\n'
+                 b'    (pad "2" smd rect (at 2 0) (size 1 1)'
+                 b' (layers "F.Cu" "F.Mask") (solder_mask_margin -0.03)))\n)\n')
+
+    def _md(rules):
+        rr = handle({"jsonrpc": "2.0", "id": 1710, "method": "tools/call",
+                     "params": {"name": "dfm_check", "arguments": {
+                         "path": _md_board,
+                         "capability": {"fab": "selftest",
+                                        "source": "selftest fixture",
+                                        "rules": dict(rules)}}}})
+        return json.loads(rr["result"]["content"][0]["text"])
+
+    _md_none = _md({"max_mask_defined_pads": 0})
+    _md_facts = ((_md_none.get("value") or {}).get("facts") or {})
+    _md_c = [c for c in ((_md_none.get("value") or {}).get("checks") or [])
+             if c["rule"] == "max_mask_defined_pads"]
+    check("0.0.82 a fab that does not do mask-defined pads says a maximum of 0, and "
+          "this board has 2 (-0.05 and -0.03 margins) - the count is 2, not a pass",
+          _md_none.get("status") == "ok" and len(_md_c) == 1
+          and _md_c[0]["measured"] == 2.0 and _md_c[0]["verdict"] == "fail"
+          and (_md_facts.get("mask_defined_pads") or {}).get("measured") == 2.0
+          and (_md_facts.get("mask_defined_pads") or {}).get("widest_overlap_mm")
+          == 0.05,
+          "count %s, verdict %s, widest %s" % (
+              _md_c[0]["measured"] if _md_c else "missing",
+              _md_c[0]["verdict"] if _md_c else "missing",
+              (_md_facts.get("mask_defined_pads") or {}).get("widest_overlap_mm")))
+
+    _md_ov = _md({"max_mask_defined_pads": 2, "min_mask_defined_overlap_mm": 0.05})
+    _md_checks = {c["rule"]: c for c in
+                  ((_md_ov.get("value") or {}).get("checks") or [])}
+    check("0.0.82 the overlap is the SMALLEST of the pads and it is a MINIMUM: 2 "
+          "pads pass a count of 2 while the 0.03 mm overlap fails a 0.05 mm limit, "
+          "so one board answers the two limits in opposite directions",
+          _md_ov.get("status") == "ok"
+          and _md_checks.get("max_mask_defined_pads", {}).get("verdict") == "pass"
+          and _md_checks.get("min_mask_defined_overlap_mm", {}).get("verdict")
+          == "fail"
+          and _md_checks["min_mask_defined_overlap_mm"]["measured"] == 0.03
+          and _md_checks["min_mask_defined_overlap_mm"]["margin"] == -0.02,
+          "count %s, overlap %s / %s" % (
+              _md_checks.get("max_mask_defined_pads", {}).get("verdict"),
+              _md_checks.get("min_mask_defined_overlap_mm", {}).get("measured"),
+              _md_checks.get("min_mask_defined_overlap_mm", {}).get("verdict")))
+    _shutil.rmtree(_md_tmp, ignore_errors=True)
+
     # --- fusing along a taper (0.0.59). A UNIFORM trace with insulated ends has
     # identical neighbours, so every axial conduction term cancels in pairs and the
     # 1-D model must reproduce the lumped adiabatic answer - i.e. Onderdonk's, to

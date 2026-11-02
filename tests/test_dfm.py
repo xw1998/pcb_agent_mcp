@@ -114,6 +114,11 @@ ALL_RULES = {
     "min_silk_text_height_mm": 0.8,
     "min_mask_web_mm": 0.25,
     "min_copper_to_hole_mm": 0.5,
+    # 0.0.82. The fixture board has no negative mask margin, so the count is 0
+    # (a measurement) and the overlap has nothing to measure (not_applicable -
+    # which is why `passed` below is one short of the rule count).
+    "max_mask_defined_pads": 0,
+    "min_mask_defined_overlap_mm": 0.05,
 }
 
 
@@ -286,7 +291,10 @@ class TestDfmCheck(unittest.TestCase):
         v = r["value"]
         self.assertEqual(v["overall"], "pass", v["checks"])
         self.assertEqual(v["failed"], 0)
-        self.assertEqual(v["passed"], len(ALL_RULES))
+        # One short of the rule count on purpose: a board with no mask-defined
+        # pad has no overlap to measure, and "not applicable" is not "passed".
+        self.assertEqual(v["passed"], len(ALL_RULES) - 1)
+        self.assertEqual(v["not_applicable"], ["min_mask_defined_overlap_mm"])
         self.assertEqual(v["missing_known_rules"], [])
         self.assertNotIn("warnings", v)
         self.assertIn("facts", v)

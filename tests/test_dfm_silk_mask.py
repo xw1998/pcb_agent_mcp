@@ -411,8 +411,10 @@ class TestCopperToFinishedHole(unittest.TestCase):
 # ------------------------------------------------------------------- catalogue
 class TestTheCatalogue(unittest.TestCase):
 
-    def test_the_rule_count_is_fifteen_and_the_new_keys_name_their_facts(self):
-        self.assertEqual(len(dfm.RULES), 15)
+    def test_the_rule_count_is_seventeen_and_the_0_0_56_keys_name_their_facts(self):
+        # 15 at 0.0.56 + the two mask-defined-pad keys added in 0.0.82 (their own
+        # assertions live in test_dfm_mask_defined.py, next to their fixtures).
+        self.assertEqual(len(dfm.RULES), 17)
         for key, fact in (("min_silk_line_width_mm", "min_silk_line_width"),
                           ("min_silk_text_height_mm", "min_silk_text_height"),
                           ("min_mask_web_mm", "min_mask_web"),
@@ -426,7 +428,9 @@ class TestTheCatalogue(unittest.TestCase):
         # three may still claim the quantity is not measured at all.
         self.assertEqual(len(dfm.NOT_CHECKED_BY_DESIGN), 8)
         joined = " ".join(dfm.NOT_CHECKED_BY_DESIGN).lower()
-        self.assertIn("mask-defined pads", joined)
+        # 0.0.82 narrowed the mask entry again by measuring mask-defined pads, so
+        # what has to survive in it is the part that is STILL true.
+        self.assertIn("mask film itself is not read", joined)
         self.assertIn("state no line width", joined)
         self.assertIn("after plating", joined)
 
@@ -439,8 +443,8 @@ class TestTheCatalogue(unittest.TestCase):
     def test_coverage_denominator_moved_with_the_rule_count(self):
         env = dfm.validate({"fab": "f", "source": "s", "verified": True,
                             "rules": {"min_track_width_mm": 0.2}})
-        self.assertEqual(env["value"]["rules_known"], 15)
-        self.assertEqual(env["value"]["coverage_pct"], 6.7)
+        self.assertEqual(env["value"]["rules_known"], 17)
+        self.assertEqual(env["value"]["coverage_pct"], 5.9)
 
 
 # -------------------------------------------------------------- registration

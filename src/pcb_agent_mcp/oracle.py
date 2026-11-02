@@ -2665,6 +2665,62 @@ def _mask_web(apertures, window_mm=5.0):
                         ("; %d pair(s) merge" % merged) if merged else "")}
 
 
+def _mask_defined_pads(board):
+    """Pads whose solder-mask opening is SMALLER than the copper it opens.
+
+    A negative mask margin shrinks the opening inside the pad, so the exposed
+    area is decided by the mask rather than by the copper - a mask-defined pad.
+    Both numbers a capability document can talk about come out of ONE pass,
+    because the two ways a fab refuses this are different questions: some state
+    "no mask-defined pads" (a count of 0), others state the overlap they can hold
+    (a minimum). A pad is counted ONCE even when it is masked on both sides: it is
+    one pad, its two openings share one margin, and counting sides would make the
+    limit depend on whether the part happens to be through-hole.
+
+    Where the margin came from is carried along (`pad` / `footprint` / `setup` /
+    `absent_treated_as_zero`), because a negative number that came from a file
+    default is a different thing to argue with a fab about than one typed on a
+    pad.
+    """
+    pads = []
+    for fp in board.footprints or []:
+        for pad in fp.get("pads") or []:
+            if not (pad.get("mask_layers") or []):
+                continue
+            m = float(pad.get("mask_margin") or 0.0)
+            if not (m < 0.0):
+                continue
+            pads.append({"ref": "%s.%s" % (fp.get("ref") or "?",
+                                           pad.get("number") or "?"),
+                         "overlap_mm": round(-m, 6),
+                         "margin_source": pad.get("mask_margin_source") or "?"})
+    if not pads:
+        return ({"measured": 0.0,
+                 "where": "no pad states a negative mask margin - every opening is "
+                          "at least as large as the copper under it",
+                 "pads": []},
+                {"not_applicable":
+                 "no pad has its solder-mask opening smaller than its copper, so "
+                 "there is no overlap to measure"})
+    pads.sort(key=lambda p: p["overlap_mm"])
+    sources = {}
+    for p in pads:
+        sources[p["margin_source"]] = sources.get(p["margin_source"], 0) + 1
+    count = {"measured": float(len(pads)),
+             "where": "%d pad(s) with a negative mask margin; margin came from: %s"
+                      % (len(pads), ", ".join("%s x%d" % (k, v)
+                                              for k, v in sorted(sources.items()))),
+             "pads": pads[:40],
+             "list_truncated": len(pads) > 40,
+             "widest_overlap_mm": pads[-1]["overlap_mm"]}
+    least = pads[0]
+    overlap = {"measured": least["overlap_mm"],
+               "where": "smallest overlap %s mm at %s (mask margin -%s mm, from %s)"
+                        % (least["overlap_mm"], least["ref"],
+                           least["overlap_mm"], least["margin_source"]),
+               "pads": pads[:40]}
+    return count, overlap
+
 def _copper_to_hole(items, holes, plating_mm, window_mm=5.0):
     """Another net's copper to the FINISHED hole wall: distance - drill/2 - plating.
 
@@ -2893,6 +2949,21 @@ def _dfm_facts(board, rules, layer=None, window_mm=5.0, check_clearance=True,
     else:
         facts["min_mask_web"] = _mask_web(_mask_apertures(board),
                                           window_mm=window_mm)
+
+    # -- mask-defined pads (an opening SMALLER than its copper) -------------
+    # Gated on the rules the document states, like the mask web above: a sweep
+    # nobody asked for is not a measurement, and its absence must read as
+    # "not stated", not as "none found".
+    if not [k for k in ("max_mask_defined_pads", "min_mask_defined_overlap_mm")
+            if k in rules]:
+        why = {"why": "the capability document states neither max_mask_defined_pads "
+                      "nor min_mask_defined_overlap_mm, so the pads' mask margins "
+                      "were not examined"}
+        facts["mask_defined_pads"] = dict(why)
+        facts["min_mask_defined_overlap"] = dict(why)
+    else:
+        (facts["mask_defined_pads"],
+         facts["min_mask_defined_overlap"]) = _mask_defined_pads(board)
 
     # -- copper to the finished hole wall ----------------------------------
     if "min_copper_to_hole_mm" not in rules:

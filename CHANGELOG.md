@@ -9,6 +9,48 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.82] - 2026-11-02
+
+**DFM 残余里那条「掩膜定义的焊盘」——它不是没测，是没被问过；一次遍历同时给出「有几个」和「压得最紧的那个有多紧」**
+（工具数仍 **179**，`dependencies = []` 仍成立；本版不加工具，回读走 `dfm_check` 既有的 `value["facts"]` 与 `checks`）。
+
+`NOT_CHECKED_BY_DESIGN` 里从 `0.0.56` 起就写着「掩膜定义的焊盘」，这一版把它从「不做」改成「做」：
+阻焊**开窗**比**铜**小（负的 mask margin）是两个文件里的纯几何，不读菲林图像也能算准。
+
+### 两条规则，因为一个数答不了两个问题
+
+- `max_mask_defined_pads`（count，max 方向）——「做不做这种焊盘」。
+- `min_mask_defined_overlap_mm`（mm，min 方向）——「做的话，最紧的那处压多少」。
+
+**同一块板对两条规则给出相反结论**（实测）：两个 1×1 mm 焊盘、margin −0.05/−0.03 的板上，
+`max_mask_defined_pads: 2` 判 **pass**（margin 0.0），`min_mask_defined_overlap_mm: 0.05` 判 **fail**（margin −0.02）。
+用一条规则去答另一个是**错答案**，不是缺答案——这就是分两条的理由。
+
+**符号负控制**（同一几何翻成正 margin）：计数 2 → 0、最小重叠 0.030 → `not_applicable`、掩膜桥 1.080 → 0.920 mm。
+一个符号写反会同向推动两个数，所以两条断言必须一起钉。
+
+### 口径
+
+- 焊盘**只数一次**（双面开窗不重复），未开掩膜的焊盘不数。
+- margin 优先级 **pad > footprint > `(setup (pad_to_mask_clearance))`**，负值原样透传、不 clamp；来源登记
+  `pad` / `footprint` / `setup` / `absent_treated_as_zero`。
+- **门**：文档没提这两条规则 ⇒ 两个事实都带 `were not examined`，不做无谓遍历。
+- **本版唯一一处放松既有校验**：`read_capability` 原来要求所有 limits `> 0`，这让「我们不做这种焊盘」
+  （`max_mask_defined_pads: 0`）无法表达。现在 **max 允许 0、min 取 0 仍拒、任何负值仍拒、非数仍拒**，
+  四侧都有测试钉住，最坏方向仍是 fail-closed。
+- **仍然不做**：菲林本身就是一张图，库里从不读它 ⇒「远离焊盘、也远离两个开窗之间那条桥的掩膜残余」照旧不测；
+  `NOT_CHECKED_BY_DESIGN` 改写**不删**、条数仍 **8**。
+
+### 测试与回归
+
+- 新增 `tests/test_dfm_mask_defined.py`（**27 例**）：规则目录 / 测量（单负 margin、取最小不取最大、正 margin 归零、
+  absent=0、footprint 级、setup 级、pad 优先、未开掩膜不数、双面只数一次、45 个时 `list_truncated`、掩膜桥的两个符号）/
+  判定（5 个端到端 + 只提一条规则时另一条不被报）/ 门控（2）/ 文档侧（4：max 0 接受、min 0 拒、负值拒、`min_track_width_mm: 0` 仍拒）。
+- 棘轮两处：`RULES` **15 → 17**、`rules_known` 15 → 17 与 `coverage_pct` 6.7 → 5.9。
+- `--selftest` **299/299 → 301/301**（新增 2 条：max 0 的房间，以及 count/overlap 的一次遍历）。
+- 全量回归 **`Ran 3304 tests in 1055.161s` / `OK (skipped=5)`**（0.0.81 是 3277 例 / 1024.718 s；3277 + 27）。
+- 文档：[docs/84-掩膜定义的焊盘.md](docs/84-掩膜定义的焊盘.md)（第八十四篇）。
+
 ## [0.0.81] - 2026-11-02
 
 **两家厂商都不印 Steinmetz 三元组——那就把厂商真印出来的东西入库，并给你带来的三元组一个能对账的裁判**

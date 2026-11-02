@@ -93,17 +93,37 @@ RULES = {
                 "(drill radius + the plating the document states)",
         "unit": "mm", "direction": "min", "fact": "min_copper_to_hole",
     },
+    # 0.0.82: a mask feature that does NOT come from a gap between two openings.
+    # A negative expansion means the opening is SMALLER than its copper, so the
+    # exposed area is defined by the mask and the fab has to hold that overlap
+    # lithographically. Two keys, because the two ways a fab refuses it are
+    # different questions: "we will not do mask-defined pads at all" is a COUNT
+    # of 0, and "we can, down to this much overlap" is a MINIMUM. Answering one
+    # of them for the other would be a wrong verdict, not a missing one.
+    "max_mask_defined_pads": {
+        "what": "number of pads whose solder-mask opening is smaller than its "
+                "copper (a negative mask margin)",
+        "unit": "count", "direction": "max", "fact": "mask_defined_pads",
+    },
+    "min_mask_defined_overlap_mm": {
+        "what": "smallest overlap of mask onto copper among those pads, i.e. the "
+                "negative mask margin taken as a positive overlap",
+        "unit": "mm", "direction": "min", "fact": "min_mask_defined_overlap",
+    },
 }
 
 # Things a fab capability document often states that this layer CANNOT check.
 # Listed so "not in the result" is not read as "checked and fine".
 NOT_CHECKED_BY_DESIGN = [
-    # 0.0.56 narrowed this: the web BETWEEN two openings is measured now
-    # (`min_mask_web_mm`). What is still not modelled is a mask feature that does
-    # not come from a gap - a mask-defined pad (opening smaller than the copper)
-    # and a sliver between an opening and the mask's own edge are not judged.
-    "mask-defined pads (an opening smaller than its copper) and any mask sliver "
-    "that is not the gap between two openings",
+    # 0.0.56 narrowed this to the web BETWEEN two openings
+    # (`min_mask_web_mm`); 0.0.82 narrowed it again by measuring the pad whose
+    # openING is smaller than its copper (`max_mask_defined_pads`,
+    # `min_mask_defined_overlap_mm`). What is still not modelled is a mask edge
+    # that belongs to neither of those two: this layer never reads the mask FILM,
+    # so a sliver it leaves somewhere else (at the board edge, around a zone) has
+    # no measurement behind it.
+    "solder-mask slivers away from pads and away from the gap between two openings "
+    "(the mask film itself is not read, so its own edge is not measured)",
     # 0.0.56 narrowed this too: stroke widths and character heights are measured
     # (`min_silk_line_width_mm`, `min_silk_text_height_mm`). Still not modelled:
     # items whose width the file does not state, and silk clipping over pads.
@@ -221,14 +241,25 @@ def read_capability(doc):
         if not _is_number(v):
             bad.append({"rule": k, "value": v if isinstance(v, (str, int, float))
                         else repr(v), "why": "not a finite number"})
-        elif v <= 0:
-            bad.append({"rule": k, "value": v, "why": "must be > 0"})
+        elif v < 0:
+            bad.append({"rule": k, "value": v,
+                        "why": "negative, and no rule key here points downward"})
+        elif v == 0 and RULES[k]["direction"] == "min":
+            # 0.0.82: a MAXIMUM of zero is a real limit ("this feature must not
+            # appear at all" - a fab that will not do mask-defined pads says
+            # exactly that), so zeros are accepted there. A MINIMUM of zero asks
+            # for nothing at all, which is a fill-in mistake, not a limit - and
+            # silently accepting it would report a check that can never fail.
+            bad.append({"rule": k, "value": v,
+                        "why": "a minimum of 0 asks for nothing; that is a fill-in "
+                               "error, not a limit"})
     if bad:
         return None, err("%d rule value(s) are unusable: %s"
                          % (len(bad), ", ".join(b["rule"] for b in bad)),
                          "CAPABILITY_VALUE_INVALID",
-                         hint="limits are numbers greater than zero; units live in the "
-                              "key name (_mm / _layers)",
+                         hint="limits are positive numbers, except that a MAXIMUM may "
+                              "be 0 (\"this feature must not appear at all\"); units "
+                              "live in the key name (_mm / _layers)",
                          extra={"invalid_rules": bad})
     return {k: float(v) for k, v in rules.items()}, None
 
