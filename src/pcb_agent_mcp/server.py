@@ -2687,10 +2687,36 @@ def selftest():
                   _bwrote and len(_ledger.entries(kind="route")) == _bbefore + 1
                   and _ledger.entries(kind="route")[0]["payload"]["board"] == _bdigest,
                   str(_bwrote))
+            # 0.0.94: a run names its owner. Work done inside a background job
+            # records that job's id, so `owner=` can be answered without matching
+            # timestamps - and an owner nobody used must come back empty rather
+            # than falling back to "every run".
+            from . import jobs as _jobs
+
+            def _owned_run():
+                _tools._ledger_note("route", _bb, {"verdict": "incomplete",
+                                                  "note": "owned by a job"})
+                return _jobs.current()
+
+            _job = _jobs.submit("default", _owned_run)
+            _jobs.wait(_job["id"], timeout_s=30)
+            _owned = _ledger.summary(owner=_job["id"])
+            _stranger = _ledger.summary(owner="route-999-nobody")
+            check("a run made inside a job records that job as its owner, and an "
+                  "owner filter is a filter rather than a fallback",
+                  _owned["count"] == 1
+                  and _owned["runs"][0]["owner"] == _job["id"]
+                  and _ledger.entries(owner=_job["id"])[0]["payload"]["verdict"]
+                  == "incomplete"
+                  and _stranger["count"] == 0
+                  and _jobs.current() is None
+                  and _tools.call_tool("board_run_ledger", {"owner": ""})
+                  .get("reason_code") == "ARG_INVALID",
+                  str((_owned["count"], _stranger["count"], _job["id"])))
             os.environ["PCB_AGENT_LEDGER"] = "0"
             check("the ledger's one switch off writes nothing at all",
                   _ledger.record("route", {"verdict": "routed"}) is False
-                  and len(_ledger.entries(kind="route")) == _bbefore + 1)
+                  and len(_ledger.entries(kind="route")) == _bbefore + 2)
         finally:
             os.environ.pop("PCB_AGENT_LEDGER", None)
             if _bhome is None:
@@ -5435,8 +5461,10 @@ def selftest():
           "exactly one (board_dangling_copper), and 0.0.92 arguments only "
           "(the LCEDA reader now honours a through-hole pad's own layer code "
           "and gets the bottom-side transform right; the tool gained pad_trust), "
-          "and 0.0.93 adds exactly seven (the experience library: recall, "
-          "check, candidate, promote, outcome, export, import)",
+          "0.0.93 exactly seven (the experience library: recall, check, "
+          "candidate, promote, outcome, export, import), and 0.0.94 arguments "
+          "only (ledger runs now name the job that made them, and "
+          "board_run_ledger filters by it)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"

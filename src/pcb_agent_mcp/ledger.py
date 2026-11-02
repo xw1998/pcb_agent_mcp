@@ -14,7 +14,11 @@ Rules this module keeps:
   reused as a result;
 * **it holds no design data it does not need** - a digest, the arguments that
   change behaviour, the verdict, and nothing that could reconstruct the board;
-* **default on, one switch off** - `PCB_AGENT_LEDGER=0` writes nothing at all.
+* **default on, one switch off** - `PCB_AGENT_LEDGER=0` writes nothing at all;
+* **a run names its owner** - when the work ran inside a background job the line
+  carries that job's id, so `board_run_ledger(owner=...)` can answer "what did
+  *that* job do" without matching on timestamps. A run made directly in a request
+  has no owner and says `null` rather than borrowing the nearest id.
 """
 import hashlib
 import json
@@ -48,11 +52,12 @@ def digest(board_path):
     except (OSError, TypeError):
         return None
 
-def record(kind, payload):
+def record(kind, payload, owner=None):
     """Append one run. Returns True when it was written; never raises.
 
     A failure to record must never fail the tool that was asked to do real work,
-    so every exception here ends as `False`.
+    so every exception here ends as `False`. `owner` is the job id the work ran
+    under, or None for work done directly in a request.
     """
     if not enabled():
         return False
@@ -63,6 +68,7 @@ def record(kind, payload):
         line = {"at": round(time.time(), 3),
                 "kind": kind,
                 "version": _version(),
+                "owner": owner or None,
                 "payload": payload}
         text = json.dumps(line, ensure_ascii=False, sort_keys=True, default=str)
         target = path()
@@ -87,7 +93,7 @@ def _version():
     except Exception:                      # noqa: BLE001
         return None
 
-def entries(kind=None, digest_value=None, limit=50):
+def entries(kind=None, digest_value=None, limit=50, owner=None):
     """Newest first. A malformed line is skipped, never fatal."""
     target = path()
     if not os.path.isfile(target):
@@ -107,20 +113,22 @@ def entries(kind=None, digest_value=None, limit=50):
                     continue
                 if digest_value and (row.get("payload") or {}).get("board") != digest_value:
                     continue
+                if owner and row.get("owner") != owner:
+                    continue
                 out.append(row)
     except OSError:
         return []
     out.reverse()
     return out[:int(limit)] if limit else out
 
-def summary(kind=None, digest_value=None, limit=50):
+def summary(kind=None, digest_value=None, limit=50, owner=None):
     """A compact view: one row per run, plus the totals worth knowing."""
-    rows = entries(kind=kind, digest_value=digest_value, limit=limit)
+    rows = entries(kind=kind, digest_value=digest_value, limit=limit, owner=owner)
     compact = []
     for row in rows:
         p = row.get("payload") or {}
         compact.append({"at": row.get("at"), "kind": row.get("kind"),
-                        "version": row.get("version"),
+                        "version": row.get("version"), "owner": row.get("owner"),
                         "board": (p.get("board") or "")[:12],
                         "verdict": p.get("verdict"), "note": p.get("note")})
     totals = {}

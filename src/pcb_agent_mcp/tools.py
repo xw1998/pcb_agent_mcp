@@ -2430,10 +2430,11 @@ def _ledger_note(kind, board_path, payload):
     never be able to fail the work that happened.
     """
     try:
+        from . import jobs as _jobs
         from . import ledger as _ledger
         body = dict(payload)
         body["board"] = _ledger.digest(board_path)
-        _ledger.record(kind, body)
+        _ledger.record(kind, body, owner=_jobs.current())
     except Exception:                        # noqa: BLE001 - see docstring
         pass
 
@@ -2604,15 +2605,29 @@ def _board_run_ledger(args):
         if digest_value is None:
             return err("cannot read %s, so its digest is unknown" % args["path"],
                        "FILE_UNREADABLE")
+    owner = args.get("owner")
+    if owner is not None and not isinstance(owner, str):
+        return err("owner must be a job id string", "ARG_INVALID")
+    if owner == "":
+        # An empty string is not "no filter" spelled differently: it would silently
+        # return every run whose owner is null, which is the opposite of asking.
+        return err("owner must be a job id, not an empty string", "ARG_INVALID")
     limit = args.get("limit")
     limit = 20 if limit is None else int(limit)
-    got = _ledger.summary(kind=kind, digest_value=digest_value, limit=limit)
+    got = _ledger.summary(kind=kind, digest_value=digest_value, limit=limit,
+                          owner=owner)
     return ok({"enabled": _ledger.enabled(), "file": got["file"],
                "count": got["count"], "totals": got["totals"],
                "runs": got["runs"],
                "board_digest": (None if digest_value is None
                                 else digest_value[:12]),
+               "owner": owner,
+               "owner_note": ("runs made inside a background job carry that job's id; "
+                              "runs made directly in a request carry null"
+                              if owner is None else
+                              "only runs made under job %s are listed" % owner),
                "stores_per_line": ["board digest (sha256, first 12 shown)",
+                                   "the job id the work ran under, or null",
                                    "the arguments that change behaviour",
                                    "the verdict"],
                "holds_no_design_data": True},
@@ -2640,6 +2655,8 @@ _tool(
     "line per routing / fan-out / DRC / fab / apply run, keyed by the sha256 of the "
     "board file, holding the arguments that change behaviour and the verdict - so a "
     "second attempt does not have to re-derive what the first one learned. It is a "
+    "A run made inside a background job also records that job's id, so owner=... "
+    "answers 'what did that job do' without matching on timestamps. It is a "
     "RECORD, not a cache: nothing here is ever reused as a result, and no line "
     "contains design data that could reconstruct the board. Recording is best effort "
     "and never changes what a tool returns; PCB_AGENT_LEDGER=0 disables it entirely. "
@@ -2648,6 +2665,8 @@ _tool(
      "properties": dict({
          "kind": _str("only runs of this kind", enum=list(
              ("route", "fanout", "drc", "fab", "apply"))),
+         "owner": _str("only runs made under this background job id "
+                       "(board_job(action='list') shows the ids)", None),
          "limit": _num("newest first, at most this many rows (default 20)", 20),
      }, **_COMMON),
      "required": []},

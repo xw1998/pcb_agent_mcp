@@ -181,5 +181,60 @@ class TestTheTool(LedgerBase):
         self.assertEqual(out["reason_code"], "FILE_UNREADABLE")
         self.assertIn("digest is unknown", out["message"])
 
+class TestWhoRanIt(LedgerBase):
+    """A run names its owner, and asking for an owner is not asking for everything."""
+
+    def call(self, **args):
+        return tools.call_tool("board_run_ledger", args)
+
+    def test_a_request_thread_has_no_owner(self):
+        from pcb_agent_mcp import jobs
+        self.assertIsNone(jobs.current())
+
+    def test_work_inside_a_job_records_that_job_as_the_owner(self):
+        from pcb_agent_mcp import jobs
+        box = {}
+
+        def work():
+            box["owner"] = jobs.current()
+            ledger.record("route", {"board": ledger.digest(self.board),
+                                    "verdict": "routed"}, owner=jobs.current())
+            return True
+
+        job = jobs.submit("default", work)
+        jobs.wait(job["id"], timeout_s=10)
+        self.assertEqual(box["owner"], job["id"])
+        got = ledger.summary(owner=job["id"])
+        self.assertEqual(got["count"], 1)
+        self.assertEqual(got["runs"][0]["owner"], job["id"])
+        # and once the thread is done the next caller is nobody's job again
+        self.assertIsNone(jobs.current())
+
+    def test_an_owner_filter_does_not_silently_return_everything(self):
+        ledger.record("route", {"board": "0" * 64, "verdict": "routed"})
+        ledger.record("route", {"board": "0" * 64, "verdict": "routed"},
+                      owner="route-1-abc123")
+        self.assertEqual(ledger.summary()["count"], 2)
+        self.assertEqual(ledger.summary(owner="route-1-abc123")["count"], 1)
+        # the negative control: an owner nobody used returns nothing rather than
+        # falling back to "all runs"
+        self.assertEqual(ledger.summary(owner="route-9-zzzzzz")["count"], 0)
+
+    def test_the_tool_filters_by_owner_and_says_which(self):
+        ledger.record("route", {"board": "0" * 64, "verdict": "routed"},
+                      owner="route-2-def456")
+        out = self.call(owner="route-2-def456")
+        self.assertEqual(out["status"], "ok", out)
+        self.assertEqual(out["value"]["count"], 1)
+        self.assertEqual(out["value"]["owner"], "route-2-def456")
+        self.assertIn("route-2-def456", out["value"]["owner_note"])
+        other = self.call(owner="route-3-111111")
+        self.assertEqual(other["value"]["count"], 0)
+
+    def test_an_empty_owner_is_refused_instead_of_meaning_all(self):
+        out = self.call(owner="")
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "ARG_INVALID")
+
 if __name__ == "__main__":
     unittest.main()

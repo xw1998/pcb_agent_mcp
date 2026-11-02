@@ -50,6 +50,15 @@ _LOCK = threading.Lock()
 _JOBS = {}
 _SEQ = [0]
 
+# Which job the current thread is running, so anything the work records can name
+# its owner without every call site having to thread an id through. A thread
+# that is not running a job sees None and records nothing rather than guessing.
+_CURRENT = threading.local()
+
+def current():
+    """The id of the job whose worker thread this is, or None."""
+    return getattr(_CURRENT, "jid", None)
+
 class JobError(Exception):
     """A refusal from this module rather than from the work."""
 
@@ -107,6 +116,7 @@ def submit(kind, fn, label=None, timeout_hint_s=None):
     return accepted
 
 def _work(jid, fn):
+    _CURRENT.jid = jid
     try:
         value = fn()
         with _LOCK:
@@ -130,6 +140,8 @@ def _work(jid, fn):
             job["state"] = "cancelled" if job["cancel_requested"] else "failed"
             job["error"] = {"type": type(exc).__name__, "message": str(exc)}
             job["finished_at"] = round(time.time(), 3)
+    finally:
+        _CURRENT.jid = None
 
 def snapshot(jid):
     """One job as it currently stands. Never invents a result."""
