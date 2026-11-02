@@ -9,6 +9,51 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.93] - 2026-11-02
+
+**经验累积层：两条链、七条随包发出的实测条目、七个工具**
+（工具数 **181 → 188** / `calc_capabilities.available` **175 → 182** /
+`not_implemented_yet` **23**（不变）/ `--selftest` **327/327** / `dependencies = []` 仍成立）
+
+`docs/02 §B` 的「经验累积」此前只有名字没有实现，[docs/94](docs/94-经验累积模块与语料.md) 是它的正文。
+
+### 1. 两条链，一条红线
+
+`hard`（有失败侧、板上可测的规则，违反＝缺陷）与 `soft`（好板子的习惯，违背＝问一句）分开判；
+`violated` 只留给 hard，soft 用 `outside_habit`；`pad_placement_verified` 问的是「读者能不能担保输入」，
+单列 `verified`/`unverified`，不进缺陷列表；量不出来是 `not_checkable_here`，**不是** pass。
+**候选永不自己变成规则**：`promote` 要 `confirm=true` + `reason`；`candidate`/`promote`/`outcome`/`import`
+四个写入口一致拒绝 `exp.seed.*`，否则一个候选就能影子掉一条在役硬规则。
+
+### 2. 种子：6 个真实工程、20 块板、16 522 段铜、12 805 个 via
+
+`data/experience_seed.json`（新文件，只读）7 条 active：
+走线 45° 栅格 16 336 成立 / 186 不成立（1.1258 %，最差一块 144 段）、
+via 环宽 19 / 0、via 几何单一 15 / 4、电源线更宽 18 / 1、线宽 ≤12 种 19 / 1、
+通孔跨层 235 / 0、焊盘位置可担保 0 / 6。
+**数字由 `experience.observe()` 自己产出**（`corpus.measured_with` 写明），生成脚本不入库——
+随包数字与运行时数字不可能出自两套公式。
+
+### 3. 两个被真实板子撞出来的陷阱
+
+- `(0.5−0.3)/2 = 0.09999999999999998 < 0.1` ⇒ 一块真实出货板上 **1497 个 via 被判环宽过薄**；
+  加 `RING_EPS_MM = 1e-6`。
+- 同一个 24 mil via 一个文件写 `0.6096 mm`、另一个写 `0.61 mm` ⇒ `round(x, 4)` 把 **5 块好板判成两种几何**；
+  分组改 `round(x, 3)`，回到 15 / 19。
+
+### 4. 七个工具与开关
+
+`experience_recall` / `experience_check` / `experience_candidate` / `experience_promote` /
+`experience_outcome` / `experience_export` / `experience_import`；本地库 `PCB_AGENT_HOME/experience.json`。
+`PCB_AGENT_EXPERIENCE=0` 时给 `DATA_UNAVAILABLE` 而**不是空列表**（「关掉了」与「库里是空的」是两个答案）。
+默认开着且不改任何既有答案，靠的是没有任何既有工具调用它。
+
+### 5. 判据
+
+`tests/test_experience.py` **24 例**（种子的度量必须是模块认识的那七个；soft 永不说 violated；
+0.1 环不算 below；同一 via 两种单位算一个；候选不进 active；导入不是提升；关闭 = `DATA_UNAVAILABLE`）。
+`--selftest` 新增 9104–9112 共 9 个编号，**327/327**。
+
 ## [0.0.92] - 2026-11-02
 
 **在真实板上量出来的两处错读数：通孔焊盘跨层 + 底面不镜像；顺带一个 `pad_trust` 闸门**

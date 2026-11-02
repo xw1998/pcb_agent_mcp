@@ -1,0 +1,169 @@
+{
+ "schema": 1,
+ "corpus": {
+  "boards": 20,
+  "tracks": 16522,
+  "vias": 12805,
+  "packed_projects": 6,
+  "origin": "C:/Users/14905/OneDrive/Documents/LCEDA-Pro/online-projects-backup - the newest zip of each project, copied into _scratch/corpus and never written to",
+  "measured_with": "pcb_agent_mcp.experience.observe (same code that judges a board at run time)"
+ },
+ "entries": [
+  {
+   "id": "exp.seed.track-angle-on-45",
+   "kind": "soft",
+   "status": "active",
+   "scope": "route.geometry",
+   "trigger": {
+    "board_metric": "tracks_off_45_grid",
+    "tolerance_deg": 0.5,
+    "max_off_grid_share": 0.02
+   },
+   "claim": "A finished board is drawn on the 45 degree grid: 16336 of 16522 segments sit within 0.5 deg of a multiple of 45, and the 186 that do not are hand-tuned diagonals, none of them more than 22.5 degrees off (median of the off ones: 8.13, 90th percentile: 21.16). A board that leaves more than 2% of its segments off the grid is not drawing on it any more.",
+   "action": "Route on the 45 degree grid. A segment off it is something a person moved by hand, not something an autorouter produced - and it is worth reading before it is worth fixing.",
+   "evidence": {
+    "hits": 16336,
+    "violated": 186,
+    "sources": [
+     "6 LCEDA-Pro projects, 20 boards, 16522 net-bearing segments",
+     "off-grid share 1.1258% (this is the real number: an earlier round reported 0 because the binning wrapped 179.9 deg back to 0 deg)",
+     "deviation percentiles of the 186 off-grid segments: median 8.13 deg, p90 21.16 deg, max 22.50 deg",
+     "worst board: df224a1fb02947818097e3ccb8d479ff.epcb with 144 off-grid segments",
+     "zero-length segments: 0"
+    ]
+   },
+   "confidence": "measured",
+   "owner": "pcb_agent_mcp 0.0.93 corpus survey"
+  },
+  {
+   "id": "exp.seed.via-annular-ring",
+   "kind": "hard",
+   "status": "active",
+   "scope": "fab",
+   "trigger": {
+    "board_metric": "via_annular_ring_below",
+    "min_mm": 0.1
+   },
+   "claim": "No via on a finished board has an annular ring below 0.10 mm: 19 of 19 boards with vias pass, and the smallest ring in the whole corpus is 0.1000 mm.",
+   "action": "Treat a via with a ring under 0.10 mm as a fabrication defect candidate, not as a tight-but-fine design choice. The realistic floor on these boards is 0.152 mm (11 of 20) with 0.10 as the absolute edge (4 of 20), so 0.10 is a floor and not a target.",
+   "evidence": {
+    "hits": 19,
+    "violated": 0,
+    "sources": [
+     "19 LCEDA-Pro boards with at least one via; ring = (diameter - drill) / 2",
+     "per-board minimum ring: 0.152 (11 boards), 0.153 (4), 0.10 (4), no vias (1)"
+    ]
+   },
+   "confidence": "measured",
+   "owner": "pcb_agent_mcp 0.0.93 corpus survey"
+  },
+  {
+   "id": "exp.seed.via-palette-single",
+   "kind": "soft",
+   "status": "active",
+   "scope": "route.via",
+   "trigger": {
+    "board_metric": "distinct_via_geometries",
+    "max_distinct": 1
+   },
+   "claim": "A board uses one via geometry: 15 of 19 boards with vias have exactly one (diameter, drill) pair.",
+   "action": "Prefer a single via geometry per board. A second geometry is not a defect - it is a habit worth asking about, because it usually means two people or two rules drew the same board.",
+   "evidence": {
+    "hits": 15,
+    "violated": 4,
+    "sources": [
+     "19 LCEDA-Pro boards with vias, counted by exact (diameter, drill) pair"
+    ]
+   },
+   "confidence": "measured, soft",
+   "owner": "pcb_agent_mcp 0.0.93 corpus survey"
+  },
+  {
+   "id": "exp.seed.power-wider-than-signal",
+   "kind": "soft",
+   "status": "active",
+   "scope": "route.width",
+   "trigger": {
+    "board_metric": "power_wider_than_signal"
+   },
+   "claim": "Power copper is wider than signal copper: on 18 of 19 checkable boards the median power track width exceeds the median signal width.",
+   "action": "Start a power net at or above the signal width and go up from there. This is what the boards do, not a rule about what current needs - for that, width_for_current is the tool.",
+   "evidence": {
+    "hits": 18,
+    "violated": 1,
+    "sources": [
+     "19 LCEDA-Pro boards; power nets recognised by substring: VCC, VDD, VIN, VBUS, VBAT, GND, VSS, +5, +3, +12, 3V3, 5V, 12V, VCCIO, AVDD, DVDD, PWR, V+, V-",
+     "a board with no power net or no signal net is not counted either way"
+    ]
+   },
+   "confidence": "measured, soft",
+   "owner": "pcb_agent_mcp 0.0.93 corpus survey"
+  },
+  {
+   "id": "exp.seed.track-width-palette",
+   "kind": "soft",
+   "status": "active",
+   "scope": "route.width",
+   "trigger": {
+    "board_metric": "distinct_track_widths",
+    "max_distinct": 12
+   },
+   "claim": "A board carries a small palette of widths: the median board uses 8 distinct widths (range 1 to 19), and 19 of 20 stay at or under 12.",
+   "action": "Ask why a width exists before adding a new one. A board with nineteen widths is not necessarily wrong - it is a board where width stopped meaning something.",
+   "evidence": {
+    "hits": 19,
+    "violated": 1,
+    "sources": [
+     "20 LCEDA-Pro boards; per-board distinct widths sorted: [1, 4, 4, 4, 4, 5, 6, 6, 6, 8, 8, 8, 9, 9, 9, 10, 12, 12, 12, 19]"
+    ]
+   },
+   "confidence": "measured, soft",
+   "owner": "pcb_agent_mcp 0.0.93 corpus survey"
+  },
+  {
+   "id": "exp.seed.lceda-through-hole-spans",
+   "kind": "hard",
+   "status": "active",
+   "scope": "format.lceda",
+   "trigger": {
+    "board_metric": "through_hole_pads_single_layer"
+   },
+   "claim": "In an LCEDA-Pro board a drilled pad is on every copper layer - a plated through hole - and never on one side only: 235 of 235 drilled pads span all copper.",
+   "action": "When reading an LCEDA-Pro board, treat a pad whose layer code is 12 (or that carries a hole) as `*.Cu` rather than as the component's side. Getting this wrong leaves every through-hole pad's copper unattached on the far side.",
+   "evidence": {
+    "hits": 235,
+    "violated": 0,
+    "sources": [
+     "6 packed LCEDA-Pro projects, 235 drilled pads in placed footprints",
+     "layer codes over all 4724 pad records (library definitions included): ('1', no hole) 4308, ('2', no hole) 3, ('12', hole) 413 - that table is what the adapter fix was measured on; the 235 here are the placed through-hole pads",
+     "the rule is code 12 OR any hole; the corpus has no exception",
+     "code 12 does not require a hole: 2 loose pads carry layer MULTI with no drill, and they are multi-layer too"
+    ]
+   },
+   "confidence": "measured",
+   "owner": "pcb_agent_mcp 0.0.92 adapter fix"
+  },
+  {
+   "id": "exp.seed.lceda-pad-placement-unverified",
+   "kind": "hard",
+   "status": "active",
+   "scope": "format.lceda",
+   "trigger": {
+    "board_metric": "pad_placement_verified"
+   },
+   "claim": "An LCEDA-Pro board read offline does not state pad placement that has been verified against the application: 6 of 6 projects carry verified_by_app=false, and the transform matches 62.1% of top-side / 82.6% of bottom-side pad endpoints exactly - a lower bound, not an accuracy.",
+   "action": "Any conclusion that rests on where the pads are - dangling copper being cuttable, a fanout target, a clearance to a pad - is a candidate and not a verdict on an offline LCEDA-Pro file. pad_trust in board_dangling_copper already enforces this.",
+   "evidence": {
+    "hits": 0,
+    "violated": 6,
+    "sources": [
+     "6 packed LCEDA-Pro projects",
+     "2549 net-bearing pads, 0.05 mm tolerance: no mirror 62.1% top / 82.6% bottom; -y 37.0%/53.2%; -x 3.0%/6.0%",
+     "cross-net hits 1/1/0/0 top and 3/2/0/0 bottom - the ordering is not a tolerance artefact"
+    ]
+   },
+   "confidence": "measured",
+   "owner": "pcb_agent_mcp 0.0.92 adapter fix"
+  }
+ ]
+}

@@ -3840,6 +3840,27 @@ def _capabilities(_args):
                      "checkpoint, atomic write, five independent gates, rollback on any "
                      "failure). KiCad edits are re-judged by kicad-cli; a new DRC "
                      "violation blocks the write",
+            "experience": "what the corpus of real boards taught, kept as two chains "
+                          "that are not interchangeable: HARD entries are rules with a "
+                          "failure side measured on a board (via annular ring under "
+                          "0.10 mm, a drilled pad that is not on every copper layer) "
+                          "and a violation is a finding; SOFT entries are base rates "
+                          "of a habit (power copper wider than signal copper, one via "
+                          "geometry per board) and leaving one is a question, not a "
+                          "defect. Every entry states the corpus as a numerator with "
+                          "its denominator, and every entry is judged by a metric "
+                          "this server can actually evaluate - a metric that cannot "
+                          "run comes back not_checkable_here, never as a pass. What "
+                          "it does NOT do: promote anything by itself (a candidate "
+                          "needs confirm=true and a human reason), learn from the "
+                          "board it is checking (experience_check writes nothing), "
+                          "or cover anything the seven metrics do not measure - no "
+                          "impedance, no EMC, no placement. The seed numbers come "
+                          "from 20 real LCEDA-Pro boards with copper (16522 track "
+                          "segments, 12805 vias, plus 6 packed projects for the pad "
+                          "rules) and are read-only: a "
+                          "shipped number that a local edit could change is not "
+                          "evidence",
             "parts": "the real part catalogue, not a part generator. Offline it reads "
                      "the SQLite library LCEDA Pro ships (lceda-std.elib: 16k devices, "
                      "21k symbol/footprint documents, 385k attribute rows with real "
@@ -3954,6 +3975,9 @@ def _capabilities(_args):
             "schematic_pcb_diff", "schematic_pcb_sync", "schematic_export",
             "board_blockers", "board_run_ledger", "board_fanout", "board_intent",
             "lceda_pcb_write",
+            "experience_recall", "experience_check", "experience_candidate",
+            "experience_promote", "experience_outcome", "experience_export",
+            "experience_import",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "only for safety_standard families other than "
@@ -9079,6 +9103,394 @@ _tool(
      }},
     lambda a: _guarded(lambda: _fullwave_solver(a)),
 )
+
+# ------------------------------------------------------------- experience
+# The library of what the corpus taught, and the refusal that keeps it from
+# becoming a rule nobody confirmed. `docs/02` section B is the design; `docs/94`
+# is what changed when it became code.
+def _experience():
+    """The module, or the error saying why this answer cannot be given."""
+    from . import experience as _exp
+    if not _exp.enabled():
+        return None, err("the experience library is switched off "
+                         "(PCB_AGENT_EXPERIENCE=0): nothing is read and nothing is "
+                         "written", "DATA_UNAVAILABLE",
+                         hint="unset PCB_AGENT_EXPERIENCE to read the library again")
+    return _exp, None
+
+_EXP_KIND = _str("hard = a rule with a failure side that is measured on the board "
+                 "(a violation is a finding); soft = a habit the good boards share "
+                 "(a departure is a question, not a defect)")
+_EXP_STATUS = _str("candidate = an observation nobody has confirmed; active = in "
+                   "force; retired = kept for the record, not applied")
+_EXP_SCOPE = _str("dotted scope: route.geometry, route.via, route.width, fab, "
+                  "format.lceda, ...")
+_EXP_METRIC = _str("which measurement decides this entry. Every metric here is "
+                   "implemented and can fail; a trigger naming anything else is "
+                   "refused rather than reported as passed")
+_EXP_TRIGGER = dict({
+    "min_mm": _num("threshold for via_annular_ring_below, in mm"),
+    "max_distinct": _num("threshold for distinct_via_geometries / "
+                         "distinct_track_widths"),
+    "tolerance_deg": _num("tolerance for tracks_off_45_grid, in degrees (default 0.5)"),
+    "max_off_grid_share": _num("largest share of segments that may sit off the grid "
+                               "(default 0.0, so any off-grid segment departs)"),
+})
+
+_tool(
+    "experience_recall",
+    "Read what this server has learned from boards it did not draw. Two kinds, and "
+    "they are not interchangeable: HARD entries are rules with a failure side that is "
+    "measured on the board (a via ring under 0.10 mm, a drilled pad that is not on "
+    "every copper layer) - a violation is a defect. SOFT entries are habits the good "
+    "boards share (power copper wider than signal copper, one via geometry per "
+    "board) - leaving one is a question, not a defect. Every entry carries the corpus "
+    "it came from as a numerator with a denominator, and every entry can be evaluated "
+    "on a board by experience_report. Only ACTIVE entries are recalled by default: a "
+    "candidate is an observation nobody confirmed, and this tool will not let it shape "
+    "work before someone does. The seed that ships with the package is read-only, so "
+    "the shipped numbers cannot drift from a local edit; runtime learning goes to "
+    "$PCB_AGENT_HOME/experience.json and shadows a seed entry of the same id, which is "
+    "reported as shadowed_seed_ids rather than hidden.",
+    {"type": "object",
+     "properties": {
+         "scope": _EXP_SCOPE,
+         "kind": _EXP_KIND,
+         "status": _str("default active. 'any' reads every status, candidates and "
+                        "retired included", ["active", "candidate", "retired", "any"],
+                        "active"),
+         "query": _str("substring, matched against id / claim / action / scope"),
+         "limit": _num("how many entries to return (default 50)", 50),
+     }},
+    lambda a: _guarded(lambda: _experience_recall(a)),
+)
+
+def _experience_recall(args):
+    exp, e = _experience()
+    if e:
+        return e
+    status = args.get("status") or "active"
+    got = exp.recall(scope=args.get("scope"),
+                     kind=args.get("kind"),
+                     status=None if status == "any" else status,
+                     query=args.get("query"),
+                     limit=int(args.get("limit") or 50))
+    value = {
+        "entries": [_experience_row(entry) for entry in got["entries"]],
+        "matched": got["matched"],
+        "library": got["library"],
+        "status_filter": got["status_filter"],
+        "store": got["store"],
+        "seed": got["seed"],
+        "statuses_are": {"candidate": "an observation, never applied",
+                         "active": "in force",
+                         "retired": "kept for the record, not applied"},
+    }
+    out = ok(value, "entries",
+             model="a two-chain library (hard rules with a measured failure side, "
+                   "soft habits with a measured base rate) keyed by a metric this "
+                   "module can actually evaluate",
+             basis="docs/02 section B (designed before there was code) and docs/94 "
+                   "(what changed when it became code); the seed entries were "
+                   "measured on 20 real LCEDA-Pro boards, 16522 track segments, by "
+                   "pcb_agent_mcp.experience.observe itself",
+             precision="counts are exact on the corpus they name; no entry states a "
+                       "number without the denominator it came from",
+             assumptions={"a soft entry is not a rule": True,
+                          "recall is read-only": True})
+    if not got["entries"]:
+        out["message"] = ("nothing matches that filter; %d entries exist in the "
+                          "library (%s)" % (got["library"]["total"],
+                                            ", ".join("%s %d" % (k, v) for k, v in
+                                                      sorted(got["library"].items())
+                                                      if k != "total")))
+    return out
+
+def _experience_row(entry):
+    return {"id": entry.get("id"),
+            "kind": entry.get("kind"),
+            "status": entry.get("status"),
+            "scope": entry.get("scope"),
+            "claim": entry.get("claim"),
+            "action": entry.get("action"),
+            "trigger": entry.get("trigger"),
+            "evidence": entry.get("evidence"),
+            "confidence": entry.get("confidence"),
+            "origin": entry.get("origin"),
+            "owner": entry.get("owner"),
+            "updated_at": entry.get("updated_at")}
+
+_tool(
+    "experience_check",
+    "Check a board against the active library. Read-only: it measures and reports, it "
+    "never rewrites the board and never writes an entry. The verdict names are kept "
+    "apart on purpose - a HARD entry that comes back `violated` is a finding (a via "
+    "whose ring is under 0.10 mm), a SOFT one that comes back `outside_habit` says "
+    "this board does something the good boards mostly do not (which is a question), "
+    "and `unverified` says the READER could not certify the input (an offline "
+    "LCEDA-Pro file does not state that its pad placement was checked against the "
+    "application) - an admission, not a defect. A metric that cannot run on this "
+    "board comes back `not_checkable_here`, never as a pass. Each row carries the "
+    "measurement it was judged on, the denominator, and how it was measured.",
+    {"type": "object",
+     "properties": {
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "member": _str("member inside an .epro / .eprj2 archive"),
+         "project": _str("project directory inside an .epro archive"),
+         "scope": _EXP_SCOPE,
+         "status": _str("which entries to apply (default active)",
+                        ["active", "candidate", "any"], "active"),
+     },
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _experience_report(a)),
+)
+
+def _experience_report(args):
+    exp, e = _experience()
+    if e:
+        return e
+    board, e = _load_board(args)
+    if e:
+        return e
+    status = args.get("status") or "active"
+    got = exp.report(board, scope=args.get("scope"),
+                     status=None if status == "any" else status)
+    out = ok(got, "verdicts",
+             model="each metric measured on the board by the same code that "
+                   "measured the corpus it is compared against, so a seed number "
+                   "and a board reading cannot come from two different formulas",
+             basis="docs/02 section B; the corpus behind the seed is 20 real "
+                   "LCEDA-Pro boards (docs/94)",
+             precision="one verdict per entry; the measurement and its denominator "
+                       "are reported beside it",
+             assumptions={"soft is not a rule": True,
+                          "writes_nothing": got["writes_nothing"]})
+    if got["hard_violations"]:
+        out["message"] = ("%d hard violation(s): %s"
+                          % (len(got["hard_violations"]),
+                             ", ".join(got["hard_violations"])))
+    elif got["unverified"]:
+        out["message"] = ("no hard violation; %d entr(y/ies) could not be certified "
+                          "on this file and say so: %s"
+                          % (len(got["unverified"]), ", ".join(got["unverified"])))
+    else:
+        out["message"] = "no hard violation on this board"
+    return out
+
+_tool(
+    "experience_candidate",
+    "Write an observation down as a CANDIDATE. It is never applied by this call and "
+    "never becomes a rule by itself: experience_promote needs confirm=true and a "
+    "human reason. An entry that cannot be evaluated later is refused at this door - "
+    "no id, an unknown kind, a trigger that names no board_metric, a metric this "
+    "module does not implement, or an empty claim. A candidate that could not fail is "
+    "just an opinion, and this library does not store opinions.",
+    {"type": "object",
+     "properties": dict({
+         "id": _str("stable id, e.g. exp.local.my-observation"),
+         "kind": _EXP_KIND,
+         "scope": _EXP_SCOPE,
+         "claim": _str("what is claimed, as a sentence a measurement can contradict"),
+         "action": _str("what to do about it"),
+         "metric": _EXP_METRIC,
+         "confidence": _str("how much the observation is worth, in your words"),
+         "owner": _str("who observed it"),
+         "note": _str("appended to action verbatim"),
+     }, **_EXP_TRIGGER),
+     "required": ["id", "kind", "claim", "metric"]},
+    lambda a: _guarded(lambda: _experience_candidate(a)),
+)
+
+def _experience_candidate(args):
+    exp, e = _experience()
+    if e:
+        return e
+    trigger = {"board_metric": args.get("metric")}
+    for key in ("min_mm", "max_distinct", "tolerance_deg", "max_off_grid_share"):
+        if args.get(key) is not None:
+            trigger[key] = float(args[key])
+    entry = {"id": args.get("id"), "kind": args.get("kind"),
+             "scope": args.get("scope"), "claim": args.get("claim"),
+             "action": args.get("action"), "trigger": trigger,
+             "confidence": args.get("confidence"), "owner": args.get("owner"),
+             "evidence": {"hits": None, "violated": None, "sources": []}}
+    try:
+        written = exp.candidate(entry, note=args.get("note"))
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID",
+                   hint="nothing was written: " + exp.path())
+    out = ok({"entry": _experience_row(written), "store": exp.path(),
+              "writes_nothing": False},
+             "entry",
+             model="a candidate: an observation stored so it can be evaluated later, "
+                   "carrying the metric that will judge it",
+             basis="docs/02 section B - the red line is that a candidate never "
+                   "becomes active on its own",
+             precision="the claim is prose; the trigger is the machine-checkable "
+                       "part, and it is the only part that can fail",
+             assumptions={"applied": False})
+    out["next_step"] = ("experience_check will evaluate it (status='candidate'); "
+                        "experience_promote id=%r confirm=true reason=... turns it "
+                        "into a rule, and only a person can do that"
+                        % written["id"])
+    return out
+
+_tool(
+    "experience_promote",
+    "Turn a candidate into an active entry. confirm=true is required and is not "
+    "decorative: the alternative - promoting on counters alone - is exactly the "
+    "failure mode the design forbids, because a number crossing a threshold is not a "
+    "person deciding the claim is true. A seed entry cannot be promoted or edited "
+    "(it ships with the package and would be lost on update): copy it to a new id. "
+    "A retired entry cannot be re-promoted by this call either.",
+    {"type": "object",
+     "properties": {
+         "id": _str("the candidate's id"),
+         "confirm": _bool("must be true. false or absent is refused"),
+         "reason": _str("why this is believed - stored with the entry"),
+     },
+     "required": ["id", "confirm", "reason"]},
+    lambda a: _guarded(lambda: _experience_promote(a)),
+)
+
+def _experience_promote(args):
+    exp, e = _experience()
+    if e:
+        return e
+    try:
+        got = exp.promote(args.get("id"), confirm=args.get("confirm"),
+                          reason=args.get("reason"))
+    except PermissionError as exc:
+        return err(str(exc), "ARG_INVALID",
+                   hint="pass confirm=true and a reason to promote %r"
+                        % args.get("id"))
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    except KeyError as exc:
+        return err(str(exc).strip("\'\""), "NOT_FOUND",
+                   hint="experience_recall status='candidate' lists what can be "
+                        "promoted")
+    return ok({"entry": _experience_row(got), "store": exp.path()}, "entry",
+              model="candidate -> active, on a person's confirmation",
+              basis="docs/02 section B (the red line)",
+              precision="one status change; the reason is stored verbatim",
+              assumptions={"promoted_by": got.get("promoted_by") or ""},
+              extra={"writes_nothing": False})
+
+_tool(
+    "experience_outcome",
+    "Record that an active entry did or did not hold on a real board. Counters only: "
+    "hits / violated, plus the note in sources. This is the feedback half of the loop "
+    "and it does NOT change an entry's status - an entry that starts failing on real "
+    "boards is still the entry a person confirmed, and demoting it is a person's "
+    "decision. A seed entry cannot take an outcome because its counters live in the "
+    "package and would be lost on update: copy it to a new id first.",
+    {"type": "object",
+     "properties": {
+         "id": _str("a LOCAL entry's id (the seed is read-only)"),
+         "hit": _bool("true = it held on this board, false = it did not", True),
+         "note": _str("appended to evidence.sources verbatim, e.g. the board's name"),
+     },
+     "required": ["id"]},
+    lambda a: _guarded(lambda: _experience_outcome(a)),
+)
+
+def _experience_outcome(args):
+    exp, e = _experience()
+    if e:
+        return e
+    try:
+        got = exp.outcome(args.get("id"), hit=args.get("hit") is not False,
+                          note=args.get("note"))
+    except KeyError as exc:
+        return err(str(exc).strip("\'\""), "NOT_FOUND",
+                   hint="the seed ships read-only; copy the entry to a new id to "
+                        "keep counters of your own")
+    return ok({"entry": _experience_row(got), "store": exp.path()},
+              "counters",
+              model="the feedback half of the recall -> outcome loop",
+              basis="docs/02 section B",
+              precision="+1 on hits or violated; sources gains the note verbatim",
+              assumptions={"status_unchanged": True},
+              extra={"writes_nothing": False})
+
+_tool(
+    "experience_export",
+    "The library as one self-contained JSON blob: what a person reads, what another "
+    "agent imports, and what goes into the repository with the rest of the knowledge "
+    "this package ships. Entries keep their origin (seed / local / imported) so a "
+    "reader can tell a measured corpus number from a runtime observation.",
+    {"type": "object",
+     "properties": {
+         "status": _str("only this status", ["candidate", "active", "retired"]),
+         "ids": _arr("only these ids"),
+     }},
+    lambda a: _guarded(lambda: _experience_export(a)),
+)
+
+def _experience_export(args):
+    exp, e = _experience()
+    if e:
+        return e
+    got = exp.export(entries=args.get("ids"), status=args.get("status"))
+    out = ok(got, "json",
+             model="a portable snapshot of the two-chain library",
+             basis="docs/02 section B",
+             precision="verbatim entries; no number is recomputed on export",
+             assumptions={"writes_nothing": True})
+    out["next_step"] = ("write it next to the package's data/ to ship it, or hand it "
+                        "to experience_import elsewhere (which lands every entry as a "
+                        "candidate)")
+    return out
+
+_tool(
+    "experience_import",
+    "Merge another library in. Every imported entry lands as a CANDIDATE, whatever "
+    "status the file claims: the confirmation belonged to whoever wrote the file, not "
+    "to this store, so an import is not a promotion channel either. Entries that "
+    "cannot be evaluated (an unknown metric, no trigger, no claim) are skipped with "
+    "the reason instead of being stored broken.",
+    {"type": "object",
+     "properties": {
+         "blob": {"type": "object",
+                  "description": "the JSON object experience_export produced"},
+         "path": _str("or a JSON file to read it from (blob wins if both are given)"),
+     }},
+    lambda a: _guarded(lambda: _experience_import(a)),
+)
+
+def _experience_import(args):
+    exp, e = _experience()
+    if e:
+        return e
+    blob = args.get("blob")
+    if blob is None:
+        path = args.get("path")
+        if not path:
+            return err("give either blob or path", "ARG_MISSING")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                blob = json.load(fh)
+        except OSError as exc:
+            return err("cannot read %r: %s" % (path, exc), "FILE_NOT_FOUND")
+        except ValueError as exc:
+            return err("%r is not JSON: %s" % (path, exc), "ARG_INVALID")
+    try:
+        got = exp.import_entries(blob)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    out = ok(got, "entries",
+             model="a merge that cannot promote: every incoming entry is a candidate",
+             basis="docs/02 section B (the red line applies to imports too)",
+             precision="counts of added / demoted / skipped; skipped carries the "
+                       "refusal for each",
+             assumptions={"writes_nothing": False})
+    if got["skipped"]:
+        out["message"] = ("%d entr(y/ies) skipped: %s"
+                          % (len(got["skipped"]),
+                             "; ".join("%s: %s" % (s.get("id"), s.get("why"))
+                                       for s in got["skipped"][:5])))
+    return out
 
 _tool(
     "calc_capabilities",

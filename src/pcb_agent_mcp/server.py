@@ -4980,9 +4980,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (181 tools now), so an agent that asks what can be computed is "
+          "table (188 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 181
+          len(_tools.TOOLS) == 188
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -5157,8 +5157,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (181 tools now)",
-          len(_tools.TOOLS) == 181
+          "table (188 tools now)",
+          len(_tools.TOOLS) == 188
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5422,7 +5422,7 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 181, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 188, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
@@ -5434,7 +5434,9 @@ def selftest():
           "0.0.90 arguments only (fixed_nets on board_route), 0.0.91 "
           "exactly one (board_dangling_copper), and 0.0.92 arguments only "
           "(the LCEDA reader now honours a through-hole pad's own layer code "
-          "and gets the bottom-side transform right; the tool gained pad_trust)",
+          "and gets the bottom-side transform right; the tool gained pad_trust), "
+          "and 0.0.93 adds exactly seven (the experience library: recall, "
+          "check, candidate, promote, outcome, export, import)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5442,7 +5444,7 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 181,
+          and len(_tools.TOOLS) == 188,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -5584,7 +5586,7 @@ def selftest():
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 181,
+          and len(_tools.TOOLS) == 188,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -5866,7 +5868,7 @@ def selftest():
           and _au_temp.get("temperatures_printed") == [100.0]
           and _au_kneg.get("reason_code") == "ARG_RANGE"
           and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 181,
+          and len(_tools.TOOLS) == 188,
           "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
           % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
              _au_n27.get("reason_code"), _au_mat.get("reason_code"),
@@ -6362,6 +6364,145 @@ def selftest():
         else:
             os.environ["PCB_AGENT_HOME"] = _dg_home
         _shutil.rmtree(_dg_tmp, ignore_errors=True)
+
+    # ---- 0.0.93: the experience library ------------------------------------
+    # Three checks and one temp home. The library is read, it judges a board built
+    # to break the hard rules, and it refuses to promote anything by itself. The
+    # seed is the shipped one: if it is missing, that is a failure, not a skip.
+    _ex_tmp = _tempfile.mkdtemp(prefix="pcbagent-experience-")
+    _ex_home = os.environ.get("PCB_AGENT_HOME")
+    _ex_switch = os.environ.get("PCB_AGENT_EXPERIENCE")
+    os.environ["PCB_AGENT_HOME"] = os.path.join(_ex_tmp, "home")
+    os.environ.pop("PCB_AGENT_EXPERIENCE", None)
+    _ex_u = "00000000-0000-0000-0000-000000000"
+    try:
+        _ex_recall = _call("experience_recall", {}, 9104)
+        _ex_val = _ex_recall.get("value") or {}
+        _ex_ids = [e["id"] for e in (_ex_val.get("entries") or [])]
+        _ex_cand = _call("experience_candidate",
+                         {"id": "exp.local.selftest", "kind": "hard",
+                          "scope": "fab",
+                          "claim": "no via ring under 0.2 mm on this board",
+                          "action": "ask before shrinking the ring",
+                          "metric": "via_annular_ring_below", "min_mm": 0.2},
+                         9105)
+        _ex_after = _call("experience_recall", {}, 9106).get("value") or {}
+        _ex_pending = _call("experience_recall", {"status": "candidate"},
+                            9107).get("value") or {}
+        check("the seed ships readable and every entry can be judged: 7 active "
+              "entries, 3 hard / 4 soft, each naming the metric that decides it, "
+              "and writing a candidate does NOT add it to the active library (the "
+              "red line is that a candidate never becomes a rule on its own)",
+              _ex_recall.get("status") == "ok"
+              and sorted(_ex_ids) == sorted([
+                  "exp.seed.track-angle-on-45", "exp.seed.via-annular-ring",
+                  "exp.seed.via-palette-single",
+                  "exp.seed.power-wider-than-signal",
+                  "exp.seed.track-width-palette",
+                  "exp.seed.lceda-through-hole-spans",
+                  "exp.seed.lceda-pad-placement-unverified"])
+              and _ex_val.get("library", {}).get("kind_hard") == 3
+              and _ex_val.get("library", {}).get("kind_soft") == 4
+              and _ex_cand.get("status") == "ok"
+              and (_ex_cand.get("value") or {}).get("entry", {}).get("status")
+              == "candidate"
+              and _ex_after.get("matched") == 7
+              and _ex_pending.get("matched") == 1,
+              "seed %d active (%d hard / %d soft), after candidate %s, candidates "
+              "%s"
+              % (len(_ex_ids), _ex_val.get("library", {}).get("kind_hard", -1),
+                 _ex_val.get("library", {}).get("kind_soft", -1),
+                 _ex_after.get("matched"), _ex_pending.get("matched")))
+
+        # A board built to break the two hard rules and leave two habits.
+        _ex_board = os.path.join(_ex_tmp, "rules.kicad_pcb")
+        with open(_ex_board, "w", encoding="utf-8", newline="\n") as _fh:
+            _fh.write("\n".join([
+                '(kicad_pcb (version 20221018) (generator pcbnew)',
+                '  (general (thickness 1.6))',
+                '  (layers (0 "F.Cu" signal) (31 "B.Cu" signal)',
+                '    (44 "Edge.Cuts" user))',
+                '  (net 0 "") (net 1 "GND") (net 2 "VCC") (net 3 "SIG")',
+                '  (net_class "Default" "" (clearance 0.2) (trace_width 0.25)',
+                '    (via_dia 0.6) (via_drill 0.3))',
+                '  (gr_line (start 0 0) (end 40 0) (layer "Edge.Cuts")',
+                '    (width 0.1) (tstamp %s001))' % _ex_u,
+                '  (segment (start 0 0) (end 10 1.76) (width 0.25)',
+                '    (layer "F.Cu") (net 3) (tstamp %s002))' % _ex_u,
+                '  (segment (start 0 5) (end 10 5) (width 0.5)',
+                '    (layer "F.Cu") (net 3) (tstamp %s003))' % _ex_u,
+                '  (segment (start 0 10) (end 10 10) (width 0.1)',
+                '    (layer "F.Cu") (net 2) (tstamp %s004))' % _ex_u,
+                '  (via (at 5 5) (size 0.6) (drill 0.45)',
+                '    (layers "F.Cu" "B.Cu") (net 1) (tstamp %s005))' % _ex_u,
+                '  (footprint "SYN:TH" (version 20221018) (generator pcbnew)',
+                '    (layer "F.Cu") (at 20 20) (attr through_hole)',
+                '    (fp_text reference "J1" (at 0 -3) (layer "F.SilkS")',
+                '      (effects (font (size 0.7 0.7) (thickness 0.12))))',
+                '    (pad "1" thru_hole circle (at 0 0) (size 1.6 1.6)',
+                '      (drill 0.8) (layers "F.Cu" "*.Mask") (net 1 "GND")',
+                '      (tstamp %s006)))' % _ex_u,
+                ')',
+            ]) + "\n")
+        _ex_rep = _call("experience_check", {"path": _ex_board}, 9108)
+        _ex_r = _ex_rep.get("value") or {}
+        _ex_rows = dict((r["id"], r["verdict"]) for r in (_ex_r.get("rows") or []))
+        check("a board built to break the hard rules is judged on the rules and the "
+              "habits SEPARATELY: the 0.075 mm via ring and the one-sided drilled "
+              "pad are hard violations, the off-grid segment and the narrow power "
+              "track are outside_habit (a question, not a defect), and the two "
+              "metrics the board satisfies pass - so no verdict is a constant",
+              sorted(_ex_r.get("hard_violations") or []) == [
+                  "exp.seed.lceda-through-hole-spans",
+                  "exp.seed.via-annular-ring"]
+              and sorted(_ex_r.get("outside_habit") or []) == [
+                  "exp.seed.power-wider-than-signal",
+                  "exp.seed.track-angle-on-45"]
+              and _ex_rows.get("exp.seed.via-palette-single") == "passes"
+              and _ex_rows.get("exp.seed.track-width-palette") == "passes"
+              and _ex_r.get("checked") == 7
+              and _ex_r.get("writes_nothing") is True,
+              "hard %s, habit %s, rows %s"
+              % (_ex_r.get("hard_violations"), _ex_r.get("outside_habit"),
+                 _ex_rows))
+
+        _ex_noconfirm = _call("experience_promote",
+                              {"id": "exp.local.selftest", "confirm": False,
+                               "reason": "x"}, 9109)
+        _ex_promoted = _call("experience_promote",
+                             {"id": "exp.local.selftest", "confirm": True,
+                              "reason": "checked by hand in the self-test"}, 9110)
+        _ex_seedpromote = _call("experience_promote",
+                                {"id": "exp.seed.via-annular-ring",
+                                 "confirm": True, "reason": "x"}, 9111)
+        _ex_import = _call("experience_import", {"blob": {
+            "entries": [{"id": "exp.imported.selftest", "kind": "soft",
+                         "status": "active", "claim": "one via geometry per board",
+                         "trigger": {"board_metric": "distinct_via_geometries",
+                                     "max_distinct": 1}}]}}, 9112)
+        _ex_imp = _ex_import.get("value") or {}
+        check("and nothing promotes itself: confirm=false is refused with a reason "
+              "code, confirm=true with a reason works, a seed id is refused at "
+              "every door, and an import lands an active entry as a candidate",
+              _ex_noconfirm.get("reason_code") == "ARG_INVALID"
+              and _ex_promoted.get("status") == "ok"
+              and (_ex_promoted.get("value") or {}).get("entry", {}).get(
+                  "status") == "active"
+              and _ex_seedpromote.get("status") == "error"
+              and _ex_imp.get("added") == ["exp.imported.selftest"]
+              and _ex_imp.get("demoted_to_candidate") == ["exp.imported.selftest"],
+              "no confirm %s, promote %s, seed %s, import %s/%s"
+              % (_ex_noconfirm.get("reason_code"), _ex_promoted.get("status"),
+                 _ex_seedpromote.get("reason_code"), _ex_imp.get("added"),
+                 _ex_imp.get("demoted_to_candidate")))
+    finally:
+        if _ex_home is None:
+            os.environ.pop("PCB_AGENT_HOME", None)
+        else:
+            os.environ["PCB_AGENT_HOME"] = _ex_home
+        if _ex_switch is not None:
+            os.environ["PCB_AGENT_EXPERIENCE"] = _ex_switch
+        _shutil.rmtree(_ex_tmp, ignore_errors=True)
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
