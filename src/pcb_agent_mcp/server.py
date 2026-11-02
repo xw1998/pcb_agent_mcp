@@ -5431,8 +5431,10 @@ def selftest():
           "(melting_model on fusing_current), 0.0.87 arguments only "
           "(melting_model on repetitive_pulse_rating), 0.0.88 arguments only "
           "(melting_model on fusing_current_taper), 0.0.89 arguments only, "
-          "0.0.90 arguments only (fixed_nets on board_route), and 0.0.91 "
-          "exactly one (board_dangling_copper)",
+          "0.0.90 arguments only (fixed_nets on board_route), 0.0.91 "
+          "exactly one (board_dangling_copper), and 0.0.92 arguments only "
+          "(the LCEDA reader now honours a through-hole pad's own layer code "
+          "and gets the bottom-side transform right; the tool gained pad_trust)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"

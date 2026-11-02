@@ -504,6 +504,13 @@ def _library(container):
                                for pt in pts]
             found.setdefault(number, {
                 "x": _num(rec[6]), "y": _num(rec[7]),
+                # The pad's own layer field. Measured over 6 projects / 4724
+                # pads: code 1 = top, 2 = bottom, 12 = every copper layer, and
+                # "12" holds for exactly the 413 pads that carry a hole
+                # (413/413 both directions, zero exceptions). Reading the
+                # component's layer instead of this field is what made every
+                # through-hole pad look single-sided.
+                "layer_code": str(rec[4]) if len(rec) > 4 else None,
                 "hole": hole,
                 "hole_kind": str(hole[0]).lower() if hole else None,
                 "hole_size": (_num(hole[1]) if hole and len(hole) > 1 else None),
@@ -517,6 +524,24 @@ def _library(container):
             "title_source": title_source, "footprint_docs": len(docs)}
 
 # ------------------------------------------------------------------ parse
+_MULTI_LAYER_CODE = "12"
+
+
+def _pad_layers(component_layer, layer_code, hole_kind):
+    """Every copper layer a pad sits on.
+
+    A through-hole pad is not on the component's side only: it is on all of
+    them. The file says so itself - a drilled pad carries layer code 12
+    ("multi") in its own PAD record, measured 413/413 in the sample corpus.
+    Until 0.0.92 this reader ignored that field and reported the component's
+    side, so a track arriving on the far side of a through-hole pad looked
+    like it ended in mid-air.
+    """
+    if hole_kind is not None or str(layer_code) == _MULTI_LAYER_CODE:
+        return ["*.Cu"]
+    return [component_layer] if component_layer else []
+
+
 def parse_board(path, member=None):
     """Read one LCEDA Pro board into a canonical `Board`. Never writes."""
     container = _open_container(path)
@@ -639,30 +664,30 @@ def _parse(container, path, member):
             px, py = pad["x"], pad["y"]
             if px is None or py is None:
                 continue
-            if mirrored:
-                # Measured weak (35.1% of pads land on a copper endpoint vs 20.7%
-                # for -x and 32.2% for none): declared, not claimed.
-                py = -py
+            # Bottom side: the footprint is NOT y-mirrored. Measured over 2549
+            # net-bearing pads on 6 projects, by asking which transform puts the
+            # pad centre exactly on a copper endpoint of its own net (tolerance
+            # 0.05 mm): no mirror 62.1% top / 82.6% bottom, y-mirror 37.0% /
+            # 53.2%, x-mirror 3.0% / 6.0%, both 1.7% / 3.5%; cross-net hits per
+            # hypothesis were 1/1/0/0 top and 3/2/0/0 bottom, so the ordering is
+            # not an artefact of loose tolerance. The hit rate is a lower bound
+            # (an unrouted pad or a pad fed only by a pour carries no endpoint):
+            # placement is therefore still declared, not verified.
             a = math.radians(angle)
             cos_a, sin_a = math.cos(a), math.sin(a)
-
-            def place(x_local, y_local):
-                y_local = -y_local if mirrored else y_local
-                return (x + x_local * cos_a - y_local * sin_a,
-                        y + x_local * sin_a + y_local * cos_a)
-
-            rx, ry = place(px, py)
+            rx = x + px * cos_a - py * sin_a
+            ry = y + px * sin_a + py * cos_a
             hole_kind = pad.get("hole_kind")
             polygon = pad.get("polygon")
             # Centre-relative and *not* rotated: `canonical.pad_points` applies
             # `rotation` to a custom polygon, so storing it already turned would
-            # turn it twice. The mirror is applied here because canonical has no
-            # bottom-side flip.
+            # turn it twice. No bottom-side flip either - see the measurement
+            # above; a flipped polygon under an unflipped centre would be a shape
+            # that contradicts its own position.
             rel_polygon = None
             if polygon:
                 rel_polygon = []
                 for dx, dy in polygon:
-                    dy = -dy if mirrored else dy
                     if rel_polygon and _close(rel_polygon[-1], (dx, dy), 1e-9):
                         continue
                     rel_polygon.append((dx, dy))
@@ -677,7 +702,11 @@ def _parse(container, path, member):
                             if rel_polygon else None),
                 "corner_radius_mm": mm(pad.get("corner")),
                 "rotation": angle,
-                "layers": [layer] if layer else [],
+                "layers": _pad_layers(layer, pad.get("layer_code"), hole_kind),
+                # What this reader reported before 0.0.92: the component's
+                # side, with through-hole pads folded into it. Kept so the old
+                # reading stays traceable instead of silently vanishing.
+                "layers_as_written": [layer] if layer else [],
                 "hole_mm": mm(pad.get("hole_size")),
                 "hole_kind": hole_kind,
                 "hole_length_mm": (mm(pad.get("hole2"))
@@ -688,12 +717,29 @@ def _parse(container, path, member):
         board.footprints.append(entry)
     board.source["pad_transform"] = {
         "top_side": "component.xy + R(+angle) * footprint-local pad xy",
-        "bottom_side": "footprint-local y negated, then the same +angle turn",
-        "verified_against": "copper LINE/ARC endpoints, 60 archives, 9874 pads",
+        "bottom_side": "the same transform - no y mirror (measured, see below)",
+        "verified_against": "copper LINE endpoints, 6 projects, 2549 net-bearing pads "
+                            "with a footprint-local position",
         "verified_by_app": False,
-        "top_side_hit_rate": {"exact": 0.541, "within_5mil": 0.605, "n": 9874},
-        "bottom_side_hit_rate": {"exact": 0.351, "n": 348,
-                                 "alternatives": {"-x": 0.207, "none": 0.322}},
+        "top_side_hit_rate": {"exact": 0.621, "n": 2002,
+                              "alternatives": {"y-mirror": 0.370,
+                                               "x-mirror": 0.030,
+                                               "both": 0.017}},
+        "bottom_side_hit_rate": {"exact": 0.826, "n": 547,
+                                 "alternatives": {"y-mirror": 0.532,
+                                                  "x-mirror": 0.060,
+                                                  "both": 0.035}},
+        "hit_rate_is": "a lower bound on placement accuracy: a pad that is unrouted, "
+                       "or fed only by a pour, carries no track endpoint to land on",
+        "cross_net_hits": {"top": {"none": 1, "y-mirror": 1, "x-mirror": 0,
+                                   "both": 0},
+                           "bottom": {"none": 3, "y-mirror": 2, "x-mirror": 0,
+                                      "both": 0}},
+        "note": "0.0.92 corrected two numbers this reader used to report, both from "
+                "re-measuring rather than re-reasoning: the bottom-side transform is "
+                "no-mirror (not y-mirror, whose 0.351 was a measurement of the wrong "
+                "hypothesis), and through-hole pads sit on every copper layer, which "
+                "the file states itself in the pad's own layer code 12 (413/413).",
     }
 
     # PAD records that the board document itself stores (no component link in
@@ -712,7 +758,10 @@ def _parse(container, path, member):
             "h": mm(_num(shape[2])) if len(shape) > 2 else None,
             "shape": _pad_shape(shape[0] if shape else None),
             "rotation": 0.0,
-            "layers": [_layer_of(pcb, rec[4], names)],
+            "layers": _pad_layers(_layer_of(pcb, rec[4], names),
+                                  str(rec[4]) if len(rec) > 4 else None,
+                                  str(hole[0]).lower() if hole else None),
+            "layers_as_written": [_layer_of(pcb, rec[4], names)],
             "hole_mm": mm(_num(hole[1])) if hole and len(hole) > 1 else None,
             "smd": hole is None,
         })

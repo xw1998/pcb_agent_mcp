@@ -460,5 +460,100 @@ class TheCutRefusesLockedCopperAtTheOpLayer(DanglingBase):
         self.assertEqual(self.ops(), [])
 
 
+class PadTrust(DanglingBase):
+    """Where the pads are is part of every answer, so it is read first.
+
+    A tail is cut by deciding "this copper reaches nothing". When pad positions
+    come from a transform the adapter has not verified, that decision has no
+    ground under it: the copper may reach a pad we simply placed somewhere else.
+    The board below is the same T-junction board as everywhere else, with the
+    two facts a reader can state about its own pads flipped.
+    """
+
+    def set_trust(self, present=True, verified=None):
+        board = self.board_model()
+        board.present["pads"] = {"present": present}
+        if verified is not None:
+            board.source["pad_transform"] = {"verified_by_app": verified,
+                                             "verified_against": "synthetic"}
+        from pcb_agent_mcp import dangling
+        return board, dangling.survey(board)
+
+    def test_a_kicad_board_counts_as_trusted(self):
+        from pcb_agent_mcp import dangling
+        trust = dangling.pad_trust(self.board_model())
+        self.assertTrue(trust["trusted"], trust)
+        self.assertEqual(trust["reason"], "pads_read_and_placement_verified")
+
+    def test_the_same_board_with_unverified_placement_cuts_nothing(self):
+        from pcb_agent_mcp import dangling
+        board, report = self.set_trust(verified=False)
+        self.assertFalse(report["pad_trust"]["trusted"])
+        self.assertEqual(report["pad_trust"]["reason"],
+                         "pad_placement_unverified")
+        self.assertEqual(report["cuttable"], 0)
+        self.assertGreater(report["tails"], 0)        # still reported ...
+        for net in report["nets"]:
+            for t in net["tails"]:
+                self.assertFalse(t["cuttable"], t)
+                self.assertEqual(t["why_not"], "pad_placement_untrusted")
+            for f in net["floating"]:
+                self.assertFalse(f["cuttable"], f)
+        self.assertEqual(dangling.removal_ops(report), [])
+        self.assertEqual(dangling.removal_ops(report, include_floating=True), [])
+
+    def test_no_pad_geometry_is_a_different_reason(self):
+        from pcb_agent_mcp import dangling
+        board, report = self.set_trust(present=False)
+        self.assertEqual(report["pad_trust"]["reason"], "pad_geometry_absent")
+        self.assertEqual(report["cuttable"], 0)
+
+    def test_the_survey_that_does_not_say_anything_new_still_cuts(self):
+        """The control: the same board, trusted, keeps its one cuttable tail."""
+        report = self.survey()
+        self.assertEqual(report["cuttable"], 1)
+        self.assertEqual(len(self.ops()), 1)
+
+class ThroughHoleSpansEveryLayer(unittest.TestCase):
+    """A drilled pad is on every copper layer - the file says so itself.
+
+    Reading the component's side instead (what this adapter did until 0.0.92)
+    made a track arriving on the far side of a through-hole pad look like it
+    ended in mid-air: on one real board that turned 71 pieces of copper into
+    "floating" and 4 tails into "dangling".
+    """
+
+    def test_the_pad_layer_rule(self):
+        from pcb_agent_mcp.adapters import epro
+        self.assertEqual(epro._pad_layers("TOP", "1", None), ["TOP"])
+        self.assertEqual(epro._pad_layers("BOTTOM", "2", None), ["BOTTOM"])
+        self.assertEqual(epro._pad_layers("TOP", "12", "round"), ["*.Cu"])
+        self.assertEqual(epro._pad_layers("BOTTOM", "12", "slot"), ["*.Cu"])
+        # the hole alone is enough: the layer code is a second witness, not the
+        # only one, and a pad with a hole is never single-sided
+        self.assertEqual(epro._pad_layers("TOP", None, "round"), ["*.Cu"])
+
+    def test_a_track_on_the_far_side_attaches_to_a_through_hole_pad(self):
+        from pcb_agent_mcp.adapters.canonical import Board
+        from pcb_agent_mcp import dangling
+        board = Board("test", "memory")
+        board.mark("pads", True)
+        pads = [{"number": n, "net": "GND", "x": x, "y": 5.0, "w": 1.6, "h": 1.6,
+                 "layers": ["*.Cu"]} for n, x in (("1", 10.0), ("2", 20.0))]
+        board.footprints = [{"ref": "J1", "pads": pads}]
+        board.tracks = [
+            {"uuid": "t1", "net": "GND", "layer": "B.Cu", "width": 0.25,
+             "start": [10.0, 5.0], "end": [20.0, 5.0]},
+        ]
+        report = dangling.survey(board)
+        self.assertEqual((report["tails"], report["floating"]), (0, 0), report)
+        # the control: the same pads written on one side only leave the track
+        # hanging at both ends, which is exactly the false finding this rule
+        # removes - and it is the finding the real boards were full of
+        for pad in pads:
+            pad["layers"] = ["TOP"]
+        self.assertEqual(dangling.survey(board)["floating"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

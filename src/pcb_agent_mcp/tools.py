@@ -2280,7 +2280,13 @@ _tool(
     "at). Attachments are exact geometry: a gap of 0.002 mm is a gap. Returns a "
     "report by default; apply=true writes the cuts through board_propose + "
     "board_apply (checkpoint, atomic write, four gates, KiCad DRC) and re-surveys "
-    "afterwards.",
+    "afterwards. One thing is read before any of that: pad TRUST. Deciding 'this "
+    "copper reaches nothing' rests on where the pads are, so when the adapter "
+    "places pads by a transform it has not verified against the application (the "
+    "LCEDA-Pro reader says so itself: verified_by_app=false, 54% of pads land "
+    "exactly on a copper endpoint), every tail is reported as a candidate and "
+    "none is called cuttable - removal_ops returns nothing. pad_trust in the "
+    "reply states which of the two it was and why.",
     {"type": "object",
      "properties": dict({
          "apply": _bool("cut the cuttable tails (default false: report only)"),
@@ -2332,6 +2338,7 @@ def _board_dangling_copper(args):
         "ops_preview": ops[:20],
         "ops_count": len(ops),
         "cuts_floating": args.get("include_floating") is True,
+        "pad_trust": report["pad_trust"],
         "writes_nothing": True,
     }
     out = ok(value, "mm",
@@ -2353,9 +2360,17 @@ def _board_dangling_copper(args):
                                    "default is 0.002 mm"}),
              extra={})
     if not ops:
-        out["message"] = ("nothing on this board is both dangling and safe to cut"
-                          if report["tails"] or report["floating"]
-                          else "no dangling copper")
+        if report["tails"] or report["floating"]:
+            trust = report["pad_trust"]
+            if trust["trusted"] is not True:
+                out["message"] = (
+                    "%d tail(s) and %d floating piece(s) found, but none is "
+                    "called cuttable: %s. They are listed as candidates only."
+                    % (report["tails"], report["floating"], trust["why"]))
+            else:
+                out["message"] = "nothing on this board is both dangling and safe to cut"
+        else:
+            out["message"] = "no dangling copper"
         return out
     if args.get("apply") is not True:
         out["next_step"] = ("pass apply=true to cut these %d piece(s) (it goes "

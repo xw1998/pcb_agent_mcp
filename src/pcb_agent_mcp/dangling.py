@@ -225,6 +225,45 @@ def _pours(board, net, copper):
     return out
 
 
+# --------------------------------------------------------- pad trust ----
+def pad_trust(board):
+    """Can a pad's *position* be believed on this board?
+
+    A tail is cut by deciding "this copper reaches nothing". That decision
+    rests on where the pads are. On a LCEDA-Pro board this reader places pads
+    by a transform it measured but cannot verify (`verified_by_app: False`,
+    54.1% of 9874 pads land exactly on a copper endpoint) - so a track that
+    arrives on a pad someone else placed may simply be one we misplaced.
+
+    Trusting a board is therefore a two-part fact, not a default:
+
+    * the adapter actually read pad geometry (`present["pads"]["present"]`),
+    * and the placement is either exact by construction (KiCad) or was
+      verified against the app (`source["pad_transform"]["verified_by_app"]`).
+
+    When either part fails, every tail is reported as a candidate and none is
+    called cuttable: `removal_ops` then returns nothing.
+    """
+    pads = (board.present or {}).get("pads") or {}
+    present = bool(pads.get("present"))
+    transform = (board.source or {}).get("pad_transform") or {}
+    verified = transform.get("verified_by_app")
+    if not present:
+        return {"trusted": False, "reason": "pad_geometry_absent",
+                "why": "the file carried no pad geometry, so 'this copper "
+                       "reaches no pad' cannot be decided"}
+    if verified is False:
+        return {"trusted": False, "reason": "pad_placement_unverified",
+                "why": "pad positions come from a transform this adapter "
+                       "measured but has not verified against the application",
+                "evidence": {k: v for k, v in transform.items()
+                             if k in ("verified_against", "top_side_hit_rate",
+                                      "bottom_side_hit_rate")}}
+    return {"trusted": True, "reason": "pads_read_and_placement_verified",
+            "why": ("pad positions are exact by construction (KiCad) or were "
+                    "verified against the application")}
+
+
 # ------------------------------------------------------------- the walk
 def _pad_piece(pad, copper):
     """A pad as copper: the one thing a track can attach to and stay alive."""
@@ -462,6 +501,8 @@ def survey(board, tol_mm=TOL_MM, max_report=200):
     """
     copper = _copper_order(board)
     copper_set = set(copper)
+    trust = pad_trust(board)
+    untrusted = trust["trusted"] is not True
 
     groups = {}
     for tr in board.tracks or []:
@@ -537,10 +578,18 @@ def survey(board, tol_mm=TOL_MM, max_report=200):
                     "ends_at": terminal,
                 }
                 if terminal == "open":
+                    if untrusted:
+                        entry["cuttable"] = False
+                        entry["why_not"] = "pad_placement_untrusted"
+                    else:
+                        entry["cuttable"] = True
                     floating.append(entry)
                     continue
                 locked = [p.uuid for p in chain if p.locked]
-                if locked:
+                if untrusted:
+                    entry["cuttable"] = False
+                    entry["why_not"] = "pad_placement_untrusted"
+                elif locked:
                     entry["cuttable"] = False
                     entry["why_not"] = "locked"
                     entry["locked"] = locked
@@ -578,6 +627,7 @@ def survey(board, tol_mm=TOL_MM, max_report=200):
         "cuttable_length_mm": round(removable_length, 4),
         "nets_with_pour": poured,
         "tolerance_mm": tol_mm,
+        "pad_trust": trust,
         "zones_as_copper": ("a same-net filled_polygon counts as copper; a board "
                             "that was never filled has none, and no pour was "
                             "assumed"),
