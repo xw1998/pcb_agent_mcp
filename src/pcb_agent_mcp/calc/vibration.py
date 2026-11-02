@@ -622,7 +622,7 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                 n_modes=4, poly_degree=7, probe_points=None, max_dof=MAX_DOF,
                 stress_amplitude_mm=None, copper_um=None, added_mass_g=None,
                 added_mass_at_mm=None, copper_um_bottom=None,
-                added_mass_regions=None):
+                added_mass_regions=None, participation=False):
     """Natural frequencies and mode shapes of a rectangular thin plate.
 
     Rayleigh-Ritz on a monomial basis (psi = xi^k eta^l) restricted to the null
@@ -772,6 +772,56 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
     I2xw = wq(Wx, I2)
     ICxw = wq(Wx, IC)
     I1xw = wq(Wx, I1)
+    # ---- modal participation (0.0.83) ------------------------------------
+    # For uniform base acceleration the modal force is a_base * int rho w dA, so
+    # the factor a mode carries is Gamma = int w dA / int w^2 dA. The Ritz basis
+    # is separable, X_i(xi) Y_j(eta), so both integrals are monomial moments and
+    # the two numbers below are exact - no quadrature, no lumping, no fitting.
+    part = bool(participation)
+    ix1 = [sum(Wx[k][i] / (k + 1.0) for k in range(K + 1)) for i in range(nx)]
+    iy1 = [sum(Wy[k][j] / (k + 1.0) for k in range(K + 1)) for j in range(ny)]
+    ix2 = [[sum(Wx[k][i] * Wx[k2][i2] / (k + k2 + 1.0)
+                for k in range(K + 1) for k2 in range(K + 1))
+            for i2 in range(nx)] for i in range(nx)]
+    iy2 = [[sum(Wy[k][j] * Wy[k2][j2] / (k + k2 + 1.0)
+                for k in range(K + 1) for k2 in range(K + 1))
+            for j2 in range(ny)] for j in range(ny)]
+    part_rows = [] if part else None
+
+    def _moments_of(vec_c):
+        """(int w dA, int w^2 dA) on the unit square, w = sum vec_c X_i Y_j."""
+        s1 = 0.0
+        for i in range(nx):
+            fx = ix1[i]
+            if fx == 0.0:
+                continue
+            base = i * ny
+            for j in range(ny):
+                c = vec_c[base + j]
+                if c != 0.0:
+                    s1 += c * fx * iy1[j]
+        s2 = 0.0
+        for i in range(nx):
+            base = i * ny
+            for j in range(ny):
+                c = vec_c[base + j]
+                if c == 0.0:
+                    continue
+                row = 0.0
+                for i2 in range(nx):
+                    f = ix2[i][i2]
+                    if f == 0.0:
+                        continue
+                    base2 = i2 * ny
+                    t = 0.0
+                    for j2 in range(ny):
+                        c2 = vec_c[base2 + j2]
+                        if c2 != 0.0:
+                            t += c2 * iy2[j][j2]
+                    row += f * t
+                s2 += c * row
+        return s1, s2
+
     M0yw = wq(Wy, M0)
     D1yw = wq(Wy, D1)
     I2yw = wq(Wy, I2)
@@ -1297,6 +1347,15 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
             # one would be a number with no meaning behind it
             entry["antinode_mm"] = [_sig(best_xy[0]), _sig(best_xy[1])]
             entry["quiet_area_fraction"] = _sig(quiet, 3)
+            if part:
+                sh1, sh2 = _moments_of([c / peak for c in vec])
+                if sh2 > 0.0:
+                    gam = sh1 / sh2
+                    entry["participation"] = _sig(gam, 6)
+                    entry["modal_mass_g"] = _sig(mpa * am * bm * sh2 * 1e3, 6)
+                    entry["effective_mass_g"] = _sig(
+                        mpa * am * bm * sh2 * gam * gam * 1e3, 6)
+                    part_rows.append((mi + 1, freqs[mi], gam, sh2))
         if amp_mm is not None and not is_rigid and "stress" not in entry:
             # 21 x 21 is enough for a peak: the curvature field is smooth and the
             # second derivative of a degree-K polynomial is degree K-2.
@@ -1504,6 +1563,40 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
         warnings.append(
             "mounting compliance and shear deformation are not modelled either")
 
+    part_report = None
+    if part:
+        plate_mass_g = mpa * am * bm * 1e3
+        modal_sum = sum(r[3] for r in part_rows)
+        eff_sum = sum(r[3] * r[2] * r[2] for r in part_rows)
+        part_report = {
+            "modes_included": len(part_rows),
+            "modes": [{"index": r[0], "freq_hz": _sig(r[1]),
+                       "participation": _sig(r[2], 6),
+                       "modal_mass_g": _sig(mpa * am * bm * r[3] * 1e3, 6),
+                       "effective_mass_g": _sig(mpa * am * bm * r[3] * r[2] * r[2]
+                                                * 1e3, 6)}
+                      for r in part_rows],
+            "plate_mass_g": _sig(plate_mass_g, 6),
+            "modal_mass_sum_g": _sig(mpa * am * bm * modal_sum * 1e3, 6),
+            "effective_mass_sum_g": _sig(mpa * am * bm * eff_sum * 1e3, 6),
+            "mass_capture_fraction": _sig(eff_sum, 6),
+            "participation_note":
+                ("Gamma = int w dA / int w^2 dA with w the shape normalised to peak "
+                 "1; both integrals are exact monomial moments of the Ritz basis. A "
+                 "mode with no net deflection has Gamma = 0 and uniform base "
+                 "acceleration does not excite it at all - on an SSSS square the "
+                 "(1,2) and (2,1) modes are exactly that. effective_mass = "
+                 "Gamma^2 * modal_mass, and its sum over ALL modes is the plate "
+                 "mass, so over a truncated basis mass_capture_fraction is below 1 "
+                 "and rises with poly_degree: that is the check that it is a "
+                 "participation and not a fitted weight"),
+        }
+        if added_mass_g is not None or added_mass_regions is not None:
+            warnings.append(
+                "the participation factors are integrals of the BARE plate mass "
+                "(rho*h): an added part is not in int rho w dA, so the modal masses "
+                "here are the plate alone and Gamma moves once the part is included")
+
     return ok(
         {
             "a_mm": a, "b_mm": b, "thickness_mm": h_mm,
@@ -1559,6 +1652,7 @@ def plate_modes(a_mm, b_mm, thickness_mm, material=None, e_gpa=None, nu=None,
                       "auto_reduced": K != int(poly_degree)},
             "rigid_body_modes": rid,
             "modes": modes,
+            "participation": part_report,
             "stress_not_computed": (None if amp_mm is None else [
                 "stress concentrations: a hole, a notch, a connector footprint and "
                 "a solder fillet all concentrate stress, and none of them is modelled",
@@ -1631,7 +1725,296 @@ def _psd_at(points, f):
     return w0 + (w1 - w0) * (f - f0) / (f1 - f0)
 
 
-def miles_response(f_n_hz, psd=None, zeta=None, q_factor=None, gamma=3.0):
+def _modal_response(psd, modes, zeta=None, q_factor=None, gamma=3.0):
+    """Random response summed over the modes you supply (0.0.83).
+
+    Steady state, uniform base acceleration a, classical (viscous, proportional)
+    damping. With w_i(p) the mode-shape value at the point being watched and
+    Gamma_i the participation factor (int w dA / int w^2 dA), the displacement of
+    that point relative to the base is
+
+        z_p(f) = -a(f) * sum_i w_i(p) Gamma_i / (w_i^2 - w^2 + 2 j zeta_i w w_i)
+
+    and the absolute acceleration of that point is a - w^2 z_p, again exact at
+    every frequency rather than "the peak value in the middle". Both are
+    integrated against the PSD, so the cross terms between modes are in the
+    number - not dropped and not approximated by a sum of squares.
+
+    Miles' closed form is the special case of ONE mode with w(p) Gamma = 1 on a
+    flat PSD, which is what the selftest compares against.
+    """
+    if not isinstance(modes, list) or len(modes) == 0:
+        return err("modes must be a non-empty list", "ARG_REQUIRED",
+                   hint='each entry is {"freq_hz": ..., "participation": ..., '
+                        '"shape_at_point": ...}; plate_modes(participation=true) '
+                        'gives the first two per mode and probe_points the third')
+    if len(modes) > 200:
+        return err("modes carries %d entries; 200 is the ceiling" % len(modes),
+                   "TOO_LARGE")
+    g = _num(gamma)
+    if g is None or g <= 0.0:
+        return err("gamma (peak factor) must be > 0", "ARG_INVALID")
+    z0, e0 = _sdof_zeta(q_factor, zeta)
+    terms = []
+    for i, m in enumerate(modes):
+        if not isinstance(m, dict):
+            return err("modes[%d] must be an object" % i, "ARG_INVALID")
+        fr = _pos(m.get("freq_hz"))
+        if fr is None:
+            return err("modes[%d].freq_hz must be > 0" % i, "ARG_INVALID",
+                       hint="take it from the 'freq_hz' of each mode")
+        gam = _num(m.get("participation"))
+        if gam is None:
+            return err("modes[%d].participation must be a number" % i, "ARG_INVALID",
+                       hint="plate_modes(participation=true) computes it as "
+                            "int w dA / int w^2 dA; a mode with no net deflection "
+                            "has 0 and is not excited by base motion")
+        shp = m.get("shape_at_point")
+        if shp is None:
+            shp = m.get("shape")
+        shp = _num(shp)
+        if shp is None:
+            return err("modes[%d].shape_at_point must be a number" % i, "ARG_INVALID",
+                       hint="the mode shape at the point you are watching, peak "
+                            "normalised to 1 (plate_modes probe_points gives it as "
+                            "normalised_deflection)")
+        if m.get("zeta") is not None or m.get("q_factor") is not None:
+            zi, ei = _sdof_zeta(m.get("q_factor"), m.get("zeta"))
+            if ei is not None:
+                return ei
+        else:
+            if e0 is not None:
+                return e0
+            zi = z0
+        terms.append((fr, zi, shp * gam))
+
+    if not isinstance(psd, dict):
+        return err("psd must be an object", "ARG_REQUIRED",
+                   hint='either {"g2_per_hz": 0.1} or '
+                        '{"points": [[10, 0.01], [100, 0.1], [2000, 0.01]]}')
+    warnings = []
+    pts = None
+    wflat = None
+    if "g2_per_hz" in psd:
+        wflat = _num(psd.get("g2_per_hz"))
+        if wflat is None or wflat <= 0.0:
+            return err("psd.g2_per_hz must be > 0", "ARG_INVALID")
+    elif "points" in psd:
+        pts = []
+        try:
+            for p in psd["points"]:
+                fv = _pos(p[0])
+                wv = _num(p[1])
+                if fv is None or wv is None or wv < 0.0:
+                    raise ValueError
+                pts.append((fv, wv))
+        except (TypeError, IndexError, ValueError):
+            return err("psd.points must be [[hz, g2/Hz], ...] with hz > 0",
+                       "ARG_INVALID")
+        if len(pts) < 2:
+            return err("psd.points needs at least two breakpoints", "ARG_INVALID")
+    else:
+        return err("psd has neither g2_per_hz nor points", "ARG_REQUIRED")
+
+    f_hi_mode = max(t[0] for t in terms)
+    if pts is None:
+        f_lo, f_hi = 0.0, 3.0 * f_hi_mode
+
+        def wfun(f):
+            return wflat
+    else:
+        f_lo = pts[0][0]
+        f_hi = max(pts[-1][0], 3.0 * f_hi_mode)
+        if pts[-1][0] < 3.0 * f_hi_mode:
+            warnings.append("PSD ends at %.0f Hz, below 3*the highest mode = %.0f "
+                            "Hz; the integral is clamped to the last value there"
+                            % (pts[-1][0], 3.0 * f_hi_mode))
+
+        def wfun(f):
+            return _psd_at(pts, f)
+
+    # ---- grid: a coarse pass over the whole band plus a fine pass over every
+    # modal peak. A uniform grid cannot resolve a Q=100 peak without hundreds of
+    # thousands of points, and the cross terms need the peaks resolved too.
+    grid = []
+    n_coarse = 600
+    for i in range(n_coarse + 1):
+        grid.append(f_lo + (f_hi - f_lo) * i / float(n_coarse))
+    peak_bands = []
+    for fr, zi, _c in terms:
+        d = max(12.0 * zi, 0.02)
+        a0 = max(f_lo, fr * (1.0 - d))
+        a1 = min(f_hi, fr * (1.0 + d))
+        peak_bands.append((a0, a1, 1200))
+        if a1 <= a0:
+            continue
+        for i in range(1201):
+            grid.append(a0 + (a1 - a0) * i / 1200.0)
+    grid.sort()
+
+    two_pi = 2.0 * math.pi
+    n = len(terms)
+    # Three integrals, all convergent, none of them band-truncated:
+    #   z_disp   int W |sum_i D_i|^2 df      displacement of the point (coherent)
+    #   z_diag   int W |D_k|^2 df            each mode on its own
+    #   g_abs    int W |1 - w^2 sum_i D_i|^2 df   what a bonded sensor reads
+    # The acceleration of one mode is w_k^2 times ITS displacement (the response
+    # is narrow-band at w_k), which is Miles' own step and stays exact here. The
+    # relative-acceleration integrand |w^2 D|^2 is NOT used: it tends to 1/c at
+    # high frequency, so any band integral of it would be dominated by a term
+    # that is not resonant at all.
+    z_disp = 0.0
+    g_abs = 0.0
+    z_diag = [0.0] * n
+    prev = None
+    for f in grid:
+        w = two_pi * f
+        tot = 0j
+        per = []
+        for fr, zi, c in terms:
+            wi = two_pi * fr
+            den = (wi * wi - w * w) + 1j * (2.0 * zi * w * wi)
+            D = c / den
+            tot += D
+            per.append(D)
+        wf = wfun(f)
+        wt = w * w * tot
+        vals = (wf * abs(tot) ** 2, wf * abs(1.0 - wt) ** 2,
+                [wf * abs(D) ** 2 for D in per])
+        if prev is not None:
+            h = f - prev[0]
+            if h > 0.0:
+                z_disp += 0.5 * (prev[1][0] + vals[0]) * h
+                g_abs += 0.5 * (prev[1][1] + vals[1]) * h
+                pd = prev[1][2]
+                for k in range(n):
+                    z_diag[k] += 0.5 * (pd[k] + vals[2][k]) * h
+        prev = (f, vals)
+
+    z_diag_m = [G0 * math.sqrt(max(0.0, v)) for v in z_diag]
+    z_rms_m = G0 * math.sqrt(max(0.0, z_disp))
+    g_own = [(two_pi * terms[k][0]) ** 2 * z_diag_m[k] / G0 for k in range(n)]
+    g_rms = math.sqrt(sum(v * v for v in g_own))
+    g_abs_rms = math.sqrt(max(0.0, g_abs))
+
+    diag_var = sum(v * v for v in z_diag_m)
+    total_var = z_rms_m * z_rms_m
+    coherent = total_var - diag_var
+    shares = [(100.0 * (v * v) / diag_var if diag_var > 0.0 else 0.0)
+              for v in z_diag_m]
+
+    strongest = 0
+    best = -1.0
+    for k, v in enumerate(g_own):
+        if v > best:
+            best = v
+            strongest = k
+
+    if diag_var <= 0.0:
+        warnings.append(
+            "every mode has shape_at_point * participation ~ 0: uniform base "
+            "acceleration does not excite any of them, so this response is ~0 by "
+            "symmetry rather than by calculation")
+
+    per_mode = []
+    for k, (fr, zi, c) in enumerate(terms):
+        per_mode.append({
+            "index": k + 1,
+            "freq_hz": _sig(fr),
+            "zeta": _sig(zi, 6),
+            "q_factor": _sig(1.0 / (2.0 * zi), 6),
+            "participation_times_shape": _sig(c, 6),
+            "g_rms_own": _sig(g_own[k]),
+            "displacement_rms_own_mm": _sig(z_diag_m[k] * 1000.0),
+            "share_of_resonant_variance_pct": _sig(shares[k], 4),
+        })
+
+    coherent_pct = (100.0 * coherent / total_var) if total_var > 0.0 else 0.0
+    if abs(coherent_pct) > 5.0:
+        warnings.append(
+            "the modes overlap: the coherent sum moves the displacement variance "
+            "by %+.1f %% against summing them as independent, and that term is in "
+            "displacement_rms_mm (it is not dropped). The per-mode accelerations "
+            "are still summed as independent, which is the standard modal "
+            "superposition - a coherent acceleration number would need the phase "
+            "of every mode at the point, which plate_modes does not carry"
+            % coherent_pct)
+
+    miles = None
+    miles_ratio = None
+    miles_z_mm = None
+    z_ratio = None
+    if wflat is not None:
+        fr, zi, c = terms[0]
+        miles = abs(c) * math.sqrt(0.5 * math.pi * fr * (1.0 / (2.0 * zi)) * wflat)
+        if miles > 0.0:
+            miles_ratio = g_rms / miles
+            miles_z_mm = G0 * miles / ((two_pi * fr) ** 2) * 1000.0
+            if miles_z_mm > 0.0:
+                z_ratio = z_rms_m * 1000.0 / miles_z_mm
+
+    return ok(
+        {
+            "modes_included": n,
+            "mode_1_freq_hz": _sig(terms[0][0]),
+            "zeta": _sig(terms[0][1], 6),
+            "g_rms": _sig(g_rms),
+            "g_peak": _sig(g * g_rms),
+            "peak_factor": g,
+            "g_rms_absolute_including_quasistatic": _sig(g_abs_rms),
+            "g_rms_if_only_the_strongest_mode": _sig(g_own[strongest]),
+            "displacement_rms_mm": _sig(z_rms_m * 1000.0),
+            "displacement_peak_mm": _sig(z_rms_m * 1000.0 * g),
+            "z_3sigma_mm": _sig(z_rms_m * 1000.0 * g),
+            "per_mode": per_mode,
+            "strongest_mode": strongest + 1,
+            "resonant_variance_independent_g2": _sig(sum(v * v for v in g_own)),
+            "coherent_displacement_variance_share_pct": _sig(coherent_pct, 3),
+            "miles_single_mode_g_rms": (None if miles is None else _sig(miles)),
+            "ratio_to_miles": (None if miles_ratio is None else _sig(miles_ratio, 4)),
+            "miles_single_mode_displacement_rms_mm":
+                (None if miles_z_mm is None else _sig(miles_z_mm, 6)),
+            "displacement_ratio_to_miles":
+                (None if z_ratio is None else _sig(z_ratio, 4)),
+            "integration_band_hz": [_sig(f_lo), _sig(f_hi)],
+            "grid_points": len(grid),
+            "method": ("modal summation of %d modes, steady state, exact complex "
+                       "sum for the displacement (cross terms included) and w_k^2 "
+                       "times each mode's own displacement for its acceleration, "
+                       "then trapezoid on a grid with a fine pass over every peak"
+                       % n),
+            "warnings": warnings,
+        },
+        "g",
+        "modal summation (steady state) over the modes supplied",
+        "z_p(f) = -a sum_i w_i(p) Gamma_i / (w_i^2 - w^2 + 2 j zeta_i w w_i); "
+        "g_i = w_i^2 z_i (narrow-band at w_i), g_rms = sqrt(sum g_i^2); absolute "
+        "acceleration = a - w^2 z_p, integrated as its own quantity",
+        "single-mode limit reproduces Miles' closed form: displacement to the "
+        "digits the closed form carries, g_rms inside the trapezoid error "
+        "(measured in the selftest and in docs/85)",
+        {
+            "note": "g_rms is the resonant acceleration, sqrt(sum w_i^4 z_i^2), "
+                    "which is the quantity Miles' closed form gives for one mode "
+                    "and the one Steinberg's bands are defined against; "
+                    "displacement_rms_mm is the coherent sum over modes (cross "
+                    "terms in) and is the number to hand to Steinberg; "
+                    "g_rms_absolute_including_quasistatic is the full |1 - w^2 z| "
+                    "integral, i.e. what a sensor bonded to the board reads at low "
+                    "frequency as well",
+            "input": "uniform base acceleration; a point force, a shaker through "
+                     "one standoff or acoustic excitation is a different problem",
+            "damping": "classical (viscous) damping per mode; no joint slip, no "
+                       "material damping model, no coupling through the damper",
+            "modes": "Gamma and the shape come from plate_modes(participation=true) "
+                     "and are exact for the Ritz basis used there; this function "
+                     "does not re-derive them",
+        },
+    )
+
+
+def miles_response(f_n_hz, psd=None, zeta=None, q_factor=None, gamma=3.0,
+                   modes=None):
     """Single-mode random response: g_rms, and the displacement that follows.
 
     Flat PSD -> Miles' closed form  g_rms = sqrt(pi/2 * f_n * Q * W).
@@ -1644,7 +2027,14 @@ def miles_response(f_n_hz, psd=None, zeta=None, q_factor=None, gamma=3.0):
     modes, of which the second one is often only 1.5x away, and it treats the
     input as applied to the base. It also says nothing about stress - give the
     result to steinberg_fatigue() for that.
+
+    Pass `modes` (from plate_modes(participation=true)) instead of a single
+    f_n_hz and the same PSD is summed over every mode, cross terms included;
+    pass neither and nothing about this function changes (0.0.83).
     """
+    if modes is not None:
+        return _modal_response(psd, modes, zeta=zeta, q_factor=q_factor,
+                               gamma=gamma)
     f_n = _pos(f_n_hz)
     if f_n is None:
         return err("f_n_hz must be > 0", "ARG_INVALID",

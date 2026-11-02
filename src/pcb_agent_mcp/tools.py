@@ -4233,7 +4233,20 @@ def _capabilities(_args):
             "pump-out or mounting pressure in the interface layer, rth_cs (still an "
             "input you must supply), and heatsink selection - thermal_heatsink returns "
             "the BUDGET, there is deliberately no heatsink table in this server",
-            "Vibration is a THIN-PLATE, SINGLE-MODE, LINEAR layer, by name: no shear "
+            "Vibration is a THIN-PLATE, LINEAR layer, by name - and since 0.0.83 the "
+            "random response is no longer SINGLE-MODE: vibration_random_response sums "
+            "whatever modes you hand it (vibration_plate_modes(participation=true) "
+            "gives the participation factor int w dA / int w^2 dA, the modal mass and "
+            "the effective mass per mode), with the displacement summed coherently and "
+            "each mode's acceleration taken as w^2 times its own displacement. What "
+            "that still does NOT do: put the phase of every mode into ONE acceleration "
+            "number (the per-mode accelerations are summed as independent narrow-band "
+            "responses, standard practice but not a coherent acceleration spectrum), "
+            "carry the cross-coupling a non-proportional damper would introduce, "
+            "excite through a point force or a shaker on one standoff instead of "
+            "through the base, or report a stress spectrum (hand each mode's "
+            "displacement to vibration_plate_stress one mode at a time). It is still a "
+            "THIN-PLATE layer: no shear "
             "deformation or rotary inertia (so a thick or short plate reads too "
             "stiff). Copper skins with DIFFERENT thicknesses on the two faces ARE "
             "modelled (0.0.57: A/B/D section, and for the in-plane-free plate the "
@@ -6536,6 +6549,16 @@ _tool(
                                "potting or conformal coat). Integrated as an exact "
                                "polynomial moment, so it is the real mode-shape "
                                "weighting and not a smear", "items": {}},
+        "participation": _bool(
+            "per mode: Gamma = int w dA / int w^2 dA, the modal mass and the "
+            "effective mass, plus the fraction of the plate mass the reported modes "
+            "capture. That is what a mode needs to be summed against a random "
+            "vibration PSD (vibration_random_response takes exactly these). Both "
+            "integrals are exact monomial moments of the Ritz basis - no quadrature "
+            "and no fitting. A mode with no net deflection gets Gamma = 0, which is "
+            "the physical statement that uniform base acceleration does not excite "
+            "it (on an SSSS square the (1,2) and (2,1) modes are exactly that)",
+            False),
     }, "required": ["a_mm", "b_mm", "thickness_mm"]},
     lambda a: _vib.plate_modes(
         a.get("a_mm"), a.get("b_mm"), a.get("thickness_mm"),
@@ -6551,7 +6574,8 @@ _tool(
         copper_um_bottom=a.get("copper_um_bottom"),
         added_mass_g=a.get("added_mass_g"),
         added_mass_at_mm=a.get("added_mass_at_mm"),
-        added_mass_regions=a.get("added_mass_regions")),
+        added_mass_regions=a.get("added_mass_regions"),
+        participation=bool(a.get("participation"))),
 )
 
 _tool(
@@ -6682,23 +6706,41 @@ _tool(
 
 _tool(
     "vibration_random_response",
-    "Single-mode (Miles) random vibration: the g_rms a mode sees under a PSD, and the "
-    "displacement that follows. A flat PSD uses Miles' closed form "
-    "g_rms = sqrt(pi/2 * f_n * Q * W); a measured PSD curve is integrated as "
-    "int W(f)|H(f)|^2 df over three panels so a high-Q peak is actually resolved. The two "
-    "agree inside 1 % on a flat PSD. Single mode only - does not sum the other modes.",
+    "Random vibration: the g_rms a board sees under a PSD, and the displacement that "
+    "follows. TWO ways in, and the difference matters. Give f_n_hz and you get "
+    "single-mode (Miles): the flat-PSD closed form g_rms = sqrt(pi/2 * f_n * Q * W), or "
+    "the defining int W(f)|H(f)|^2 df for a measured PSD curve, over three panels so a "
+    "high-Q peak is resolved; the two agree inside 1 %. Give `modes` instead - the list "
+    "plate_modes(participation=true) hands you, with each mode's frequency, "
+    "participation factor and shape at the point you are watching - and the same PSD is "
+    "SUMMED over every mode: the displacement is an exact complex sum, so the modes "
+    "add coherently where they overlap and the cross terms are in the number; each "
+    "mode's acceleration is w_k^2 times its own displacement, and the accelerations "
+    "add as independent narrow-band responses, which is standard modal superposition "
+    "and says so. Cross terms matter: on a 100/105 Hz pair at zeta 0.02 the coherent "
+    "sum moves the displacement variance 29 % against summing the modes as "
+    "independent. With neither f_n_hz nor modes, nothing is guessed - it errors.",
     {"type": "object", "properties": {
-        "f_n_hz": _num("natural frequency (from vibration_plate_modes)"),
+        "f_n_hz": _num("natural frequency, for the single-mode (Miles) answer; leave "
+                       "it out and pass `modes` instead"),
         "psd": {"type": "object", "description":
                 '{"g2_per_hz": 0.1} or {"points": [[hz, g2/Hz], ...]}'},
+        "modes": {"type": "array", "description":
+                  "sum over these modes instead of one: each {freq_hz, "
+                  "participation, shape_at_point} from "
+                  "vibration_plate_modes(participation=true) plus a probe point. "
+                  "Optional per-mode zeta / q_factor override the global ones. "
+                  "Displacement is summed coherently (cross terms in); acceleration "
+                  "per mode is w^2 * its displacement", "items": {}},
         "zeta": _num("damping ratio"),
         "q_factor": _num("Q = 1/(2 zeta); give this OR zeta"),
         "gamma": _num("peak factor, default 3 (3 sigma)", 3),
-    }, "required": ["f_n_hz", "psd"]},
+    }, "required": ["psd"]},
     lambda a: _vib.miles_response(
         a.get("f_n_hz"), psd=a.get("psd"), zeta=a.get("zeta"),
         q_factor=a.get("q_factor"),
-        gamma=(a["gamma"] if a.get("gamma") is not None else 3.0)),
+        gamma=(a["gamma"] if a.get("gamma") is not None else 3.0),
+        modes=a.get("modes")),
 )
 
 _tool(

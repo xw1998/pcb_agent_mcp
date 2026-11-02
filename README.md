@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.82` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
+当前版本 `0.0.83` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -33,7 +33,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 > `00` 调研与架构 → `05` 无损转化架构总纲 → `06` 存储形式与信息传递 → `07` 自研定位与风险分期
 > → `10` 桌面控制与双栈读路径 → `11` 保真层 → `12` 写路径 → `13` 立创实测（真实存储与记录格式）
 > → `14` 原理图写路径 → `15` 对账（推导对着厂商判决）→ `16` 天线与馈线 → `17` 仿真层
-> → `18` DFM 工艺能力校验 → `19` 机械振动（薄板 Ritz 模态、Miles、Steinberg、冲击、传递率）
+> → `18` DFM 工艺能力校验 → `19` 机械振动（薄板 Ritz 模态、多模态随机响应、Steinberg、冲击、传递率）
 > → `20` 平面谐振与电热耦合 → `22` 微带与腔体滤波器 → `24` 立创进程内桥
 > → `25` 技能并入清单 → `26` 分步可见与铺铜闭环 → `27` 自动布线器。
 
@@ -122,12 +122,12 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.82
-python run_server.py --selftest         # 301/301
-python -m unittest discover -s tests    # 3304 例（实测 1055.161 s、skipped=5；0.0.81 是 3277 例 /
-                                        #   1024.718 s，本轮新增 27 例（`tests/test_dfm_mask_defined.py`）；
+python run_server.py --version          # 0.0.83
+python run_server.py --selftest         # 305/305
+python -m unittest discover -s tests    # 3345 例（实测 1330.170 s、skipped=5；0.0.82 是 3304 例 /
+                                        #   1055.161 s，本轮新增 41 例（`tests/test_vibration_modal.py`）；
                                         #   秒数不作性能结论——本机负载没有记录；skipped 仍是那 5 条；
-                                        #   3277 + 27）
+                                        #   3304 + 41）
 ```
 
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
@@ -357,7 +357,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `vibration_plate_modes` | 矩形薄板自由振动：频率/模态形状（Rayleigh–Ritz 单轴单项式基 + 边界零空间 + 质量白化 + Jacobi）；四边简支/固支/自由/悬臂/四角点支撑；铜进三件（`copper_um` 双面对称 / `copper_um_bottom` 起**不对称**叠层：`B≠0`、`D* = D − B A⁻¹B`、`ε⁰ = −A⁻¹Bκ`），质量进两件（`added_mass_g`+`added_mass_at_mm` 一个点，秩一白化；`added_mass_regions` 一块 footprint 上均布或整板） | 只有 Kirchhoff 薄板；不算阻尼、不算预紧/大变形、不算开孔与加强筋；不做元件**刚度**、层压板各向异性；不对称叠层只给**平态附近**的线化解（真板会弓起来，那个平衡态不解） |
 | `vibration_plate_outline` | **真实外轮廓**（任意简单多边形）的薄板自由振动：Green 定理在环上精确积内部矩 + 质量内积 GMS 白化 + 罚阶梯取**最平一档**（该档步长即 `alpha_spread_pct` 误差棒）；逐边 `ss`/`cc`/`free`、`free` 板、点支撑；每阶带 `penalty_share`/`physical`，撑不住的阶自己承认；0.0.57 起收 `copper_um`/`copper_um_bottom`（广义刚度 `d11/d22/d12/d66`，与矩形工具**同义**：单独给 `copper_um` = 两面相同） | 只解**外轮廓**：孔/挖空不网格化、不加元件质量、不算应力与疲劳；凹角与高边数不保证收敛（`alpha_converged=false` + `boundary_rms_mm` 明说）；`poly_degree<8` 带固支时空间里可能没有合法解 |
 | `vibration_plate_stress` | 振型 → 表面应力：同一模态在多个多项式阶上各解一次，**误差棒是量出来的**（`degree_sensitivity_pct`）；von Mises 与最大主应力**各报各的点** | `amplitude_mm` **必填**（振型没有幅值）；点支承下阶梯塌成一档 ⇒ `converged=None`（没有误差棒，而不是误差棒很小） |
-| `vibration_random_response` | 随机振动：Miles 等效（平坦闭式 + 实测谱积分互证）→ g_rms / 位移 rms | 单模态；非平坦谱逐段积分只在足迹内，谱外不计 |
+| `vibration_random_response` | 随机振动：**单模** Miles 等效（平坦闭式 + 实测谱积分互证），或给 `modes` 做**多模态叠加**（`Γ = ∫w dA/∫w² dA` 来自 `plate_modes(participation=true)`；位移**相干**求和、交叉项不丢，加速度按每模 `ω²z` 独立求和；同时报 `g_rms`（共振口径，可与 Miles 比）与 `g_rms_absolute_including_quasistatic`（板上传感器读数）） | 均匀**基座**加速度、经典（比例）阻尼：不做相位化的单一加速度谱、不做非比例阻尼耦合、不做点力/单点固定激振、不给应力谱；非平坦谱逐段积分只在足迹内，谱外不计 |
 | `vibration_fatigue` | Steinberg 三带（3σ/2σ/1σ）+ Miner 线性累积 → 循环数与小时寿命 | `z_allow_mm` **必填**（不内置「典型允许挠度」） |
 | `vibration_shock` | 半正弦冲击：SDOF Newmark（β=1/4、γ=1/2）→ 峰值位移/加速度、DLF | 单自由度；不算应力、不算二次冲击与接触碰撞 |
 | `vibration_isolator` | 隔振：传递率曲线、隔振起点 `f_n√2`、r=1 处 `Q√(1+1/Q²)` | 高频按 **1/r** 掉（分子含 (2ζr)²），不是 1/r²；不算隔振器非线性与蠕变 |
@@ -386,9 +386,9 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.82
-python run_server.py --selftest      # 协议级自检，301/301（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问、DC 偏置四问、DC 偏置接进选型四问、环型 MLT 与铜损六问、粉末磁化曲线七问、厂商损耗锚点审计四问、掩膜定义焊盘二问）
-python -m unittest discover -s tests # 3304 个用例（实测 1055.161 s、skipped=5，kicad-cli / pcbnew 与二维场解用例占大头；
+python run_server.py --version       # 0.0.83
+python run_server.py --selftest      # 协议级自检，305/305（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问、DC 偏置四问、DC 偏置接进选型四问、环型 MLT 与铜损六问、粉末磁化曲线七问、厂商损耗锚点审计四问、掩膜定义焊盘二问、随机振动模态叠加四问）
+python -m unittest discover -s tests # 3345 个用例（实测 1330.170 s、skipped=5，kicad-cli / pcbnew 与二维场解用例占大头；
                                      #   0.0.81 同机 3277 例跑了 1024.718 s，秒数随机器负载浮动，不作性能结论）
 python run_server.py                 # 起 stdio MCP 服务
 ```
@@ -1064,7 +1064,7 @@ pcb_agent_mcp/
 │       ├── power.py              # 铜阻/过孔/自感/电阻网络/IR drop/电容组/PDN
 │       ├── thermal.py            # 1-D 热阻串/过孔阵列/2-D 板 SOR/瞬态/散热片/对流
 │       ├── dfm.py                # DFM：17 条规则目录 + 能力文档体检 + 五态判定（无内置表）
-│       ├── vibration.py          # 振动：Ritz 模态 + Miles/Steinberg/冲击/传递率 + 应力（degree 阶梯误差棒）
+│       ├── vibration.py          # 振动：Ritz 模态 + 参与因子/多模态叠加 + Miles/Steinberg/冲击/传递率 + 应力
 │       ├── vibration_poly.py     # 非矩形外轮廓：Green 定理精确矩 + GMS 白化 + 罚阶梯（spread/penalty_share 自述局限）
 │       ├── reliability.py        # 可靠性：焊点热疲劳（Engelmaier/Miner/Norris-Landzberg）+ 跌落板面应变 + 冲击谱
 │       ├── cavity.py             # 平面谐振：腔体模 + 过孔围栏 pitch/λ_g（判据外给）+ plane_q（Qc = h/δs）
@@ -1086,7 +1086,7 @@ pcb_agent_mcp/
 │   ├── powder_curve_fits.json    # 125 行 DC 磁化 B(H) + 54 行 Δµ/µ(T) + 49 行印刷稳定性表 + 5 行偏置变体，每行带印刷页与 URL（0.0.80 起）
 │   ├── material_loss_anchors.json # 9 个牌号 / 17 个厂商印刷 PV 点 / 3 个来源，每点带 printed_page、printed_as 与 qualifier（`≤` / `~` / `Max.` / 裸数字四分类，0.0.81 起）
 │   └── creepage_tables.json      # 电气间隙/爬电距离阶梯（schematic_review 的隔离间距用）
-├── tests/                        # 3304 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 3345 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）

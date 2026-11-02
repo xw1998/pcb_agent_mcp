@@ -653,6 +653,64 @@ def selftest():
         check("vibration Miles integral matches the closed form 21.708 g inside 1 %",
               abs(_g - 21.708) < 0.217, str(_g))
 
+        # --- modal participation (0.0.83). Two numbers here are ANALYTIC, not
+        # this code agreeing with itself: for an SSSS plate the (1,1) mode has
+        # int w dA / int w^2 dA = 16/pi^2 exactly, and every mode with an even
+        # index along an axis has a zero net deflection, so uniform base
+        # acceleration cannot excite it at all.
+        r = handle({"jsonrpc": "2.0", "id": 841, "method": "tools/call",
+                    "params": {"name": "vibration_plate_modes", "arguments": {
+                        "a_mm": 100, "b_mm": 100, "thickness_mm": 1.6,
+                        "material": "fr4", "mount": "edges", "n_modes": 4,
+                        "participation": True}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _p = (payload.get("value") or {}).get("participation") or {}
+        _pm = _p.get("modes") or [{}, {}]
+        check("vibration participation: SSSS (1,1) Gamma = 16/pi^2 = 1.621139 and the "
+              "(1,2)/(2,1) pair carries 0",
+              abs((_pm[0] or {}).get("participation", 0) - 1.621139) < 0.001
+              and abs((_pm[1] or {}).get("participation", 1)) < 1e-3,
+              "%s / %s" % ((_pm[0] or {}).get("participation"),
+                           (_pm[1] or {}).get("participation")))
+        check("vibration participation: the four reported modes capture "
+              "(16/pi^2)^2/4 = 0.656966 of the plate mass",
+              abs(_p.get("mass_capture_fraction", 0) - 0.656966) < 0.0005,
+              str(_p.get("mass_capture_fraction")))
+
+        # --- the modal summation must reduce to Miles for one mode with
+        # participation*shape = 1, both in g and in displacement.
+        r = handle({"jsonrpc": "2.0", "id": 842, "method": "tools/call",
+                    "params": {"name": "vibration_random_response", "arguments": {
+                        "psd": {"g2_per_hz": 0.1}, "q_factor": 10,
+                        "modes": [{"freq_hz": 300, "participation": 1.0,
+                                   "shape_at_point": 1.0}]}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v = payload.get("value") or {}
+        check("vibration modal summation of ONE mode reproduces Miles 21.708 g "
+              "inside 1 % and its displacement inside 0.1 %",
+              abs(_v.get("g_rms", 0) - 21.708) < 0.217
+              and abs(_v.get("displacement_ratio_to_miles", 0) - 1.0) < 0.001,
+              "%s / %s" % (_v.get("g_rms"), _v.get("displacement_ratio_to_miles")))
+
+        # --- and it must NOT be the same as the single-mode answer when a second
+        # mode sits close by: that is the whole point of the summation.
+        r = handle({"jsonrpc": "2.0", "id": 843, "method": "tools/call",
+                    "params": {"name": "vibration_random_response", "arguments": {
+                        "psd": {"g2_per_hz": 0.1}, "q_factor": 10,
+                        "modes": [{"freq_hz": 300, "participation": 1.0,
+                                   "shape_at_point": 1.0},
+                                  {"freq_hz": 315, "participation": 1.0,
+                                   "shape_at_point": 1.0}]}}})
+        payload = json.loads(r["result"]["content"][0]["text"])
+        _v2 = payload.get("value") or {}
+        check("vibration modal summation: a 5 % neighbour changes the answer and the "
+              "coherent displacement share is reported (not dropped)",
+              _v2.get("modes_included") == 2
+              and _v2.get("g_rms", 0) > 1.2 * _v.get("g_rms", 1.0)
+              and abs(_v2.get("coherent_displacement_variance_share_pct", 0)) > 20.0,
+              "%s / %s" % (_v2.get("g_rms"),
+                           _v2.get("coherent_displacement_variance_share_pct")))
+
         r = handle({"jsonrpc": "2.0", "id": 85, "method": "tools/call",
                     "params": {"name": "vibration_fatigue", "arguments": {
                         "f_n_hz": 300, "z_3sigma_mm": 0.5}}})
