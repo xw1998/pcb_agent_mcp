@@ -9,6 +9,80 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.91] - 2026-11-02
+
+**悬空铜能查能切：`board_dangling_copper`（FreeRouting 算法层第二轮）**
+（`docs/92` 的落地部分；工具数 **181**（新增 1）/ `calc_capabilities.available` **175** /
+`not_implemented_yet` **23** / `--selftest` **324/324** / `dependencies = []` 仍成立）
+
+### 它是什么
+
+FreeRouting 在写出板子之前会把布线阶段留下的悬空铜清掉（`DanglingCopper.java`，85 行）：
+**一个 via 只在一层上有本网的铜**、**一条 trace 有自由端**，把每个尾巴背后一路删到下一个
+**fork / pin / fixed item**，最多 16 轮（删掉 stub 可能让后面的 via 只剩一层铜，所以是串行收敛）；
+**用户放置的铜是 fixed，保留**；删完开路连接数上升就整轮 undo。
+
+我们抄的是机制，不是代码（GPL-3.0，只读）。落成 `src/pcb_agent_mcp/dangling.py`（607 行），
+与他们的两处**有意不同**都写在 docstring 里：切除单位是**整节点**（`segment`/`arc`/`via`），
+不是 track 中段；不需要 16 轮，因为我们的链一次走到头。
+
+### 三条属于我们自己的读数
+
+1. **「attached」是几何断言**：点落在另一段的宽度内 / via 的尺寸内 / pad 的 reach 内 / 同网
+   `filled_polygon` 内才算附着；只是靠近不算，间隙就是间隙（`TOL_MM = 0.002`，可改）。
+2. **「cuttable」是证明不是希望**：链只有一个附着点，且不是任何 pad 的唯一铜 ⇒ 切它
+   **不可能**开连接；否则报 `why_not`（`locked` / `would_open_a_pad`）。
+3. **zone 尊重而非忽略**：同网 `filled_polygon` 才算铜，keepout 不是铜，没 fill 的板子
+   **如实说「不猜」**。
+
+### 写路径
+
+* 新 op **`delete_via`**（悬空铜要删的第二类节点原来删不掉），错误码 `ARG_MISSING` /
+  `TARGET_NOT_FOUND`，走 `_refuse_fixed`（`allow_fixed=true` 才动 locked 的 via）；
+* `delete_track` 加 **`include_arcs`**（默认 **false** ⇒ 既有答案逐位不变），弧也是铜。
+
+### 工具行为
+
+`board_dangling_copper(path, apply, include_floating, max_report, tolerance_mm, …)`：
+默认**只报告**（`writes_nothing: True`）；**没有可切的就绝不造空计划**（`message` 是
+`"no dangling copper"` 或 `"nothing on this board is both dangling and safe to cut"`，
+`apply=true` 在干净板上返回的是拒绝编造）；**浮铜默认不切**（`include_floating=true` 才切，
+「有人故意放的测试点」不是这个工具能替人判的缺陷）；`apply=true` 走 propose → apply_plan，
+**写后再 survey 一次**放进 `value["after"]`。
+
+### 顺手修掉的一处读写分歧
+
+`adapters/kicad_pcb.py::_uuid` 原来只认 `(uuid "<x>")`（KiCad 8 起），而 KiCad 7 写的是裸 atom
+`(tstamp <x>)`；`edit/build.py::id_of` 早就两种都读。**读得到的不一定能删**就是这种分歧，这版两个都读。
+
+### 本轮实测
+
+`tests/test_dangling.py` **22 个用例全绿**（含负控制：活 via 杀掉尾巴后不再报；同一块板改
+`tolerance_mm` 就改答案；干净板必须报 0；locked via 拒绝且不落盘）；相关子集
+`test_edit` + `test_ops_edit` + `test_route_fixed` **110 例全绿**、
+`test_kicad_pcb` + `test_fidelity` + `test_tools` + `test_route` **149 例全绿**；
+`--selftest` **324/324**（新增三条 (9101)/(9102)/(9103)）；`calc_capabilities` 实测
+`available 175` / `not_implemented_yet 23` / `len(TOOLS) 181`。
+全量回归（3493 例）按既定节奏留到功能收口时集中跑。
+
+### 只记账、未实施
+
+`LastMileBlockerRipup.java`（93 行）：只剩少数未完成连接时撕掉落在剩余 airline 走廊内的外来铜，
+`MAX_ITEMS = 24`、走廊 `margin = max(span/4, 1)`、只撕 `Trace`/`Via` 且非 fixed、非本网、
+`netCount() > 0`。我们的 `_negotiate()` 已是它的更强形态（带价格、按 wish 走廊、整轮重布线），
+增量价值等悬空铜跑过真板再评估。
+
+### 一条反面事实
+
+`autoroute/BoardUpdateStrategy.java` 整个文件 6 行，枚举**只有一个值** `GLOBAL_OPTIMAL`——
+「策略」等于没有策略。我们加任何 `mode`/`strategy` 类参数时，要么两个值都有可观测的行为差，
+要么就别暴露它。
+
+### 不动的东西
+
+既有工具、既有 op 默认行为、既有信封字段一个都没变：不传 `include_floating` / `include_arcs` /
+`tolerance_mm` 时，旧的删除语义与旧的悬空判定都不受影响。
+
 ## [0.0.90] - 2026-11-02
 
 **A1「锁定的铜不回流」：文件 `(locked)` 与调用方 `fixed_nets` 两条入口**

@@ -4980,9 +4980,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (180 tools now), so an agent that asks what can be computed is "
+          "table (181 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 180
+          len(_tools.TOOLS) == 181
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -5157,8 +5157,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (180 tools now)",
-          len(_tools.TOOLS) == 180
+          "table (181 tools now)",
+          len(_tools.TOOLS) == 181
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5422,14 +5422,17 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 180, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 181, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
           "(magnetics_core_loss_audit), 0.0.82-0.0.84 arguments only, 0.0.85 "
           "exactly one (thermal_spreading), 0.0.86 arguments only "
-          "(melting_model on fusing_current), and 0.0.87 arguments only "
-          "(melting_model on repetitive_pulse_rating)",
+          "(melting_model on fusing_current), 0.0.87 arguments only "
+          "(melting_model on repetitive_pulse_rating), 0.0.88 arguments only "
+          "(melting_model on fusing_current_taper), 0.0.89 arguments only, "
+          "0.0.90 arguments only (fixed_nets on board_route), and 0.0.91 "
+          "exactly one (board_dangling_copper)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5437,7 +5440,7 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 180,
+          and len(_tools.TOOLS) == 181,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -5579,7 +5582,7 @@ def selftest():
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 180,
+          and len(_tools.TOOLS) == 181,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -5861,7 +5864,7 @@ def selftest():
           and _au_temp.get("temperatures_printed") == [100.0]
           and _au_kneg.get("reason_code") == "ARG_RANGE"
           and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 180,
+          and len(_tools.TOOLS) == 181,
           "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
           % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
              _au_n27.get("reason_code"), _au_mat.get("reason_code"),
@@ -6213,6 +6216,150 @@ def selftest():
           "10 A %s / 30 A %s / bad %s"
           % (_tp_lo.get("melt_delay_pct"), _tp_hi.get("melt_delay_pct"),
              _tp_bad.get("reason_code")))
+
+    # ---- 0.0.91: dangling copper -------------------------------------------
+    # One board carrying the four readings at once: a T-junction tail that may
+    # be cut, a stub that is its pad's only copper (refuse), a (locked) tail
+    # (refuse), and a piece attached at neither end (reported, not cut).
+    _dg_tmp = _tempfile.mkdtemp(prefix="pcbagent-dangling-")
+    _dg_home = os.environ.get("PCB_AGENT_HOME")
+    os.environ["PCB_AGENT_HOME"] = os.path.join(_dg_tmp, "home")
+    _dg_u = "00000000-0000-0000-0000-000000000"
+    _dg_body = [
+        '(kicad_pcb (version 20221018) (generator pcbnew)',
+        '  (general (thickness 1.6))',
+        '  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))',
+        '  (net 0 "") (net 1 "GND") (net 2 "VCC") (net 3 "SIG")',
+        '  (net_class "Default" "" (clearance 0.2) (trace_width 0.25)',
+        '    (via_dia 0.6) (via_drill 0.3))',
+        '  (gr_line (start 0 0) (end 40 0) (layer "Edge.Cuts") (width 0.1)',
+        '    (tstamp %s001))' % _dg_u,
+        '  (segment (start 5 5) (end 20 5) (width 0.25) (layer "F.Cu") (net 1)',
+        '    (tstamp %s301))' % _dg_u,
+        '  (segment (start 12 5) (end 12 10) (width 0.25) (layer "F.Cu") (net 1)',
+        '    (tstamp %s302))' % _dg_u,
+        '  (segment (start 35 5) (end 35 10) (width 0.25) (layer "F.Cu") (net 1)',
+        '    (tstamp %s303))' % _dg_u,
+        '  (segment (start 25 20) (end 30 20) (width 0.25) (layer "F.Cu") (net 3)',
+        '    (tstamp %s304))' % _dg_u,
+        '  (segment (start 5 15) (end 20 15) (width 0.25) (layer "F.Cu") (net 2)',
+        '    (tstamp %s305))' % _dg_u,
+        '  (segment (start 12 15) (end 12 25) (width 0.25) (layer "F.Cu") (net 2)',
+        '    (tstamp %s306) (locked))' % _dg_u,
+        '  (footprint "SYN:Pad" (version 20221018) (generator pcbnew)',
+        '    (layer "F.Cu") (at 0 0) (attr smd)',
+        '    (fp_text reference "J1" (at 0 -3) (layer "F.SilkS")',
+        '      (effects (font (size 0.7 0.7) (thickness 0.12))))',
+        '    (pad "1" smd rect (at 5 5) (size 1 1)',
+        '      (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "GND")',
+        '      (tstamp %s401))' % _dg_u,
+        '    (pad "2" smd rect (at 20 5) (size 1 1)',
+        '      (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "GND")',
+        '      (tstamp %s402))' % _dg_u,
+        '    (pad "3" smd rect (at 35 5) (size 1 1)',
+        '      (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "GND")',
+        '      (tstamp %s403)))' % _dg_u,
+        '  (footprint "SYN:Pad" (version 20221018) (generator pcbnew)',
+        '    (layer "F.Cu") (at 0 0) (attr smd)',
+        '    (fp_text reference "J2" (at 0 -14) (layer "F.SilkS")',
+        '      (effects (font (size 0.7 0.7) (thickness 0.12))))',
+        '    (pad "1" smd rect (at 5 15) (size 1 1)',
+        '      (layers "F.Cu" "F.Paste" "F.Mask") (net 2 "VCC")',
+        '      (tstamp %s501))' % _dg_u,
+        '    (pad "2" smd rect (at 20 15) (size 1 1)',
+        '      (layers "F.Cu" "F.Paste" "F.Mask") (net 2 "VCC")',
+        '      (tstamp %s502)))' % _dg_u,
+        ')',
+    ]
+    _dg_path = os.path.join(_dg_tmp, "dangling.kicad_pcb")
+    try:
+        with open(_dg_path, "w", encoding="utf-8", newline="\n") as _fh:
+            _fh.write("\n".join(_dg_body) + "\n")
+        _dg_rep = _call("board_dangling_copper", {"path": _dg_path}, 9101)
+        _dg_val = _dg_rep.get("value") or {}
+        _dg_tails = _dg_val.get("tail_list") or []
+        _dg_why = dict((t["uuids"][0][-3:], t.get("why_not"))
+                       for t in _dg_tails if t["kind"] == "tail")
+        check("a tail is found where the copper is free at one end and attached at "
+              "the other, and the two reasons NOT to cut it are answers of their "
+              "own: the stub that is its pad's only copper is refused by name, the "
+              "(locked) tail is refused, the tail into a real fork is cuttable, and "
+              "the piece attached at neither end is reported as floating instead",
+              _dg_val.get("tails") == 3
+              and _dg_val.get("floating") == 1
+              and _dg_val.get("cuttable") == 1
+              and _dg_why.get("302") is None
+              and _dg_why.get("303") == "would_open_a_pad"
+              and _dg_why.get("306") == "locked",
+              "tails %s, floating %s, cuttable %s, why %s"
+              % (_dg_val.get("tails"), _dg_val.get("floating"),
+                 _dg_val.get("cuttable"), _dg_why))
+
+        _dg_before = open(_dg_path, encoding="utf-8").read()
+        _dg_apply = _call("board_dangling_copper",
+                          {"path": _dg_path, "apply": True}, 9102)
+        _dg_after = open(_dg_path, encoding="utf-8").read()
+        check("the cut lands in the FILE and nowhere else: the one cuttable tail is "
+              "gone, the trunk, the pad stub, the floating piece and the (locked) "
+              "tail are all still there, and the second survey says nothing "
+              "cuttable is left",
+              _dg_apply.get("status") == "ok"
+              and (_dg_apply.get("value") or {}).get("ops_written") == 1
+              and _dg_u + "302" not in _dg_after
+              and all(_dg_u + k in _dg_after for k in ("301", "303", "304",
+                                                       "305", "306"))
+              and ((_dg_apply.get("value") or {}).get("after") or {}).get("cuttable") == 0,
+              "status %s, wrote %s, after %s"
+              % (_dg_apply.get("status"),
+                 (_dg_apply.get("value") or {}).get("ops_written"),
+                 ((_dg_apply.get("value") or {}).get("after") or {}).get("cuttable")))
+
+        # the failure side of the same question: a board with nothing dangling
+        # (one track, pad to pad - so zero is the only honest answer)
+        _dg_clean = os.path.join(_dg_tmp, "clean.kicad_pcb")
+        with open(_dg_clean, "w", encoding="utf-8", newline="\n") as _fh:
+            _fh.write("\n".join([
+                '(kicad_pcb (version 20221018) (generator pcbnew)',
+                '  (general (thickness 1.6))',
+                '  (layers (0 "F.Cu" signal) (31 "B.Cu" signal)',
+                '    (44 "Edge.Cuts" user))',
+                '  (net 0 "") (net 1 "GND")',
+                '  (net_class "Default" "" (clearance 0.2) (trace_width 0.25)',
+                '    (via_dia 0.6) (via_drill 0.3))',
+                '  (gr_line (start 0 0) (end 40 0) (layer "Edge.Cuts")',
+                '    (width 0.1) (tstamp %s001))' % _dg_u,
+                '  (segment (start 5 5) (end 20 5) (width 0.25) (layer "F.Cu")',
+                '    (net 1) (tstamp %s601))' % _dg_u,
+                '  (footprint "SYN:Pad" (version 20221018) (generator pcbnew)',
+                '    (layer "F.Cu") (at 0 0) (attr smd)',
+                '    (fp_text reference "J9" (at 0 -3) (layer "F.SilkS")',
+                '      (effects (font (size 0.7 0.7) (thickness 0.12))))',
+                '    (pad "1" smd rect (at 5 5) (size 1 1)',
+                '      (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "GND")',
+                '      (tstamp %s611))' % _dg_u,
+                '    (pad "2" smd rect (at 20 5) (size 1 1)',
+                '      (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "GND")',
+                '      (tstamp %s612)))' % _dg_u,
+                ')',
+            ]) + "\n")
+        _dg_zero = _call("board_dangling_copper",
+                         {"path": _dg_clean, "apply": True}, 9103)
+        check("and a board whose copper is all attached reports nothing and writes "
+              "nothing - apply=true on it is not an empty plan, it is a refusal to "
+              "invent one",
+              _dg_zero.get("status") == "ok"
+              and (_dg_zero.get("value") or {}).get("tails") == 0
+              and (_dg_zero.get("value") or {}).get("writes_nothing") is True
+              and _dg_zero.get("message") == "no dangling copper",
+              "tails %s, message %s"
+              % ((_dg_zero.get("value") or {}).get("tails"),
+                 _dg_zero.get("message")))
+    finally:
+        if _dg_home is None:
+            os.environ.pop("PCB_AGENT_HOME", None)
+        else:
+            os.environ["PCB_AGENT_HOME"] = _dg_home
+        _shutil.rmtree(_dg_tmp, ignore_errors=True)
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

@@ -1211,8 +1211,14 @@ def _select_tracks(ed, o):
     uid = o.get("uuid")
     near = o.get("near")
     tol = _num(o, "tol", required=False, default=1.0)
+    # KiCad stores an arc as a track too (`(arc (start) (mid) (end) ...)`), and a
+    # dangling chain can run into one. `include_arcs` is off by default because a
+    # bare `delete_track` has always meant "segments" and a selector that quietly
+    # widened would delete copper nobody asked it to touch.
+    heads = ("segment", "arc") if _bool(o, "include_arcs", False) else ("segment",)
+    nodes = [n for h in heads for n in ed.items(h)]
     out = []
-    for node in ed.items("segment"):
+    for node in nodes:
         node_uid = ed.sp.id_of(node)
         if uid and node_uid != uid:
             continue
@@ -1279,8 +1285,64 @@ op("delete_track", {"copper"},
    "Delete track segments by uuid, or by a point within 'tol' of an end point. "
    "Refuses without a selector.",
    {"uuid": "segment uuid", "near": "[x, y] mm", "tol": "mm",
+    "include_arcs": "bool: also match track arcs (default false)",
     "allow_fixed": "bool: also move copper the file marks (locked)"},
    _run_delete_track, _verify_delete_track)
+
+def _select_vias(ed, o):
+    uid = o.get("uuid")
+    near = o.get("near")
+    tol = _num(o, "tol", required=False, default=0.05)
+    out = []
+    for node in ed.items("via"):
+        node_uid = ed.sp.id_of(node)
+        if uid and node_uid != uid:
+            continue
+        if near is not None:
+            if not isinstance(near, (list, tuple)) or len(near) != 2:
+                raise OpError("'near' must be [x, y]", "ARG_INVALID")
+            at = S.child(node, "at")
+            if at is None:
+                continue
+            if (abs(S.arg_num(at, 1, 0.0) - float(near[0])) > tol or
+                    abs(-S.arg_num(at, 2, 0.0) - float(near[1])) > tol):
+                continue
+        out.append(node)
+    return out
+
+def _run_delete_via(ed, o, seed):
+    """Delete one via by uuid, or the via(s) within 'tol' of a point.
+
+    The companion of `delete_track`: a dangling chain can end in a via that then
+    carries copper on one layer only, and a board that cannot lose that via keeps
+    a stub nobody drew on purpose. Same rule as every other write on copper: the
+    file's `(locked)` wins unless `allow_fixed` says otherwise.
+    """
+    if not o.get("uuid") and o.get("near") is None:
+        raise OpError("delete_via needs a selector: 'uuid' or 'near' (a bare "
+                      "'delete all vias' is not an operation)", "ARG_MISSING")
+    targets = _select_vias(ed, o)
+    if not targets:
+        raise OpError("no via matches that selector", "TARGET_NOT_FOUND")
+    _refuse_fixed(ed, "selected via(s)", _fixed_nodes(targets), len(targets), o)
+    out = []
+    for node in targets:
+        out.append(ed.sp.id_of(node))
+        ed.remove(node)
+    return {"nodes_removed": len(targets), "uuids": out}
+
+def _verify_delete_via(ed, o):
+    if o.get("uuid"):
+        left = [n for n in ed.items("via") if ed.sp.id_of(n) == o["uuid"]]
+        return {"ok": not left, "vias_with_that_uuid": len(left)}
+    return {"ok": not _select_vias(ed, o), "vias_left_near": len(_select_vias(ed, o))}
+
+op("delete_via", {"copper"},
+   "Delete a via by uuid, or by a point within 'tol' of it. Refuses without a "
+   "selector.",
+   {"uuid": "via uuid", "near": "[x, y] mm", "tol": "mm (default 0.05)",
+    "allow_fixed": "bool: also move copper the file marks (locked)"},
+   _run_delete_via, _verify_delete_via)
 
 def _run_set_track_width(ed, o, seed):
     width = _num(o, "width", positive=True)

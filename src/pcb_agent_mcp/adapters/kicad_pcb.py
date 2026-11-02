@@ -282,8 +282,17 @@ def _uuid(node):
     kicad-cli's DRC report identifies each offending item by uuid only (its
     descriptions are translated, its `pos` is the item's ANCHOR, not the closest
     point), so the uuid is the one identity both sides can agree on.
+
+    KiCad 7 wrote the same value as `(tstamp <uuid>)` and only renamed it to a
+    quoted `(uuid ...)` in the v8 format, so both spellings are read here; the
+    edit side (`edit/build.py::id_of`) has always accepted either, and a reader
+    that only knew one of them would report every v7 item as anonymous.
     """
-    return (atom(child(node, "uuid"), 1, None) or None)
+    for name in ("uuid", "tstamp"):
+        v = atom(child(node, name), 1, None)
+        if v:
+            return v
+    return None
 
 
 def _pad_from_node(pad_node):

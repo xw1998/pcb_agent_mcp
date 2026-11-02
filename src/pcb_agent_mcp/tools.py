@@ -2262,6 +2262,151 @@ _tool(
     lambda a: _guarded(lambda: _board_fanout(a)),
 )
 
+_tool(
+    "board_dangling_copper",
+    "Find the copper that hangs off a board attached at one end only, and cut the "
+    "part of it that cannot be carrying anything. A TAIL is copper attached at one "
+    "end and free at the other; the chain behind it is walked to the next fork, pad, "
+    "via or pour, exactly the mechanism FreeRouting's DanglingCopper uses after an "
+    "autoroute. Copper attached to nothing at either end is reported separately as "
+    "FLOATING - a different finding, and not cut unless include_floating=true, "
+    "because a piece someone placed on purpose (a test point, a marker) is not a "
+    "defect this tool gets to decide about. What makes a cut a proof rather than a "
+    "hope: a chain is cuttable only when no piece is (locked) and no pad of the net "
+    "would be left with copper only through it - such a chain hangs off one "
+    "attachment point and is nobody's only path, so removing it cannot open a "
+    "connection. Zones count as copper only where the file carries a real "
+    "filled_polygon (a keep-out is not copper, and an unfilled pour is not guessed "
+    "at). Attachments are exact geometry: a gap of 0.002 mm is a gap. Returns a "
+    "report by default; apply=true writes the cuts through board_propose + "
+    "board_apply (checkpoint, atomic write, four gates, KiCad DRC) and re-surveys "
+    "afterwards.",
+    {"type": "object",
+     "properties": dict({
+         "apply": _bool("cut the cuttable tails (default false: report only)"),
+         "include_floating": _bool("also cut copper attached at neither end "
+                                   "(default false: reported, not cut)", False),
+         "max_report": _num("how many tails / floating pieces to list per net "
+                            "(default 200)", 200),
+         "tolerance_mm": _num("a gap smaller than this is a gap, not a contact "
+                              "(default 0.002)", None),
+         "allow_new_violations": _bool("accept newly introduced DRC violations"),
+         "strict_drc": _bool("let every new violation block, warnings included"),
+     }, **_COMMON),
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_dangling_copper(a)),
+)
+
+def _board_dangling_copper(args):
+    """Report (and on request cut) the tails a board is carrying.
+
+    Read-only by default and honest about the three readings it makes: what
+    counts as attached, what makes a chain cuttable, and which zone copper is
+    real. Nothing here decides that a net is finished - it only says which copper
+    cannot be carrying a connection.
+    """
+    from . import dangling as _dangling
+    from . import edit as _edit
+    board, e = _load_board(args)
+    if e:
+        return e
+    kw = {}
+    if args.get("tolerance_mm") is not None:
+        kw["tol_mm"] = float(args["tolerance_mm"])
+    if args.get("max_report") is not None:
+        kw["max_report"] = int(args["max_report"])
+    report = _dangling.survey(board, **kw)
+    ops = _dangling.removal_ops(report,
+                                include_floating=args.get("include_floating") is True)
+
+    value = {
+        "tails": report["tails"],
+        "floating": report["floating"],
+        "cuttable": report["cuttable"],
+        "cuttable_length_mm": report["cuttable_length_mm"],
+        "nets_with_dangling": report["nets_with_dangling"],
+        "nets_with_pour": report["nets_with_pour"],
+        "tolerance_mm": report["tolerance_mm"],
+        "zones_as_copper": report["zones_as_copper"],
+        "tail_list": _flatten_tails(report),
+        "ops_preview": ops[:20],
+        "ops_count": len(ops),
+        "cuts_floating": args.get("include_floating") is True,
+        "writes_nothing": True,
+    }
+    out = ok(value, "mm",
+             model="attachment by exact copper geometry (a track end inside "
+                   "another piece's width, a via's size or a pad's reach, or a "
+                   "point inside a same-net filled_polygon); cuttability judged "
+                   "by walking the chain to its one attachment point",
+             basis="mechanism of FreeRouting "
+                   "autoroute/pipeline/DanglingCopper.java (walk the stub behind "
+                   "each tail to the next fork/pin/fixed item, keep user-fixed "
+                   "copper, never increase the net's open connections); the three "
+                   "readings this server adds are stated in the tool description",
+             precision="\u00b10.001 mm on reported lengths (coordinates are the "
+                       "file's own, rounded to 4 decimals)",
+             assumptions=({"tolerance_mm": report["tolerance_mm"]}
+                          if kw.get("tol_mm") is not None else
+                          {"tolerance_mm": report["tolerance_mm"],
+                           "note": "a smaller gap would be a different answer; the "
+                                   "default is 0.002 mm"}),
+             extra={})
+    if not ops:
+        out["message"] = ("nothing on this board is both dangling and safe to cut"
+                          if report["tails"] or report["floating"]
+                          else "no dangling copper")
+        return out
+    if args.get("apply") is not True:
+        out["next_step"] = ("pass apply=true to cut these %d piece(s) (it goes "
+                            "through board_propose + board_apply and the four gates)"
+                            % len(ops))
+        return out
+    plan = _edit.propose(args["path"], ops, {"engine": True})
+    try:
+        applied = _edit.apply_plan(plan["plan_id"], confirm=True,
+                                   options={"engine": True,
+                                            "allow_new_violations": bool(
+                                                args.get("allow_new_violations")),
+                                            "strict_drc": bool(args.get("strict_drc"))})
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+    after = None
+    try:
+        board2, e2 = _load_board(args)
+        if e2 is None:
+            after = _dangling_summary(_dangling.survey(board2))
+    except Exception:                     # noqa: BLE001 - the cut already happened
+        after = None
+    out["value"]["plan_id"] = plan["plan_id"]
+    out["value"]["writes_nothing"] = False
+    out["value"]["ops_written"] = len(ops)
+    out["value"]["after"] = after
+    out["applied"] = applied
+    return out
+
+def _dangling_summary(report):
+    return {"tails": report["tails"], "floating": report["floating"],
+            "cuttable": report["cuttable"],
+            "cuttable_length_mm": report["cuttable_length_mm"],
+            "nets_with_dangling": report["nets_with_dangling"]}
+
+def _flatten_tails(report):
+    """Every tail, net-tagged, longest first - one list for a caller that just
+    wants to read them."""
+    out = []
+    for net in report["nets"]:
+        for entry in net["tails"]:
+            row = dict(entry)
+            row["kind"] = "tail"
+            out.append(row)
+        for entry in net["floating"]:
+            row = dict(entry)
+            row["kind"] = "floating"
+            out.append(row)
+    out.sort(key=lambda r: -r["length_mm"])
+    return out[:200]
+
 def _ledger_note(kind, board_path, payload):
     """Append one run to the ledger. BEST EFFORT - it cannot change an answer.
 
@@ -3730,6 +3875,7 @@ def _capabilities(_args):
             "board_summary", "board_components", "board_nets", "board_clearance",
             "board_free_space", "board_routability", "board_pour_connectivity",
             "board_zones", "board_fill_zones", "board_route",
+            "board_dangling_copper",
             "board_cross_split",
             "board_loop_area", "board_fidelity", "board_view", "board_drc",
             "board_stats", "board_cross_check", "epro_inspect",

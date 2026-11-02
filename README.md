@@ -2,7 +2,7 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.90` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
+当前版本 `0.0.91` 已实现十层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -19,7 +19,7 @@ KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对
 | **Sim** | 无板子的物理计算：SPICE 子集（DC/瞬态/AC）、铜阻与 PDN、热阻与 2-D 板温度、薄板模态与振动响应、平面谐振、电热耦合（单集中 Rth） | 已实现（子集，未实现项逐条点名拒绝（`0.0.37` 起 `A` 卡由随包 ngspice 承担；`0.0.39` 起 `gain`/`limit`、`0.0.40` 起多端口的 `summer`/`mult` 这四种代数 code model 由内置自己解） |
 | **Desktop** | 找得到/启得动/关得掉 EDA，能打开工程并用窗口标题确认 | 已实现 |
 | **Write** | `propose`（只算不写）→ `apply`（checkpoint + 原子写 + 六道闸门 + 失败回滚） | 已实现（KiCad 真机验证；`.epro` 实测口径＝原地重写一个成员，`0.0.62` 起**写出的归档再喂回应用并回读几何**验证过） |
-| **Route** | `board_route`：A* 布线（双栅格 + 精确多边形判决 + 事务化 + 按位置 rip-up），规则只从板/工程/调用方取，取不到就拒绝 | 已实现（50 网真板 baseline 27/50 → sweep+rip 38/50、端到端 apply 后 kicad-cli DRC 0 新增阻断项、12 网提速 5.5×；`0.0.15` 起爬电/差分对间距/等长进搜索，`0.0.16` 起回流/阻抗目标/拥塞协商也进了（协商默认关，一块板 +3 网 / +61% 时间），`0.0.17` 铺铜重填与多端网拓扑，`0.0.18` 起布不通要报**挡路的是谁**（`board_blockers`）与**哪些球埋着**（`board_fanout`）；`0.0.90` 起**锁定的铜不动**（文件里的 `(locked)` 或调用方的 `fixed_nets`：不布、不撕、不耦合/不等长——那两个 pass 要 MOVE 铜，所以是**拒绝**而不是悄悄剔掉，且无铜的固定网报 `fixed_missing_copper`），写路径对锁定铜要 `allow_fixed=true` 才动；仍然四邻 + 4×45°、不拆已接受的扇出、拓扑默认 mst 且不是精确 RSMT） |
+| **Route** | `board_route`：A* 布线（双栅格 + 精确多边形判决 + 事务化 + 按位置 rip-up），规则只从板/工程/调用方取，取不到就拒绝 | 已实现（50 网真板 baseline 27/50 → sweep+rip 38/50、端到端 apply 后 kicad-cli DRC 0 新增阻断项、12 网提速 5.5×；`0.0.15` 起爬电/差分对间距/等长进搜索，`0.0.16` 起回流/阻抗目标/拥塞协商也进了（协商默认关，一块板 +3 网 / +61% 时间），`0.0.17` 铺铜重填与多端网拓扑，`0.0.18` 起布不通要报**挡路的是谁**（`board_blockers`）与**哪些球埋着**（`board_fanout`）；`0.0.90` 起**锁定的铜不动**（文件里的 `(locked)` 或调用方的 `fixed_nets`：不布、不撕、不耦合/不等长——那两个 pass 要 MOVE 铜，所以是**拒绝**而不是悄悄剔掉，且无铜的固定网报 `fixed_missing_copper`），写路径对锁定铜要 `allow_fixed=true` 才动；`0.0.91` 起**悬空铜可查可切**（`board_dangling_copper`：只在「一个附着点 + 不是任何 pad 的唯一铜」被证明后才切，浮铜默认不动、锁定铜一律不动、没铺铜 fill 就如实说不猜），仍然四邻 + 4×45°、不拆已接受的扇出、拓扑默认 mst 且不是精确 RSMT） |
 | **Fab** | 制造输出：Gerber / Excellon / 位置文件 / gbrjob / STEP / PDF / BOM / 网表 / 图形，加 `manifest.json` 与可选 `fab.zip` | 已实现（**只外包不重算**：`kicad-cli` 在临时目录里跑，产物**重新读一遍**验终止符 / 工具表 / 行数 / ISO-10303-21，不合格判 failed；真板 15 个产物 / 103 923 字节 / `fab.zip` 33 577 字节；`out_dir` 落在源目录里直接拒） |
 | **Sync** | 原理图网表 ↔ 板：逐脚差集，再变成 op 交给写路径 | 已实现（两侧都用权威：KiCad 自己的网表器 + 板文件里的 pad net；缺封装只报 `needs_placement`，**没有诚实的默认位置**；`sync` 一个字节都不写） |
 
@@ -91,6 +91,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 | 立创的 DRC 判决 | 明确拒绝给判决（立创无命令行），不近似 | 拿自己的几何冒充「厂商判过」是第二种假答案 |
 | 3-D 热 / 器件自热 / 交流损耗进 SPICE | 全部写进 `not_computed` | 需要场解与频率相关模型，超出子集 |
 | 接 Specctra DSN/SES 交换（收外部布线器的候选） | 判决写在 [docs/91](docs/91-Specctra评估-DSN与SES交换格式.md)：**不接**，只借五条机制（其中「锁定的铜不回流」= A1 已在 `0.0.90` 实施，「合并=替换未锁定」= A2 仍**记账未实施**） | 三条：① **判据错位**——我们的价值是精确几何 + 外部裁判，收外部候选要付整套 IO 保真责任，换来的只是「多一个候选」；② **零依赖红线**——FreeRouting 是 Java 程序、KiCad 布线器在 PCB editor 里，都不能当 runtime 依赖；③ **GPL-3.0**——两个参考实现都是，本仓库 MIT，一行都不能抄 |
+| 最后一公里撕铜（FreeRouting `LastMileBlockerRipup`） | `board_route` 的 `_negotiate()` 已是更强形态（带历史价格、按 wish 走廊、整轮重布线、`max_rips` 可调）；判决与常量（`MAX_ITEMS = 24`、走廊 `margin = max(span/4, 1)`）记在 [docs/92](docs/92-FreeRouting算法借鉴-悬空铜与最后一公里.md) | 增量只在「不带价格、只在最后几条时触发、item 级上限」这三条，做成参数即可，不值得新增一个阶段；先让悬空铜跑过真板再评估 |
 
 #### B2 ｜现在拒绝，**门是开着的**（前置条件写在那里）
 
@@ -128,8 +129,8 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.90
-python run_server.py --selftest         # 321/321
+python run_server.py --version          # 0.0.91
+python run_server.py --selftest         # 324/324
 python -m unittest discover -s tests    # 3493 例（0.0.86 实测 1382.506 s、skipped=5；0.0.87 新增 28 例
                                         #   （`tests/test_pulse_latent.py`）⇒ 3464；本轮再新增 29 例
                                         #   （`tests/test_taper_latent.py`）⇒ 3464 + 29 = 3493；
@@ -210,7 +211,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（180 个）
+## 工具（181 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` / `magnetics_dc_bias` /
 `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor` / `ac_self_heating`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
@@ -246,6 +247,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_export` / `board_graphics` | Gerber / STEP / PDF / 图形 | 同上；`kicad-cli` 缺失即 `KICAD_CLI_NOT_FOUND`，不回退自研 writer |
 | `board_blockers` | 布不通时**挡路的是谁**：八扇区哪些开着 + 每个对象的可变性标注 | 标注是**结构事实**（pad movable / 铜 reroutable / 铺铜·keepout·板框 fixed），不是替你做的决定 |
 | `board_fanout` | BGA 扇出：每个球朝外短桩 + 四次旋转，用布线器同一套精确几何判 | 不做 via-in-pad、不回拆已接受的出口、**不声称完整扇出**（`skipped` 就是埋着的球） |
+| `board_dangling_copper` | 悬空铜：一个 via 只在一层有本网铜、一条 track 有自由端 ⇒ 报尾巴的层/长度/终点（`fork`/`pad`/`pour`/`dead_end_via`/`loop`），并给出**能切的那几条**与切后重扫 | 默认**只报告不写**（`writes_nothing`）；只能切「只有一个附着点且不是任何 pad 的唯一铜」的链，否则报 `why_not`（`locked` / `would_open_a_pad`）；**浮铜默认不切**（`include_floating=true` 才切）、锁定铜要 `allow_fixed=true`、没铺铜 fill 就说不知道；切的是**整节点**（`segment`/`arc`/`via`），不是 track 中段 |
 | `board_run_ledger` | 这块板试过没有、当时说了什么（按板文件 sha256 归键） | **永不改变答案、不是缓存**、不存能重建板的数据；`PCB_AGENT_LEDGER=0` 一个字不写 |
 | `fullwave_solver` | 全波**接缝**：装了哪个求解器、版本、要你给它什么 | **点名未装即 `SOLVER_NOT_FOUND`**，绝不回退闭式数；`verified_here` 恒 `false`（本仓库从未跑过任何全波求解器） |
 | `board_summary` | 开板：计数/板框 bbox/叠层/规则 + **哪些事实缺失** | 只读；格式按内容嗅探 |
@@ -394,8 +396,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.90
-python run_server.py --selftest      # 协议级自检，321/321（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问、DC 偏置四问、DC 偏置接进选型四问、环型 MLT 与铜损六问、粉末磁化曲线七问、厂商损耗锚点审计四问、掩膜定义焊盘二问、随机振动模态叠加四问、热焊盘花三问、熔断潜热三问、脉冲串三电流四问、沿长度潜热三问）
+python run_server.py --version       # 0.0.91
+python run_server.py --selftest      # 协议级自检，324/324（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问、DC 偏置四问、DC 偏置接进选型四问、环型 MLT 与铜损六问、粉末磁化曲线七问、厂商损耗锚点审计四问、掩膜定义焊盘二问、随机振动模态叠加四问、热焊盘花三问、熔断潜热三问、脉冲串三电流四问、沿长度潜热三问、悬空铜三问）
 python -m unittest discover -s tests # 3493 个用例（0.0.86 实测 1382.506 s、skipped=5，kicad-cli / pcbnew 与二维场解用例占大头；
                                      #   秒数随机器负载浮动，不作性能结论；本轮 3493 例的实测秒数待全量回归回填）
 python run_server.py                 # 起 stdio MCP 服务
@@ -1018,7 +1020,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 180 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 181 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -1098,7 +1100,7 @@ pcb_agent_mcp/
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
-├── docs/                         # 设计文档 00~91，建议按编号顺序读（索引见 docs/README.md）
+├── docs/                         # 设计文档 00~92，建议按编号顺序读（索引见 docs/README.md）
 ├── CHANGELOG.md
 └── LICENSE
 ```
