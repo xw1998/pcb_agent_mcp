@@ -125,7 +125,11 @@ class TestAdiabaticLimit(unittest.TestCase):
         self.assertIn("never leaves", r["no_cooling"])
         # negative control: with cooling the same width has a real rating
         r2 = C.repetitive_pulse_rating(**BASE)
-        self.assertGreater(r2["value"], 10.0)
+        self.assertGreater(r2["value"], 5.0)
+        # 0.0.87: `value` is the MELT-FREE current (settled peak on 1083 C), and the
+        # runaway bound - no steady peak exists above it - is reported separately and
+        # is strictly higher, because it carries no melt point at all
+        self.assertGreater(r2["max_repetitive_current_a"], r2["value"])
 
     def test_no_cooling_shot_energy_is_independent_of_the_pulse_length(self):
         # every joule stays in, so only the total on-time matters:

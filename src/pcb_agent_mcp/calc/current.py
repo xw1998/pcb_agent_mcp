@@ -60,6 +60,13 @@ M2_PER_CMIL = 5.067074790975e-10
 # energy the phase change itself absorbs. Not a choice this module makes for you.
 MELTING_MODELS = ("sensible", "sensible_plus_latent")
 
+# The fusion energy re-expressed as a temperature: L_f / c_p = 208.7 kJ/kg / 385
+# J/(kg K) = 542.08 K. Once a node is AT the melt point, every further joule goes
+# into this reservoir instead of into another kelvin, so the reservoir is 542 K deep
+# and it cannot be skipped - it is the same 208.7 kJ/kg that adds 25.3 % to I^2t in
+# fusing_current. Expressed this way the pulse-train map stays in temperature units.
+COPPER_LATENT_RISE_K = COPPER_LATENT_HEAT_J_PER_KG / COPPER_CP_J_PER_KGK
+
 # --- IPC-2152 closed-form fit: dT = K * I^a * W^b * Th^c  (W, Th in mil, I in A) ---
 # Copied verbatim from KiCad 10.0 common/track_width_calculations.cpp, which in turn
 # names D. G. Brooks and J. Adam, "Trace Currents and Temperatures Revisited" (2015),
@@ -775,6 +782,12 @@ def _train(a, beta, tau, t_on, t_off, dt_melt):
     if u <= 0.0:
         out["shots"] = 1
         return out
+    if b == 0.0:
+        # the off-time is so strong that the trough is back at zero (underflowed to
+        # exactly zero) one period later: every shot then starts from the same cold
+        # state, so the peak never grows and there is no shot that melts it
+        out["shots"] = None
+        return out
     if abs(q - 1.0) < 1e-12:
         m = (u / b) if b > 0 else float("inf")
     else:
@@ -796,6 +809,213 @@ def _train(a, beta, tau, t_on, t_off, dt_melt):
     return out
 
 
+def _latent_settles(a, beta, tau, t_on, t_off, dt_melt, latent_rise):
+    """Does this train reach a cycle that repeats for ever, with latent heat on?
+
+    Stepping the map shot by shot is the honest way to answer it and the wrong way to
+    do it here: at the ceiling the trough creeps towards its fixed point like 1/n, so a
+    train that has already settled can need a hundred thousand shots to prove it (this
+    was measured - the B geometry needs 1e5 at 41.338 A but only 4e3 at 41.30 A). The
+    map is a monotone increasing map of one variable, so the fixed point it converges
+    to is the root of F(x) - x = 0, and that root is one bisection away on exactly the
+    same algebra. Two ways to melt through come out of it, and they are different:
+
+      * one pulse puts more into the reservoir than it holds (gain >= latent_rise);
+      * the off-time cannot empty what the pulse put in (gain > freeze_rise*t_off).
+
+    `F(x)` is the trough one period later starting from trough `x`: the pulse is
+    pinned at the melt point for the part it cannot finish, the reservoir is emptied
+    only as far as the off-time allows, and whatever is left keeps the trough at the
+    melt point.
+    """
+    if tau == float("inf"):
+        # no cooling: any reservoir at all is permanent
+        freeze_rise = 0.0
+    else:
+        freeze_rise = dt_melt / tau
+    k = a * beta - (1.0 / tau if tau != float("inf") else 0.0)
+    phi = a + k * dt_melt
+    if phi <= 0.0:
+        return True                     # the melt point is never reached at all
+
+    def gain_at(x):
+        if x >= dt_melt:
+            t_a = 0.0
+        else:
+            den = a + k * x
+            if den <= 0.0:
+                return None             # the pulse starts already running away
+            t_a = math.log(phi / den) / k
+            if t_a < 0.0:
+                t_a = 0.0
+        if t_a >= t_on:
+            return 0.0
+        return phi * (t_on - t_a)
+
+    def next_trough(x):
+        g = gain_at(x)
+        if g is None:
+            return dt_melt, g              # the pulse starts already running away
+        if g <= 0.0:
+            # the pulse never reaches the melt point: the trough is the cooled PEAK,
+            # not the cooled trough - getting this wrong makes every runaway look
+            # settled, because the true peak term never enters
+            peak = _rise(x, a, k, t_on)
+            if tau == float("inf"):
+                return peak, g
+            return peak * math.exp(-t_off / tau), g
+        if freeze_rise <= 0.0:
+            return dt_melt, g
+        t_hold = g / freeze_rise
+        if t_hold < t_off:
+            return dt_melt * math.exp(-(t_off - t_hold) / tau), g
+        return dt_melt, g
+
+    # the fixed point of a monotone increasing map: bisect F(x) - x, which is >= 0 at
+    # x = 0 and <= 0 at x = dt_melt, so a sign change always exists
+    lo, hi = 0.0, dt_melt
+    for _bis in range(80):
+        mid = 0.5 * (lo + hi)
+        nx, _g = next_trough(mid)
+        if nx - mid > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    x_star = 0.5 * (lo + hi)
+    g_star = gain_at(x_star)
+    if g_star is None:
+        return False
+    if g_star >= latent_rise:
+        return False
+    if freeze_rise <= 0.0:
+        return g_star <= 0.0
+    return g_star <= freeze_rise * t_off
+
+
+def _train_latent(a, beta, tau, t_on, t_off, dt_melt, latent_rise,
+                  max_shots=200000):
+    """Shots to melt when the fusion energy is carried as a reservoir.
+
+    Same per-interval map as `_train` - the pulse is still d(dT)/dt = a + k dT - with
+    one extra state: once the rise reaches dt_melt the rest of THAT pulse goes into
+    `latent_rise` (COPPER_LATENT_RISE_K) instead of into more kelvin, and the off-time
+    has to refreeze at the melt point before the trough can fall again. Two regimes
+    come out of this and they are not symmetric:
+
+      * the reservoir empties inside the off-time: the trough falls normally and the
+        cycle is the same as the sensible one, only hotter for a while;
+      * it does not: the trace spends the whole off-time pinned at the melt point and
+        still arrives at the next pulse frozen, so the reservoir grows shot after
+        shot and melt is certain - the trace cannot sit at 1083 C while absorbing
+        energy, because temperature cannot rise until the reservoir is full.
+
+    Returns {"shots": int or None, "why": str, "peak": rise or None,
+             "latent_left": K, "gain_per_shot": K, "release_capacity": K}.
+    """
+    if tau == float("inf"):
+        freeze_rise = 0.0                      # h = 0: nothing ever refreezes
+    else:
+        freeze_rise = dt_melt / tau            # K per second while pinned at the melt
+    k = a * beta - (1.0 / tau if tau != float("inf") else 0.0)
+    trough, latent = 0.0, 0.0
+    prev = None
+    gain_last = 0.0
+    for shot in range(1, int(max_shots) + 1):
+        if a + k * dt_melt <= 0.0:
+            return {"shots": None, "why": "cannot reach the melt point",
+                    "peak": None, "latent_left": latent,
+                    "gain_per_shot": 0.0, "release_capacity": freeze_rise * t_off}
+        if trough >= dt_melt:
+            t_a = 0.0
+        else:
+            t_a = math.log((a + k * dt_melt) / (a + k * trough)) / k
+            if t_a < 0.0:
+                t_a = 0.0
+        if t_a >= t_on:
+            peak = _rise(trough, a, k, t_on)
+            latent_after = latent
+            gain_last = 0.0
+        else:
+            gain_last = (a + k * dt_melt) * (t_on - t_a)     # K of reservoir added
+            latent_after = latent + gain_last
+            if latent_after >= latent_rise:
+                return {"shots": shot, "why": "melt", "peak": dt_melt,
+                        "latent_left": latent_after,
+                        "gain_per_shot": gain_last,
+                        "release_capacity": freeze_rise * t_off}
+            peak = dt_melt
+        latent = latent_after
+        if latent > 0.0:
+            t_hold = latent / freeze_rise if freeze_rise > 0.0 else float("inf")
+            if t_hold < t_off:
+                latent = 0.0
+                trough = dt_melt * math.exp(-(t_off - t_hold) / tau)
+            else:
+                latent -= freeze_rise * t_off
+                trough = dt_melt
+        else:
+            trough = peak * math.exp(-t_off / tau)
+        if (latent == 0.0 and prev is not None
+                and abs(trough - prev) <= 1e-13 * max(1.0, trough)):
+            return {"shots": None, "why": "settled", "peak": peak,
+                    "latent_left": 0.0,
+                    "gain_per_shot": gain_last,
+                    "release_capacity": freeze_rise * t_off}
+        if shot % 50 == 0 and _latent_settles(a, beta, tau, t_on, t_off, dt_melt,
+                                             latent_rise):
+            return {"shots": None, "why": "settled", "peak": peak,
+                    "latent_left": 0.0,
+                    "gain_per_shot": gain_last,
+                    "release_capacity": freeze_rise * t_off}
+        prev = trough
+    return {"shots": None, "why": "beyond the shot cap", "peak": None,
+            "latent_left": latent, "gain_per_shot": gain_last,
+            "release_capacity": freeze_rise * t_off}
+
+def _latent_ceiling(mkargs, dt_melt, hi, lo_hint=None, max_shots=4000):
+    """Largest current whose pulse train never MELTS THROUGH with latent heat on.
+
+    A different question from the melt-free ceiling: once the peak is pinned at
+    1083 C the extra energy goes into the reservoir, and as long as the off-time
+    empties that reservoir again the cycle repeats forever at the melt point. The
+    train only melts through when the reservoir cannot be emptied, so this ceiling
+    sits ABOVE the melt-free one and the two are different numbers. Bisected on the
+    same per-shot map: `_train_latent` reports why it stopped, and "settled" is the
+    condition we are looking for.
+    """
+    def settles(cur):
+        a = cur * cur * mkargs["rho_amb"] / (mkargs["area"] * mkargs["c_line"])
+        st = _train_latent(a, mkargs["beta"], mkargs["tau"], mkargs["t_on"],
+                          mkargs["t_off"], dt_melt, COPPER_LATENT_RISE_K,
+                          max_shots=max_shots)
+        return st["why"] == "settled"
+
+    if hi <= 0.0:
+        return None
+    # a low point has to be found from below: near the ceiling the trough creeps
+    # towards its fixed point like 1/n, so the map needs a shot cap, and a cap that
+    # is too small can only make the ceiling look LOWER, never higher. The candidate
+    # ladder starts just under the melt-free current, which always settles (there the
+    # pulse ends exactly at the melt point, so no reservoir is ever entered).
+    lo_i = None
+    for cand in (lo_hint, 0.75 * hi, 0.5 * hi, 0.25 * hi):
+        if cand and cand > 0.0 and settles(cand):
+            lo_i = cand
+            break
+    if lo_i is None:
+        return None
+    hi_i = hi
+    if settles(hi_i):
+        return hi_i
+    for _bis in range(60):
+        mid = 0.5 * (lo_i + hi_i)
+        if settles(mid):
+            lo_i = mid
+        else:
+            hi_i = mid
+    return 0.5 * (lo_i + hi_i)
+
+
 def _brute_train(a, beta, tau, t_on, t_off, cycles=3):
     """The same map, stepped cycle by cycle - the internal check on the algebra."""
     k = a * beta - 1.0 / tau
@@ -811,7 +1031,7 @@ def _brute_train(a, beta, tau, t_on, t_off, cycles=3):
 def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
                             copper_oz=1.0, thickness_um=None, t_ambient_c=25.0,
                             h_w_m2k=None, current_a=None, delta_t_c=10.0,
-                            layer="external", standard=None):
+                            layer="external", standard=None, melting_model="sensible"):
     """Largest current a trace can carry as a repeating pulse train, forever.
 
     The single number is the current at which the train stops being able to shed
@@ -852,6 +1072,16 @@ def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
             h = float(h_w_m2k)
         except (TypeError, ValueError):
             return err("h_w_m2k must be numeric", "ARG_INVALID")
+
+    if melting_model is None:
+        melting_model = "sensible"
+    if melting_model not in MELTING_MODELS:
+        return err("melting_model must be one of " + ", ".join(MELTING_MODELS),
+                   "ARG_INVALID",
+                   hint="'sensible' stops at the melt POINT (the default, unchanged); "
+                        "'sensible_plus_latent' also charges copper's 208.7 kJ/kg of "
+                        "fusion energy, which delays the shot count but does not move "
+                        "the sustainable current")
 
     _, layer_n = _k(layer)
     if layer_n is None:
@@ -927,6 +1157,29 @@ def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
     # Note it carries no heat capacity: this is a balance of rates, not of energy.
     i_crit = math.sqrt(area * g_line / (duty * beta * rho_amb)) if g_line > 0 else 0.0
 
+    # `i_crit` above is the RUNAWAY bound: above it no steady peak exists at all, and
+    # that condition is a balance of RATES - it carries no heat capacity and no melt
+    # point, because it never asks how hot the trace gets. The current a train
+    # actually survives is the one whose steady peak lands ON the melt point, which is
+    # strictly lower and can be much lower: on a 1 % duty cycle the runaway bound is
+    # 4.4x the melt-free current, because the train settles to a peak far above 1083 C
+    # while still having a steady solution. Solved here by bisection on the same exact
+    # map rather than on a second approximation, so the two numbers cannot drift.
+    if g_line > 0:
+        lo_i, hi_i = 0.0, i_crit
+        for _bis in range(200):
+            mid_i = 0.5 * (lo_i + hi_i)
+            st_mid = _train(mid_i * mid_i * rho_amb / (area * c_line),
+                            beta, tau, t_on_s, t_off_s, dt_melt)
+            pk_mid = st_mid["steady_peak"]
+            if pk_mid is None or pk_mid >= dt_melt:
+                hi_i = mid_i
+            else:
+                lo_i = mid_i
+        i_nomelt = 0.5 * (lo_i + hi_i)
+    else:
+        i_nomelt = 0.0
+
     # single pulse that would melt it - the number the train is derated against
     area_mil2 = (width_mm / 0.0254) * (thick_um / UM_PER_MIL)
     area_cmil = area_mil2 * CMIL_PER_MIL2
@@ -971,12 +1224,29 @@ def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
         "thermal_time_constant_s": (None if tau == float("inf") else round(tau, 9)),
         "time_constant_over_period": (None if tau == float("inf")
                                       else round(tau / (t_on_s + t_off_s), 6)),
-        "max_repetitive_current_a": round(i_crit, 6),
+        "max_repetitive_current_a": round(i_crit, 6),   # runaway bound, kept as-is
+        "max_repetitive_current_a_note": "the RUNAWAY bound - above it no steady peak "
+                                         "exists at all. It ignores the melt point and "
+                                         "the heat capacity, so it is an upper bound; "
+                                         "the survivable current is value / "
+                                         "max_current_without_melting_a",
         "single_pulse_fusing_current_a": round(i_fuse_once, 6),
-        "derating_vs_single_pulse": (round(i_crit / i_fuse_once, 6)
+        "derating_vs_single_pulse": (round(i_nomelt / i_fuse_once, 6)
                                      if i_fuse_once > 0 else None),
-        "runaway_rule": "melts when I^2 > area*h*P / (D*beta*rho(Ta)); the threshold "
-                        "does not involve heat capacity - it is a balance of rates",
+        "runaway_rule": "no steady peak exists at all when I^2 > area*h*P / "
+                        "(D*beta*rho(Ta)); that bound carries no heat capacity, no melt "
+                        "point and no pulse length, so it is an UPPER bound on the "
+                        "survivable current, not the answer to it - see "
+                        "max_current_without_melting_a",
+        "max_current_without_melting_a": round(i_nomelt, 6),
+        "max_current_without_melting_basis": "root of steady_peak(I) = 1083 C on the "
+                                             "same exact per-interval map, bisected; "
+                                             "this is the current whose settled peak "
+                                             "sits ON the melt point, so below it the "
+                                             "train never melts and above it the peak "
+                                             "settles above 1083 C and the metal opens",
+        "runaway_bound_over_no_melt": (round(i_crit / i_nomelt, 6)
+                                       if i_nomelt > 0 else None),
         "adiabatic_limit_reproduced_pct": round(gate_adiabatic_pct, 4),
         "melts_at_c": ONDERDONK_MELT_C,
     }
@@ -1088,16 +1358,64 @@ def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
                 out["h_sensitivity"] = (
                     "halving/doubling h moves the steady peak by %.0f %% of its own "
                     "rise: the answer is only as good as your h" % (100.0 * spread))
-        if stats["shots"] is None or stats["shots"] >= TRAIN_NEVER:
+        # --- the same question with the fusion energy carried as a reservoir ---
+        shots_used = stats["shots"]
+        lat_capped = False
+        if melting_model == "sensible_plus_latent":
+            out["melting_model"] = melting_model
+            out["pulses_to_melt_sensible"] = (None if (stats["shots"] is None
+                                                       or stats["shots"] >= TRAIN_NEVER)
+                                              else stats["shots"])
+            lat = _train_latent(a_val, beta, tau, t_on_s, t_off_s, dt_melt,
+                               COPPER_LATENT_RISE_K)
+            out["latent_rise_k"] = round(COPPER_LATENT_RISE_K, 6)
+            out["pulses_to_melt_with_latent"] = lat["shots"]
+            out["latent_release_capacity_k_per_period"] = round(
+                lat["release_capacity"], 6)
+            out["latent_gain_last_pulse_k"] = round(lat["gain_per_shot"], 6)
+            if lat["why"] == "settled":
+                out["latent_verdict"] = ("the reservoir empties inside the off-time and "
+                                         "the train settles below the melt point, so "
+                                         "the shot count is None for the same reason "
+                                         "as the sensible one")
+            elif lat["why"] == "melt":
+                out["latent_verdict"] = ("the reservoir is still partly full at the end "
+                                         "of every pulse; the trace is pinned at the "
+                                         "melt point for part of the cycle and cannot "
+                                         "stay there while absorbing energy, so melt is "
+                                         "certain at the shot count above")
+            elif lat["why"] == "cannot reach the melt point":
+                out["latent_verdict"] = ("this current cannot even hold the melt point: "
+                                         "the reservoir is never entered")
+            else:
+                out["latent_verdict"] = ("not resolved within %d shots; the reservoir is "
+                                         "accumulating, so it does melt, later than the "
+                                         "cap" % 200000)
+            lat_capped = (lat["why"] == "beyond the shot cap")
+            if (stats["shots"] is not None and lat["shots"] is not None
+                    and stats["shots"] < TRAIN_NEVER):
+                out["latent_delays_melt_pct"] = round(
+                    100.0 * (lat["shots"] / float(stats["shots"]) - 1.0), 3)
+            # the number the answer is derated against is unchanged by this: a cyclic
+            # steady state cannot hold latent energy, in = out over a period, so the
+            # sustainable current is the same one. Stated, not implied.
+            out["max_repetitive_current_unaffected_by_latent"] = True
+            shots_used = lat["shots"]
+        if shots_used is None or shots_used >= TRAIN_NEVER:
             # The sequence of trough temperatures converges below the melting rise:
             # the train settles and no number of extra shots changes that. Reported
             # as None rather than a huge integer, because "never" is not a count.
-            out["survives_indefinitely"] = True
+            # A capped latent run has no shot count but is NOT a survivor: its
+            # reservoir was still growing when the cap was hit, which is the one case
+            # where "no number" and "never" are different answers.
+            out["survives_indefinitely"] = (not lat_capped)
             out["pulses_to_melt"] = None
+            if lat_capped:
+                out["melt_beyond_shot_cap"] = 200000
         else:
             out["survives_indefinitely"] = False
-            out["pulses_to_melt"] = stats["shots"]
-            out["melt_after_s"] = round(stats["shots"] * (t_on_s + t_off_s), 6)
+            out["pulses_to_melt"] = shots_used
+            out["melt_after_s"] = round(shots_used * (t_on_s + t_off_s), 6)
         # "will the peak settle?" is a yes/no and must be answered both ways
         out["runs_away"] = peak_rise is None
         # the duty ceiling at this current, when there is one
@@ -1105,6 +1423,25 @@ def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
             out["max_duty_cycle_at_current"] = round(1.0 / (1.0 + stats["k"] * tau), 6)
         else:
             out["max_duty_cycle_at_current"] = 1.0
+
+    # --- the latent heat's own ceiling: a threshold, so it does not need current_a ---
+    if melting_model == "sensible_plus_latent":
+        i_meltthrough = _latent_ceiling(
+            {"rho_amb": rho_amb, "area": area, "c_line": c_line, "beta": beta,
+             "tau": tau, "t_on": t_on_s, "t_off": t_off_s}, dt_melt, i_crit,
+            lo_hint=0.9 * i_nomelt)
+        out["max_current_without_melt_through_a"] = (
+            round(i_meltthrough, 6) if i_meltthrough is not None else None)
+        out["melt_through_over_no_melt"] = (
+            round(i_meltthrough / i_nomelt, 6)
+            if (i_meltthrough is not None and i_nomelt > 0) else None)
+        out["max_current_without_melt_through_basis"] = (
+            "largest current whose train never melts THROUGH with the reservoir "
+            "included: every pulse may pin the peak on 1083 C, but the off-time has to "
+            "empty the reservoir again. Above it the reservoir accumulates and melt is "
+            "certain. This sits above value because the peak is capped at the melt "
+            "point instead of running past it; it is NOT permission to park the copper "
+            "at 1083 C")
 
     if standard is not None:
         std, e = _guard_standard(standard)
@@ -1117,35 +1454,54 @@ def repetitive_pulse_rating(width_mm, t_on_s, duty_cycle=None, period_s=None,
             "standard": std,
             "delta_t_c": round(delta_t_c, 3),
             "capacity_a": cap["value"],
-            "repetitive_over_continuous": (round(i_crit / cap["value"], 6)
+            "repetitive_over_continuous": (round(i_nomelt / cap["value"], 6)
                                            if cap["value"] else None),
             "note": "not a safety margin, and not even the same criterion: capacity_a "
                     "is a DC current that reaches delta_t_c on the standard's cooling "
-                    "(board + both faces), while max_repetitive_current_a is the train "
-                    "current at the melt boundary on your h*P. Compare at the same "
-                    "temperature instead - see dc_equivalent_current_a",
+                    "(board + both faces), while max_current_without_melting_a is the "
+                    "train current whose settled peak sits on 1083 C under your h*P. "
+                    "Compare at the same temperature instead - see "
+                    "dc_equivalent_current_a",
         }
 
     return ok(
-        value=round(i_crit, 6),
+        value=round(i_nomelt, 6),
         unit="A",
         model="lumped_first_order_pulse_train",
         basis="C' dT/dt = I^2 rho(T) - hP(T-Ta) solved exactly per interval; copper's "
               "resistance law with the same 234 as Onderdonk (1928), so the adiabatic "
-              "limit reproduces the fusing time; runaway when k*t_on >= t_off/tau",
+              "limit reproduces the fusing time. The returned value is the current "
+              "whose SETTLED PEAK sits on 1083 C (the melt-free ceiling); the runaway "
+              "bound, above which no steady peak exists at all, is reported alongside "
+              "as max_repetitive_current_a and is strictly higher"
+              + ("" if melting_model == "sensible" else
+                 "; the shot count adds the latent heat (L_f/c_p = 542.08 K of "
+                 "equivalent rise at the melt point)"),
         precision="+/-40% and dominated by two one-sided choices: h is yours (a factor "
                   "of 2 in h moves the sustained current by sqrt(2) and the steady peak "
                   "far more) and the copper is lumped (one temperature for the whole "
                   "section, no lengthwise gradient, no board, no radiating surface "
-                  "separate from h). The melt threshold ignores latent heat and the "
-                  "resistance law is copper's only",
+                  "separate from h). Two currents come back: the runaway bound (no "
+                  "steady solution exists above it - a balance of rates) and the "
+                  "melt-free current (settled peak on 1083 C); they are the same only "
+                  "as the duty cycle approaches 1 and differ 4.4x at 1 %. The melt "
+                  "threshold "
+                  + ("ignores latent heat" if melting_model == "sensible"
+                     else "charges the latent heat as a 542.08 K reservoir at the melt "
+                          "point") + " and the resistance law is copper's only",
         assumptions={
             "material": "copper (rho20 = 1.72e-8 ohm*m, rho_m = 8960 kg/m^3, "
                         "c_p = 385 J/(kg*K), melt at 1083 C)",
             "cooling": "lumped: h * perimeter, one h you supply, no separate "
                        "top/bottom/edge coefficients",
             "spatial": "one temperature for the whole trace cross-section and length",
-            "phase_change": "not modelled (melt point only)",
+            "phase_change": ("not modelled: the shot count stops where the rise reaches "
+                             "1083 C (melting_model='sensible')"
+                             if melting_model == "sensible" else
+                             "included: the pulse cannot carry the rise past 1083 C, so "
+                             "the rest of each pulse charges copper's 208.7 kJ/kg "
+                             "(542.08 K of equivalent rise) and the off-time has to "
+                             "refreeze it before the trough can fall"),
             "waveform": "rectangular current pulses of constant amplitude; a pulse of "
                         "the same RMS is not equivalent",
             "skin_effect": "not modelled (short pulses at high frequency make the "

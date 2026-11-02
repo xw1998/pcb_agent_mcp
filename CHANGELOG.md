@@ -9,6 +9,127 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.87] - 2026-11-02
+
+**`repetitive_pulse_rating` 的主数是错的：它把「速率平衡点」当成「最大可持续电流」返回。
+这一版把 `value` 换成真正的「不熔电流」，把旧数按原名保留并标成上界，
+再给脉冲串补上熔化潜热**（工具数**仍 180**，本版只加参数、不新增工具；
+`dependencies = []` 仍成立；默认 `melting_model="sensible"` ⇒ 默认信封**逐位不变**）
+
+### 这是一个语义错误，不是精度问题
+
+旧实现里
+
+```
+value = i_crit = sqrt( A·h·P / (duty·β·ρ) )
+```
+
+`A` 是侧面积、`h` 是对流系数、`P` 是周长、`β` 是 `ρ(T)` 的温度系数、`ρ` 是电阻率。
+它只写了一件很窄的事：**平均散热功率 = 平均焦耳热**。它里面**没有热容**（所以脉冲多短都一个答案）、
+**没有熔点**（所以答案与「会不会熔」无关），却被命名为「最大可持续电流」放在 `value` 上。
+
+决定性反例是 **duty**：把 5 % 改成 1 %，这个公式按 `1/sqrt(duty)` 涨，量出来 **23.445147 A**；
+而真正的不熔电流几乎不变，**5.284344 A**。**高报 4.436718 倍**。
+
+### 三段电流（并存，各有各的定义）
+
+| 键 | 定义 | 0.5 mm / 1 oz / 1 ms / duty 5 % |
+|---|---|---|
+| `max_current_without_melting_a`（**= `value`**） | 稳态峰值**恰好到达** 1083 °C 的电流（二分 200 次，与温升同一条精确映射） | **29.617434 A** |
+| `max_repetitive_current_a` | 旧的 `i_crit`，**数值一字不改**，另给 `max_repetitive_current_a_note` 写明是 upper bound | **33.156444 A** |
+| `max_current_without_melt_through_a` | 峰值可**钉在 1083 °C**、靠停歇把储层排空的电流（仅 `sensible_plus_latent`） | **29.717885 A** |
+
+第一段与潜热**无关**（潜热不改变「峰值到 1083」这件事），第三段才是潜热真正买到的东西：
+它比第一段只高 **+0.34 %~+11.3 %**（见下表 `thru/no` 列），而远不是第三段 vs 第二段那个量级。
+
+### 五组几何（全部实测，`_scratch/probe_freeze087b.py` / `probe_scan087.py` 复核）
+
+| geo | 参数 | `value`（不熔） | `max_repetitive_current_a`（上界） | `..._without_melt_through_a` | thru/no | run/no |
+|---|---|---|---|---|---|---|
+| A | 0.5 mm / 1 oz / h 200 / 1 ms / D 5 % | 29.617434 | 33.156444 | 29.717885 | 1.003392 | 1.119491 |
+| B | 2.0 mm / 2 oz / h 50 / 10 ms / D 20 % | 41.302920 | 46.121186 | 41.338090 | 1.000852 | 1.116657 |
+| C | 0.5 mm / 1 oz / h 20 / 1 s / D 10 % | 5.079179 | 7.414006 | 5.581757 | 1.098949 | 1.459686 |
+| D | 0.5 mm / 1 oz / h 20 / 1 s / **D 1 %** | 5.284344 | **23.445147** | 5.881642 | 1.113032 | **4.436718** |
+| E | 0.25 mm / 0.5 oz / h 30 / 0.1 s / D 50 % | 1.279918 | 1.435716 | 1.286822 | 1.005394 | 1.121725 |
+
+（`h` 单位 W·m⁻²·K⁻¹；`run/no` = 旧值 / 新值。）
+
+### 潜热在脉冲串上的实测
+
+- `latent_rise_k = L_f / c_p = 208700 / 385 = **542.077922 K**`
+- 旧口径下 0.95×runaway：A 31.498622 A ⇒ `sensible` **81** 发 vs `latent` **139** 发（+71.605 %）；
+  B 43.815127 A ⇒ **274** vs **467**（+70.438 %）
+- 新口径下 1.005×`value`：A ⇒ **218** vs **2360** 发（+982.569 %）
+- 1.02×`value`：C `sensible` **3** 发、D **1** 发，`latent` **永不熔**
+- 1.02×`thru`：A 熔在 **305** 发、B **1037**、C **2**、D **1**、E **100**；0.98×`thru` 全部 `survives_indefinitely=True`
+- **`value` 以下（0.99 / 0.995×`value`）两个模型都 `pulses_to_melt = None`** —— 物理上峰值到不了
+  1083 °C 就不可能熔。（本版早期的一条内部记录写在 0.95×`value` 下 91→166 发，
+  **是错的**，被本轮实测推翻，已从文档里删掉。）
+
+### 绝热极限：`lat = ceil((1+β)/t_on)` 也是错的
+
+`h = 0`、`duty = 1`、`i_fuse = 5.024 A`，实测 `sensible` **1 / 2 / 5 / 10** 发（`t_on` = 1 / 0.5 / 0.2 / 0.1 s），
+`latent` **2 / 3 / 7 / 13** 发。按 `ceil((1+β)/t_on)` 推 0.2 s 档应是 **6**，实测 **7**。
+
+真规律是**储层按熔点处的吸热速率灌满**：
+
+```
+φ = a·(1 + β·dTm) = 423.8640 × (1 + 0.003861 × 1058) = 2155.3238 K/s
+额外通电时间 = (L_f/c_p) / φ = 542.077922 / 2155.3238 = 0.251506 s
+```
+
+实测咬合：`t_on` = 0.05 → 5 发（0.25 s）、0.01 → 25 发（0.25 s）、0.005 → 51 发（0.255 s）、
+0.1 → 3 发（0.3 s）、0.2 → 2 发（0.4 s）。`t_on` 越短越接近 0.2515 s 的极限。
+
+负控制（都能失败）：把温升模型算成 `1.512` 倍（真值 `1 + β = 1.003861`）；
+按**冷态速率** `a` 付潜热要 **1.279 s**（约 5 倍于 0.25 s）；按温升付约 **0.509 s**（约 2 倍）。
+
+### 数值方法：临界点逐发在 1/n 上收敛，不能直接二分
+
+`_train_latent` 的逐发推进在临界电流处按 **1/n** 收（B 组要 1e5 发才看到 1 %），
+所以二分上限只能用**解析不动点**：`_latent_settles` 解 `F(x) = x`（`F` 是「冷却一个周期后仍留在储层里的量」），
+80 次二分，并与逐发暴力实现交叉验证（`_scratch/probe_xpair087.py` 12 点全 OK；
+`probe_drift087.py` 在 0.98×thru 下 2000 与 20000 发沟底漂移 **0.0**）。
+
+### 文件
+
+- `src/pcb_agent_mcp/calc/current.py`：`COPPER_LATENT_RISE_K`；`_latent_settles` / `_train_latent` /
+  `_latent_ceiling`；`_train` 的除零分支（`b == 0` ⇒ `shots=None`）；
+  `repetitive_pulse_rating(..., melting_model="sensible")`（`None` → `"sensible"`，非法 → `ARG_INVALID`）；
+  `value` 改成不熔电流；新增 `max_current_without_melting_a` / `runaway_bound_over_no_melt` /
+  `max_repetitive_current_a_note` / `max_current_without_melt_through_a` / `melt_through_over_no_melt` /
+  `melt_beyond_shot_cap` / `melting_model` / `pulses_to_melt_sensible` / `latent_rise_k` /
+  `pulses_to_melt_with_latent` / `latent_release_capacity_k_per_period` / `latent_gain_last_pulse_k` /
+  `latent_verdict` / `latent_delays_melt_pct` / `max_repetitive_current_unaffected_by_latent`。
+- `src/pcb_agent_mcp/tools.py`：schema 加 `melting_model`；handler 透传；description 改写成三段电流口径；
+  `not_implemented_yet` 第 22 条收窄到**只剩** `fusing_current_taper`。
+- `src/pcb_agent_mcp/server.py`：自检 `870/8701/8702/8703/8704/8705/8706/8707`（三段电流 + 潜热第四数 +
+  阈值两侧 305 + `ARG_INVALID` + 默认 == 显式 sensible），**314 → 318**；工具数历史文案补
+  `0.0.87 arguments only (melting_model on repetitive_pulse_rating)`。
+- `tests/test_pulse_latent.py`：**新增 28 例**（五组几何 + 三段语义 + 默认逐位不变 + 潜热迟滞 +
+  绝热档 + 储层交叉验证 + 天花板两侧 + 两条负控制 + 发数上限不等于存活 + 工具层）。
+- `tests/test_pulse_fusing.py`：1 处旧断言跟着主数语义改（`> 10.0` → `> 5.0`，并加
+  「`max_repetitive_current_a` 必须大于 `value`」）。
+- `tests/test_fusing_latent.py`：1 处 —— 旧断言「另两个熔断工具都不认 `melting_model`」改名收窄成
+  **只管 `fusing_current_taper`**（`repetitive_pulse_rating` 本版就有这个参数了）。
+- `docs/89-脉冲串的熔化潜热.md`：新增（9 节）。
+- `docs/README.md`：八十八篇 → **八十九篇**（2 处）+ 表行 `| 89 |`。
+- `README.md`：版本 0.0.87、`--selftest 318/318`、一页速查新增「脉冲串的潜热」行、
+  「另两个熔断工具」收窄成只剩 taper、用例数 3376/3436 → **3464**（两处）、自检话题补「脉冲串三电流四问」。
+- `pyproject.toml` / `__init__.py`：0.0.87。
+
+### 测试
+
+自检 **318/318**。按用户要求「简化测试，功能全部做完后再批量测回归」，
+本版**没有跑全量回归**：只跑单文件（`tests.test_pulse_fusing` + `tests.test_pulse_latent` +
+`tests.test_fusing_latent` 合计 `Ran 93 tests in 25.556s` / `OK`）。全量 3464 例的实测秒数等下一次集中回归回填。
+
+### 仍未做（登记，不静默）
+
+`fusing_current_taper` 仍按熔点判（时间**短 20.2 %**）：沿长度那一版要每节点一个 `0..L_f` 的焓状态，
+源项按 `T(H)` 分段，backward Euler + Picard——登记为下一版。潜热这一侧也没有 Stefan 前沿、
+没有熔流与体积变化、没有焊点合金化。
+
 ## [0.0.86] - 2026-11-02
 
 **Onderdonk 只算到铜「到达 1083 °C」，可它还没熔——这一版把熔化潜热做成闭式，

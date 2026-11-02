@@ -5427,8 +5427,9 @@ def selftest():
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
           "(magnetics_core_loss_audit), 0.0.82-0.0.84 arguments only, 0.0.85 "
-          "exactly one (thermal_spreading), and 0.0.86 arguments only "
-          "(melting_model on fusing_current)",
+          "exactly one (thermal_spreading), 0.0.86 arguments only "
+          "(melting_model on fusing_current), and 0.0.87 arguments only "
+          "(melting_model on repetitive_pulse_rating)",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -6043,6 +6044,88 @@ def selftest():
           "beta %s, 33 rel %+.5f, naive/beta %.6f"
           % (["%.6f" % b for b in _fl_beta], (_fl_lhs - _fl_rhs) / _fl_rhs,
              _fl_naive / _fl_beta[1]))
+
+    # ---- 0.0.87: the pulse train had three currents confused into one -------
+    # `value` used to be the RUNAWAY bound - a rate balance with no heat capacity
+    # and no melt point - and at 1 % duty that number was 4.44x the current the
+    # copper survives. 0.0.87 splits it: value = the melt-free current, the
+    # runaway bound keeps its number under its own name, and with latent heat on a
+    # third threshold appears. Nothing here is allowed to move the runaway number.
+    _pl_a = {"width_mm": 0.5, "copper_oz": 1.0, "h_w_m2k": 200.0,
+             "t_on_s": 0.001, "duty_cycle": 0.05}
+    _pl_d = {"width_mm": 0.5, "copper_oz": 1.0, "h_w_m2k": 20.0,
+             "t_on_s": 1.0, "duty_cycle": 0.01}
+    _pl_def = _call("repetitive_pulse_rating", dict(_pl_a), 870)
+    _pl_lat = _call("repetitive_pulse_rating",
+                    dict(_pl_a, current_a=10.0,
+                         melting_model="sensible_plus_latent"), 8701)
+    _pl_low = _call("repetitive_pulse_rating",
+                    dict(_pl_d, melting_model="sensible_plus_latent"), 8702)
+    check("the pulse train's headline number is the MELT-FREE current, not the "
+          "runaway bound: geometry A gives 29.617434 A and the 0.0.86 number "
+          "33.156444 A is still printed, renamed and annotated as an upper bound; "
+          "the default envelope carries no latent keys at all, so 0.0.86 answers "
+          "are untouched; and at 1 % duty the old answer was 4.436718x too high",
+          _pl_def.get("value") == 29.617434
+          and _pl_def.get("max_current_without_melting_a") == 29.617434
+          and _pl_def.get("max_repetitive_current_a") == 33.156444
+          and abs(_pl_def.get("runaway_bound_over_no_melt") - 1.119491) < 1e-6
+          and "upper bound" in (_pl_def.get("max_repetitive_current_a_note") or "")
+          and "melting_model" not in _pl_def
+          and not [k for k in _pl_def if k.startswith("latent")]
+          and _pl_low.get("value") == 5.284344
+          and _pl_low.get("max_repetitive_current_a") == 23.445147
+          and abs(_pl_low.get("runaway_bound_over_no_melt") - 4.436718) < 1e-6,
+          "%s / %s / low %s vs %s"
+          % (_pl_def.get("value"), _pl_def.get("max_repetitive_current_a"),
+             _pl_low.get("value"), _pl_low.get("max_repetitive_current_a")))
+
+    check("with the reservoir on, a fourth number appears that is NOT a fifth "
+          "permission: parking the peak on 1083 C and emptying the off-time buys "
+          "29.717885 A (ratio 1.003392) for the same copper, the reservoir is "
+          "542.077922 K = 208700/385, and the sustainable current itself does not "
+          "move - in equals out over a period, which is stated as a flag",
+          _pl_lat.get("max_current_without_melt_through_a") == 29.717885
+          and abs(_pl_lat.get("melt_through_over_no_melt") - 1.003392) < 1e-6
+          and _pl_lat.get("latent_rise_k") == 542.077922
+          and _pl_lat.get("max_repetitive_current_a") == 33.156444
+          and _pl_lat.get("value") == 29.617434
+          and _pl_lat.get("max_repetitive_current_unaffected_by_latent") is True
+          and "NOT permission" in (_pl_lat.get("max_current_without_melt_through_basis") or ""),
+          "thru %s / rise %s / run %s"
+          % (_pl_lat.get("max_current_without_melt_through_a"),
+             _pl_lat.get("latent_rise_k"), _pl_lat.get("max_repetitive_current_a")))
+
+    _pl_bad = _call("repetitive_pulse_rating",
+                    dict(_pl_a, melting_model="latent"), 8703)
+    _pl_sens = _call("repetitive_pulse_rating",
+                     dict(_pl_a, current_a=10.0, melting_model="sensible"), 8704)
+    _pl_abs = _call("repetitive_pulse_rating", dict(_pl_a, current_a=10.0), 8705)
+    check("an invented model name is refused ARG_INVALID rather than folding back "
+          "to the default, and the default path is bit-for-bit the explicit "
+          "\"sensible\" path (an absent argument must never mean latent by "
+          "accident)",
+          _pl_bad.get("reason_code") == "ARG_INVALID"
+          and "sensible_plus_latent" in (_pl_bad.get("message") or "")
+          and _pl_sens == _pl_abs,
+          "%s / equal %s" % (_pl_bad.get("reason_code"), _pl_sens == _pl_abs))
+
+    _pl_x1 = _call("repetitive_pulse_rating",
+                   dict(_pl_a, current_a=1.02 * 29.717885,
+                        melting_model="sensible_plus_latent"), 8706)
+    _pl_x0 = _call("repetitive_pulse_rating",
+                   dict(_pl_a, current_a=0.98 * 29.717885,
+                        melting_model="sensible_plus_latent"), 8707)
+    check("the melt-through threshold is a threshold and not a trend: 2 % below it "
+          "the train settles and never melts, 2 % above it the reservoir cannot be "
+          "emptied and melt is certain at shot 305 - so the number has a failure "
+          "side on both sides",
+          _pl_x0.get("survives_indefinitely") is True
+          and _pl_x0.get("pulses_to_melt") is None
+          and _pl_x1.get("survives_indefinitely") is False
+          and _pl_x1.get("pulses_to_melt") == 305,
+          "below %s / above %s"
+          % (_pl_x0.get("pulses_to_melt"), _pl_x1.get("pulses_to_melt")))
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

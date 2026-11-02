@@ -331,9 +331,24 @@ _tool(
     "melts), and - if you also pass current_a - whether those particular pulses "
     "survive and for how many shots. One lumped first-order model solved exactly "
     "per interval: C' dT/dt = I^2 rho(T) - h*P*(T-Ta), with copper's own resistance "
-    "law, so the adiabatic limit reproduces the single-pulse fusing time. Below the "
-    "returned current the peak settles; above it every cycle ends hotter and the "
-    "trace melts after a finite number of shots no matter how long you wait. "
+    "law, so the adiabatic limit reproduces the single-pulse fusing time. "
+    "melting_model='sensible' stops at the melt POINT (1083 C, Onderdonk as "
+    "printed); 'sensible_plus_latent' carries copper's 208.7 kJ/kg of fusion "
+    "energy as a 542.08 K reservoir that has to be filled before the metal opens. "
+    "Latent heat does not move the returned current - there the pulse ends exactly "
+    "on the melt point, so no reservoir is ever entered - but it changes what "
+    "happens above it: a train that does melt needs 71.6 % more shots at 0.95x "
+    "that current, and it opens a second, higher ceiling "
+    "(max_current_without_melt_through_a) where every pulse pins the peak at "
+    "1083 C and the train only melts through once the off-time can no longer "
+    "empty the reservoir. Below the "
+    "returned current the peak settles UNDER the melt point; above it every cycle "
+    "ends hotter and the trace melts after a finite number of shots however long "
+    "you wait. Two currents come back and they are not interchangeable: value is "
+    "the melt-free one, max_repetitive_current_a is the RUNAWAY bound (above it no "
+    "steady peak exists at all, and it carries neither the melt point nor the heat "
+    "capacity) - on a 1 % duty cycle that bound is 4.4x the current a train can "
+    "actually survive, so do not read it as the rating. "
     "h_w_m2k is REQUIRED: cooling is the whole answer here and it can differ 20x "
     "between a bare trace and a copper pour bolted to metal, so there is no default.",
     {"type": "object", "properties": {
@@ -352,6 +367,10 @@ _tool(
         "delta_t_c": _num("temperature rise used for the continuous rating", 10),
         "layer": _LAYER,
         "standard": _CUR_STD_OPT,
+        "melting_model": _str("where the calculation stops: the melt POINT "
+                              "(Onderdonk as printed) or a copper that has to absorb "
+                              "208.7 kJ/kg of fusion energy before it opens",
+                              ["sensible", "sensible_plus_latent"]),
     }, "required": ["width_mm", "t_on_s", "h_w_m2k"]},
     lambda a: _current.repetitive_pulse_rating(
         a["width_mm"],
@@ -365,7 +384,9 @@ _tool(
         current_a=a.get("current_a"),
         delta_t_c=(a["delta_t_c"] if a.get("delta_t_c") is not None else 10.0),
         layer=a.get("layer", "external"),
-        standard=a.get("standard")),
+        standard=a.get("standard"),
+        melting_model=(a["melting_model"]
+                       if a.get("melting_model") is not None else "sensible")),
 )
 
 # ----------------------------------------------------------- impedance
@@ -4185,7 +4206,12 @@ def _capabilities(_args):
             "answers the TRAIN - one lumped "
             "temperature, cooling as h*P with h supplied by you (no default, because "
             "it ranges 20x), copper's own resistance law solved exactly per interval, "
-            "and the melt boundary as a closed form. fusing_current_taper adds the "
+            "and the melt boundary as a closed form; since 0.0.87 the same melting_model "
+            "switch applies to the train, where latent heat can be carried exactly as "
+            "a 542.08 K reservoir per shot because the model is a single lumped "
+            "temperature - it leaves the sustainable current unchanged and pushes a "
+            "doomed train 71.6 % further out at 0.95x that current. "
+            "fusing_current_taper adds the "
             "LENGTH axis (0.0.59): one isothermal node per axial segment, each pair "
             "joined by two half-lengths in series, copper's own rho(T), backward Euler "
             "- so a neck melts first, the arms' shared heat shows up as a MEASURED "
@@ -4313,19 +4339,22 @@ def _capabilities(_args):
             "or a stiffener, and no fatigue law applied to those numbers (Steinberg "
             "needs slope and allowable from you)",
             "Melting, by name: fusing_current models the latent heat of fusion since "
-            "0.0.86 (melting_model='sensible_plus_latent'), but the OTHER two melt "
-            "tools still stop at the melt POINT. repetitive_pulse_rating takes a lumped "
-            "temperature per interval with the melt boundary as a closed form, and "
-            "fusing_current_taper marches one isothermal node per axial segment; both "
-            "call 1083 C the end of the calculation, so a melt time they print is the "
-            "time to REACH 1083 C - which is 20.2 % SHORT of the time to melt through "
-            "at 25 C (19.2 % short at 0 C, 23.1 % at 100 C), because I^2t scales by "
-            "1+latent share while time scales by the same factor and the current by "
-            "its square root. Paying it there is not a scalar multiply: the latent "
-            "stage needs a per-node 0..L_f enthalpy state, which turns a smooth ODE "
-            "into a switching system, so it is registered here rather than silently "
-            "approximated. Casting latent heat as a temperature offset would be "
-            "exactly that silent approximation and is refused. Also absent from all "
+            "0.0.86 and repetitive_pulse_rating since 0.0.87 (both take "
+            "melting_model='sensible_plus_latent'), but fusing_current_taper still "
+            "stops at the melt POINT. It marches one isothermal node per axial "
+            "segment and calls 1083 C the end of the calculation, so a melt time it "
+            "prints is the time to REACH 1083 C - which is 20.2 % SHORT of the time "
+            "to melt through at 25 C (19.2 % short at 0 C, 23.1 % at 100 C), because "
+            "I^2t scales by 1+latent share while time scales by the same factor and "
+            "the current by its square root. Paying it there is not a scalar multiply "
+            "even though the lumped train allowed a closed form: the taper is an "
+            "axial PDE with rho(T) inside a Thomas tridiagonal solve, so the latent "
+            "stage needs a per-node 0..L_f enthalpy state and a Picard loop to "
+            "resolve which nodes are on the plateau - a switching system, registered "
+            "here rather than silently approximated. Casting latent heat as a "
+            "temperature offset would be exactly that silent approximation and is "
+            "refused - at 25 C it puts the melt time at 4.809 s against the exact "
+            "1.253 s, 3.7x too slow. Also absent from all "
             "three: the volume change and the molten flow after the copper opens "
             "(both past the question they answer), and alloying or intermetallic "
             "effects at a joint",

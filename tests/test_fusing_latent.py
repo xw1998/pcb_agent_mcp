@@ -319,11 +319,16 @@ class TestToolLayer(unittest.TestCase):
         self.assertEqual(r["status"], "error")
         self.assertEqual(r["reason_code"], "ARG_INVALID")
 
-    def test_other_two_melt_tools_still_stop_at_the_melt_point(self):
-        # registered, not silently approximated: neither schema has the parameter
-        for name in ("fusing_current_taper", "repetitive_pulse_rating"):
-            self.assertNotIn("melting_model",
-                             tools.TOOLS[name]["inputSchema"]["properties"], msg=name)
+    def test_the_taper_still_stops_at_the_melt_point(self):
+        # registered, not silently approximated. 0.0.87 gave the pulse TRAIN its own
+        # reservoir (that row now has the parameter and is tested in
+        # test_pulse_latent); the taper is a different model - an enthalpy field
+        # along the trace - and it still has no melting_model, which is exactly
+        # what not_implemented_yet says.
+        self.assertNotIn("melting_model",
+                         tools.TOOLS["fusing_current_taper"]["inputSchema"]["properties"])
+        self.assertIn("melting_model",
+                      tools.TOOLS["repetitive_pulse_rating"]["inputSchema"]["properties"])
 
     def test_tool_count_did_not_change(self):
         self.assertEqual(len(tools.TOOLS), 180)
