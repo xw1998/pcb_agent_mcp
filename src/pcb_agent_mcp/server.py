@@ -6127,6 +6127,93 @@ def selftest():
           "below %s / above %s"
           % (_pl_x0.get("pulses_to_melt"), _pl_x1.get("pulses_to_melt")))
 
+    # ---- 0.0.88: the latent heat on the LENGTH axis --------------------------
+    # The taper is a PDE (one isothermal node per axial segment) with rho(T) inside
+    # a Thomas solve, so the reservoir cannot ride along as a scalar multiply. It
+    # gets a per-node enthalpy state E = C (T - melt_c) + phi L and an exact phase
+    # boundary (phi in (0,1) holds T at melt_c, no mushy band, no adjustable
+    # width). What is checked here is that the switch is honest: off is bit-for-bit
+    # the 0.0.87 answer, on reproduces the adiabatic 1+share anchor, the onset it
+    # prints is exactly what the sensible model calls the melt time, and the delay
+    # it reports has a failure side on both sides of the current.
+    _tp_geo = [{"length_mm": 1.0, "width_mm": 1.0},
+               {"length_mm": 0.5, "width_mm": 0.5},
+               {"length_mm": 1.0, "width_mm": 1.0}]
+    _tp_sens = _call("fusing_current_taper",
+                     {"segments": _tp_geo, "current_a": 20.0}, 880)
+    _tp_expl = _call("fusing_current_taper",
+                     {"segments": _tp_geo, "current_a": 20.0,
+                      "melting_model": "sensible"}, 8801)
+    _tp_lat = _call("fusing_current_taper",
+                    {"segments": _tp_geo, "current_a": 20.0,
+                     "melting_model": "sensible_plus_latent"}, 8802)
+    check("the taper's latent heat is opt-in and the default is BIT-FOR-BIT the "
+          "0.0.87 answer: the whole envelope with the argument absent equals the "
+          "whole envelope with melting_model='sensible', no latent key leaks into "
+          "the default, and turning it on reports an onset equal to the sensible "
+          "melt time - the plateau has to be paid on top, never instead",
+          _tp_sens == _tp_expl
+          and "melting_model" not in _tp_sens
+          and not [k for k in _tp_sens if k.startswith("latent")]
+          and _tp_lat.get("melting_model") == "sensible_plus_latent"
+          and _tp_lat.get("t_onset_s") is not None
+          and _tp_lat.get("t_onset_s") == _tp_sens.get("value")
+          and _tp_lat.get("value") > _tp_sens.get("value"),
+          "sens %s / onset %s / full %s"
+          % (_tp_sens.get("value"), _tp_lat.get("t_onset_s"),
+             _tp_lat.get("value")))
+
+    _tp_adi = _call("fusing_current_taper",
+                    {"segments": [{"length_mm": 10.0, "width_mm": 0.5}],
+                     "current_a": 5.024, "k_thermal_w_mk": 0.0,
+                     "t_end_s": 3.0}, 8803)
+    _tp_adf = _call("fusing_current_taper",
+                    {"segments": [{"length_mm": 10.0, "width_mm": 0.5}],
+                     "current_a": 5.024, "k_thermal_w_mk": 0.0,
+                     "t_end_s": 3.0, "melting_model": "sensible_plus_latent"}, 8804)
+    _tp_ratio = ((_tp_adf.get("value") or 0.0) / (_tp_adf.get("t_onset_s") or 1.0)
+                 if _tp_adf.get("value") else 0.0)
+    check("with conduction off, one node and no way to lose heat, the enthalpy "
+          "solver lands on the adiabatic anchor it has to: melt-through takes "
+          "1+latent_share longer than reaching 1083 C (1.253093, last digits set by "
+          "the step size), and that share is the SAME number fusing_current uses - "
+          "one anchor, not two - so an off-by-one in the reservoir would show up as "
+          "542 K here",
+          abs(_tp_ratio - (1.0 + _tp_adf.get("latent_share_of_i2t", 0.0))) < 1e-2
+          and abs(_tp_adf.get("latent_share_of_i2t") - 0.253092719) < 1e-9
+          and _tp_adf.get("latent_rise_k") == 542.077922
+          and _tp_adf.get("fully_melted") is True
+          and (_tp_adf.get("energy_balance_rel") or 1.0) < 1e-2,
+          "ratio %.6f vs %.6f (share %s, energy %s)"
+          % (_tp_ratio, 1.0 + _tp_adf.get("latent_share_of_i2t", 0.0),
+             _tp_adf.get("latent_share_of_i2t"),
+             _tp_adf.get("energy_balance_rel")))
+
+    _tp_lo = _call("fusing_current_taper",
+                   {"segments": _tp_geo, "current_a": 10.0,
+                    "melting_model": "sensible_plus_latent"}, 8805)
+    _tp_hi = _call("fusing_current_taper",
+                   {"segments": _tp_geo, "current_a": 30.0,
+                    "melting_model": "sensible_plus_latent"}, 8806)
+    _tp_bad = _call("fusing_current_taper",
+                    {"segments": _tp_geo, "current_a": 20.0,
+                     "melting_model": "latent"}, 8807)
+    check("the reported delay is an OUTPUT with a failure side, not a decoration: "
+          "conduction lengthens the onset and taxes the plateau unequally, so the "
+          "delay is not bounded by the adiabatic share and it is not monotone in "
+          "current - 10 A and 30 A must give different, finite numbers - and an "
+          "invented model name is refused ARG_INVALID instead of folding back to "
+          "the default",
+          _tp_lo.get("melt_delay_pct") is not None
+          and _tp_hi.get("melt_delay_pct") is not None
+          and _tp_lo.get("melt_delay_pct") != _tp_hi.get("melt_delay_pct")
+          and "NOT bounded" in (_tp_lo.get("melt_delay_note") or "")
+          and _tp_bad.get("reason_code") == "ARG_INVALID"
+          and "sensible_plus_latent" in (_tp_bad.get("message") or ""),
+          "10 A %s / 30 A %s / bad %s"
+          % (_tp_lo.get("melt_delay_pct"), _tp_hi.get("melt_delay_pct"),
+             _tp_bad.get("reason_code")))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

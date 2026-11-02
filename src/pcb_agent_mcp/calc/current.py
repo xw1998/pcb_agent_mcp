@@ -1704,6 +1704,238 @@ def _taper_run(g, current_a, t_end_s, dt_s, melt_c, ta_c, ends_c, k_w_mk,
             "dt_s": dt_s, "conduction_delay_pct": None}, None
 
 
+def _taper_latent_share(t_ambient_c, melt_c, alpha_per_k, cp_j_kgk, latent_j_kg):
+    """How much LONGER a full melt takes than merely reaching the melt point.
+
+    One node, no conduction, rho(T) = rho20 (1 + alpha (T - 20)):
+
+        t_reach = (C / (I^2 R alpha)) ln(r(Tm) / r(Ta))
+        t_lat   = (L_f / c_p) C / (I^2 R r(Tm))
+
+    Divide and the geometry, the area and rho20 cancel:
+
+        t_lat / t_reach = (L_f / c_p) alpha / (r(Tm) ln(r(Tm)/r(Ta)))
+
+    With copper's own numbers this is 0.253093 - the same 25.3 % that
+    fusing_current reports for I^2t, which is why it is an anchor and not a new
+    constant. It is the LOWER bracket of the taper's own bisection: latent heat can
+    only add time, never remove it, and for a single node it is the exact factor.
+    """
+    r_melt = 1.0 + alpha_per_k * (melt_c - T_REF_C)
+    r_amb = 1.0 + alpha_per_k * (t_ambient_c - T_REF_C)
+    if not (r_amb > 0.0) or not (r_melt > r_amb):
+        return None
+    return (latent_j_kg / cp_j_kgk) * alpha_per_k / (
+        r_melt * math.log(r_melt / r_amb))
+
+def _taper_run_latent(g, current_a, t_end_s, dt_s, melt_c, ta_c, ends_c, k_w_mk,
+                      alpha, rho_m, cp, rho20, latent_j_kg):
+    """_taper_run, plus a per-node latent reservoir - so the answer is MELT THROUGH.
+
+    Each node carries (T, phi):  phi in [0, 1] is the molten FRACTION of that node,
+
+        E_i = C_i (T_i - Tm) + phi_i L_i,   C_i = rho_m c_p A_i l_i,
+                                            L_i = rho_m L_f A_i l_i
+
+    so phi = 0 is solid, phi = 1 is liquid, and 0 < phi < 1 is a node sitting ON the
+    melt point whose temperature cannot move while the reservoir fills. That plateau
+    is EXACT: the unknown for such a node is phi, not T, so there is no artificial
+    "mushy" temperature band - nothing to tune and nothing to tune wrongly. It is
+    the switching system the 0.0.86 note said this needs.
+
+    The active set (which nodes are pinned to Tm) is re-solved until it stops
+    changing. Every iteration is one backward-Euler step over the same tridiagonal
+    system as the sensible model, so with latent_j_kg = 0 the arithmetic is IDENTICAL
+    to _taper_run and reproduces it bit for bit - that is the negative control.
+
+    Two times come out, and they are different questions:
+      t_onset_s  - a node first reaches melt_c      (what the sensible model answers)
+      t_melt_s   - a node is FULLY liquid           (what melting costs on top)
+    """
+    seg = g["segments"]
+    n = len(seg)
+    cap, cond, g0, gN, a_src, b_src = _taper_coeffs(
+        g, current_a, k_w_mk, ends_c, alpha, rho_m, cp, rho20)
+    lat = [rho_m * latent_j_kg * s["area_m2"] * s["length_m"] for s in seg]
+    temp = [float(ta_c)] * n
+    phi = [0.0] * n
+    nsteps = int(math.ceil(t_end_s / dt_s - 1e-9))
+    t = 0.0
+    t_onset = None
+    i_onset = None
+    t_full = None
+    i_full = None
+    max_iters = 0
+    gen_total = 0.0
+    flux_total = 0.0
+    e_start = sum(cap[i] * (temp[i] - melt_c) for i in range(n))
+    for _step in range(nsteps):
+        temp_old = list(temp)
+        phi_old = list(phi)
+        pinned = [1 if (lat[i] > 0.0 and 0.0 < phi[i] < 1.0) else 0 for i in range(n)]
+        x = None
+        x_first = None
+        newtemp = list(temp_old)
+        newphi = list(phi_old)
+        for _it in range(80):
+            max_iters = max(max_iters, _it + 1)
+            diag = [0.0] * n
+            lower = [0.0] * n
+            upper = [0.0] * n
+            rhs = [0.0] * n
+            for i in range(n):
+                if pinned[i]:
+                    diag[i] = 1.0
+                    rhs[i] = melt_c
+                    continue
+                s = 0.0
+                if i > 0:
+                    s += cond[i - 1]
+                    if pinned[i - 1]:
+                        rhs[i] += cond[i - 1] * melt_c
+                    else:
+                        lower[i] = -cond[i - 1]
+                if i < n - 1:
+                    s += cond[i]
+                    if pinned[i + 1]:
+                        rhs[i] += cond[i] * melt_c
+                    else:
+                        upper[i] = -cond[i]
+                if i == 0:
+                    s += g0
+                if i == n - 1:
+                    s += gN
+                # The phi term CANCELS on a node whose phase is not changing:
+                #   C(T' - Tm) + phi L = C(T - Tm) + phi L + dt Q
+                # so the linear system is the sensible one and the latent book
+                # keeping happens in the projection below, where E is inverted.
+                diag[i] = cap[i] / dt_s - b_src[i] + s
+                rhs[i] += cap[i] / dt_s * temp_old[i] + a_src[i]
+                if g0 and i == 0:
+                    rhs[i] += g0 * ends_c
+                if gN and i == n - 1:
+                    rhs[i] += gN * ends_c
+            x = _thomas(diag, lower, upper, rhs)
+            if x is None:
+                return None, err("the axial enthalpy system went singular at t = "
+                                 "%.4g s (generation has outrun conduction)" % t,
+                                 "SOLVER_SINGULAR")
+            for v in x:
+                if v != v or v in (float("inf"), float("-inf")):
+                    return None, err("non-finite temperature at t = %.4g s" % t,
+                                     "SOLVER_DIVERGED")
+            if _it == 0:
+                # The first solve is the UNPINNED one, so it still carries how far
+                # past melt_c this step would have gone. Once a node is pinned its
+                # solve returns exactly melt_c, which would collapse the sub-step
+                # interpolation to whole steps - so keep the first one for that.
+                x_first = list(x)
+            for i in range(n):
+                if pinned[i]:
+                    q = a_src[i] + b_src[i] * melt_c
+                    if i > 0 and not pinned[i - 1]:
+                        q += cond[i - 1] * (x[i - 1] - melt_c)
+                    if i < n - 1 and not pinned[i + 1]:
+                        q += cond[i] * (x[i + 1] - melt_c)
+                    if i == 0 and g0:
+                        q += g0 * (ends_c - melt_c)
+                    if i == n - 1 and gN:
+                        q += gN * (ends_c - melt_c)
+                    e_new = phi_old[i] * lat[i] + dt_s * q
+                    f = e_new / lat[i]
+                    if f <= 0.0:
+                        newphi[i] = 0.0
+                        newtemp[i] = melt_c + e_new / cap[i]
+                    elif f >= 1.0:
+                        newphi[i] = 1.0
+                        newtemp[i] = melt_c + (e_new - lat[i]) / cap[i]
+                    else:
+                        newphi[i] = f
+                        newtemp[i] = melt_c
+                    continue
+                e_new = cap[i] * (x[i] - melt_c) + phi_old[i] * lat[i]
+                if lat[i] <= 0.0:
+                    # no reservoir on this node: plain sensible temperature, and it
+                    # may pass melt_c without any phase change (the L = 0 control)
+                    newphi[i] = 0.0
+                    newtemp[i] = x[i]
+                    continue
+                # E = C (T - Tm) + phi L is INVERTIBLE, so the projection from the
+                # solved energy is unique and needs no phase test: E < 0 is solid,
+                # E > L is liquid, anything between is a node ON the plateau.
+                f = e_new / lat[i]
+                if f <= 0.0:
+                    newphi[i] = 0.0
+                    newtemp[i] = melt_c + e_new / cap[i]
+                elif f >= 1.0:
+                    newphi[i] = 1.0
+                    newtemp[i] = melt_c + (e_new - lat[i]) / cap[i]
+                else:
+                    newphi[i] = f
+                    newtemp[i] = melt_c
+            trial = [1 if (lat[i] > 0.0 and 0.0 < newphi[i] < 1.0) else 0
+                     for i in range(n)]
+            if trial == pinned:
+                break
+            pinned = trial
+        for v in newtemp:
+            if v != v or v in (float("inf"), float("-inf")):
+                return None, err("non-finite temperature at t = %.4g s" % t,
+                                 "SOLVER_DIVERGED")
+        for i in range(n):
+            if temp_old[i] < melt_c and (newtemp[i] >= melt_c or newphi[i] > 0.0):
+                base = temp_old[i]
+                src = x_first[i] if x_first is not None else x[i]
+                top = src if src > base else base
+                frac = 1.0 if top <= base else (melt_c - base) / (top - base)
+                frac = min(1.0, max(0.0, frac))
+                tt = t + frac * dt_s
+                if t_onset is None or tt < t_onset:
+                    t_onset, i_onset = tt, i
+            if lat[i] > 0.0 and phi_old[i] < 1.0 and newphi[i] >= 1.0:
+                den = newphi[i] - phi_old[i]
+                frac = 1.0 if den <= 0.0 else (1.0 - phi_old[i]) / den
+                frac = min(1.0, max(0.0, frac))
+                tt = t + frac * dt_s
+                if t_full is None or tt < t_full:
+                    t_full, i_full = tt, i
+        # Stop where the sensible model stops: on the event, with the state left at
+        # the last COMPLETED step (that is what _taper_run returns, and with
+        # latent_j_kg = 0 this makes the two profiles bit-identical).
+        if t_full is not None:
+            break
+        if t_onset is not None and not any(v > 0.0 for v in lat):
+            # nothing to melt THROUGH on a reservoir this model does not have
+            break
+        for i in range(n):
+            gen_total += dt_s * (a_src[i] + b_src[i] * newtemp[i])
+        if g0:
+            flux_total += dt_s * g0 * (ends_c - newtemp[0])
+        if gN:
+            flux_total += dt_s * gN * (ends_c - newtemp[n - 1])
+        temp = newtemp
+        phi = newphi
+        t += dt_s
+    e_end = sum(cap[i] * (temp[i] - melt_c) + phi[i] * lat[i] for i in range(n))
+    denom = abs(gen_total)
+    if denom <= 0.0:
+        denom = 1.0
+    return {"melted": t_full is not None,
+            "t_melt_s": t_full,
+            "melt_segment": i_full,
+            "reached_melt_point": t_onset is not None,
+            "t_onset_s": t_onset,
+            "onset_segment": i_onset,
+            "temperature_c": temp,
+            "melt_fraction": phi,
+            "at_s": t,
+            "steps": nsteps,
+            "dt_s": dt_s,
+            "conduction_delay_pct": None,
+            "energy_balance_rel": abs((e_end - e_start) -
+                                      (gen_total - flux_total)) / denom,
+            "active_set_iters_max": max_iters}, None
+
 def _taper_steady(g, current_a, ends_c, k_w_mk, alpha, rho_m, cp, rho20):
     """Steady state with FIXED terminals: peak temperature, or None if singular.
 
@@ -1778,13 +2010,24 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
                          ends_c=None, current_a=None, t_melt_s=None, t_end_s=10.0,
                          dt_s=None, max_steps=200000, melt_c=MELT_CU_C,
                          rho_mass_kg_m3=RHO_MASS_CU, cp_j_kgk=CP_CU,
-                         rho20_ohm_m=RHO20_CU):
+                         rho20_ohm_m=RHO20_CU, melting_model="sensible",
+                         latent_heat_j_kg=COPPER_LATENT_HEAT_J_PER_KG):
     """Fusing current (or time to melt) for a trace whose WIDTH CHANGES along it.
 
     Two questions, pick one and give the other as its answer:
 
       * current_a given  -> how long until the hottest segment reaches melt
       * t_melt_s given   -> what current melts it in that time (bisection)
+
+    `melting_model` picks which of those two the answer is, exactly as on
+    fusing_current:
+      * "sensible" (default) - stop where a node reaches melt_c. This is what every
+        printed fusing table means, and it is bit-for-bit what this tool printed
+        before 0.0.88.
+      * "sensible_plus_latent" - carry the fusion enthalpy as a per-node reservoir
+        and answer "when is that node FULLY liquid". `t_onset_s` is still when it
+        first reaches melt_c (so the two models meet at that number, and they do, to
+        the last digit), and `melt_delay_pct` is what melting costs on top.
 
     What the model is, in one line: one isothermal node per axial segment, joined by
     each pair's two half-lengths in series, copper's own rho(T), backward Euler. No
@@ -1813,8 +2056,20 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
         rho_mass_kg_m3 = float(rho_mass_kg_m3)
         cp_j_kgk = float(cp_j_kgk)
         rho20_ohm_m = float(rho20_ohm_m)
+        latent_heat_j_kg = float(latent_heat_j_kg)
     except (TypeError, ValueError):
         return err("numeric arguments required", "ARG_INVALID")
+    if latent_heat_j_kg < 0:
+        return err("latent_heat_j_kg must be >= 0", "ARG_RANGE")
+    if melting_model is None:
+        melting_model = "sensible"
+    if melting_model not in MELTING_MODELS:
+        return err("melting_model must be one of %s" % (", ".join(MELTING_MODELS),),
+                   "ARG_INVALID",
+                   hint="sensible stops at the melt point (Onderdonk); "
+                        "sensible_plus_latent pays the fusion enthalpy and answers "
+                        "melt-through")
+    latent = melting_model == "sensible_plus_latent"
     if thickness_um is None:
         thick_um = copper_oz * OZ_TO_UM
     else:
@@ -1860,6 +2115,27 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
                    "ARG_RANGE")
     n = len(g["segments"])
 
+    def _run(i_amp, t_window, dt, k_w=None, ends="__keep__"):
+        """One march under whichever melting model was asked for."""
+        if k_w is None:
+            k_w = k_thermal_w_mk
+        if ends == "__keep__":
+            ends = ends_c
+        if latent:
+            return _taper_run_latent(g, i_amp, t_window, dt, melt_c, t_ambient_c,
+                                     ends, k_w, alpha_per_k, rho_mass_kg_m3,
+                                     cp_j_kgk, rho20_ohm_m, latent_heat_j_kg)
+        return _taper_run(g, i_amp, t_window, dt, melt_c, t_ambient_c, ends, k_w,
+                          alpha_per_k, rho_mass_kg_m3, cp_j_kgk, rho20_ohm_m)
+
+    beta_amb = None
+    if latent:
+        beta_amb = _taper_latent_share(t_ambient_c, melt_c, alpha_per_k, cp_j_kgk,
+                                       latent_heat_j_kg)
+        if beta_amb is None:
+            return err("the latent share is not defined for these t_ambient_c / "
+                       "melt_c", "ARG_RANGE")
+
     asked_time = current_a is None
     if current_a is not None:
         try:
@@ -1879,9 +2155,7 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
         if steps > max_steps:
             return err("this would take %d steps (max_steps = %d)" % (steps, max_steps),
                        "ARG_RANGE", hint="raise dt_s or max_steps")
-        run, e = _taper_run(g, current_a, t_end_s, dt, melt_c, t_ambient_c, ends_c,
-                            k_thermal_w_mk, alpha_per_k, rho_mass_kg_m3, cp_j_kgk,
-                            rho20_ohm_m)
+        run, e = _run(current_a, t_end_s, dt)
         if e:
             return e
     else:
@@ -1910,11 +2184,13 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
             return err("the adiabatic lower bracket came out non-positive; check "
                        "melt_c / t_ambient_c", "INTERNAL")
         i_lo *= 0.999
+        if latent:
+            # the adiabatic anchor is the time to REACH melt_c; melting through
+            # adds exactly (1+beta) to I^2t, i.e. divides the current by its root
+            i_lo /= math.sqrt(1.0 + beta_amb)
 
         def melts(i_test):
-            r, ee = _taper_run(g, i_test, t_melt_target, dt, melt_c, t_ambient_c,
-                               ends_c, k_thermal_w_mk, alpha_per_k, rho_mass_kg_m3,
-                               cp_j_kgk, rho20_ohm_m)
+            r, ee = _run(i_test, t_melt_target, dt)
             if ee:
                 return ee, None
             return None, (r["melted"] and r["t_melt_s"] <= t_melt_target)
@@ -1959,9 +2235,7 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
         # 2 % past the target so the crossing is strictly INSIDE the last step: at the
         # bracket point itself the node lands on melt_c exactly and "crossed" is
         # ambiguous, which would report melted=false on a converged answer
-        run, e = _taper_run(g, current_a, t_melt_target * 1.02, dt, melt_c,
-                            t_ambient_c, ends_c, k_thermal_w_mk, alpha_per_k,
-                            rho_mass_kg_m3, cp_j_kgk, rho20_ohm_m)
+        run, e = _run(current_a, t_melt_target * 1.02, dt)
         if e:
             return e
 
@@ -1972,8 +2246,7 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
         ctrl_window = float(t_melt_s)
     else:
         ctrl_window = t_end_s
-    ctrl, e = _taper_run(g, current_a, ctrl_window, dt, melt_c, t_ambient_c, None,
-                         0.0, alpha_per_k, rho_mass_kg_m3, cp_j_kgk, rho20_ohm_m)
+    ctrl, e = _run(current_a, ctrl_window, dt, k_w=0.0, ends=None)
     delay = None
     if not e and run["melted"] and ctrl["melted"] and ctrl["t_melt_s"] > 0:
         delay = 100.0 * (run["t_melt_s"] - ctrl["t_melt_s"]) / ctrl["t_melt_s"]
@@ -1982,9 +2255,12 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
     seg = g["segments"]
     profile = []
     for i in range(n):
-        profile.append({"segment": i, "x_mm": seg[i]["x_mm"],
-                        "width_mm": seg[i]["width_mm"],
-                        "t_c": round(run["temperature_c"][i], 4)})
+        row = {"segment": i, "x_mm": seg[i]["x_mm"],
+               "width_mm": seg[i]["width_mm"],
+               "t_c": round(run["temperature_c"][i], 4)}
+        if latent:
+            row["melt_fraction"] = round(run["melt_fraction"][i], 6)
+        profile.append(row)
     hot = max(range(n), key=lambda i: run["temperature_c"][i])
     extra = {
         "melted": run["melted"],
@@ -2024,6 +2300,37 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
                          "not melt within its window, or the control itself errored)"),
         },
     }
+    if latent:
+        t_on = run["t_onset_s"]
+        t_full = run["t_melt_s"]
+        extra["melting_model"] = melting_model
+        extra["latent_rise_k"] = round(latent_heat_j_kg / cp_j_kgk, 6)
+        extra["latent_share_of_i2t"] = round(beta_amb, 9)
+        extra["reached_melt_point"] = run["reached_melt_point"]
+        extra["t_onset_s"] = round(t_on, 6) if t_on is not None else None
+        extra["onset_at_mm"] = (seg[run["onset_segment"]]["x_mm"]
+                               if run["onset_segment"] is not None else None)
+        extra["fully_melted"] = run["melted"]
+        extra["melt_delay_pct"] = (
+            round(100.0 * (t_full - t_on) / t_on, 3)
+            if (t_full is not None and t_on) else None)
+        extra["melt_delay_note"] = (
+            "how much LONGER a full melt takes than merely reaching melt_c, at this "
+            "current and this geometry. This is NOT bounded by the adiabatic "
+            "latent_share_of_i2t (25.31 % at 25 C): conduction lengthens the onset "
+            "AND taxes the plateau, and it does the two unequally, so the ratio can "
+            "land either side of that share. Measured, dt = 2e-4 s, ends_c = 25: on "
+            "a uniform 10 mm x 0.5 mm trace (k = 400) it is 76.9 % at 8 A, 35.96 % at "
+            "10 A, 28.95 % at 14 A, 26.91 % at 20 A, 25.91 % at 26 A, 26.54 % at "
+            "30 A, 25.70 % at 40 A - steep where conduction dominates the onset, then "
+            "hovering either side of the share. The same neck with insulated ends "
+            "stays well under it (8.46 % at 4 A, 12.51 % at 50 A). Read this as "
+            "output, not as a correction to that anchor")
+        extra["t_melt_s_means"] = (
+            "the first node is FULLY liquid. t_onset_s is when a node first reaches "
+            "melt_c, and that is exactly what the sensible model returns")
+        extra["energy_balance_rel"] = run["energy_balance_rel"]
+        extra["active_set_iters_max"] = run["active_set_iters_max"]
     if ends_c is not None:
         thr = _taper_steady_threshold(g, melt_c, ends_c, k_thermal_w_mk, alpha_per_k,
                                       rho_mass_kg_m3, cp_j_kgk, rho20_ohm_m)
@@ -2056,7 +2363,11 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
               "+ sum_j G_ij (T_j - T_i), R_i = rho(T_i) L_i / A_i, G_ij = the two "
               "half-lengths in series, rho(T) = rho20 (1 + alpha (T - 20)) with "
               "alpha = 1/254 (copper's own 234 law, the same 234 as Onderdonk 1928); "
-              "backward Euler + Thomas, melt at the point where a node crosses melt_c",
+              "backward Euler + Thomas, melt at the point where a node crosses melt_c"
+              + ("; each node also carries an enthalpy state E = C (T - melt_c) + phi L "
+                 "with phi its molten fraction, so a melting node is PINNED at melt_c "
+                 "(an exact plateau - no mushy band, nothing fitted) and the answer is "
+                 "the time to melt THROUGH" if latent else ""),
         precision="+/-25% and two one-sided choices that point in OPPOSITE directions: "
                   "cooling to air/board is deleted (only axial conduction survives), "
                   "which makes the number low, while each cross-section is one "
@@ -2064,9 +2375,17 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
                   "makes it high (current_density_field solves that 2-D crowding on "
                   "the same neck, so if the neck is where it melts, measure it there "
                   "and feed the result back as a geometry change). k_thermal_w_mk is yours (400 is bulk copper; a thin "
-                  "film, a plated layer or a trace over a void is worse). Latent heat "
-                  "is not modelled (melt point, not molten), and time is resolved to "
-                  "dt_s - both melt times in the answer are interpolated within a step",
+                  "film, a plated layer or a trace over a void is worse). "
+                  + ("Latent heat IS modelled (per-node enthalpy, exact plateau), so "
+                     "the melt time is the time to melt through; what is still missing "
+                     "is what happens after that (no melt flow, no volume change), and "
+                     "time is resolved to dt_s - every melt time is interpolated "
+                     "within a step, so the latent delay is only as sharp as dt_s"
+                     if latent else
+                     "Latent heat is not modelled (melt point, not molten: 20.2 % "
+                     "short at 25 C - melting_model='sensible_plus_latent' answers "
+                     "that), and time is resolved to dt_s - both melt times in the "
+                     "answer are interpolated within a step"),
         assumptions={
             "material": "copper: rho20 = %.3g ohm*m, rho_m = %.4g kg/m^3, "
                         "c_p = %.4g J/(kg*K), melt %.0f C, k = %.4g W/(m*K)"
@@ -2080,7 +2399,15 @@ def fusing_current_taper(segments, thickness_um=None, copper_oz=1.0, t_ambient_c
                            "the two ends are pinned at ends_c"
                            if ends_c is not None else
                            "and the ends are insulated, so nothing leaves"),
-            "phase_change": "not modelled (melt point only, no latent heat)",
+            "phase_change": (
+                "latent heat is modelled exactly (0.0.88): %g J/kg of fusion energy, "
+                "stored per node as E = C (T - melt_c) + phi L, phi in [0, 1]. A node "
+                "on the plateau is pinned at melt_c, so there is no mushy band and no "
+                "artificial width to tune. Not modelled: the volume change on melting, "
+                "melt flow after the copper opens, and any mushy-zone physics inside a "
+                "real alloy" % latent_heat_j_kg
+                if latent else
+                "not modelled (melt point only, no latent heat)"),
             "waveform": "constant current; a pulse of the same RMS is not equivalent",
             "skin_effect": "not modelled",
             "geometry": "rectangular segments of constant width, joined end to end; "

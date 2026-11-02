@@ -281,7 +281,15 @@ _tool(
     "against a conduction-off control arm, not asserted), and - when ends_c gives "
     "the terminals a temperature - the current below which no steady state melts "
     "at all. Give exactly one of current_a and t_melt_s. A current that does not "
-    "melt returns NO time, only the peak and the margin.",
+    "melt returns NO time, only the peak and the margin. melting_model="
+    "'sensible_plus_latent' (opt in, default off) gives every node an enthalpy "
+    "state, so 1083 C stops being the end and the plateau has to fill before the "
+    "metal opens: t_melt_s then means the FIRST NODE FULLY LIQUID, t_onset_s says "
+    "when a node first reached 1083 C and is exactly what sensible returns "
+    "(reported as melt_delay_pct), and melt_fraction rides along in the profile. "
+    "The plateau is solved as an exact phase boundary with no mushy band and no "
+    "adjustable width; the step size is the only resolution, so read the delay as "
+    "sharp to time_resolution_s and no further.",
     {"type": "object", "properties": {
         "segments": {"type": "array", "description": "axial sections in order from "
                      "one end to the other; each {length_mm, width_mm}, both > 0",
@@ -306,6 +314,12 @@ _tool(
                      "interpolated inside a step"),
         "max_steps": _num("refuse rather than grind past this many steps", 200000),
         "melt_c": _num("melt temperature in Celsius", 1083),
+        "melting_model": {"type": "string",
+                          "enum": ["sensible", "sensible_plus_latent"],
+                          "description": "'sensible' (default) stops at the melt "
+                          "POINT, exactly the answer 0.0.87 gave. "
+                          "'sensible_plus_latent' adds copper's 208.7 kJ/kg of "
+                          "fusion, so a node sits on 1083 C until it has paid it"},
     }, "required": ["segments"]},
     lambda a: _current.fusing_current_taper(
         a.get("segments"),
@@ -322,7 +336,9 @@ _tool(
         t_end_s=(a["t_end_s"] if a.get("t_end_s") is not None else 10.0),
         dt_s=a.get("dt_s"),
         max_steps=(int(a["max_steps"]) if a.get("max_steps") is not None else 200000),
-        melt_c=(a["melt_c"] if a.get("melt_c") is not None else 1083.0)),
+        melt_c=(a["melt_c"] if a.get("melt_c") is not None else 1083.0),
+        melting_model=(a["melting_model"] if a.get("melting_model") is not None
+                       else "sensible")),
 )
 
 _tool(
@@ -4219,12 +4235,12 @@ def _capabilities(_args):
             "ends_c giving the terminals a temperature there is a steady threshold "
             "below which nothing melts. What that still leaves out: cooling to air "
             "and to the board (the taper model has axial conduction ONLY, so it has "
-            "no h at all), latent heat at the melt IN THOSE TWO MODELS (0.0.86 "
-            "quantifies it and offers it on fusing_current; the taper solver and "
-            "the pulse train still stop at the melt point, and making them pay it "
-            "needs a per-node 0..L_f enthalpy state, so they report the same "
-            "+11.9 % rather than pretend it is there), skin effect inside a short "
-            "pulse, electromigration (Black's "
+            "no h at all), latent heat at the melt now on all three (0.0.86 on "
+            "fusing_current as a scalar 1+share on I^2t, 0.0.87 on the pulse train "
+            "as a closed-form reservoir because the train is one lumped temperature, "
+            "0.0.88 on the taper as a per-node enthalpy state with an exact "
+            "phase boundary - no mushy band, no adjustable width), skin effect inside "
+            "a short pulse, electromigration (Black's "
             "equation needs a current density a fab will qualify), arc/plasma after "
             "the copper opens, and board_ir_drop's A/mm^2 verdict - that tool still "
             "reports density with no criterion attached. The transverse gradient in a "
@@ -4338,26 +4354,19 @@ def _capabilities(_args):
             "point only - there is no stress map, no stress concentration at a hole "
             "or a stiffener, and no fatigue law applied to those numbers (Steinberg "
             "needs slope and allowable from you)",
-            "Melting, by name: fusing_current models the latent heat of fusion since "
-            "0.0.86 and repetitive_pulse_rating since 0.0.87 (both take "
-            "melting_model='sensible_plus_latent'), but fusing_current_taper still "
-            "stops at the melt POINT. It marches one isothermal node per axial "
-            "segment and calls 1083 C the end of the calculation, so a melt time it "
-            "prints is the time to REACH 1083 C - which is 20.2 % SHORT of the time "
-            "to melt through at 25 C (19.2 % short at 0 C, 23.1 % at 100 C), because "
-            "I^2t scales by 1+latent share while time scales by the same factor and "
-            "the current by its square root. Paying it there is not a scalar multiply "
-            "even though the lumped train allowed a closed form: the taper is an "
-            "axial PDE with rho(T) inside a Thomas tridiagonal solve, so the latent "
-            "stage needs a per-node 0..L_f enthalpy state and a Picard loop to "
-            "resolve which nodes are on the plateau - a switching system, registered "
-            "here rather than silently approximated. Casting latent heat as a "
-            "temperature offset would be exactly that silent approximation and is "
-            "refused - at 25 C it puts the melt time at 4.809 s against the exact "
-            "1.253 s, 3.7x too slow. Also absent from all "
-            "three: the volume change and the molten flow after the copper opens "
-            "(both past the question they answer), and alloying or intermetallic "
-            "effects at a joint",
+            "Melting, past the melt-through: all three fusing tools carry the latent "
+            "heat of fusion since 0.0.88 (melting_model='sensible_plus_latent', "
+            "default off). What none of them carries is what the metal DOES once it "
+            "is molten: the density change across the melt (copper expands on "
+            "melting, so the trace does not simply vanish), the molten flow "
+            "that opens the gap, surface tension balling the ends up, and the "
+            "alloying or intermetallic growth at a joint. Those are past the question "
+            "a fusing current answers - the trace is already failed at the first "
+            "fully liquid node - and none of them is approximated here. One more "
+            "refusal, on the way in: casting latent heat as a temperature offset "
+            "(raising effective melt_c) would be a silent approximation and is not "
+            "offered - at 25 C it puts the melt time at 4.809 s against the exact "
+            "1.253 s, 3.7x too slow",
             "Filter synthesis stops at the CIRCUIT, by name: filter_lumped_bandpass gives L/C values with its own S21 audited two ways; finite-Q dissipation and first-order parasitics (inductor cp, capacitor esl) are available but OFF unless asked for, and the loss model is a resistor per branch, not dielectric or conductor physics - no skin effect, no substrate loss, no temperature drift. filter_mc_yield does tolerance yield, but it is uniform and independent only (no correlation, no batch shift, no ageing), so it is a worst case whose confidence half-width grows as 1/sqrt(n_draws). filter_coupled_microstrip / filter_coupled_resonator are QUASI-STATIC and non-dispersive: no T-junctions, no stepped-impedance discontinuities, no cross-coupling between non-adjacent resonators (so stopband nulls are not modelled), no finite substrate/ground-plane size, no radiation Q, and no layout is generated - the w/s/lengths are geometry to draw, not a routed board. filter_waveguide_cavity covers any TE_mnp / TM_mnp, charts the modes below a band edge and takes an Rq roughness correction, but it has no iris or probe coupling geometry (a coupling iris must be solved by a full-wave solver), no radiation Q and no 3-D field map. filter_coupling_matrix evaluates the coupling matrix as a real network (finite zeros from a cross-coupling, finite-Qu loss), but it PERTURBS the inline matrix rather than running a full Cameron synthesis: the in-band ripple it reports is the perturbed one, so a cross-coupled filter whose mask matters still needs the synthesis run and then the EM run. It also has no dispersion, no iris or probe geometry, and no layout. Nothing here is an EM simulator: a filter that must meet a mask needs the EM run, and these numbers are the starting point handed to it",
         ],
         "contract": "every value carries model + basis + precision + assumptions; a "

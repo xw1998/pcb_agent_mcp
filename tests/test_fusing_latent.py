@@ -319,14 +319,15 @@ class TestToolLayer(unittest.TestCase):
         self.assertEqual(r["status"], "error")
         self.assertEqual(r["reason_code"], "ARG_INVALID")
 
-    def test_the_taper_still_stops_at_the_melt_point(self):
-        # registered, not silently approximated. 0.0.87 gave the pulse TRAIN its own
-        # reservoir (that row now has the parameter and is tested in
-        # test_pulse_latent); the taper is a different model - an enthalpy field
-        # along the trace - and it still has no melting_model, which is exactly
-        # what not_implemented_yet says.
-        self.assertNotIn("melting_model",
-                         tools.TOOLS["fusing_current_taper"]["inputSchema"]["properties"])
+    def test_the_taper_has_it_too_since_088(self):
+        # 0.0.86 gave fusing_current the switch, 0.0.87 the pulse train (closed form,
+        # one lumped temperature), 0.0.88 the taper (per-node enthalpy state, exact
+        # phase boundary). All three now carry it - and the taper's own numbers live
+        # in test_taper_latent.
+        props = tools.TOOLS["fusing_current_taper"]["inputSchema"]["properties"]
+        self.assertIn("melting_model", props)
+        self.assertEqual(props["melting_model"]["enum"],
+                         ["sensible", "sensible_plus_latent"])
         self.assertIn("melting_model",
                       tools.TOOLS["repetitive_pulse_rating"]["inputSchema"]["properties"])
 
@@ -334,8 +335,13 @@ class TestToolLayer(unittest.TestCase):
         self.assertEqual(len(tools.TOOLS), 180)
 
     def test_gap_is_registered(self):
+        # 0.0.88 closed the "melting, by name" gap on all three tools, so that entry
+        # was replaced - not deleted - by the one that is still open: what the metal
+        # does after it is liquid.
         cap = tools.call_tool("calc_capabilities", {})
-        self.assertIn("Melting, by name", "\n".join(cap["not_implemented_yet"]))
+        text = "\n".join(cap["not_implemented_yet"])
+        self.assertNotIn("Melting, by name", text)
+        self.assertIn("Melting, past the melt-through", text)
 
 
 if __name__ == "__main__":
