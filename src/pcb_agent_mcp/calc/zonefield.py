@@ -173,6 +173,27 @@ def build_sheets(zones, net, rho_ohm_mm, thick_um_by_layer, grid_mm=None,
             layers.append(info)
     return {"layers": layers}
 
+def thermal_spoke_ohm(sheet_ohm_per_sq, gap_mm, spokes, width_mm):
+    """The resistance joining a pad to the pour when a thermal relief is in between.
+
+        R = R_sheet * gap / (n * w)
+
+    A spoke is `gap` long and `w` wide across the relief gap, so it is gap/w squares
+    of the same foil the sheet is made of; n of them in parallel divide that by n.
+    There is no spreading term and no contact resistance: the spoke is a strip whose
+    length is a clearance (0.2-1 mm) and whose width is a fraction of that, so its
+    own end-to-end resistance is what the number is about.
+
+    `sheet_ohm_per_sq` is the sheet resistance actually in use for that layer, so at a
+    frequency this automatically carries the skin-corrected thickness (t_eff) instead
+    of the DC foil - the spoke is the same copper and gets the same treatment. What is
+    NOT in it: current crowding at the spoke roots (a 3-D effect at the pad corner),
+    the pad's own spreading resistance (the pad is a node here, as everywhere else),
+    and the case where n*w exceeds the pad perimeter - physically impossible, and
+    reported rather than clamped.
+    """
+    return float(sheet_ohm_per_sq) * float(gap_mm) / (float(spokes) * float(width_mm))
+
 def cell_index(info, x, y):
     i = int(math.floor((float(x) - info["x0"]) / info["h_mm"]))
     j = int(math.floor((float(y) - info["y0"]) / info["h_mm"]))

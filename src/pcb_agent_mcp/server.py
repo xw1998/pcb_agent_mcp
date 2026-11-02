@@ -4054,6 +4054,50 @@ def selftest():
           and _pz_cut.get("reason_code") == "NOT_CONNECTED"
           and "U2.1" in (_pz_cut.get("message") or ""),
           str(_pz_cut.get("reason_code")))
+    # ---- 0.0.84: the thermal relief. A pad joined to its pour by spokes is not
+    # the same conductor as a pad sitting in solid copper, and until this the model
+    # said "1 uOhm", which is the one place the answer could be OPTIMISTIC.
+    _tr_args = {"path": _pz_full, "net": "VCC", "source": "U1.1",
+                "sinks": ["U2.1"], "current_a": 1.0, "model_zones": True,
+                "zone_grid_mm": 0.5, "max_zone_nodes": 20000}
+    _tr_4 = _call("board_ir_drop", dict(_tr_args, thermal_relief={
+        "spokes": 4, "spoke_width_mm": 0.5, "gap_mm": 0.5}), 844)
+    _tr_s = (_tr_4.get("zone_summary") or {}).get("thermal_relief") or {}
+    _tr_r = (_tr_s.get("connection_ohm_by_layer") or {}).get("F.Cu")
+    check("thermal relief: 4 x 0.5 mm spokes over a 0.5 mm gap on 35 um foil is "
+          "R_sheet*gap/(n*w) = 1.2314e-04 ohm by hand, and that is what the "
+          "connection gets - not a fitted number, not a fraction of a square",
+          _tr_4.get("status") == "ok" and _tr_r is not None
+          and abs(_tr_r / 1.2314285714e-04 - 1.0) < 1e-6,
+          "%s ohm, expected 1.2314285714e-04" % (_tr_r,))
+
+    _tr_def = _call("board_ir_drop", dict(_tr_args), 848)
+    _tr_v = (_tr_4.get("value") or {}).get("max_drop_mv") or 0.0
+    _tr_d = (_tr_def.get("value") or {}).get("max_drop_mv") or 0.0
+    check("thermal relief: the same board WITHOUT the flag still answers 0.935986 mV "
+          "(the switch is off and nothing moved) while WITH it 1.207938 mV - the "
+          "rise is the two pad connections that were being counted as solid copper, "
+          "so the default really was optimistic and both numbers are pinned",
+          abs(_tr_d - 0.935986) < 5e-6 and abs(_tr_v - 1.207938) < 5e-5
+          and _tr_v > _tr_d,
+          "default %s, relief %s mV" % (_tr_d, _tr_v))
+
+    _tr_1 = _call("board_ir_drop", dict(_tr_args, thermal_relief={
+        "spokes": 1, "spoke_width_mm": 0.5, "gap_mm": 0.5}), 845)
+    _tr_w = _call("board_ir_drop", dict(_tr_args, thermal_relief={
+        "spokes": 4, "spoke_width_mm": 1.0, "gap_mm": 0.5}), 846)
+    _tr_bad = _call("board_ir_drop", dict(_tr_args, thermal_relief={
+        "spokes": 4, "spoke_width_mm": 0.5}), 847)
+    check("thermal relief: one spoke costs four times what four do (1.947975 vs "
+          "1.207938 mV) and a 1 mm spoke costs half a 0.5 mm one (1.083380 mV), so "
+          "the n and the w are in the answer where the formula puts them - and a "
+          "half-specified relief is refused by name instead of guessed",
+          abs(((_tr_1.get("value") or {}).get("max_drop_mv") or 0) - 1.947975) < 5e-5
+          and abs(((_tr_w.get("value") or {}).get("max_drop_mv") or 0) - 1.083380) < 5e-5
+          and _tr_bad.get("reason_code") == "ARG_REQUIRED",
+          "%s / %s / %s" % (((_tr_1.get("value") or {}).get("max_drop_mv")),
+                            ((_tr_w.get("value") or {}).get("max_drop_mv")),
+                            _tr_bad.get("reason_code")))
     _shutil.rmtree(_pz_tmp, ignore_errors=True)
 
     # ---- 0.0.65: the same network, but stepped. |Z| and a load transient are

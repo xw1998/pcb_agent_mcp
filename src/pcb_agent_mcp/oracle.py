@@ -1422,7 +1422,8 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                   plating_um=None, quantize_mm=0.01, temp_c=20.0,
                   max_nodes=1200, model_zones=False, zone_grid_mm=None,
                   max_zone_nodes=8000, zone_link_mm=0.5, frequency_hz=None,
-                  faces="one", mu_r=1.0, roughness_rq_um=None):
+                  faces="one", mu_r=1.0, roughness_rq_um=None,
+                  thermal_relief=None):
     """DC voltage drop across ONE net, out of the copper the board actually carries.
 
     This is "will 2 A make it from the regulator to the MCU without browning it
@@ -1457,6 +1458,15 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
     publishes), and a via barrel is solved as the tube it is (the same Bessel
     answer as `roundwire`). Only resistances change - the topology, the DC path
     and the meaning of every other field do not.
+
+    `thermal_relief={"spokes": n, "spoke_width_mm": w, "gap_mm": g}` replaces the
+    modelled pad-to-pour link with the thermal relief that is really there: n spokes
+    w wide crossing a g gap, i.e. R = R_sheet * g / (n * w) per connection. Without
+    it a pad that sits INSIDE the fill is joined at 1 uOhm (solid copper) and a pad
+    near it is bridged with ONE sheet square - both are stand-ins, and on a board
+    where the fill the file carries does not show the relief the first one is
+    OPTIMISTIC. With it, both become the same printed geometry. Off by default, and
+    the default answer stays digit for digit what it was.
 
     What is still missing at a frequency is said out loud rather than absorbed:
     no proximity effect from a neighbouring conductor, no lateral crowding along
@@ -1502,6 +1512,50 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
         return err("zone_link_mm must be a number", "ARG_INVALID")
     if zone_link_mm < 0:
         return err("zone_link_mm must be >= 0", "ARG_RANGE")
+
+    # ---- thermal relief (0.0.84). Three numbers, all required: the geometry is the
+    # whole point, and defaulting any of them would be inventing the answer.
+    tr_geo = None
+    if thermal_relief is not None:
+        if not isinstance(thermal_relief, dict):
+            return err("thermal_relief must be an object {spokes, spoke_width_mm, "
+                       "gap_mm} - the thermal relief that joins the pad to the pour",
+                       "ARG_INVALID")
+        unknown = [k for k in thermal_relief
+                   if k not in ("spokes", "spoke_width_mm", "gap_mm")]
+        if unknown:
+            return err("thermal_relief has unknown key(s) %s; it takes spokes, "
+                       "spoke_width_mm and gap_mm" % ", ".join(sorted(unknown)),
+                       "ARG_INVALID",
+                       hint="a silently ignored key would leave the caller thinking "
+                            "the relief was modelled")
+        for key in ("spokes", "spoke_width_mm", "gap_mm"):
+            if thermal_relief.get(key) is None:
+                return err("thermal_relief.%s is required - R = R_sheet*gap/"
+                           "(n*width) needs all three, and there is no sane default "
+                           "for any of them" % key, "ARG_REQUIRED")
+        try:
+            tr_n = int(thermal_relief["spokes"])
+            tr_w = float(thermal_relief["spoke_width_mm"])
+            tr_g = float(thermal_relief["gap_mm"])
+        except (TypeError, ValueError):
+            return err("thermal_relief values must be numbers", "ARG_INVALID")
+        if tr_n < 1 or tr_n > 16:
+            return err("thermal_relief.spokes must be 1..16 (a relief with more than "
+                       "16 spokes is not a relief, it is a solid connection)",
+                       "ARG_RANGE")
+        if not (tr_w > 0.0):
+            return err("thermal_relief.spoke_width_mm must be > 0", "ARG_RANGE")
+        if not (tr_g > 0.0):
+            return err("thermal_relief.gap_mm must be > 0", "ARG_RANGE",
+                       hint="a gap of 0 IS a solid connection - leave thermal_relief "
+                            "out and the pad is joined at 1 uOhm")
+        if not model_zones:
+            return err("thermal_relief describes how a pad meets the COPPER POUR, so "
+                       "it needs model_zones=true: with the pour off there is no "
+                       "pour to cross a gap to", "ARG_CONFLICT",
+                       hint="add model_zones=true, or drop thermal_relief")
+        tr_geo = {"spokes": tr_n, "spoke_width_mm": tr_w, "gap_mm": tr_g}
 
     # ---- AC knobs (0.0.70). Validated before any copper is touched, so a bad
     # value can never half-apply to a network that is already half built.
@@ -1810,6 +1864,8 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
     base_nodes = len(names)
     zone_summary = None
     zone_bridged = []
+    zone_spoked = []
+    tr_by_layer = {}
     zone_wide = []
     zone_skipped = []
     if model_zones:
@@ -1878,10 +1934,29 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
             # it: same net, same layer, same metal. 1 uOhm, not 0, so the solver
             # has a finite conductance to work with.
             info["_zf"] = ZF
+            # A pad's anchor point is also a node in the graph, so it would be
+            # joined here AND again by the pad-box loop below. With a 1 uOhm link
+            # the double join is harmless (two shorts in parallel are a short);
+            # with a real spoke resistance it would halve the answer, so the anchor
+            # is left to the pad-box loop when a relief is being modelled.
+            tr_ohm = None
+            if tr_geo is not None:
+                tr_ohm = ZF.thermal_spoke_ohm(info["sheet_ohm_per_sq"],
+                                             tr_geo["gap_mm"], tr_geo["spokes"],
+                                             tr_geo["spoke_width_mm"])
+                tr_by_layer[lay] = tr_ohm
+            anchor_here = set()
+            if tr_geo is not None:
+                for (ax, ay, _hw2, _hh2, aplays) in pad_boxes:
+                    if lay in aplays:
+                        anchor_here.add((int(round(ax / q)), int(round(ay / q))))
             for rec in list(names)[:base_nodes]:
                 if rec["layer"] != lay:
                     continue
                 x, y = rec["x_mm"], rec["y_mm"]
+                is_anchor = ((int(round(x / q)), int(round(y / q))) in anchor_here)
+                if tr_ohm is not None and is_anchor:
+                    continue
                 key = ZF.cell_index(info, x, y)
                 if key is not None:
                     add(node(x, y, lay), znode(key), ZF.LINK_OHM, "zone_link",
@@ -1889,6 +1964,32 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                     continue
                 key, d = ZF.nearest_cell(info, x, y, float(zone_link_mm))
                 if key is not None:
+                    if tr_ohm is not None and is_anchor:
+                        # The pad does not sit in the fill, so the connection really
+                        # is across a gap. Modelled as the relief the caller states
+                        # rather than as one sheet square.
+                        add(node(x, y, lay), znode(key), tr_ohm, "zone_spoke",
+                            "thermal relief %dx%.3gmm over %.3gmm to pour %s"
+                            % (tr_geo["spokes"], tr_geo["spoke_width_mm"], tr_geo["gap_mm"], lay),
+                            layer=lay, bridged_mm=round(d, 6),
+                            spokes=tr_geo["spokes"],
+                            spoke_width_mm=tr_geo["spoke_width_mm"],
+                            relief_gap_mm=tr_geo["gap_mm"],
+                            width_mm=tr_geo["spoke_width_mm"],
+                            copper_um=phys_by_layer.get(lay, t_um),
+                            **({"copper_eff_um": t_um,
+                                "r_ac_over_rdc": ratio_by_layer.get(lay, 1.0)}
+                               if freq is not None else {}))
+                        if freq is not None:
+                            _zr = ratio_by_layer.get(lay, 1.0)
+                            ac_acc["zone"].append((tr_ohm / _zr, tr_ohm, _zr))
+                        zone_bridged.append({"layer": lay, "x_mm": x, "y_mm": y,
+                                             "gap_mm": round(d, 6),
+                                             "relief_ohm": round(tr_ohm, 12)})
+                        zone_spoked.append({"layer": lay, "x_mm": x, "y_mm": y,
+                                            "cells": 1,
+                                            "gap_mm": round(d, 6)})
+                        continue
                     # One sheet square, not a short: the gap being crossed is a
                     # thermal-relief spoke or an unfilled sliver, and a spoke of
                     # length ~ width is one square. Small enough not to invent a
@@ -1927,10 +2028,56 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                 if n > 2000:
                     zone_wide.append((lay, px, py, n))
                     continue
+                contacted = []
                 for j in range(max(j0, 0), min(j1, info["ny"] - 1) + 1):
                     for i in range(max(i0, 0), min(i1, info["nx"] - 1) + 1):
-                        if not info["mask"][j * info["nx"] + i]:
-                            continue
+                        if info["mask"][j * info["nx"] + i]:
+                            contacted.append((i, j))
+                if tr_by_layer.get(lay) is not None:
+                    # The fill covers this pad, but the caller states the connection
+                    # is a relief. The relief's gap is what separates the pad from
+                    # the copper, so with that gap the pad cannot really be sitting
+                    # in the fill: the fill the file carries is the OUTLINE, not the
+                    # relief. The pad's whole connection is one relief resistance,
+                    # split evenly over the cells it touches so the parallel
+                    # combination is that number and not a fraction of it.
+                    if contacted:
+                        k_cells = float(len(contacted))
+                        r_cell = tr_by_layer[lay] * k_cells
+                        for (i, j) in contacted:
+                            add(node(px, py, lay), znode((i, j)), r_cell,
+                                "zone_spoke_node",
+                                "thermal relief (1/%d of R) at pad %s"
+                                % (len(contacted), lay),
+                                layer=lay, spokes=tr_geo["spokes"],
+                                spoke_width_mm=tr_geo["spoke_width_mm"],
+                                relief_gap_mm=tr_geo["gap_mm"],
+                                relief_share=len(contacted))
+                        zone_spoked.append({"layer": lay, "x_mm": px, "y_mm": py,
+                                            "cells": len(contacted), "gap_mm": None})
+                    else:
+                        # The pad does not overlap the fill at all, but its anchor
+                        # was skipped in the node loop because a relief was being
+                        # modelled - so the one connection it does have (the gap
+                        # it can still be bridged across) has to be made here, or
+                        # the pad would silently drop out of the network.
+                        key, d = ZF.nearest_cell(info, px, py, float(zone_link_mm))
+                        if key is not None:
+                            add(node(px, py, lay), znode(key), tr_by_layer[lay],
+                                "zone_spoke",
+                                "thermal relief %dx%.3gmm over %.3gmm to pour %s"
+                                % (tr_geo["spokes"], tr_geo["spoke_width_mm"],
+                                   tr_geo["gap_mm"], lay),
+                                layer=lay, bridged_mm=round(d, 6),
+                                spokes=tr_geo["spokes"],
+                                spoke_width_mm=tr_geo["spoke_width_mm"],
+                                relief_gap_mm=tr_geo["gap_mm"],
+                                width_mm=tr_geo["spoke_width_mm"],
+                                copper_um=phys_by_layer.get(lay, t_um))
+                            zone_spoked.append({"layer": lay, "x_mm": px, "y_mm": py,
+                                                "cells": 1, "gap_mm": round(d, 6)})
+                else:
+                    for (i, j) in contacted:
                         add(node(px, py, lay), znode((i, j)),
                             ZF.LINK_OHM, "zone_link", "pad contact %s" % (lay,),
                             layer=lay)
@@ -1978,6 +2125,81 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                     "under their anchor was tied to the pour, so their contact "
                     "spreading is over-stated (self-check: pass a coarser "
                     "zone_grid_mm)" % len(zone_wide))
+            # what the FILE says about reliefs, reported and never adopted: the
+            # geometry that goes into the answer is the caller's (or the 1 uOhm
+            # stand-in), so a file value can only inform, not decide.
+            file_states = []
+            for z in (board.zones or []):
+                if z.get("net") != net or z.get("keepout") or z.get("is_keepout"):
+                    continue
+                if z.get("connect_pads") is None:
+                    continue
+                file_states.append({
+                    "layers": list(ZF.zone_layer_list(z)),
+                    "connect_pads": z.get("connect_pads"),
+                    "thermal_gap_mm": z.get("thermal_gap_mm"),
+                    "thermal_bridge_width_mm": z.get("thermal_bridge_width_mm"),
+                })
+            if file_states:
+                zone_summary["board_file_states"] = file_states
+                if tr_geo is None and any(f["connect_pads"] in ("thermal",
+                                                            "thru_hole_only")
+                                      for f in file_states):
+                    warnings.append(
+                        "the board file states a THERMAL RELIEF for a pour on this "
+                        "net (connect_pads=%s, thermal_gap=%s mm, "
+                        "thermal_bridge_width=%s mm) but thermal_relief was not "
+                        "passed, so those pads are joined at 1 uOhm (solid) and this "
+                        "answer is OPTIMISTIC there. Pass thermal_relief with the "
+                        "same three numbers to model it"
+                        % (", ".join(sorted(set(f["connect_pads"]
+                                                for f in file_states))),
+                           ", ".join(sorted(set("%.3g" % f["thermal_gap_mm"]
+                                                for f in file_states
+                                                if f["thermal_gap_mm"] is not None)))
+                           or "-",
+                           ", ".join(sorted(set("%.3g" % f["thermal_bridge_width_mm"]
+                                                for f in file_states
+                                                if f["thermal_bridge_width_mm"]
+                                                is not None))) or "-"))
+            if tr_geo is not None:
+                zone_summary["thermal_relief"] = {
+                    "spokes": tr_geo["spokes"],
+                    "spoke_width_mm": tr_geo["spoke_width_mm"],
+                    "gap_mm": tr_geo["gap_mm"],
+                    "connection_ohm_by_layer": {
+                        k2: round(v2, 12) for k2, v2 in sorted(tr_by_layer.items())},
+                    "formula": ("R = R_sheet * gap / (spokes * width): a spoke is "
+                                "gap/width squares of the same foil the sheet is, and "
+                                "n of them in parallel divide it by n. R_sheet is the "
+                                "one in use for that layer, so at a frequency this "
+                                "carries the skin-corrected thickness"),
+                    "pad_connections_modelled": len(zone_spoked),
+                    "pads_split_over_cells": sum(1 for r in zone_spoked
+                                                 if r.get("cells", 1) > 1),
+                    "connections": [dict(c) for c in zone_spoked],
+                    "not_in_it": ["the pad's own spreading resistance (the pad is a "
+                                  "node, here and everywhere else in this answer)",
+                                  "current crowding where a spoke meets the pad "
+                                  "corner (3-D at the pad edge)",
+                                  "a spoke wider than the pad perimeter is accepted "
+                                  "and reported, not clamped"],
+                }
+                if not zone_spoked:
+                    warnings.append(
+                        "thermal_relief was given but no pad needed it: every pad on "
+                        "this net either sits in the fill without being an anchor "
+                        "point or has no pour contact at all. The answer is what it "
+                        "would have been without the relief - check model_zones and "
+                        "the zone_link_mm window")
+                else:
+                    warnings.append(
+                        "%d pad connection(s) were modelled as thermal reliefs (%d x "
+                        "%.3g mm spokes over %.3g mm), not as solid copper: R = "
+                        "R_sheet*gap/(n*width). Without this the answer was "
+                        "OPTIMISTIC for those pads"
+                        % (len(zone_spoked), tr_geo["spokes"], tr_geo["spoke_width_mm"],
+                           tr_geo["gap_mm"]))
             if zone_bridged:
                 warnings.append(
                     "%d node(s) do not sit inside the filled pour but are within "

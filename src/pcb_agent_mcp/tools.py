@@ -4187,12 +4187,20 @@ def _capabilities(_args):
             "planned from the area its fill covers (clamped to 0.2-2.0 mm), each cell "
             "is one square of rho(T)/t and four-connected, and pads / track ends inside "
             "the fill are tied to it with a 1 uOhm link. What that leaves out, by name: "
-            "THERMAL-RELIEF SPOKES ARE NOT MODELLED - a pad sitting in the fill is "
-            "treated as solid copper, so where a spoke is the real connection this "
-            "drop is a LOWER bound (the one place this answer can be optimistic); a "
-            "node within zone_link_mm of the fill but outside it is bridged with ONE "
-            "sheet square, an order-of-magnitude stand-in for a spoke or an unfilled "
-            "sliver and the crudest number in the answer; zone priority, minimum width "
+            "THERMAL-RELIEF SPOKES ARE MODELLED SINCE 0.0.84 when asked for: "
+            "board_ir_drop(thermal_relief={spokes, spoke_width_mm, gap_mm}) turns the "
+            "pad-to-pour connection into R = R_sheet*gap/(n*width) - what a relief "
+            "physically is - instead of the 1 uOhm solid link or the one-square "
+            "bridge, and the board file's own connect_pads / thermal_gap / "
+            "thermal_bridge_width are reported NEXT TO the answer but never adopted "
+            "as a default, because the geometry that goes into the number is the "
+            "geometry the caller states. WITHOUT the flag both stand-ins are still in "
+            "place and the solid one is the single place this answer can be "
+            "OPTIMISTIC (a pad sitting in the fill is joined as solid copper, so "
+            "where a spoke is the real connection this drop is a LOWER bound); a node "
+            "within zone_link_mm of the fill but outside it is bridged with ONE sheet "
+            "square, an order-of-magnitude stand-in and the crudest number in the "
+            "answer; zone priority, minimum width "
             "and the clearance ring to other nets are taken from the fill the file "
             "already carries rather than solved for; pour islands the source cannot "
             "reach are dropped (they carry no current) and the count is reported; a "
@@ -6407,6 +6415,23 @@ _tool(
                                 "Hammerstad-Jensen factor multiplies the AC "
                                 "resistance. Omit and the AC resistance is a LOWER "
                                 "bound once the skin depth is comparable"),
+        "thermal_relief": {
+            "type": "object", "description":
+            "Model the THERMAL RELIEF that joins a pad to the pour, instead of the "
+            "stand-in (a pad inside the fill is otherwise joined at 1 uOhm = solid, "
+            "and one near it with one sheet square). All three numbers are required "
+            "and none is defaulted: R = R_sheet * gap / (spokes * spoke_width). With "
+            "the stand-in the answer is OPTIMISTIC exactly where a relief is real. "
+            "Needs model_zones=true; off by default, and the default answer is digit "
+            "for digit what it was. A relief stated in the board file is REPORTED "
+            "next to the answer but never adopted - the geometry that goes into the "
+            "number is the one you pass",
+            "properties": {
+                "spokes": _num("how many spokes join the pad (1..16)"),
+                "spoke_width_mm": _num("width of one spoke"),
+                "gap_mm": _num("the relief gap a spoke crosses (pad edge to pour)"),
+            },
+            "required": ["spokes", "spoke_width_mm", "gap_mm"]},
     }, **_COMMON),
      "required": ["path", "net", "source", "sinks"]},
     _board_tool(lambda b, a: _oracle.board_ir_drop(
@@ -6424,7 +6449,8 @@ _tool(
         frequency_hz=a.get("frequency_hz"),
         faces=(a.get("faces") or "one"),
         mu_r=(a["mu_r"] if a.get("mu_r") is not None else 1.0),
-        roughness_rq_um=a.get("roughness_rq_um")), derived=True),
+        roughness_rq_um=a.get("roughness_rq_um"),
+        thermal_relief=a.get("thermal_relief")), derived=True),
 )
 
 _tool(

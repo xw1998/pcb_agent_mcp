@@ -771,6 +771,27 @@ def _zone(node):
         if pts:
             filled.append([xy(p) for p in children(pts, "xy")])
     priority = atom(child(node, "priority"), 1)
+    # Thermal reliefs: the numbers a relief is made of live in two places, and they
+    # are READ here but never used as a default anywhere - the tool that models a
+    # relief asks the caller for the geometry, so a file value can only ever be
+    # reported next to the answer, never silently adopted.
+    #   (connect_pads [yes|thru_hole_only|no] (clearance X))
+    #   (fill yes (thermal_gap G) (thermal_bridge_width W))
+    pad_connection = None
+    cp = child(node, "connect_pads")
+    if cp is not None:
+        words = [w for w in cp[1:] if not isinstance(w, list)]
+        if "yes" in words:
+            pad_connection = "thermal"
+        elif "thru_hole_only" in words:
+            pad_connection = "thru_hole_only"
+        elif "no" in words:
+            pad_connection = "none"
+        else:
+            pad_connection = "solid"
+    thermal_gap = num(child(fill, "thermal_gap"), 1) if fill is not None else None
+    thermal_bridge = (num(child(fill, "thermal_bridge_width"), 1)
+                      if fill is not None else None)
     return {
         "net": net_name or net_code,
         "layers": layer_list,
@@ -781,6 +802,10 @@ def _zone(node):
         "keepout": keepout,
         "is_keepout": keepout is not None,
         "min_thickness": num(child(node, "min_thickness"), 1),
+        "connect_pads": pad_connection,
+        "thermal_gap_mm": thermal_gap if thermal_gap not in (None, "") else None,
+        "thermal_bridge_width_mm": (thermal_bridge
+                                    if thermal_bridge not in (None, "") else None),
     }
 
 
