@@ -2450,7 +2450,11 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
            "total_current_a": round(total_a, 9),
            "max_drop_mv": round(max_drop, 6),
            "worst_sink": worst_sink["pad"],
-           "worst_sink_drop_pct_of_3v3": round(100.0 * max_drop / 3.3, 6),
+           # `max_drop` is millivolts; dividing it by 3.3 V and multiplying by 100
+           # reported 2.94 mV as 89.19 % of 3.3 V for a year of releases - the
+           # factor is 1000, and nothing in this module ever checked the two
+           # fields against each other. The test `pct_agrees_with_mv` is that check.
+           "worst_sink_drop_pct_of_3v3": round(100.0 * (max_drop / 1000.0) / 3.3, 6),
            "sinks": sink_out,
            "total_copper_loss_w": round(loss, 9),
            "worst_current_density": (worst_j or {}),

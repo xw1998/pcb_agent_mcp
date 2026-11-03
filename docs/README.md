@@ -1,6 +1,6 @@
 # 设计文档索引
 
-这九十九篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
+这一百篇不是教程，是一条**逐步收紧的判决链**：每一篇都在推翻或修正前一篇的某个前提，
 最后收敛到「先做 Calc 层」这个可执行决定。建议按编号顺序读，跳过前面会看不懂后面的取舍。
 
 > **完成度总账在仓库根 README 的「一页速查：做完了什么 / 还差什么」**（哪些做完、哪些结构上不做、
@@ -91,6 +91,7 @@
 | 96 | [会话不是被计算打死的：`tools/list` 的体积与一条批量请求](96-tools-list与批量请求.md) | 一个算得对的服务凭什么在第一次握手就把对话撑死、又凭什么会被一条合法请求整死？ | 「工具越多越强」——工具数不是能力，是每一轮对话都要付的租金（316 728 B ≈ 10.6 万 token 实测）；「批量请求是边角料」——它抛在任何 handler 之外，能打死进程 |
 | 97 | [为什么焊盘坐标会差 25.4 mm：两个翻转叠加成一次镜像](97-board_view焊盘旋转符号.md) | `board_view` 说 `J2B.6` 在 `x = -10.16`，KiCad 说 15.24——差的 25.4 mm 不是精度，是符号；而这个错只在旋转不为 0 时出现 | 「焊盘坐标已经对过了」——对过，但只对过 `rotation = 0`，那块板 32 个封装里 30 个恰好都是 0 度；根因是 `_at()` 已把 Y 翻成 Y-up、`_rotate()` 又用文件帧的 `-deg`，两翻转叠加 ⇒ 旋转退化成绕封装原点**镜像**；三条独立证据（`kicad-cli` DRC 的 `items[].pos` + canonical `parse_board()` + pcbnew 实测常量 `PAD_TRUTH`）一致指向视图层单点，canonical 与文件都没问题；改一行 `math.radians(deg)` + 三个角度四个坐标的回归用例，修后六个焊盘与 DRC 报文逐位一致 |
 | 98 | [字段的图层、位置与字号](98-字段的图层位置与字号.md) | 一块板报 32 条 `text_height` 和 46 条丝印冲突，全都出在位号上——可那个 op 只能改文字和显隐，位置和字号怎么改？ | 「字段只有内容和可见性两个属性」——文件里还有 `layer`、`(at x y rot)`、`(effects (font (size h w)))`，这三样恰好是丝印能不能过 DRC 的全部；新增五个**可选**参数，一个不点名时逐字节不变；白名单只许 8 层丝印/文档层、**故意不许写铜层**（文字落 `F.Cu` 就是真的加了一块铜）；`(at)` 是封装局部帧、Y 向下，参数 Y-up ⇒ 恰好翻一次；只校验被点名的那一维；顺带修掉既有缺陷——改 Reference 的值时写后 `verify` 还按旧名字找封装，导致「改位号」在 0.0.97 之前**永远回滚** |
+| 100 | [同一个量的两种写法：2.94 mV 报成「3.3 V 的 89.19 %」](100-百分比与毫伏的单位.md) | `board_ir_drop` 的压降算对了 2.94 mV，同一段回答里的百分比却是 89.19 %——差 1000 倍，因为没人算过那个字段 |
 | 99 | [板子画对了，图是白的：整板平移与出图落位](99-整板平移与出图落位.md) | DRC 118 → 0、Gerber 正常，可 PDF/SVG 是一张白纸——不是导出参数错了，是整板画在负 Y |
 
 ## 三条贯穿全部文档的结论
@@ -325,4 +326,5 @@
 - 97 → fidelity/views.py（`_rotate`：`math.radians(-deg)` → `math.radians(deg)`，docstring 换成带实测证据的版本；全仓唯一调用点是 pads 分支）+ tests/test_fidelity.py（新增 `test_a_rotated_footprint_puts_its_pads_where_kicad_does`，90°/45°/90° 三个角度四个坐标对齐 pcbnew 实测）（**0.0.97**）：`board_view` 报 `J2B.6 x=-10.16`、`kicad-cli` DRC 判 `15.24`，差 25.4 mm；根因 `_at()` 已翻成 Y-up、`_rotate()` 又用文件帧的 `-deg` ⇒ 非零角度绕封装原点镜像；`rotation=0` 直接返回原值，所以 32 个封装里 30 个 0 度的板一直没被抓到；修后 `U1.1/J2A.3/J2A.6/J2B.3/J2B.6/J4.2` 六个焊盘与 DRC 报文逐位一致；`test_fidelity` 33→34 例、受影响 74 + 466 例全绿
 - 98 → edit/ops.py（`set_footprint_field` 新增五个可选参数 `layer` / `x` / `y` / `text_height` / `text_width`；新常量 `FIELD_SILK_OR_DOC_LAYERS` 八层白名单与 `_opt_mm`（非数/布尔/NaN/inf 一律 `ARG_INVALID`）；`_verify_set_field` 开头改按旧 ref 找不到时，若 field 是 Reference 且新值非空则改按新值找；末尾新增 layer / 单轴坐标 / 字号校验，未点名的维度标未检查） + tests/test_ops_edit.py（`FieldGeometry` 7 例，含反假绿） + docs/98（**0.0.98，工具数仍 192、写 op 仍 40**）：F412 核心板 `kicad-cli` 第一版 118 条里 `text_height 32`（位号 0.7 mm）+ `silk_over_copper 24` + `silk_overlap 14` 全指向参考字段；字高抬到 0.8 后 118 → 46，剩下 46 条 `silk_over_copper 26 + silk_overlap 18 + silk_edge 2` **100 % 涉及参考字段**，只能挪位号；`(at)` 在封装局部帧 Y 向下、参数 Y-up ⇒ 恰好翻一次（入 -3.25 落盘 +3.25）；白名单**故意不许写铜层**（文字落 `F.Cu` 就是真的加铜、DRC 按铜判）；只校验被点名维度；顺带修掉既有缺陷——改名时写后 `verify` 按旧 ref 找 ⇒ `REFERENCE_NOT_FOUND` ⇒ 回滚，即 0.0.97 之前「改位号」永远不可能成功；`test_ops_edit` 71 → **78 例**，受影响的五个模块 **160 例 OK**
 - 99 → edit/ops.py（新 op `translate_board`（`_MOVE_TOP` 18 种顶层对象 / `_META_TOP` 14 种不搬的元数据、`_POINT_HEADS` 六种位置写法、`_LOCAL_FRAME` 两个封装头；`_board_points` / `_points_digest` 位置指纹；`_shift_point` / `_shift_tree`；`_verify_translate_board` 吃 record 并写死 `verify_limit` 与 `UNSUPPORTED_ITEM` fail-closed）+ tests/test_ops_edit.py（`TranslateBoard` 六例：整板同增量 / 封装内部不动 / 旋转保留 / 零位移拒绝 / 未知种类拒绝且不落盘 / 反向对照）+ docs/99（**0.0.99，工具数仍 192、写 op 40 → 41**）；顺带把 docs 表格里 97/98 两行的次序错位改回来）
-- 代码里的每条"拒绝回答"分支，都能在这九十九篇里找到对应的判据来源。
+- 100 → oracle.py（`worst_sink_drop_pct_of_3v3` 补 `/1000`：max_drop 是毫伏、分母是伏，字段自加入起放大 1000 倍）+ tests/test_board_ir_drop.py（新增 `test_pct_agrees_with_mv`：百分比必须等于 `100*max_drop_mv/1000/3.3`，且 19.7029 mV 的绝对值是 0.597056 %）+ docs/100（**0.0.100，工具数仍 192、写 op 仍 41**）
+- 代码里的每条"拒绝回答"分支，都能在这一百篇里找到对应的判据来源。

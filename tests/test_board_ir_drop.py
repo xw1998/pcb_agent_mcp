@@ -82,6 +82,18 @@ class TestSingleLayer(unittest.TestCase):
         self.assertEqual(v["edge_count"], 1)
         self.assertEqual(v["node_count"], 2)
 
+    def test_pct_agrees_with_mv(self):
+        # the percentage and the millivolts are the same quantity twice. They were
+        # NOT: 19.7029 mV of 3.3 V is 0.597 %, and the field said 597.06 %. A
+        # derived field nobody computes by hand needs a test that ties it to the
+        # field it is derived from - otherwise it is decoration.
+        r = oracle.board_ir_drop(board(ONE_TRACK, "F.Cu"), "VCC", "U1.1", ["U2.1"],
+                                 current_a=1.0)
+        v = r["value"]
+        self.assertAlmostEqual(v["worst_sink_drop_pct_of_3v3"],
+                               100.0 * v["max_drop_mv"] / 1000.0 / 3.3, places=6)
+        self.assertAlmostEqual(v["worst_sink_drop_pct_of_3v3"], 0.597056, places=6)
+
     def test_copper_um_overrides_the_stackup_and_says_so(self):
         # 18 um instead of 35 um is 35/18 = 1.944x the resistance
         r = oracle.board_ir_drop(board(ONE_TRACK, "F.Cu"), "VCC", "U1.1", ["U2.1"],
