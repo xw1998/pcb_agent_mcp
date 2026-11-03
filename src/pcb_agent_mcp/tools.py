@@ -10257,6 +10257,49 @@ def _tools_trim_spec(spec, desc_cut=200, inner_cut=80):
     return out, cut
 
 
+# Prose is cut one step at a time until the list fits in one page. Measured on
+# the shipped core profile (46 tools) on 2026-11-03:
+#   full 54 905 B | (200,80) 38 766 | (120,40) 33 396 | (120,0) 26 725
+#   (60,0) 23 976 | (40,0) 23 056 | no prose at all 15 127
+# The floor is the schema itself, so a budget under ~16 KiB can only be met by
+# dropping tools - which this file exists to prevent.
+_TOOLS_TRIM_LADDER = ((200, 80), (120, 40), (120, 0), (60, 0), (0, 0))
+
+
+def _tools_fit(specs, cap, level):
+    """Pack `specs`, trimmed at `level`, into one array no bigger than `cap`.
+
+    Returns (page, used, cut). A page shorter than `specs` means the caller must
+    choose between a smaller level and paging.
+    """
+    import json as _json
+
+    def size(obj):
+        return len(_json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    desc_cut, inner_cut = level
+    page = []
+    used = 0
+    cut = 0
+    for spec in specs:
+        trimmed, cut_here = _tools_trim_spec(spec, desc_cut, inner_cut)
+        cut += cut_here
+        piece = size(trimmed) + 2       # the comma and newline of the array
+        if page and used + piece > cap:
+            break
+        if not page and piece > cap:
+            # One entry that cannot fit even alone: keep its name and schema
+            # shape, drop every description. Dropping the entry would make a
+            # tool invisible, which is worse than a bare one.
+            bare, _ = _tools_trim_spec(spec, 0, 0)
+            page.append(bare)
+            used += size(bare) + 2
+            break
+        page.append(trimmed)
+        used += piece
+    return page, used, cut
+
+
 def tools_page(specs, cap_bytes, cursor=None):
     """Fit `specs` into one reply of at most `cap_bytes`.
 
@@ -10290,25 +10333,19 @@ def tools_page(specs, cap_bytes, cursor=None):
     # exactly the kind of quiet overshoot the page exists to prevent.
     cap = (cap_bytes - _TOOLS_ENVELOPE_BYTES) if cap_bytes else (1 << 62)
     cap = max(cap, 512)
-    trimmed = [_tools_trim_spec(s) for s in specs[start:]]
-    trimmed = [t[0] for t in trimmed]
-    page = []
-    used = 0
-    for spec in trimmed:
-        piece = size(spec) + 2          # the comma and newline of the array
-        if page and used + piece > cap:
-            break
-        if not page and piece > cap:
-            # A single entry that cannot fit even alone: keep the name and the
-            # schema shape, drop every description, and say so. Dropping the
-            # entry instead would make a tool invisible, which is worse than a
-            # bare one.
-            bare, _cut = _tools_trim_spec(spec, 0, 0)
-            page.append(bare)
-            used += size(bare) + 2
-            break
-        page.append(spec)
-        used += piece
+    # 0.0.110: until now trimming had one setting and then went straight to
+    # paging, so a smaller budget could only be met by cutting tools out. The
+    # ladder walks prose out first and pages only when even the bare list is
+    # too big for one reply.
+    rest = specs[start:]
+    level = _TOOLS_TRIM_LADDER[0]
+    page, _used, cut = _tools_fit(rest, cap, level)
+    if len(page) != len(rest):
+        for step in _TOOLS_TRIM_LADDER[1:]:
+            candidate, _used2, cut2 = _tools_fit(rest, cap, step)
+            level, page, cut = step, candidate, cut2
+            if len(candidate) == len(rest):
+                break
 
     end = start + len(page)
     info = {"tools_total": len(specs), "tools_from": start,
@@ -10316,10 +10353,13 @@ def tools_page(specs, cap_bytes, cursor=None):
     if len(page) != len(specs) or start or any(
             t != s for t, s in zip(page, specs[start:end])):
         info["descriptions_shortened"] = True
+        info["prose_cut"] = "%d/%d" % level      # description / parameter, chars
+        info["fields_shortened"] = cut
         info["note"] = ("tool descriptions are shortened to keep this reply inside "
-                        "PCB_AGENT_MAX_RESULT_KB; names, parameters and required "
-                        "lists are complete. Set PCB_AGENT_MAX_RESULT_KB=0 for the "
-                        "full prose, or use tool_search for one tool's text.")
+                        "PCB_AGENT_MAX_TOOLS_KB; names, parameters, types, enum "
+                        "values and required lists are complete. Set "
+                        "PCB_AGENT_MAX_TOOLS_KB=0 for the full prose, or use "
+                        "tool_search for one tool's text.")
     return page, (str(end) if end < len(specs) else None), info
 
 
@@ -10444,6 +10484,30 @@ def max_result_chars():
         kb = int(float(raw))
     except (TypeError, ValueError):
         kb = 48
+    return max(0, kb) * 1024
+
+def max_tools_chars():
+    """Budget for one tools/list reply (0 disables). PCB_AGENT_MAX_TOOLS_KB.
+
+    This is a different ceiling from `max_result_chars` on purpose. A tool reply
+    is read once and thrown away; the tool list is not - the client turns every
+    entry into a function declaration and pays for it on EVERY turn of the
+    session. Measured on 2026-11-03 from the host's own log: this session was
+    compacted three times, original 78 767 / 123 625 / 104 242 tokens down to a
+    55 798-58 827 token floor. The core profile's 37 210 B tool list is about
+    11 000 tokens of that floor, ~19 % of every request, spent on prose.
+
+    So the default is 25 KiB, not "unlimited". It is measured, not guessed: the
+    core profile at 25 KiB still fits in ONE page with all 46 tools and every
+    parameter name, type, enum and required list intact - only prose is cut
+    (37 210 -> 23 976 B, -36 %). Anything that raises the value gets the old
+    answer back byte for byte.
+    """
+    raw = os.environ.get("PCB_AGENT_MAX_TOOLS_KB", "25")
+    try:
+        kb = int(float(raw))
+    except (TypeError, ValueError):
+        kb = 25
     return max(0, kb) * 1024
 
 

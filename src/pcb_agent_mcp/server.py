@@ -90,7 +90,7 @@ def handle(request):
         # "the mcp broke again", not like "a reply was too big".
         specs = _tools.list_tools(_tools.toolset_from_env())
         page, next_cursor, info = _tools.tools_page(
-            specs, _tools.max_result_chars(), (params or {}).get("cursor"))
+            specs, _tools.max_tools_chars(), (params or {}).get("cursor"))
         listed = {"tools": page}
         if next_cursor is not None:
             listed["nextCursor"] = next_cursor
@@ -7047,7 +7047,7 @@ def selftest(verbose=False):
     else:
         os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kb_before_selftest
 
-    # --- 0.0.109 tools/list 也有预算 --------------------------------------
+    # --- 0.0.110 tools/list 的预算：默认 25 KiB + 先削文再分页 -------------
     # 0.0.104 给 tools/call 上了 48 KiB 的闸门，但每次会话第一件事就是拉
     # tools/list，而它一直是原样全发：core 档 54 905 B、all 档 300 159 B。守了
     # 回包的体积，没守自己发出去的体积 —— 而宿主只会把这件事报成"服务坏了"。
@@ -7061,25 +7061,25 @@ def selftest(verbose=False):
         return handle(_req)["result"]
 
     _ts_before = os.environ.get("PCB_AGENT_TOOLSET")
-    _kb_before_list = os.environ.get("PCB_AGENT_MAX_RESULT_KB")
+    _kb_before_list = os.environ.get("PCB_AGENT_MAX_TOOLS_KB")
     try:
-        os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)      # 文档上的默认值
+        os.environ.pop("PCB_AGENT_MAX_TOOLS_KB", None)      # 文档上的默认值
         os.environ["PCB_AGENT_TOOLSET"] = "core"
         _raw_core = _tools.list_tools("core")
         _one = _ask_list()
         _one_bytes = _tsize(_one)
-        check("tools/list in the default `core` profile arrives in one page inside "
-              "the same 48 KiB the tool replies are held to: the reply every "
-              "session fetches before any tool runs was the one reply nothing "
-              "measured (54 905 B raw against a 49 152 B cap)",
+        check("tools/list in the default `core` profile arrives in ONE page "
+              "inside the 25 KiB default: every tool is present, so the smaller "
+              "budget is paid for with prose, never with entries",
               len(_one["tools"]) == len(_raw_core)
               and "nextCursor" not in _one
-              and _one_bytes <= 48 * 1024,
-              "%d tools, %d B, cap %d B" % (len(_one["tools"]), _one_bytes, 48 * 1024))
+              and _one_bytes <= 25 * 1024,
+              "%d tools, %d B, cap %d B"
+              % (len(_one["tools"]), _one_bytes, 25 * 1024))
 
         # 反向对照：把预算压到 8 KiB。分页必须一条不丢 —— 少了这一条，上面
         # 那句"一页装得下"就只是在蛾耀默认档小，而不是在证明机制对。
-        os.environ["PCB_AGENT_MAX_RESULT_KB"] = "8"
+        os.environ["PCB_AGENT_MAX_TOOLS_KB"] = "8"
         _seen, _cur, _pages, _worst = [], None, 0, 0
         while True:
             _p = _ask_list(_cur)
@@ -7098,7 +7098,7 @@ def selftest(verbose=False):
               "%d pages, worst %d B, %d/%d tools"
               % (_pages, _worst, len(_seen), len(_raw_core)))
 
-        os.environ["PCB_AGENT_MAX_RESULT_KB"] = "0"      # pop would fall back to 48
+        os.environ["PCB_AGENT_MAX_TOOLS_KB"] = "0"      # pop would fall back to 25
         _full = _ask_list()
         check("with the cap switched off, tools/list is byte for byte the old "
               "answer - so shortening a description can never quietly edit a "
@@ -7110,7 +7110,7 @@ def selftest(verbose=False):
               "%d B" % _tsize(_full))
 
         os.environ["PCB_AGENT_TOOLSET"] = "all"
-        os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)   # 回到文档默认的 48 KiB
+        os.environ.pop("PCB_AGENT_MAX_TOOLS_KB", None)   # 回到文档默认的 25 KiB
         _raw_all = _tools.list_tools("all")
         _seen2, _cur2, _pages2, _worst2 = [], None, 0, 0
         while True:
@@ -7126,7 +7126,7 @@ def selftest(verbose=False):
               "likely to kill a session is now the one with a measured way out"
               % _tsize(_raw_all),
               _seen2 == [t["name"] for t in _raw_all]
-              and _worst2 <= 48 * 1024,
+              and _worst2 <= 25 * 1024,
               "%d pages, worst %d B, %d tools" % (_pages2, _worst2, len(_seen2)))
     finally:
         if _ts_before is None:
@@ -7134,9 +7134,76 @@ def selftest(verbose=False):
         else:
             os.environ["PCB_AGENT_TOOLSET"] = _ts_before
         if _kb_before_list is None:
-            os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)
+            os.environ.pop("PCB_AGENT_MAX_TOOLS_KB", None)
         else:
-            os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kb_before_list
+            os.environ["PCB_AGENT_MAX_TOOLS_KB"] = _kb_before_list
+
+    # --- 0.0.110 削的只能是散文：名字、参数、枚举、必填一个都不能动 -------
+    def _schema_fingerprint(spec):
+        """(property names, required list, every enum tuple) of one tool."""
+        sch = spec.get("inputSchema") or {}
+        props = sorted((sch.get("properties") or {}).keys())
+        req = list(sch.get("required") or [])
+        enums = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                for key, val in node.items():
+                    if key == "enum":
+                        enums.append(json.dumps(val, ensure_ascii=False, sort_keys=True))
+                    else:
+                        walk(val)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(sch)
+        return (props, req, tuple(sorted(enums)))
+
+    _ts_before2 = os.environ.get("PCB_AGENT_TOOLSET")
+    _kb_before2 = os.environ.get("PCB_AGENT_MAX_TOOLS_KB")
+    try:
+        os.environ.pop("PCB_AGENT_MAX_TOOLS_KB", None)
+        os.environ["PCB_AGENT_TOOLSET"] = "core"
+        _raw_core2 = _tools.list_tools("core")
+        _shipped = _ask_list()
+        _mismatch = [s["name"] for s in _raw_core2
+                     if _schema_fingerprint(s)
+                     != _schema_fingerprint(
+                         [t for t in _shipped["tools"] if t["name"] == s["name"]][0])]
+        check("shortening descriptions never touches what a call is made of: for "
+              "all %d tools in the default page the property names, the required "
+              "list and every enum value are identical to the un-trimmed spec - "
+              "if the trimmer ever edited a schema this list would not be empty"
+              % len(_raw_core2),
+              not _mismatch and len(_shipped["tools"]) == len(_raw_core2),
+              "mismatched: %r" % (_mismatch[:6],))
+
+        # 反向对照：抬预算必须真的把散文还回来，否则"省了 13 KiB"可能只是
+        # 免费地从别处减了东西。
+        os.environ["PCB_AGENT_MAX_TOOLS_KB"] = "0"
+        _rich = _ask_list()
+        _rich_bytes = _tsize(_rich)
+        _shipped_bytes = _tsize(_shipped)
+        _rich_cut = _rich.get("fields_shortened")
+        check("raising the budget hands the prose back: the same %d tools come "
+              "back larger than the default page and nothing is reported as "
+              "shortened - the default page is smaller because it cut text, not "
+              "because it cut tools" % len(_rich["tools"]),
+              _rich_bytes > _shipped_bytes
+              and _rich_cut is None
+              and len(_rich["tools"]) == len(_shipped["tools"]),
+              "default %d B (%s cut) vs full %d B"
+              % (_shipped_bytes, _shipped.get("fields_shortened"), _rich_bytes))
+    finally:
+        if _ts_before2 is None:
+            os.environ.pop("PCB_AGENT_TOOLSET", None)
+        else:
+            os.environ["PCB_AGENT_TOOLSET"] = _ts_before2
+        if _kb_before2 is None:
+            os.environ.pop("PCB_AGENT_MAX_TOOLS_KB", None)
+        else:
+            os.environ["PCB_AGENT_MAX_TOOLS_KB"] = _kb_before2
 
     # --- 0.0.107 自动布线/自动布局已摘除：不是关掉，是不存在 -------------
     _all_names = [t["name"] for t in _tools.list_tools("all")]

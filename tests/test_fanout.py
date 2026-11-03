@@ -281,32 +281,54 @@ class TestFanoutOps(FanoutBase):
         self.assertTrue(pc["all_verified"], pc)
         self.assertEqual(len(pc["operations"]), 59)
 
-    def test_tools_call_returns_a_plan_and_writes_nothing(self):
+    def test_the_tool_is_gone_even_with_arguments_that_would_have_worked(self):
+        """0.0.108 removed the TOOL, not the default: this board is a 1.27 mm
+        array the planner would have escaped (see the tests above), and the
+        call still has to come back TOOL_RETIRED - a tool that answers "ok"
+        when a caller asked for automatic escapes would be the laziness the
+        removal exists to prevent."""
         self.bga()
         with open(self.board, "rb") as fh:
             before = fh.read()
         out = tools.call_tool("board_fanout", {"path": self.board})
-        self.assertEqual(out["status"], "ok", out.get("message"))
-        self.assertEqual(out["value"]["escaped"], 25)
-        self.assertTrue(out["value"]["writes_nothing"])
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "TOOL_RETIRED")
+        self.assertIn("cannot be called", out["message"])
         with open(self.board, "rb") as fh:
             self.assertEqual(fh.read(), before)
 
-    def test_tools_call_writes_when_asked(self):
+    def test_apply_true_is_refused_too_and_writes_nothing(self):
+        """The dangerous argument is the one that writes. It must be refused
+        before anything reaches the file, not after a plan is built."""
         self.bga()
+        with open(self.board, "rb") as fh:
+            before = fh.read()
         out = tools.call_tool("board_fanout",
                               {"path": self.board, "apply": True})
-        self.assertEqual(out["status"], "ok", out.get("message"))
-        self.assertFalse(out["value"]["writes_nothing"])
-        self.assertEqual(len(out["applied"]["gates"]["postconditions"]["operations"]),
-                         59)
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "TOOL_RETIRED")
+        self.assertNotIn("applied", out)
+        with open(self.board, "rb") as fh:
+            self.assertEqual(fh.read(), before)
 
-    def test_tools_call_reports_a_missing_array_as_an_error(self):
+    def test_a_missing_array_is_no_longer_diagnosed_because_nothing_runs(self):
+        """NO_ARRAY used to be the honest error. Now the tool does not run at
+        all, so the error has to be about the tool - reporting NO_ARRAY would
+        tell the caller the ref was wrong when the capability is gone."""
         self.bga()
         out = tools.call_tool("board_fanout", {"path": self.board, "ref": "U9"})
         self.assertEqual(out["status"], "error")
-        self.assertEqual(out["reason_code"], "NO_ARRAY")
-        self.assertTrue(out["hint"])
+        self.assertEqual(out["reason_code"], "TOOL_RETIRED")
+        self.assertNotEqual(out["reason_code"], "NO_ARRAY")
+
+    def test_the_planner_itself_still_works_as_a_library(self):
+        """Retiring the tool is not deleting the work: the planner is still
+        importable and still escapes 25 balls on this board. That keeps the
+        distinction honest - 'no automatic escape in this server' is a product
+        decision, not 'the code was broken'."""
+        self.assertTrue(callable(getattr(FO, "fanout", None)),
+                        "pcb_agent_mcp.fanout.fanout must still exist: the tool "
+                        "was retired, the planner was not deleted")
 
 class TestFanoutAgainstKiCad(FanoutBase):
     """KiCad's own DRC has to accept the escapes."""
