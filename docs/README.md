@@ -349,3 +349,4 @@
 - 109 → `docs/109-tools-list才是那条没闸门的应答.md`（**文档 + `tools.py` / `server.py` / 一个测试**：新增 `tools_page()` 三层（原样发 / 瘦身描述 / 游标分页）、`tools/list` 接入预算、自检加 4 条（含 8 KiB 强制分页的反向对照）、`--selftest` 摘要档与 `--verbose`、`test_server_protocol` 改走游标；实测 348/348 PASS 124.6 s）
 - 代码里的每条"拒绝回答"分支，都能在这一百零三篇里找到对应的判据来源。
 - 103 → tools.py + server.py（`cap_result` / `_cap_walk` / `_spine_reply` / `_minimal_reply`；`_VIEW_MAX_BYTES` 64 KiB→16 KiB；`PCB_AGENT_MAX_RESULT_KB` 默认 1024→48；自检里的「量数据」与「量闸门」分开）
+- 113 → `skills/` 新增两份技能文档：`pcb-layout-methodology`（约束表/七步流程/扇出算术/14 条实测失败模式/何时该重摆）与 `pcb-agent-mcp-usage`（190 工具默认只广告 core、六阶段工作流、权威性分层、48 KiB 与 `saved_to`、九个真坑）；联网取到 IPC-2221B 间距行、ST 晶振布局、Sierra 两层板与缝合惯例，另诚实标注 AN4879/AN2867 只核到条目未读正文。零功能改动，工具数仍 190。
