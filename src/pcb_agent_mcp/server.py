@@ -12,6 +12,7 @@ import sys
 import zipfile
 
 from . import __version__
+from . import jsonsafe as _jsonsafe
 from . import tools as _tools
 
 SERVER_NAME = "pcb-agent-mcp"
@@ -36,11 +37,25 @@ def _error(msg_id, code, message, data=None):
     return {"jsonrpc": "2.0", "id": msg_id, "error": e}
 
 
+def _json_safe(value):
+    """Kept as a name: the rule itself lives in `jsonsafe.sanitise`."""
+    return _jsonsafe.sanitise(value)
+
+
+def _dumps(payload):
+    """Strict JSON over the wire - see jsonsafe for why this is not json.dumps."""
+    return _jsonsafe.dumps(payload)
+
+
 def handle(request):
     """Return a response dict, or None for notifications."""
+    if not isinstance(request, dict):
+        return _error(None, -32600, "invalid request: expected a JSON object")
     method = request.get("method")
     msg_id = request.get("id")
-    params = request.get("params") or {}
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
 
     if msg_id is None:
         # notification: initialized / cancelled / anything else -> no response
@@ -57,7 +72,10 @@ def handle(request):
                 "Calc layer for PCB design. Every numeric answer carries model, "
                 "basis, precision and assumptions. Some tools refuse to answer "
                 "unless the governing standard is named or its data table is loaded - "
-                "do not substitute your own memorised value when that happens."
+                "do not substitute your own memorised value when that happens. "
+                "Only the common tools are listed directly: when the capability you "
+                "need is not in the tool list, call tool_search with the task, then "
+                "tool_call with the returned name and schema."
             ),
         })
 
@@ -65,7 +83,7 @@ def handle(request):
         return _ok(msg_id, {})
 
     if method == "tools/list":
-        return _ok(msg_id, {"tools": _tools.list_tools()})
+        return _ok(msg_id, {"tools": _tools.list_tools(_tools.toolset_from_env())})
 
     if method == "tools/call":
         name = params.get("name")
@@ -79,8 +97,12 @@ def handle(request):
 
     if method in ("resources/list",):
         return _ok(msg_id, {"resources": []})
+    if method in ("resources/templates/list",):
+        return _ok(msg_id, {"resourceTemplates": []})
     if method in ("prompts/list",):
         return _ok(msg_id, {"prompts": []})
+    if method in ("logging/setLevel",):
+        return _ok(msg_id, {})
 
     return _error(msg_id, -32601, "method not found: %s" % method)
 
@@ -88,6 +110,11 @@ def handle(request):
 def serve(stdin=None, stdout=None):
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
+
+    def write(payload):
+        stdout.write((_dumps(payload) + "\n").encode("utf-8"))
+        stdout.flush()
+
     for raw in stdin:
         line = raw.decode("utf-8", errors="replace").strip()
         if not line:
@@ -95,14 +122,42 @@ def serve(stdin=None, stdout=None):
         try:
             request = json.loads(line)
         except json.JSONDecodeError as exc:
-            payload = _error(None, -32700, "parse error: %s" % exc)
-            stdout.write((json.dumps(payload) + "\n").encode("utf-8"))
-            stdout.flush()
+            write(_error(None, -32700, "parse error: %s" % exc))
             continue
-        response = handle(request)
+        # A batch arrives as an array. Answer it with an array; an element that
+        # cannot be handled must not take the whole session down.
+        if isinstance(request, list):
+            responses = []
+            for item in request:
+                try:
+                    response = handle(item)
+                except Exception as exc:  # noqa: BLE001
+                    _log("request failed: %s: %s" % (type(exc).__name__, exc))
+                    msg_id = item.get("id") if isinstance(item, dict) else None
+                    response = _error(msg_id, -32603, "internal error: %s: %s"
+                                      % (type(exc).__name__, exc))
+                if response is not None:
+                    responses.append(response)
+            if not responses:
+                # An empty array is a malformed request, not a quiet no-op: the
+                # spec answers it with one error. A batch of pure notifications
+                # stays silent, which is why these two cases are separated.
+                if not request:
+                    write(_error(None, -32600, "invalid request: empty batch"))
+                continue
+            write(responses)
+            continue
+        try:
+            response = handle(request)
+        except Exception as exc:  # noqa: BLE001
+            # The process dying is indistinguishable from the conversation
+            # dying, so one broken request or tool ends a turn, not the server.
+            _log("request failed: %s: %s" % (type(exc).__name__, exc))
+            msg_id = request.get("id") if isinstance(request, dict) else None
+            response = _error(msg_id, -32603, "internal error: %s: %s"
+                              % (type(exc).__name__, exc))
         if response is not None:
-            stdout.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            stdout.flush()
+            write(response)
 
 
 def selftest():
@@ -5060,9 +5115,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (190 tools now), so an agent that asks what can be computed is "
+          "table (192 tools now), so an agent that asks what can be computed is "
           "told about it",
-          len(_tools.TOOLS) == 190
+          len(_tools.TOOLS) == 192
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -5237,8 +5292,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (190 tools now)",
-          len(_tools.TOOLS) == 190
+          "table (192 tools now)",
+          len(_tools.TOOLS) == 192
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5502,7 +5557,7 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 190, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 192, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
@@ -5526,7 +5581,7 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 190,
+          and len(_tools.TOOLS) == 192,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -5668,7 +5723,7 @@ def selftest():
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 190,
+          and len(_tools.TOOLS) == 192,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -5950,7 +6005,7 @@ def selftest():
           and _au_temp.get("temperatures_printed") == [100.0]
           and _au_kneg.get("reason_code") == "ARG_RANGE"
           and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 190,
+          and len(_tools.TOOLS) == 192,
           "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
           % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
              _au_n27.get("reason_code"), _au_mat.get("reason_code"),

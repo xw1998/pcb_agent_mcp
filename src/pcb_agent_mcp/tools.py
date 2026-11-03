@@ -6,6 +6,10 @@ must say what the tool will NOT do as clearly as what it does.
 """
 import json
 import math
+import os
+import re
+
+from . import jsonsafe as _jsonsafe
 
 from . import desktop as _desktop
 from . import parts as _parts
@@ -4044,6 +4048,7 @@ def _capabilities(_args):
                                    "not silently accepted",
         },
         "available": [
+            "tool_search", "tool_call",
             "unit_convert", "width_for_current", "current_capacity",
             "via_current_allowed", "fusing_current", "fusing_current_taper",
             "repetitive_pulse_rating", "current_density_field",
@@ -9818,11 +9823,303 @@ _tool(
     _schematic_export,
 )
 
-def list_tools():
+# ------------------------------------------------------------ tool profile
+#
+# The registry holds ~190 tools, which is ~315 KB of JSON (roughly 100 k tokens)
+# in a single tools/list reply. A chat client puts that in front of the model
+# before the first user message, so the context window fills up and the dialog
+# stalls or breaks outright. The default profile advertises the entry point of
+# every layer plus discovery; tool_search / tool_call reach the rest without
+# paying for their schemas up front.
+#
+# PCB_AGENT_TOOLSET:
+#   core (default)  the entry points below + the discovery tools
+#   all / *         every registered tool (the behaviour before this profile)
+#   <tokens>        comma/space separated tool names or prefixes, e.g.
+#                   "board_,magnetics_" - "core" may be mixed in
+DEFAULT_TOOLSET = "core"
+
+META_TOOLS = ("tool_search", "tool_call")
+# the historical private name; same tuple, kept so old imports keep working
+_META_TOOLS = META_TOOLS
+
+CORE_TOOLS = (
+    # discovery / self description
+    "calc_capabilities",
+    # board: read
+    "board_summary", "board_components", "board_nets", "board_zones",
+    "board_drc", "board_view", "board_rules", "board_fidelity",
+    # board: write
+    "board_create", "board_propose", "board_apply", "board_rules_write",
+    # schematic
+    "schematic_summary", "schematic_review", "schematic_propose",
+    "schematic_apply", "schematic_pcb_diff", "schematic_pcb_sync",
+    # desktop / LCEDA
+    "epro_inspect", "app_detect", "app_status", "lceda_pro_status",
+    "lceda_pro_open",
+    # calc / rules
+    "unit_convert", "width_for_current", "current_capacity", "via_resistance",
+    "via_current_allowed", "trace_impedance", "width_for_impedance",
+    "diff_impedance", "clearance_required", "creepage_required",
+    "lambda_over_20", "stackup_design", "dfm_check", "decoupling_check",
+    "pdn_impedance", "ir_drop_chain",
+    # simulation / thermal
+    "sim_spice", "thermal_via_array",
+    # parts
+    "part_search", "part_get",
+)
+
+
+def toolset_from_env():
+    return (os.environ.get("PCB_AGENT_TOOLSET") or DEFAULT_TOOLSET).strip()
+
+
+def _resolve_toolset(toolset):
+    """Tool names a profile asks for, or None when it asks for everything."""
+    raw = (toolset or "").strip()
+    if not raw or raw.lower() in ("all", "*"):
+        return None
+    picked = []
+    for token in re.split(r"[,\s]+", raw.lower()):
+        if not token:
+            continue
+        if token in ("all", "*"):
+            return None
+        if token == "core":
+            picked.extend(CORE_TOOLS)
+            continue
+        exact = [n for n in TOOLS if n.lower() == token]
+        picked.extend(exact or [n for n in TOOLS if n.lower().startswith(token)])
+    # Discovery must survive every profile: without the two meta tools the
+    # tools that were filtered out are unreachable.
+    picked.extend(_META_TOOLS)
+    out, seen = [], set()
+    for name in picked:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    # A profile whose tokens all missed is a typo, not a request for an empty
+    # server: `PCB_AGENT_TOOLSET=boards_` would otherwise advertise two tools and
+    # read as "every capability was deleted". Fall back to the default profile.
+    if all(name in META_TOOLS for name in out):
+        return [n for n in CORE_TOOLS if n in TOOLS] + list(META_TOOLS)
+    return out
+
+
+# Chinese task nouns -> the English words the descriptions are written in.
+#
+# Why this exists: the keyword pass splits on [^0-9a-z_]+, so a query made only of
+# Chinese characters produced zero words and tool_search answered "ok, 0 matches".
+# That is a silent false negative - it reads as "this server cannot do impedance"
+# when the tool is right there. This is a lookup table of task nouns, not a
+# translator: anything outside it gets an explicit "no keyword mapped" hint
+# instead of a quiet zero.
+_CJK_ALIASES = (
+    ("阻抗", ("impedance",)),
+    ("线宽", ("width",)),
+    ("宽度", ("width",)),
+    ("载流", ("current", "capacity")),
+    ("电流", ("current",)),
+    ("电压", ("voltage",)),
+    ("压降", ("drop",)),
+    ("过孔", ("via",)),
+    ("去耦", ("decoupling",)),
+    ("电容", ("capacitor",)),
+    ("电感", ("inductor",)),
+    ("磁芯", ("core",)),
+    ("铁氧体", ("ferrite",)),
+    ("磁性", ("magnetics",)),
+    ("损耗", ("loss",)),
+    ("热", ("thermal",)),
+    ("温度", ("temperature",)),
+    ("散热", ("heat", "thermal")),
+    ("焊盘", ("pad",)),
+    ("封装", ("footprint",)),
+    ("原理图", ("schematic",)),
+    ("布线", ("route",)),
+    ("走线", ("track",)),
+    ("等长", ("length",)),
+    ("差分", ("diff",)),
+    ("串扰", ("crosstalk",)),
+    ("间距", ("clearance",)),
+    ("爬电", ("creepage",)),
+    ("叠层", ("stackup",)),
+    ("铺铜", ("zone", "pour")),
+    ("覆铜", ("zone", "pour")),
+    ("铜皮", ("zone",)),
+    ("仿真", ("sim",)),
+    ("晶振", ("crystal",)),
+    ("滤波", ("filter",)),
+    ("天线", ("antenna",)),
+    ("熔断", ("fusing",)),
+    ("振动", ("vibration",)),
+    ("跌落", ("drop", "shock")),
+    ("焊点", ("solder", "joint")),
+    ("疲劳", ("fatigue",)),
+    ("电源", ("power", "pdn")),
+    ("平面", ("plane", "zone")),
+    ("检查", ("check",)),
+    ("评审", ("review",)),
+    ("规则", ("rules",)),
+    ("板", ("board",)),
+    ("元件", ("component", "part")),
+    ("器件", ("part",)),
+    ("数据", ("data",)),
+)
+
+
+def _search_words(query):
+    """(latin words, words contributed by the Chinese alias table)."""
+    latin = [w for w in re.split(r"[^0-9a-z_]+", query.lower()) if w]
+    extra = []
+    for run in re.findall(r"[\u4e00-\u9fff]+", query):
+        for zh, en in _CJK_ALIASES:
+            if zh in run:
+                extra.extend(en)
+    return latin, extra
+
+
+def _tool_search(args):
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return err("query is required", "ARG_MISSING",
+                   hint="search by the task, e.g. 'trace impedance'")
+    try:
+        limit = int(args.get("limit") or 8)
+    except (TypeError, ValueError):
+        limit = 8
+    limit = max(1, min(limit, 25))
+    words, aliased = _search_words(query)
+    words = words + [w for w in aliased if w not in words]
+
+    def whole(word, text):
+        # Whole word, with `_` counting as a boundary: `via` hits `via_resistance`
+        # but not `trivial`. Plain substring matching was a false-positive source -
+        # 25 of the 25 first hits for 过孔 were tools that merely mention it.
+        return re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(word),
+                         text) is not None
+
+    scored = []
+    for name, spec in TOOLS.items():
+        low_name = name.lower()
+        low_desc = spec["description"].lower()
+        name_hits = sum(1 for w in words if whole(w, low_name))
+        desc_hits = sum(1 for w in words if whole(w, low_desc))
+        if not name_hits and not desc_hits:
+            continue
+        # A hit in the tool's NAME is evidence that this is the tool; a hit in its
+        # description is a mention. Weighting them alike let a query return pages
+        # of tools that talk about the word without doing anything with it.
+        score = name_hits * 12 + desc_hits * 4
+        wanted = query.strip().lower()
+        if low_name == wanted:
+            score += 100
+        elif wanted and wanted in low_name:
+            score += 20
+        scored.append((score, name))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    picked = [name for _, name in scored[:limit]]
+    out = {
+        "status": "ok",
+        "query": query,
+        "total_matches": len(scored),
+        "returned": len(picked),
+        "tools": [{"name": n, "description": TOOLS[n]["description"],
+                   "inputSchema": TOOLS[n]["inputSchema"]} for n in picked],
+        "how_to_call": "call tool_call with {\"name\": <name>, \"arguments\": {...}}",
+        "payload_is": "top_level",
+        "where_to_read": "matching tool specs are under `tools`; run one with tool_call",
+    }
+    if not picked:
+        if re.search(r"[\u4e00-\u9fff]", query) and not aliased:
+            # The alias table is finite; say so instead of answering a quiet zero.
+            out["hint"] = ("none of the Chinese words in this query is in the alias "
+                           "table, so nothing was searched: it covers common task "
+                           "nouns (阻抗 / 过孔 / 铺铜 / "
+                           "散热 / 爬电 ...). Retry with an English "
+                           "keyword, or call calc_capabilities for the layer map.")
+            out["search_was_english_only"] = True
+        else:
+            out["hint"] = ("no tool matched these words; call calc_capabilities for "
+                           "the layer map, or search a single keyword such as "
+                           "'impedance'")
+    return out
+
+
+def _tool_call(args):
+    name = args.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return err("name is required", "ARG_MISSING", hint="call tool_search first")
+    name = name.strip()
+    if name == "tool_call":
+        return err("tool_call cannot call itself", "ARG_INVALID")
+    if name not in TOOLS:
+        return err("unknown tool: %s" % name, "TOOL_NOT_FOUND",
+                   hint="call tool_search with the task you want to do")
+    inner = args.get("arguments")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except json.JSONDecodeError as exc:
+            return err("arguments is a string but not valid JSON: %s" % exc,
+                       "ARG_INVALID")
+    if inner is None:
+        inner = {}
+    if not isinstance(inner, dict):
+        return err("arguments must be an object", "ARG_INVALID")
+    return call_tool(name, inner)
+
+
+_tool(
+    "tool_search",
+    "Find a tool that is not in your advertised tool list. This server registers "
+    "about 190 tools; the common entry points are listed directly and the rest are "
+    "reached through tool_search + tool_call, so the model prompt stays small. Search "
+    "by the task ('impedance', 'magnetics core loss'); every hit carries its full "
+    "argument schema. Call this before assuming a capability is missing.",
+    {
+        "type": "object",
+        "properties": {
+            "query": _str("words describing the task"),
+            "limit": _num("maximum hits to return (1-25, default 8)", 8),
+        },
+        "required": ["query"],
+    },
+    _tool_search,
+)
+
+_tool(
+    "tool_call",
+    "Run a tool returned by tool_search. Put its arguments in `arguments`, named "
+    "exactly as the hit's inputSchema names them; the reply is the same envelope the "
+    "tool would have returned if it were listed directly (status / value / basis / "
+    "assumptions).",
+    {
+        "type": "object",
+        "properties": {
+            "name": _str("exact tool name from tool_search"),
+            "arguments": {"type": "object",
+                          "description": "the tool's arguments (may be omitted if it takes none)"},
+        },
+        "required": ["name"],
+    },
+    _tool_call,
+)
+
+
+def list_tools(toolset="all"):
+    """Tool specs for tools/list.
+
+    Library callers get every tool; the server passes the profile from
+    PCB_AGENT_TOOLSET, which defaults to "core".
+    """
+    names = _resolve_toolset(toolset)
+    if names is None:
+        names = list(TOOLS)
     return [
-        {"name": name, "description": spec["description"],
-         "inputSchema": spec["inputSchema"]}
-        for name, spec in TOOLS.items()
+        {"name": name, "description": TOOLS[name]["description"],
+         "inputSchema": TOOLS[name]["inputSchema"]}
+        for name in names if name in TOOLS
     ]
 
 
@@ -9912,4 +10209,8 @@ def _flag_unread_arguments(spec, args, out):
 
 
 def result_to_text(result):
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    # Compact, not indent=2: a board_view reply can be megabytes and indentation
+    # is ~15 % of it, paid again on every token the client renders. Strict JSON
+    # because a NaN anywhere in an answer makes the client reject the whole
+    # message - see jsonsafe.
+    return _jsonsafe.dumps(result)

@@ -211,6 +211,11 @@ def compare(board, netlist):
                     schematic_net=raw, board_pads=sorted(pads))
                 continue
             got = pads[pin]
+            if got.startswith("unconnected-"):
+                # the mirror image of the case above: KiCad names a pad with no
+                # net after the pad itself, so an untied pad and a schematic pin
+                # that connects nothing are the same statement, not a mismatch
+                got = ""
             if got != want and (not want or got != raw):
                 add("pad_net_mismatch", ref=ref, pin=pin, pad=pin,
                     schematic=want, board=got)

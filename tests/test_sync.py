@@ -181,6 +181,18 @@ class Compare(SyncBase):
             [("unconnected-(R9-Pad1)", [("R9", "1")])]))
         self.assertNotIn("pad_net_mismatch", self.kinds(diff))
 
+    def test_a_pad_named_unconnected_agrees_with_a_pin_that_names_no_net(self):
+        # the mirror image of the case above: the schematic lists nothing for
+        # the pin at all, and KiCad has named the pad's net after the pad.
+        # Both sides are saying "nothing is connected here".
+        board = self.write_board(BOARD.replace(
+            '(net 2 "SDA") (tstamp 00000000-0000-0000-0000-000000000013)',
+            '(net 4 "unconnected-(R9-Pad1)") (tstamp 00000000-0000-0000-0000-000000000013)'
+        ).replace('(net 3 "STALE")', '(net 3 "STALE") (net 4 "unconnected-(R9-Pad1)")\n'))
+        diff = SY.compare(board, netlist(
+            [("R9", "10k", "Test:0805"), ("U1", "MCU", "Test:QFN")], []))
+        self.assertNotIn("pad_net_mismatch", self.kinds(diff))
+
     def test_an_untied_pad_where_the_schematic_connects_a_net(self):
         board = self.write_board(BOARD.replace(
             '(net 2 "SDA") (tstamp 00000000-0000-0000-0000-000000000013)',

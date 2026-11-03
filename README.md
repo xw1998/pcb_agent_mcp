@@ -223,7 +223,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（190 个）
+## 工具（192 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` / `magnetics_dc_bias` /
 `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor` / `ac_self_heating` / `experience_recall` / `experience_check` / `experience_candidate` / `experience_promote` / `experience_outcome` / `experience_export` / `experience_import`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
@@ -431,6 +431,17 @@ MCP 客户端配置（stdio）：
 
 协议实现是 stdlib 手写的 JSON-RPC 2.0 换行分隔流（`2025-06-18`，向后兼容 `2025-03-26` / `2024-11-05`），
 `dependencies = []`（`0.0.37` 起 `vendor/ngspice/` 是一个随包的**外部程序**，不是一个 Python 依赖，删掉它不影响任何 import，见下文「最小内核随包」）。日志只写 stderr —— stdout 承载协议。
+
+`tools/list` 默认只列 46 个入口工具（约 54 KB）：全量 192 个工具是约 315 KB（≈10 万 token），
+聊天客户端每轮都把它放进上下文，会撑爆窗口并让对话中断或卡死。不在列表里的工具用
+`tool_search`（按任务搜，返回完整参数 schema）+ `tool_call`（按名调用）取用，能力一个不少。
+需要旧的全量列表时设 `PCB_AGENT_TOOLSET=all`；也可以用前缀自选，例如
+`PCB_AGENT_TOOLSET=board_,magnetics_`（`core` 可与前缀混写）。
+
+传输层同批修掉两处会让对话中断的缺陷（见 `docs/96`）：JSON-RPC **批量请求**（数组）
+按数组回答、坏元素只坏自己，此前它抛在 handler 之外、直接打死进程（复现原文
+`AttributeError: 'list' object has no attribute 'get'`）；以及 `NaN` / `Infinity`
+不再是线上形态（非有限浮点→`null`，两处序列化点统一走 `jsonsafe.py`）。
 
 ## 路线图
 
@@ -1034,7 +1045,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 190 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 192 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
