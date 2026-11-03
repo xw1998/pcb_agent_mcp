@@ -17,6 +17,7 @@ What every test holds the code to:
   against itself in a round trip, because a mirrored pad that is 3 mm off looks
   perfectly plausible in the file.
 """
+import io
 import os
 import shutil
 import subprocess
@@ -1211,3 +1212,98 @@ class DryRun(EditBase):
                             options=dict(engine=False))
         self.assertEqual(done["status"], "ok")
         self.assertEqual(len(self.editor().items("segment")), 2)
+
+class TranslateBoard(EditBase):
+    """Moving the whole board exists because a plot lands where the numbers are.
+
+    The board below sits at positive coordinates; the real board this was written
+    for sits at negative Y and exported as a blank page. What the tests hold the
+    operation to: every position moves by the same delta, the geometry INSIDE a
+    footprint does not (it is already in the footprint's own frame), one unknown
+    item kind stops the whole move, and the postcondition notices a point that
+    stayed behind.
+    """
+
+    def node_at(self, head, index=0):
+        nodes = self.editor().items(head)
+        return nodes[index]
+
+    def point(self, node, child):
+        n = S.child(node, child)
+        return (S.arg_num(n, 1, 0.0), S.arg_num(n, 2, 0.0))
+
+    def test_everything_outside_a_footprint_moves_by_the_same_delta(self):
+        plan, _ = self.apply({"op": "translate_board", "dx": 100.0, "dy": 25.0})
+        ed = self.editor()
+        # a file Y of -25 is 25 mm up: the API is Y up, the file is Y down
+        edge = ed.items("gr_line")[0]
+        self.assertEqual(self.point(edge, "start"), (100.0, -25.0))
+        self.assertEqual(self.point(edge, "end"), (140.0, -25.0))
+        self.assertEqual(self.point(ed.footprint("R1"), "at")[:2], (110.0, -15.0))
+        segment = ed.items("segment")[0]
+        self.assertEqual(self.point(segment, "start"), (111.0, -15.0))
+        self.assertEqual(self.point(ed.items("via")[0], "at"), (114.0, -15.0))
+        zone = ed.items("zone")[0]
+        first = S.children(S.child(S.child(zone, "polygon"), "pts"), "xy")[0]
+        self.assertEqual((S.arg_num(first, 1, 0.0), S.arg_num(first, 2, 0.0)),
+                         (102.0, -23.0))
+        detail = plan["operations"][0]["detail"]
+        self.assertEqual(detail["items_total"], 10)
+        self.assertEqual(detail["positions"], 21)
+        self.assertNotEqual(detail["digest_before"], detail["digest_after"])
+
+    def test_the_geometry_inside_a_footprint_does_not_move_relative_to_it(self):
+        self.apply({"op": "translate_board", "dx": 100.0, "dy": 25.0})
+        fp = self.editor().footprint("R1")
+        pads = S.children(fp, "pad")
+        self.assertEqual(self.point(pads[0], "at"), (-0.95, 0.0))
+        self.assertEqual(self.point(pads[1], "at"), (0.95, 0.0))
+        self.assertEqual(self.point(S.children(fp, "fp_text")[0], "at"), (0.0, -2.0))
+
+    def test_the_rotation_of_a_footprint_survives(self):
+        self.apply({"op": "translate_board", "dx": -5.0, "dy": -7.0})
+        at = S.child(self.editor().footprint("U1"), "at")
+        # U1 was at file (20, 15); -5 mm and 7 mm up put it at (15, 22) in the
+        # file's Y-down frame, which is (15, -22) in the frame this server reports
+        self.assertEqual((S.arg_num(at, 1, 0.0), S.arg_num(at, 2, 0.0)),
+                         (15.0, 22.0))
+        self.assertAlmostEqual(S.arg_num(at, 3, 0.0), 30.0, places=9)
+
+    def test_a_move_of_nothing_is_refused(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "translate_board", "dx": 0, "dy": 0})
+        self.assertEqual(ctx.exception.code, "ARG_INVALID")
+
+    def test_an_item_kind_it_does_not_know_stops_the_whole_move(self):
+        # KiCad 8 writes tables; nothing here knows how a table is anchored, so a
+        # board carrying one must be refused rather than moved around it.
+        with open(self.board, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(BOARD.replace("(segment ", "(table (column_count 2) (at 5 5))"
+                                   "\n  (segment ", 1))
+        with open(self.board, "rb") as fh:
+            before = fh.read()
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "translate_board", "dx": 10, "dy": 10})
+        self.assertEqual(ctx.exception.code, "UNSUPPORTED_ITEM")
+        self.assertIn("table", str(ctx.exception))
+        with open(self.board, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_the_verifier_notices_a_position_that_stayed_behind(self):
+        # reverse control: the write succeeds, then one corner is put back. The
+        # postcondition has to fail - otherwise it is only checking that run() ran.
+        plan = E.propose(self.board, [{"op": "translate_board", "dx": 100.0,
+                                       "dy": 25.0}])
+        records = P.PLANS[plan["plan_id"]]["records"]      # gone after a write
+        E.apply_plan(plan["plan_id"], confirm=True, options=dict(engine=False))
+        with open(self.board, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        self.assertIn("(start 100 -25)", text)
+        with open(self.board, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text.replace("(start 100 -25)", "(start 0 0)", 1))
+        with open(self.board, encoding="utf-8", newline="") as fh:
+            doc = K.KiCadDocument.from_text(fh.read(), self.board)
+        out = O.verify_all(doc, plan["operations"], records=records)
+        self.assertFalse(out["all_verified"], out)
+        self.assertIn("not the ones the run computed",
+                      " ".join(out["operations"][0]["detail"].get("problems") or []))

@@ -17,6 +17,7 @@ a coordinate read from a view can be passed straight back in.
 Anything that is not in `OPS` is refused. Anything whose layer or net is not in
 the file is refused (a typo'd layer name silently creates a drawing on nothing).
 """
+import hashlib
 import inspect as _inspect
 import os
 
@@ -649,6 +650,186 @@ op("add_board_text", {"mech", "silk"},
    {"text": "string", "x": "mm", "y": "mm", "layer": "layer name",
     "height": "mm", "thickness": "mm", "rot": "deg"},
    _run_board_text, _verify_board_text)
+
+# --- whole board ------------------------------------------------------
+# Board coordinates are the file's own numbers, and KiCad plots at (almost) those
+# numbers: a board whose geometry sits at negative Y renders off the page and the
+# export comes out blank. Moving every object by one delta is the fix, and it is
+# only safe if NOTHING is left behind - hence the two closed lists below. An item
+# kind this code has never seen refuses the whole move (UNSUPPORTED_ITEM) instead
+# of being silently parked at the old coordinates.
+_MOVE_TOP = ("segment", "arc", "via", "zone", "footprint", "module", "group",
+             "gr_line", "gr_arc", "gr_rect", "gr_circle", "gr_curve", "gr_poly",
+             "gr_text", "gr_text_box", "dimension", "target", "image")
+
+# Nodes that carry no board geometry. `setup` is listed as a whole on purpose: it
+# holds aux_axis_origin / grid_origin, which are view aids, and moving a drawing
+# origin while moving the copper would be a change nobody asked for.
+_META_TOP = frozenset((
+    "version", "generator", "generator_version", "general", "paper", "layers",
+    "setup", "title_block", "net", "net_class", "property", "embedded_fonts",
+    "embedded_files", "lib_symbols"))
+
+# The spellings KiCad uses for a single position.
+_POINT_HEADS = frozenset(("at", "start", "end", "mid", "center", "xy"))
+
+# Geometry inside a footprint is in the footprint's OWN frame and travels with it,
+# so the walk stops at the footprint node and shifts only its `at`.
+_LOCAL_FRAME = frozenset(("footprint", "module"))
+
+
+def _point(node):
+    """(x, y) of a position node in file units, or None when it carries none."""
+    if node is None or len(node.items) < 3:
+        return None
+    x, y = S.arg_num(node, 1), S.arg_num(node, 2)
+    if x is None or y is None:
+        return None
+    return x, y
+
+
+def _board_points(board):
+    """Every position in the board, in traversal order, in file units.
+
+    The walk and `_shift_tree` below must agree exactly: the digest of this list is
+    the postcondition of the move, so anything one of them skips must be skipped by
+    both or the move would report success while something stayed behind.
+    """
+    out = []
+
+    def walk(node):
+        for child in node.items[1:]:
+            if not isinstance(child, S.Seq):
+                continue
+            head = S.head(child)
+            if head in _META_TOP:
+                continue
+            if head in _LOCAL_FRAME:
+                p = _point(S.child(child, "at"))
+                if p is not None:
+                    out.append(("at",) + p)
+                continue
+            if head in _POINT_HEADS:
+                p = _point(child)
+                if p is not None:
+                    out.append((head,) + p)
+                continue
+            walk(child)
+
+    walk(board)
+    return out
+
+
+def _points_digest(points):
+    h = hashlib.sha256()
+    for head, x, y in points:
+        h.update(("%s %.10g %.10g\n" % (head, x, y)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _shift_point(node, dx, dy):
+    p = _point(node)
+    if p is None:
+        raise OpError("cannot move (%s ...): it has no numeric position"
+                      % S.head(node), "ARG_INVALID")
+    items = list(node.items)
+    items[1] = S.Atom(B.num(p[0] + dx))
+    items[2] = S.Atom(B.num(p[1] + dy))
+    node.items = items
+
+
+def _shift_tree(node, dx, dy):
+    for child in list(node.items[1:]):
+        if not isinstance(child, S.Seq):
+            continue
+        head = S.head(child)
+        if head in _META_TOP:
+            continue
+        if head in _LOCAL_FRAME:
+            at = S.child(child, "at")
+            if at is not None:
+                _shift_point(at, dx, dy)
+            continue
+        if head in _POINT_HEADS:
+            _shift_point(child, dx, dy)
+            continue
+        _shift_tree(child, dx, dy)
+
+
+def _run_translate_board(ed, o, seed):
+    dx = _num(o, "dx", required=False, default=0.0)
+    dy = _num(o, "dy", required=False, default=0.0)
+    if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+        raise OpError("dx = dy = 0 moves nothing - that is a typo, not an operation",
+                      "ARG_INVALID")
+    unknown = []
+    moved = {}
+    for item in ed.board.items[1:]:
+        if not isinstance(item, S.Seq):
+            continue
+        head = S.head(item)
+        if head in _META_TOP:
+            continue
+        if head not in _MOVE_TOP:
+            unknown.append(head)
+            continue
+        moved[head] = moved.get(head, 0) + 1
+    if unknown:
+        raise OpError(
+            "this board carries item kinds this operation cannot move (%s); moving "
+            "the rest would leave them at the old place, so nothing is moved"
+            % ", ".join(sorted(set(unknown))), "UNSUPPORTED_ITEM")
+    before = _board_points(ed.board)
+    # KiCad's file stores Y downwards; this server's frames are Y up.
+    _shift_tree(ed.board, dx, -dy)
+    after = _board_points(ed.board)
+    if len(after) != len(before):
+        raise OpError("internal: %d positions before the move, %d after"
+                      % (len(before), len(after)), "OP_INVALID")
+    return {"dx": dx, "dy": dy, "items": moved,
+            "items_total": sum(moved.values()), "positions": len(after),
+            "digest_before": _points_digest(before),
+            "digest_after": _points_digest(after)}
+
+
+def _verify_translate_board(ed, o, record=None):
+    dx = _num(o, "dx", required=False, default=0.0)
+    dy = _num(o, "dy", required=False, default=0.0)
+    # `record` is the wrapper run_all returns ({"index", "op", "affects",
+    # "detail"}); the numbers the run computed live under "detail".
+    rec = (record or {}).get("detail") or {}
+    if not rec.get("digest_after"):
+        return {"ok": False,
+                "error": "this postcondition is the digest of the move itself, so it "
+                         "needs the record the run returned; none was passed"}
+    now = _board_points(ed.board)
+    problems = []
+    if rec.get("positions") != len(now):
+        problems.append("the file has %s positions, the run moved %s"
+                        % (len(now), rec.get("positions")))
+    if rec.get("digest_after") != _points_digest(now):
+        problems.append("the positions on disk are not the ones the run computed "
+                        "(something moved differently or stayed behind)")
+    bad_delta = (abs(float(rec.get("dx") or 0.0) - dx) > 1e-9 or
+                 abs(float(rec.get("dy") or 0.0) - dy) > 1e-9)
+    if bad_delta:
+        problems.append("the recorded delta is not the requested one")
+    if rec.get("digest_before") == rec.get("digest_after"):
+        problems.append("the digest did not change: nothing moved")
+    return {"ok": not problems, "positions": len(now), "problems": problems,
+            "verify_limit": "the digest proves the whole set of positions moved by "
+                            "exactly this delta; on its own it cannot prove which "
+                            "object each position belongs to, so this verifier also "
+                            "checks the position count and the recorded delta"}
+
+
+op("translate_board", {"outline", "copper", "silk", "mech"},
+   "Move every object on the board by the same delta (mm, Y up). It exists because "
+   "KiCad plots a board at the file's own coordinates: geometry that sits at "
+   "negative Y lands off the PDF/SVG page and the export comes out blank. Nothing "
+   "is moved unless every item kind on the board is one this operation knows.",
+   {"dx": "mm (default 0)", "dy": "mm (default 0)"},
+   _run_translate_board, _verify_translate_board)
 
 # --- placement --------------------------------------------------------
 _FOOTPRINT_DROP = ("version", "generator", "generator_version", "tedit",

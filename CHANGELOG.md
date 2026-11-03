@@ -9,6 +9,61 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.99] - 2026-11-03
+
+**新 op `translate_board(dx, dy)`：整板按同一增量平移，fail-closed**
+**它存在的理由是一个读数：DRC 已经 118 → 0、Gerber 也正常，可出图是一张白纸**
+（`test_ops_edit` 78 例 → **84 例** / 受影响模块 **201 例全绿**（test_ops_edit 84 + test_edit / test_tools / test_tools_profile / test_fidelity 102 + tests.test_step_apply 15） /
+工具数仍 **192**、写 op 40 → **41**、`dependencies = []` 仍成立）
+
+### 1. 白图不是导出参数错
+
+STM32F412RGT6 核心板 DRC 清零后出图，`pymupdf` 量到内容 bbox
+`Rect(1.4, -84.98, 149.8, -1.4)`——**整块板都在页面外**。同参数导真实板
+`StickHub.kicad_pcb` 得到 `Rect(401.8, 226.8, 448.6, 338.5)`，落在 841.9 × 595.3
+的页内。所以不是参数：`kicad-cli pcb export pdf/svg` **按文件坐标原样摆位**，而这块板
+的文件 Y ∈ [-30.48, 0]，整板位于负 Y ⇒ 落在纸的上方被裁掉。Gerber 不受影响
+（`Edge_Cuts.gbr` 是 `X0Y0 … X53340000Y30480000`，导出器自己归一化过）。
+
+三次渲染绕过全部失败并记进 docs/99：`pixmap(clip=)`、`set_mediabox(负 y)`、
+cairosvg 换 `viewBox`。
+
+### 2. 为什么平移整板，而不是给导出加偏移
+
+加偏移 = 让人看的图和文件说两套坐标，此后「图上的位置 ↔ 文件坐标」的每次换算都要带一个
+隐藏偏移，而 DRC 的 `items[].pos`、Gerber 的 X/Y、`board_view` 的焊盘坐标全是文件坐标。
+平移整板则所有读数一起动、相对几何不变——这正是它能被验证的原因。
+
+### 3. 参数与三条边界
+
+| 参数 | 含义 |
+|---|---|
+| `dx` | mm，默认 0 |
+| `dy` | mm，**Y 向上**（与 `board_view` 同一个坐标系；文件里的 Y 是反的） |
+| `dx = dy = 0` | `ARG_INVALID`——这是笔误，不是操作 |
+
+- **封装只搬自己的 `(at …)`**：封装内部坐标是它自己的坐标系，跟着父对象走；
+- **`setup` 整块跳过**：里面是 `aux_axis_origin` / `grid_origin`，绘图原点不是铜；
+- **未知顶层种类 → `UNSUPPORTED_ITEM`**：搬认识的、留下不认识的，会让一块板静默裂成两半。
+  测试里构造一个 `(table (column_count 2) (at 5 5))` 验证「拒绝且文件一字节没变」。
+
+### 4. 后置条件用位置指纹，并写死它的局限
+
+平移没法用「绝对值等于多少」验：要验的正是「每个点都动了、动的量一样」，而「之前在哪」
+只存在于运行期。所以 `run` 把平移前后全部位置（遍历序、文件坐标）各取 sha256 写进 record，
+`verify` 在**写完的文件**上重算并对照四项：位置个数、`digest_after`、record 的 `dx/dy`、
+`digest_before ≠ digest_after`。`verify_limit` 明说：指纹是位置的**多重集**，它证明整体动了
+这么多，不证明每个点仍属于原来那个对象。
+
+反向对照：写成功后把一个角点改回原处，同一 record 再跑 `verify_all` 必须红，
+且理由含「not the ones the run computed」。
+
+### 5. 六条测试（`tests/test_ops_edit.py::TranslateBoard`）
+
+整板同增量（边界线/线段/过孔/两 zone/封装 `at`，`items_total` = 10）· 封装内部坐标不动 ·
+30° 旋转保留 · 零位移拒绝 · 未知种类拒绝且不落盘 · 反向对照。
+Y 的符号每条各验一次（`dy = 25` 让文件 Y 从 10 变成 −15）。
+
 ## [0.0.98] - 2026-11-03
 
 **`set_footprint_field` 加五个可选几何参数：字段印在哪一层、在哪、多大**
