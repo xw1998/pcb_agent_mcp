@@ -435,12 +435,20 @@ class BoardView(object):
 
 # --------------------------------------------------------------- helpers
 def _rotate(x, y, deg):
+    """Turn a footprint-local offset by the footprint's angle.
+
+    `(x, y)` here is already in the Y-UP frame this view reports (`_at` negates the
+    file's Y), so the plain counter-clockwise matrix is the right one. The negated
+    angle this used to apply was inherited from the file frame and, mixed with the
+    already-flipped local offsets, mirrored every rotated footprint about its own
+    origin: on the STM32F412 core board the header J2B.6 (footprint at 90 deg) read
+    x = -10.16 where KiCad puts the pad at x = 15.24, i.e. 25.4 mm out. Rotation 0
+    hides the mistake, which is why nothing failed for so long.
+    """
     import math
     if not deg:
         return (x, y)
-    # KiCad rotates counter-clockwise in a Y-down frame, which in the Y-up frame
-    # we report is a clockwise rotation, hence the sign.
-    a = math.radians(-deg)
+    a = math.radians(deg)
     c, s = math.cos(a), math.sin(a)
     return (x * c - y * s, x * s + y * c)
 
