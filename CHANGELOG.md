@@ -9,6 +9,34 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.103] - 2026-11-03
+
+### Fixed
+
+- `desktop.launch()` 现在显式构造子进程环境并摘掉 `ELECTRON_RUN_AS_NODE`，返回值多一个
+  `env_cleared`。真因是实测的：本服务由 Electron 宿主启动，该变量被继承，于是任何 Electron
+  app 变成一台裸 node——`--version` 打出 node 的版本、参数被当成脚本路径、无参数则开 REPL
+  并因 stdin 为 EOF 立即 `rc 0` 退出；没有窗口、没有命令空间管道、应用日志一个字不写。
+  摘掉后 `lceda-pro.exe` 的 `\\.\pipe\JLCEDAPro<8 hex>` 在 **1.0 s** 出现，
+  `lceda_pro_status` 回 `ok`（`bridgeVersion 4.1.60.198f38ab`）。
+- `APP_NOT_RUNNING` 的 hint 重写。旧文把现象当原因（「从 shell 启动会 0.5 s 退出，用 explorer
+  才能活」），新文给两个静默真因：继承的 node 模式，以及启动方的进程树在调用返回时被回收
+  （本会话里 `CREATE_BREAKAWAY_FROM_JOB` 直接 `WinError 5`，所以 `app_launch` 用
+  `DETACHED_PROCESS` 起，并且必须在调用结束前确认它还在）。
+
+### Tests
+
+- `tests/test_desktop.py` 新增 `test_launch_does_not_hand_an_electron_child_its_own_node_mode`：
+  把父进程的变量设成 `1`，启动一个只打印自己环境的小脚本，要求它写下 `absent`——
+  判据是**子进程自己怎么看**，忘了传 `env=` 这种退步会红。
+- `run_server.py --selftest` **331 → 332**：父环境设成 `1` 时 `_child_env()` 必须回报
+  `dropped == ["ELECTRON_RUN_AS_NODE"]` 且子环境不含该键。
+
+### Docs
+
+- `docs/102`（新）：四个读数钉住现象、`ping` 被当脚本这一条取证、为什么旧观测真而解释错、
+  「启动成功」与「启动之后还在」是两件事的四种启动对照表、三条教训。
+
 ## [0.0.102] - 2026-11-03
 
 ### Added

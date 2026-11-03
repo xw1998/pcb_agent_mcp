@@ -57,10 +57,13 @@ APPS = {
                   "while the editor's own command-space pipe "
                   "(\\\\.\\pipe\\JLCEDAPro<8 hex>) is open whenever the app is "
                   "running and answers ping/open/session/invoke - see lceda_pro_*. "
-                  "Launch: from a shell that inherits a console the exe returns rc 0 in "
-                  "about 0.5 s; started via explorer.exe (the double-click path) it "
-                  "stays up. The argv form for attaching a project is still "
-                  "unverified."),
+                  "Launch, measured 2026-11-03: the earlier note here (rc 0 in 0.5 s from a "
+                  "shell, fine via explorer) was the symptom of "
+                  "ELECTRON_RUN_AS_NODE=1 being inherited: Electron then runs as a "
+                  "bare node REPL and exits at once. With that variable cleared the "
+                  "app starts and the pipe appears in about 1 s from any launcher - "
+                  "including this one, which strips it. The argv form for attaching a "
+                  "project is still unverified."),
     },
     "kicad": {
         "display": "KiCad (project manager)",
@@ -587,12 +590,29 @@ def status(app, probe_ports=True):
 _SPAWNED = []
 
 
+# Measured 2026-11-03: with ELECTRON_RUN_AS_NODE=1 in the environment (this server
+# was started by an Electron host, so the variable is inherited - not set by us),
+# every Electron app becomes a plain Node interpreter: `--version` prints node's
+# own version, a bare argument is looked up as a script, and with no arguments it
+# starts a REPL that exits 0 the moment stdin is at EOF. The window never appears,
+# no pipe is created, nothing is written to the app's log, and the caller sees a
+# clean exit - the failure mode is a silent no-op, which is why it read as "the app
+# will not start from a shell". Dropping the key is harmless for a non-Electron exe.
+_DROP_FROM_CHILD_ENV = ("ELECTRON_RUN_AS_NODE",)
+
+def _child_env():
+    """(env, dropped) - the environment an EDA child should get, made explicit."""
+    env = dict(os.environ)
+    dropped = [k for k in _DROP_FROM_CHILD_ENV if env.pop(k, None) is not None]
+    return env, dropped
+
 def launch(exe, args=None):
     """Start an exe detached from this process's job, so it outlives the MCP call."""
     if not exe or not os.path.isfile(exe):
         return {"status": "error", "reason_code": "EXE_NOT_FOUND",
                 "message": "executable not found: %r" % exe}
     cmd = [exe] + list(args or [])
+    env, dropped = _child_env()
     base = 0
     if IS_WINDOWS:
         base = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008) |
@@ -600,19 +620,20 @@ def launch(exe, args=None):
     flags = base | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
     devnull = subprocess.DEVNULL
     try:
-        proc = subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+        proc = subprocess.Popen(cmd, creationflags=flags, close_fds=True, env=env,
                                 stdin=devnull, stdout=devnull, stderr=devnull)
         _SPAWNED.append(proc)
         return {"status": "ok", "pid": proc.pid, "command": cmd,
-                "creationflags": hex(flags), "breakaway": True}
+                "creationflags": hex(flags), "breakaway": True,
+                "env_cleared": dropped}
     except OSError as exc:
         try:
-            proc = subprocess.Popen(cmd, creationflags=base, close_fds=True,
+            proc = subprocess.Popen(cmd, creationflags=base, close_fds=True, env=env,
                                     stdin=devnull, stdout=devnull, stderr=devnull)
             _SPAWNED.append(proc)
             return {"status": "ok", "pid": proc.pid, "command": cmd,
                     "creationflags": hex(base), "breakaway": False,
-                    "breakaway_error": str(exc)}
+                    "breakaway_error": str(exc), "env_cleared": dropped}
         except Exception as exc2:                                # noqa: BLE001
             return {"status": "error", "reason_code": "LAUNCH_FAILED",
                     "message": "cannot start %s: %s (breakaway attempt: %s)"

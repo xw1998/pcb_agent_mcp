@@ -6741,6 +6741,30 @@ def selftest():
     finally:
         _shutil.rmtree(_pl_tmp, ignore_errors=True)
 
+    # --- an EDA launched from here must not inherit node mode (0.0.103) ----
+    # Measured 2026-11-03: ELECTRON_RUN_AS_NODE=1 in this server's environment (put
+    # there by the Electron host that started it) turns every Electron app into a
+    # bare node REPL: exit 0, no window, no pipe, empty log. Silent.
+    from . import desktop as _desk
+    _kept = os.environ.get("ELECTRON_RUN_AS_NODE")
+    os.environ["ELECTRON_RUN_AS_NODE"] = "1"
+    try:
+        _env, _dropped = _desk._child_env()
+    finally:
+        if _kept is None:
+            os.environ.pop("ELECTRON_RUN_AS_NODE", None)
+        else:
+            os.environ["ELECTRON_RUN_AS_NODE"] = _kept
+    check("an EDA started by this server does not inherit this server's own node "
+          "mode: with ELECTRON_RUN_AS_NODE set in the parent, the child environment "
+          "comes back without it and the reply names what was cleared - the measured "
+          "failure without this is exit 0, no window, no command-space pipe and an "
+          "empty app log, which reads as 'it started'",
+          _dropped == ["ELECTRON_RUN_AS_NODE"]
+          and "ELECTRON_RUN_AS_NODE" not in _env,
+          "dropped %s, present in child env %s"
+          % (_dropped, "ELECTRON_RUN_AS_NODE" in _env))
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

@@ -9,7 +9,9 @@ part that most often lies in this kind of tool:
   * a running process is identified by its image path, not by a hardcoded path,
   * start/stop are observable through the OS (verified with a throwaway process).
 """
+import io
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -112,6 +114,45 @@ class TestStatusAndClose(unittest.TestCase):
 
 @unittest.skipUnless(WINDOWS, "desktop layer is Windows-only")
 class TestLaunchAndStop(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pcbdesk-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_launch_does_not_hand_an_electron_child_its_own_node_mode(self):
+        """ELECTRON_RUN_AS_NODE must not reach the child.
+
+        Measured 2026-11-03: inherited, it turns every Electron app into a plain
+        node - no window, no pipe, exit 0 - and the caller sees a clean start of
+        nothing. The child here prints its own view of the variable, so the test
+        fails if the key survives the launch, not if the code merely looks right.
+        """
+        import os
+        old = os.environ.get("ELECTRON_RUN_AS_NODE")
+        os.environ["ELECTRON_RUN_AS_NODE"] = "1"
+        out = os.path.join(self.tmp, "env.txt")
+        script = ("import os,sys;"
+                  "open(sys.argv[1],'w').write(os.environ.get('ELECTRON_RUN_AS_NODE','absent'))")
+        try:
+            r = desktop.launch(sys.executable, ["-c", script, out])
+            pid = r["pid"]
+            deadline = time.time() + 20
+            while time.time() < deadline and not os.path.exists(out):
+                time.sleep(0.05)
+                if not desktop.process_alive(pid) and not os.path.exists(out):
+                    break
+            self.assertEqual(r.get("env_cleared"), ["ELECTRON_RUN_AS_NODE"], r)
+            with io.open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "absent")
+        finally:
+            if old is None:
+                os.environ.pop("ELECTRON_RUN_AS_NODE", None)
+            else:
+                os.environ["ELECTRON_RUN_AS_NODE"] = old
+            if os.path.exists(out):
+                os.unlink(out)
+
     def test_launch_detached_and_it_exits(self):
         # a throwaway interpreter, not an EDA: safe to start and stop
         r = desktop.launch(sys.executable, ["-c", "import time; time.sleep(30)"])

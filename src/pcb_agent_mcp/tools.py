@@ -899,10 +899,17 @@ _LIVE_MODEL = "lceda_pro_command_space"
 
 def _live_hint(code):
     return {
-        "APP_NOT_RUNNING": "start LCEDA Pro and retry. Measured: launched from a "
-                           "shell (console inherited) it exits in about 0.5 s with "
-                           "rc 0 and no log; launched via explorer.exe (the double-"
-                           "click path) it stays up and the pipe appears",
+        "APP_NOT_RUNNING": "start LCEDA Pro and retry. Two measured reasons, both "
+                           "silent: (1) the app is an Electron binary and "
+                           "ELECTRON_RUN_AS_NODE=1 is inherited from this server's own "
+                           "parent - Electron then runs as a bare node REPL, exits 0 "
+                           "in about a second, opens no window, creates no pipe and "
+                           "writes nothing to its log; app_launch clears that key, so "
+                           "launch through it rather than from a shell. (2) the "
+                           "launcher's process tree is torn down when the call that "
+                           "started it returns, which also loses the app - again, "
+                           "app_launch starts it detached. With both cleared the pipe "
+                           "appears about 1 s after start",
         "APP_UNREACHABLE": "the pipe vanished while talking - the editor was most "
                            "likely closed",
         "APP_TIMEOUT": "the app accepted the frame but did not answer within the "
