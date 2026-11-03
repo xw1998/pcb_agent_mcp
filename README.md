@@ -271,7 +271,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_cross_split` | 信号是否跨参考平面断口 | **无平面 zone 直接拒绝**（看不见就不答） |
 | `board_loop_area` | 环路面积（走线长 × 到下层铜的距离） | **无叠层直接拒绝**（猜介质高度 = 猜 EMC 答案） |
 | `board_fidelity` | **自证**：节点/字节计数、token 双射往返、还没读取规则的节点清单，KiCad 侧再让 kicad-cli 把原件与写回件各画一次并比对铜箔/统计/位号 | 只读；临时目录工作，绝不写在工程旁边 |
-| `board_view` | 从保真树读事实：nets/规则类/层/叠层/setup/元件/pad（精确尺寸·钻孔·旋转·网络）/走线/过孔/zone（含**文件里存的填充多边形**）/板框图元/板上文字/尚无规则的节点 | 每条记录都带 `raw`（原始 S 表达式），视图漏掉的不会丢 |
+| `board_view` | 从保真树读事实：nets/规则类/层/叠层/setup/元件/pad（精确尺寸·钻孔·旋转·网络）/走线/过孔/zone（含**文件里存的填充多边形**）/板框图元/板上文字/尚无规则的节点 | `kind=all` 只回每类**计数**（真板的全量表是几十 MB）；读记录用单个 kind + `limit/offset/max_bytes` 分页；`include_raw=true` 才带原始 S 表达式 |
 | `board_drc` | **判决**：跑 KiCad 自己的 DRC 引擎，回违规项（按严重级/类型）+ 未连接项 | 立创无命令行 → 明确拒绝给判决，不近似；大板用 `background=true` 交作业（默认超时 `DRC_TIMEOUT_S = 900`，`timeout_s` 可覆盖） |
 | `board_stats` | **判决**：KiCad 自己的板统计（尺寸/面积/正反铜面积含铺铜/板厚/最小线宽与孔径） | 只读 |
 | `board_cross_check` | **对账**：同一文件上，我们的间距测量与厂商 DRC 双向比对（recall / 漏报 / 我们多报 / 判不了） | 只有 clearance 有厂商对应物；zone 铜、板边孔规则、阻焊钢网明说不比；其余四个派生量回 `not_comparable` |
@@ -437,6 +437,14 @@ MCP 客户端配置（stdio）：
 `tool_search`（按任务搜，返回完整参数 schema）+ `tool_call`（按名调用）取用，能力一个不少。
 需要旧的全量列表时设 `PCB_AGENT_TOOLSET=all`；也可以用前缀自选，例如
 `PCB_AGENT_TOOLSET=board_,magnetics_`（`core` 可与前缀混写）。
+
+单个工具的回复也有上限，因为一次几十万 token 的结果同样会把会话撑死：
+
+- `board_components` / `board_nets` 默认 100 条一页，回 `total` / `truncated` / `next_offset`，用 `offset` 翻页；
+- `board_view` 的 `kind=all` 只回每类计数，读记录要指名 kind，并用 `limit` / `offset` / `max_bytes` 分页（`max_bytes` 默认 16 KB，实测一页约 50 个焊盘）；原始 S 表达式只在 `include_raw=true` 时附带；
+- 任何工具的单次回复超过 `PCB_AGENT_MAX_RESULT_KB`（默认 **48 KB**）时，回复会被**截断而不是丢弃**：留住 `status`、所有标量、每个长列表的头部（按字节预算）与每个长串前 2000 字符，加 `truncated` / `bytes_full` / `cap_bytes` / `truncated_fields`，并把完整 JSON 落到 `%TEMP%\pcb_agent_mcp_results\` 后以 `saved_to` 指出；设成 `0` 关闭该上限。
+
+  为什么是 48 KB 而不是管道那套 1 MiB / 16 MiB：这两个数字回答的是「搬得动吗」，不是「读进来还有没有地方推理」。实测本仓库最大的诚实答案是 `board_ops` **33 340 B**（41 条写操作），最小的一次倾泻是 `calc_capabilities` **68 089 B**，再往上是 `board_view` pads 109 190 B 与 `lceda_pro_run` 的整对象几百 KB；48 KB 夹在中间。0.0.104 之前这里只有 `RESULT_TOO_LARGE`（整包丢弃），调用方付了查询的代价却只拿回一句「太大了」。见 `docs/103`。
 
 传输层同批修掉两处会让对话中断的缺陷（见 `docs/96`）：JSON-RPC **批量请求**（数组）
 按数组回答、坏元素只坏自己，此前它抛在 handler 之外、直接打死进程（复现原文

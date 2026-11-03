@@ -267,7 +267,7 @@ def summary(board):
     )
 
 
-def components(board, layer=None):
+def components(board, layer=None, limit=None, offset=0):
     rows = []
     for fp in board.footprints:
         pads = fp.get("pads") or []
@@ -286,18 +286,31 @@ def components(board, layer=None):
         })
     if layer:
         rows = [r for r in rows if r["layer"] == layer]
+    total = len(rows)
+    start = max(0, int(offset or 0))
+    page = rows[start:] if limit is None else rows[start:start + max(0, int(limit))]
+    returned = len(page)
+    truncated = start + returned < total
+    extra = {"total": total, "returned": returned, "truncated": truncated}
+    if truncated:
+        extra["next_offset"] = start + returned
+        extra["message"] = ("components %d-%d of %d; call again with offset=%d for "
+                            "the next page" % (start + 1, start + returned, total,
+                                               start + returned))
     return ok(
-        value=rows,
+        value=page,
         unit="list",
         model="canonical_component_table",
         basis="footprint placement and pad-to-net assignment read from the file",
         precision="exact for positions/rotations; bbox is derived from pad extents "
                   "(courtyard and 3D height are not included)",
-        assumptions={"count": len(rows), "layer_filter": layer},
+        assumptions={"count": total, "returned": returned, "layer_filter": layer,
+                     "offset": start, "truncated": truncated},
+        extra=extra,
     )
 
 
-def nets(board):
+def nets(board, limit=None, offset=0):
     stats = {}
     for fp in board.footprints:
         for pad in fp.get("pads") or []:
@@ -331,15 +344,30 @@ def nets(board):
                                     "zones": 0, "track_length_mm": 0.0})["zones"] += 1
     for entry in stats.values():
         entry["track_length_mm"] = round(entry["track_length_mm"], 3)
+    items = list(stats.items())
+    total = len(items)
+    start = max(0, int(offset or 0))
+    page_items = items[start:] if limit is None else items[start:start + max(0, int(limit))]
+    page = dict(page_items)
+    returned = len(page)
+    truncated = start + returned < total
+    extra = {"total": total, "returned": returned, "truncated": truncated}
+    if truncated:
+        extra["next_offset"] = start + returned
+        extra["message"] = ("nets %d-%d of %d; call again with offset=%d for the "
+                            "next page" % (start + 1, start + returned, total,
+                                           start + returned))
     return ok(
-        value=stats,
+        value=page,
         unit="per-net counts",
         model="canonical_net_table",
         basis="pads/tracks/vias/zones grouped by net name; length is the sum of "
               "centreline segment lengths",
         precision="exact counts; track_length ignores arc true length (arcs are "
                   "polyline-approximated by the adapter)",
-        assumptions={"nets": len(stats)},
+        assumptions={"nets": total, "returned": returned, "offset": start,
+                     "truncated": truncated},
+        extra=extra,
     )
 
 

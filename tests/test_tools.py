@@ -77,10 +77,27 @@ class TestFidelityTools(unittest.TestCase):
         self.assertTrue(out["truncated"])
 
     def test_view_keeps_raw_on_every_record(self):
-        out = tools.call_tool("board_view", {"path": SAMPLE, "kind": "zones"})
+        out = tools.call_tool("board_view", {"path": SAMPLE, "kind": "zones",
+                                             "include_raw": True})
         for item in out["items"]:
             self.assertIn("filled_polygons", item)
             self.assertTrue(item["raw"].startswith("(zone"))
+
+    def test_view_all_reports_counts_not_the_whole_document(self):
+        # kind=all used to inline every record with its raw S-expression: 95 MB on
+        # a real board, which is a conversation-killer rather than an answer.
+        out = tools.call_tool("board_view", {"path": SAMPLE})
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("counts", out)
+        self.assertNotIn("facts", out)
+        self.assertGreaterEqual(out["counts"]["pads"], 1)
+
+    def test_view_records_are_paged_by_a_byte_budget(self):
+        out = tools.call_tool("board_view", {"path": SAMPLE, "kind": "pads",
+                                             "limit": 200, "max_bytes": 1})
+        self.assertEqual(out["returned"], 1)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["next_offset"], 1)
 
 
 class TestRegistryShape(unittest.TestCase):

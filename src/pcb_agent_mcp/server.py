@@ -89,9 +89,14 @@ def handle(request):
         name = params.get("name")
         args = params.get("arguments") or {}
         result = _tools.call_tool(name, args)
+        # 0.0.104: an oversized reply is CUT to fit and the whole thing is
+        # written to disk, instead of being replaced by a refusal. A refusal
+        # made the caller pay for the query and learn nothing; the head plus a
+        # path is worth more than a byte count alone.
+        result, text = _tools.cap_result(name, result)
         is_error = result.get("status") == "error"
         return _ok(msg_id, {
-            "content": [{"type": "text", "text": _tools.result_to_text(result)}],
+            "content": [{"type": "text", "text": text}],
             "isError": is_error,
         })
 
@@ -163,6 +168,17 @@ def serve(stdin=None, stdout=None):
 def selftest():
     """Protocol-level smoke test without any client."""
     checks = []
+
+    # The body below asks "is the data what the vendor printed", not "does the
+    # conversation gate work". Leave the gate on and the two questions get mixed:
+    # magnetics_data's 500-row powder grid is cut to whatever fits in 48 KiB (27
+    # rows on the first run, 64 on another), so the data checks fail while the
+    # gate is working exactly as designed. So: gate off for the body, and the
+    # gate gets its own four checks at the end - three behaviour checks plus the
+    # default value itself, which is what makes this split honest rather than a
+    # way of making red go away.
+    _kb_before_selftest = os.environ.get("PCB_AGENT_MAX_RESULT_KB")
+    os.environ["PCB_AGENT_MAX_RESULT_KB"] = "0"
 
     def check(name, cond, detail=""):
         checks.append((name, bool(cond), detail))
@@ -6764,6 +6780,75 @@ def selftest():
           and "ELECTRON_RUN_AS_NODE" not in _env,
           "dropped %s, present in child env %s"
           % (_dropped, "ELECTRON_RUN_AS_NODE" in _env))
+
+    # --- an oversized reply is CUT, not thrown away (0.0.104) --------------
+    # Measured 2026-11-03: driving the editor through lceda_pro_run returned the
+    # tool's whole `getAll()` object as one reply. The only ceiling in the path
+    # was 1024 KiB - a pipe bound, not a conversation bound - so the reply fitted
+    # and the conversation did not. These three checks pin the replacement: under
+    # the cap a reply is byte-identical, over it the head survives with a path to
+    # the rest, and with the cap disabled nothing is cut (so the checks are
+    # measuring the gate and not the payload).
+    _small = {"status": "ok", "value": {"n": 1}, "unit": "count"}
+    os.environ["PCB_AGENT_MAX_RESULT_KB"] = "48"
+    _s_out, _s_text = _tools.cap_result("probe", _small)
+    _big = {"status": "ok", "value": {"items": [{"i": n, "pad": "x" * 400}
+                                                for n in range(60)]}}
+    _kept_kb = os.environ.get("PCB_AGENT_MAX_RESULT_KB")
+    _cap_seen = 0
+    _c_out = {}
+    try:
+        os.environ["PCB_AGENT_MAX_RESULT_KB"] = "8"
+        _c_out, _c_text = _tools.cap_result("probe", _big)
+        _cap_seen = _tools.max_result_chars()
+        _saved = _c_out.get("saved_to")
+        _saved_bytes = (os.path.getsize(_saved) if _saved and os.path.exists(_saved)
+                        else -1)
+        os.environ["PCB_AGENT_MAX_RESULT_KB"] = "0"
+        _free_out, _free_text = _tools.cap_result("probe", _big)
+    finally:
+        if _kept_kb is None:
+            os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)
+        else:
+            os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kept_kb
+    _c_items = ((_c_out.get("value") or {}).get("items") or [])
+    check("a reply under the cap comes back unchanged: no `truncated` key, same "
+          "text - so shrinking one reply can never quietly edit another",
+          "truncated" not in _s_out
+          and _s_text == _tools.result_to_text(_small),
+          "keys %s" % sorted(_s_out))
+    check("a reply over the cap keeps its status, keeps the head of the list, says "
+          "how much it cut, and writes the full JSON to a file whose size equals "
+          "the size it reports - the failure this replaces was a reply that was "
+          "either dropped whole or sent whole",
+          _c_out.get("status") == "ok"
+          and _c_out.get("truncated") is True
+          and 0 < len(_c_items) < 60
+          and _c_out.get("value", {}).get("items") is not None
+          and _c_out.get("bytes_full", 0) > _cap_seen
+          and _saved_bytes == _c_out.get("bytes_full")
+          and (_c_out.get("truncated_fields") or {}),
+          "kept %d of 60 items, full %d B, cap %d B, file %d B"
+          % (len(_c_items), _c_out.get("bytes_full", 0), _cap_seen, _saved_bytes))
+    check("with the cap switched off the same payload is NOT cut - the two checks "
+          "above are measuring the gate, not a payload that happens to be small",
+          "truncated" not in _free_out
+          and len(_free_out["value"]["items"]) == 60
+          and len(_free_text) > len(_c_text),
+          "kept %d items with cap off" % len(_free_out["value"]["items"]))
+
+    # the documented default, measured on the empty environment it is documented for
+    os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)
+    _default_cap = _tools.max_result_chars()
+    check("the conversation cap defaults to 48 KiB: above the largest honest answer "
+          "measured in this repo (board_ops 33 340 B) and below the smallest reply "
+          "that actually killed a conversation (calc_capabilities 68 089 B), with "
+          "the pipe's own 16 MiB nowhere near it",
+          _default_cap == 48 * 1024, "%d B" % _default_cap)
+    if _kb_before_selftest is None:
+        os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)
+    else:
+        os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kb_before_selftest
 
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:

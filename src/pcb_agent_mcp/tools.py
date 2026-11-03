@@ -1809,19 +1809,32 @@ _tool(
 _tool(
     "board_components",
     "Every placed component with reference, value, library id, position (mm, Y up), "
-    "rotation and pad count, plus a bbox the model can reason about.",
+    "rotation and pad count, plus a bbox the model can reason about. Paged: 100 rows "
+    "by default, `total`/`truncated`/`next_offset` say what is left.",
     {"type": "object",
-     "properties": dict({"layer": _str("only components on this copper layer")}, **_COMMON),
+     "properties": dict({
+         "layer": _str("only components on this copper layer"),
+         "limit": _num("max components returned (default 100; page with offset)", 100),
+         "offset": _num("skip this many components", 0),
+     }, **_COMMON),
      "required": ["path"]},
-    _board_tool(lambda b, a: _oracle.components(b, layer=a.get("layer"))),
+    _board_tool(lambda b, a: _oracle.components(
+        b, layer=a.get("layer"), limit=a.get("limit", 100),
+        offset=a.get("offset", 0))),
 )
 
 _tool(
     "board_nets",
     "Per net: pad/track/via/zone counts and total routed length. Use it to spot a net "
-    "that exists in the netlist but has no copper.",
-    {"type": "object", "properties": dict(_COMMON), "required": ["path"]},
-    _board_tool(lambda b, a: _oracle.nets(b)),
+    "that exists in the netlist but has no copper. Paged: 100 nets by default, "
+    "`total`/`truncated`/`next_offset` say what is left.",
+    {"type": "object",
+     "properties": dict({
+         "limit": _num("max nets returned (default 100; page with offset)", 100),
+         "offset": _num("skip this many nets", 0),
+     }, **_COMMON), "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.nets(
+        b, limit=a.get("limit", 100), offset=a.get("offset", 0))),
 )
 
 _tool(
@@ -4988,6 +5001,18 @@ _VIEW_KINDS = ("nets", "net_classes", "layers", "stackup", "setup", "footprints"
                "pads", "tracks", "vias", "zones", "outline", "graphics",
                "uninterpreted", "all")
 
+# Soft byte budget for one board_view page. A record that carries `raw` can be
+# tens of kilobytes (a 1125-component board was 12.8 MB at limit=200), which is
+# a context window in a single reply; the page stops at the budget and says so.
+#
+# 64 KiB was a TRANSPORT bound, not a conversation bound: it protects the pipe
+# and still spends ~20k tokens of the model's context in one reply, which is
+# what actually broke a session on 2026-11-03 (194 pads came back as one page).
+# 16 KiB is the size a model can read and still have room to answer in; a
+# caller that really wants more asks for it with max_bytes= and takes the
+# consequence knowingly.
+_VIEW_MAX_BYTES = 16384
+
 
 def _board_view(args):
     doc, e = _load_fidelity(args)
@@ -4995,24 +5020,56 @@ def _board_view(args):
         return e
     kind = args.get("kind") or "all"
     limit = int(args.get("limit") or 200)
+    offset = int(args.get("offset") or 0)
+    include_raw = bool(args.get("include_raw"))
+    max_bytes = int(args.get("max_bytes") or _VIEW_MAX_BYTES)
     from .fidelity import kicad_doc as _kdoc
     if isinstance(doc, _kdoc.KiCadDocument):
-        view = _fviews.BoardView(doc)
         if kind == "all":
-            data = view.facts()
-            return {"status": "ok", "format": "kicad_pcb", "facts": data,
-                    "not_written": _NOT_WRITTEN,
-                    "note": "every record carries `raw`, the complete S-expression "
-                            "it was read from"}
+            # NOT the whole document any more: on a real board this used to return
+            # ~95 MB of JSON (every node, every raw S-expression), which no chat
+            # client can take. Counts answer "what is in here"; a named kind
+            # answers "show me".
+            counter = _fviews.BoardView(doc, with_raw=False)
+            counts = {k: len(getattr(counter, k)() or {})
+                      for k in _VIEW_KINDS if k != "all"}
+            return {"status": "ok", "format": "kicad_pcb",
+                    "source": {"path": getattr(doc, "path", None), "x_unit": "mm",
+                               "y_direction": "up (source is down, negated)"},
+                    "counts": counts,
+                    "next": "call board_view with one kind (and limit/offset/"
+                            "max_bytes) to read records; kind=all never inlines them",
+                    "not_written": _NOT_WRITTEN}
         if kind not in _VIEW_KINDS:
             return err("unknown kind %r" % kind, "ARG_INVALID",
                        hint="one of: " + ", ".join(_VIEW_KINDS))
+        view = _fviews.BoardView(doc, with_raw=include_raw)
         items = getattr(view, kind)()
         if isinstance(items, list):
             total = len(items)
-            return {"status": "ok", "kind": kind, "total": total,
-                    "returned": min(total, limit), "truncated": total > limit,
-                    "items": items[:limit], "not_written": _NOT_WRITTEN}
+            start = max(0, offset)
+            page, used = [], 0
+            for item in items[start:start + max(0, limit)]:
+                if not include_raw and isinstance(item, dict):
+                    item = {k: v for k, v in item.items() if k != "raw"}
+                size = len(json.dumps(item, ensure_ascii=False))
+                if page and used + size > max_bytes:
+                    break
+                page.append(item)
+                used += size
+            end = start + len(page)
+            out = {"status": "ok", "kind": kind, "total": total,
+                   "returned": len(page), "truncated": end < total,
+                   "bytes_used": used, "items": page,
+                   "not_written": _NOT_WRITTEN}
+            if end < total:
+                out["next_offset"] = end
+                out["hint"] = ("%d record(s) left: page with offset=%d, lower limit, "
+                               "or raise max_bytes (now %d)"
+                               % (total - end, end, max_bytes))
+            return out
+        if not include_raw and isinstance(items, dict):
+            items = {k: v for k, v in items.items() if k != "raw"}
         return {"status": "ok", "kind": kind, "value": items,
                 "not_written": _NOT_WRITTEN}
     # .epro
@@ -5069,8 +5126,10 @@ _tool(
     "Read FACTS out of the converted board: nets, net classes, layers, stackup, setup, "
     "footprints, pads (exact size/drill/rotation/net), tracks, vias, zones (including "
     "the stored fill polygons), Edge.Cuts geometry, board graphics/texts, and the nodes "
-    "with no reading rule yet. Every record carries `raw` - the complete original "
-    "S-expression - so nothing is lost between the file and the answer.",
+    "with no reading rule yet. kind=all returns per-kind COUNTS only (a real board's "
+    "full fact table is tens of MB); pick one kind to read records, paged by "
+    "limit/offset/max_bytes. Records carry the source S-expression only when "
+    "include_raw=true.",
     {"type": "object",
      "properties": {
          "path": _str("absolute path to the board file"),
@@ -5082,6 +5141,11 @@ _tool(
                       "all"),
          "member": _str("for .epro: which member to read (default: first text member)"),
          "limit": _num("max items returned", 200),
+         "offset": _num("skip this many items (paging)", 0),
+         "include_raw": _bool("attach the original S-expression to every record "
+                              "(large: one footprint can be tens of KB)", False),
+         "max_bytes": _num("soft byte budget for this page; it stops when reached "
+                           "and reports next_offset", _VIEW_MAX_BYTES),
      },
      "required": ["path"]},
     lambda a: _guarded(lambda: _board_view(a)),
@@ -10226,3 +10290,215 @@ def result_to_text(result):
     # because a NaN anywhere in an answer makes the client reject the whole
     # message - see jsonsafe.
     return _jsonsafe.dumps(result)
+
+
+def max_result_chars():
+    """Hard ceiling on one tool reply (0 disables). PCB_AGENT_MAX_RESULT_KB.
+
+    A reply that is larger than the conversation budget is not an answer the
+    model can use: the client either truncates it (silently) or fails the turn.
+    Naming the size is the honest option - and since 0.0.104 the oversized reply
+    is not thrown away either: `cap_result` keeps its head, writes the full JSON
+    to disk and says where it went. The default is 48 KiB - measured, not
+    guessed: the largest honest answer in this repo is board_ops at 33 340 B
+    (41 operations), while the replies that actually killed a conversation
+    start at 68 089 B (calc_capabilities) and 109 190 B (board_view pads),
+    with lceda_pro_run returning whole getAll() objects above that. A pipe
+    carries 16 MiB; a conversation does not.
+    """
+    raw = os.environ.get("PCB_AGENT_MAX_RESULT_KB", "48")
+    try:
+        kb = int(float(raw))
+    except (TypeError, ValueError):
+        kb = 48
+    return max(0, kb) * 1024
+
+
+_CAP_LIST_BYTES = 8192
+_CAP_STRING = 2000
+# (bytes one list may take, longest string kept) - tried in order until the reply
+# really fits. 0.0.104 first shipped one fixed setting ("keep 8 items of each
+# list") and produced two defects on the spot: a 41-entry write catalogue came
+# back as 8 entries, and a reply that was supposed to be cut was still 34 KiB
+# against a 24 KiB cap. A count is the wrong knob - the size is.
+_CAP_SCHEDULE = ((8192, 2000), (2048, 800), (512, 300), (128, 120), (32, 60))
+
+
+def _is_scalar(v):
+    return v is None or isinstance(v, (str, int, float, bool))
+
+
+def _cap_walk(node, path, cuts, budget, strlen):
+    if isinstance(node, dict):
+        return {k: _cap_walk(v, (path + "." + str(k)) if path else str(k), cuts,
+                             budget, strlen)
+                for k, v in node.items()}
+    if isinstance(node, list):
+        where = (path or "value") + "[]"
+        kept, spent = 0, 0
+        for v in node:
+            piece = len(result_to_text(v).encode("utf-8")) + 2
+            if kept and spent + piece > budget:
+                break
+            spent += piece
+            kept += 1
+        if len(node) > kept:
+            cuts[where] = {"kept": kept, "total": len(node),
+                           "budget_bytes": budget}
+        # kept == 0 only when the very first item alone blows the budget; it is
+        # kept anyway and its long strings get cut, so the head is always visible.
+        return [_cap_walk(v, where, cuts, budget, strlen) for v in node[:kept]]
+    if isinstance(node, str) and len(node) > strlen:
+        cuts[(path or "value") + " (string)"] = {"kept": strlen,
+                                                 "total": len(node)}
+        return node[:strlen] + "...[cut at %d chars]" % strlen
+    return node
+
+
+def _save_full_reply(name, text):
+    """Write the whole reply somewhere the caller can read it; return the path."""
+    try:
+        import tempfile as _tf
+        import time as _time
+        folder = os.path.join(_tf.gettempdir(), "pcb_agent_mcp_results")
+        os.makedirs(folder, exist_ok=True)
+        stamp = _time.strftime("%Y%m%d-%H%M%S")
+        size = len(text.encode("utf-8"))
+        path = os.path.join(folder, "%s-%s-%d.json" % (stamp, name, size))
+        io_open = __import__("io").open
+        io_open(path, "w", encoding="utf-8").write(text)
+        return path
+    except Exception:  # noqa: BLE001 - a full replay nobody can read is not fatal
+        return None
+
+
+def _cap_meta(out, name, size, cap, cuts, saved, items, strlen):
+    out["truncated"] = True
+    out["reason_code"] = out.get("reason_code") or "RESULT_TRUNCATED"
+    out["bytes_full"] = size
+    out["cap_bytes"] = cap
+    out["truncated_fields"] = cuts
+    if saved:
+        out["saved_to"] = saved
+        out["where_the_rest_is"] = (
+            "the complete reply is the JSON file at `saved_to` (%d bytes); this "
+            "one keeps every scalar and every short list, the head of each long "
+            "list up to %d bytes and the first %d characters of each long string"
+            % (size, items, strlen))
+    else:
+        out["where_the_rest_is"] = ("the reply could not be written to disk; only "
+                                    "the head above survived")
+    out["how_to_shrink"] = ("ask for less: board_view kind=/limit=/offset=/"
+                            "max_bytes=, board_components / board_nets "
+                            "limit=/offset=; for lceda_pro_run return only the "
+                            "fields you need from the snippet instead of the whole "
+                            "object")
+    out["where_to_read"] = ("this IS the tool's answer, cut to fit the "
+                            "conversation; the uncut JSON is at `saved_to`")
+    out.setdefault("payload_is", "top_level")
+    return out
+
+
+def _spine_reply(name, result, size, cap, saved):
+    """Last resort: shape and counts only, no values. Always small."""
+    shape = {}
+    for k, v in result.items():
+        if _is_scalar(v) and not (isinstance(v, str) and len(v) > 120):
+            shape[k] = v
+        elif isinstance(v, list):
+            shape[k] = {"type": "list", "len": len(v)}
+        elif isinstance(v, dict):
+            shape[k] = {"type": "object", "keys": list(v)[:12],
+                        "key_count": len(v)}
+        else:
+            shape[k] = {"type": type(v).__name__}
+    saved_path = saved
+    shape = _cap_meta(shape, name, size, cap, {"(payload)": "every value replaced "
+                                               "by its shape: even the heads did "
+                                               "not fit"}, saved_path, 0, 0)
+    shape["where_the_rest_is"] = (
+        "not even a cut-down copy fitted %d bytes, so this reply carries shapes "
+        "and counts only; the complete reply is at `saved_to` (%d bytes)"
+        % (cap, size))
+    return shape, result_to_text(shape)
+
+
+def _minimal_reply(name, result, size, cap, saved):
+    """The floor: a receipt, not a payload. Used when nothing else fits the cap."""
+    out = {
+        "status": result.get("status", "ok") if isinstance(result, dict) else "ok",
+        "truncated": True,
+        "reason_code": "RESULT_TRUNCATED",
+        "bytes_full": size,
+        "cap_bytes": cap,
+        "saved_to": saved,
+        "payload_is": "top_level",
+        "message": ("tool %s produced %d bytes and the cap is %d; even shapes and "
+                    "counts did not fit, so this reply is a receipt. Read the "
+                    "uncut JSON at `saved_to`, or raise PCB_AGENT_MAX_RESULT_KB if "
+                    "you know what you are asking the conversation to hold."
+                    % (name, size, cap)),
+        "where_the_rest_is": "the file at `saved_to`" if saved else "nowhere: write failed",
+        "where_to_read": "this is a receipt, not a measurement",
+    }
+    if isinstance(result, dict):
+        out["top_level_keys"] = list(result)[:40]
+    return out, result_to_text(out)
+
+
+def cap_result(name, result):
+    """Shrink one reply to the conversation cap instead of refusing it.
+
+    Until 0.0.104 an oversized reply was replaced by `RESULT_TOO_LARGE`, so the
+    caller got a size and nothing else and had to re-run a query it had already
+    paid for. Here the reply keeps its own `status`, keeps every scalar, keeps
+    the head of every list of records and the head of every long string, and the
+    complete JSON goes to a file whose path is in `saved_to`.
+
+    Two properties are pinned: a reply under the cap is returned IDENTICAL (no
+    key added, nothing reordered), and a reply over the cap really does come back
+    under it - the schedule is retried, then the payload degenerates to shapes
+    and counts, which is the honest end state when nothing else fits.
+
+    A flat list of names is bounded by bytes rather than by item count: 186 tool
+    names are one answer, and keeping eight of them is a wrong answer.
+    """
+    text = result_to_text(result)
+    size = len(text.encode("utf-8"))
+    cap = max_result_chars()
+    if not cap or size <= cap:
+        return result, text
+    saved = _save_full_reply(name, text)
+    last = None
+    for items, strlen in _CAP_SCHEDULE:
+        cuts = {}
+        trimmed = _cap_walk(result, "", cuts, items, strlen)
+        if not isinstance(trimmed, dict):
+            trimmed = {"status": "ok", "value": trimmed}
+        out = _cap_meta(dict(trimmed), name, size, cap, cuts, saved, items, strlen)
+        text = result_to_text(out)
+        last = (out, text)
+        if len(text.encode("utf-8")) <= cap:
+            return out, text
+    out, text = _spine_reply(name, result, size, cap, saved)
+    if len(text.encode("utf-8")) <= cap:
+        return out, text
+    return _minimal_reply(name, result, size, cap, saved)
+
+
+def result_too_large_text(name, size):
+    cap = max_result_chars()
+    return _jsonsafe.dumps({
+        "status": "error",
+        "reason_code": "RESULT_TOO_LARGE",
+        "message": ("tool %s produced %d bytes of JSON, above the %d-byte cap; the "
+                    "reply was dropped instead of overflowing the conversation"
+                    % (name, size, cap)),
+        "bytes": size,
+        "cap_bytes": cap,
+        "hint": ("narrow the query: board_view kind=/limit=/offset=/max_bytes=, "
+                 "board_components / board_nets limit=/offset=; set "
+                 "PCB_AGENT_MAX_RESULT_KB=0 to disable this cap"),
+        "payload_is": "top_level",
+        "where_to_read": "this is a refusal, not a measurement",
+    })

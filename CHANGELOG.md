@@ -9,6 +9,36 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.104] - 2026-11-03
+
+### Fixed
+
+- **单条回复的体积闸门从「传输界」改成「对话界」**。此前仓库里四个上限
+  （`_VIEW_MAX_BYTES` 64 KiB、`PCB_AGENT_MAX_RESULT_KB` 1024 KiB、`lceda_live` 4/16 MiB、
+  `MAX_FRAME` 16 MiB）全在回答「管道搬得动吗」，没有一条在回答「读进上下文还剩不剩地方推理」，
+  于是 109 190 B 的 `board_view` pads 页、68 089 B 的 `calc_capabilities`、
+  `lceda_pro_run` 的整 `getAll()` 对象都能一路走到对话里把会话撑死。
+  现在默认 **48 KiB**（实测锚点：最大的诚实答案 `board_ops` 33 340 B 之上、最小的倾泻
+  `calc_capabilities` 68 089 B 之下），`board_view` 单页 64 KiB → **16 KiB**。
+- **超限不再整包丢弃，改成截断 + 落盘**。旧的 `RESULT_TOO_LARGE` 让调用方付了查询的代价只拿回
+  一句「太大了」。新的 `cap_result()` 留住 `status`、所有标量、每个列表的头部（按字节预算，不按条数）
+  与每个长串前 2000 字符，加 `truncated` / `bytes_full` / `cap_bytes` / `truncated_fields`，
+  完整 JSON 落到 `%TEMP%\pcb_agent_mcp_results\` 并以 `saved_to` 指出。
+  **未超上限的回复逐字节不变**（不加键、不重排）。
+- **「截断」必须真的变短**：第一版单档设置下 68 089 B 的回复截完仍 34 931 B，超过它自己声称的
+  24 576 B 上限。现在按 `_CAP_SCHEDULE` 逐档收紧，仍装不下就退化成「形状+计数」，再不行退化成回执；
+  实测 48 KiB→34 162 B、2 KiB→1 918 B、1 KiB→853 B，三档都在上限内。
+- **列表不许按「前 8 条」砍**：一串名字是一个答案，砍成 8 条等于回错答案（186 个工具名里
+  `board_summary` 是第 22 个，被砍掉后自检当场红）；列表改按每次预算的字节装到装不下为止。
+- **自检里「量数据」与「量闸门」分开**。默认闸门开着跑 selftest，`magnetics_data` 的 500 行粉芯表
+  被截成 27 行（另一轮 64 行），三条数据检查假 FAIL。现在 `selftest()` 正文把上限置 0 看完整答案，
+  闸门由末尾四条专检负责（含「上限关掉就不许切」的反向对照），并新增一条默认值检查。
+
+### Measured
+
+- `python -m unittest tests.test_tools tests.test_server_protocol tests.test_tools_profile` → 46 tests OK
+- `python -m run_server --selftest` → **336/336 passed**
+
 ## [0.0.103] - 2026-11-03
 
 ### Fixed

@@ -51,17 +51,25 @@ INTERPRETED_HEADS = frozenset((
 
 
 class BoardView(object):
-    """Read-only projection of one KiCad board document."""
+    """Read-only projection of one KiCad board document.
 
-    def __init__(self, doc):
+    ``with_raw=False`` drops the source S-expression from every record. The
+    default keeps it; a caller that only needs fields (a chat agent, where a
+    single footprint's raw text is tens of kilobytes) can turn it off and keep
+    the answer small without changing any field that was derived from it.
+    """
+
+    def __init__(self, doc, with_raw=True):
         self.doc = doc
         self._board = doc.board()
+        self.with_raw = with_raw
 
     # ------------------------------------------------------------ helpers
     def _wrap(self, node, path, **fields):
         out = dict(fields)
         out["src"] = path
-        out["raw"] = S.dumps(node)
+        if self.with_raw:
+            out["raw"] = S.dumps(node)
         return out
 
     def _xy(self, node):
