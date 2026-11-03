@@ -366,7 +366,7 @@ class TestTheSurfaceMovedOnce(unittest.TestCase):
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
         # 192 = 190 + tool_search/tool_call (discovery tools, so the default
         # tools/list profile can stay small without losing a capability)
-        self.assertEqual(len(tools.TOOLS), 192)
+        self.assertEqual(len(tools.TOOLS), 190)
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_core_loss_audit", cap["available"])
         # 186 = 184 + tool_search/tool_call

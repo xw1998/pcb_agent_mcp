@@ -112,62 +112,228 @@ def handle(request):
     return _error(msg_id, -32601, "method not found: %s" % method)
 
 
+def _call_timeout_s():
+    """Wall-clock budget for one tools/call. 0 = wait forever (the default).
+
+    Zero keeps every existing answer byte-identical; a deployment that has been
+    bitten by a wedged tool sets PCB_AGENT_CALL_TIMEOUT_S. The timeout does not
+    kill the tool (a Python thread cannot be killed) - it stops waiting, says
+    so, and lets the worker finish out of sight.
+    """
+    raw = os.environ.get("PCB_AGENT_CALL_TIMEOUT_S", "0")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0 else 0.0
+
+
+_CANCEL_METHODS = ("notifications/cancelled", "notifications/cancel")
+
+
+def _cancelled_request_id(item):
+    """The requestId inside a cancellation notification, else None."""
+    if not isinstance(item, dict):
+        return None
+    if item.get("method") not in _CANCEL_METHODS:
+        return None
+    params = item.get("params")
+    if isinstance(params, dict):
+        if params.get("requestId") is not None:
+            return params["requestId"]
+        return params.get("id")
+    return None
+
+
 def serve(stdin=None, stdout=None):
+    """Read lines in one thread, run one tool at a time in another.
+
+    Until 0.0.108 this was `for raw in stdin: handle(raw)` in the only thread
+    the process had, and a notification was dropped on the floor because
+    `handle` returns None when `id` is missing. Two consequences, both seen in
+    real sessions:
+
+      * one slow tool (a DRC that spawns kicad-cli, a fill, a parse of a large
+        board) owned the process; the server did not even read the next line,
+        so `notifications/cancelled` was never seen, and the client's only
+        remaining move was to kill the connection - which is indistinguishable
+        from a dead conversation;
+      * there was no wall-clock ceiling at all, so "how long is too long" was
+        answered by the host, not by this server.
+
+    Now the loop only reads and dispatches; one worker thread runs the calls;
+    a cancel for the in-flight id is answered with -32800 immediately; and an
+    optional PCB_AGENT_CALL_TIMEOUT_S turns a wedged call into an error reply
+    instead of a frozen session. Batches still run in-line: they are rare and
+    a host that batches is not the host this protects.
+    """
+    import threading
+    import time
+    import queue
+
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
+    dead = []
 
     def write(payload):
-        stdout.write((_dumps(payload) + "\n").encode("utf-8"))
-        stdout.flush()
-
-    for raw in stdin:
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line:
-            continue
+        if dead:
+            return
         try:
-            request = json.loads(line)
-        except json.JSONDecodeError as exc:
-            write(_error(None, -32700, "parse error: %s" % exc))
-            continue
-        # A batch arrives as an array. Answer it with an array; an element that
-        # cannot be handled must not take the whole session down.
-        if isinstance(request, list):
+            stdout.write((_dumps(payload) + "\n").encode("utf-8"))
+            stdout.flush()
+        except OSError as exc:            # the client went away
+            dead.append(1)
+            _log("stdout closed: %s: %s" % (type(exc).__name__, exc))
+
+    def handle_safely(item):
+        # A batch arrives as an array and is answered with an array; one broken
+        # element must not take the session down, and an empty batch is a
+        # malformed request rather than a quiet no-op.
+        if isinstance(item, list):
             responses = []
-            for item in request:
+            for one in item:
                 try:
-                    response = handle(item)
+                    response = handle(one)
                 except Exception as exc:  # noqa: BLE001
                     _log("request failed: %s: %s" % (type(exc).__name__, exc))
-                    msg_id = item.get("id") if isinstance(item, dict) else None
+                    msg_id = one.get("id") if isinstance(one, dict) else None
                     response = _error(msg_id, -32603, "internal error: %s: %s"
                                       % (type(exc).__name__, exc))
                 if response is not None:
                     responses.append(response)
-            if not responses:
-                # An empty array is a malformed request, not a quiet no-op: the
-                # spec answers it with one error. A batch of pure notifications
-                # stays silent, which is why these two cases are separated.
-                if not request:
-                    write(_error(None, -32600, "invalid request: empty batch"))
-                continue
-            write(responses)
-            continue
+            if responses:
+                return responses
+            if not item:
+                return _error(None, -32600, "invalid request: empty batch")
+            return None
         try:
-            response = handle(request)
-        except Exception as exc:  # noqa: BLE001
-            # The process dying is indistinguishable from the conversation
-            # dying, so one broken request or tool ends a turn, not the server.
+            return handle(item)
+        except Exception as exc:          # noqa: BLE001
             _log("request failed: %s: %s" % (type(exc).__name__, exc))
-            msg_id = request.get("id") if isinstance(request, dict) else None
-            response = _error(msg_id, -32603, "internal error: %s: %s"
-                              % (type(exc).__name__, exc))
-        if response is not None:
-            write(response)
+            msg_id = item.get("id") if isinstance(item, dict) else None
+            return _error(msg_id, -32603, "internal error: %s: %s"
+                          % (type(exc).__name__, exc))
+
+    in_q = queue.Queue()
+    eof = threading.Event()
+
+    def reader():
+        try:
+            for raw in stdin:
+                in_q.put(raw)
+        except Exception as exc:          # noqa: BLE001
+            _log("stdin reader stopped: %s: %s" % (type(exc).__name__, exc))
+        finally:
+            eof.set()
+
+    threading.Thread(target=reader, name="mcp-stdin", daemon=True).start()
+
+    job_q = queue.Queue()
+
+    def worker():
+        while True:
+            box = job_q.get()
+            if box is None:
+                return
+            box["response"] = handle_safely(box.pop("req"))
+            box["done"] = True
+
+    threading.Thread(target=worker, name="mcp-worker", daemon=True).start()
+
+    timeout_s = _call_timeout_s()
+    pending = []
+    job = None
+    EMPTY = object()
+
+    def start(item):
+        """Submit a tools/call; return the job box. Anything else runs here."""
+        box = {"req": item, "done": False, "response": None,
+               "t0": time.monotonic(), "cancelled": False,
+               "id": item.get("id"),
+               "tool": (item.get("params") or {}).get("name")}
+        job_q.put(box)
+        return box
+
+    def is_async(item):
+        return (isinstance(item, dict)
+                and item.get("method") == "tools/call"
+                and item.get("id") is not None)
+
+    while not dead:
+        raw = EMPTY
+        try:
+            raw = in_q.get(timeout=0.2)
+        except queue.Empty:
+            pass
+
+        if raw is not EMPTY:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    write(_error(None, -32700, "parse error: %s" % exc))
+                    item = EMPTY
+                if item is not EMPTY:
+                    cid = _cancelled_request_id(item)
+                    if cid is not None and job is not None \
+                            and job["id"] == cid:
+                        job["cancelled"] = True
+                        write(_error(cid, -32800,
+                                     "request cancelled by the client",
+                                     {"still_running": not job["done"],
+                                      "tool": job["tool"]}))
+                        _log("cancelled %r while %r was running"
+                             % (cid, job["tool"]))
+                        job = None
+                    elif job is None and is_async(item):
+                        job = start(item)
+                    elif job is None:
+                        response = handle_safely(item)
+                        if response is not None:
+                            write(response)
+                    else:
+                        pending.append(item)
+
+        if job is not None:
+            if job["done"]:
+                if not job["cancelled"] and job["response"] is not None:
+                    write(job["response"])
+                job = None
+            elif timeout_s and (time.monotonic() - job["t0"]) > timeout_s:
+                write(_error(job["id"], -32800,
+                             "tool call exceeded PCB_AGENT_CALL_TIMEOUT_S",
+                             {"tool": job["tool"], "timeout_s": timeout_s,
+                              "still_running": True}))
+                _log("timeout after %.1fs on %r" % (timeout_s, job["tool"]))
+                job = None
+
+        while job is None and pending:
+            item = pending.pop(0)
+            if is_async(item):
+                job = start(item)
+            else:
+                response = handle_safely(item)
+                if response is not None:
+                    write(response)
+
+        if job is None and not pending and eof.is_set() and in_q.empty():
+            job_q.put(None)              # tell the worker to stop
+            return
 
 
 def selftest():
     """Protocol-level smoke test without any client."""
+    import time as _stime
     checks = []
+    # 逐条耗时是这套闸门自己的闸门：跑一次要几分钟的自检等于没人跑，而没人跑
+    # 的闸门会让"某一条检查直接崩"这种缺陷一直躲在里面（0.0.108 就是这个状态：
+    # 一条检查在 isinstance 上抛 AttributeError，整套自检连 PASS/FAIL 都没机会打）。
+    # 名字必须独一无二：Python 是函数作用域，0.0.108 的 stdio 计时块里也用 _t0，
+    # 结果这一行的总耗时被它覆盖成 0.5 s —— 一条自我欺骗的读数比没有读数更糟。
+    _gate_t0 = _stime.perf_counter()
+    _last = [_gate_t0]
+    _times = []
 
     # The body below asks "is the data what the vendor printed", not "does the
     # conversation gate work". Leave the gate on and the two questions get mixed:
@@ -181,6 +347,12 @@ def selftest():
     os.environ["PCB_AGENT_MAX_RESULT_KB"] = "0"
 
     def check(name, cond, detail=""):
+        _now = _stime.perf_counter()
+        _el = _now - _last[0]
+        _last[0] = _now
+        _times.append((_el, name))
+        if _el > 1.0:                      # 慢的立刻吐，卡住时最后一行就是现场
+            _log("  %6.2fs  %s" % (_el, name))
         checks.append((name, bool(cond), detail))
 
     r = handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -5131,9 +5303,9 @@ def selftest():
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (192 tools now), so an agent that asks what can be computed is "
-          "told about it",
-          len(_tools.TOOLS) == 192
+          "table (190 tools now: 192 until 0.0.107 removed the autorouter and the auto-fanout), so an agent that asks what can be "
+          "computed is told about it",
+          len(_tools.TOOLS) == 190
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -5308,8 +5480,8 @@ def selftest():
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (192 tools now)",
-          len(_tools.TOOLS) == 192
+          "table (190 tools now: 192 until 0.0.107 removed the autorouter and the auto-fanout)",
+          len(_tools.TOOLS) == 190
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5573,7 +5745,7 @@ def selftest():
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 192, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 190, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
@@ -5589,7 +5761,12 @@ def selftest():
           "0.0.93 exactly seven (the experience library: recall, check, "
           "candidate, promote, outcome, export, import), and 0.0.94 arguments "
           "only (ledger runs now name the job that made them, and "
-          "board_run_ledger filters by it)",
+          "board_run_ledger filters by it), and 0.0.107 exactly MINUS two: the "
+          "autorouter (board_route) and the automatic BGA escape (board_fanout) "
+          "were REMOVED from the server, not disabled, so 192 -> 190, and "
+          "0.0.108 exactly one: the stdio loop stopped being a place where one "
+          "slow tool owned the process (reads, cancel and an optional wall "
+          "clock ceiling now live there), so the tool count is still 190",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5597,7 +5774,7 @@ def selftest():
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 192,
+          and len(_tools.TOOLS) == 190,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -5739,7 +5916,7 @@ def selftest():
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 192,
+          and len(_tools.TOOLS) == 190,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -6021,7 +6198,7 @@ def selftest():
           and _au_temp.get("temperatures_printed") == [100.0]
           and _au_kneg.get("reason_code") == "ARG_RANGE"
           and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 192,
+          and len(_tools.TOOLS) == 190,
           "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
           % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
              _au_n27.get("reason_code"), _au_mat.get("reason_code"),
@@ -6850,6 +7027,144 @@ def selftest():
     else:
         os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kb_before_selftest
 
+    # --- 0.0.107 自动布线/自动布局已摘除：不是关掉，是不存在 -------------
+    _all_names = [t["name"] for t in _tools.list_tools("all")]
+    _gone = [n for n in ("board_route", "board_fanout") if n in _all_names]
+    check("no autorouter and no auto-fanout are advertised even with every tool "
+          "profile asked for: they were removed, not defaulted off, so a caller "
+          "cannot be talked into handing the layout decision to a search",
+          not _gone, "still listed: %r" % (_gone,))
+    check("and calling them by name is refused with TOOL_RETIRED, not TOOL_NOT_FOUND: "
+          "a tool that exists in the source but cannot be reached has to say which "
+          "it is, or the caller reads 'unknown tool' as 'misremembered the name'",
+          (_tools.call_tool("board_route", {}).get("reason_code") == "TOOL_RETIRED"
+           and _tools.call_tool("board_fanout", {}).get("reason_code") == "TOOL_RETIRED"),
+          _tools.call_tool("board_route", {}).get("message", "")[:80])
+    _core = len(json.dumps(_tools.list_tools("core"), ensure_ascii=False))
+    check("the default profile still fits a context window after the removal and "
+          "the execution primitives are untouched: add_track / add_via / add_zone / "
+          "move_footprint are all still there, only the two searches are gone",
+          _core < 64 * 1024
+          and all(_tools.TOOLS.get(n) for n in ("tool_search", "tool_call"))
+          and _tools.TOOLS.get("board_ops") is not None, "core %d B" % _core)
+
+    # --- 0.0.108 stdio 循环不再被单个慢工具卡死 ----------------------------
+    # 证据口径：这不是"看起来更快"，而是"工具还在跑的时候进程仍然读 stdin"。
+    # 用一条假工具代替真工具，把三件事分别钉住：取消能被答、超时能被答、
+    # 默认值仍然是"无限等"（既有答案逐字不变）。
+    import io as _bio
+    import threading as _bth
+    import time as _btime
+
+    def _serve_lines(lines, timeout_s=None):
+        _kept = os.environ.get("PCB_AGENT_CALL_TIMEOUT_S")
+        if timeout_s is None:
+            os.environ.pop("PCB_AGENT_CALL_TIMEOUT_S", None)
+        else:
+            os.environ["PCB_AGENT_CALL_TIMEOUT_S"] = str(timeout_s)
+        out = _bio.BytesIO()
+        try:
+            serve(stdin=_bio.BytesIO("".join(lines).encode("utf-8")), stdout=out)
+        finally:
+            if _kept is None:
+                os.environ.pop("PCB_AGENT_CALL_TIMEOUT_S", None)
+            else:
+                os.environ["PCB_AGENT_CALL_TIMEOUT_S"] = _kept
+        return [json.loads(ln) for ln in out.getvalue().decode("utf-8").splitlines()
+                if ln.strip()]
+
+    def _req(mid, method, params=None):
+        body = {"jsonrpc": "2.0", "id": mid, "method": method}
+        if params is not None:
+            body["params"] = params
+        return json.dumps(body) + "\n"
+
+    def _note(method, params):
+        return json.dumps({"jsonrpc": "2.0", "method": method,
+                           "params": params}) + "\n"
+
+    _real_call = _tools.call_tool
+    _gate = _bth.Event()
+
+    def _wedged(name, args):
+        _gate.wait(3.0)
+        return {"status": "ok", "value": "finished after the client gave up"}
+
+    _tools.call_tool = _wedged
+    try:
+        _t0 = _btime.monotonic()
+        _canc = _serve_lines([
+            _req(7, "tools/call", {"name": "board_drc", "arguments": {}}),
+            _note("notifications/cancelled", {"requestId": 7})])
+        _canc_s = _btime.monotonic() - _t0
+        _t0 = _btime.monotonic()
+        _tout = _serve_lines([_req(9, "tools/call", {"name": "board_drc",
+                                                    "arguments": {}})],
+                             timeout_s=0.3)
+        _tout_s = _btime.monotonic() - _t0
+    finally:
+        _gate.set()
+        _tools.call_tool = _real_call
+
+    check("a cancel that arrives while a tool is still running is answered at once "
+          "and the reply says the tool is still running: the old loop could not even "
+          "read that notification, so the client's only move was to kill the "
+          "connection - which reads as a dead conversation",
+          any(m.get("id") == 7 and (m.get("error") or {}).get("code") == -32800
+              and (m.get("error") or {}).get("data", {}).get("still_running") is True
+              for m in _canc)
+          and _canc_s < 1.0
+          and not any(m.get("result") for m in _canc),
+          "%r in %.2fs" % (_canc, _canc_s))
+
+    check("and a wall clock ceiling turns a wedged call into an error reply that names "
+          "the tool, the ceiling and the fact that it is still running: refused, not "
+          "silently abandoned, so the caller is not told the work failed",
+          any(m.get("id") == 9 and (m.get("error") or {}).get("code") == -32800
+              and "PCB_AGENT_CALL_TIMEOUT_S" in ((m.get("error") or {}).get("message") or "")
+              and (m.get("error") or {}).get("data", {}).get("tool") == "board_drc"
+              for m in _tout)
+          and _tout_s < 2.0,
+          "%r in %.2fs" % (_tout, _tout_s))
+
+    check("the ceiling defaults to zero seconds, i.e. exactly the old behaviour of "
+          "waiting as long as the tool takes: the guard exists for a deployment that "
+          "has been bitten, and does not shorten anyone else's answer",
+          _call_timeout_s() == 0.0,
+          "PCB_AGENT_CALL_TIMEOUT_S=%r -> %r"
+          % (os.environ.get("PCB_AGENT_CALL_TIMEOUT_S"), _call_timeout_s()))
+
+    _plain = _serve_lines([_req(1, "initialize", {}), _req(2, "tools/list", {})])
+    _batch = _serve_lines(["[%s,%s]\n" % (_req(11, "ping").strip(),
+                                        _req(12, "ping").strip())])
+    check("and the rewrite did not change what a normal turn looks like: two requests "
+          "are answered in the order they arrived, and a batch is still answered with "
+          "one array rather than being read as a malformed object",
+          [m.get("id") for m in _plain] == [1, 2]
+          and _plain[1].get("result", {}).get("tools")
+          and len(_batch) == 1 and isinstance(_batch[0], list)
+          and [m.get("id") for m in _batch[0]] == [11, 12],
+          "plain %r batch %r" % ([m.get("id") for m in _plain],
+                                 [[x.get("id") for x in b] if isinstance(b, list)
+                                  else b.get("id") for b in _batch]))
+
+    # 自检本身也要有预算：一条检查占掉分钟级，等于把整道闸门变成没人愿意跑的
+    # 东西，而 0.0.108 的 AttributeError 就是这样一直没被发现。
+    _tot = _stime.perf_counter() - _gate_t0
+    _worst = max(_times) if _times else (0.0, "-")
+    _sum_slow = sum(t for t, _n in _times if t > 1.0)
+    _log("  ---- %d checks, %.1fs total, %.1fs of it in checks over 1 s, "
+         "slowest %.1fs (%s)" % (len(_times), _tot, _sum_slow, _worst[0], _worst[1][:50]))
+    # 这是棘轮，不是目标价：今天实测 160.1 s / 单条最慢 30.6 s（共面波导的 2D 场
+    # 求解），所以闸门只保证"不许再变慢"，不假装已经够快。真正的目标是 120 s 总量 /
+    # 单条 20 s，它要求把这些慢物理检查拆成 opt-in 的 `--deep` 套件，登记在 docs/108
+    # 的欠账里 —— 写成 120 s 然后放 160 s 通过，才是把这条检查变成装饰。
+    check("the gate does not get slower: 180 s total and 35 s for any single check, a "
+          "ratchet around the measured 160.1 s / 30.6 s. The target is 120 s / 20 s and "
+          "is registered as debt (docs/108), because a gate that takes minutes is a gate "
+          "nobody runs and a crash inside it then stays invisible for releases",
+          _tot <= 180.0 and _worst[0] <= 35.0,
+          "total %.1fs, slowest %.1fs (%s)" % (_tot, _worst[0], _worst[1][:60]))
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))

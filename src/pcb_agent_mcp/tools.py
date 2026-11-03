@@ -2563,8 +2563,8 @@ def _board_blockers(args):
         out["message"] = res["diagnosis"]
     elif res["open_sectors"]:
         out["message"] = res["diagnosis"]
-        out["hint"] = ("nothing at this point needs to move: look further along the "
-                       "net (board_route on one net tells you which edge failed)")
+        out["hint"] = ("nothing at this point needs to move: walk the net yourself "
+                       "(board_dangling / board_routability give the per-net edges)")
     else:
         out["message"] = res["diagnosis"]
         out["hint"] = ("the fixes that exist for a boxed-in pad are: move the part "
@@ -10202,6 +10202,15 @@ def list_tools(toolset="all"):
 def call_tool(name, arguments):
     spec = TOOLS.get(name)
     if spec is None:
+        gone = RETIRED_TOOLS.get(name)
+        if gone is not None:
+            return err("%s was removed from this server and cannot be called: %s"
+                       % (name, gone), "TOOL_RETIRED",
+                       hint=("this server does not route or place automatically; "
+                             "every copper path and every part position has to be "
+                             "passed in by the caller as explicit coordinates "
+                             "(ops add_track / add_via / move_footprint). "
+                             "call tools/list for what is left"))
         return err("unknown tool: " + str(name), "TOOL_NOT_FOUND",
                    hint="call tools/list")
     args = arguments or {}
@@ -10502,3 +10511,29 @@ def result_too_large_text(name, size):
         "payload_is": "top_level",
         "where_to_read": "this is a refusal, not a measurement",
     })
+
+# ---------------------------------------------------------------------------
+# 0.0.107: 自动布线 / 自动布局 从这里被摘掉，不是关掉。
+#
+# 用户的裁决是逐字的：「不再允许自动布线和自动布局的存在，防止你偷懒」。所以
+# 这两个工具不是「默认关闭、设个环境变量就能打开」——它们根本不在 TOOLS 里，
+# PCB_AGENT_TOOLSET=all 也拿不回来，tool_call 找不到它们，直接按名字调只会拿到
+# TOOL_RETIRED。留下的只有实现代码（本文件里 _board_route / _board_fanout 与
+# route/ 、fanout.py 仍然存在，供人读和供自检引用），注册被摘掉，所以对本服务
+# 的任何调用方而言它们不存在。
+#
+# 与之配套的纪律（写在这里是为了让后来的人不要顺手加回来）：
+#   * 本服务器只提供「执行原语」：add_track / add_via / add_zone / move_footprint
+#     / set_footprint_layer / add_footprint / delete_*。坐标由调用方给。
+#   * 摆放决策与走线路径是人的决定，不是搜索的结果。任何「自己算出一条路径
+#     再写进去」的东西都属于被摘掉的这一类。
+#   * 允许的自动化只有几何算术：焊盘中心、线段距离、90° 折角切 45°。
+RETIRED_TOOLS = {
+    "board_route": ("it was an A* maze autorouter with a rip-up pass; autorouting "
+                    "is no longer part of this server"),
+    "board_fanout": ("it planned a BGA escape automatically, which is autorouting "
+                     "under another name; it is no longer part of this server"),
+}
+
+for _gone in RETIRED_TOOLS:
+    TOOLS.pop(_gone, None)
