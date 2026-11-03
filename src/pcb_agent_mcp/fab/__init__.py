@@ -431,6 +431,129 @@ def board_layers(path):
     return names
 
 
+#: Paper sizes in mm, portrait (w, h). Only the ones a board is actually drawn
+#: on; an unknown paper name means "do not judge the page", never "fits".
+_PAPER_MM = {
+    "A5": (148.0, 210.0), "A4": (210.0, 297.0), "A3": (297.0, 420.0),
+    "A2": (420.0, 594.0), "A1": (594.0, 841.0), "A0": (841.0, 1189.0),
+    "USLetter": (215.9, 279.4), "USLegal": (215.9, 355.6),
+    "USLedger": (279.4, 431.8), "User": (0.0, 0.0),
+}
+
+
+def _paper_mm(path):
+    """(name, w_mm, h_mm) or (None, 0, 0) when the file does not say."""
+    from ..adapters import kicad_pcb as KD
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8", errors="replace")
+        tree = KD.parse_sexpr(text)
+    except (OSError, ValueError):
+        return None, 0.0, 0.0
+    node = KD.child(tree, "paper") if tree else None
+    if not isinstance(node, list) or len(node) < 2 or not isinstance(node[1], str):
+        return None, 0.0, 0.0
+    name = node[1]
+    if name == "User":
+        # A custom (paper "User" 200 150) states its own size; without one there is
+        # nothing to compare against.
+        if len(node) >= 4:
+            try:
+                return name, float(node[2]), float(node[3])
+            except (TypeError, ValueError):
+                return None, 0.0, 0.0
+        return None, 0.0, 0.0
+    size = _PAPER_MM.get(name)
+    if size is None:
+        # An unknown name means "do not judge the page", never "fits".
+        return None, 0.0, 0.0
+    return name, size[0], size[1]
+
+
+def board_extent(path):
+    """Where the board sits in FILE coordinates, and whether a plot can land on the page.
+
+    `kicad-cli` places a plot by the design's own coordinates: a board drawn at
+    negative y is printed above the sheet and the page comes back blank while the
+    board itself is fine (docs/99). This reads the positions and reports - it never
+    moves anything, and it is the same traversal the edit layer's `translate_board`
+    uses, so the two agree on what moving a board means.
+
+    Returns None when the file cannot be read: "could not measure" must not be
+    dressed up as "fits".
+    """
+    from ..fidelity import sexpr as S
+    from ..edit import ops as OPS
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8", errors="replace")
+        # `sexpr.parse` keeps the node objects `_board_points` walks; the adapter's
+        # own parser flattens to plain lists and has no `items`.
+        parsed = S.parse(text)
+        points = OPS._board_points(parsed[0]) if parsed else []
+    except (OSError, ValueError, AttributeError, IndexError):
+        return None
+    if not points:
+        return None
+    xs = [p[1] for p in points]
+    ys = [p[2] for p in points]
+    box = {"x_min": round(min(xs), 4), "x_max": round(max(xs), 4),
+           "y_min": round(min(ys), 4), "y_max": round(max(ys), 4)}
+    out = {"bbox_file_mm": box, "positions": len(points),
+           "y_axis": "file coordinates, y down",
+           "how_measured": "every position the board carries (footprints by their "
+                           "origin, everything else by its own points), the same "
+                           "walk translate_board moves",
+           "warnings": []}
+    if box["x_min"] < 0 or box["y_min"] < 0:
+        axes = []
+        if box["x_min"] < 0:
+            axes.append("x")
+        if box["y_min"] < 0:
+            axes.append("y")
+        out["negative_axes"] = axes
+        # The edit layer is y-up while the file is y-down, so the dy that lifts a
+        # negative-y board is the file's own y_min - not its negation. Handing back
+        # the number means the advice can be executed without a second guess, and
+        # the test below executes it literally instead of trusting the prose.
+        dx = round(-box["x_min"], 4) if box["x_min"] < 0 else 0.0
+        dy = round(box["y_min"], 4) if box["y_min"] < 0 else 0.0
+        out["advice"] = {"op": "translate_board", "dx": dx, "dy": dy,
+                         "note": "the edit API is y-up, the file is y-down: this dy "
+                                 "moves the design just far enough to clear the origin"}
+        out["warnings"].append(
+            "the board occupies negative %s in file coordinates (x %s..%s, y %s..%s); "
+            "KiCad places a plot by those coordinates, so part of it lands outside "
+            "the sheet and the page can come back blank. Nothing here moved the "
+            "board - `translate_board` with dx=%s dy=%s shifts the whole design into "
+            "positive coordinates, and the plot then lands on the page."
+            % ("/".join(axes), box["x_min"], box["x_max"], box["y_min"], box["y_max"],
+               dx, dy))
+    name, pw, ph = _paper_mm(path)
+    if name:
+        # KiCad's page origin is the top-left corner and y grows downwards, so the
+        # usable area is 0..w by 0..h - swapping in the landscape orientation when
+        # the paper name says nothing about it.
+        w, h = max(pw, ph), min(pw, ph)
+        out["paper"] = {"name": name, "w_mm": w, "h_mm": h}
+        # Two different reasons, kept apart: a board that is simply too big for the
+        # sheet, and one that is the right size sitting off the origin. Only the first
+        # is a size problem - saying "clipped" to a negative-y board adds a second
+        # symptom for one cause.
+        if pw and ph and (box["x_max"] > w or box["y_max"] > h):
+            out["fits_paper"] = False
+            out["warnings"].append(
+                "the board's extent is %s..%s x %s..%s mm and %s is %sx%s mm: the "
+                "plot is clipped, not scaled."
+                % (box["x_min"], box["x_max"], box["y_min"], box["y_max"],
+                   name, w, h))
+        elif box["x_min"] < 0 or box["y_min"] < 0:
+            out["fits_paper"] = False     # off the sheet, and 99.7 named why already
+        else:
+            out["fits_paper"] = True
+    return out
+
+
 def _default_layers(path):
     names = board_layers(path)
     copper = [n for n in names if n.endswith(".Cu")]
@@ -470,7 +593,7 @@ def graphics(path, fmt="pdf", layers=None, out_dir=None, allow_beside_source=Fal
     after = _snapshot(out)
     fresh = [{"name": rel, "bytes": v[0], "sha256": v[1]}
              for rel, v in sorted(after.items()) if before.get(rel) != v]
-    return {"status": "ok" if fresh else "error",
+    answer = {"status": "ok" if fresh else "error",
             "out_dir": out, "format": fmt, "layers": used, "files": fresh,
             "assumptions": {"who_wrote_the_files": "kicad-cli (%s)" % engine.version(),
                             "layers": "given explicitly" if layers else
@@ -478,6 +601,17 @@ def graphics(path, fmt="pdf", layers=None, out_dir=None, allow_beside_source=Fal
                                       "from the board file's (layers) node",
                             "dxf": "one file per layer, named <board>-<Layer>.dxf",
                             "pdf_svg": "one file, mode-single, layers overlaid"}}
+    # Where the board sits is a fact about the plot, not a defect of the design,
+    # so it travels beside the files and never changes `status`: a board outside
+    # the sheet still produced real files (that is exactly the trap docs/99
+    # records - the export "succeeded" and the page was blank).
+    if fmt in ("pdf", "svg", "ps", "dxf"):
+        placement = board_extent(path)
+        if placement:
+            answer["placement"] = placement
+            if placement["warnings"]:
+                answer["warnings"] = list(placement["warnings"])
+    return answer
 
 
 # ------------------------------------------------------------------ 3D

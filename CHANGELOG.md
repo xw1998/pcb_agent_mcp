@@ -9,6 +9,41 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.102] - 2026-11-03
+
+### Added
+
+- `fab.board_extent(path)`：读一块板在**文件坐标**里占了多大，并判断纸张装不装得下。
+  复用 `edit.ops._board_points` 的同一遍历（也就是 `translate_board` 搬的那批位置），
+  所以「盒子」和「整板平移」对同一块板的理解一致。
+- `board_export_graphics` 的 pdf / svg / ps / dxf 返回值多一个 `placement`：
+  `bbox_file_mm` / `positions` / `y_axis` / `how_measured` / `paper` / `fits_paper` /
+  `warnings` / `negative_axes` / `advice`。`status` 不变（文件是真的），`warnings` 只在触发时出现，
+  未触发时返回体与 0.0.101 逐字节相同。
+- `advice` 直接给出 `translate_board` 的 `dx` / `dy`。符号这里最容易反：编辑 API 是 Y 向上、
+  文件是 Y 向下，所以抬高 `y_min = -30.48` 的板要填 `dy = -30.48`（等于 `y_min`），不是相反数。
+
+### Changed
+
+- 负坐标与超尺寸拆成两种原因：板在纸内但坐在负半轴时只报「落在负坐标 + 怎么搬」，
+  只在真的比纸大时报 `clipped, not scaled`。此前一因两果。
+- `_paper_mm`：认得的纸名按表查（统一按横向算），`(paper "User" W H)` 用自带尺寸，
+  不认识的纸名 / 没尺寸的 `User` 一律**不判**——不出现 `paper` 也不出现 `fits_paper`。
+
+### Tests
+
+- `tests/test_graphics_placement.py` 八例。关键一条是端到端：
+  `test_the_advice_actually_clears_the_warning` 把 `dx` / `dy` **从警告里读出来**（不是写在测试里），
+  执行 `translate_board` 后重出一张 PDF，要求 `warnings` 清空、`fits_paper` 为真、`bbox` 的
+  `y_min` 落在 0.00。建议只要还是文案，这条就会红。
+- `run_server.py --selftest` **329 → 331**，两条都是 `board_extent`：一条判盒子与「读不了不判」，
+  一条把警告里的 `dx` / `dy` 原样交给 `translate_board`，要求警告消失、`y_min` 恰好落在 0.00
+  （符号填反只会「搬到了别处」，不会红——所以判据是「警告清空」而不是「搬过」）。
+
+### Docs
+
+- `docs/99` 追加 §99.7（同一块 F412 平移前后两行读数、符号的由来、六种「不判」情形、三条诚实披露）。
+
 ## [0.0.101] - 2026-11-03
 
 **STM32F412RGT6 核心板：把 DRC 118 → 0 之后的全部读数落成一份可对账的板卡报告**

@@ -9772,7 +9772,12 @@ _tool(
     "Layer plot for humans: pdf / svg / dxf / ps / 3dpdf. `layers` defaults to every "
     "copper layer plus F.SilkS / B.SilkS / Edge.Cuts, read from the board file - "
     "kicad-cli refuses a plot with no layer list, so the list comes from the design and "
-    "is echoed back. dxf writes one file per layer.",
+    "is echoed back. dxf writes one file per layer. Every pdf / svg / ps / dxf answer "
+    "also carries `placement`: the board's extent in FILE coordinates and whether the "
+    "sheet holds it. kicad-cli places a plot by those coordinates, so a design drawn at "
+    "negative y prints off the page and the page comes back blank while the export says "
+    "ok - that case stays status=ok (the file is real) and adds `warnings` plus an "
+    "`advice` block naming the exact translate_board dx/dy that clears it.",
     {"type": "object", "properties": {
         "path": _str("the .kicad_pcb file"),
         "format": _str("pdf / svg / dxf / ps / 3dpdf", enum=["pdf", "svg", "dxf", "ps", "3dpdf"]),

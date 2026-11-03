@@ -6641,6 +6641,106 @@ def selftest():
             os.environ["PCB_AGENT_EXPERIENCE"] = _ex_switch
         _shutil.rmtree(_ex_tmp, ignore_errors=True)
 
+    # --- where a plot will land (0.0.102) -------------------------------
+    # The trap docs/99 records: a design drawn at negative y is plotted by those
+    # coordinates, so the page comes back blank while the export says ok. Then the
+    # advice has to work - the last assertion here executes it and requires the
+    # note to go quiet.
+    _pl_tmp = _tempfile.mkdtemp(prefix="pcbagent-place-")
+    try:
+        _pl_body = [
+            '(kicad_pcb (version 20221018) (generator pcbnew)',
+            '  (general (thickness 1.6))',
+            '  (paper "A4")',
+            '  (layers (0 "F.Cu" signal) (31 "B.Cu" signal)',
+            '    (37 "F.SilkS" user) (44 "Edge.Cuts" user))',
+            '  (net 0 "") (net 1 "GND")',
+            '  (gr_line (start 10 -40) (end 60 -40) (layer "Edge.Cuts") (width 0.1)',
+            '    (tstamp 00000000-0000-0000-0000-000000000101))',
+            '  (gr_line (start 60 -40) (end 60 -10) (layer "Edge.Cuts") (width 0.1)',
+            '    (tstamp 00000000-0000-0000-0000-000000000102))',
+            '  (gr_line (start 60 -10) (end 10 -10) (layer "Edge.Cuts") (width 0.1)',
+            '    (tstamp 00000000-0000-0000-0000-000000000103))',
+            '  (gr_line (start 10 -10) (end 10 -40) (layer "Edge.Cuts") (width 0.1)',
+            '    (tstamp 00000000-0000-0000-0000-000000000104))',
+            '  (footprint "SYN:Pad" (layer "F.Cu") (at 30 -25) (attr smd)',
+            '    (fp_text reference "R1" (at 0 0) (layer "F.SilkS")',
+            '      (effects (font (size 1 1) (thickness 0.15))))',
+            '    (pad "1" smd rect (at 0 0) (size 1 1)',
+            '      (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "GND")))',
+            '  (segment (start 10 -40) (end 30 -25) (width 0.25) (layer "F.Cu")',
+            '    (net 1) (tstamp 00000000-0000-0000-0000-000000000120))',
+            '  (via (at 30 -25) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu")',
+            '    (net 1) (tstamp 00000000-0000-0000-0000-000000000121))',
+            ')',
+        ]
+        _pl_neg = os.path.join(_pl_tmp, "neg.kicad_pcb")
+        with open(_pl_neg, "w", encoding="utf-8", newline="\n") as _fh:
+            _fh.write("\n".join(_pl_body) + "\n")
+        # the same body shifted into positive numbers, so the two boards differ in
+        # nothing but where they sit
+        _pl_pos = os.path.join(_pl_tmp, "pos.kicad_pcb")
+        with open(_pl_pos, "w", encoding="utf-8", newline="\n") as _fh:
+            _fh.write(("\n".join(_pl_body).replace("-40", "40")
+                       .replace("-25", "25").replace("-10", "10")) + "\n")
+
+        from . import fab as _pl_fab
+        _pl_a = _pl_fab.board_extent(_pl_pos)
+        _pl_b = _pl_fab.board_extent(_pl_neg)
+        _pl_bad = _pl_fab.board_extent(os.path.join(_pl_tmp, "absent.kicad_pcb"))
+        check("a plot is placed by the design's own coordinates, so the tool now says "
+              "where the board sits before it draws: a positive board fits an A4 and "
+              "warns about nothing, a board at negative y is named on that axis and "
+              "the box is NOT silently flipped into positive numbers, and a file that "
+              "cannot be read comes back as no measurement instead of a pass",
+              _pl_a is not None and _pl_a.get("warnings") == []
+              and _pl_a.get("fits_paper") is True
+              and _pl_a.get("positions") == 12
+              and _pl_b is not None and _pl_b.get("negative_axes") == ["y"]
+              and _pl_b.get("fits_paper") is False
+              and _pl_b.get("bbox_file_mm", {}).get("y_min") == -40.0
+              and _pl_b.get("bbox_file_mm", {}).get("y_max") == -10.0
+              and len(_pl_b.get("warnings") or []) == 1
+              and _pl_bad is None,
+              "pos %s positions %s, neg %s axes %s warnings %s, bad %s"
+              % (_pl_a and _pl_a.get("bbox_file_mm"), _pl_a and _pl_a.get("positions"),
+                 _pl_b and _pl_b.get("bbox_file_mm"), _pl_b and _pl_b.get("negative_axes"),
+                 _pl_b and len(_pl_b.get("warnings") or []), _pl_bad))
+
+        # The advice carried in the warning has to be executable, and the sign is the
+        # crux: the edit API is y-up while the file is y-down, so lifting a board
+        # whose y_min is -40 takes dy = -40, not +40. A wrong sign here still passes
+        # "it moved", so the assertion is that the note goes quiet.
+        from . import edit as _pl_edit
+        _pl_adv = (_pl_b or {}).get("advice") or {}
+        _pl_plan = _pl_edit.propose(_pl_neg, [{"op": "translate_board",
+                                               "dx": _pl_adv.get("dx"),
+                                               "dy": _pl_adv.get("dy")}])
+        _pl_blocking = _pl_plan.get("blocking") or []
+        _pl_app = {}
+        if not _pl_blocking:
+            _pl_app = _pl_edit.apply_plan(_pl_plan["plan_id"], confirm=True,
+                                          options=dict(engine=False)) or {}
+        _pl_after = _pl_fab.board_extent(_pl_neg)
+        check("and following the advice actually clears it: the dx/dy taken from the "
+              "warning are handed straight to translate_board, and afterwards the "
+              "same board measures warnings=[] with y_min exactly on the origin - so "
+              "the note is a repair, not a sentence, and a flipped sign cannot pass "
+              "by having moved the board somewhere",
+              _pl_adv.get("dy") == -40.0 and _pl_adv.get("dx") == 0.0
+              and not _pl_blocking
+              and (_pl_app.get("status") in (None, "ok"))
+              and _pl_after is not None
+              and _pl_after.get("warnings") == []
+              and "negative_axes" not in _pl_after
+              and _pl_after.get("bbox_file_mm", {}).get("y_min") == 0.0
+              and _pl_after.get("fits_paper") is True,
+              "advice %s, blocking %s, apply %s, after %s"
+              % (_pl_adv, _pl_blocking, _pl_app.get("status"),
+                 _pl_after and _pl_after.get("bbox_file_mm")))
+    finally:
+        _shutil.rmtree(_pl_tmp, ignore_errors=True)
+
     failed = [c for c in checks if not c[1]]
     for name, good, detail in checks:
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
