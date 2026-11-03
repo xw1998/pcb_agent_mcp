@@ -2651,6 +2651,29 @@ op("set_pad_size", {"copper"},
     "height": "mm > 0 (default: the width)"},
    _run_set_pad_size, _verify_set_pad_size)
 
+FIELD_SILK_OR_DOC_LAYERS = ("F.SilkS", "B.SilkS", "F.Fab", "B.Fab",
+                           "F.CrtYd", "B.CrtYd", "Dwgs.User", "Cmts.User")
+
+
+def _opt_mm(o, key):
+    """An optional millimetre parameter: absent -> None, present -> a float.
+
+    Deliberately stricter than `float()`: a string that is not a number, a bool
+    and a NaN all mean the caller and the server disagree about units, and
+    writing is not the place to find out.
+    """
+    if key not in o or o.get(key) is None:
+        return None
+    v = o.get(key)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise OpError("%r must be a number in millimetres (got %r)"
+                      % (key, v), "ARG_INVALID")
+    v = float(v)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise OpError("%r must be finite" % key, "ARG_INVALID")
+    return v
+
+
 def _run_set_field(ed, o, seed):
     ref = _str(o, "ref")
     name = _str(o, "field")
@@ -2698,14 +2721,88 @@ def _run_set_field(ed, o, seed):
             S.append_child(target, B.L(B.A("hide"), B.A("yes")))
         elif want and hide is not None:
             target.items = [it for it in target.items if it is not hide]
+    # --- geometry: which layer the text prints on, where, how big ----------
+    # All three are optional and independent. A caller that names none of them
+    # gets exactly the behaviour this operation had before it grew them: the
+    # text changes and visibility changes, the geometry is left alone.
+    moved = {}
+    layer = o.get("layer")
+    if layer is not None:
+        if not isinstance(layer, str) or not layer:
+            raise OpError("'layer' must be a layer name", "ARG_INVALID")
+        ed.require_layer(layer, allowed=FIELD_SILK_OR_DOC_LAYERS)
+        ln = S.child(target, "layer")
+        if ln is None:
+            S.append_child(target, B.L(B.A("layer"), B.A(layer, True)))
+        else:
+            ln.items = [B.A("layer"), B.A(layer, True)]
+        moved["layer"] = layer
+
+    want_x = _opt_mm(o, "x")
+    want_y = _opt_mm(o, "y")
+    if want_x is not None or want_y is not None:
+        at = S.child(target, "at")
+        if at is None:
+            at = B.at(0.0, 0.0, 0)
+            S.append_child(target, at)
+        # `(at x y)` inside a footprint is in the footprint's own frame, whose Y
+        # points DOWN like the file's. The parameter is Y-UP like every other
+        # coordinate this server takes, so the sign flips exactly once here.
+        nx = S.arg_num(at, 1, 0.0) if want_x is None else want_x
+        ny_file = S.arg_num(at, 2, 0.0) if want_y is None else -want_y
+        rot = S.arg_num(at, 3, None)
+        at.items = [B.A("at"), B.A(B.num(nx)), B.A(B.num(ny_file))]
+        if rot is not None:
+            at.items.append(B.A(B.num(rot)))
+        moved["x"] = nx
+        moved["y"] = -ny_file
+        moved["angle"] = rot
+
+    want_h = _opt_mm(o, "text_height")
+    want_w = _opt_mm(o, "text_width")
+    if want_h is not None or want_w is not None:
+        for nm, v in (("text_height", want_h), ("text_width", want_w)):
+            if v is not None and v <= 0:
+                raise OpError("%s must be positive (got %s mm)" % (nm, v),
+                              "ARG_INVALID")
+        effects = S.child(target, "effects")
+        if effects is None:
+            effects = B.L(B.A("effects"))
+            S.append_child(target, effects)
+        font = S.child(effects, "font")
+        if font is None:
+            font = B.L(B.A("font"))
+            effects.items.append(font)
+        node = S.child(font, "size")
+        cur_w = S.arg_num(node, 1, 1.0) if node is not None else 1.0
+        cur_h = S.arg_num(node, 2, 1.0) if node is not None else 1.0
+        nw = cur_w if want_w is None else want_w
+        nh = cur_h if want_h is None else want_h
+        if node is None:
+            font.items.append(B.size(nw, nh))
+        else:
+            node.items = [B.A("size"), B.A(B.num(nw)), B.A(B.num(nh))]
+        moved["text_width"] = nw
+        moved["text_height"] = nh
+
     return {"reference": ref, "field": name, "value": value,
-            "created": created, "visible": visible}
+            "created": created, "visible": visible,
+            "geometry": moved or None}
 
 def _verify_set_field(ed, o):
     ref = _str(o, "ref")
     name = _str(o, "field")
     value = o.get("value")
-    fp = ed.footprint(ref)
+    try:
+        fp = ed.footprint(ref)
+    except OpError:
+        # Renaming a Reference is the one case where the footprint can no longer
+        # answer to the name the plan used: after the write the only handle left
+        # is the new name. Before 0.0.98 this path raised REFERENCE_NOT_FOUND
+        # and the write was rolled back, which made "rename a part" impossible.
+        if name.lower() != "reference" or not isinstance(value, str) or not value:
+            raise
+        fp = ed.footprint(value)
     for kind in ("property", "fp_text"):
         for cand in S.children(fp, kind):
             if (S.arg_text(cand, 1) or "").lower() != name.lower():
@@ -2715,14 +2812,72 @@ def _verify_set_field(ed, o):
             if o.get("visible") is not None:
                 out["visible"] = S.child(cand, "hide") is None
                 out["ok"] = out["ok"] and out["visible"] == bool(o.get("visible"))
+            if o.get("layer"):
+                ln = S.child(cand, "layer")
+                out["layer"] = S.arg_text(ln, 1) if ln is not None else None
+                out["ok"] = out["ok"] and out["layer"] == o["layer"]
+            # Only the axes the caller named are checked: the other one keeps
+            # whatever it had, and pretending to verify a number nobody asked
+            # to change would turn a pass into a decoration.
+            if o.get("x") is not None or o.get("y") is not None:
+                at = S.child(cand, "at")
+                if at is None:
+                    out["ok"] = False
+                    out["reason"] = "field has no (at) after the write"
+                else:
+                    checks = {}
+                    if _opt_mm(o, "x") is not None:
+                        checks["x"] = (S.arg_num(at, 1, None), _opt_mm(o, "x"))
+                    if _opt_mm(o, "y") is not None:
+                        got_y = S.arg_num(at, 2, None)
+                        checks["y"] = (None if got_y is None else -got_y,
+                                       _opt_mm(o, "y"))
+                    out["position"] = {k: v[0] for k, v in checks.items()}
+                    for k, (got, want) in checks.items():
+                        if got is None or abs(got - want) > 1e-4:
+                            out["ok"] = False
+                            out["reason"] = ("%s reads %r, the plan said %r"
+                                             % (k, got, want))
+            if o.get("text_height") is not None or o.get("text_width") is not None:
+                node = None
+                effects = S.child(cand, "effects")
+                font = S.child(effects, "font") if effects is not None else None
+                if font is not None:
+                    node = S.child(font, "size")
+                sizes = {}
+                if node is not None:
+                    if _opt_mm(o, "text_width") is not None:
+                        sizes["text_width"] = (S.arg_num(node, 1, None),
+                                               _opt_mm(o, "text_width"))
+                    if _opt_mm(o, "text_height") is not None:
+                        sizes["text_height"] = (S.arg_num(node, 2, None),
+                                                _opt_mm(o, "text_height"))
+                else:
+                    out["ok"] = False
+                    out["reason"] = "field has no (effects (font (size ...)))"
+                if sizes:
+                    out["text_size"] = {k: v[0] for k, v in sizes.items()}
+                for k, (got, want) in sizes.items():
+                    if got is None or abs(got - want) > 1e-4:
+                        out["ok"] = False
+                        out["reason"] = ("%s reads %r, the plan said %r"
+                                         % (k, got, want))
             return out
     return {"ok": False, "reason": "field not present after write"}
 
 op("set_footprint_field", {"silk", "mech", "meta"},
    "Set the text of one field of a placed footprint (Reference, Value, or any "
-   "property) and optionally show or hide it.",
+   "property), show or hide it, and optionally move it to another "
+   "silkscreen/documentation layer, another local position or another text "
+   "size. Every geometry parameter is optional: name none of them and the "
+   "field keeps the layer, position and size it had.",
    {"ref": "reference designator", "field": "field name, e.g. Reference",
-    "value": "string (\"\" clears it)", "visible": "bool - optional"},
+    "value": "string (\"\" clears it)", "visible": "bool - optional",
+    "layer": "layer name (F.SilkS / B.SilkS / F.Fab / B.Fab / *.CrtYd / "
+             "Dwgs.User / Cmts.User) - optional",
+    "x": "mm, footprint-local X, Y up - optional",
+    "y": "mm, footprint-local Y up (the file's own Y is the negation) - optional",
+    "text_height": "mm - optional", "text_width": "mm - optional"},
    _run_set_field, _verify_set_field)
 
 def _run_mech_arc(ed, o, seed):

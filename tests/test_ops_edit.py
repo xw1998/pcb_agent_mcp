@@ -573,6 +573,107 @@ class PadsAndFields(EditBase):
                         "field": "Value"})
         self.assertEqual(ctx.exception.code, "ARG_MISSING")
 
+class FieldGeometry(EditBase):
+    """The optional layer / position / size arguments added in 0.0.98.
+
+    The rule these tests defend: naming none of them must leave the field
+    exactly as it was, and naming one must not quietly move the others.
+    """
+
+    def _field(self, name="reference", ref="R1"):
+        return [f for f in S.children(self.footprint(ref), "fp_text")
+                if S.arg_text(f, 1) == name][0]
+
+    def test_naming_no_geometry_leaves_the_field_where_it_was(self):
+        at0 = S.child(self._field(), "at")
+        x0, y0 = S.arg_num(at0, 1), S.arg_num(at0, 2)
+        layer0 = S.arg_text(S.child(self._field(), "layer"), 1)
+        self.assertIsNone(S.child(self._field(), "effects"),
+                          "the fixture field has no effects node - if that "
+                          "changes, this test stops proving anything")
+        self.apply({"op": "set_footprint_field", "ref": "R1",
+                    "field": "Reference", "value": "R99"})
+        field = self._field(ref="R99")
+        self.assertEqual(S.arg_text(field, 2), "R99")
+        at = S.child(field, "at")
+        self.assertAlmostEqual(S.arg_num(at, 1), x0, places=9)
+        self.assertAlmostEqual(S.arg_num(at, 2), y0, places=9)
+        self.assertEqual(S.arg_text(S.child(field, "layer"), 1), layer0)
+        self.assertIsNone(S.child(field, "effects"),
+                          "a size nobody asked for must not be invented")
+
+    def test_a_field_can_move_layer_position_and_size_at_once(self):
+        plan, _ = self.apply({"op": "set_footprint_field", "ref": "R1",
+                              "field": "Reference", "value": "R1",
+                              "layer": "F.Fab", "x": 1.5, "y": -3.25,
+                              "text_height": 0.8, "text_width": 0.9})
+        field = self._field()
+        self.assertEqual(S.arg_text(S.child(field, "layer"), 1), "F.Fab")
+        at = S.child(field, "at")
+        self.assertAlmostEqual(S.arg_num(at, 1), 1.5, places=6)
+        # Y is Y-UP on the way in and Y-DOWN in the file: -3.25 in, +3.25 out
+        self.assertAlmostEqual(S.arg_num(at, 2), 3.25, places=6)
+        node = S.child(S.child(S.child(field, "effects"), "font"), "size")
+        self.assertAlmostEqual(S.arg_num(node, 1), 0.9, places=6)
+        self.assertAlmostEqual(S.arg_num(node, 2), 0.8, places=6)
+        detail = plan["operations"][0]["detail"]["geometry"]
+        self.assertEqual(detail["layer"], "F.Fab")
+        self.assertAlmostEqual(detail["x"], 1.5, places=6)
+        self.assertAlmostEqual(detail["y"], -3.25, places=6)
+
+    def test_naming_one_axis_keeps_the_other_and_the_angle(self):
+        at0 = S.child(self._field(), "at")
+        y0 = S.arg_num(at0, 2)
+        self.apply({"op": "set_footprint_field", "ref": "R1",
+                    "field": "Reference", "value": "R1", "x": 2.5})
+        at = S.child(self._field(), "at")
+        self.assertAlmostEqual(S.arg_num(at, 1), 2.5, places=6)
+        self.assertAlmostEqual(S.arg_num(at, 2), y0, places=6)
+
+    def test_a_layer_the_board_does_not_declare_is_refused(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_footprint_field", "ref": "R1",
+                        "field": "Reference", "value": "R1",
+                        "layer": "F.Nope"})
+        self.assertEqual(ctx.exception.code, "LAYER_NOT_IN_BOARD")
+        self.assertEqual(S.arg_text(S.child(self._field(), "layer"), 1),
+                         "F.SilkS", "a refused op must not have written")
+
+    def test_a_position_written_as_text_is_refused(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_footprint_field", "ref": "R1",
+                        "field": "Reference", "value": "R1", "x": "1.5"})
+        self.assertEqual(ctx.exception.code, "ARG_INVALID")
+
+    def test_a_non_positive_text_size_is_refused(self):
+        for size in (0, -0.8):
+            with self.assertRaises(O.OpError) as ctx:
+                self.apply({"op": "set_footprint_field", "ref": "R1",
+                            "field": "Reference", "value": "R1",
+                            "text_height": size})
+            self.assertEqual(ctx.exception.code, "ARG_INVALID")
+
+    def test_the_verifier_notices_a_field_that_did_not_move(self):
+        """The negative control: a passing verify must mean something.
+
+        After a write that moved the field to x=2.5, asking the verifier to
+        confirm x=4.0 has to come back False - otherwise `all_verified` is a
+        constant and the gate is decoration.
+        """
+        self.apply({"op": "set_footprint_field", "ref": "R1",
+                    "field": "Reference", "value": "R1", "x": 2.5})
+        spec = O.OPS["set_footprint_field"]
+        out = spec["verify"](self.editor(),
+                             {"ref": "R1", "field": "Reference",
+                              "value": "R1", "x": 4.0})
+        self.assertFalse(out["ok"], out)
+        self.assertIn("reads", out.get("reason", ""))
+        ok = spec["verify"](self.editor(),
+                            {"ref": "R1", "field": "Reference",
+                             "value": "R1", "x": 2.5})
+        self.assertTrue(ok["ok"], ok)
+
+
 
 class MechArc(EditBase):
     def test_the_arc_lands_on_the_requested_layer(self):

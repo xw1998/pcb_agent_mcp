@@ -9,6 +9,54 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.98] - 2026-11-03
+
+**`set_footprint_field` 加五个可选几何参数：字段印在哪一层、在哪、多大**
+**顺带修掉「改不了位号名字」——写后 `verify` 还按旧名字找封装，改名永远回滚**
+（`test_ops_edit` 71 例 → 78 例 / 受影响的五个模块 **160 例全绿** /
+工具数仍 **192**、写 op 仍 **40**、`dependencies = []` 仍成立）
+
+### 1. 32 条 `text_height` 与 46 条丝印冲突，都指向同一个缺口
+
+STM32F412RGT6 核心板（`kicad-cli pcb drc --severity-all`）第一版 **118 条**，其中
+`text_height` **32**（位号 0.7 mm，低于板厂最小丝印字高 0.8 mm）、`silk_over_copper`
+**24**、`silk_overlap` **14**。把字高抬到 0.8 之后总量 **118 → 46**，剩下的 46 条
+`silk_over_copper 26 + silk_overlap 18 + silk_edge 2` **100 % 涉及参考字段**——位号
+压在自己的丝印框或邻居的焊盘上。要修只能**挪它**，而那个 op 当时只会改字符串。
+
+新增五个可选参数：
+
+| 参数 | 语义 | 拒绝 |
+|---|---|---|
+| `layer` | 文本印在哪层 | 不在 `(layers)` 表 → `LAYER_NOT_IN_BOARD`；不在白名单 → `LAYER_NOT_ALLOWED` |
+| `x` / `y` | 封装**局部**坐标，**Y-up** | 非数 / 布尔 / `NaN` / `±inf` → `ARG_INVALID` |
+| `text_height` / `text_width` | 字高 / 字宽，mm | `≤ 0` → `ARG_INVALID` |
+
+三条约定：**白名单只有 8 层**（`F/B.SilkS`、`F/B.Fab`、`F/B.CrtYd`、`Dwgs.User`、
+`Cmts.User`）——**故意不许写铜层**，文字落到 `F.Cu` 就是真的加了一块铜、DRC 会按铜判，
+而调用者通常只想换地方；**`(at x y)` 在封装局部帧、Y 向下，参数是 Y-up，恰好翻转一次**；
+**只校验被点名的那一维**（给了 `x` 没给 `y`，`y` 保持不变但标未检查）——校验没人要求
+改的数字，通过率就是装饰。
+
+一个都不点名时行为与 0.0.97 相同，由用例**直接断言**（`effects` 子节点仍为 `None`：
+没人要的字号不能被凭空造出来）。
+
+### 2. 既有缺陷：改位号名字永远不可能成功
+
+`_verify_set_field` 第一句是 `ed.footprint(ref)`。当这次操作改的正是 **Reference 的值**，
+写完之后旧名字已不存在 ⇒ `REFERENCE_NOT_FOUND` ⇒ 整笔回滚。现在只在
+「`field == Reference` 且新值非空」这一种情况下改按新名字找，其余
+`REFERENCE_NOT_FOUND` 原样抛出。
+
+### 3. 门禁
+
+`tests/test_ops_edit.py::FieldGeometry` **7 例**，其中一条是**反假绿**：真写到 `x = 2.5`
+之后拿 `x = 4.0` 去问 `verify` 必须 `ok = False`、再拿 `2.5` 问必须 `True`。
+`test_ops_edit` **71 → 78 例**；`test_ops_edit + test_fidelity +
+test_board_ops_footprint + test_tools_profile + test_tools` 合计 **160 例 OK**。
+
+详见 [docs/98](docs/98-字段的图层位置与字号.md)。
+
 ## [0.0.97] - 2026-11-03
 
 **`board_view` 的焊盘坐标在非零角度的封装上绕自身原点镜像：J2B.6 报 x=-10.16，
