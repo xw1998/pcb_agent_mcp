@@ -83,7 +83,19 @@ def handle(request):
         return _ok(msg_id, {})
 
     if method == "tools/list":
-        return _ok(msg_id, {"tools": _tools.list_tools(_tools.toolset_from_env())})
+        # 0.0.109: `tools/call` has been capped since 0.0.104; `tools/list` was
+        # not, and the shipped `core` profile is 54 905 B against that same
+        # 48 KiB cap. The one reply every session must fetch before any tool
+        # runs was the one reply nothing measured - so the failure looked like
+        # "the mcp broke again", not like "a reply was too big".
+        specs = _tools.list_tools(_tools.toolset_from_env())
+        page, next_cursor, info = _tools.tools_page(
+            specs, _tools.max_result_chars(), (params or {}).get("cursor"))
+        listed = {"tools": page}
+        if next_cursor is not None:
+            listed["nextCursor"] = next_cursor
+        listed.update(info)
+        return _ok(msg_id, listed)
 
     if method == "tools/call":
         name = params.get("name")
@@ -322,8 +334,16 @@ def serve(stdin=None, stdout=None):
             return
 
 
-def selftest():
-    """Protocol-level smoke test without any client."""
+def selftest(verbose=False):
+    """Protocol-level smoke test without any client.
+
+    Prints FAIL lines plus a summary by default. 0.0.108 printed all 344 lines
+    unconditionally - a 85 KB stdout, which is the same trap the tool replies
+    had: a diagnostic that does not fit the conversation stops being read. The
+    detail still exists, one flag away (`--selftest --verbose` or
+    PCB_AGENT_SELFTEST_VERBOSE=1), because hiding a passing line is not the
+    same thing as hiding a failing one.
+    """
     import time as _stime
     checks = []
     # 逐条耗时是这套闸门自己的闸门：跑一次要几分钟的自检等于没人跑，而没人跑
@@ -7027,6 +7047,97 @@ def selftest():
     else:
         os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kb_before_selftest
 
+    # --- 0.0.109 tools/list 也有预算 --------------------------------------
+    # 0.0.104 给 tools/call 上了 48 KiB 的闸门，但每次会话第一件事就是拉
+    # tools/list，而它一直是原样全发：core 档 54 905 B、all 档 300 159 B。守了
+    # 回包的体积，没守自己发出去的体积 —— 而宿主只会把这件事报成"服务坏了"。
+    def _tsize(obj):
+        return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _ask_list(cursor=None):
+        _req = {"jsonrpc": "2.0", "id": 900, "method": "tools/list"}
+        if cursor:
+            _req["params"] = {"cursor": cursor}
+        return handle(_req)["result"]
+
+    _ts_before = os.environ.get("PCB_AGENT_TOOLSET")
+    _kb_before_list = os.environ.get("PCB_AGENT_MAX_RESULT_KB")
+    try:
+        os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)      # 文档上的默认值
+        os.environ["PCB_AGENT_TOOLSET"] = "core"
+        _raw_core = _tools.list_tools("core")
+        _one = _ask_list()
+        _one_bytes = _tsize(_one)
+        check("tools/list in the default `core` profile arrives in one page inside "
+              "the same 48 KiB the tool replies are held to: the reply every "
+              "session fetches before any tool runs was the one reply nothing "
+              "measured (54 905 B raw against a 49 152 B cap)",
+              len(_one["tools"]) == len(_raw_core)
+              and "nextCursor" not in _one
+              and _one_bytes <= 48 * 1024,
+              "%d tools, %d B, cap %d B" % (len(_one["tools"]), _one_bytes, 48 * 1024))
+
+        # 反向对照：把预算压到 8 KiB。分页必须一条不丢 —— 少了这一条，上面
+        # 那句"一页装得下"就只是在蛾耀默认档小，而不是在证明机制对。
+        os.environ["PCB_AGENT_MAX_RESULT_KB"] = "8"
+        _seen, _cur, _pages, _worst = [], None, 0, 0
+        while True:
+            _p = _ask_list(_cur)
+            _pages += 1
+            _worst = max(_worst, _tsize(_p))
+            _seen += [t["name"] for t in _p["tools"]]
+            _cur = _p.get("nextCursor")
+            if not _cur or _pages > 40:
+                break
+        check("with the budget forced down to 8 KiB, tools/list pages instead of "
+              "dropping entries: every page fits, the pages cover all %d tools in "
+              "order, and none is listed twice" % len(_raw_core),
+              _seen == [t["name"] for t in _raw_core]
+              and _worst <= 8 * 1024
+              and len(_seen) == len(set(_seen)),
+              "%d pages, worst %d B, %d/%d tools"
+              % (_pages, _worst, len(_seen), len(_raw_core)))
+
+        os.environ["PCB_AGENT_MAX_RESULT_KB"] = "0"      # pop would fall back to 48
+        _full = _ask_list()
+        check("with the cap switched off, tools/list is byte for byte the old "
+              "answer - so shortening a description can never quietly edit a "
+              "schema, and a caller who asks for the full prose gets exactly the "
+              "prose that existed before this release",
+              json.dumps(_full["tools"], ensure_ascii=False)
+              == json.dumps(_raw_core, ensure_ascii=False)
+              and "descriptions_shortened" not in _full,
+              "%d B" % _tsize(_full))
+
+        os.environ["PCB_AGENT_TOOLSET"] = "all"
+        os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)   # 回到文档默认的 48 KiB
+        _raw_all = _tools.list_tools("all")
+        _seen2, _cur2, _pages2, _worst2 = [], None, 0, 0
+        while True:
+            _p = _ask_list(_cur2)
+            _pages2 += 1
+            _worst2 = max(_worst2, _tsize(_p))
+            _seen2 += [t["name"] for t in _p["tools"]]
+            _cur2 = _p.get("nextCursor")
+            if not _cur2 or _pages2 > 40:
+                break
+        check("the `all` profile (190 tools, %d B raw) still reaches every tool "
+              "through the cursor while no page exceeds the cap: the profile most "
+              "likely to kill a session is now the one with a measured way out"
+              % _tsize(_raw_all),
+              _seen2 == [t["name"] for t in _raw_all]
+              and _worst2 <= 48 * 1024,
+              "%d pages, worst %d B, %d tools" % (_pages2, _worst2, len(_seen2)))
+    finally:
+        if _ts_before is None:
+            os.environ.pop("PCB_AGENT_TOOLSET", None)
+        else:
+            os.environ["PCB_AGENT_TOOLSET"] = _ts_before
+        if _kb_before_list is None:
+            os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)
+        else:
+            os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kb_before_list
+
     # --- 0.0.107 自动布线/自动布局已摘除：不是关掉，是不存在 -------------
     _all_names = [t["name"] for t in _tools.list_tools("all")]
     _gone = [n for n in ("board_route", "board_fanout") if n in _all_names]
@@ -7166,16 +7277,23 @@ def selftest():
           _tot <= 180.0 and _worst[0] <= 35.0,
           "total %.1fs, slowest %.1fs (%s)" % (_tot, _worst[0], _worst[1][:60]))
     failed = [c for c in checks if not c[1]]
-    for name, good, detail in checks:
+    _loud = verbose or os.environ.get("PCB_AGENT_SELFTEST_VERBOSE") not in (None, "", "0")
+    for name, good, detail in (checks if _loud else failed):
         _log(("PASS  " if good else "FAIL  ") + name + (("  [" + detail + "]") if detail else ""))
-    _log("%d/%d passed" % (len(checks) - len(failed), len(checks)))
+    if not _loud:
+        _slow = sorted(_times, reverse=True)[:5]
+        _slow_txt = ", ".join("%.1fs %s" % (t, n[:38]) for t, n in _slow)
+        _log("  slowest: " + (_slow_txt or "-"))
+        _log("  %d passing checks hidden; --selftest --verbose (or "
+             "PCB_AGENT_SELFTEST_VERBOSE=1) prints every line" % (len(checks) - len(failed)))
+    _log("%d/%d passed in %.1fs" % (len(checks) - len(failed), len(checks), _tot))
     return 1 if failed else 0
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--selftest" in argv:
-        raise SystemExit(selftest())
+        raise SystemExit(selftest(verbose="--verbose" in argv))
     if "--version" in argv:
         print("%s %s" % (SERVER_NAME, __version__))
         return

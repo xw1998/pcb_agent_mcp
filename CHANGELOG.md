@@ -9,6 +9,38 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.109] - 2026-11-03
+
+### Added
+- `tools_page()` — `tools/list` 现在也受体积预算约束，三层：装得下逐字节原样发、
+  装不下先瘦身描述（`description` 200 字符 / schema 内各参数 80 字符，名字/类型/
+  `required`/默认值一字不动）、仍装不下才用 MCP 游标分页（`params.cursor` 进、
+  `result.nextCursor` 出）。**分页只花往返次数，不丢条目。**
+- 自检新增 4 条判据：默认 `core` 档一页且 ≤48 KiB；预算强制 8 KiB 时分页必须覆盖
+  全部 46 条且每页 ≤8 KiB（反向对照）；闸门关掉时逐字节等于旧答案；`all` 档跟游标
+  覆盖全部 190 条且每页 ≤48 KiB。
+- `--selftest --verbose` / `PCB_AGENT_SELFTEST_VERBOSE=1` 打印全部检查行。
+
+### Changed
+- `--selftest` 默认只打 FAIL 明细 + 最慢 5 条 + 汇总：**stdout 85 KB → 4 002 B**。
+  通过的检查行默认隐藏，失败行任何档位照打。
+- `tests/test_server_protocol.py::test_tools_list_follows_the_profile` 改为走游标
+  计数（原来断言「`all` 一次返回 190 条」，分页后会因正确的原因变红）。
+
+### Fixed
+- **`tools/list` 是唯一没有体积闸门的出口**：`tools/call` 自 0.0.104 起有 48 KiB
+  上限，而每次会话必拉的 `tools/list` 原样全发——`core` 档 **54 905 B**（46 条，
+  超 48 KiB 共 5 753 B）、`all` 档 **300 159 B**（190 条）。宿主只会把这件事报成
+  「服务坏了 / 对话中断」，不会报成「应答太大」。修后 `core` 39 102 B 一页、
+  `all` 5 页最坏 48 466 B。
+
+### Documented
+- `docs/109-tools-list才是那条没闸门的应答.md`（归因读数、三层修法、两条反向对照
+  各自红过一次的经过、三行取证手册、三条欠账）。
+
+### Measured
+- `--selftest`：348/348 PASS，124.6 s，最慢 25.3 s（棘轮 180 s / 35 s 内）。
+
 ## [0.0.108] - 2026-11-03
 
 ### Added

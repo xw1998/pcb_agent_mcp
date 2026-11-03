@@ -124,8 +124,20 @@ class TheProtocolSurface(unittest.TestCase):
             self.assertEqual(len(core["result"]["tools"]),
                              len(tools.CORE_TOOLS) + len(tools.META_TOOLS))
             os.environ["PCB_AGENT_TOOLSET"] = "all"
-            every = serve('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n')[0]
-            self.assertEqual(len(every["result"]["tools"]), len(tools.TOOLS))
+            # 0.0.109: the `all` profile is 300 159 B, so the server pages it with
+            # the MCP cursor instead of sending one oversized reply. Counting only
+            # the first page would now fail for the wrong reason, so walk the
+            # cursor and count what a client would actually receive.
+            seen, cursor = 0, None
+            while True:
+                params = ('"params":{"cursor":"%s"}' % cursor) if cursor else ""
+                page = serve('{"jsonrpc":"2.0","id":1,"method":"tools/list"%s}\n'
+                             % (("," + params) if params else ""))[0]["result"]
+                seen += len(page["tools"])
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    break
+            self.assertEqual(seen, len(tools.TOOLS))
 
     def test_the_optional_resource_and_prompt_queries_have_answers(self):
         for method, key in (("resources/templates/list", "resourceTemplates"),

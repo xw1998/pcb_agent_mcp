@@ -10199,6 +10199,130 @@ def list_tools(toolset="all"):
     ]
 
 
+# --- tools/list delivery budget -------------------------------------------
+# Until 0.0.109 `tools/call` was capped at 48 KiB while `tools/list` was sent
+# whole. That is a contradiction with a cost: the default `core` profile is
+# 54 905 B (46 tools) and `all` is 300 159 B (190 tools), so the one reply every
+# session must fetch was the one reply nothing measured. A host that truncates
+# it silently loses tools; a host that fails the turn calls it a broken server
+# and the conversation ends - which is what "the mcp broke again" looked like.
+#
+# The fix is not to cut tools away. It walks the same list, but
+#   1. if the whole list already fits, it is sent byte for byte (no change at
+#      all for anyone who raises PCB_AGENT_MAX_RESULT_KB or has few tools);
+#   2. if it does not fit, descriptions are shortened first, because a name, a
+#      parameter type and a required list are what a caller needs to call a
+#      tool, while prose is what tool_search is for;
+#   3. only if it still does not fit is the list paged, with the MCP cursor
+#      protocol (`params.cursor` in, `result.nextCursor` out), so no tool is
+#      ever dropped - paging loses round trips, never entries.
+# Measured with the shipped profiles: core 54 905 -> 38 766 B after trimming
+# (one page, every tool, every parameter intact), all 300 159 -> 203 114 B
+# (five pages at the 48 KiB cap).
+_TOOLS_ENVELOPE_BYTES = 1024
+
+
+def _tools_trim_spec(spec, desc_cut=200, inner_cut=80):
+    """Copy `spec` with long prose shortened. Returns (spec, cut_fields)."""
+    import copy
+    out = copy.deepcopy(spec)
+    cut = 0
+
+    def short(text, limit):
+        if isinstance(text, str) and len(text) > limit:
+            return text[:limit].rstrip() + " ..."
+        return text
+
+    described = short(out.get("description"), desc_cut)
+    if described != out.get("description"):
+        cut += 1
+    out["description"] = described
+
+    def walk(node):
+        nonlocal cut
+        if isinstance(node, dict):
+            for key, val in list(node.items()):
+                if key == "description" and isinstance(val, str):
+                    new = short(val, inner_cut)
+                    if new != val:
+                        node[key] = new
+                        cut += 1
+                else:
+                    walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(out.get("inputSchema") or {})
+    return out, cut
+
+
+def tools_page(specs, cap_bytes, cursor=None):
+    """Fit `specs` into one reply of at most `cap_bytes`.
+
+    Returns (page, next_cursor, info). `info` is empty when nothing had to be
+    done - that is the contract that makes this safe to ship: an unchanged
+    answer stays unchanged, byte for byte, and only an answer that would not
+    have arrived at all is reshaped.
+    """
+    import json as _json
+
+    def size(obj):
+        return len(_json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    total = size(specs)
+    if not cursor and (not cap_bytes or total <= cap_bytes):
+        return specs, None, {}
+
+    start = 0
+    if cursor:
+        try:
+            start = max(0, int(str(cursor)))
+        except (TypeError, ValueError):
+            start = 0
+    if start >= len(specs):
+        return [], None, {"tools_total": len(specs), "tools_from": start}
+
+    # The cap is on the whole JSON-RPC reply, so the envelope has to be paid for
+    # out of it: {"tools":[...],"nextCursor":...,"tools_total":...,"note":...}
+    # with the note alone near 330 B. 0.0.109 first forgot this and measured a
+    # worst page of 49 397 B against a 49 152 B cap - over by 245 B, which is
+    # exactly the kind of quiet overshoot the page exists to prevent.
+    cap = (cap_bytes - _TOOLS_ENVELOPE_BYTES) if cap_bytes else (1 << 62)
+    cap = max(cap, 512)
+    trimmed = [_tools_trim_spec(s) for s in specs[start:]]
+    trimmed = [t[0] for t in trimmed]
+    page = []
+    used = 0
+    for spec in trimmed:
+        piece = size(spec) + 2          # the comma and newline of the array
+        if page and used + piece > cap:
+            break
+        if not page and piece > cap:
+            # A single entry that cannot fit even alone: keep the name and the
+            # schema shape, drop every description, and say so. Dropping the
+            # entry instead would make a tool invisible, which is worse than a
+            # bare one.
+            bare, _cut = _tools_trim_spec(spec, 0, 0)
+            page.append(bare)
+            used += size(bare) + 2
+            break
+        page.append(spec)
+        used += piece
+
+    end = start + len(page)
+    info = {"tools_total": len(specs), "tools_from": start,
+            "tools_returned": len(page)}
+    if len(page) != len(specs) or start or any(
+            t != s for t, s in zip(page, specs[start:end])):
+        info["descriptions_shortened"] = True
+        info["note"] = ("tool descriptions are shortened to keep this reply inside "
+                        "PCB_AGENT_MAX_RESULT_KB; names, parameters and required "
+                        "lists are complete. Set PCB_AGENT_MAX_RESULT_KB=0 for the "
+                        "full prose, or use tool_search for one tool's text.")
+    return page, (str(end) if end < len(specs) else None), info
+
+
 def call_tool(name, arguments):
     spec = TOOLS.get(name)
     if spec is None:
