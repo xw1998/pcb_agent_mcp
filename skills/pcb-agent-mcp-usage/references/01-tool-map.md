@@ -1,10 +1,10 @@
-# 工具全表（0.0.116 实测 192 个）
+# 工具全表（0.0.117 实测 193 个）
 
 用途：查名字。语义以 `tool_search` / `tools/list` 的当前返回为准，本表只给一句话索引。
 
 注意：默认档位 `core` 只广告其中约 45 个 + `tool_search` / `tool_call`。表里出现但清单里没有的，走 `tool_search` 找、`tool_call` 调。
 
-## 读板 / 写板 / 度量（39）
+## 读板 / 写板 / 度量（40）
 
 - `board_summary` — Open a board and report what the file actually carries: counts, board outline bbox, stackup, design rules, and
 - `board_components` — Every placed component with reference, value, library id, position (mm, Y up), rotation and pad count, plus a 
@@ -42,6 +42,7 @@
 - `board_vibration` — Natural frequencies of THIS board from its own outline and stackup, with every component sampled against the f
 - `board_electrothermal` — Board-level 2-D electro-thermal: every conductor's I^2R feeds a plate solve, and the plate temperature feeds b
 - `board_45_corners` — Measure the TURNS on a board, which this server never did before: clearance, edge and annular ring were all it
+- `board_stitch_vias` — Put ground vias on the board - the one thing every via tool here could only COMPUTE (resistance, current, ther
 - `board_fab_package` — Build a manufacturing package from a KiCad board: Gerbers (the board's own plot settings), Excellon drill (mm,
 - `board_export_graphics` — Layer plot for humans: pdf / svg / dxf / ps / 3dpdf.
 - `board_export_3d` — 3D solid export of a KiCad board: step / stpz / brep / glb / stl / ply / vrml / xao / u3d.

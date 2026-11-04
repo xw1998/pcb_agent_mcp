@@ -107,8 +107,16 @@ KiCad（以及所有 EDA）把铺铜结果**烘成多边形顶点**存进文件�
   关键处（晶振四周、接口进线、板边一圈）加密。
 - 信号换层时，**必须**在换层过孔旁就近放一个地过孔（回流路径跟着换）。
   只换信号不换回流 = 回流被迫绕一大圈。
-- 缝合孔只放在「两面都已经是地铜」的位置。工具（`board_stitch` / `return_path`）会报告它
-  因为那一侧没铜而跳过了哪些点——**跳过就是跳过，不是成功**。
+- 缝合孔只放在「两面都已经是地铜」的位置。`board_stitch_vias` 就是干这件事的：
+  `action="audit"` 读现状（现有同网过孔数、按 pitch 网格哪些点落在**两面填充铜**里却没有孔、
+  有多少换层信号过孔附近没有回流地孔），`action="place"` 出孔位计划。它按原因报告**跳过了哪些点**
+  （`no_pour_here` / `pour_edge_too_close` / `too_close`+网名+间隙 / `hole_too_close` /
+  `too_near_board_edge` / `existing_via` / `no_room_around_signal_via`）——**跳过就是跳过，不是成功**。
+- 判据是**点是否落在 `filled_polygon` 里**，不是落在 zone 外框里：外框是「铜可以去哪」，
+  填充才是「铜在哪」。一个写了 `(fill yes)` 却没有 `filled_polygon` 的区是**还没铺**，
+  报告 `pour_not_filled`，不许当覆盖。
+- 只算不落的那些工具（`via_resistance` / `via_current_allowed` / `thermal_via_array` /
+  `cavity_via_fence` / `pdn_plane_*`）回答的是「这个孔行不行」，不是「这块板缝没缝上」。
 
 ## 6. 禁布区（keepout）：不是装饰，是几何约束
 
@@ -137,7 +145,7 @@ KiCad（以及所有 EDA）把铺铜结果**烘成多边形顶点**存进文件�
 | 切角尺寸 | `L ≤ 0.4W`、`R ≥ 0.5W` | 尺寸可在 `chamfer` 的 `cut_mm_range` 上核 |
 | 间距/边距 | DRC `clearance`/`copper_edge_clearance` 为 0 | `board_drc(refill_zones=true)` |
 | 铺铜 | 每个电源网都有区；无 `starved_thermal`/`isolated_copper` | `board_drc` + `board_zones` |
-| 缝合 | 两面地之间的过孔数 > 0，且换层处就近有地孔 | `board_stitch` / `return_path` |
+| 缝合 | 两面地之间的过孔数 > 0（`existing_stitch_vias`），网格点无孔数 = 0，换层处无回流地孔数 = 0 | `board_stitch_vias(action="audit")` |
 | 回流 | 没有信号跨分割 | `board_cross_split` |
 | 禁布区 | 晶振/USB/按键/安装孔四处都能读出禁区 | `board_zones` |
 

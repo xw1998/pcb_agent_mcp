@@ -41,7 +41,7 @@ def served_tools_list():
 class TheProfileIsSmaller(unittest.TestCase):
     def test_the_default_reply_is_about_a_sixth_of_the_registry(self):
         line, listed = served_tools_list()
-        self.assertGreaterEqual(len(tools.TOOLS), 192,
+        self.assertGreaterEqual(len(tools.TOOLS), 193,
                                 "the registry shrank; re-measure before trusting "
                                 "the sizes in this file")
         self.assertLessEqual(len(listed), 50, "profile is not a profile: %d tools"

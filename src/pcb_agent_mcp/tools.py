@@ -9580,6 +9580,174 @@ _tool(
     lambda a: _guarded(lambda: _board_45_corners(a)),
 )
 
+def _board_stitch_vias(args):
+    """Sew two pours into one plane: audit the stitching, or plan the holes.
+
+    The server could compute a via's resistance, current and thermal fence, and
+    could pour copper - but it had no way to put a ground via ON the board. So two
+    ground planes with zero vias between them scored clean, which is exactly the
+    board a human calls "not sewn shut".
+    """
+    from . import edit as _edit
+    from .route import stitch as _stitch
+
+    board, e = _load_board(args)
+    if e:
+        return e
+    net = args.get("net") or "GND"
+    layers = tuple(args.get("layers") or ["F.Cu", "B.Cu"])
+    pitch = float(args.get("pitch_mm") or 3.0)
+    dia = float(args.get("dia_mm") or 0.6)
+    drill = float(args.get("drill_mm") or 0.3)
+    edge = float(args.get("edge_mm") or 0.5)
+    clr = float(args.get("clearance_mm") or 0.25)
+    near = args.get("near_via_mm")
+    near = pitch if near is None else float(near)
+
+    model = ("a stitching via is a hole whose annular ring sits inside the same "
+             "net's FILLED copper on every layer it spans - point in "
+             "filled_polygon, not point in the zone outline, because the outline "
+             "is where copper could go and the fill is where it is; spacing is "
+             "measured from the point to existing copper this server reads "
+             "itself (different net >= clearance from the annulus; any two drills "
+             ">= 0.25 mm apart, net-independent)")
+    basis = ("IPC-2221 / common two-layer practice: two pours are one plane only "
+             "where copper crosses between them (stitching), and a signal that "
+             "changes layer needs a return via within about one via pitch of that "
+             "change; the 0.25 mm hole-to-hole figure is KiCad's default and is a "
+             "fabrication rule, so it applies between two holes of the same net")
+    precision = ("\u00b10.0001 mm on grid points (the file's own coordinates); the "
+                 "point-in-fill and spacing tests are exact for the stored "
+                 "polygons, so a point within 1e-9 mm of a boundary may answer "
+                 "either way - hence the annular ring is also required to clear "
+                 "the fill's own boundary")
+
+    if args.get("action") == "place" or args.get("apply") is True:
+        try:
+            p = _stitch.plan(board, net=net, pitch_mm=pitch, dia_mm=dia,
+                             drill_mm=drill, edge_mm=edge, clearance_mm=clr,
+                             layers=layers, beside_vias=bool(
+                                 args.get("beside_vias", True)),
+                             near_via_mm=near,
+                             nudge_mm=float(args.get("nudge_mm", 0.4)))
+        except ValueError as exc:
+            return err(str(exc), "ARG_INVALID")
+        value = dict(p)
+        value["writes_nothing"] = args.get("apply") is not True
+        out = ok(value, "mm", model=model, basis=basis, precision=precision,
+                 assumptions={"net": net, "pitch_mm": pitch, "dia_mm": dia,
+                              "drill_mm": drill, "edge_mm": edge,
+                              "clearance_mm": clr, "layers": list(layers),
+                              "hole_clearance_mm": _stitch.HOLE_CLEARANCE_MM,
+                              "copper_spacing_checked_on": list(layers),
+                              "focused_on": "the fill as stored in the file"})
+        if p.get("refused"):
+            out["next_step"] = ("pour %s on %s first, or stitch different layers"
+                                % (net, ", ".join(p["layers_without_fill"])))
+            return out
+        if not p["ops"]:
+            out["message"] = ("no hole can go on this board with these "
+                              "parameters: %s" % p.get("skip_counts"))
+            return out
+        if args.get("apply") is not True:
+            out["next_step"] = ("pass apply=true to write these %d via(s) through "
+                                "board_propose + board_apply, then re-read with "
+                                "board_drc(refill_zones=true)" % len(p["ops"]))
+            return out
+        prop = _edit.propose(args["path"], p["ops"], {"engine": True})
+        try:
+            applied = _edit.apply_plan(
+                prop["plan_id"], confirm=True,
+                options={"engine": True,
+                         "allow_new_violations": bool(
+                             args.get("allow_new_violations")),
+                         "strict_drc": bool(args.get("strict_drc"))})
+        except _edit.EditError as exc:
+            return _edit_error(exc)
+        value["plan_id"] = prop["plan_id"]
+        value["applied"] = applied
+        value["writes_nothing"] = False
+        try:
+            board2, e2 = _load_board(args)
+            if e2 is None:
+                again = _stitch.audit(board2, net=net, pitch_mm=pitch,
+                                      near_via_mm=near, layers=layers,
+                                      edge_mm=edge)
+                value["after"] = {k: again.get(k) for k in
+                                  ("existing_stitch_vias", "verdict",
+                                   "points_without_a_via_half_pitch",
+                                   "signal_vias_without_nearby_return")}
+        except Exception:              # noqa: BLE001 - the write already happened
+            value["after"] = None
+        return out
+
+    value = _stitch.audit(board, net=net, pitch_mm=pitch, near_via_mm=near,
+                          layers=layers, edge_mm=edge)
+    value["writes_nothing"] = True
+    out = ok(value, "mm", model=model, basis=basis, precision=precision,
+             assumptions={"net": net, "pitch_mm": pitch, "near_via_mm": near,
+                          "edge_mm": edge, "layers": list(layers),
+                          "copper_spacing_checked_at": "dia 0.6 / drill 0.3, "
+                                                       "clearance 0.25"})
+    if value.get("verdict") == "not_stitchable":
+        out["next_step"] = ("no %s fill on %s: a via there would be a stub"
+                            % (net, ", ".join(value["why"]["layers_without_fill"])))
+    elif value.get("gaps"):
+        out["next_step"] = ("action='place' plans %d hole(s) on a %s mm grid and "
+                            "beside vias that change layer" % (len(value["gaps"]),
+                                                                pitch))
+    else:
+        out["message"] = ("the plane is stitched: every grid point within half a "
+                          "pitch of a %s via" % net)
+    return out
+
+_tool(
+    "board_stitch_vias",
+    "Put ground vias on the board - the one thing every via tool here could only "
+    "COMPUTE (resistance, current, thermal fence) and never PLACE, so two ground "
+    "pours with zero holes between them passed every check while a human called the "
+    "board 'not sewn shut'. action='audit' (default) reads the current state: how "
+    "many same-net vias exist, which points of a centred pitch grid sit inside the "
+    "same-net FILL on both layers but have no via within half a pitch (a 'gap'), "
+    "and how many layer-changing signal vias have no return via within one pitch. "
+    "action='place' plans holes: grid points inside the filled copper on every "
+    "layer, clear of the fill's own boundary by the annular ring, clear of "
+    "different-net copper, 0.25 mm hole-to-hole of any existing drill, and "
+    "edge_mm from the board edge; then one ground via beside every signal via that "
+    "changes layer and has no return yet. A point that fails by a hair is nudged "
+    "(nudge_mm, default 0.4) rather than dropped. Refusals are reported by reason "
+    "('no_pour_here', 'pour_edge_too_close', 'too_close' with the net and the gap, "
+    "'hole_too_close', 'too_near_board_edge', 'existing_via', "
+    "'no_room_around_signal_via') - a skip is a skip, not a success. This is not "
+    "auto-routing: no track moves, only holes are added, and placement is a grid "
+    "the caller chose. apply=true writes through board_propose + board_apply and "
+    "then re-audits.",
+    {"type": "object",
+     "properties": dict({
+         "action": _str("'audit' (default: read only) or 'place' (plan the holes)",
+                        enum=("audit", "place")),
+         "apply": _bool("write the plan (default false: plan only)"),
+         "net": _str("the net the holes stitch (default GND)"),
+         "layers": _arr("layers the hole must join (default [F.Cu, B.Cu])"),
+         "pitch_mm": _num("grid pitch; also the 'is this point covered' radius "
+                          "(default 3.0)", 3.0),
+         "dia_mm": _num("via pad diameter (default 0.6)", 0.6),
+         "drill_mm": _num("via drill (default 0.3, must be < dia)", 0.3),
+         "edge_mm": _num("minimum distance from the board edge (default 0.5)", 0.5),
+         "clearance_mm": _num("copper spacing to other nets (default 0.25)", 0.25),
+         "near_via_mm": _num("how close a return via must be to a signal via "
+                            "(default = pitch)", None),
+         "beside_vias": _bool("also plan a return via beside every layer-changing "
+                              "signal via (default true)", True),
+         "nudge_mm": _num("move a point this far to escape a hair-line refusal "
+                         "(default 0.4, 0 disables)", 0.4),
+         "allow_new_violations": _bool("accept newly introduced DRC violations"),
+         "strict_drc": _bool("let every new violation block, warnings included"),
+     }, **_COMMON),
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_stitch_vias(a)),
+)
+
 # ------------------------------------------------------------- experience
 # The library of what the corpus taught, and the refusal that keeps it from
 # becoming a rule nobody confirmed. `docs/02` section B is the design; `docs/94`

@@ -635,7 +635,7 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # the vendor's printed points is a different question from evaluating a fit)
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
-        self.assertEqual(len(tools.TOOLS), 192)
+        self.assertEqual(len(tools.TOOLS), 193)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only
