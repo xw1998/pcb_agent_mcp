@@ -361,6 +361,67 @@ op("add_outline_rect", {"outline"},
    {"x0": "mm", "y0": "mm", "x1": "mm", "y1": "mm", "width": "mm (default: netclass)"},
    _run_outline_rect, _verify_outline_rect)
 
+def _run_set_board_outline(ed, o, seed):
+    """Replace the board edge with a new rectangle.
+
+    `add_outline_rect` can only ADD an edge, so a board could never be resized:
+    a re-layout that needs a different board shape had to be done by editing the
+    file by hand, outside every gate. Deleting the old edge is exactly the
+    operation that needs those gates - a board left with a stale inner rectangle
+    looks fine in a viewer and is two outlines to every rule that matters.
+    """
+    old = ed.edge_items()
+    fp_edges = 0
+    for node in list(old):
+        if S.head(node) not in ("gr_line", "gr_arc", "gr_rect", "gr_circle",
+                               "gr_poly", "gr_curve"):
+            continue
+        ed.remove(node)
+        fp_edges += 1
+    x0, y0, x1, y1 = _rect(o)
+    if x1 <= x0 or y1 <= y0:
+        raise OpError("outline needs x1 > x0 and y1 > y0", "ARG_INVALID")
+    w = _width(o, ed, default=0.1)
+    nodes = B.rect_as_lines(x0, y0, x1, y1, OUTLINE_LAYER, w, ed.sp, seed)
+    for n in nodes:
+        ed.append(n)
+    return {"nodes_removed": fp_edges, "nodes_added": len(nodes),
+            "bbox": [x0, y0, x1, y1]}
+
+def _verify_set_board_outline(ed, o, record=None):
+    x0, y0, x1, y1 = _rect(o)
+    want = {(round(x0, 4), round(y0, 4)), (round(x1, 4), round(y0, 4)),
+            (round(x1, 4), round(y1, 4)), (round(x0, 4), round(y1, 4))}
+    got = set()
+    extra = 0
+    for node in ed.edge_items():
+        if S.head(node) != "gr_line":
+            extra += 1
+            continue
+        st, en = S.child(node, "start"), S.child(node, "end")
+        if st is None or en is None:
+            extra += 1
+            continue
+        for pair in ((st, en), (en, st)):
+            p = (round(S.arg_num(pair[0], 1, 0.0), 4),
+                 round(-S.arg_num(pair[0], 2, 0.0), 4))
+            if p in want:
+                got.add(p)
+    lines = sum(1 for n in ed.edge_items() if S.head(n) == "gr_line")
+    return {"ok": got == want and lines == 4 and extra == 0,
+            "corners_found": len(got), "corners_expected": 4,
+            "edge_lines": lines, "other_edge_items": extra}
+
+op("set_board_outline", {"outline"},
+   "Replace the board edge with a new rectangle: the old Edge.Cuts geometry is "
+   "removed first, then four new lines are written. Use this to RESIZE a board - "
+   "add_outline_rect alone leaves the old edge behind, and a board with two "
+   "outlines is two boards to every rule that reads Edge.Cuts. Footprint-level "
+   "edge graphics are not touched.",
+   {"x0": "mm", "y0": "mm", "x1": "mm", "y1": "mm",
+    "width": "mm (default 0.1)"},
+   _run_set_board_outline, _verify_set_board_outline)
+
 def _run_outline_polygon(ed, o, seed):
     points = _points(o)
     w = _width(o, ed, default=0.1)
@@ -1274,6 +1335,42 @@ op("add_footprint", {"copper", "silk", "meta"},
    _run_add_footprint, _verify_add_footprint)
 
 # --- placement --------------------------------------------------------
+def _fmt_deg(v):
+    v = round(float(v), 6)
+    if abs(v) < 1e-9:
+        return "0"
+    return ("%.6f" % v).rstrip("0").rstrip(".")
+
+
+def _rotate_pads(fp, delta):
+    """Turn every pad's `at` angle by `delta` degrees.
+
+    Pad angles are stored **in the board frame**, not relative to the footprint:
+    `(pad "A1" ... (at -3.2 -3.745 90) (size 0.6 1.3))` is a 0.6x1.3 pad whose
+    long axis follows that 90 whether the parent footprint sits at 0 or at 90.
+    Rotating only the footprint's own `at` therefore leaves every pad pointing
+    the old way, which on a row of 0.8 mm pitch pads turns a legal fan-out into
+    a short between neighbours (found by rotating a USB-C receptacle: A1[GND]
+    and A4[VBUS] shorted although nothing had been routed). The pad POSITION is
+    relative to the footprint and is rotated by KiCad itself; only the angle
+    needs help.
+    """
+    n = 0
+    for pad in S.children(fp, "pad"):
+        at = S.child(pad, "at")
+        if at is None:
+            continue
+        ang = S.arg_num(at, 3, 0.0) or 0.0
+        new = (ang + float(delta) + 180.0) % 360.0 - 180.0
+        text = _fmt_deg(new)
+        if len(at.items) > 3:
+            at.items[3].text = text
+        else:
+            at.items.append(S.Atom(text))
+        n += 1
+    return n
+
+
 def _run_move_footprint(ed, o, seed):
     ref = _str(o, "ref")
     fp = ed.footprint(ref)
@@ -1299,10 +1396,16 @@ def _run_move_footprint(ed, o, seed):
                 break
     else:
         S.insert_child(fp, 1, node)
+    delta = 0.0
+    if rot is not None:
+        delta = (new_rot or 0.0) - (cur_rot or 0.0)
+    pads_rotated = _rotate_pads(fp, delta) if abs(delta) > 1e-9 else 0
     return {"reference": ref, "before": [cur_x, cur_y, cur_rot],
-            "after": [new_x, new_y, new_rot]}
+            "after": [new_x, new_y, new_rot],
+            "pad_angle_delta": delta if pads_rotated else 0.0,
+            "pads_rotated": pads_rotated}
 
-def _verify_move_footprint(ed, o):
+def _verify_move_footprint(ed, o, record=None):
     fp = ed.footprint(_str(o, "ref"))
     at = S.child(fp, "at")
     got = [S.arg_num(at, 1, 0.0), -S.arg_num(at, 2, 0.0),
@@ -1316,8 +1419,19 @@ def _verify_move_footprint(ed, o):
     if want_y is not None:
         ok = ok and abs(got[1] - want_y) < 1e-6
     if want_rot is not None:
-        ok = ok and got[2] is not None and abs(got[2] - want_rot) < 1e-6
-    return {"ok": ok, "at": got}
+        # A footprint written as `(at x y)` has angle 0 -- KiCad's default. The
+        # old check demanded an explicit angle token, so every rotate-to-0 op on
+        # a footprint that never had one failed its own postcondition and the
+        # whole plan rolled back (17 of 19 moves on a real board, 2026-11-04).
+        got_rot = S.arg_num(at, 3, 0.0) if at is not None else 0.0
+        ok = ok and abs(got_rot - want_rot) < 1e-6
+    # Every pad must have been turned when the footprint was: a skipped pad is a
+    # pad still pointing the old way, which is a short on a fine-pitch row.
+    pads_rotated = ((record or {}).get("detail") or {}).get("pads_rotated")
+    pads_with_at = sum(1 for p in S.children(fp, "pad") if S.child(p, "at") is not None)
+    pads_ok = True if not pads_rotated else pads_rotated == pads_with_at
+    return {"ok": ok and pads_ok, "at": got,
+            "pads_rotated": pads_rotated, "pads_with_at": pads_with_at}
 
 op("move_footprint", {"copper", "silk"},
    "Move and/or rotate a placed footprint. Coordinates are the board frame (mm, "

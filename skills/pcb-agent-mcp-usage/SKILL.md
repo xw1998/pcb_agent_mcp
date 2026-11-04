@@ -35,7 +35,22 @@ description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路—�
 | 网表与网络类（clearance / trace_width / via） | `board_nets` |
 | 每个焊盘的精确尺寸/钻孔/旋转/网（这是所有几何推论的源头） | `board_view` |
 | 铺铜到底铺出来没有 | `board_zones` |
+| 项目里到底写了什么限制（线宽/间距/网络类）、我画的贴不贴边 | `board_constraints_report` |
+| 器件真实外框（courtyard/丝印/焊盘三种盒） | `board_footprint_extents` |
+| 走线的间距、直角/锐角、线对焊盘侵入 | `board_geometry_check` |
+| 某块区域还有没有合法落点 | `board_pad_obstacle_map` |
+| 这组配对能不能零交叉扇出（画之前判） | `board_fanout_order_check` |
 | 权威 DRC + 未连通项 | `board_drc` |
+
+**判据类工具只判不画。** 本服务**没有**自动布线/自动布局（`board_route`/`board_fanout`
+已退休，`PCB_AGENT_TOOLSET=all` 也拿不回来）。上面这五个工具回答「现在这样行不行 / 这个方案
+可行吗」，几何全靠自己算。
+
+**读约束必须读项目文件**：`min_track_width` 之类的限制住在 `.kicad_pro` 的
+`design_settings.rules` 里，不在 `.kicad_pcb` 里。`board_constraints_report` 没拿到项目文件时
+报 `PROJECT_ABSENT` 而不是拿一个默认值充数。它还会把「文件里写了什么」与「引擎实际执行哪个」
+分开报（`contradictions`，例如 `min_clearance=0.000` 与 `Default.clearance=0.200` 同时存在时，
+引擎用的是后者）。
 
 **`board_view` 是一颗体积炸弹**：它会回 nets、net classes、layers、stackup、setup、
 footprints、pads、tracks、vias、zones（含填充多边形）、Edge.Cuts、graphics、texts。
@@ -91,6 +106,21 @@ postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、
   `ir_drop` 类都会在缺参数时拒答或给 `INDETERMINATE`。**不要为了要一个数而补一个猜的参数。**
 - **`authoritative` 字段**：同一件事有权威与非权威两个读数时，报告里必须写明用的是哪个。
 - **单点读数失败不否证被测对象**：某个网布不通，可能只是这一版摆放不行。
+
+### 改服务自己的代码时：每条后置条件必须有能失败的反向对照
+
+`board_propose` 的每个 op 都带后置条件（写完了读回来对不对）。后置条件写错的代价是
+**整批回滚**：2026-11-04 一次真实编辑 19 个 `move_footprint` 挂了 17 个，报
+`postcondition check failed` 而 `failed_detail` 是 `None`。真因是校验函数要求文件里
+**显式写出角度**，而 KiCad 把 `(at x y)` 当作角度 0——它把自己写出的结果判成了错。
+
+所以：
+1. 新写/修改一个后置条件，必须在**一块真实工程板**上跑一遍全部 op（不是砂盒上的一两个）。
+2. 每种“合法但看着不典型”的写法都要有夹具：角度 0 写成省略、铺铜未 fill、零宽丝印线段。
+3. **反向对照是必须的**：一个判据如果从来不会说「不行」，它就没有在判。
+   本仓库的做法写在各工具的 `reverse_control` 字段里（例如 `board_geometry_check`
+   的直角/锐角/45° 三块小夹板，`board_fanout_order_check` 的反单调映射）。
+4. 不许用「回滚成功」当作「对的」——回滚只能证明它拒绝了自己，不能证明它接受了对的。
 
 ## 体积与预算（血泪）
 

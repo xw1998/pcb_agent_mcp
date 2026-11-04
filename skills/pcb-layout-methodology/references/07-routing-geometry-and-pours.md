@@ -148,6 +148,58 @@ KiCad（以及所有 EDA）把铺铜结果**烘成多边形顶点**存进文件�
 | 缝合 | 两面地之间的过孔数 > 0（`existing_stitch_vias`），网格点无孔数 = 0，换层处无回流地孔数 = 0 | `board_stitch_vias(action="audit")` |
 | 回流 | 没有信号跨分割 | `board_cross_split` |
 | 禁布区 | 晶振/USB/按键/安装孔四处都能读出禁区 | `board_zones` |
+| 扇出顺序 | `verdict = zero_crossing_exists`，`inversions = 0`、`simulated_crossings = 0` | `board_fanout_order_check` |
+| 线间距 | `closest_pair.centre_to_centre` 与设计值一致（0.5 间距扇出 = 0.3536） | `board_geometry_check` |
+| 限制读数 | `hugging` 里没有 `margin < 0`；`contradictions` 已逐条解释 | `board_constraints_report` |
+| 器件外框 | 无重叠，用的是真实 courtyard，`missing_courtyard` 已交代 | `board_footprint_extents` |
+
+## 8b. 扇出可行性是配对的**不变量**（0.5 mm 间距必读）
+
+### 定理
+
+两条相邻 45° 平行线的垂距恒为 `d/√2`（与两线实际多长无关）。间距 `d = 0.5` ⇒ 中心距
+`0.3536`；线宽 `w = 0.15` ⇒ 边距 `0.2036 ≥ clearance 0.2`，仅 3.6 µm 余量——这是精确算术。
+
+由此得到一条**与画法无关**的结论：在两个平行焊盘组之间做「法向外伸 + 一段 45° + 水平进焊盘」
+的扇出时，**交叉数 ≥ 配对相对两组焊盘顺序的逆序数**，且「零交叉存在」⇔「逆序数 = 0」。
+
+所以「这组线能不能干净地扇出」是**配对与朝向的性质**，不是布线手艺。逆序不为 0 时，
+唯一有效的两件事是：改排针的网络顺序，或改器件朝向。绕线无穷圈也不会变好。
+
+### 上板前怎么判
+
+```
+board_fanout_order_check(ref_a=U1, side_a=right, ref_b=J2B, mapping=[[33,16],[34,15],...])
+  → verdict ∈ {zero_crossing_exists, crossing_forced, self_check_failed}
+```
+
+- LQFP 焊盘是**一圈**，必须用 `side_a/side_b = left|right|top|bottom` 取一条边；
+- `mapping` 用来排除 GND/+3V3/VBUS（它们走 B.Cu，不占这条走廊）；
+- 工具会**独立重算一遍扇出并数真实交点**，与逆序数矛盾时返回 `self_check_failed`
+  **拒答**，不给一个自相矛盾的结论；
+- 两个数（逆序数 / 模拟交点数）**不要求相等**：一个交点可能了结多个逆序。
+  只比「零 vs 非零」。本项目实测反单调配对 45 逆序 / 42 交点。
+
+### 反向对照（判据必须能失败）
+
+| 夹具 | 期望 | 实测 |
+|---|---|---|
+| `_scratch/geomctl/right90.kicad_pcb` | `right_angle_corner_count = 1`，90° | 成立 |
+| `_scratch/geomctl/fourtyfive.kicad_pcb` | `right_angle_corner_count = 0` | 成立 |
+| `_scratch/geomctl/acute.kicad_pcb` | `acute_corner_count = 1`，45° 内角 | 成立 |
+| 反单调 mapping（U1 右列 ↔ J2B 反向） | `crossing_forced`，两个数都 > 0 | 成立 |
+| 单调 mapping（v42 现况） | `zero_crossing_exists`，两个数都是 0 | 成立 |
+
+## 8c. 元件本体可以压线（这是版面上最常被误判的一条）
+
+KiCad 不检查「走线从器件体下面穿过」，板厂也不管，几乎所有密板都这么做。
+把器件外框当成障碍会**让合法位置被判成不可用**：一块 8.5 mm 走廊上扫过 18 条线的板子，
+按外框判就是「放不下」，于是器件乱飞——上几版难看的直接原因之一。
+
+- 障碍物只有**焊盘 / 走线 / 过孔**（`board_pad_obstacle_map` 就是这么算的）；
+- 器件之间不能打架，那件事用 **courtyard** 判，不用焊盘盒（差 0.4~1.9 mm/边）；
+- 封装没画 courtyard 时 `board_footprint_extents` 会在 `missing_courtyard` 里列出来，
+  **那是不确定，不是零**——按丝印盒再自己留余量，并在交付里写明。
 
 ## 9. 来源
 

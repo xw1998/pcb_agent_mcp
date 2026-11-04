@@ -453,7 +453,7 @@ class TestTheSurfaceMovedOnce(unittest.TestCase):
         # the vendor's printed points is a different question from evaluating a fit)
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
-        self.assertEqual(len(tools.TOOLS), 193)
+        self.assertEqual(len(tools.TOOLS), 199)
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_powder_curve", cap["available"])
         # 174 = 173 + thermal_spreading in 0.0.85

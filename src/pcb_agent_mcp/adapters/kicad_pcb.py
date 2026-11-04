@@ -479,6 +479,40 @@ def mask_layers(layers):
     return out
 
 
+def _graphic_points(g):
+    """The raw vertices a graphic is drawn from, in its OWN frame.
+
+    Unlike `_graphic_poly` this keeps a zero-width line (courtyards are usually
+    drawn with `(stroke (width 0) ...)`, and the polygon helper returns None for
+    those, which is why courtyards looked absent).
+    """
+    kind = g[0] if g else ""
+    if kind in ("fp_poly", "gr_poly"):
+        pn = child(g, "pts")
+        return [xy(p) for p in children(pn, "xy")] if pn else None
+    if kind in ("fp_rect", "gr_rect"):
+        a, b = xy(child(g, "start")), xy(child(g, "end"))
+        if a is None or b is None:
+            return None
+        return [a, b]
+    if kind in ("fp_circle", "gr_circle"):
+        c, e = xy(child(g, "center")), xy(child(g, "end"))
+        if c is None or e is None:
+            return None
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        return [(c[0] - r, c[1] - r), (c[0] + r, c[1] + r)]
+    if kind in ("fp_line", "gr_line", "fp_arc", "gr_arc"):
+        s_, m_, e_ = child(g, "start"), child(g, "mid"), child(g, "end")
+        if kind in ("fp_arc", "gr_arc"):
+            if not (s_ and m_ and e_):
+                return None
+            return _arc_points(xy(s_), xy(m_), xy(e_))
+        if not (s_ and e_):
+            return None
+        return [xy(s_), xy(e_)]
+    return None
+
+
 def _graphic_poly(g):
     """A copper graphic as one polygon in its OWN frame (caller rotates it).
 
@@ -565,8 +599,13 @@ def _text_metrics(node):
             h = num(sz, 1, None)
     return h, num(child(font, "thickness"), 1, None)
 
-def _silk_item(kind, node):
-    """One silkscreen item: a stroked shape, or a text with a size and a stroke."""
+def _silk_item(kind, node, place=None):
+    """One silkscreen item: a stroked shape, or a text with a size and a stroke.
+
+    `place` = (x, y, cos, sin) puts a bbox in board space on the item. Silk carried
+    no geometry at all before, so "does this silk line sit on a pad" could only be
+    answered by KiCad's engine; a caller with no KiCad had nothing to measure.
+    """
     layer = atom(child(node, "layer"), 1, "")
     item = {"layer": layer, "kind": kind, "uuid": _uuid(node)}
     if kind in _SILK_TEXT_KINDS:
@@ -575,6 +614,35 @@ def _silk_item(kind, node):
         item["height_mm"], item["width_mm"] = _text_metrics(node)
     else:
         item["width_mm"] = _stroke_width(node)
+    if place is None:
+        return item
+    x, y, ca, sa = place
+    if kind in _SILK_TEXT_KINDS:
+        at = child(node, "at")
+        tx, ty = xy(at) if at is not None else (0.0, 0.0)
+        h = item.get("height_mm") or 0.0
+        w = (item.get("width_mm") or 0.0) * max(1, len(item.get("text") or ""))
+        if h <= 0:
+            return item
+        lx, ly = tx - w / 2, ty - h / 2
+        corners = [(lx, ly), (lx + w, ly), (lx + w, ly + h), (lx, ly + h)]
+        # a text's bbox is reported, not its ink: the glyph extents are the font's
+        # business, so the box is the advance box and says so.
+        item["bbox_source"] = "advance box (length x width x height), not glyph ink"
+    else:
+        lpts = _graphic_points(node)
+        if not lpts:
+            return item
+        half = (_stroke_width(node) or 0.0) / 2.0
+        lx = min(p[0] for p in lpts) - half
+        ly = min(p[1] for p in lpts) - half
+        mx = max(p[0] for p in lpts) + half
+        my = max(p[1] for p in lpts) + half
+        corners = [(lx, ly), (mx, ly), (mx, my), (lx, my)]
+        item["bbox_source"] = "hull of the drawn vertices, grown by half the stroke"
+    rp = [(x + qx * ca - qy * sa, y + qx * sa + qy * ca) for qx, qy in corners]
+    item["bbox"] = _bbox_dict((min(p[0] for p in rp), min(p[1] for p in rp),
+                               max(p[0] for p in rp), max(p[1] for p in rp)))
     return item
 
 
@@ -707,7 +775,7 @@ def _footprint(node, mask_expansion=0.0):
             continue
         glayer = atom(child(g, "layer"), 1, "")
         if _is_silk(glayer):
-            silk.append(_silk_item(g[0], g))
+            silk.append(_silk_item(g[0], g, (x, y, ca, sa)))
             continue
         if _is_mask(glayer) and g[0] in _GRAPHIC_KINDS:
             mpoly = _graphic_poly(g)
@@ -716,6 +784,47 @@ def _footprint(node, mask_expansion=0.0):
                              "margin_source": "graphic",
                              "poly": [(x + qx * ca - qy * sa, y + qx * sa + qy * ca)
                                       for qx, qy in mpoly]})
+    # Courtyard: the outline a fab uses to check that two parts will not collide.
+    # It was never parsed (F.CrtYd matched neither the copper, the silk nor the
+    # mask test, so it fell through every branch and was dropped), which left every
+    # caller to approximate it as "pad bbox + a guess". Measured on a 34-part core
+    # board, that guess was 0.4-1.9 mm too small per side and turned into three
+    # phantom courtyard overlaps plus a real short. The bbox below is the hull of
+    # the real F.CrtYd/B.CrtYd graphics, rotated with the footprint.
+    courtyard = None
+    for g in node:
+        if not (isinstance(g, list) and g and g[0] in _GRAPHIC_KINDS):
+            continue
+        glayer = atom(child(g, "layer"), 1, "")
+        if not str(glayer or "").endswith(".CrtYd"):
+            continue
+        lpts = _graphic_points(g)
+        if not lpts:
+            continue
+        half = (_stroke_width(g) or 0.0) / 2.0
+        lx = [p[0] for p in lpts]
+        ly = [p[1] for p in lpts]
+        corners = [(min(lx) - half, min(ly) - half), (max(lx) + half, min(ly) - half),
+                   (max(lx) + half, max(ly) + half), (min(lx) - half, max(ly) + half)]
+        rp = [(x + qx * ca - qy * sa, y + qx * sa + qy * ca) for qx, qy in corners]
+        rx = [p[0] for p in rp]
+        ry = [p[1] for p in rp]
+        box = (min(rx), min(ry), max(rx), max(ry))
+        if courtyard is None:
+            courtyard = {"layer": glayer, "bbox": box}
+        else:
+            old = courtyard["bbox"]
+            courtyard["bbox"] = (min(old[0], box[0]), min(old[1], box[1]),
+                                 max(old[2], box[2]), max(old[3], box[3]))
+            if courtyard["layer"] != glayer:
+                courtyard["layer"] = courtyard["layer"] + "+" + glayer
+    if courtyard is not None:
+        courtyard = {"layer": courtyard["layer"],
+                     "bbox": _bbox_dict(courtyard["bbox"]),
+                     "source": "F.CrtYd/B.CrtYd graphics in the file"}
+    else:
+        courtyard = {"layer": None, "bbox": None,
+                     "source": "absent - this footprint draws no courtyard"}
     bbox = None
     if pads:
         xs, ys = [], []
@@ -732,7 +841,7 @@ def _footprint(node, mask_expansion=0.0):
         flags = [f for f in flags if isinstance(f, str)]
     dnp = ("dnp" in flags) or (child(node, "dnp") is not None)
     return {"ref": ref, "value": value, "lib_id": lib_id, "graphics": graphics,
-            "silk": silk, "mask": mask,
+            "silk": silk, "mask": mask, "courtyard": courtyard,
             "x": round(x, 4),
             "y": round(y, 4), "rotation": rot, "layer": layer,
             "bbox": _bbox_dict(bbox), "pads": pads,
