@@ -546,10 +546,19 @@ def apply_plan(plan_id, confirm=False, options=None):
             eng["ok"] = bool(eng.get("status") in ("ok", "skipped") and not silent
                              and (comparable or eng.get("status") == "skipped"))
             pro_beside = _project_beside(target)
-            drc_before = _engine.drc(before_file, project=pro_beside)
-            drc_after = _engine.drc(target, project=pro_beside)
+            # Both halves are read with the zones refilled in a scratch copy.
+            # A filled_polygon is a snapshot: without the refill, the copper this
+            # edit adds is not cut out of the pour, so every new track reads as a
+            # 0 mm clearance to GND and the gate calls its own artwork a pile of
+            # NEW clearance errors. Refilling CANNOT hide a real violation - two
+            # tracks that are too close are still too close - it only removes the
+            # phantom ones. Measured on the STM32F412 core board: 502 violations
+            # stale vs 52 refilled, same bytes (kicad-cli 10.0.7).
+            drc_before = _engine.drc(before_file, project=pro_beside, refill=True)
+            drc_after = _engine.drc(target, project=pro_beside, refill=True)
             gates["drc"] = _drc_diff(drc_before, drc_after,
                                      strict=bool(options.get("strict_drc")))
+            gates["drc"]["zones_refilled_for_check"] = True
             if gates["drc"].get("comparable"):
                 gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")
             # The pour happens AFTER this DRC, so its errors have to be compared
@@ -909,8 +918,10 @@ def _final_gates_board(plan, target, session, options):
                          and (comparable or eng.get("status") == "skipped"))
         gates["engine"] = eng
         pro_beside = _project_beside(target)
-        gates["drc"] = _drc_diff(_engine.drc(before_file, project=pro_beside),
-                                 _engine.drc(target, project=pro_beside),
+        gates["drc"] = _drc_diff(_engine.drc(before_file, project=pro_beside,
+                                             refill=True),
+                                 _engine.drc(target, project=pro_beside,
+                                             refill=True),
                                  strict=bool(options.get("strict_drc")))
         if gates["drc"].get("comparable"):
             gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")

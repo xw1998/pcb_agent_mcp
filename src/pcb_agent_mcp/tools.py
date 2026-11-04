@@ -5159,11 +5159,18 @@ _tool(
     "one. Read-only: the report goes to a temp directory, never beside your project. "
     "On a large board DRC can outlast any sane request, so background=true hands back "
     "a job id instead: ask board_job(action='get', id=...) for the verdict later. A "
-    "running job has no result, and none is ever approximated.",
+    "running job has no result, and none is ever approximated. "
+    "refill_zones (default true) refills the zones in a scratch copy first: a "
+    "filled_polygon is a snapshot, and every track drawn after the last fill reads "
+    "as 0 mm clearance to it (measured: 502 violations stale vs 52 refilled on the "
+    "same bytes). Turn it off only to audit a stale file on purpose.",
     {"type": "object",
      "properties": {
          "path": _str("absolute path to a .kicad_pcb"),
          "severity": _str("which violations to include", ["all", "error"], "all"),
+         "refill_zones": _bool("refill the zones (in a scratch copy) before "
+                               "checking, so the pour is not an old snapshot "
+                               "(default true)", True),
          "strict": _bool("also report warnings as blocking (the write gate's strict "
                          "mode)"),
          "limit": _num("how many blocking/advisory entries to list", 20),
@@ -5228,8 +5235,11 @@ def _board_drc(args):
     severity = args.get("severity") or "all"
     timeout_s = float(args.get("timeout_s") or _engine.DRC_TIMEOUT_S)
 
+    refill = args.get("refill_zones")
+    refill = True if refill is None else bool(refill)
+
     def _do_drc():
-        out = _engine.drc(path, severity=severity, timeout=timeout_s)
+        out = _engine.drc(path, severity=severity, timeout=timeout_s, refill=refill)
         if out.get("status") != "ok":
             return out
         from .edit import drc_policy as _policy
@@ -9431,6 +9441,143 @@ _tool(
          "timeout_s": _num("per-probe timeout (default 15 s)", 15),
      }},
     lambda a: _guarded(lambda: _fullwave_solver(a)),
+)
+
+def _board_45_corners(args):
+    """Read every turn on the board, and on request miter the right angles.
+
+    The reading half is the point: this server could measure clearance, edge and
+    annular ring, so a board whose every second segment turned 90 degrees passed
+    every check it had. Angle was simply not a question it asked. It does now.
+    """
+    from . import edit as _edit
+    from .route import corners as _corners
+
+    board, e = _load_board(args)
+    if e:
+        return e
+    tol = float(args.get("tolerance_deg") or 0.5)
+    value = _corners.survey(board, tolerance_deg=tol)
+    value.pop("_right_all", None)
+    value["writes_nothing"] = True
+    model = ("a corner is two and only two same-net same-layer segments sharing an "
+             "endpoint; its turn is the angle between them as seen from the vertex "
+             "(180 straight, 135 a 45 degree mitre, 90 a right angle, <90 acute); a "
+             "segment is on the 45 degree grid when its direction is within "
+             "tolerance_deg of a multiple of 45")
+    basis = ("IPC-2221 recommends mitered or arced turns and forbids acute corners "
+             "(the etchant cannot refresh inside the wedge); the 45 degree grid is "
+             "the layout convention this repository's own experience metric "
+             "'tracks_off_45_grid' already measured. Angle alone is not an "
+             "electrical defect on a slow net - this tool reports, it does not "
+             "judge the net")
+    precision = ("\u00b10.0001 deg on turn angles and \u00b10.001 mm on leg lengths "
+                 "(the file's own coordinates)")
+
+    if args.get("action") != "chamfer":
+        out = ok(value, "mm", model=model, basis=basis, precision=precision,
+                 assumptions={"tolerance_deg": tol, "vertices_joined_at_mm": 0.0001})
+        if value["right_angle_corners"]:
+            out["next_step"] = ("action='chamfer' replaces each of these %d "
+                                "right-angle vertices with a symmetric 45 degree "
+                                "mitre (plan only; apply=true writes it)"
+                                % value["right_angle_corners"])
+        elif value["acute_corners"]:
+            out["next_step"] = ("no right angles left; the %d acute corner(s) are "
+                                "reported and never cut here - a wedge narrower than "
+                                "90 degrees has to move a leg, not trim it"
+                                % value["acute_corners"])
+        else:
+            out["message"] = "every corner on this board is already 45 degrees or straight"
+        return out
+
+    plan = _corners.chamfer_ops(
+        board,
+        max_cut_mm=float(args.get("max_cut_mm") or 1.0),
+        min_leg_mm=float(args.get("min_leg_mm") or 0.4),
+        tolerance_deg=tol,
+        nets=args.get("nets"))
+    value["plan"] = {k: plan[k] for k in
+                     ("corners_chamfered", "segments_rewritten", "skipped",
+                      "width_mismatch", "cut_mm_range", "diagonals")}
+    value["ops_count"] = len(plan["ops"])
+    out = ok(value, "mm", model=model, basis=basis, precision=precision,
+             assumptions={"tolerance_deg": tol,
+                          "max_cut_mm": float(args.get("max_cut_mm") or 1.0),
+                          "min_leg_mm": float(args.get("min_leg_mm") or 0.4),
+                          "geometry_changed": "the path is shortened by 2*cut per "
+                                              "corner - a mitre is shorter than the "
+                                              "corner it replaces, not a new route"})
+    if not plan["ops"]:
+        out["message"] = ("nothing chamferable: %d corner(s) refused because a leg "
+                          "is shorter than the cut would need"
+                          % len(plan["skipped"]))
+        return out
+    if args.get("apply") is not True:
+        out["next_step"] = ("pass apply=true to write these %d op(s) through "
+                            "board_propose + board_apply (checkpoint, atomic write, "
+                            "four gates)" % len(plan["ops"]))
+        return out
+    prop = _edit.propose(args["path"], plan["ops"], {"engine": True})
+    try:
+        applied = _edit.apply_plan(prop["plan_id"], confirm=True,
+                                   options={"engine": True,
+                                            "allow_new_violations": bool(
+                                                args.get("allow_new_violations")),
+                                            "strict_drc": bool(args.get("strict_drc"))})
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+    value["plan_id"] = prop["plan_id"]
+    value["applied"] = applied
+    value["writes_nothing"] = False
+    try:
+        board2, e2 = _load_board(args)
+        if e2 is None:
+            again = _corners.survey(board2, tolerance_deg=tol)
+            value["after"] = {k: again[k] for k in
+                              ("segments", "off45_segments",
+                               "right_angle_corners", "acute_corners",
+                               "corners", "corner_kinds")}
+    except Exception:                     # noqa: BLE001 - the write already happened
+        value["after"] = None
+    return out
+
+
+_tool(
+    "board_45_corners",
+    "Measure the TURNS on a board, which this server never did before: clearance, "
+    "edge and annular ring were all it asked about, so a layout whose every second "
+    "segment turned a bare 90 degrees passed every check it had. Reads three things "
+    "and keeps them apart - segments off the 45 degree grid (direction not within "
+    "tolerance of a multiple of 45), corners (exactly two same-net same-layer "
+    "segments sharing an endpoint, turned from 180 collinear through 135 mitre and "
+    "90 right angle down to acute), and junctions (3+ segments at one point, "
+    "reported and never touched, because a T has no single corner and guessing the "
+    "trunk is a human decision). action='chamfer' plans a symmetric mitre at every "
+    "right-angle vertex: the vertex is replaced by two points `cut` mm back along "
+    "each leg joined by one diagonal, so the turn becomes exactly 45 degrees. Legs "
+    "shorter than the cut would need are refused ('leg_too_short' with the cut they "
+    "would have needed), junctions/acute corners/arcs are never modified, and two "
+    "legs of different width are chamfered at the wider width and listed under "
+    "width_mismatch. Honest about the trade: this is a geometric edit, the path gets "
+    "SHORTER by 2*cut per corner and no track is re-routed, so it fixes the shape "
+    "and nothing else - run it before judging clearance, and its write goes through "
+    "board_propose + board_apply with the same gates as every other write.",
+    {"type": "object",
+     "properties": dict({
+         "action": _str("'audit' (default: read only) or 'chamfer' (plan the mitres)",
+                        enum=("audit", "chamfer")),
+         "apply": _bool("write the chamfer plan (default false: plan only)"),
+         "max_cut_mm": _num("longest pull-back along either leg (default 1.0)", 1.0),
+         "min_leg_mm": _num("leave at least this much of each leg (default 0.4)", 0.4),
+         "tolerance_deg": _num("how far off 45/90/135 still counts as that angle "
+                               "(default 0.5)", 0.5),
+         "nets": _arr("only chamfer these nets (default: every net)"),
+         "allow_new_violations": _bool("accept newly introduced DRC violations"),
+         "strict_drc": _bool("let every new violation block, warnings included"),
+     }, **_COMMON),
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_45_corners(a)),
 )
 
 # ------------------------------------------------------------- experience

@@ -9,6 +9,73 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.116] - 2026-11-04
+
+两件事：**DRC 到底该不该先重铺**，以及**角度第一次成为被检查的量**。
+
+### 1. 修复（会改变读数，必须看）
+
+`board_drc` 的 `refill_zones` 默认 **true**；`board_apply` 的 DRC 闸门两侧都带 `refill=True`。
+
+- 现场：F412 核心板，231 段走线、两片 GND 区（F.Cu 优先级 1 / B.Cu 优先级 0），
+  填充比最后一轮布线**早一代**。同一份字节：
+  - 不重铺，`violations 502`，其中 `clearance 324`；
+  - 重铺后（`kicad-cli --refill-zones`，scratch 副本，**不写文件**），`violations 52`，`clearance 0`。
+- 机理：`filled_polygon` 是**快照**。填铜之后画的每一根线都没有被从多边形里挖掉，
+  于是每根新线都被判成「走线 → 填充区 0.25 mm，实际 0.0000 mm」。
+  后果不是「报得更严」，而是：① 一次真实只新增 3 条违规的编辑被闸门报成 **169~178 条**并回滚，
+  编辑永远写不进去；② 反过来，习惯性 `allow_new_violations=true` 会把真短路当合格。
+- 为什么这不是「放水」：重铺只会去掉幻觉。两根线太近，重铺后还是太近。
+  **重铺后 clearance 从 324 掉到 0，说明那 324 条一条都不在走线之间。**
+- 输出里新增 `zones_refilled_for_check` / `zone_refill_note`，不静默：报了就是报了。
+  `_engine.drc(refill=)` 默认 False ⇒ 引擎层零行为变化；默认值的改动只在 `board_drc` 与写闸门上，
+  并在回包里明说。
+
+### 2. 新增 `board_45_corners`（角度第一次被量）
+
+这个服务器此前只量**距离**（clearance / edge / annular ring），**从不问角度**，
+所以一块 123 个 90° 直角、0 个 45° 的板子「全项通过」。这也是一块板能被画成
+「自动布线都不如」的直接原因：没有一条判据在管拐角。
+
+- `action="audit"`：`segments / arcs_skipped / off45_segments / off45_worst_deg /
+  off45_median_deg / corners / corner_kinds{right,miter45,straight,other} /
+  right_angle_corners / acute_corners / junctions / right_angle_shortlist`。
+- `action="chamfer"`：保持拓扑的对称 45° 斜切，`apply=true` 走 `board_propose` + `board_apply`。
+- 角的定义：顶点两侧的夹角。180° 共线（straight）／135° 已 45°（miter45）／90°（right）／
+  <90°（acute，只报不修）。**≥3 条同网同层线段交于一点 = junction，只报不动**——
+  T 型没有「一个角」，选哪条是主干是人的决定。
+- 五种拒绝，见到就当结论读：`vertex_on_pad` / `vertex_on_via`（在焊盘或过孔上切角 = 拔铜断路）、
+  `leg_too_short` / `leg_reserved`（腿不够长，或同一段两端各切一刀会互穿）、
+  `would_collide`（附 `with` / `with_net` / `gap_mm`）。另有 `width_mismatch` 列表。
+
+**实测（F412 核心板 v36，重铺后倒角）**：
+
+| | segments | right | miter45 | acute |
+|---|---|---|---|---|
+| before | 231 | 123 | 3 | 0 |
+| after | 312 | 42 | 165 | 0 |
+
+`chamfered 81 / skipped {would_collide:28, vertex_on_via:6, vertex_on_pad:5, leg_too_short:2, leg_reserved:1}`。
+倒角后 DRC（重铺口径）**52 → 52，一条不增**；unconnected 45 → 44。
+
+**这条数字本身就是结论**：123 个直角只有 81 个能切 —— 45° 必须在布线的当下走出来，
+布完再倒角只是验收，不是补救。
+
+### 3. 技能
+
+- 新 `skills/pcb-layout-methodology/references/07-routing-geometry-and-pours.md`：
+  45°/圆弧的**诚实口径**（10 GHz 插损只差 0.15–0.28 dB，真正收益在铜箔应力：塑性变形低 37%；
+  锐角是真缺陷 = 蚀刻酸角）、`L ≤ 0.4W` 与 `R ≥ 0.5W`、线宽梯度、铺铜参数与**快照陷阱**、
+  缝合孔与回流、四处禁布区、泪滴、可判真伪的验收清单。每条带来源 URL。
+- `SKILL.md` 加「布线之前必读的三条」。
+- `pcb-agent-mcp-usage/references/01-tool-map.md` 重新生成（192 个工具，版本号改为动态读取）。
+
+### 4. 已知边界（诚实列）
+
+- `chamfer` 不产生新层、不改走线方向、不做弧线；圆弧仍要人给。
+- `junctions > 0` 时不处理（T 型的主干选择是人的决定，工具不替人猜）。
+- 倒角后 `off45_segments` 仍是 7（那是**段方向**不是拐角，来自斜线本身，与倒角无关）。
+
 ## [0.0.115] - 2026-11-04
 
 断线续跑第二版：把 checkpoint 从「人记得写」变成「写盘就自动有」。

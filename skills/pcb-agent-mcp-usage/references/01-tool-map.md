@@ -1,10 +1,10 @@
-# 工具全表（0.0.111 实测 190 个）
+# 工具全表（0.0.116 实测 192 个）
 
 用途：查名字。语义以 `tool_search` / `tools/list` 的当前返回为准，本表只给一句话索引。
 
 注意：默认档位 `core` 只广告其中约 45 个 + `tool_search` / `tool_call`。表里出现但清单里没有的，走 `tool_search` 找、`tool_call` 调。
 
-## 读板 / 写板 / 度量（37）
+## 读板 / 写板 / 度量（39）
 
 - `board_summary` — Open a board and report what the file actually carries: counts, board outline bbox, stackup, design rules, and
 - `board_components` — Every placed component with reference, value, library id, position (mm, Y up), rotation and pad count, plus a 
@@ -35,12 +35,13 @@
 - `board_propose` — Plan a change to a KiCad board WITHOUT writing anything: returns a plan_id, the board digest before/after, per
 - `board_apply` — Apply a proposal and prove it.
 - `board_checkpoints` — List the checkpoints this server took before writing.
+- `board_journal` — A tiny append-only progress journal under PCB_AGENT_HOME, so a session that dies mid-job can resume from ~1 Ki
 - `board_restore` — Put a checkpoint back on disk.
 - `board_progress` — Watch or stop a stepped apply.
-- `board_journal` — The tiny append-only progress journal under `PCB_AGENT_HOME` (`journal.jsonl`): `action=add` stores one note (kind + text, max 400 chars), `action=tail` returns the last N with their byte cost, `action=resume` starts at the newest `kind="apply"` entry, adds the notes after it and caps the reply at 4096 B (oldest dropped first, `no_checkpoint=true` when there is none), `action=clear` RENAMES the file to `journal.jsonl.bak-<stamp>` (confirm=true, nothing deleted). A successful `board_apply` drops one `kind="apply"` line by itself; that line and the tool's own reply never change what `board_apply` answers. An entry proves the text is on disk, never that the board is good - re-read the file and run the DRC.
 - `board_ir_drop` — DC voltage drop across ONE net, built from the copper the board ACTUALLY carries: every track segment becomes 
 - `board_vibration` — Natural frequencies of THIS board from its own outline and stackup, with every component sampled against the f
 - `board_electrothermal` — Board-level 2-D electro-thermal: every conductor's I^2R feeds a plate solve, and the plate temperature feeds b
+- `board_45_corners` — Measure the TURNS on a board, which this server never did before: clearance, edge and annular ring were all it
 - `board_fab_package` — Build a manufacturing package from a KiCad board: Gerbers (the board's own plot settings), Excellon drill (mm,
 - `board_export_graphics` — Layer plot for humans: pdf / svg / dxf / ps / 3dpdf.
 - `board_export_3d` — 3D solid export of a KiCad board: step / stpz / brep / glb / stl / ply / vrml / xao / u3d.

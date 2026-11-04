@@ -455,7 +455,7 @@ class TestTheFilledSaturationValues(unittest.TestCase):
         # the vendor's printed points is a different question from evaluating a fit)
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
-        self.assertEqual(len(tools.TOOLS), 190)
+        self.assertEqual(len(tools.TOOLS), 192)
         props = tools.TOOLS["magnetics_select_core"]["inputSchema"]["properties"]
         self.assertIn("include_powder_cores", props)
         self.assertIn("permeability", props)

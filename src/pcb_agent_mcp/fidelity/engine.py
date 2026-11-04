@@ -121,7 +121,7 @@ def _run(args, cwd, timeout=180):
 # because the right answer to a slow call is an id, not a longer wait.
 DRC_TIMEOUT_S = 900
 
-def drc(path, severity="all", timeout=None, project=None):
+def drc(path, severity="all", timeout=None, project=None, refill=False):
     """Authoritative DRC. Reports only; never writes beside the input.
 
     `project` is the `.kicad_pro` the verdict has to be read against. It is not
@@ -146,6 +146,18 @@ def drc(path, severity="all", timeout=None, project=None):
     When `project` is given, the board AND that project are copied into the
     scratch directory under their own basenames, so the verdict is read against
     the real rule set and nothing is written beside the input.
+
+    `refill=True` passes kicad-cli's `--refill-zones`: the zones are refilled **in
+    memory** before the check and the file on disk is left untouched (no
+    `--save-board` is passed, so the refilled polygons are thrown away with the
+    scratch copy). This matters more than it sounds. A `filled_polygon` is a
+    SNAPSHOT of the pour taken when the zone was last filled; copper added after
+    that snapshot is not cut out of it, so every new track reads as
+    "track -> zone, wanted 0.25 mm, got 0.0000 mm". Measured on the STM32F412
+    core board (kicad-cli 10.0.7, 231 tracks, two GND zones, fill one edit old):
+    without the refill 502 violations / 324 of them clearance; with it 52 / 0
+    clearance. The 450 difference was entirely the stale snapshot - which is to
+    say the no-refill verdict was not a stricter answer, it was a wrong one.
     """
     timeout = DRC_TIMEOUT_S if timeout is None else timeout
     exe = find_kicad_cli()
@@ -180,6 +192,8 @@ def drc(path, severity="all", timeout=None, project=None):
         report = os.path.join(tmp, "drc.json")
         args = ["pcb", "drc", "-o", report, "--format", "json"]
         args.append("--severity-all" if severity == "all" else "--severity-error")
+        if refill:
+            args.append("--refill-zones")
         args.append(target_path)
         res = _run(args, cwd=tmp, timeout=timeout)
         if not os.path.isfile(report):
@@ -204,6 +218,17 @@ def drc(path, severity="all", timeout=None, project=None):
             "included_severities": data.get("included_severities"),
             "schematic_parity": data.get("schematic_parity"),
             "project_file_used": project_used,
+            "zones_refilled_for_check": bool(refill),
+            "zone_refill_note": (
+                "zones were refilled in a scratch copy before the check, so the "
+                "verdict is about the pour as it would be after a fill - the "
+                "filled_polygons in the file you named are still the old "
+                "snapshot") if refill else (
+                "zones were NOT refilled: any filled_polygon older than the "
+                "copper reads as a 0 mm clearance to every track added since, "
+                "so clearance counts can be inflated by hundreds of phantom "
+                "violations. Pass refill=True unless you are deliberately "
+                "auditing a stale file"),
             "rule_source": "project" if project_used else "kicad_defaults",
             "rule_source_note": None if project_used else (
                 "no .kicad_pro was found beside this board, so this verdict was "
