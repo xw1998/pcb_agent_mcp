@@ -5530,8 +5530,10 @@ def _board_apply(args):
     from . import edit as _edit
     options = args.get("options") or {}
     try:
-        return _edit.apply_plan(args.get("plan_id"), args.get("confirm") is True,
-                                options)
+        out = _edit.apply_plan(args.get("plan_id"), args.get("confirm") is True,
+                               options)
+        _journal_apply(out)
+        return out
     except getattr(_edit, "_DryRunBlocked", ()) as exc:   # dry run + a gate said no
         out = _edit_error(exc)
         out["status"] = "ok"
@@ -5568,6 +5570,41 @@ def _board_progress(args):
     except _edit.EditError as exc:
         return _edit_error(exc)
 
+def _journal_apply(out):
+    """One automatic line per SUCCESSFUL write, so a dead session leaves a trail.
+
+    The reply dict is not touched: a checkpoint that changed what a tool answers
+    would be a different tool. Returns the receipt, or None when nothing was
+    written (dry run, error, or a reply with no file in it).
+    """
+    from . import journal as _j
+    if not isinstance(out, dict) or out.get("status") != "ok":
+        return None
+    if out.get("dry_run") or out.get("would_write") is False:
+        return None
+    if out.get("file_unchanged"):
+        return None
+    target = out.get("target") or out.get("path")
+    if not isinstance(target, str) or not target:
+        return None
+    try:
+        head = os.path.basename(target)
+    except Exception:      # a target that is not a path is not worth a traceback
+        head = target
+    bits = ["apply ok -> %s" % head]
+    for key in ("bytes", "operations_done", "operations_total", "layers_written"):
+        if key in out:
+            bits.append("%s=%s" % (key, out[key]))
+    if out.get("done") is False:
+        bits.append("done=False")
+    if out.get("status") == "ok" and out.get("gates"):
+        bad = [k for k, v in out["gates"].items()
+               if isinstance(v, dict) and v.get("ok") is False]
+        if bad:
+            bits.append("gates_failed=%s" % ",".join(bad))
+    return _j.auto("apply", " ".join(bits)[:_j.MAX_TEXT], board=target)
+
+
 def _board_journal(args):
     """Append / read the tiny progress journal (survives a session break)."""
     from . import journal as _j
@@ -5576,12 +5613,14 @@ def _board_journal(args):
         if action == "add":
             return _j.append(args.get("kind"), args.get("text"),
                              board=args.get("board"), data=args.get("data"))
+        if action == "resume":
+            return _j.resume(limit=args.get("limit") or 20)
         if action == "clear":
             return _j.clear(args.get("confirm") is True)
         if action in ("read", "tail", "list"):
             return _j.tail(limit=args.get("limit") or 8, kind=args.get("kind"))
         raise _j.JournalError("ARG_INVALID",
-                              "action %r is not add / tail / clear" % action)
+                              "action %r is not add / tail / resume / clear" % action)
     except _j.JournalError as exc:
         return exc.as_dict()
 
@@ -5744,11 +5783,16 @@ _tool(
     "action=add stores ONE note (kind + text, at most 400 characters, optional "
     "board path and small data object) and replies with the entry and the new "
     "totals; action=tail returns the last N entries with the byte cost; "
-    "action=clear renames the file to journal.jsonl.bak-<stamp> (confirm=true, "
-    "nothing is deleted). It records what a caller wrote, never that the work "
-    "happened - re-read the board and run the DRC before trusting an entry.",
+    "action=resume returns the newest kind='apply' entry plus the notes after "
+    "it, capped at 4096 bytes (oldest dropped first) - that is the cheap way to "
+    "pick a dead session back up; action=clear renames the file to "
+    "journal.jsonl.bak-<stamp> (confirm=true, nothing is deleted). A successful "
+    "board_apply also drops one kind='apply' line on its own. It records what a "
+    "caller wrote, never that the work happened - re-read the board and run the "
+    "DRC before trusting an entry.",
     {"type": "object", "properties": {
-        "action": _str("add / tail / clear", enum=["add", "tail", "clear"]),
+        "action": _str("add / tail / resume / clear",
+                             enum=["add", "tail", "resume", "clear"]),
         "kind": _str("what the note is about (add), or filter by it (tail)",
                      enum=["board", "route", "drc", "apply", "note", "handover"]),
         "text": _str("the note, at most 400 characters"),

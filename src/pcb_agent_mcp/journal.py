@@ -170,6 +170,81 @@ def tail(limit=8, kind=None):
     return out
 
 
+def auto(kind, text, board=None, data=None):
+    """Append if the journal is on, and never raise. A checkpoint is a courtesy.
+
+    Called from the write path, so a full journal, a read-only home or a switched
+    off journal must not turn a successful board write into an error the caller
+    has to debug. Returns the receipt, or None when nothing was written.
+    """
+    try:
+        return append(kind, text, board=board, data=data)
+    except Exception:      # journal trouble never breaks the work it was logging
+        return None
+
+
+def resume(limit=20, budget=4096):
+    """The last written checkpoint plus everything noted after it.
+
+    A session that has just lost its memory needs ONE small read, not a rewritten
+    summary. This starts at the newest `kind="apply"` entry and keeps what came
+    after it; if the reply would exceed `budget` bytes the OLDEST entries go
+    first, so what survives is always the newest part of the story.
+    """
+    limit = max(1, min(int(limit or 20), 50))
+    budget = max(512, min(int(budget or 4096), 16384))
+    total, size = _count()
+    out = {"status": "ok", "action": "resume", "journal": path(),
+           "entries_total": total, "journal_bytes": size, "entries": [],
+           "budget_bytes": budget,
+           "what_this_proves": "what a previous session wrote down. Re-read the "
+                               "board file and run the DRC before trusting it"}
+    if not enabled():
+        out["status"] = "disabled"
+        out["message"] = ("PCB_AGENT_JOURNAL is off; an empty list here means the "
+                          "journal is disabled, not that no work was done")
+        return out
+    if not total:
+        out["message"] = ("the journal is empty: nothing has been written yet, "
+                          "which is not the same as nothing having been done")
+        return out
+    entries = []
+    try:
+        with io.open(path(), encoding="utf-8", newline="") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except ValueError:
+                    entries.append({"kind": "unreadable", "text": line[:MAX_TEXT]})
+    except OSError as exc:
+        raise JournalError("JOURNAL_UNREADABLE", "cannot read %s: %s" % (path(), exc))
+    start = None
+    for i in range(len(entries) - 1, -1, -1):
+        if entries[i].get("kind") == "apply":
+            start = i
+            break
+    if start is None:
+        start = max(0, len(entries) - limit)
+        out["no_checkpoint"] = True
+        out["message"] = ("no kind='apply' entry yet, so this is the tail of the "
+                          "journal and not a checkpoint; nothing is invented")
+    span = entries[start:]
+    window = span[-limit:]
+    while len(window) > 1:
+        out["entries"] = window
+        if len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= budget:
+            break
+        window = window[1:]
+    out["entries"] = window
+    out["returned"] = len(window)
+    out["dropped_for_budget"] = len(span) - len(window)
+    out["reply_bytes"] = len(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+    return out
+
+
 def clear(confirm):
     if confirm is not True:
         raise JournalError("CONFIRM_REQUIRED",

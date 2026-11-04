@@ -7288,6 +7288,74 @@ def selftest(verbose=False):
         else:
             os.environ["PCB_AGENT_HOME"] = _jhome_before
 
+    # --- 0.0.115 断线续跑 2：写盘就自动留一行，续跑只需一次 4 KiB 的读 ------
+    # 17:52 那次压缩之后 answer_runes=0、reason=no_answer（同日第 32 次空回答，
+    # 46 次压缩里中位 original_tokens=112799 -> compacted_tokens=55356）。断点
+    # 在宿主的压缩-再生成，MCP 改不了；能改的是"断了以后要花多少字节接回来"。
+    _jtmp2 = _tempfile.mkdtemp(prefix="pcb-journal2-")
+    _jb = os.environ.get("PCB_AGENT_JOURNAL")
+    _jh = os.environ.get("PCB_AGENT_HOME")
+    try:
+        os.environ.pop("PCB_AGENT_JOURNAL", None)
+        os.environ["PCB_AGENT_HOME"] = _jtmp2
+        _rep = {"status": "ok",
+                "target": os.path.join(_jtmp2, "v21_g4n5b.kicad_pcb"),
+                "bytes": 41209, "operations_done": 3, "operations_total": 3,
+                "done": True}
+        _snap = json.dumps(_rep, ensure_ascii=False, sort_keys=True)
+        _rec = _tools._journal_apply(_rep)
+        check("a successful write drops exactly one kind='apply' line and leaves the "
+              "reply dict byte-identical - a checkpoint must not become a second "
+              "answer",
+              _rec is not None and _journal._count()[0] == 1
+              and json.dumps(_rep, ensure_ascii=False, sort_keys=True) == _snap,
+              "%s, journal=%d" % (_rec and _rec.get("entries_total"),
+                                  _journal._count()[0]))
+        _dry = _tools._journal_apply({"status": "ok", "dry_run": True,
+                                      "target": "x.kicad_pcb"})
+        _err = _tools._journal_apply({"status": "error", "reason_code": "X",
+                                      "path": "y.kicad_pcb"})
+        _nofile = _tools._journal_apply({"status": "ok", "bytes": 3})
+        check("a dry run, a failure and a reply with no file in it all write "
+              "NOTHING - the journal must not claim work that did not happen",
+              _dry is None and _err is None and _nofile is None
+              and _journal._count()[0] == 1,
+              "%d entries" % _journal._count()[0])
+        _journal.append("note", "next: g4n6 SWDIO 东列 -> J2B.19")
+        _journal.append("note", "todo: g4n7 SWCLK/SWDIO 西支、g5 电源")
+        _jr = _journal.resume()
+        check("resume starts at the last apply and carries the notes after it, "
+              "inside its byte budget - one small read replaces a rewritten summary",
+              [e.get("kind") for e in _jr["entries"]] == ["apply", "note", "note"]
+              and _jr["returned"] == 3
+              and _jr["reply_bytes"] <= _jr["budget_bytes"],
+              "%d entries, %d B" % (_jr["returned"], _jr["reply_bytes"]))
+        _journal.clear(True)
+        _journal.append("note", "只有一条 note，没有 apply 检查点")
+        _jrn = _journal.resume(limit=1)
+        check("with no apply entry resume says so instead of presenting the tail as "
+              "a checkpoint - no checkpoint is invented",
+              _jrn.get("no_checkpoint") is True
+              and _jrn["entries"][0].get("kind") == "note"
+              and _jrn["returned"] == 1, str(_jrn.get("no_checkpoint")))
+        os.environ["PCB_AGENT_JOURNAL"] = "0"
+        _rec_off = _tools._journal_apply(dict(_rep))
+        _jr_off = _journal.resume()
+        check("with the journal switched off an automatic checkpoint is skipped "
+              "silently (no exception out of board_apply) and resume reports "
+              "DISABLED rather than 'no work was done'",
+              _rec_off is None and _jr_off.get("status") == "disabled"
+              and _jr_off["entries"] == [], str(_jr_off.get("status")))
+    finally:
+        if _jb is None:
+            os.environ.pop("PCB_AGENT_JOURNAL", None)
+        else:
+            os.environ["PCB_AGENT_JOURNAL"] = _jb
+        if _jh is None:
+            os.environ.pop("PCB_AGENT_HOME", None)
+        else:
+            os.environ["PCB_AGENT_HOME"] = _jh
+
     # --- 0.0.110 tools/list 的预算：默认 25 KiB + 先削文再分页 -------------
     # 0.0.104 给 tools/call 上了 48 KiB 的闸门，但每次会话第一件事就是拉
     # tools/list，而它一直是原样全发：core 档 54 905 B、all 档 300 159 B。守了

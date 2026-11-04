@@ -9,6 +9,38 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.115] - 2026-11-04
+
+断线续跑第二版：把 checkpoint 从「人记得写」变成「写盘就自动有」。
+
+### 现场（第三次，同一天）
+
+`app-server_2026-11-04.log`：
+
+- `17:52:33 [context_compactor] compact success: c_compact, msgs=104->3, original_tokens=123191, compacted_tokens=60837, ratio=49.4%`（压缩那次请求本身 `cost_ms=84959`）
+- `17:57:14 recommendation decision ... answer_runes=0 operation=run.recommendations reason=no_answer` —— 压缩之后那一次生成返回空
+- `17:57:15 run forwarding finished duration_ms=1035952`（整轮 17.3 分钟）
+- `18:38:15 session started`（41 分钟后客户端起全新会话）
+- 全天：压缩 46 次，`answer_runes=0` 32 次；压缩中位 `original_tokens=112799 -> compacted_tokens=55356`；MCP stdio / JSON-RPC 协议层错误 **0 次**
+
+同一位置第三次复现，数字每次都不同 ⇒ 断点在宿主的「压缩 → 再生成」那一段，不在 MCP 传输层。
+
+### 新增
+
+- `journal.auto(kind, text, board, data)`：写不进去就返回 `None`，**绝不抛异常**。写盘日志不该把一次成功的板级写入变成待排查的错误。
+- `board_apply` 成功落盘后**自动**追加一条 `kind="apply"`，文本形如
+  `apply ok -> v21_g4n5b.kicad_pcb bytes=41209 operations_done=3 operations_total=3`。
+  回包 **一个字节都不变**（自检里对 dict 做了 `sort_keys` 全等比较）。
+  干跑 / 失败 / 回包里没有文件的一律不写。
+- `board_journal(action="resume")`：从**最新的 `kind="apply"`** 开始，带上它之后的所有 note，回包上限 **4096 B**，超了从**最旧**的一端丢。没有 apply 条目时回 `no_checkpoint=true`，不把尾巴冒充检查点。
+- 5 条自检（自动落行且回包不变 / 干跑与失败不写 / resume 起点与预算 / 无检查点不冒充 / 关掉时静默跳过且报 disabled）。
+
+### 边界（不许读错）
+
+1. 自动行只证明「这一行字在盘上」，不证明板子被那次 apply 改对了 —— 仍然要重读文件、跑 DRC。
+2. `PCB_AGENT_JOURNAL=0` 时自动落行**静默跳过**，此时 `resume` 回 `status=disabled` 并报出磁盘上原有条数。
+3. 自动行按 `MAX_TEXT=400` 截断；截断只影响这一行，不影响任何工具答案。
+
 ## [0.0.114] - 2026-11-04
 
 断线续跑：把一次交接从「重写一篇摘要」压成「读 8 行」——新增 `board_journal`。
