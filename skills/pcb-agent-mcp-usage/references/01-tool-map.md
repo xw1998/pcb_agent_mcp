@@ -37,6 +37,7 @@
 - `board_checkpoints` — List the checkpoints this server took before writing.
 - `board_restore` — Put a checkpoint back on disk.
 - `board_progress` — Watch or stop a stepped apply.
+- `board_journal` — The tiny append-only progress journal under `PCB_AGENT_HOME` (`journal.jsonl`): `action=add` stores one note (kind + text, max 400 chars), `action=tail` returns the last N with their byte cost, `action=resume` starts at the newest `kind="apply"` entry, adds the notes after it and caps the reply at 4096 B (oldest dropped first, `no_checkpoint=true` when there is none), `action=clear` RENAMES the file to `journal.jsonl.bak-<stamp>` (confirm=true, nothing deleted). A successful `board_apply` drops one `kind="apply"` line by itself; that line and the tool's own reply never change what `board_apply` answers. An entry proves the text is on disk, never that the board is good - re-read the file and run the DRC.
 - `board_ir_drop` — DC voltage drop across ONE net, built from the copper the board ACTUALLY carries: every track segment becomes 
 - `board_vibration` — Natural frequencies of THIS board from its own outline and stackup, with every component sampled against the f
 - `board_electrothermal` — Board-level 2-D electro-thermal: every conductor's I^2R feeds a plate solve, and the plate temperature feeds b

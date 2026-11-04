@@ -1,14 +1,21 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——190 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——191 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
 
+## 会话断了怎么办（board_journal）
+
+1. 先 `board_journal(action="resume")`：从最近一次成功落盘开始，带它之后的 note，回包上限 4 KiB。**它只说明上次的人写了什么，不说明板子是对的。**
+2. 再读板子本身（`board_stats` / `board_drc`）核对；两者对不上时以文件为准。
+3. 每做完一个网络组，用 `kind="note"` 记一行「下一步是什么、卡在哪」——`board_apply` 成功时会自动留 apply 行，但「为什么停在这」只有人能写。
+4. `PCB_AGENT_JOURNAL=0` 关掉时自动落行静默跳过，`resume` 回 `status=disabled` 并报出磁盘原有条数。
+
 ## 三件必须先知道的事
 
-1. **它注册了 190 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
-   这是故意的：把 315 KB 的工具清单塞进上下文会直接把对话撑爆。
+1. **它注册了 191 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
+   这是故意的：把 301 KB 的工具清单塞进上下文会直接把对话撑爆。
    ⇒ 想用的工具不在清单里，就先 `tool_search`（按**任务**搜，支持中文任务名词，
    例如「阻抗」「回流」「铺铜」），再 `tool_call` 执行。**不要臆造工具名，也不要因为
    「清单里没有」就断言「这个服务做不到」。**
