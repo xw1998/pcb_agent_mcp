@@ -4821,9 +4821,12 @@ def find_ngspice(allow_bundled=False):
     install-directory scan. It is OFF by default so that the answer to "what does
     this machine have installed" does not change, and so that engine='auto' keeps
     meaning exactly what it meant before the bundle existed. The bundle ranks
-    above the install scan because a hand-unpacked copy routinely has no spinit
-    (the one on this machine does not), i.e. a lookup heuristic must not shadow
-    the copy this repository can vouch for.
+    above the install-directory scan but BELOW PATH and below
+    PCB_AGENT_NGSPICE: those are explicit statements about this machine, and an
+    explicit answer must not be overridden by a vendored binary. (0.0.112
+    corrected this paragraph: it used to claim the bundle ranked above PATH and
+    the install scan, which the code has never done. The behaviour is unchanged -
+    only the description was wrong.)
     """
     if NGSPICE_CMD:
         return list(NGSPICE_CMD)

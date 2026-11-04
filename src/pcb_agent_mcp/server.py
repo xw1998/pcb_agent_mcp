@@ -46,6 +46,88 @@ def _dumps(payload):
     """Strict JSON over the wire - see jsonsafe for why this is not json.dumps."""
     return _jsonsafe.dumps(payload)
 
+def _bytes_of(text):
+    return len(text.encode("utf-8"))
+
+def _line_too_large(resp, limit, full, head):
+    """A reply that still carries the id, and says it is a receipt."""
+    msg_id = resp.get("id") if isinstance(resp, dict) else None
+    err = resp.get("error") if isinstance(resp, dict) else None
+    note = {
+        "status": "error" if err else "ok",
+        "truncated": True,
+        "reason_code": "LINE_TOO_LARGE",
+        "bytes_full": full,
+        "cap_bytes": limit,
+        "message": ("this one JSON-RPC message was %d bytes against a wire ceiling of "
+                    "%d bytes; a reply that does not fit the transport is not "
+                    "a reply, it is a truncated frame and a desynchronised client"
+                    % (full, limit)),
+        "fix": ("ask for less, or send the calls one at a time (a batch is ONE "
+                "message), or raise PCB_AGENT_MAX_LINE_KB if the client really "
+                "reads lines that long"),
+        "where_to_read": "this is a receipt, not a measurement",
+    }
+    if err:
+        note["upstream_error"] = {"code": err.get("code"),
+                                  "message": str(err.get("message", ""))[:200]}
+    # 240 -> 80 -> 0: the head is a courtesy, the id and the reason are not.
+    for keep in (240, 80, 0):
+        body = dict(note)
+        body["head"] = (head[:keep] if keep else "")
+        text = _dumps(body)
+        if err:
+            out = _error(msg_id, err.get("code", -32603),
+                         "reply cut at the wire ceiling", dict(note))
+        else:
+            out = _ok(msg_id, {"content": [{"type": "text", "text": text}],
+                               "isError": False})
+        if _bytes_of(_dumps(out)) <= limit:
+            return out
+    return {"jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": -32603, "message": "reply over the wire ceiling"}}
+
+def _fit_one(resp, limit):
+    """Return `resp` unchanged if it fits, else the smallest honest substitute.
+
+    Unchanged means byte-identical: no key added, nothing reordered. That is the
+    property that keeps this gate invisible for every reply that already fitted.
+    """
+    if limit <= 0 or not isinstance(resp, dict):
+        return resp
+    text = _dumps(resp)
+    full = _bytes_of(text)
+    if full <= limit:
+        return resp
+    head = ""
+    result = resp.get("result")
+    if isinstance(result, dict):
+        content = result.get("content")
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            head = str(content[0].get("text") or "")
+    return _line_too_large(resp, limit, full, head)
+
+def _line_for_wire(payload, limit):
+    """One newline-delimited frame, guaranteed to fit `limit` bytes."""
+    if limit <= 0:
+        return _dumps(payload)
+    if isinstance(payload, list):
+        # A batch is one message, so the budget is shared: every element stays
+        # present (dropping one would be a protocol error) and each gets its own
+        # slice. Absolute floor 512 B - below that even an envelope with an id
+        # and a reason does not fit, and pretending otherwise would loop.
+        each = max(512, limit // max(1, len(payload)))
+        return _dumps([_fit_one(one, each) for one in payload])
+    return _dumps(_fit_one(payload, limit))
+
+def _emergency_envelope(payload, exc):
+    """Last resort when serialising itself failed: the id, and why."""
+    msg_id = payload.get("id") if isinstance(payload, dict) else None
+    return {"jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": -32603,
+                      "message": "could not serialise the reply: %s"
+                                 % type(exc).__name__}}
+
 
 def handle(request):
     """Return a response dict, or None for notifications."""
@@ -186,16 +268,58 @@ def serve(stdin=None, stdout=None):
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
     dead = []
+    ceiling = _tools.max_line_bytes()
 
     def write(payload):
+        """Put one frame on the wire, or end the session - never crash it.
+
+        0.0.104 capped a tool REPLY (48 KiB) and 0.0.109 capped tools/list
+        (25 KiB), but the frame carrying them had no ceiling at all, and the
+        writer caught only OSError. Two ways to lose a session followed:
+
+          * a batch is ONE frame. Eight legal 35 KiB replies became a 273 KiB
+            line (measured 2026-11-04, `_scratch/_m_line.py`), which a client
+            that caps a line reports as a dead connection;
+          * anything `_dumps` or `encode` raised that was not OSError propagated
+            out of `serve()`, so the process left without a word and the client
+            saw EOF - the same symptom, with no trace in the log.
+
+        Now: the frame is shrunk to `PCB_AGENT_MAX_LINE_KB` first (element by
+        element for a batch, because dropping one would be a protocol error),
+        the write is retried once with an emergency envelope if it raises
+        anything, and only a genuinely closed stdout - or a second failure -
+        ends the session.
+        """
         if dead:
             return
-        try:
-            stdout.write((_dumps(payload) + "\n").encode("utf-8"))
-            stdout.flush()
-        except OSError as exc:            # the client went away
-            dead.append(1)
-            _log("stdout closed: %s: %s" % (type(exc).__name__, exc))
+        lim = ceiling
+        for attempt in (0, 1):
+            try:
+                stdout.write((_line_for_wire(payload, lim) + "\n").encode("utf-8"))
+                stdout.flush()
+                return
+            except OSError as exc:        # the client went away
+                dead.append(1)
+                _log("stdout closed: %s: %s" % (type(exc).__name__, exc))
+                return
+            except Exception as exc:      # noqa: BLE001
+                # Not the client leaving: a payload or a buffer this process
+                # could not turn into bytes. Try one envelope with no payload.
+                _log("could not write a reply (%s: %s); retrying with a bare "
+                     "envelope instead of ending the session"
+                     % (type(exc).__name__, exc))
+                try:
+                    payload = _emergency_envelope(payload, exc)
+                    lim = 0                   # the fallback is tiny by construction
+                except Exception:             # noqa: BLE001
+                    payload = {"jsonrpc": "2.0", "id": None,
+                               "error": {"code": -32603,
+                                         "message": "reply could not be written"}}
+                    lim = 0
+        dead.append(1)
+        _log("stdout stayed unusable after a fallback envelope; ending the session "
+             "here rather than writing a corrupt line that would desynchronise "
+             "the client")
 
     def handle_safely(item):
         # A batch arrives as an array and is answered with an array; one broken
@@ -7325,6 +7449,80 @@ def selftest(verbose=False):
           "plain %r batch %r" % ([m.get("id") for m in _plain],
                                  [[x.get("id") for x in b] if isinstance(b, list)
                                   else b.get("id") for b in _batch]))
+
+    # --- 0.0.112 一帧（行）也要有上限，写不出去也不许断线 --------------------
+    # 0.0.104 管住了单条 tools/call（48 KiB），0.0.109 管住了 tools/list（25 KiB），
+    # 但两上限都是「每条回复」，不是「每帧」——而一个批次就是一帧。实测：
+    # 8 个 calc_capabilities 合法回包拼成一行 279 633 B。读行那侧的默认上限
+    # （asyncio.StreamReader._DEFAULT_LIMIT = 65536）一旦被越，用户看到的是
+    # 「连接断了」，而不是「回复太大」。
+    _cap8 = "".join(_req(20 + i, "tools/call",
+                         {"name": "calc_capabilities", "arguments": {}})
+                    for i in range(8))
+    _t0 = _btime.monotonic()
+    _batch8 = _serve_lines(["[" + ",".join(_cap8.strip().splitlines()) + "]\n"])
+    _b8_s = _btime.monotonic() - _t0
+    _kept_line = os.environ.get("PCB_AGENT_MAX_LINE_KB")
+    try:
+        os.environ["PCB_AGENT_MAX_LINE_KB"] = "0"
+        _batch8_raw = _serve_lines(["[" + ",".join(_cap8.strip().splitlines())
+                                    + "]\n"])
+        _raw_bytes = len(_dumps(_batch8_raw[0]).encode("utf-8"))
+    finally:
+        if _kept_line is None:
+            os.environ.pop("PCB_AGENT_MAX_LINE_KB", None)
+        else:
+            os.environ["PCB_AGENT_MAX_LINE_KB"] = _kept_line
+    _b8 = _batch8[0] if _batch8 else []
+    check("a batch is ONE frame, and the frame is bounded too: eight legal replies that "
+          "add up to about 279 kB go out as a single line inside PCB_AGENT_MAX_LINE_KB, "
+          "with every id still present (dropping one would be a protocol error) and "
+          "each oversized element replaced by a receipt that names the reason",
+          len(_batch8) == 1 and isinstance(_b8, list) and len(_b8) == 8
+          and [m.get("id") for m in _b8] == list(range(20, 28))
+          and len(_dumps(_batch8).encode("utf-8")) <= 64 * 1024,
+          "%d B on the line, ids %r, %.2fs"
+          % (len(_dumps(_batch8).encode("utf-8")), [m.get("id") for m in _b8], _b8_s))
+
+    check("and the ceiling is what did that: with PCB_AGENT_MAX_LINE_KB=0 the same batch "
+          "is back to about 279 kB byte for byte - so the gate is a floor under the "
+          "protocol, not a second opinion on how big an answer may be, and switching "
+          "it off restores the old behaviour exactly",
+          _raw_bytes > 250 * 1024,
+          "uncapped frame %d B" % _raw_bytes)
+
+    _small = _req(41, "tools/call", {"name": "board_nets", "arguments": {}})
+    _resp = handle(json.loads(_small))
+    check("a reply that already fits is untouched: the gate adds no key and reorders "
+          "nothing, so the only replies that change are the ones that could not have "
+          "arrived anyway",
+          _line_for_wire(_resp, 64 * 1024) == _dumps(_resp),
+          "%d B" % len(_dumps(_resp).encode("utf-8")))
+
+    class _FlakyOut(object):
+        """A wire that raises once, for a reason that is NOT the client leaving."""
+        def __init__(self):
+            self.n = 0
+            self.buf = _bio.BytesIO()
+        def write(self, data):
+            self.n += 1
+            if self.n == 1:
+                raise ValueError("a payload this process could not turn into bytes")
+            return self.buf.write(data)
+        def flush(self):
+            pass
+
+    _flaky = _FlakyOut()
+    serve(stdin=_bio.BytesIO((_req(51, "ping") + _req(52, "ping")).encode("utf-8")),
+          stdout=_flaky)
+    _flat = [json.loads(ln) for ln in _flaky.buf.getvalue().decode("utf-8").splitlines()
+             if ln.strip()]
+    check("a write that raises something other than OSError no longer ends the session: "
+          "it is logged, retried with a bare envelope, and the next request is still "
+          "answered - before this, any such exception unwound serve() and the client "
+          "saw EOF with nothing in the log",
+          52 in [m.get("id") for m in _flat],
+          "ids %r after %d write attempts" % ([m.get("id") for m in _flat], _flaky.n))
 
     # 自检本身也要有预算：一条检查占掉分钟级，等于把整道闸门变成没人愿意跑的
     # 东西，而 0.0.108 的 AttributeError 就是这样一直没被发现。

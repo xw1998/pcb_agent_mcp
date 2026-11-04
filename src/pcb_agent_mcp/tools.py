@@ -10512,6 +10512,40 @@ def max_tools_chars():
 
 
 _CAP_LIST_BYTES = 8192
+def max_line_bytes():
+    """Ceiling on ONE line of the stdio transport (0 disables).
+
+    PCB_AGENT_MAX_LINE_KB, default 64 KiB. This is the third ceiling and it
+    exists because the first two are per REPLY, not per FRAME:
+
+      * `max_result_chars` bounds one tools/call result (48 KiB);
+      * `max_tools_chars` bounds one tools/list page (25 KiB);
+      * nothing bounded the JSON-RPC message itself, and a batch is one
+        message. Measured 2026-11-04: a batch of eight `calc_capabilities`
+        calls came back as a single 279 633 B line (measured on the wire) -
+        every element legally
+        under its own cap, the frame 273 KiB. A reader that caps a line (or a
+        4 KiB pipe with a client that reads lazily) does not see 'a big
+        answer', it sees a broken connection, which is exactly the symptom
+        users report as 'the mcp died again'.
+
+    The default is 64 KiB because 64 KiB is what a common MCP host code path
+    actually accepts: `asyncio.StreamReader` (Python 3.12, verified here) has
+    `_DEFAULT_LIMIT = 65536` and raises on a line that long, so the frame size
+    that turns into "the connection dropped" is a number, not a guess.
+
+    The default also sits above the 48 KiB result cap on purpose: with the
+    shipped settings no single reply is touched, so this gate is invisible until
+    somebody batches or raises the other two. It is a floor under the protocol,
+    not a second opinion on how big an answer may be.
+    """
+    raw = os.environ.get("PCB_AGENT_MAX_LINE_KB", "64")
+    try:
+        kb = int(float(raw))
+    except (TypeError, ValueError):
+        kb = 64
+    return max(0, kb) * 1024
+
 _CAP_STRING = 2000
 # (bytes one list may take, longest string kept) - tried in order until the reply
 # really fits. 0.0.104 first shipped one fixed setting ("keep 8 items of each
