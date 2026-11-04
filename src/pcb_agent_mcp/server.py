@@ -269,6 +269,7 @@ def serve(stdin=None, stdout=None):
     stdout = stdout or sys.stdout.buffer
     dead = []
     ceiling = _tools.max_line_bytes()
+    _tools.reset_session_budget()   # one process, one conversation's accounting
 
     def write(payload):
         """Put one frame on the wire, or end the session - never crash it.
@@ -7170,6 +7171,59 @@ def selftest(verbose=False):
         os.environ.pop("PCB_AGENT_MAX_RESULT_KB", None)
     else:
         os.environ["PCB_AGENT_MAX_RESULT_KB"] = _kb_before_selftest
+
+    # --- 0.0.113 会话预算：一条回包合法，不等于整场对话还活着 --------------
+    # 宿主日志里那次“还在断”的现场：context_compactor 记 original_tokens=133868
+    # 压缩完之后紧跟一条 answer_runes=111 的空回复。每一条回包都合法，对话死了。
+    _sb_before = os.environ.get("PCB_AGENT_SESSION_BUDGET_KB")
+    _st_before = os.environ.get("PCB_AGENT_SESSION_TAIL_KB")
+    try:
+        os.environ.pop("PCB_AGENT_SESSION_BUDGET_KB", None)   # 文档上的默认值
+        os.environ.pop("PCB_AGENT_SESSION_TAIL_KB", None)
+        _mid = {"status": "ok",
+                "pads": [{"i": i, "net": "GND"} for i in range(1200)]}
+        _mid_text = _tools.result_to_text(_mid)
+        _mid_bytes = len(_mid_text.encode("utf-8"))
+
+        _tools.reset_session_budget()
+        _mid_out, _mid_got = _tools.cap_result("selftest_mid", _mid)
+        check("a reply that is under the 48 KiB result cap and under the session "
+              "budget is returned BYTE-IDENTICAL and charged to the session - the "
+              "new accounting must not touch replies that were already legal",
+              _mid_bytes < 48 * 1024 and _mid_got == _mid_text
+              and _tools.session_spent_bytes() == _mid_bytes,
+              "%d B, spent %d B" % (_mid_bytes, _tools.session_spent_bytes()))
+
+        _tools.reset_session_budget()
+        _tools.note_reply_bytes(300 * 1024)
+        _cut_out, _cut_text = _tools.cap_result("selftest_mid", _mid)
+        _cut_bytes = len(_cut_text.encode("utf-8"))
+        check("after the session has spent its 256 KiB, the very same legal reply "
+              "comes back as a %d-byte receipt with reason_code SESSION_BUDGET "
+              "and the full JSON on disk - the session finishes the job instead "
+              "of dying at a size nobody could see" % _tools.session_tail_bytes(),
+              _cut_out.get("reason_code") == "SESSION_BUDGET"
+              and bool(_cut_out.get("saved_to"))
+              and _cut_bytes <= _tools.session_tail_bytes() < _mid_bytes
+              and _cut_out.get("session_bytes") == 300 * 1024,
+              "%d B (full %d B)" % (_cut_bytes, _mid_bytes))
+
+        os.environ["PCB_AGENT_SESSION_BUDGET_KB"] = "0"
+        _tools.reset_session_budget()
+        _tools.note_reply_bytes(300 * 1024)
+        _off_out, _off_text = _tools.cap_result("selftest_mid", _mid)
+        check("with PCB_AGENT_SESSION_BUDGET_KB=0 the same reply comes back whole "
+              "again - so the check above measured the session gate and not a "
+              "payload that had already shrunk on its own",
+              _off_text == _mid_text and "truncated" not in _off_out)
+    finally:
+        for _k, _v in (("PCB_AGENT_SESSION_BUDGET_KB", _sb_before),
+                       ("PCB_AGENT_SESSION_TAIL_KB", _st_before)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        _tools.reset_session_budget()
 
     # --- 0.0.110 tools/list 的预算：默认 25 KiB + 先削文再分页 -------------
     # 0.0.104 给 tools/call 上了 48 KiB 的闸门，但每次会话第一件事就是拉

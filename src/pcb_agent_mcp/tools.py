@@ -10486,6 +10486,67 @@ def max_result_chars():
         kb = 48
     return max(0, kb) * 1024
 
+_SESSION = {"bytes": 0}
+
+def session_budget_bytes():
+    """How much tool text one SESSION may pour into a conversation. 0 = off.
+
+    PCB_AGENT_SESSION_BUDGET_KB, default 256 KiB (about 65 000 tokens).
+
+    Why a third knob after `max_result_chars` and `max_line_bytes`: both of those
+    bound ONE message, and a conversation is not one message. Measured on
+    2026-11-04 from the host's own log: the session that kept "breaking" was
+    compacted at `original_tokens=133868` and the very next answer was
+    `answer_runes=111` - a nearly empty turn, which is what the user sees as
+    "still disconnected". Forty-eight KiB per reply is ~12 000 tokens; ten
+    honest replies and the session is spent, no matter how legal each one was.
+
+    So the session gets a budget, and the accounting is of what actually enters
+    the conversation, not of what the tool computed. Below the budget every
+    reply is byte-for-byte what it always was; above it the remaining replies
+    are cut to `session_tail_bytes()` with `reason_code = SESSION_BUDGET`, the
+    full JSON on disk and the size of the overrun in the reply itself. The
+    honest alternative - dying at turn 40 with no trace - is worse.
+    """
+    raw = os.environ.get("PCB_AGENT_SESSION_BUDGET_KB", "256")
+    try:
+        kb = int(float(raw))
+    except (TypeError, ValueError):
+        kb = 256
+    return max(0, kb) * 1024
+
+def session_tail_bytes():
+    """Per-reply cap once the session budget is gone. PCB_AGENT_SESSION_TAIL_KB.
+
+    Default 6 KiB: a receipt the model can act on (counts, status, saved_to)
+    with room for a handful of short values, and about 1 500 tokens.
+    """
+    raw = os.environ.get("PCB_AGENT_SESSION_TAIL_KB", "6")
+    try:
+        kb = int(float(raw))
+    except (TypeError, ValueError):
+        kb = 6
+    return max(1024, kb * 1024)
+
+def session_spent_bytes():
+    return _SESSION["bytes"]
+
+def reset_session_budget():
+    """Start a fresh conversation's accounting. Called by serve() and by tests."""
+    _SESSION["bytes"] = 0
+
+def note_reply_bytes(n):
+    """Charge what a reply actually put in the transcript, not what it computed."""
+    _SESSION["bytes"] += max(0, int(n))
+
+def effective_result_cap():
+    """The per-reply cap in force right now: the result cap, tightened by the budget."""
+    cap = max_result_chars()
+    budget = session_budget_bytes()
+    if cap and budget and _SESSION["bytes"] >= budget:
+        return min(cap, session_tail_bytes())
+    return cap
+
 def max_tools_chars():
     """Budget for one tools/list reply (0 disables). PCB_AGENT_MAX_TOOLS_KB.
 
@@ -10603,9 +10664,24 @@ def _save_full_reply(name, text):
         return None
 
 
-def _cap_meta(out, name, size, cap, cuts, saved, items, strlen):
+def _mark_session_budget(out):
+    """Say out loud that the SESSION ran out, not that this answer was too big."""
+    out["reason_code"] = "SESSION_BUDGET"
+    out["session_bytes"] = _SESSION["bytes"]
+    out["session_budget_bytes"] = session_budget_bytes()
+    out["why_this_is_short"] = (
+        "the conversation has already taken %d bytes of tool text (budget %d); "
+        "from here replies are cut to %d bytes so the session survives to the "
+        "end of the job instead of dying mid-turn. This is not a smaller "
+        "answer, it is the same answer with the rest on disk"
+        % (_SESSION["bytes"], session_budget_bytes(), session_tail_bytes()))
+    return out
+
+def _cap_meta(out, name, size, cap, cuts, saved, items, strlen, session_cut=False):
     out["truncated"] = True
     out["reason_code"] = out.get("reason_code") or "RESULT_TRUNCATED"
+    if session_cut:
+        _mark_session_budget(out)
     out["bytes_full"] = size
     out["cap_bytes"] = cap
     out["truncated_fields"] = cuts
@@ -10630,7 +10706,7 @@ def _cap_meta(out, name, size, cap, cuts, saved, items, strlen):
     return out
 
 
-def _spine_reply(name, result, size, cap, saved):
+def _spine_reply(name, result, size, cap, saved, session_cut=False):
     """Last resort: shape and counts only, no values. Always small."""
     shape = {}
     for k, v in result.items():
@@ -10646,7 +10722,8 @@ def _spine_reply(name, result, size, cap, saved):
     saved_path = saved
     shape = _cap_meta(shape, name, size, cap, {"(payload)": "every value replaced "
                                                "by its shape: even the heads did "
-                                               "not fit"}, saved_path, 0, 0)
+                                               "not fit"}, saved_path, 0, 0,
+                      session_cut=session_cut)
     shape["where_the_rest_is"] = (
         "not even a cut-down copy fitted %d bytes, so this reply carries shapes "
         "and counts only; the complete reply is at `saved_to` (%d bytes)"
@@ -10654,7 +10731,7 @@ def _spine_reply(name, result, size, cap, saved):
     return shape, result_to_text(shape)
 
 
-def _minimal_reply(name, result, size, cap, saved):
+def _minimal_reply(name, result, size, cap, saved, session_cut=False):
     """The floor: a receipt, not a payload. Used when nothing else fits the cap."""
     out = {
         "status": result.get("status", "ok") if isinstance(result, dict) else "ok",
@@ -10674,6 +10751,8 @@ def _minimal_reply(name, result, size, cap, saved):
     }
     if isinstance(result, dict):
         out["top_level_keys"] = list(result)[:40]
+    if session_cut:
+        _mark_session_budget(out)
     return out, result_to_text(out)
 
 
@@ -10696,8 +10775,11 @@ def cap_result(name, result):
     """
     text = result_to_text(result)
     size = len(text.encode("utf-8"))
-    cap = max_result_chars()
+    hard = max_result_chars()
+    cap = effective_result_cap()
+    session_cut = bool(cap and hard and cap < hard)
     if not cap or size <= cap:
+        note_reply_bytes(len(text.encode("utf-8")))
         return result, text
     saved = _save_full_reply(name, text)
     last = None
@@ -10706,15 +10788,20 @@ def cap_result(name, result):
         trimmed = _cap_walk(result, "", cuts, items, strlen)
         if not isinstance(trimmed, dict):
             trimmed = {"status": "ok", "value": trimmed}
-        out = _cap_meta(dict(trimmed), name, size, cap, cuts, saved, items, strlen)
+        out = _cap_meta(dict(trimmed), name, size, cap, cuts, saved, items, strlen,
+                        session_cut=session_cut)
         text = result_to_text(out)
         last = (out, text)
         if len(text.encode("utf-8")) <= cap:
+            note_reply_bytes(len(text.encode("utf-8")))
             return out, text
-    out, text = _spine_reply(name, result, size, cap, saved)
+    out, text = _spine_reply(name, result, size, cap, saved, session_cut=session_cut)
     if len(text.encode("utf-8")) <= cap:
+        note_reply_bytes(len(text.encode("utf-8")))
         return out, text
-    return _minimal_reply(name, result, size, cap, saved)
+    out, text = _minimal_reply(name, result, size, cap, saved, session_cut=session_cut)
+    note_reply_bytes(len(text.encode("utf-8")))
+    return out, text
 
 
 def result_too_large_text(name, size):

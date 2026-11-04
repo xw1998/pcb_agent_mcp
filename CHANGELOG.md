@@ -9,6 +9,27 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.113] - 2026-11-04
+
+会话也有体积预算了：一条回包合法 ≠ 整场对话还活着。
+
+前两道闸门（0.0.104 的 48 KiB 单条回复、0.0.112 的 64 KiB 单帧）都只盯
+**一个消息**，而用户报的「还是断了」现场是：宿主 `context_compactor` 记
+`original_tokens=133868`，压缩完紧接着一条 `answer_runes=111` 的近空回复 ⇒
+会话重启。四十条 48 KiB 的回包加起来是 60 万 token，每一条都合法。
+
+- `PCB_AGENT_SESSION_BUDGET_KB`（默认 **256 KiB**，`0` 关闭）与
+  `PCB_AGENT_SESSION_TAIL_KB`（默认 **6 KiB**）；
+- 记账的是**真正进对话的字节**（`note_reply_bytes` 在 `cap_result` 的每条
+  返回路径上记账），不是工具算出来的字节；
+- 预算未到时，回包**逐字节不变**（反向对照写在自检里）；越过后，后续回包
+  按 6 KiB 收尾，`reason_code = SESSION_BUDGET`，带上 `session_bytes` /
+  `session_budget_bytes` / `why_this_is_short`，全文照旧落 `saved_to`；
+- `serve()` 启动时 `reset_session_budget()`：一个进程 = 一场对话。
+
+自检 **357/357 passed**（108.3 s，`_scratch/_st113.log`），新增四条
+（不变 / 越界切 / 关掉不切 / 反向对照）。
+
 ## [0.0.112] - 2026-11-04
 
 一帧（行）也有上限了，写不出去也不再断线。前两道闸门都是「每条回复」：
