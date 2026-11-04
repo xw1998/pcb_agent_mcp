@@ -5448,9 +5448,9 @@ def selftest(verbose=False):
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (190 tools now: 192 until 0.0.107 removed the autorouter and the auto-fanout), so an agent that asks what can be "
+          "table (191 tools now: 192 until 0.0.107 removed the autorouter and the auto-fanout, then 0.0.114 added exactly one, board_journal), so an agent that asks what can be "
           "computed is told about it",
-          len(_tools.TOOLS) == 190
+          len(_tools.TOOLS) == 191
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -5625,8 +5625,8 @@ def selftest(verbose=False):
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (190 tools now: 192 until 0.0.107 removed the autorouter and the auto-fanout)",
-          len(_tools.TOOLS) == 190
+          "table (191 tools now: 192 until 0.0.107 removed the autorouter and the auto-fanout, then 0.0.114 added exactly one, board_journal)",
+          len(_tools.TOOLS) == 191
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5890,7 +5890,7 @@ def selftest(verbose=False):
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 190, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 191, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
@@ -5911,7 +5911,9 @@ def selftest(verbose=False):
           "were REMOVED from the server, not disabled, so 192 -> 190, and "
           "0.0.108 exactly one: the stdio loop stopped being a place where one "
           "slow tool owned the process (reads, cancel and an optional wall "
-          "clock ceiling now live there), so the tool count is still 190",
+          "clock ceiling now live there), so the tool count stayed 190, and 0.0.114 "
+          "exactly one (board_journal, the progress journal a broken session resumes "
+          "from), so it is 191",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5919,7 +5921,7 @@ def selftest(verbose=False):
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 190,
+          and len(_tools.TOOLS) == 191,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -6061,7 +6063,7 @@ def selftest(verbose=False):
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 190,
+          and len(_tools.TOOLS) == 191,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -6343,7 +6345,7 @@ def selftest(verbose=False):
           and _au_temp.get("temperatures_printed") == [100.0]
           and _au_kneg.get("reason_code") == "ARG_RANGE"
           and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 190,
+          and len(_tools.TOOLS) == 191,
           "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
           % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
              _au_n27.get("reason_code"), _au_mat.get("reason_code"),
@@ -7225,6 +7227,67 @@ def selftest(verbose=False):
                 os.environ[_k] = _v
         _tools.reset_session_budget()
 
+    # --- 0.0.114 断线续跑：把交接成本压到 1 KiB 量级 ---------------------
+    # 2026-11-04 17:21 的现场：context_compactor 记 original_tokens=88078 ->
+    # compacted_tokens=59054（ratio 67%），随后那一条请求 cost_ms=260388，
+    # 客户端 17:40 起的是一个全新会话。盘上的板子一点没丢，丢的是对话自己的
+    # 记忆，而补回来的代价是一篇多页交接摘要。日志线约 100 B，读尾巴即可。
+    from . import journal as _journal
+    import tempfile as _tempfile
+    _j_before = os.environ.get("PCB_AGENT_JOURNAL")
+    _jhome_before = os.environ.get("PCB_AGENT_HOME")
+    _jtmp = _tempfile.mkdtemp(prefix="pcb-journal-")
+    try:
+        os.environ.pop("PCB_AGENT_JOURNAL", None)
+        os.environ["PCB_AGENT_HOME"] = _jtmp
+        for _i in range(8):
+            _journal.append("route", "g4n4 PC15/PC2 walked, 0 issues, step %d" % _i,
+                            board="v21_g4n4.kicad_pcb", data={"issues": 0})
+        _jt = _journal.tail(limit=8)
+        _jt_bytes = len(json.dumps(_jt, ensure_ascii=False).encode("utf-8"))
+        check("eight journal entries come back in well under 1 KiB, so a broken "
+              "session's handover is a file read and not a rewritten summary",
+              _jt["entries_total"] == 8 and _jt["returned"] == 8
+              and _jt_bytes < 1024 * 2,
+              "%d entries, %d B reply" % (_jt["returned"], _jt_bytes))
+        _long = None
+        try:
+            _journal.append("note", "x" * (_journal.MAX_TEXT + 1))
+        except _journal.JournalError as _exc:
+            _long = _exc.code
+        check("an entry longer than 400 characters is REFUSED by name instead of "
+              "being stored - the cap is what keeps the handover small",
+              _long == "ARG_TOO_LONG" and _journal._count()[0] == 8, str(_long))
+        os.environ["PCB_AGENT_JOURNAL"] = "0"
+        _off = _journal.tail(limit=8)
+        _off_add = None
+        try:
+            _journal.append("note", "this must not be written")
+        except _journal.JournalError as _exc:
+            _off_add = _exc.code
+        check("with PCB_AGENT_JOURNAL=0 an empty tail is reported as DISABLED while "
+              "the file still holds 8 entries - 'nothing written' must never be "
+              "read as 'nothing was done'",
+              _off.get("status") == "disabled" and _off["entries"] == []
+              and _off["entries_total"] == 8 and _off_add == "JOURNAL_DISABLED",
+              "%s, %d on disk" % (_off.get("status"), _off["entries_total"]))
+        os.environ.pop("PCB_AGENT_JOURNAL", None)
+        _cl = _journal.clear(True)
+        check("action=clear archives the file and leaves an empty journal - the old "
+              "entries are renamed, not deleted",
+              _cl["cleared"] is True and os.path.isfile(_cl["archived_to"])
+              and not os.path.isfile(_cl["journal"])
+              and _journal.tail(1)["entries_total"] == 0, _cl["archived_to"][-24:])
+    finally:
+        if _j_before is None:
+            os.environ.pop("PCB_AGENT_JOURNAL", None)
+        else:
+            os.environ["PCB_AGENT_JOURNAL"] = _j_before
+        if _jhome_before is None:
+            os.environ.pop("PCB_AGENT_HOME", None)
+        else:
+            os.environ["PCB_AGENT_HOME"] = _jhome_before
+
     # --- 0.0.110 tools/list 的预算：默认 25 KiB + 先削文再分页 -------------
     # 0.0.104 给 tools/call 上了 48 KiB 的闸门，但每次会话第一件事就是拉
     # tools/list，而它一直是原样全发：core 档 54 905 B、all 档 300 159 B。守了
@@ -7299,7 +7362,7 @@ def selftest(verbose=False):
             _cur2 = _p.get("nextCursor")
             if not _cur2 or _pages2 > 40:
                 break
-        check("the `all` profile (190 tools, %d B raw) still reaches every tool "
+        check("the `all` profile (191 tools, %d B raw) still reaches every tool "
               "through the cursor while no page exceeds the cap: the profile most "
               "likely to kill a session is now the one with a measured way out"
               % _tsize(_raw_all),

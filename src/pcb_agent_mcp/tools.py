@@ -5568,6 +5568,23 @@ def _board_progress(args):
     except _edit.EditError as exc:
         return _edit_error(exc)
 
+def _board_journal(args):
+    """Append / read the tiny progress journal (survives a session break)."""
+    from . import journal as _j
+    action = (args.get("action") or "tail").strip().lower()
+    try:
+        if action == "add":
+            return _j.append(args.get("kind"), args.get("text"),
+                             board=args.get("board"), data=args.get("data"))
+        if action == "clear":
+            return _j.clear(args.get("confirm") is True)
+        if action in ("read", "tail", "list"):
+            return _j.tail(limit=args.get("limit") or 8, kind=args.get("kind"))
+        raise _j.JournalError("ARG_INVALID",
+                              "action %r is not add / tail / clear" % action)
+    except _j.JournalError as exc:
+        return exc.as_dict()
+
 def _board_restore(args):
     from . import edit as _edit
     try:
@@ -5718,6 +5735,31 @@ _tool(
         "limit": _num("how many to return", 20),
     }},
     _board_checkpoints,
+)
+
+_tool(
+    "board_journal",
+    "A tiny append-only progress journal under PCB_AGENT_HOME, so a session that "
+    "dies mid-job can resume from ~1 KiB instead of a rewritten summary. "
+    "action=add stores ONE note (kind + text, at most 400 characters, optional "
+    "board path and small data object) and replies with the entry and the new "
+    "totals; action=tail returns the last N entries with the byte cost; "
+    "action=clear renames the file to journal.jsonl.bak-<stamp> (confirm=true, "
+    "nothing is deleted). It records what a caller wrote, never that the work "
+    "happened - re-read the board and run the DRC before trusting an entry.",
+    {"type": "object", "properties": {
+        "action": _str("add / tail / clear", enum=["add", "tail", "clear"]),
+        "kind": _str("what the note is about (add), or filter by it (tail)",
+                     enum=["board", "route", "drc", "apply", "note", "handover"]),
+        "text": _str("the note, at most 400 characters"),
+        "board": _str("board file this note is about"),
+        "data": {"type": "object", "description":
+                 "small numbers worth keeping (counts, ids); keep it under a "
+                 "few hundred bytes"},
+        "limit": _num("how many entries tail returns", 8),
+        "confirm": _bool("clear only: true moves the file aside"),
+    }},
+    _board_journal,
 )
 
 _tool(

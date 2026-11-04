@@ -9,6 +9,59 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.114] - 2026-11-04
+
+断线续跑：把一次交接从「重写一篇摘要」压成「读 8 行」——新增 `board_journal`。
+
+0.0.113 把回包体积闸住之后，用户报的还是「现在还是断了」。这一次日志把现场
+钉住了，而且比上一轮更像同一条链在换位置：
+
+- `17:21:45` `[context_compactor] compact success: c_compact, msgs=57->3,
+  original_tokens=88078, compacted_tokens=59054, ratio=67.0%` —— 压缩成功，
+  压缩完的上下文仍有 5.9 万 token。
+- `17:26:10` 紧随其后的那条请求 `cost_ms=260388`（260 秒），产出 85 995 字节。
+- `17:26:14` `run forwarding finished ... duration_ms=1804814`（整轮 30 分钟）。
+- `17:40:00` `session started` —— 客户端起的是一个**全新会话**。
+- 全天 `UPSTREAM_TIMEOUT` 55 次、`empty choices` 281 次，**仍然没有任何
+  MCP stdio / 协议层错误**。
+
+结论不能改口：断点在宿主的压缩-再生成那一段，不在 MCP 的传输层。MCP 能动的
+只有「让每次交接便宜」这一侧。盘上的板子一点没丢，丢的是对话自己的记忆；而
+现在补回来的方式是让模型重写一篇多页交接摘要，那件事正是 260 秒里最贵的一段。
+
+所以这一版加的不是又一个检查器，而是一个**只写不删、每行约 100 字节**的进度
+日志：
+
+- 存储：`$PCB_AGENT_HOME/journal.jsonl`（默认 `~/.pcb_agent_mcp`），只在该有
+  写入时创建；`PCB_AGENT_JOURNAL=0` 可关。
+- `board_journal(action='add', kind, text, board, data)`：一条笔记，`text`
+  硬上限 **400 字符**（超了按 `ARG_TOO_LONG` 拒绝并给出上限，不静默截断），
+  回执只给这一条 + 全库条数与字节数。
+- `board_journal(action='tail', limit=8)`：最后 N 条 + 字节成本，实测 8 条
+  回包小于 2 KiB。
+- `board_journal(action='clear', confirm=true)`：`os.replace` 改名成
+  `.bak-<stamp>`，**不删除**；`confirm` 不给就 `CONFIRM_REQUIRED`。
+- 写满 4000 条或 2 MiB 时 `JOURNAL_FULL` 拒绝新增，绝不为腾地方丢旧条目。
+
+三条不许读错的边界写进工具描述与自检：
+
+1. 日志证明的是「这行字在盘上」，**不证明**任何一次布线/DRC 真的发生过；
+   `tail` 的 `what_this_proves` 每次原样重复这一句。
+2. `PCB_AGENT_JOURNAL=0` 时 `tail` 返回 `status=disabled` 且**同时报出磁盘上
+   仍有几条**——「没读到」不等于「没做过」。
+3. `clear` 是改名不是删除。
+
+自检 4 条（`356/361 -> 360/361` 的计数漂移另行说明：新增工具让 5 条把「工具数
+= 190」写死的审计链断言变成 191，已同步更新，见下）：
+
+- 8 条写入后 `tail` 一次读回，回包 < 2 KiB（否则「读尾巴」等于又一篇文章）；
+- 401 字符被 `ARG_TOO_LONG` 拒绝且库内仍是 8 条；
+- `PCB_AGENT_JOURNAL=0` 下 `tail` 报 `disabled` + `entries_total=8`，
+  `add` 报 `JOURNAL_DISABLED`；
+- `clear(confirm=true)` 后旧文件在 `.bak-*`、日志路径不存在、`tail` 为 0 条。
+
+工具数 190 -> **191**；`--selftest` 的计数型断言与叙述一并更新。
+
 ## [0.0.113] - 2026-11-04
 
 会话也有体积预算了：一条回包合法 ≠ 整场对话还活着。
