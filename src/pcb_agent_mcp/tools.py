@@ -1398,6 +1398,138 @@ _tool(
     _lceda_pcb_write,
 )
 
+def _lceda_pour(args):
+    """Official copper pour on the running editor: border in, fill read back.
+
+    A pour is two objects. ``pcb_PrimitivePour`` is the border and is writable;
+    ``pcb_PrimitivePoured`` is the fill RESULT and is read-only. Measured on
+    V4.1.60: no rebuild entry exists anywhere in the API, and the only thing
+    that fills is the editor's own Shift+B pressed by a human. So this handler
+    creates the official border, reads the official fill, and answers
+    ``needs_editor_rebuild=true`` with the exact keystroke instead of inventing
+    copper. Areas are this server's arithmetic (shoelace over the fill rings),
+    never a vendor number.
+    """
+    from . import lceda_pour as _pour
+    session = args.get("session")
+    if not session:
+        return _live_error(_live.LiveError("ARG_REQUIRED", "session is required"))
+    action = args.get("action") or "list"
+    if action not in ("list", "check", "create", "delete", "save"):
+        return err("unknown action %r" % (action,), "ARG_INVALID",
+                   hint="action is list | check | create | delete | save")
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    tm = args.get("timeout_ms")
+    identity = getattr(client, "identity", None) or {}
+    try:
+        if action in ("list", "check"):
+            rep = _pour.list_pours(client, session, timeout_ms=tm)
+        elif action == "create":
+            rep, e = _pour.create_pour(
+                client, session,
+                net=args.get("net"), layer=args.get("layer"),
+                rect_mm=args.get("rect_mm"),
+                polygon_mil=args.get("polygon_mil"),
+                name=args.get("name"),
+                priority=args.get("priority", 1),
+                fill_method=args.get("fill_method") or "solid",
+                preserve_silos=bool(args.get("preserve_silos", False)),
+                line_width=args.get("line_width", 10),
+                timeout_ms=tm)
+            if e:
+                return e
+        elif action == "delete":
+            rep, e = _pour.delete_pours(client, session, args.get("ids") or [],
+                                        timeout_ms=tm)
+            if e:
+                return e
+        else:
+            rep, e = _pour.save(client, session, timeout_ms=tm)
+            if e:
+                return e
+    except _live.LiveError as exc:
+        return _live_error(exc)
+    finally:
+        client.close()
+    return ok(
+        rep, "pour borders and fill regions as the editor reports them",
+        "lceda_pour_v1",
+        "eda.pcb_PrimitivePour.getAll() + eda.pcb_PrimitivePoured.getAll() read "
+        "inside the running editor; each fill path's first ring is the copper "
+        "edge and the rest are holes; area by shoelace with 1 unit = 10 mil "
+        "(0.254 mm), measured on this build's board outline",
+        "Borders and fill paths are the editor's own bytes, unmodified. The "
+        "areas are this server's arithmetic on those rings, so they are only as "
+        "good as the ring parse ('ARC' is treated as its end point, which "
+        "rounds a rounded corner by less than one unit). Whether the fill is "
+        "CURRENT is not answerable here: a track, pad or outline edit after the "
+        "last rebuild leaves it stale with no marker in the reply.",
+        {"action": action,
+         "api_can_rebuild": False,
+         "rebuild_needs_a_human": _pour.EDITOR_ACTION,
+         "no_rebuild_entry_evidence": dict(_pour.NO_REBUILD_EVIDENCE),
+         "this_server_never_draws_copper": (
+             "a self-drawn fill was measured to produce 302 clearance "
+             "violations: it does not know the rule table, so it is refused "
+             "here rather than offered as a fallback")},
+        extra={"endpoint": client.endpoint,
+               "bridge_version": identity.get("bridgeVersion"),
+               "verified_against_app": True})
+
+_tool(
+    "lceda_pour",
+    "Official copper pour in the running LCEDA Pro editor. A pour is TWO objects "
+    "and the split is the whole point: `pcb_PrimitivePour` is the border (net, "
+    "layer, fill method, priority) and the API can WRITE it; `pcb_PrimitivePoured` "
+    "is the fill RESULT and the API can only READ it. action='list' reads both "
+    "tables and reports per pour: net, layer, name, priority, border polygon, "
+    "fill_paths, filled_area_mm2 and `filled`. action='create' builds the OFFICIAL "
+    "border from rect_mm (board mm, canvas y down) and then reads it back - a "
+    "create whose re-read does not show one more pour with the net/layer asked "
+    "for is WRITE_HAD_NO_EFFECT, not a success. action='delete' removes ids and "
+    "proves the count fell by exactly that many. action='save' asks the editor to "
+    "write the project and refuses unless it answers true. action='check' is the "
+    "same read as list, meant to be run AFTER a rebuild.\n\n"
+    "What it cannot do, measured rather than guessed: all 98 eda.* namespaces and "
+    "every dmt_*/sys_* method were enumerated on V4.1.60 and NO rebuild entry "
+    "exists; save(), pcb_Drc.check(), pour.modify(), zoom, nesting a pour inside "
+    "another and closing-then-reopening the document were each tried and none "
+    "produced fill (a reopen keeps the border and loses the fill). The only thing "
+    "that fills is the editor's own Shift+B in the PCB canvas, pressed by a human. "
+    "So when a pour has no fill this tool answers needs_editor_rebuild=true plus "
+    "the exact keystroke, and it NEVER draws copper itself - a self-made fill was "
+    "measured to raise 302 clearance violations because it does not know the rule "
+    "table. `filled` is a snapshot, not live copper.",
+    {"type": "object",
+     "properties": dict(_LIVE_ARGS, **{
+         "session": _str("session id from lceda_pro_open / lceda_pro_sessions"),
+         "action": _str("list (default) | check | create | delete | save",
+                        ["list", "check", "create", "delete", "save"], "list"),
+         "net": _str("net the pour belongs to (create), e.g. GND"),
+         "layer": _num("copper layer: 1 top, 2 bottom (create)"),
+         "rect_mm": {"type": "array", "items": {"type": "number"},
+                     "description": "create: [x0,y0,x1,y1] in board mm, canvas y "
+                                    "down; converted to the document's mil"},
+         "polygon_mil": {"type": "array",
+                         "description": "create: a raw vendor polygon in document "
+                                        "units, e.g. ['R',20,2578.4,1534.8,2558.4,0,0]. "
+                                        "Used instead of rect_mm when given"},
+         "name": _str("pour name shown in the editor (create)"),
+         "priority": _num("pour priority; higher wins where pours overlap", 1),
+         "fill_method": _str("vendor fill method (create)", default="solid"),
+         "preserve_silos": _bool("keep isolated copper islands (default false)",
+                                 False),
+         "line_width": _num("border line width in document units (default 10)", 10),
+         "ids": _arr("pour primitive ids to delete"),
+         "timeout_ms": _num("per-invoke budget passed to the app (max 60000)", None),
+     }),
+     "required": ["session"]},
+    _lceda_pour,
+)
+
 def _lceda_write_snippet(args):
     """Build a save/move/create snippet from the app's own method table.
 

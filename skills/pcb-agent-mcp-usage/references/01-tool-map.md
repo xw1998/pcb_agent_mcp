@@ -1,4 +1,4 @@
-# 工具全表（0.0.118 实测 199 个）
+# 工具全表（0.0.119 实测 200 个）
 
 用途：查名字。语义以 `tool_search` / `tools/list` 的当前返回为准，本表只给一句话索引。
 
@@ -67,7 +67,7 @@
 - `schematic_review` — Grade a schematic / BOM against the missing-part catalogue: per-pin decoupling, bulk per rail, floating reset 
 - `schematic_export` — Schematic output: bom (CSV, parsed into rows with a placement count), netlist (kicadsexpr / kicadxml / spice /
 
-## 立创EDA 写入（12）
+## 立创EDA 写入（13）
 
 - `lceda_api_probe` — Speak to LCEDA Pro's API gateway rather than just looking at the port: opens a real RFC 6455 WebSocket to 127.
 - `lceda_pro_status` — Is the LCEDA Pro IN-PROCESS bridge alive, and which build is it? Speaks the editor's own command-space pipe (n
@@ -78,6 +78,7 @@
 - `lceda_pro_run` — Run a snippet INSIDE the running editor: the code is the body of an async function, gets the vendor's eda obje
 - `lceda_pro_steps` — Run a design change inside the running editor ONE STEP AT A TIME, so it can be watched and interrupted.
 - `lceda_pcb_write` — Perform ONE write inside the running LCEDA Pro editor and READ IT BACK.
+- `lceda_pour` — Official copper pour in the running LCEDA Pro editor. A pour is TWO objects: `pcb_PrimitivePour` (border, writable) and `pcb_PrimitivePoured` (fill result, read-only). actions list/check/create/delete/save; no fill means `needs_editor_rebuild=true` + the exact Shift+B keystroke, because the API has no rebuild entry (98 namespaces scanned) and this server never draws copper itself.
 - `lceda_write_snippet` — Build a save / move / create snippet for `lceda_pcb_write` out of the method table the running editor reports 
 - `lceda_step_record` — Freeze a run of editor steps into a replayable script.
 - `lceda_step_replay` — Replay a recorded step script inside the running editor and COMPARE each step's reply with the value that was 

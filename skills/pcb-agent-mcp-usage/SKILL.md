@@ -154,6 +154,11 @@ postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、
 - 写盘路径只有 `board_propose → board_apply`（原理图同理 `schematic_propose → schematic_apply`）。
   **不要用文本编辑去改 `.kicad_pcb` 绕过它**。
 - 用户的工程目录（例如 `LCEDA-Pro` 下的）**只读**；实验在副本上做。
+- **禁止自己造铺铜填充**（手算带状矩形、一条条 `pcb_PrimitiveFill` 之类）。铺铜是两个对象：
+  边框你写，**填充交给 EDA 官方**——KiCad 用 `board_fill_zones`（官方 `ZONE_FILLER`），
+  立创用 `lceda_pour(action="create")` 建边框 + 编辑器 `Shift+B` 重建，立创侧 API 没有重建入口
+  （98 个命名空间 + 键鼠注入均实测无效）。自行填充实测会报 302 条 Clearance 违规。
+  新画的线在填充之后，要让铜皮合并进最终 Gerber 就**再按一次 `Shift+B`**，然后 `lceda_pour(action="check")` 复核。
 
 ## 常见坑（都是真踩过的）
 
@@ -184,6 +189,6 @@ postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、
 
 ## 下一步可读
 
-- 工具全表（按域分组，190 个名字）：`references/01-tool-map.md`
+- 工具全表（按域分组，200 个名字）：`references/01-tool-map.md`
 - 分场景检查单（读板 / 改板 / 出图 / 排障）：`references/02-workflow-checklists.md`
 - 怎么摆、怎么布、怎么验收：另一份技能 `pcb-layout-methodology`

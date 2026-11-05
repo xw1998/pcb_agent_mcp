@@ -148,6 +148,17 @@ description: 手工画 PCB 的完整方法论——从约束清单、器件摆�
    `board_stitch_vias(action="audit")` 读：`existing_stitch_vias` 与「网格无孔点」都该是 0，
    换层信号过孔旁边的回流地孔也该有。用 `action="place"` 出孔位（只加孔，不动线）。
    孔只能落在**该网 `filled_polygon` 内且每一层都有**的位置——不靠「外框里就算」。
+7. **铺铜的「边框」你可以写，「填充」只能交给 EDA 官方。** 两个 EDA 里铺铜都是两个对象：
+   边界（谁、哪层、什么网、内缩多少）+ 填充结果（真正的铜、避让、孤岛）。
+   - KiCad：边框用 `board_add_zone` 之类写 `zone`，填充用 `board_fill_zones`（内部是官方
+     `ZONE_FILLER`）；`filled_polygon` 只是填充结果的快照。
+   - 立创 EDA：边框用 `lceda_pour(action="create")`，填充**没有 API 入口**——98 个命名空间逐个试过、
+     键鼠注入在本机也无效，唯一有效的是编辑器里 `Shift+B`（重建全部铺铜）。所以 `lceda_pour` 只建/删/读，
+     读的时候用 `action="check"` 看路径数与面积。
+   - **禁止自己算带状矩形、一条条画 fill 图元来「铺铜」**：实测这样铺出来的板 DRC 报 302 条
+     Clearance 违规（焊盘/走线避让全靠手算），比不铺更糟。
+   - 新画的线是在填充**之后**加的，`pourFills` 里没有它 ⇒ 同网铜虽不触发 clearance，
+     但要让铜皮真正合并、并用于最终 Gerber，**必须再按一次 `Shift+B` 再 `check`**。
 
 ## 扇出算术（LQFP 0.5 mm 间距必用）
 
