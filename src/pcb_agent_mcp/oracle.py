@@ -3481,3 +3481,226 @@ def _sig2(x):
         return float("%.6g" % float(x))
     except (TypeError, ValueError):
         return None
+
+
+# --------------------------------------------------------------------------
+# Net geometry / pour audit. Both answer "is this copper sane?", which the
+# existing tools could measure (counts, total length) but not judge.
+# --------------------------------------------------------------------------
+
+_POWERISH = ("+3V3", "+5V", "+12V", "VCC", "VDD", "VBUS", "VBAT", "VIN", "3V3",
+             "5V", "AGND", "GND", "VREF")
+
+
+def _is_powerish(name):
+    n = (name or "").upper()
+    return any(k in n for k in _POWERISH)
+
+
+def _prim_mst(points):
+    """MST length over 2-D points (Prim, O(n^2)). A LOWER BOUND on routing."""
+    n = len(points)
+    if n < 2:
+        return 0.0
+    inf = float("inf")
+    best = [inf] * n
+    used = [False] * n
+    best[0] = 0.0
+    total = 0.0
+    for _ in range(n):
+        k = -1
+        for i in range(n):
+            if not used[i] and (k < 0 or best[i] < best[k]):
+                k = i
+        used[k] = True
+        total += best[k]
+        px, py = points[k]
+        for i in range(n):
+            if used[i]:
+                continue
+            d = ((points[i][0] - px) ** 2 + (points[i][1] - py) ** 2) ** 0.5
+            if d < best[i]:
+                best[i] = d
+    return total
+
+
+def net_geometry_report(board, min_segments=4, top=40, detour_flag=1.8):
+    """Per net: routed length, segments, vias, pads, and length / pad-MST.
+
+    `detour_ratio` is the smell test for "this net took the scenic route". The
+    denominator is the minimum spanning tree over the net's PAD CENTRES, so it is
+    a lower bound on any tree that joins the pads: pad size, obstacle avoidance
+    and multi-drop topology all push the real number up. A ratio near 1 means the
+    copper goes roughly pad-to-pad; 2 means it covers twice the minimum.
+    """
+    nets = {}
+    for t in board.tracks:
+        n = t.get("net")
+        if n is None:
+            continue
+        e = nets.setdefault(n, {"length": 0.0, "segs": 0, "vias": 0, "pads": [],
+                                "widths": [], "layers": set()})
+        st, en = t.get("start"), t.get("end")
+        if st and en:
+            e["length"] += math.hypot(en[0] - st[0], en[1] - st[1])
+        e["segs"] += 1
+        e["widths"].append(t.get("width") or 0)
+        if t.get("layer"):
+            e["layers"].add(t["layer"])
+    for v in board.vias:
+        n = v.get("net")
+        if n in nets:
+            nets[n]["vias"] += 1
+    for fp in board.footprints:
+        for pd in fp.get("pads") or []:
+            n = pd.get("net")
+            if n in nets and pd.get("x") is not None:
+                nets[n]["pads"].append((pd["x"], pd["y"]))
+    if not nets:
+        return err("no routed copper on this board", "NO_GEOMETRY")
+
+    rows = []
+    for name, e in nets.items():
+        if e["segs"] < int(min_segments):
+            continue
+        mst = _prim_mst(e["pads"])
+        ratio = (e["length"] / mst) if mst > 0.001 else None
+        widest = max(e["widths"]) if e["widths"] else 0.0
+        flags = []
+        if ratio is not None and ratio >= float(detour_flag) * 1.4:
+            flags.append("very_long_detour")
+        elif ratio is not None and ratio >= float(detour_flag):
+            flags.append("long_detour")
+        if _is_powerish(name) and widest < 0.25:
+            flags.append("power_net_thin")
+        if e["segs"] >= 8 and e["vias"] / float(e["segs"]) > 0.25:
+            flags.append("via_heavy")
+        rows.append({"net": name, "length_mm": round(e["length"], 2),
+                     "segments": e["segs"], "vias": e["vias"],
+                     "pads": len(e["pads"]),
+                     "pad_mst_mm": round(mst, 2),
+                     "detour_ratio": (round(ratio, 2) if ratio else None),
+                     "widest_mm": round(widest, 3),
+                     "layers": sorted(e["layers"]), "flags": flags})
+    rows.sort(key=lambda r: (-(r["detour_ratio"] or 0), -r["length_mm"]))
+    shown = rows[:int(top)] if top else rows
+    return ok(
+        value={"nets_measured": len(rows), "returned": len(shown),
+               "nets": shown,
+               "flagged": [r["net"] for r in rows if r["flags"]],
+               "read_it_like_this": (
+                   "detour_ratio = routed length / MST over pad centres. It is a "
+                   "LOWER BOUND denominator: pads, obstacles and multi-drop nets "
+                   "all legitimately push it above 1, and a net that must ring the "
+                   "board because the parts sit on both edges is not 'routed badly'. "
+                   "Use it to FIND the nets worth looking at, then look at the "
+                   "picture (board_render) - a high ratio alone is not a defect")},
+        unit="mm",
+        model="routed length per net vs minimum spanning tree over its pad centres",
+        basis="every track segment on the net, straight-line length; MST by Prim "
+              "over pad ANCHOR points (pad size ignored)",
+        precision="exact for the lengths; the ratio is a heuristic and its "
+                  "denominator ignores pad geometry, keepouts and layer changes",
+        assumptions={"min_segments": int(min_segments),
+                     "detour_flag": float(detour_flag)})
+
+
+def pour_audit(board, zone_index=None, min_island_mm2=0.0):
+    """Per zone, per filled island: area, pads inside, same-net vias inside.
+
+    An island that contains no pad and no via of the zone's net is dead copper:
+    it is isolated from everything and exists only because the filler was told to
+    keep islands. That is the defect this reports; it is NOT a connectivity
+    verdict (the DRC is).
+    """
+    if not board.zones:
+        return err("no zones in this board", "NO_GEOMETRY",
+                   hint="there is nothing poured; board_zones lists what exists")
+    idx = range(len(board.zones)) if zone_index is None else [int(zone_index)]
+    pads_by_net = {}
+    for fp in board.footprints:
+        for pd in fp.get("pads") or []:
+            if pd.get("x") is None:
+                continue
+            pads_by_net.setdefault(pd.get("net"), []).append(
+                (pd["x"], pd["y"], "%s.%s" % (fp.get("ref") or "?",
+                                             pd.get("number") or "?")))
+    vias_by_net = {}
+    for v in board.vias:
+        if v.get("x") is None:
+            continue
+        vias_by_net.setdefault(v.get("net"), []).append((v["x"], v["y"]))
+
+    zones = []
+    dead_total = 0
+    for i in idx:
+        try:
+            z = board.zones[i]
+        except IndexError:
+            return err("zone_index out of range (0..%d)" % (len(board.zones) - 1),
+                       "ARG_RANGE")
+        if z.get("keepout"):
+            zones.append({"index": i, "net": z.get("net"),
+                          "layers": z.get("layers"), "keepout": True,
+                          "note": "a keepout has no copper by definition"})
+            continue
+        net = z.get("net")
+        polys = [p for p in (z.get("filled_polygons") or []) if len(p) >= 3]
+        pads = pads_by_net.get(net, [])
+        vias = vias_by_net.get(net, [])
+        islands = []
+        signed_total = 0.0
+        dead = 0
+        covered = set()
+        for j, poly in enumerate(polys):
+            a = 0.0
+            for k in range(len(poly)):
+                x0, y0 = poly[k]
+                x1, y1 = poly[(k + 1) % len(poly)]
+                a += x0 * y1 - x1 * y0
+            a /= 2.0
+            signed_total += a
+            hp = [p[2] for p in pads if G.point_in_polygon((p[0], p[1]), poly)]
+            covered.update(hp)
+            hv = sum(1 for v in vias if G.point_in_polygon(v, poly))
+            isdead = (not hp) and hv == 0
+            if isdead and abs(a) >= float(min_island_mm2):
+                dead += 1
+            islands.append({"island": j, "area_mm2": round(abs(a), 2),
+                            "pads": len(hp), "pads_named": hp[:8],
+                            "same_net_vias": hv,
+                            "dead_copper": isdead})
+        uncovered = [p[2] for p in pads if p[2] not in covered]
+        dead_total += dead
+        zones.append({"index": i, "net": net, "layers": z.get("layers"),
+                      "priority": z.get("priority"),
+                      "filled_polygons": len(polys),
+                      "copper_area_mm2": round(abs(signed_total), 2),
+                      "islands": len(polys),
+                      "dead_islands": dead,
+                      "pads_of_net": len(pads),
+                      "pads_on_copper": len(covered),
+                      "pads_off_copper": uncovered[:20],
+                      "island_detail": islands[:60]})
+    verdict = "pour_dead_copper" if dead_total else "pour_geometry_clean"
+    return ok(
+        value={"verdict": verdict,
+               "zones": zones,
+               "dead_islands_total": dead_total,
+               "read_it_like_this": (
+                   "dead_copper = a filled island that touches no pad and no "
+                   "same-net via. `pads_off_copper` is NOT 'unconnected': a pad "
+                   "reaches the pour through a track or a via that a "
+                   "centre-in-polygon test cannot see. Only board_drc's "
+                   "unconnected_total settles connectivity")},
+        unit="mm^2",
+        model="per filled island: shoelace area, pad-centre and via-centre "
+              "in-polygon membership",
+        basis="the filled_polygon rings stored in the file; nothing refilled",
+        precision="a fill is a SNAPSHOT - if tracks moved after the pour, these "
+                  "areas describe the old copper. Islands whose winding marks them "
+                  "as holes still count as polygons here; copper_area_mm2 uses the "
+                  "SIGNED sum so holes subtract",
+        assumptions={"zone_index": zone_index,
+                     "min_island_mm2": float(min_island_mm2),
+                     "islands_listed_per_zone": 60})

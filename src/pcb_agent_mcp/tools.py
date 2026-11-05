@@ -18,6 +18,7 @@ from . import lceda_api as _lceda_api
 from . import lceda_live as _live
 from . import fidelity as _fidelity
 from . import oracle as _oracle
+from . import snapshot as _snapshot
 from .fidelity import views as _fviews
 from .calc import current as _current
 from .calc import currentfield as _cfield
@@ -2881,6 +2882,67 @@ _tool(
                         **_COMMON),
      "required": ["path"]},
     _board_tool(_board_pour_connectivity, derived=True),
+)
+
+_tool(
+    "board_net_report",
+    "Per net: routed length, segments, vias, pads, and detour_ratio = length / "
+    "minimum spanning tree over the net's pad centres. This is the number that "
+    "turns 'this net took the scenic route' into something you can sort. The "
+    "denominator is a LOWER bound, so a multi-drop net or one whose parts sit on "
+    "opposite edges legitimately scores high - use it to pick which nets to look "
+    "at, not as a defect verdict. Flags: long_detour, very_long_detour, "
+    "power_net_thin (a power net whose widest segment is under 0.25 mm), "
+    "via_heavy. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "min_segments": _num("ignore nets with fewer segments than this", 4),
+         "top": _num("how many nets to list, longest-detour first (0 = all)", 40),
+         "detour_flag": _num("ratio at or above this is flagged", 1.8),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.net_geometry_report(
+        b, min_segments=a.get("min_segments", 4), top=a.get("top", 40),
+        detour_flag=a.get("detour_flag", 1.8)), derived=True),
+)
+
+_tool(
+    "board_pour_audit",
+    "Per zone, per FILLED ISLAND: area in mm^2, how many pads of the zone's net "
+    "sit in it, how many same-net vias sit in it. An island with neither is dead "
+    "copper - the filler was told to keep islands and kept a sliver that connects "
+    "to nothing. `pads_off_copper` is not 'unconnected': a pad reaches the pour "
+    "through a track or via this test cannot see. Only board_drc's "
+    "unconnected_total settles connectivity. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "zone_index": _num("only this zone (0-based); omit for every zone"),
+         "min_island_mm2": _num("ignore dead islands smaller than this", 0),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.pour_audit(
+        b, zone_index=a.get("zone_index"), min_island_mm2=a.get("min_island_mm2", 0)),
+        derived=True),
+)
+
+_tool(
+    "board_render",
+    "Rasterise one copper layer to a PNG and return its path, so the routing can "
+    "be LOOKED at instead of described. Draws the pour polygons, tracks, vias, "
+    "pads and the board edge as they are in the file. Preview only: no solder "
+    "mask, no silkscreen, no drill table, no transparency between layers. This "
+    "tool does not write to the board - it writes one image file.",
+    {"type": "object",
+     "properties": dict({
+         "layer": _str("copper layer to draw (F.Cu / B.Cu / In1.Cu ...); "
+                       "default F.Cu"),
+         "px_per_mm": _num("resolution (default 12; canvas capped at 4000 px)", 12),
+         "out": _str("PNG path to write (default: a file in the temp directory)"),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _snapshot.render(
+        b, layer=a.get("layer") or "F.Cu",
+        px_per_mm=a.get("px_per_mm", 12), out=a.get("out"))),
 )
 
 _tool(

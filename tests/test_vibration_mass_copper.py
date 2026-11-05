@@ -635,7 +635,11 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # the vendor's printed points is a different question from evaluating a fit)
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
-        self.assertEqual(len(tools.TOOLS), 200)
+        # 203 = 200 + the three 0.0.121 additions (board_net_report, board_pour_audit,
+        # board_render): being able to sort nets by detour, to see a pour's
+        # islands, and to LOOK at the copper are three separate questions,
+        # each of which the previous 200 tools could not answer.
+        self.assertEqual(len(tools.TOOLS), 203)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only
