@@ -196,6 +196,26 @@ description: 手工画 PCB 的完整方法论——从约束清单、器件摆�
    同尺寸参考板 4 个铺铜全是 GND/AGND，**零电源铜**，电源靠 0.50/0.60 主干。
    正解 = 双面地铜 + 加粗主干 + 缝合孔（本板 GND F 1732.6 / GND B 1635.2 mm²，857 个缝合孔）。
    要铺电源铜的前置是「先证明有一块真空闲区且该网焊盘集中在里面」，铺完 `board_pour_audit` 验收。
+10. **要铺整面电源铜，就把地铜用「高优先级 GND 区」抢回来，别靠挖洞硬凑。**
+   v66_power 实测：B.Cu 给 +3V3 整面 + 5V 底部条带，+3V3 **858.3 mm² / 1 岛**（基线 119.1）、
+   5V **86.4 mm² / 1 岛**（基线 0）、GND F.Cu **1744.9 mm² 不变**，DRC **0 error / 44 warning /
+   unconn 2 = 基线**。三步不可省：
+   - **reshape 旧 zone 再叠新 zone**（留着旧条带直接加 ⇒ `zones_intersect`）；
+   - **给被电源铜围住的地岛开「走廊」**：新建 GND zone、priority 10/11 高于电源 zone，
+     让它把电源铜顶开；相邻两块 GND 区**共享边界同样被判 `zones_intersect`**，所以必须
+     **给不同 priority**（10/11）而不是改形状。本板一条 `(7.8,-46.6)-(14.6,-42.3)` pr=11
+     的走廊把 26.03 mm² 的 F.Cu 地岛连回主地，`unconn` 从 4 回到 2；
+   - **删掉被拆成单侧的缝合孔**：电源铜吃掉一侧地铜后原来的地孔变 `via_dangling`，本板 7 个，
+     删完 warning 从 51 回到基线 44。
+   **不能用 `ISLAND_REMOVAL_MODE_AREA` 清碎岛**：实测把 +3V3 从 1 岛 858.3 变成 15 岛 930.6、
+   5V 从 1 岛 86.4 变成 9 岛 139.0 —— 面积变大、碎得更狠。判据看岛数，不看面积。
+   残余碎岛**先量再改**：本板 6 个合计 1.8 mm²（占全部铜 0.07%），kicad-cli 判 `unconn = 2`
+   与基线一致 ⇒ 连通性没问题，只是视觉碎屑，不值得为它改拓扑。**见 `references/08` 第 8c 节。**
+11. **KiCad 10 的 python API：`PCB_VIA.GetWidth()` 必须传层。**
+   `via.GetWidth()` 会触发 `pcb_track.cpp(387)` 的 `wxAssert`（弹「wxWidgets Debug Alert，
+   是否停止程序」），看上去像板文件坏了，**其实文件没事**——点「否/取消」继续即可，
+   随后把脚本改成 `GetWidth(pcbnew.F_Cu)`。`PCB_TRACK.GetWidth()` 无此问题，
+   只在外层已经过滤 `isinstance(t, PCB_VIA)` 的脚本里才安全。
 
 ## 扇出算术（LQFP 0.5 mm 间距必用）
 
