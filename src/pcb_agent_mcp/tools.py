@@ -3007,6 +3007,63 @@ _tool(
         verify_drc=bool(a.get("drc", True)))),
 )
 
+_tool(
+    "board_add_zone",
+    "Give a zone a SHAPED outline, then let KiCad pour it. A pour is not a set of "
+    "rectangles: a power pour follows the copper it serves, jogs at 45 degrees, and "
+    "a rectangle dropped on a plane cuts that plane into islands. You supply the "
+    "polygon in mm (the shape you would draw), KiCad's own ZONE_FILLER does the "
+    "copper - this server never rasterises, rounds or invents geometry, because a "
+    "shape nobody drew is a shape nobody can review. Refuses a net the board does "
+    "not have (a zone on a phantom net pours nothing and later reads as copper), a "
+    "polygon under 3 points, and a repeated point. Writes a checkpoint, adds the "
+    "zone, fills in place and reports KiCad's own DRC verdict on the poured file; "
+    "if the engine refuses, the original bytes are restored. Holes are extra "
+    "polygons inside the same zone.",
+    {"type": "object",
+     "properties": dict({
+         "net": _str("net name exactly as the board spells it, e.g. \"+3V3\""),
+         "layer": _str("copper layer to pour on", ["F.Cu", "B.Cu"]),
+         "points": {"type": "array", "minItems": 3,
+                    "description": "outline vertices in mm, [x, y], in order; do "
+                                   "not repeat the first point at the end",
+                    "items": {"type": "array", "minItems": 2, "maxItems": 2,
+                              "items": {"type": "number"}}},
+         "holes": {"type": "array",
+                   "description": "optional inner contours (same [x, y] form), "
+                                  "e.g. an area to keep clear of other parts",
+                   "items": {"type": "array", "minItems": 3,
+                             "items": {"type": "array", "minItems": 2,
+                                       "maxItems": 2,
+                                       "items": {"type": "number"}}}},
+         "priority": _num("zone priority; higher wins where two zones overlap "
+                          "(default 9 for a power pour over a priority-0 plane)", 9),
+         "clearance": _num("clearance to other nets, mm (default 0.25)", 0.25),
+         "thermal_gap": _num("thermal relief gap, mm (default 0.5)", 0.5),
+         "thermal_bridge_width": _num("thermal spoke width, mm (default 0.5)", 0.5),
+         "min_thickness": _num("minimum copper width, mm (default 0.25)", 0.25),
+         "connect": _str("how pads of the same net join the pour",
+                         ["thermal", "solid", "none", "thru_hole_only"], "thermal"),
+         "fill_it": {"type": "boolean",
+                     "description": "ask KiCad to pour it now (default true). "
+                                    "false writes the outline only"},
+         "drc": {"type": "boolean",
+                 "description": "run KiCad's DRC on the poured file and report "
+                                "`drc_after_fill` (default true)"},
+     }, **_COMMON, **{"required": ["path", "net", "layer", "points"]})},
+    lambda a: _guarded(lambda: _fill.add_zone(
+        a["path"], a["net"], a["layer"], a["points"],
+        holes=a.get("holes") or None,
+        priority=a.get("priority", 9),
+        clearance=a.get("clearance", 0.25),
+        thermal_gap=a.get("thermal_gap", 0.5),
+        thermal_bridge_width=a.get("thermal_bridge_width", 0.5),
+        min_thickness=a.get("min_thickness", 0.25),
+        connect=a.get("connect", "thermal"),
+        fill_it=bool(a.get("fill_it", True)),
+        verify_drc=bool(a.get("drc", True)))),
+)
+
 def _pro_rules_read(args):
     from . import edit as _edit
     try:

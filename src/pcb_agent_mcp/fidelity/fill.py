@@ -379,14 +379,35 @@ def _transplant(path, rows_before, rows_after):
     if len(rows_ours) != len(rows_before):
         return (False, None, _err("ENGINE_MISMATCH",
                                   "zone count changed under our feet"))
-    transplanted = 0
-    for ours, theirs in zip(rows_ours, rows_after):
-        if ours["net"] != theirs["net"] or ours["layer"] != theirs["layer"]:
+    # Pair our zones with the engine's by (net, layer), not by file position:
+    # pcbnew re-orders zones when it saves (a zone appended last in the file
+    # came back in the middle), and a positional pairing then refuses a pour
+    # that is perfectly fine. Duplicates of the same net/layer stay greedy in
+    # source order, so two pour islands of one net keep their own polygons.
+    def _key(row):
+        return (row["net"], row["layer"])
+
+    pool = {}
+    for row in rows_after:
+        pool.setdefault(_key(row), []).append(row)
+    pairs = []
+    for ours in rows_ours:
+        bucket = pool.get(_key(ours)) or []
+        if not bucket:
             return (False, None, _err(
                 "ENGINE_MISMATCH",
-                "zone %r/%r came back as %r/%r; the engine reordered the zones, "
-                "so no polygon may be moved by index"
-                % (ours["net"], ours["layer"], theirs["net"], theirs["layer"])))
+                "the engine returned no zone for %r/%r although the file has one; "
+                "no polygon may be moved" % _key(ours)))
+        pairs.append((ours, bucket.pop(0)))
+    if any(bucket for bucket in pool.values()):
+        extra = [k for k, bucket in pool.items() if bucket]
+        return (False, None, _err(
+            "ENGINE_MISMATCH",
+            "the engine returned zones the file does not have (%s); the pour "
+            "would land on the wrong net" % extra))
+
+    transplanted = 0
+    for ours, theirs in pairs:
         node = ours["_node"]
         for old in list(S.children(node, "filled_polygon")):
             S.remove_child(node, old)
@@ -575,3 +596,172 @@ def _attach_drc_gate(result, path, drc_path=None, measured_on=None):
 def _err(code, message):
     from ..calc.result import err
     return err(message, code)
+
+
+# ------------------------------------------------------- shaped pour outlines
+_COPPER_LAYERS = ("F.Cu", "B.Cu")
+
+
+def _fmt_mm(value):
+    """KiCad writes millimetres; keep 3 decimals and never an exponent."""
+    text = ("%.3f" % float(value)).rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def _available_nets(board):
+    """Net names this board actually has, gathered from the copper that uses them.
+
+    KiCad 10 writes no top-level net table, so the only honest source is the
+    `(net "...")` atoms inside pads and zones - which is also the set a new
+    zone can legally name."""
+    names = set()
+    for _path, item in S.walk(board):
+        if S.head(item) in ("pad", "zone", "segment", "via", "arc", "gr_line"):
+            node = S.child(item, "net")
+            if node is not None:
+                text = S.arg_text(node, 1)
+                if text:
+                    names.add(str(text))
+    return sorted(names)
+
+
+def add_zone(path, net, layer, points, holes=None, priority=9,
+             clearance=0.25, thermal_gap=0.5, thermal_bridge_width=0.5,
+             min_thickness=0.25, connect="thermal", fill_it=True,
+             verify_drc=True):
+    """Give a zone a SHAPED outline, then let KiCad pour it.
+
+    This exists because a pour is not a set of rectangles: a power pour follows
+    the copper it serves, with 45-degree transitions at the jogs, and a zone
+    block dropped on the middle of a plane cuts that plane into islands. The
+    caller supplies the polygon; nothing here invents geometry, rounds corners
+    or "optimises" the outline - a shape this server made up would be a shape
+    nobody can review.
+
+    What it will not do:
+      * name a net the board does not have (a zone on a phantom net pours
+        nothing and reads as copper in every later summary);
+      * accept a polygon with fewer than 3 points or zero area;
+      * report success off its own say-so - `fill_it` asks KiCad's own
+        ZONE_FILLER to pour it, and `verify_drc` asks KiCad's own DRC whether
+        the copper it poured is legal.
+
+    A checkpoint is written before the file changes; if the engine refuses the
+    pour the original bytes are restored.
+    """
+    from ..edit import plan as _plan
+    import uuid as _uuid
+
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        return _err("PROJECT_NOT_FOUND", "no such board: %s" % path)
+    layer = str(layer or "")
+    if layer not in _COPPER_LAYERS:
+        return _err("BAD_LAYER",
+                    "a pour needs a copper layer (%s), got %r"
+                    % (" / ".join(_COPPER_LAYERS), layer))
+    pts = []
+    for p in (points or []):
+        try:
+            x, y = float(p[0]), float(p[1])
+        except Exception:
+            return _err("BAD_POINTS", "every point must be [x, y] in mm; got %r" % (p,))
+        pts.append((x, y))
+    if len(pts) < 3:
+        return _err("BAD_POINTS",
+                    "a polygon needs at least 3 points, got %d" % len(pts))
+    if len(set(pts)) != len(pts):
+        return _err("BAD_POINTS", "the outline repeats a point; KiCad reads that as "
+                                  "a degenerate contour")
+    area = abs(G.polygon_area(pts))
+    if area < 0.01:
+        return _err("BAD_POINTS", "the outline encloses %.6f mm^2; nothing to pour"
+                    % area)
+    hole_pts = []
+    for h in (holes or []):
+        hp = [(float(q[0]), float(q[1])) for q in h]
+        if len(hp) < 3:
+            return _err("BAD_POINTS", "a hole needs at least 3 points")
+        hole_pts.append(hp)
+
+    doc = _kdoc.KiCadDocument.from_path(path)
+    board = doc.board()
+    nets = _available_nets(board)
+    if net not in nets:
+        return _err("NET_NOT_FOUND",
+                    "this board has no net %r; a zone on it would pour nothing. "
+                    "%d nets exist, e.g. %s"
+                    % (net, len(nets), ", ".join(nets[:12])))
+    mode = {"solid": "yes", "thermal": None, "none": "no",
+            "thru_hole_only": "thru_hole_only"}.get(str(connect))
+    if str(connect) not in ("solid", "thermal", "none", "thru_hole_only"):
+        return _err("BAD_ARGS", "connect must be solid / thermal / none / "
+                                "thru_hole_only")
+
+    def _pts_block(points_mm):
+        return " ".join("(xy %s %s)" % (_fmt_mm(x), _fmt_mm(y))
+                        for x, y in points_mm)
+
+    text = ("(zone (net %s) (layer %s) (uuid %s) (hatch edge 0.5) (priority %d) "
+            "(connect_pads %s(clearance %s)) (min_thickness %s) "
+            "(filled_areas_thickness no) "
+            "(fill yes (thermal_gap %s) (thermal_bridge_width %s) "
+            "(island_removal_mode 0)) "
+            "(polygon (pts %s))%s)"
+            % ('"%s"' % net, '"%s"' % layer, '"%s"' % _uuid.uuid4(),
+               int(priority), (mode + " ") if mode else "",
+               _fmt_mm(clearance), _fmt_mm(min_thickness),
+               _fmt_mm(thermal_gap), _fmt_mm(thermal_bridge_width),
+               _pts_block(pts),
+               "".join(" (polygon (pts %s))" % _pts_block(h) for h in hole_pts)))
+    try:
+        node = S.parse_single(text)
+        S.append_child(board, node)
+    except Exception as exc:  # noqa: BLE001
+        return _err("BAD_POINTS", "could not build the zone: %s" % exc)
+
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    checkpoint = _plan.save_checkpoint(path, raw, "before adding a shaped zone")
+    _plan._atomic_write(path, doc.to_bytes())
+
+    outline_mm2 = round(area, 3)
+    value = {
+        "net": net, "layer": layer, "points": len(pts), "holes": len(hole_pts),
+        "priority": int(priority), "connect": str(connect),
+        "outline_area_mm2": outline_mm2,
+        "checkpoint": checkpoint,
+        "file_written": True,
+        "poured": False,
+        "filled": None,
+    }
+    if not fill_it:
+        from ..calc.result import ok
+        return ok(value=value, unit="zone outline / mm2",
+                  model="zone_created_but_not_filled",
+                  basis="the outline was written; KiCad has not been asked to pour "
+                        "it yet",
+                  assumptions={"fill_is_a_snapshot": True,
+                               "next_step": "call board_fill_zones or this tool "
+                                            "with fill_it=true before judging "
+                                            "connectivity"})
+    poured = fill(path, in_place=True, verify_drc=verify_drc)
+    if isinstance(poured, dict) and str(poured.get("status")) == "error":
+        _plan._atomic_write(path, raw)
+        poured["hint"] = ("the zone outline was rolled back to the bytes before "
+                          "this call (%s still holds them)" % checkpoint)
+        return poured
+    body = poured.get("value", {}) if isinstance(poured, dict) else {}
+    value["poured"] = True
+    value["filled"] = {"zones": body.get("zones"),
+                       "poured_zones": body.get("poured_zones"),
+                       "fill_area_mm2": body.get("fill_area_mm2"),
+                       "written_to_file": body.get("written_to_file"),
+                       "drc_after_fill": body.get("drc_after_fill")}
+    result = dict(poured) if isinstance(poured, dict) else {}
+    value["outline"] = {"net": net, "layer": layer, "points": len(pts),
+                        "holes": len(hole_pts), "outline_area_mm2": outline_mm2}
+    merged = dict(result.get("value") or {})
+    merged.update(value)
+    result["value"] = merged
+    return result

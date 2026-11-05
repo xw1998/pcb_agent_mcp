@@ -332,7 +332,7 @@ class TestToolLayer(unittest.TestCase):
                       tools.TOOLS["repetitive_pulse_rating"]["inputSchema"]["properties"])
 
     def test_tool_count_did_not_change(self):
-        self.assertEqual(len(tools.TOOLS), 200)
+        self.assertEqual(len(tools.TOOLS), 205)
 
     def test_gap_is_registered(self):
         # 0.0.88 closed the "melting, by name" gap on all three tools, so that entry

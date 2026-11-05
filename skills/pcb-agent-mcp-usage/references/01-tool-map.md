@@ -1,4 +1,4 @@
-# 工具全表（0.0.122 实测 204 个）
+# 工具全表（0.0.125 实测 205 个）
 
 用途：查名字。语义以 `tool_search` / `tools/list` 的当前返回为准，本表只给一句话索引。
 
@@ -22,6 +22,7 @@
 - `board_render` — Rasterise one copper layer to a PNG and return the path, so the routing can be LOOKED at instead of described.
 - `board_angle_audit` — Three numbers that must not be mixed: segment HEADINGS (H/V/45/other - `other` is the only 45-degree-rule violation), VERTEX angles (135 chamfered / 90 square / <90 acid trap), and TEES (endpoint inside another same-net segment = a branch, not a bend). Derived: it measures geometry, KiCad DRC is still the authority.
 - `board_zones` — What the board actually POURS: every zone with its net, layer, outline area, filled polygons and poured area.
+- `board_add_zone` — Write ONE zone outline (polygon, optional holes) for a net/layer, then let KiCad's own ZONE_FILLER pour it. It validates (layer must be F.Cu/B.Cu, >=3 points, no duplicate points, non-zero area, net must exist on the board) and refuses something rather than guess; it does NOT invent/round/simplify the outline - the human draws the shape, the official engine pours the copper.
 - `board_fill_zones` — Ask KiCad's own ZONE_FILLER to pour the zones, then report what it built (area, polygons, zones that poured no
 - `board_rules` — Which net classes does this PROJECT declare, and what does a net resolve to? KiCad 7+ keeps net classes in the
 - `board_rules_write` — Write net-class rules into the .kicad_pro: set_netclass (creates a class as a copy of Default, never invents o

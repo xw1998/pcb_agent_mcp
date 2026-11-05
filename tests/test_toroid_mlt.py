@@ -407,7 +407,7 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
         # board_render): being able to sort nets by detour, to see a pour's
         # islands, and to LOOK at the copper are three separate questions,
         # each of which the previous 200 tools could not answer.
-        self.assertEqual(len(tools.TOOLS), 204)
+        self.assertEqual(len(tools.TOOLS), 205)
 
 if __name__ == "__main__":
     unittest.main()
