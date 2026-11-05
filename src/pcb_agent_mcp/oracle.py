@@ -3704,3 +3704,212 @@ def pour_audit(board, zone_index=None, min_island_mm2=0.0):
         assumptions={"zone_index": zone_index,
                      "min_island_mm2": float(min_island_mm2),
                      "islands_listed_per_zone": 60})
+
+
+# ---------------------------------------------------------------- angle audit
+def _seg_ray(p, q):
+    """Unit-ray angle (deg, 0..360) from point p towards q."""
+    return math.degrees(math.atan2(q[1] - p[1], q[0] - p[0])) % 360.0
+
+
+def _fold180(deg):
+    """Fold an angle into [0, 180): a track has no direction, only a heading."""
+    return deg % 180.0
+
+
+def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20):
+    """Are the tracks actually H / V / 45, and where do the corners come from?
+
+    Three things get measured, and they must not be mixed together:
+
+    * **segment headings** - every track segment classified as H (0/180), V
+      (90/270), 45 (45/135) or `other`. `other` is the only category that is a
+      straight 45-degree-rule violation.
+    * **corners** - at a vertex where two same-net same-layer segments meet, the
+      angle BETWEEN THE TWO OUTGOING RAYS. A properly chamfered corner is 135
+      (the route turns by 45). A 90 corner is a square corner, which is what the
+      rule forbids. Under 90 is an acute corner (acid trap).
+    * **tees** - an endpoint landing in the INTERIOR of another same-net
+      segment. A tee is a branch, not a bend: 90 is the normal way to tee off a
+      trunk, and bending a branch in at 45 creates a 45-degree wedge that is
+      worse than the square tee. Reported separately so it cannot be counted as
+      a routing defect.
+
+    The three numbers answer three different questions, which is the point:
+    "did the 45-degree rule get followed" is the first row, "why does the back
+    copper look full of right angles" is the second and third.
+    """
+    tol = float(angle_tol_deg)
+    cu = _copper_layers(board)
+    vias = {((round(float(v["x"]), 3), round(float(v["y"]), 3)), v.get("net"))
+            for v in (board.vias or [])}
+    pad_pts = set()
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            pad_pts.add((round(float(pad["x"]), 3), round(float(pad["y"]), 3)))
+
+    def _cls(heading):
+        if abs(heading - 0.0) <= tol or abs(heading - 180.0) <= tol:
+            return "H"
+        if abs(heading - 90.0) <= tol:
+            return "V"
+        if abs(heading - 45.0) <= tol or abs(heading - 135.0) <= tol:
+            return "45"
+        return "other"
+
+    per_layer = {}
+    segged = {}
+    for lay in cu:
+        if layer and lay != layer:
+            continue
+        segs = []
+        for tr in board.tracks or []:
+            if tr.get("layer") != lay:
+                continue
+            pts = tr.get("_points") or [tr["start"], tr["end"]]
+            for i in range(len(pts) - 1):
+                a, b = tuple(pts[i]), tuple(pts[i + 1])
+                L = math.hypot(b[0] - a[0], b[1] - a[1])
+                if L < 1e-6:
+                    continue
+                hd = _fold180(_seg_ray(a, b))
+                segs.append({"a": a, "b": b, "L": L, "hd": hd, "cls": _cls(hd),
+                             "net": tr.get("net"),
+                             "w": round(float(tr.get("width") or 0.0), 3)})
+        cnt = {"H": 0, "V": 0, "45": 0, "other": 0}
+        for s in segs:
+            cnt[s["cls"]] += 1
+        tot = max(1, sum(cnt.values()))
+        other = sorted([s for s in segs if s["cls"] == "other"],
+                       key=lambda s: -s["L"])[:int(top_other)]
+        per_layer[lay] = {
+            "segments": sum(cnt.values()),
+            "H": cnt["H"], "V": cnt["V"], "diag45": cnt["45"],
+            "other": cnt["other"],
+            "other_pct": round(100.0 * cnt["other"] / tot, 2),
+            "other_segments": [
+                {"net": s["net"], "w": s["w"], "length_mm": round(s["L"], 2),
+                 "heading_deg": round(s["hd"], 1),
+                 "start": [round(s["a"][0], 2), round(s["a"][1], 2)],
+                 "end": [round(s["b"][0], 2), round(s["b"][1], 2)]}
+                for s in other],
+        }
+        segged[lay] = segs
+
+    corners = {}
+    tees = {}
+    for lay, segs in segged.items():
+        # ray table: vertex -> [(ray angle, other endpoint, net)]
+        rays = {}
+        for s in segs:
+            for (p, q) in ((s["a"], s["b"]), (s["b"], s["a"])):
+                key = (round(p[0], 3), round(p[1], 3))
+                rays.setdefault((key, s["net"]), []).append(
+                    (_seg_ray(p, q), (round(q[0], 3), round(q[1], 3)), s))
+        bend = {"corner_135": 0, "corner_90": 0, "corner_acute": 0,
+                "collinear": 0, "right_angle_list": [], "acute_list": []}
+        # de-duplicate a pair of segments meeting at both ends (a 2-seg loop)
+        seen_pairs = set()
+        for (key, net), lst in rays.items():
+            for i in range(len(lst)):
+                for j in range(i + 1, len(lst)):
+                    r1, r2 = lst[i][0], lst[j][0]
+                    sig = (key, net, tuple(sorted([lst[i][1], lst[j][1]])))
+                    if sig in seen_pairs:
+                        continue
+                    seen_pairs.add(sig)
+                    d = abs((r1 - r2 + 180.0) % 360.0 - 180.0)
+                    corner = 180.0 - abs(180.0 - d) if d > 90 else d
+                    # corner = angle between the two outgoing rays, 0..180
+                    if abs(corner - 180.0) <= tol:
+                        bend["collinear"] += 1
+                    elif abs(corner - 135.0) <= tol:
+                        bend["corner_135"] += 1
+                    elif abs(corner - 90.0) <= tol:
+                        bend["corner_90"] += 1
+                        if len(bend["right_angle_list"]) < int(top_other):
+                            bend["right_angle_list"].append(
+                                {"net": net, "x": round(key[0], 2), "y": round(key[1], 2),
+                                 "w": lst[i][2]["w"]})
+                    elif corner < 90.0 + tol:
+                        bend["corner_acute"] += 1
+                        if len(bend["acute_list"]) < int(top_other):
+                            bend["acute_list"].append(
+                                {"net": net, "x": round(key[0], 2), "y": round(key[1], 2),
+                                 "corner_deg": round(corner, 1)})
+                    else:
+                        bend.setdefault("corner_other", 0)
+                        bend["corner_other"] += 1
+        # tees: endpoint strictly inside another same-net segment
+        tee = {"count": 0, "square": 0, "list": []}
+        for s in segs:
+            for p in (s["a"], s["b"]):
+                for u in segs:
+                    if u is s or u["net"] != s["net"]:
+                        continue
+                    ax, ay = u["a"]; bx, by = u["b"]
+                    dx, dy = bx - ax, by - ay
+                    L2 = dx * dx + dy * dy
+                    if L2 < 1e-12:
+                        continue
+                    t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / L2
+                    if not (0.02 < t < 0.98):
+                        continue
+                    qx, qy = ax + t * dx, ay + t * dy
+                    if math.hypot(p[0] - qx, p[1] - qy) > 0.02:
+                        continue
+                    if tuple(p) in pad_pts:
+                        continue
+                    tee["count"] += 1
+                    d = abs(_fold180(_seg_ray((ax, ay), (bx, by))) - s["hd"]) % 180.0
+                    d = min(d, 180.0 - d)
+                    if abs(d - 90.0) <= tol:
+                        tee["square"] += 1
+                    if len(tee["list"]) < int(top_other):
+                        tee["list"].append({"net": s["net"], "tee_angle_deg": round(d, 1),
+                                            "x": round(p[0], 2), "y": round(p[1], 2),
+                                            "w": s["w"]})
+        corners[lay] = bend
+        tees[lay] = tee
+
+    problems = []
+    for lay, st in per_layer.items():
+        if st["other"]:
+            problems.append("other_heading@%s" % lay)
+    for lay, c in corners.items():
+        if c["corner_90"]:
+            problems.append("right_angle_corner@%s" % lay)
+        if c["corner_acute"]:
+            problems.append("acute_corner@%s" % lay)
+    verdict = "angles_clean" if not problems else "angles_" + "+".join(problems)
+
+    return ok(
+        value={
+            "verdict": verdict,
+            "problems": problems,
+            "per_layer": per_layer,
+            "corners": corners,
+            "tees": tees,
+            "read_it_like_this": (
+                "per_layer.other is the only 45-degree-RULE violation: a segment "
+                "that is neither H, V nor 45. corners measure the angle between "
+                "the two outgoing rays at a vertex - 135 is a properly chamfered "
+                "turn, 90 is a square corner, <90 is an acid trap. tees are "
+                "branches (an endpoint inside another segment of the same net): a "
+                "90 tee is the normal way to branch off a trunk and is NOT a "
+                "routing defect, so it is reported apart from corners"),
+        },
+        unit="deg",
+        model="atan2 heading per segment folded into [0,180); corner = 180 - "
+              "|180 - delta| over the two outgoing rays; tee = point-to-segment "
+              "projection with t in (0.02,0.98) and gap <= 0.02 mm",
+        basis="the track list as stored in the file; a via-and-pad vertex is "
+              "counted, an endpoint sitting on a PAD is suppressed from tees "
+              "because a track landing on a pad is a connection, not a branch",
+        precision="a corner is only seen when two segments share an endpoint to "
+                  "0.001 mm - a corner split by a via in the middle is invisible "
+                  "here, and so is a corner drawn as one polygon. Tolerance "
+                  "%.2f deg" % tol,
+        assumptions={"layer": layer or "all copper",
+                     "angle_tol_deg": tol,
+                     "top_other": int(top_other)})

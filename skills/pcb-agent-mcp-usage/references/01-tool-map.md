@@ -1,4 +1,4 @@
-# 工具全表（0.0.121 实测 203 个）
+# 工具全表（0.0.122 实测 204 个）
 
 用途：查名字。语义以 `tool_search` / `tools/list` 的当前返回为准，本表只给一句话索引。
 
@@ -20,6 +20,7 @@
 - `board_net_report` — Per net: routed length, segments, vias, pads, and detour_ratio = length / MST over the net's pad centres (the smell test for "this net took the scenic route").
 - `board_pour_audit` — Per zone, per FILLED ISLAND: area, pads of the zone's net inside, and SAME-NET VIAS inside; an island with neither is dead copper.
 - `board_render` — Rasterise one copper layer to a PNG and return the path, so the routing can be LOOKED at instead of described.
+- `board_angle_audit` — Three numbers that must not be mixed: segment HEADINGS (H/V/45/other - `other` is the only 45-degree-rule violation), VERTEX angles (135 chamfered / 90 square / <90 acid trap), and TEES (endpoint inside another same-net segment = a branch, not a bend). Derived: it measures geometry, KiCad DRC is still the authority.
 - `board_zones` — What the board actually POURS: every zone with its net, layer, outline area, filled polygons and poured area.
 - `board_fill_zones` — Ask KiCad's own ZONE_FILLER to pour the zones, then report what it built (area, polygons, zones that poured no
 - `board_rules` — Which net classes does this PROJECT declare, and what does a net resolve to? KiCad 7+ keeps net classes in the

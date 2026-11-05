@@ -195,5 +195,87 @@ class TestRender(unittest.TestCase):
         self.assertEqual(out["status"], "error")
 
 
+# --- angle audit fixtures --------------------------------------------------
+# A 45-chamfered turn: 10,10 -> 20,10 straight, then 20,10 -> 21,11 (45), then
+# 21,11 -> 21,20 vertical. Every heading is H / 45 / V, and the only bend is 135.
+CHAMFER = """
+  (segment (start 10 10) (end 20 10) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 20 10) (end 21 11) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 21 11) (end 21 19) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 21 19) (end 20 20) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 20 20) (end 10 20) (width 0.25) (layer "F.Cu") (net 1))
+"""
+# Same board with the chamfer deleted: the H leg runs straight into a V leg and
+# the vertex is a square 90 corner.
+SQUARE = """
+  (segment (start 10 10) (end 21 10) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 21 10) (end 21 20) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 21 20) (end 10 20) (width 0.25) (layer "F.Cu") (net 1))
+"""
+# Nothing wrong with the headings, but one off-45 heading drawn on purpose.
+ODD = """
+  (segment (start 10 10) (end 20 10) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 20 10) (end 22 11) (width 0.25) (layer "F.Cu") (net 1))
+"""
+# A branch teeing off the middle of a trunk at 90: this is a tee, not a bend.
+TEE = """
+  (segment (start 10 15) (end 30 15) (width 0.5) (layer "F.Cu") (net 1))
+  (segment (start 20 15) (end 20 11) (width 0.25) (layer "F.Cu") (net 1))
+"""
+
+
+class TestAngleAudit(unittest.TestCase):
+    def test_a_chamfered_route_has_no_off_45_segment_and_no_square_corner(self):
+        out = oracle.angle_audit(board(square_board(CHAMFER)))
+        self.assertEqual(out["status"], "ok", out)
+        st = out["value"]["per_layer"]["F.Cu"]
+        self.assertEqual(st["other"], 0)
+        self.assertEqual((st["H"], st["V"], st["diag45"]), (2, 1, 2))
+        c = out["value"]["corners"]["F.Cu"]
+        self.assertEqual(c["corner_90"], 0)
+        self.assertEqual(c["corner_acute"], 0)
+        # 20,10 ; 21,11 ; 21,19 ; 20,20 are the four turns, all 135
+        self.assertEqual(c["corner_135"], 4)
+        self.assertEqual(out["value"]["verdict"], "angles_clean")
+
+    def test_removing_the_chamfer_turns_the_same_route_into_a_square_corner(self):
+        """Reverse control: identical topology, chamfer deleted -> verdict flips."""
+        out = oracle.angle_audit(board(square_board(SQUARE)))
+        self.assertEqual(out["value"]["per_layer"]["F.Cu"]["other"], 0)
+        c = out["value"]["corners"]["F.Cu"]
+        self.assertEqual(c["corner_90"], 2)
+        self.assertEqual(c["corner_135"], 0)
+        self.assertIn("right_angle_corner@F.Cu", out["value"]["problems"])
+        self.assertEqual(out["value"]["verdict"],
+                         "angles_right_angle_corner@F.Cu")
+        self.assertEqual(out["value"]["corners"]["F.Cu"]["right_angle_list"][0]["x"], 21.0)
+
+    def test_an_off_45_heading_is_the_only_rule_violation(self):
+        out = oracle.angle_audit(board(square_board(ODD)))
+        st = out["value"]["per_layer"]["F.Cu"]
+        self.assertEqual(st["other"], 1)
+        h = st["other_segments"][0]["heading_deg"]
+        self.assertGreater(min(abs(h), abs(h - 45), abs(h - 90),
+                               abs(h - 135), abs(h - 180)), 5.0)
+        self.assertAlmostEqual(st["other_pct"], 50.0, places=2)
+        self.assertIn("other_heading@F.Cu", out["value"]["problems"])
+
+    def test_a_tee_is_reported_as_a_branch_not_as_a_corner(self):
+        out = oracle.angle_audit(board(square_board(TEE)))
+        t = out["value"]["tees"]["F.Cu"]
+        self.assertEqual(t["count"], 1)
+        self.assertEqual(t["square"], 1)
+        self.assertEqual(t["list"][0]["tee_angle_deg"], 90.0)
+        # The ee must NOT be scored as a square corner.
+        self.assertEqual(out["value"]["corners"]["F.Cu"]["corner_90"], 0)
+        self.assertEqual(out["value"]["verdict"], "angles_clean")
+
+    def test_a_via_split_vertex_is_invisible_and_the_tool_says_so(self):
+        """Two collinear halves are not a corner: precision note must carry that."""
+        out = oracle.angle_audit(board(square_board(CHAMFER)))
+        self.assertIn("share an endpoint", out["precision"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

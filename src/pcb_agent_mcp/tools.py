@@ -2946,6 +2946,31 @@ _tool(
 )
 
 _tool(
+    "board_angle_audit",
+    "Did the 45-degree rule actually get followed, and where do the square corners "
+    "come from? Three separate measurements, deliberately not merged: (1) segment "
+    "headings per layer - H / V / 45 / other, where `other` is the ONLY straight "
+    "violation of the rule; (2) corners - the angle between the two outgoing rays "
+    "at a shared vertex, 135 = properly chamfered, 90 = square corner, <90 = acid "
+    "trap; (3) tees - an endpoint landing inside another same-net segment, which is "
+    "a BRANCH and not a bend (a 90 tee is how you branch off a trunk; bending a "
+    "branch in at 45 makes a worse 45-degree wedge). Ask this before claiming a "
+    "board is 45-routed, and read `tees` before calling a shape a defect. " +
+    _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "layer": _str("only this copper layer (F.Cu / B.Cu); omit for all"),
+         "angle_tol_deg": _num("tolerance when snapping to 0/45/90 (default 1.0)", 1.0),
+         "top_other": _num("how many offending items to list per bucket", 20),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.angle_audit(
+        b, layer=a.get("layer") or None,
+        angle_tol_deg=a.get("angle_tol_deg", 1.0),
+        top_other=a.get("top_other", 20)), derived=True),
+)
+
+_tool(
     "board_zones",
     "What the board actually POURS: every zone with its net, layer, outline area, "
     "filled polygons and poured area. A zone with no filled_polygon is an outline, not "
