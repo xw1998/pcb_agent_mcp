@@ -1265,7 +1265,10 @@ def _lceda_pro_verify(args):
         # it is read from disk as corroboration - never as a substitute for the
         # in-app answer, and labelled as coming from the file.
         try:
-            disk = _live.projects_on_disk(limit=400)
+            # shallow walk: the match only needs the file name and path, and
+            # opening every project database here would make a connectivity check
+            # pay for the whole disk.
+            disk = _live.projects_on_disk(deep=False, limit=None)
             match = [p for p in disk.get("projects") or []
                      if (p.get("name") or "").strip().casefold()
                      == str(report["title_project"]).strip().casefold()]

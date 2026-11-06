@@ -176,8 +176,17 @@ def _check_evidence(evidence):
             raise ValueError(
                 "evidence[%d] needs both `from` (a path or a command) and `reading` "
                 "(what it returned): 'it works' is not evidence" % index)
-        clean.append({"from": str(where), "reading": str(reading),
-                      "what": item.get("what"), "date": item.get("date")})
+        row = {"from": str(where), "reading": str(reading),
+               "what": item.get("what"), "date": item.get("date")}
+        # A path is checked for existence and the answer is carried with the
+        # evidence. It is not a refusal: the reading may have been taken on
+        # another machine, and saying "not here" is more honest than pretending
+        # to have verified it.
+        text = str(where)
+        looks_like_path = ("/" in text or "\\" in text) and "://" not in text
+        if looks_like_path:
+            row["exists_here"] = os.path.exists(text)
+        clean.append(row)
     return clean
 
 
