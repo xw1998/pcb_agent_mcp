@@ -186,6 +186,8 @@ def _zone_rows(board_node):
             "thermal_gap_mm": thermal_gap,
             "thermal_bridge_width_mm": thermal_bridge,
             "not_stated_in_file": not_stated,
+            "outline": outline,
+            "outline_key": _outline_key(outline),
             "outline_area_mm2": (round(abs(G.polygon_area(outline)), 3)
                                  if outline and len(outline) >= 3 else None),
             "filled_polygons": len(polys),
@@ -197,7 +199,35 @@ def _zone_rows(board_node):
 
 
 def _summary_row(row):
-    return {k: v for k, v in row.items() if not k.startswith("_")}
+    return {k: v for k, v in row.items()
+            if not k.startswith("_") and k not in ("outline", "outline_key")}
+
+def _outline_key(outline):
+    """Identity of a zone OUTLINE, independent of point order and start vertex.
+
+    Two zones of the same net on the same layer are common on a real board
+    (one pour over the logic area, one over the analogue area). Pairing such
+    zones by (net, layer) alone therefore mixes them up: measured on the
+    reference board, the whole-board GND pour (3146 mm2) received the 46
+    islands that belong to a 5.25 mm2 keep-area pour, and vice versa - every
+    `filled_polygon` landed in the wrong zone while the zone count matched.
+    The key is the multiset of rounded vertices, so re-walking the polygon
+    from another start vertex or in reverse still matches, but two different
+    shapes never do.
+    """
+    if not outline:
+        return None
+    pts = [(round(x, 4), round(y, 4)) for x, y in outline]
+    # pcbnew drops the closing vertex when it saves a polygon (our reader keeps
+    # whatever the path said), so a 5-point rectangle comes back as 4. Normalise
+    # both sides instead of demanding the same vertex count.
+    while len(pts) > 1 and pts[0] == pts[-1]:
+        pts.pop()
+    dedup = [pts[0]]
+    for point in pts[1:]:
+        if point != dedup[-1]:
+            dedup.append(point)
+    return tuple(sorted(dedup))
 
 
 def zones(path):
@@ -379,13 +409,15 @@ def _transplant(path, rows_before, rows_after):
     if len(rows_ours) != len(rows_before):
         return (False, None, _err("ENGINE_MISMATCH",
                                   "zone count changed under our feet"))
-    # Pair our zones with the engine's by (net, layer), not by file position:
-    # pcbnew re-orders zones when it saves (a zone appended last in the file
-    # came back in the middle), and a positional pairing then refuses a pour
-    # that is perfectly fine. Duplicates of the same net/layer stay greedy in
-    # source order, so two pour islands of one net keep their own polygons.
+    # Pair our zones with the engine's by (net, layer, outline), not by file
+    # position: pcbnew re-orders zones when it saves (a zone appended last in
+    # the file came back in the middle), and a positional pairing then refuses
+    # a pour that is perfectly fine. Pairing by (net, layer) alone is not
+    # enough either - a board with two GND pours pairs greedily and every
+    # polygon lands in the wrong zone. The outline fingerprint makes the pair
+    # unique; a leftover is an error, never a guess.
     def _key(row):
-        return (row["net"], row["layer"])
+        return (row["net"], row["layer"], row["outline_key"])
 
     pool = {}
     for row in rows_after:
@@ -396,15 +428,18 @@ def _transplant(path, rows_before, rows_after):
         if not bucket:
             return (False, None, _err(
                 "ENGINE_MISMATCH",
-                "the engine returned no zone for %r/%r although the file has one; "
-                "no polygon may be moved" % _key(ours)))
+                "the engine returned no zone for net %r layer %r with a "
+                "%s-point outline although the file has one; no polygon may be "
+                "moved" % (ours["net"], ours["layer"],
+                           len(ours["outline"] or []))))
         pairs.append((ours, bucket.pop(0)))
     if any(bucket for bucket in pool.values()):
         extra = [k for k, bucket in pool.items() if bucket]
         return (False, None, _err(
             "ENGINE_MISMATCH",
-            "the engine returned zones the file does not have (%s); the pour "
-            "would land on the wrong net" % extra))
+            "the engine returned %d zone(s) the file does not have (%s); the "
+            "pour would land on the wrong net"
+            % (sum(len(b) for b in extra), [(k[0], k[1]) for k in extra])))
 
     transplanted = 0
     for ours, theirs in pairs:

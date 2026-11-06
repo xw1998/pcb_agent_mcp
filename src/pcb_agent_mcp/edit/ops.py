@@ -1821,11 +1821,18 @@ def _run_add_keepout(ed, o, seed):
         raise OpError("unknown keepout rule(s): %s (valid: %s)"
                       % (", ".join(bad), ", ".join(sorted(valid))), "ARG_INVALID")
     points = _zone_points(o)
+    holes = o.get("holes") or []
+    parsed_holes = []
+    for ring in holes:
+        if not isinstance(ring, (list, tuple)) or len(ring) < 3:
+            raise OpError("every entry of 'holes' must be a list of at least 3 "
+                          "[x, y] pairs (mm, Y up)", "ARG_INVALID")
+        parsed_holes.append(_points({"points": ring}))
     for l in layers:
         ed.append(B.zone_polygon_conf(0, "", l, points, ed.sp, B.new_id("%s:%s" % (seed, l)),
-                                      keepout=rules))
+                                      keepout=rules, holes=parsed_holes))
     return {"nodes_added": len(layers), "layers": layers, "rules": rules,
-            "vertices": len(points)}
+            "vertices": len(points), "holes": len(parsed_holes)}
 
 def _verify_add_keepout(ed, o):
     rules = o.get("rules") or ["tracks", "vias", "pads", "copperpour"]
@@ -1844,7 +1851,8 @@ def _verify_add_keepout(ed, o):
 op("add_keepout", {"copper"},
    "A keep-out area (no tracks / vias / pads / pour) on one or more layers.",
    {"points": "[[x,y], ...] or x0/y0/x1/y1", "layer": "layer", "layers": "[layers]",
-    "rules": "subset of tracks, vias, pads, copperpour, footprints"},
+    "rules": "subset of tracks, vias, pads, copperpour, footprints",
+    "holes": "[[[x,y], ...], ...] rings that the area does NOT cover"},
    _run_add_keepout, _verify_add_keepout)
 
 def _run_add_zone(ed, o, seed):
@@ -2634,6 +2642,25 @@ op("set_zone_priority", {"copper"},
     "uuid": "zone uuid"},
    _run_set_zone_priority, _verify_set_zone_priority)
 
+ISLAND_MODES = {"always": 0, "never": 1, "area": 2}
+
+def _island_mode(raw):
+    """KiCad spells island removal as an integer: 0 always, 1 never, 2 by area."""
+    if isinstance(raw, bool) or raw is None:
+        raise OpError("island_removal_mode takes always/never/area (or 0/1/2), "
+                      "not %r" % (raw,), "ARG_INVALID")
+    if isinstance(raw, int):
+        if raw not in (0, 1, 2):
+            raise OpError("island_removal_mode must be 0, 1 or 2", "ARG_INVALID")
+        return raw
+    text = str(raw).strip().lower()
+    if text in ISLAND_MODES:
+        return ISLAND_MODES[text]
+    if text.isdigit() and int(text) in (0, 1, 2):
+        return int(text)
+    raise OpError("island_removal_mode takes always/never/area (or 0/1/2), "
+                  "not %r" % (raw,), "ARG_INVALID")
+
 def _zone_flag(raw):
     """yes/no as KiCad spells it; booleans are accepted as the same thing."""
     if isinstance(raw, bool):
@@ -2708,10 +2735,19 @@ def _run_set_zone_params(ed, o, seed):
             given[key] = value
     if o.get("connect_pads") is not None:
         given["connect_pads"] = _zone_connection_word(o.get("connect_pads"))
+    if o.get("island_removal_mode") is not None:
+        given["island_removal_mode"] = _island_mode(o.get("island_removal_mode"))
+    if o.get("island_removal_area_threshold") is not None:
+        value = _num(o, "island_removal_area_threshold")
+        if value < 0:
+            raise OpError("island_removal_area_threshold must be >= 0 (mm2)",
+                          "ARG_INVALID")
+        given["island_removal_area_threshold"] = value
     if not given:
         raise OpError("set_zone_params needs at least one of: "
                       "filled_areas_thickness, clearance, min_thickness, "
-                      "connect_pads, thermal_gap, thermal_bridge_width",
+                      "connect_pads, thermal_gap, thermal_bridge_width, "
+                      "island_removal_mode, island_removal_area_threshold",
                       "ARG_MISSING")
     targets = _select_zones(ed, o)
     if not targets:
@@ -2750,6 +2786,17 @@ def _run_set_zone_params(ed, o, seed):
         for key in ("thermal_gap", "thermal_bridge_width"):
             if key in given:
                 _zone_set_fill_number(node, key, given[key])
+        if "island_removal_mode" in given:
+            # Measured: pcbnew writes these INSIDE `(fill ...)`, next to the
+            # thermal numbers - `(fill (thermal_gap 0.5) ... (island_removal_mode
+            # 1))`. Written one level up, KiCad 10 refuses the whole board with
+            # "应为 net, layer/layers, tstamp, hatch, priority, connect_pads,
+            # min_thickness, fill, polygon ...".
+            _zone_set_fill_atom(node, "island_removal_mode",
+                                given["island_removal_mode"])
+        if "island_removal_area_threshold" in given:
+            _zone_set_fill_atom(node, "island_removal_area_threshold",
+                                given["island_removal_area_threshold"])
         # The filled polygons describe the copper of the OLD parameters. Keeping
         # them would leave the file claiming a pour that the new rules do not
         # produce - the exact "intermediate layer says one thing, the board says
@@ -2796,6 +2843,22 @@ def _zone_set_connection(node, mode, clearance=None):
         S.append_child(node, new)
 
 
+def _zone_set_fill_atom(node, key, value):
+    """Write `(key atom)` inside the zone's `(fill ...)` block, verbatim."""
+    fill = S.child(node, "fill")
+    if fill is None or (S.arg_text(fill, 1) or "").lower() in ("no", "false"):
+        raise OpError("%s only describes a pour, and this zone does not fill "
+                      "(no `(fill yes ...)`), so there is nothing to write it "
+                      "into" % (key,), "ARG_INVALID")
+    text = B.num(value) if isinstance(value, float) else str(value)
+    existing = S.child(fill, key)
+    node_new = B.L(B.A(key), B.A(text))
+    if existing is not None:
+        S.reformat(node_new, existing.lead)
+        fill.items[list(fill.items).index(existing)] = node_new
+    else:
+        S.append_child(fill, node_new)
+
 def _zone_set_fill_number(node, key, value):
     """Put `(key value)` inside the zone's `(fill ...)` block.
 
@@ -2836,6 +2899,12 @@ def _zone_params(node):
         "thermal_bridge_width": S.arg_num(
             S.child(fill, "thermal_bridge_width"), 1)
             if fill is not None else None,
+        "island_removal_mode": S.arg_num(
+            S.child(fill, "island_removal_mode"), 1)
+            if fill is not None else None,
+        "island_removal_area_threshold": S.arg_num(
+            S.child(fill, "island_removal_area_threshold"), 1)
+            if fill is not None else None,
     }
 
 def _verify_set_zone_params(ed, o):
@@ -2848,6 +2917,11 @@ def _verify_set_zone_params(ed, o):
             want[key] = float(_num(o, key))
     if o.get("connect_pads") is not None:
         want["connect_pads"] = _zone_connection_word(o.get("connect_pads"))
+    if o.get("island_removal_mode") is not None:
+        want["island_removal_mode"] = _island_mode(o.get("island_removal_mode"))
+    if o.get("island_removal_area_threshold") is not None:
+        want["island_removal_area_threshold"] = float(
+            _num(o, "island_removal_area_threshold"))
     checked = []
     ok = True
     for node in _select_zones(ed, o):
@@ -2864,6 +2938,10 @@ def _verify_set_zone_params(ed, o):
                 row["connect_pads"] = got["connect_pads"]
                 row["connect_pads_effective"] = got["connect_pads_effective"]
                 ok = ok and got["connect_pads_effective"] == value
+            elif key in ("island_removal_mode", "island_removal_area_threshold"):
+                have = got.get(key)
+                row[key] = have
+                ok = ok and have is not None and abs(have - value) < 1e-9
             else:
                 have = got.get(key)
                 row[key] = have
@@ -2884,12 +2962,18 @@ op("set_zone_params", {"copper"},
    "instead of a centreline to be stroked by min_thickness/2 - without it DRC "
    "reads every pour as half a line thicker than the polygon in the file. "
    "connect_pads=thermal is the word-less spelling KiCad itself writes; `solid` "
-   "writes `yes`, which is a different pour.",
+   "writes `yes`, which is a different pour. island_removal_mode decides what "
+   "the engine does with copper that reaches no pad: `always` (KiCad's default) "
+   "drops it, `never` keeps it, `area` keeps islands above the threshold - a "
+   "copied board that leaves islands on pours unconnected loses them under the "
+   "default.",
    {"filled_areas_thickness": "yes/no (bool accepted)", "clearance": "mm",
     "min_thickness": "mm",
     "connect_pads": "thermal | solid | none | thru_hole_only",
     "thermal_gap": "mm (only a pouring zone has a relief to describe)",
     "thermal_bridge_width": "mm",
+    "island_removal_mode": "always | never | area",
+    "island_removal_area_threshold": "mm2, only with mode=area",
     "net": "net name", "layer": "layer name", "uuid": "zone uuid"},
    _run_set_zone_params, _verify_set_zone_params)
 

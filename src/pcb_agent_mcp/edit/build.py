@@ -147,7 +147,7 @@ def via(x, y_up, dia, drill, net_code, sp, uid, layers=("F.Cu", "B.Cu")):
 def zone_polygon_conf(net_code, net_name, layer, points, sp, uid,
                       clearance=0.2, min_thickness=0.25, priority=None,
                       hatch=0.5, keepout=None, pad_connection=None,
-                      thermal_gap=None, thermal_bridge_width=None):
+                      thermal_gap=None, thermal_bridge_width=None, holes=None):
     """A zone: keepout when `keepout` is given, copper pour otherwise.
 
     A pour written this way carries `(fill yes)` but no `filled_polygon`: the
@@ -219,6 +219,13 @@ def zone_polygon_conf(net_code, net_name, layer, points, sp, uid,
             fill.append(L(A("thermal_bridge_width"), A(num(thermal_bridge_width))))
         items.append(L(*fill))
     items.append(L(A("polygon"), pts(points)))
+    # Holes are extra `(polygon ...)` nodes: KiCad writes the first polygon as the
+    # outline and every further one as a hole (read back with `pcbnew` on a zone
+    # that pcbnew itself had saved). A hole is how a rule area can leave copper
+    # alone in a spot inside the area - a pour zone that carries its own hand-drawn
+    # copper needs that, because a keepout would otherwise clip the pour to zero.
+    for ring in (holes or []):
+        items.append(L(A("polygon"), pts(ring)))
     return L(*items)
 
 def netclass(name, params, sp=None):
