@@ -1356,20 +1356,23 @@ def _lceda_pro_projects(args):
     directories, so the disk is the authority for "what is there", and the app's own
     reading is reported beside it rather than in front of it.
     """
-    listing = _live.projects_on_disk(deep=bool(args.get("deep", True)),
-                                     limit=int(args.get("limit") or 200))
-    projects = listing["projects"]
+    listing = _live.projects_on_disk(deep=bool(args.get("deep", True)), limit=None)
+    everything = listing["projects"]
     wanted = args.get("source")
     if wanted:
-        projects = [p for p in projects if p.get("source") == wanted]
+        everything = [p for p in everything if p.get("source") == wanted]
     counts = {}
-    for item in projects:
+    for item in everything:
         counts[item.get("source")] = counts.get(item.get("source"), 0) + 1
+    limit = int(args.get("limit") or 200)
+    projects = everything[:limit]
     report = {
         "config": listing["config"],
         "roots": listing["roots"],
         "counts_by_source": counts,
-        "total": len(projects),
+        "total": len(everything),
+        "returned": len(projects),
+        "truncated": len(everything) > len(projects),
         "projects": projects,
         "errors": listing["errors"],
         "note": ("a disk listing: which project files exist and in what format, not "
@@ -1396,11 +1399,20 @@ def _lceda_pro_projects(args):
             editor.update({"asked": False, "error": type(exc).__name__,
                            "message": str(exc)})
         report["editor_view"] = editor
-        if editor.get("asked") and editor.get("project_count") == 0 and projects:
+        if editor.get("asked") and editor.get("project_count") == 0 and everything:
+            # The live project directory and the recovery/backup directories are not
+            # the same thing: counting them as one pile would claim the editor shows
+            # 24 projects when it shows the ones in APP_PROJECT_DIR. Reported apart.
+            live_n = counts.get("project", 0)
+            backup_n = sum(v for k, v in counts.items() if k != "project")
+            where = "%d in the project directory the editor uses" % live_n
+            if backup_n:
+                where += " and %d in recovery / online-backup directories" % backup_n
             report["disagreement"] = (
-                "getAllProjectsUuid() lists 0 while %d project file(s) exist on disk - "
-                "that call is not the project list on this build" % len(projects))
-    if not projects:
+                "getAllProjectsUuid() lists 0 while %d project file(s) exist on disk "
+                "(%s) - that call is not the project list on this build"
+                % (len(everything), where))
+    if not everything:
         return err("no project file (.eprj / .eprj2 / .epro / .epro2) found under the "
                    "directories named in %s" % (listing["config"].get("path") or "config.json"),
                    "NO_PROJECTS",
@@ -4977,7 +4989,9 @@ def _capabilities(_args):
             "lceda_pcb_write",
             "experience_recall", "experience_check", "experience_candidate",
             "experience_promote", "experience_outcome", "experience_export",
-            "experience_import",
+            "experience_import", "experience_harvest", "experience_status",
+            "pattern_recall", "pattern_add", "pattern_verify",
+            "pattern_layout_plan", "pattern_use", "pattern_status",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "only for safety_standard families other than "
@@ -11138,6 +11152,419 @@ def _experience_import(args):
                              "; ".join("%s: %s" % (s.get("id"), s.get("why"))
                                        for s in got["skipped"][:5])))
     return out
+
+_tool(
+    "experience_harvest",
+    "Read ONE board and write down what it says, as candidates. This is the loop that "
+    "was missing: without it the library only grows when someone remembers to type a "
+    "claim by hand, and a library nobody feeds is a document. It only learns the "
+    "metrics a single board can honestly teach (off-grid share, distinct via "
+    "geometries, distinct track widths, power width against signal width) - a hard "
+    "rule (a via ring floor, a drilled pad spanning the copper) comes from a fab "
+    "capability or a spec, and a board can only violate one, which is a finding and "
+    "not a lesson. Nothing written here is active: each id is a candidate that says "
+    "'single board (1/1)' until someone confirms it with a reason. A board that "
+    "disagrees with an ACTIVE entry writes a counterexample instead of a new habit, "
+    "because the library has to be able to hear that too.",
+    {"type": "object",
+     "properties": {
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "member": _str("member inside an .epro / .eprj2 archive"),
+         "project": _str("project directory inside an .epro archive"),
+         "metric": _str("harvest only this metric instead of the four that a "
+                        "single board can teach"),
+         "dry_run": _bool("report what would be written without writing it", False),
+     },
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _experience_harvest(a)),
+)
+
+
+def _experience_harvest(args):
+    exp, e = _experience()
+    if e:
+        return e
+    board, e = _load_board(args)
+    if e:
+        return e
+    try:
+        got = exp.harvest(board, dry_run=bool(args.get("dry_run")),
+                          metric=args.get("metric") or None)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID", hint="nothing was written: " + exp.path())
+    out = ok(got, "candidates",
+             model="one board measured with the same code that measures the corpus, "
+                   "written down as candidates rather than applied",
+             basis="docs/02 section B; the red line (a candidate never becomes "
+                   "active on its own) is enforced by experience_promote",
+             precision="exact per metric; a metric this board cannot answer is "
+                       "reported not_measured, never as zero",
+             assumptions={"writes_nothing": bool(args.get("dry_run")),
+                          "applied": False})
+    written = got.get("written") or []
+    verb = "would be written (dry_run)" if args.get("dry_run") else "written"
+    out["message"] = (("%d candidate(s) %s: %s"
+                       % (len(written), verb, ", ".join(written)))
+                      if written else
+                      "nothing new: every metric was already recorded, agreed with "
+                      "the active library, or could not be measured on this board")
+    return out
+
+_tool(
+    "experience_status",
+    "Is the experience library alive, or filled once and abandoned? The number that "
+    "matters is not the total: it is how many entries are ACTIVE (so they can shape "
+    "an answer), how many are candidates waiting for a person who never came, and "
+    "when the store was last written - the file's own mtime, so this cannot be "
+    "answered from memory.",
+    {"type": "object", "properties": {}},
+    lambda a: _guarded(lambda: _experience_status(a)),
+)
+
+
+def _experience_status(args):
+    exp, e = _experience()
+    if e:
+        return e
+    got = exp.status()
+    return ok(got, "counts",
+              model="counts over the seed plus $PCB_AGENT_HOME/experience.json",
+              basis="the seed ships with the package and is read-only; runtime "
+                    "learning is the local file",
+              precision="exact; store_written_at is the file's mtime",
+              assumptions={"read_only": True})
+
+# ------------------------------------------------------------- patterns
+_PAT_KIND = _str("recipe = a solution with the numbers that made it work; "
+                 "layout = a relative arrangement of parts in mm from one anchor",
+                 ["recipe", "layout"])
+_PAT_STATUS_Q = _str("candidate = written down but never checked against a board; "
+                     "verified = a person confirmed it with a reading; retired = "
+                     "kept for the record", ["candidate", "verified", "retired"])
+
+
+def _patterns():
+    """The module, or the error saying why this answer cannot be given."""
+    from . import patterns as _pat
+    if not _pat.enabled():
+        return None, err("the pattern library is switched off (PCB_AGENT_PATTERNS=0): "
+                         "nothing is read and nothing is written", "DATA_UNAVAILABLE",
+                         hint="unset PCB_AGENT_PATTERNS to read the library again")
+    return _pat, None
+
+
+def _pat_row(entry):
+    return {"id": entry.get("id"),
+            "kind": entry.get("kind"),
+            "title": entry.get("title"),
+            "class": entry.get("class"),
+            "status": entry.get("status"),
+            "problem": entry.get("problem"),
+            "applies_to": entry.get("applies_to"),
+            "uses": entry.get("uses"),
+            "verified_by": entry.get("verified_by"),
+            "updated_at": entry.get("updated_at")}
+
+
+_tool(
+    "pattern_recall",
+    "Read the library of things that were made to work before: a RECIPE (a solution "
+    "with the numbers that made it work and the reading that proved it) or a LAYOUT "
+    "(where parts sat, in mm from one anchor). Separate from experience_recall on "
+    "purpose: an experience entry is a claim a measurement can contradict, a pattern "
+    "is an artefact a person applies again. Only VERIFIED entries are returned by "
+    "default - a candidate has never been checked against a board, and reconstructing "
+    "a layout from coordinates nobody vouched for is how a plausible-looking board "
+    "gets built wrong. Recall is read-only and does not count as a use.",
+    {"type": "object",
+     "properties": {
+         "kind": _PAT_KIND,
+         "status": _PAT_STATUS_Q,
+         "class": _str("layout class tag, e.g. mcu_cluster / usb_c / qspi"),
+         "query": _str("substring match on title / problem / id"),
+         "limit": _num("how many rows to return", 50),
+     }},
+    lambda a: _guarded(lambda: _pattern_recall(a)),
+)
+
+
+def _pattern_recall(args):
+    pat, e = _patterns()
+    if e:
+        return e
+    got = pat.library(kind=args.get("kind") or None,
+                      status=args.get("status") or "verified")
+    rows = got["entries"]
+    klass = (args.get("class") or "").strip().casefold()
+    if klass:
+        rows = [r for r in rows
+                if klass in str(r.get("class") or "").casefold()]
+    query = (args.get("query") or "").strip().casefold()
+    if query:
+        rows = [r for r in rows
+                if query in " ".join(str(r.get(key) or "") for key in
+                                     ("id", "title", "problem")).casefold()]
+    limit = int(args.get("limit") or 50)
+    page = rows[:max(0, limit)]
+    out = ok({"entries": [_pat_row(r) for r in page],
+              "counts": got["counts"], "store": got["store"],
+              "returned": len(page), "matched": len(rows),
+              "truncated": len(rows) > len(page)},
+             "entries",
+             model="a curated library of artefacts, not a corpus: every row was written "
+                   "by someone who did the work",
+             basis="$PCB_AGENT_HOME/patterns.json; nothing ships as a seed",
+             precision="exact counts; uses.count counts plans and recorded outcomes, "
+                       "not every read",
+             assumptions={"read_only": True})
+    if not rows:
+        out["message"] = ("no %s entries with status %r: the library is empty until "
+                          "something is written down (pattern_add) and confirmed "
+                          "with a reading (pattern_verify)"
+                          % (args.get("kind") or "pattern",
+                             args.get("status") or "verified"))
+    return out
+
+
+_tool(
+    "pattern_add",
+    "Write a recipe or a layout down as a CANDIDATE. Two refusals do the work here: "
+    "every parameter must be {value, unit, source} (a bare number is a guess wearing "
+    "a number's clothes, and a guess that gets reused is worse than no library), and "
+    "a layout must name exactly one anchor element (the part the offsets are measured "
+    "from; without it the coordinates have no origin). Nothing added here can be "
+    "planned from until pattern_verify confirms it with evidence.",
+    {"type": "object",
+     "properties": {
+         "kind": _PAT_KIND,
+         "entry": {"type": "object",
+                   "description": "id (must start with pat.), title, problem, "
+                                  "applies_to; recipe: procedure[>=2 steps], "
+                                  "parameters{name:{value,unit,source}}; layout: "
+                                  "class, elements[{role,dx_mm,dy_mm,rotation_deg,"
+                                  "side,anchor,must,notes}], constraints{min_gap_mm}"},
+     },
+     "required": ["kind", "entry"]},
+    lambda a: _guarded(lambda: _pattern_add(a)),
+)
+
+
+def _pattern_add(args):
+    pat, e = _patterns()
+    if e:
+        return e
+    try:
+        entry = pat.add(args.get("entry") or {}, args.get("kind"))
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID",
+                   hint="nothing was written: " + pat.path())
+    out = ok({"entry": _pat_row(entry), "store": pat.path()},
+             "entry",
+             model="a candidate artefact: stored so it can be applied once someone "
+                   "confirms it, never applied on its own",
+             basis="the red line is the same as experience.py: a candidate cannot "
+                   "become verified without a person and a reading",
+             precision="the ids and numbers are exact; the prose is not measured",
+             assumptions={"applied": False})
+    out["next_step"] = ("pattern_verify id=%r confirm=true reason=... evidence=[{from: "
+                        "<path or command>, reading: <what it returned>}] is what "
+                        "makes this usable" % entry["id"])
+    return out
+
+
+_tool(
+    "pattern_verify",
+    "candidate -> verified. Needs confirm=true, a reason, and at least one evidence "
+    "item that names where the reading came from and what it read. This is the only "
+    "door up: a verified recipe with no reading behind it is indistinguishable from a "
+    "candidate someone liked, and a layout built from those coordinates is a board "
+    "that looks deliberate.",
+    {"type": "object",
+     "properties": {
+         "id": _str("entry id, e.g. pat.layout.mcu-cluster"),
+         "confirm": _bool("must be true: nothing is promoted by a tool on its own",
+                           False),
+         "reason": _str("why this is now trusted, in your words (>= 8 chars)"),
+         "evidence": {"type": "array", "items": {"type": "object", "properties": {
+             "from": {"type": "string", "description": "file path or command"},
+             "reading": {"type": "string", "description": "what it returned"},
+             "what": {"type": "string"}, "date": {"type": "string"}}}},
+     },
+     "required": ["id", "confirm", "reason"]},
+    lambda a: _guarded(lambda: _pattern_verify(a)),
+)
+
+
+def _pattern_verify(args):
+    pat, e = _patterns()
+    if e:
+        return e
+    try:
+        entry = pat.verify(args.get("id"), confirm=args.get("confirm") is True,
+                          reason=args.get("reason"), evidence=args.get("evidence"))
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID", hint="nothing was changed: " + pat.path())
+    return ok({"entry": _pat_row(entry), "evidence": entry.get("evidence"),
+               "store": pat.path()},
+              "entry",
+              model="a verified artefact: it carries the reading that made it "
+                    "trustworthy and the person who confirmed it",
+              basis="the promotion rule from docs/02 section B, applied to artefacts",
+              precision="exact on status and evidence count; the reason is prose",
+              assumptions={"reversible": "pattern_retire keeps the record"})
+
+
+_tool(
+    "pattern_layout_plan",
+    "Turn a verified layout into absolute coordinates for one board: every element's "
+    "offset rotated about the anchor and added to (x_mm, y_mm), with optional mirror. "
+    "When a board file is given it also reports what would collide - a reference that "
+    "is already placed, a point outside the board outline, or a neighbour closer than "
+    "constraints.min_gap_mm. It writes nothing: placement stays a decision, and this "
+    "server has no auto-placement on purpose. Refuses candidates and recipes.",
+    {"type": "object",
+     "properties": dict({
+         "id": _str("verified layout id"),
+         "x_mm": _num("where the anchor really goes, x"),
+         "y_mm": _num("where the anchor really goes, y"),
+         "rotation_deg": _num("turn the whole cluster this far (same direction as a "
+                              "positive footprint angle)"),
+         "mirror": _bool("mirror the cluster left-right and swap top/bottom sides",
+                         False),
+         "path": _str("optional board file to check the plan against"),
+     }, **{"member": _str("member inside an .epro archive"),
+          "project": _str("project directory inside an .epro archive")}),
+     "required": ["id", "x_mm", "y_mm"]},
+    lambda a: _guarded(lambda: _pattern_layout_plan(a)),
+)
+
+
+def _pattern_layout_plan(args):
+    pat, e = _patterns()
+    if e:
+        return e
+    try:
+        plan = pat.plan_layout(args.get("id"), args.get("x_mm"), args.get("y_mm"),
+                              args.get("rotation_deg") or 0.0,
+                              bool(args.get("mirror")))
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    conflicts = []
+    board_note = "no board given, so nothing was checked against one"
+    if args.get("path"):
+        board, e = _load_board(args)
+        if e:
+            return e
+        gap = (plan.get("constraints") or {}).get("min_gap_mm")
+        footprints = list(getattr(board, "footprints", []) or [])
+        outline = list(getattr(board, "outline", []) or [])
+        for element in plan["elements"]:
+            point = (element["x_mm"], element["y_mm"])
+            if element.get("ref"):
+                same = [f for f in footprints
+                        if str(f.get("ref") or "") == str(element["ref"])]
+                for found in same:
+                    conflicts.append({
+                        "role": element["role"], "ref": element["ref"],
+                        "why": "this reference is already on the board at (%.3f, %.3f); "
+                               "moving it is a different decision from placing a new part"
+                               % (float(found.get("x") or 0.0),
+                                  float(found.get("y") or 0.0))})
+            if outline:
+                inside = any(G.point_in_polygon(point, poly) for poly in outline
+                             if len(poly) >= 3)
+                if not inside:
+                    conflicts.append({"role": element["role"], "ref": element.get("ref"),
+                                      "why": "the planned point is outside the board "
+                                             "outline"})
+            if gap:
+                for found in footprints:
+                    if found.get("x") is None and found.get("y") is None:
+                        # A part at (0, 0) is a real part: testing truthiness
+                        # here would silently drop it from the collision check.
+                        continue
+                    distance = math.hypot(float(found.get("x") or 0.0) - element["x_mm"],
+                                          float(found.get("y") or 0.0) - element["y_mm"])
+                    if distance < float(gap):
+                        conflicts.append({
+                            "role": element["role"], "ref": element.get("ref"),
+                            "why": "%.2f mm from %s, under the %.2f mm this layout asks "
+                                   "for" % (distance, found.get("ref") or "an unnamed "
+                                            "footprint", float(gap))})
+        board_note = ("checked against %s: %d footprint(s), %d outline ring(s)"
+                      % (getattr(board, "path", args.get("path")), len(footprints),
+                         len(outline)))
+    plan["conflicts"] = conflicts
+    plan["board_check"] = board_note
+    return ok(plan, "mm coordinates",
+              model="offset arithmetic about the anchor; no placement was performed",
+              basis="the verified layout's own offsets; conflicts are read from the "
+                    "board that was passed in",
+              precision="coordinates to 1e-4 mm; min_gap_mm compares footprint origins, "
+                        "not courtyards, and says so in every conflict it raises",
+              assumptions={"board_unchanged": True,
+                           "library_write": "uses.count is incremented and "
+                                            "last_used_at is stamped - planning "
+                                            "counts as a use, the board does not "
+                                            "change",
+                           "auto_placement": "not implemented by design"})
+
+
+_tool(
+    "pattern_use",
+    "Record what happened when a pattern was applied. `failed` counts as much as "
+    "`worked`: it is the only thing that stops a recipe being reused forever on the "
+    "strength of one good day. A verified entry nobody has ever applied is listed by "
+    "pattern_status as exactly that.",
+    {"type": "object",
+     "properties": {
+         "id": _str("entry id"),
+         "outcome": _str("what happened", ["worked", "failed"]),
+         "note": _str("what it did on this board, in your words"),
+     },
+     "required": ["id", "outcome"]},
+    lambda a: _guarded(lambda: _pattern_use(a)),
+)
+
+
+def _pattern_use(args):
+    pat, e = _patterns()
+    if e:
+        return e
+    try:
+        entry = pat.use(args.get("id"), args.get("outcome"), note=args.get("note"))
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID", hint="nothing was written: " + pat.path())
+    return ok({"entry": _pat_row(entry), "uses": entry.get("uses")},
+              "entry",
+              model="a use record on an existing artefact",
+              basis="counts only what was recorded by this call",
+              precision="exact counts",
+              assumptions={"writes_nothing": False})
+
+
+_tool(
+    "pattern_status",
+    "Is the pattern library actually alive: how many entries, how many verified, how "
+    "many were ever applied, and which verified ones never were. Written because a "
+    "library that is filled once and never read looks identical to one that works, "
+    "unless something counts the reads.",
+    {"type": "object", "properties": {}},
+    lambda a: _guarded(lambda: _pattern_status(a)),
+)
+
+
+def _pattern_status(args):
+    pat, e = _patterns()
+    if e:
+        return e
+    got = pat.status()
+    return ok(got, "counts",
+              model="counts over $PCB_AGENT_HOME/patterns.json",
+              basis="uses.count is incremented by pattern_layout_plan and pattern_use",
+              precision="exact",
+              assumptions={"read_only": True})
+
 
 _tool(
     "calc_capabilities",

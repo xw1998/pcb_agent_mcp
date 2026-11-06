@@ -118,16 +118,18 @@ def _read_seed():
     return out
 
 
-def _read_local():
+def _read_blob():
     try:
         with open(path(), encoding="utf-8") as fh:
             blob = json.load(fh)
     except (OSError, ValueError):
-        return []
-    if not isinstance(blob, dict):
-        return []
+        return {}
+    return blob if isinstance(blob, dict) else {}
+
+
+def _read_local():
     out = []
-    for entry in blob.get("entries") or []:
+    for entry in _read_blob().get("entries") or []:
         if isinstance(entry, dict):
             item = dict(entry)
             item.setdefault("origin", "local")
@@ -135,14 +137,40 @@ def _read_local():
     return out
 
 
-def _write_local(entries):
+def _read_observations():
+    """Boards that were measured against the library, one row each.
+
+    Separate from `entries` on purpose: an observation is evidence that a board
+    was looked at, never a rule. It is what lets the corpus grow without letting
+    anything change an answer - the red line still runs through `entries`.
+    """
+    out = []
+    for row in _read_blob().get("observations") or []:
+        if isinstance(row, dict) and row.get("metric"):
+            out.append(row)
+    return out
+
+
+def record_observations(rows):
+    """Append measurement rows. Returns how many were stored."""
+    rows = [dict(row) for row in (rows or []) if row.get("metric")]
+    if not rows:
+        return 0
+    _write_local(_read_local(), _read_observations() + rows)
+    return len(rows)
+
+
+def _write_local(entries, observations=None):
     target = path()
     directory = os.path.dirname(target)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
+    if observations is None:
+        observations = _read_observations()
     tmp = target + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump({"schema": SCHEMA, "entries": entries}, fh,
+        json.dump({"schema": SCHEMA, "entries": entries,
+                   "observations": observations}, fh,
                   ensure_ascii=False, indent=1, sort_keys=True)
         fh.write("\n")
     os.replace(tmp, target)
@@ -500,6 +528,10 @@ def report(board, scope=None, status="active"):
     with an admission.
     """
     picked = recall(scope=scope, status=status, limit=10000)["entries"]
+    boards_seen = {}
+    observations = _read_observations()
+    for obs in observations:
+        boards_seen[obs["metric"]] = boards_seen.get(obs["metric"], 0) + 1
     rows = []
     for entry in picked:
         observed, note = observe(board, entry["trigger"]["board_metric"],
@@ -515,9 +547,12 @@ def report(board, scope=None, status="active"):
             "how_measured": note,
             "confidence": entry.get("confidence"),
             "origin": entry.get("origin"),
+            "boards_observed": boards_seen.get(entry["trigger"]["board_metric"], 0),
         })
     hard = [r for r in rows if r["kind"] == "hard"]
-    return {"board": getattr(board, "path", None),
+    source = getattr(board, "source", None) or {}
+    return {"board": (getattr(board, "path", None) or source.get("path")
+                      or None),
             "rows": rows,
             "checked": len(rows),
             "hard_violations": [r["id"] for r in hard
@@ -528,6 +563,7 @@ def report(board, scope=None, status="active"):
                            if r["verdict"] == "unverified"],
             "not_checkable_here": [r["id"] for r in rows
                                    if r["verdict"] == "not_checkable_here"],
+            "observations": len(observations),
             "writes_nothing": True}
 
 
@@ -669,3 +705,246 @@ def retire(ident, reason=None):
             _write_local(items)
             return entry
     raise KeyError("no local entry with id %r" % ident)
+
+# --------------------------------------------------------------- harvesting
+#: The metrics a single board can honestly teach. Everything else here is a rule
+#: with a failure side - a via ring floor, a drilled pad spanning the copper, a
+#: pad placement the reader cannot certify - and a rule of that sort comes from a
+#: fab's capability or a spec, never from one board. A board can only violate
+#: those, and a violation is a finding, not a lesson.
+HARVEST_METRICS = ("tracks_off_45_grid", "distinct_via_geometries",
+                   "distinct_track_widths", "power_wider_than_signal")
+
+HARVEST_SCOPES = {"tracks_off_45_grid": "route.geometry",
+                  "distinct_via_geometries": "route.via",
+                  "distinct_track_widths": "route.width",
+                  "power_wider_than_signal": "route.width"}
+
+
+def _slug(text):
+    keep = []
+    for ch in str(text or ""):
+        keep.append(ch.lower() if ch.isalnum() else "-")
+    out = "".join(keep).strip("-")
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out[:40] or "board"
+
+
+def _trigger_from(metric, observed):
+    """The machine-checkable half, built from what this board actually read.
+
+    Building it from the reading is the point: the threshold then means "this is
+    what one real board does", which a second board can be compared against. It
+    does NOT mean "good boards do this" - that needs a corpus, and `claim` says
+    so in words every time.
+    """
+    if metric == "tracks_off_45_grid":
+        share = observed["off_grid"] / float(observed["tracks"] or 1)
+        return {"board_metric": metric, "tolerance_deg": 0.5,
+                "max_off_grid_share": round(share, 6)}
+    if metric == "distinct_via_geometries":
+        return {"board_metric": metric, "max_distinct": int(observed["distinct"])}
+    if metric == "distinct_track_widths":
+        return {"board_metric": metric, "max_distinct": int(observed["distinct"])}
+    if metric == "power_wider_than_signal":
+        return {"board_metric": metric}
+    return {"board_metric": metric}
+
+
+def _sentence(metric, observed):
+    if metric == "tracks_off_45_grid":
+        return ("%d of %d track segments sit more than 0.5 deg off the 45 degree "
+                "grid (share %.4f)"
+                % (observed["off_grid"], observed["tracks"],
+                   observed["off_grid"] / float(observed["tracks"] or 1)))
+    if metric == "distinct_via_geometries":
+        return "%d distinct via geometries are used" % observed["distinct"]
+    if metric == "distinct_track_widths":
+        return "%d distinct track widths are used" % observed["distinct"]
+    if metric == "power_wider_than_signal":
+        return ("power-net median width is %.3f mm against %.3f mm on signal nets"
+                % (observed["power_median_mm"], observed["signal_median_mm"]))
+    return metric
+
+
+def harvest(board, dry_run=False, metric=None):
+    """Read one board and write down what it says, as CANDIDATES.
+
+    This is the loop that was missing: without it the library only grows when
+    someone remembers to type a claim by hand, which is why it sat at two entries.
+    What it will not do:
+
+    * write a `hard` entry - those come from a fab's capability, and a board can
+      only violate them;
+    * overwrite an id that is already there - a second harvest of the same board
+      is a no-op, not a silent revision;
+    * promote anything. Everything written here is a candidate, and stays one
+      until `promote(confirm=True, reason=...)`.
+
+    A board that disagrees with an ACTIVE habit writes a counterexample candidate
+    instead of a new habit: the library has to be able to hear "the good boards
+    mostly do this, and this one does not".
+    """
+    chosen = [metric] if metric else list(HARVEST_METRICS)
+    for name in chosen:
+        if name not in HARVEST_METRICS:
+            raise ValueError(
+                "metric %r cannot be learned from a single board (learnable: %s). "
+                "The rest are rules with a failure side: they come from a fab "
+                "capability or a spec, and a board can only violate them."
+                % (name, ", ".join(HARVEST_METRICS)))
+    lib = library()
+    active_by_metric = {}
+    for entry in lib["entries"]:
+        if entry.get("status") == "active":
+            active_by_metric.setdefault(entry["trigger"]["board_metric"],
+                                        []).append(entry)
+    known_ids = set(e.get("id") for e in lib["entries"])
+    source = getattr(board, "source", None) or {}
+    board_path = (getattr(board, "path", None) or source.get("path")
+                  or source.get("file") or "board")
+    board_name = os.path.splitext(os.path.basename(str(board_path)))[0]
+    slug = _slug(board_name)
+    rows, written, skipped = [], [], []
+    for name in chosen:
+        observed, how = observe(board, name)
+        row = {"metric": name, "observed": observed, "how_measured": how}
+        if observed is None:
+            row["verdict"] = "not_measured"
+            rows.append(row)
+            continue
+        clashes = active_by_metric.get(name) or []
+        counterexample = False
+        if clashes:
+            verdicts = [_verdict(entry, observed) for entry in clashes]
+            if "violated" in verdicts or "outside_habit" in verdicts:
+                counterexample = True
+            else:
+                row["verdict"] = "consistent_with_active"
+                rows.append(row)
+                continue
+        if counterexample:
+            ident = "exp.harvest.%s.counterexample.%s" % (name, slug)
+            claim = ("On %s, %s - while the active library on this metric says "
+                     "otherwise. Recorded as a counterexample so the corpus can be "
+                     "corrected, not as a new habit to follow."
+                     % (board_name, _sentence(name, observed)))
+        else:
+            ident = "exp.harvest.%s.%s" % (name, slug)
+            claim = ("Single-board observation on %s: %s. This is one board, not a "
+                     "corpus, so it can be used as a comparison point and must not "
+                     "be read as a habit other boards follow."
+                     % (board_name, _sentence(name, observed)))
+        kind = "soft"
+        row["id"] = ident
+        if ident in known_ids:
+            row["verdict"] = "already_there"
+            skipped.append({"id": ident, "why": "an entry with this id already "
+                                                "exists; harvesting again does not "
+                                                "rewrite it"})
+            rows.append(row)
+            continue
+        entry = {"id": ident, "kind": kind, "scope": HARVEST_SCOPES.get(name),
+                 "claim": claim,
+                 "action": ("compare another board against this reading before "
+                            "treating it as a habit; promote with a human reason "
+                            "and a corpus, never on the strength of this one board"),
+                 "trigger": _trigger_from(name, observed),
+                 "evidence": {"hits": 1, "violated": None,
+                              "sources": [str(board_path)]},
+                 "confidence": "single board (1/1)",
+                 "owner": "experience_harvest"}
+        row["verdict"] = ("counterexample_written" if counterexample
+                          else "written")
+        if counterexample:
+            row["against"] = [e.get("id") for e in clashes]
+        if dry_run:
+            row["verdict"] = "would_be_" + row["verdict"]
+            rows.append(row)
+            written.append(ident)
+            continue
+        try:
+            candidate(entry, note=None)
+        except ValueError as exc:
+            row["verdict"] = "refused"
+            row["why"] = str(exc)
+            skipped.append({"id": ident, "why": str(exc)})
+            rows.append(row)
+            continue
+        known_ids.add(ident)
+        written.append(ident)
+        rows.append(row)
+    observations = []
+    for row in rows:
+        if row.get("observed") is None:
+            continue
+        observations.append({"metric": row["metric"], "board": board_path,
+                             "at": _now(), "verdict": row.get("verdict"),
+                             "reading": row["observed"]})
+    recorded = 0 if dry_run else record_observations(observations)
+    return {"board": board_path, "rows": rows,
+            "written": written, "skipped": skipped, "dry_run": bool(dry_run),
+            "observations": {"measured": len(observations), "stored": recorded},
+            "store": path(),
+            "hard_not_learned_here": ("a hard rule needs a fab capability or a spec "
+                                      "behind it; a board can only violate one, and "
+                                      "a violation belongs in a report, not here"),
+            "promotion": "every id above is a candidate; promote needs confirm=true "
+                         "and a reason"}
+
+
+# ------------------------------------------------------------------- health
+def status():
+    """Is this library alive, or filled once and abandoned?
+
+    The reading that matters is not the total: it is how many entries are ACTIVE
+    (so they can shape an answer) versus how many candidates are waiting for a
+    person who never came. `store_written_at` is the file's own mtime, so "when
+    did this last learn anything" cannot be answered by memory.
+    """
+    lib = library()
+    entries = lib["entries"]
+    by_origin, by_status, by_kind = {}, {}, {}
+    for entry in entries:
+        by_origin[entry.get("origin")] = by_origin.get(entry.get("origin"), 0) + 1
+        by_status[entry.get("status")] = by_status.get(entry.get("status"), 0) + 1
+        by_kind[entry.get("kind")] = by_kind.get(entry.get("kind"), 0) + 1
+    waiting = [e.get("id") for e in entries if e.get("status") == "candidate"]
+    try:
+        written_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(os.path.getmtime(path())))
+    except OSError:
+        written_at = None
+    observations = _read_observations()
+    observed_by_metric = {}
+    for obs in observations:
+        observed_by_metric[obs["metric"]] = observed_by_metric.get(obs["metric"], 0) + 1
+    active = by_status.get("active", 0)
+    parts = ["%d active entr%s can shape an answer"
+             % (active, "y" if active == 1 else "ies")]
+    if waiting:
+        parts.append("%d candidate(s) are waiting for a person who has not "
+                     "confirmed them" % len(waiting))
+    seed_share = by_origin.get("seed", 0)
+    if seed_share:
+        parts.append("%d of the %d entries ship with the package (measured once, "
+                     "then checked in)" % (seed_share, len(entries)))
+    if observations:
+        parts.append("%d board measurement(s) are recorded, so the corpus behind "
+                     "the rules can be checked against what was actually seen here"
+                     % len(observations))
+    else:
+        parts.append("no board has ever been measured against the library by this "
+                     "machine (the numbers in the seed come from its own survey)")
+    if not entries:
+        parts.append("nothing has ever been written down")
+    return {"store": path(), "seed": lib["seed"], "enabled": enabled(),
+            "total": len(entries), "by_origin": by_origin,
+            "by_status": by_status, "by_kind": by_kind,
+            "candidates_waiting": waiting,
+            "observations": {"total": len(observations),
+                             "by_metric": observed_by_metric},
+            "store_written_at": written_at,
+            "shadowed_seed_ids": lib["shadowed_seed_ids"],
+            "message": "; ".join(parts)}

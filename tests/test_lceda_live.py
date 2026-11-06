@@ -1079,5 +1079,41 @@ class TestTheProjectFileItselfSaysWhatIsInIt(unittest.TestCase):
         self.assertFalse(reading["readable"])
         self.assertIn("database", reading["why"].lower())
 
+class TestTheListingIsNotThePage(unittest.TestCase):
+    """`limit` is how many rows to hand back, not how many exist.
+
+    Measured 2026-11-07: the walk stopped at the limit, so asking for 3 rows also
+    said the machine holds 3 projects - and the disagreement text ("the app lists
+    0 while N exist") changed with the page size.
+    """
+
+    def test_total_does_not_depend_on_the_page_size(self):
+        import json
+        import shutil
+        import tempfile
+        base = tempfile.mkdtemp(prefix="lceda_projects_")
+        user = os.path.join(base, "LCEDA-Pro")
+        projects = os.path.join(base, "projects")
+        os.makedirs(user)
+        os.makedirs(projects)
+        try:
+            for index in range(5):
+                with open(os.path.join(projects, "p%d.epro2" % index), "wb") as fh:
+                    fh.write(b"PK\x03\x04" + b"\x00" * 16)
+            with open(os.path.join(user, "config.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"type": "HALF_OFFLINE",
+                           "APP_PROJECT_DIR": [projects]}, fh)
+            one = L.projects_on_disk(user_data=user, deep=True, limit=1)
+            full = L.projects_on_disk(user_data=user, deep=True, limit=None)
+            self.assertEqual(one["total"], 5)
+            self.assertEqual(len(one["projects"]), 1)
+            self.assertTrue(one["truncated"])
+            self.assertEqual(full["total"], 5)
+            self.assertEqual(len(full["projects"]), 5)
+            self.assertFalse(full["truncated"])
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()

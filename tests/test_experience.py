@@ -405,5 +405,75 @@ class TheTools(Base):
         self.assertEqual(got["value"]["added"], ["exp.file.a"])
 
 
+class HarvestIsTheLoopThatWasMissing(Base):
+    """A library that only grows when someone types a claim by hand is a document.
+
+    These cases hold the loop to what it is allowed to do: measure a board and keep
+    the reading (so the corpus grows), write a counterexample when a board
+    disagrees with an active habit, never write a rule that a fab capability owns,
+    and never change what shapes an answer.
+    """
+
+    def test_a_board_is_measured_and_every_reading_is_kept(self):
+        got = X.harvest(good_board())
+        self.assertEqual(got["observations"]["stored"], 4)
+        self.assertEqual(got["written"], [])
+        self.assertTrue(all(row["verdict"] == "consistent_with_active"
+                            for row in got["rows"]))
+        self.assertEqual(X.status()["observations"]["total"], 4)
+
+    def test_measuring_never_changes_what_shapes_an_answer(self):
+        before = X.library()["counts"]
+        X.harvest(good_board())
+        after = X.library()["counts"]
+        self.assertEqual(before, after,
+                         "a measurement is evidence, not a rule: the counts of "
+                         "active entries must not move")
+
+    def test_a_board_that_leaves_a_habit_writes_a_counterexample_once(self):
+        first = X.harvest(bad_board())
+        counter = [row for row in first["rows"]
+                   if row.get("verdict") == "counterexample_written"]
+        self.assertTrue(counter, first["rows"])
+        self.assertTrue(all("counterexample" in row["id"] for row in counter))
+        self.assertTrue(all(row.get("against") for row in counter))
+        second = X.harvest(bad_board())
+        self.assertEqual(second["written"], [])
+        self.assertTrue(any("already" in item["why"] for item in second["skipped"]))
+
+    def test_a_hard_rule_is_not_learned_from_a_board(self):
+        for metric in ("via_annular_ring_below", "through_hole_pads_single_layer"):
+            with self.assertRaises(ValueError) as caught:
+                X.harvest(good_board(), metric=metric)
+            self.assertIn("cannot be learned from a single board",
+                          str(caught.exception))
+
+    def test_a_dry_run_writes_nothing(self):
+        before_obs = X.status()["observations"]["total"]
+        before_total = X.library()["counts"]["total"]
+        got = X.harvest(bad_board(), dry_run=True)
+        self.assertTrue(got["dry_run"])
+        self.assertEqual(got["observations"]["stored"], 0)
+        self.assertEqual(X.status()["observations"]["total"], before_obs)
+        self.assertEqual(X.library()["counts"]["total"], before_total)
+        self.assertTrue(any(row["verdict"].startswith("would_be")
+                            for row in got["rows"]))
+
+    def test_the_report_says_how_many_boards_stand_behind_a_row(self):
+        X.harvest(good_board())
+        got = X.report(good_board())
+        row = [r for r in got["rows"] if r["id"] == "exp.seed.track-width-palette"][0]
+        self.assertEqual(row["boards_observed"], 1)
+        self.assertEqual(got["observations"], 4)
+
+    def test_status_names_the_candidates_nobody_confirmed(self):
+        X.harvest(bad_board())
+        got = X.status()
+        self.assertTrue(got["candidates_waiting"])
+        self.assertIn("waiting for a person", got["message"])
+        self.assertIn("board measurement", got["message"])
+        self.assertEqual(got["observations"]["total"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()

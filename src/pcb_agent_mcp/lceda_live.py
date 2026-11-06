@@ -348,6 +348,11 @@ class PipeTransport(Transport):
 
 
 PROJECT_EXTS = (".eprj2", ".eprj", ".epro2", ".epro")
+
+#: A listing stops here rather than walking a directory tree forever. It is a
+#: safety valve, not a page size: reaching it makes the answer say it is
+#: incomplete.
+HARD_LIST_CAP = 5000
 CONFIG_NAME = "config.json"
 
 def user_data_dir():
@@ -607,12 +612,21 @@ def projects_on_disk(user_data=None, limit=200, deep=True, max_depth=2):
                         except Exception as exc:
                             entry["docs"] = {"error": str(exc)}
                 found.append(entry)
-                if len(found) >= limit:
-                    errors.append({"path": base, "error": "stopped at limit %d" % limit})
+                if len(found) >= HARD_LIST_CAP:
+                    errors.append({"path": base,
+                                   "error": "stopped at the hard cap of %d files: this "
+                                            "listing is incomplete"
+                                            % HARD_LIST_CAP})
                     break
     found.sort(key=lambda item: item.get("mtime") or "", reverse=True)
-    return {"config": config, "roots": roots, "projects": found,
-            "total": len(found), "errors": errors}
+    # `limit` is how many rows to hand back, not how many exist. Cutting the walk
+    # short (the previous behaviour) made `total` depend on the page size, so a
+    # caller asking for 3 rows was told the machine holds 3 projects.
+    total = len(found)
+    page = found[:limit] if limit else found
+    return {"config": config, "roots": roots, "projects": page,
+            "total": total, "returned": len(page), "truncated": total > len(page),
+            "errors": errors}
 
 def disk_project_count(user_data=None, live_only=True):
     """How many project files exist on disk - a cheap, never-raising count.
@@ -621,7 +635,7 @@ def disk_project_count(user_data=None, live_only=True):
     reported as "nothing to load" without this number next to it.
     """
     try:
-        listing = projects_on_disk(user_data, deep=False)
+        listing = projects_on_disk(user_data, deep=False, limit=None)
         items = listing["projects"]
     except Exception:
         return 0

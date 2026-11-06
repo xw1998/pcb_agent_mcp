@@ -1,6 +1,6 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——191 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——217 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
@@ -146,6 +146,29 @@ postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、
    「计数跨过阈值」不算理由。
 4. 真实板上是否成立 → `experience_outcome`（只记命中/违反计数，**不改条目状态**）。
 5. 导出/导入 → `experience_export` / `experience_import`。
+6. **量一块板就入库** → `experience_harvest`（path=板子）。它用同一份代码量 4 个单板能教的
+   指标，把读数写进 `observations`，把与 active 习惯**相反**的写成反例候选（id 带
+   `counterexample`）。写进去的全是 candidate，`confidence` 是 `single board (1/1)`。
+   **hard 规则不从单板学**（板厂能力/规范才给），调用会直接拒。
+7. 库活着吗 → `experience_status`：active 几条、候选几条没人确认、文件最后写入时间。
+
+## 方案与布局库（`pattern_*`）
+
+经验库存的是「能被测量反驳的说法」，这里存的是「能被人再来一遍的东西」：
+- **recipe**（已验证方案）：参数 + 步骤 + 一条读数。例：USB-C 受电端 CC1/CC2 各 5.1 kΩ。
+- **layout**（可复用布局）：相对**一个 anchor** 的毫米偏移。
+
+规矩（会被拒，不是建议）：
+1. `parameters` 每项必须 `{value, unit, source}`；裸数字直接拒——没来源的数字是猜，
+   而猜被复用了比没有库更糟。
+2. layout 必须**恰好一个** `anchor: true` 的元素；缺 `dx_mm` 不等于 0，会拒。
+3. `pattern_add` 只写 candidate；`pattern_verify(confirm=true, reason=..., evidence=[{from, reading}])`
+   才能变 verified。`from` 写路径或命令，`reading` 写它返回了什么。
+4. 要用布局 → `pattern_layout_plan(id, x_mm, y_mm, rotation_deg, mirror, path=板子)`：
+   只返回坐标 + 冲突（越界 / 同一位号已在板上 / 小于 `min_gap_mm`），**`writes_nothing`**。
+   落位仍走 `board_propose → board_apply`；没有自动布局。
+5. 用过之后 `pattern_use(id, outcome="worked"|"failed", note=...)`；`failed` 和 `worked`
+   一样重要。`pattern_status` 会点名「verified 但从没被用过」的条目。
 
 ## 已退休与禁止
 
