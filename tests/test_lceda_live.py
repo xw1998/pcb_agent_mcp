@@ -221,39 +221,48 @@ class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
         transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
                                    _ok({"sessionId": "s1"}),
                                    _ok({"bridgeVersion": "4.1.60"}),
-                                   _ok({"project": {}, "pcbCount": 0})])
+                                   _ok([{"sessionId": "s1", "status": "alive"}]),
+                                   _ok({"pcbCount": 0, "schCount": 0})])
         client = L.Client(transport)
         with self.assertRaises(L.LiveError) as caught:
             client.open_project(os.path.abspath(__file__))
         exc = caught.exception
         self.assertEqual(exc.code, "OPEN_NOT_CONFIRMED")
         self.assertFalse(exc.extra["content_probe"]["loaded"])
-        self.assertEqual(exc.extra["content_probe"]["project_keys"], [])
+        self.assertFalse(exc.extra["content_probe"]["session_loaded"])
         self.assertEqual(exc.extra["content_probe"]["pcb_count"], 0)
         self.assertIn("document", exc.extra["next"])
         self.assertEqual([c[0] for c in transport.calls],
-                         ["ping", "open", "ping", "invoke"])
-        self.assertEqual(transport.calls[3][1]["session"], "s1")
+                         ["ping", "open", "ping", "session.list", "invoke"])
+        self.assertEqual(transport.calls[4][1]["session"], "s1")
 
-    def test_a_loaded_project_object_is_what_confirms_the_open(self):
+    def test_the_document_lists_are_what_confirm_the_open(self):
+        # getCurrentProjectInfo() never settles on this build (measured 45 s), so the
+        # lists of PCB and schematic documents are the reading that can answer.
         transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
                                    _ok({"sessionId": "s1"}),
                                    _ok({"bridgeVersion": "4.1.60"}),
-                                   _ok({"project": {"id": "p1"},
-                                        "pcbCount": 1, "projectCount": 3})])
+                                   _ok([{"sessionId": "s1", "status": "alive"}]),
+                                   _ok({"pcbCount": 2, "schCount": 1,
+                                        "projectUuid": "p1",
+                                        "pcbs": [{"name": "PCB1"}, {"name": "PCB2"}],
+                                        "projectCount": 0})])
         client = L.Client(transport)
         value = client.open_project(os.path.abspath(__file__))
         self.assertEqual(value["sessionId"], "s1")
         state = client.last_open["content"]
         self.assertTrue(state["loaded"])
-        self.assertEqual(state["project_keys"], ["id"])
-        self.assertEqual(state["project_count"], 3)
+        self.assertTrue(state["session_loaded"])
+        self.assertEqual(state["pcb_count"], 2)
+        self.assertEqual(state["sch_count"], 1)
+        self.assertEqual(state["project_uuid"], "p1")
+        self.assertEqual(len(state["pcbs"]), 2)
         self.assertEqual(client.open_session, "s1")
 
     def test_the_probe_uses_the_last_live_session_when_none_is_named(self):
         transport = FakeTransport([_ok([{"sessionId": "dead", "status": "dead"},
                                         {"sessionId": "s2", "status": "alive"}]),
-                                   _ok({"project": {}, "pcbCount": 0})])
+                                   _ok({"pcbCount": 0, "schCount": 0})])
         client = L.Client(transport)
         state = client.project_state()
         self.assertFalse(state["loaded"])
@@ -263,7 +272,8 @@ class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
     def test_a_probe_that_cannot_run_is_not_loaded(self):
         # A getter that never settles takes the whole probe down; the cheap fallback
         # still answers, so the two facts that are knowable are not lost with it.
-        transport = FakeTransport([L.LiveError("APP_TIMEOUT", "no reply"),
+        transport = FakeTransport([_ok([{"sessionId": "s1", "status": "alive"}]),
+                                   L.LiveError("APP_TIMEOUT", "no reply"),
                                    _ok({"projectCount": 4,
                                         "workspace": {"uuid": "Personal"}})])
         client = L.Client(transport)
@@ -272,16 +282,18 @@ class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
         self.assertEqual(state["project_count"], 4)
         self.assertEqual(state["workspace"], {"uuid": "Personal"})
         self.assertIn("APP_TIMEOUT: no reply", state["why"])
-        self.assertIn("render is blocked", state["why"])
+        self.assertIn("not a project list on this build", state["why"])
 
     def test_a_fallback_that_also_fails_still_answers(self):
-        transport = FakeTransport([L.LiveError("APP_TIMEOUT", "no reply"),
+        transport = FakeTransport([_ok([{"sessionId": "s1", "status": "alive"}]),
+                                   L.LiveError("APP_TIMEOUT", "no reply"),
                                    L.LiveError("APP_TIMEOUT", "no reply")])
         client = L.Client(transport)
         state = client.project_state("s1")
         self.assertFalse(state["loaded"])
         self.assertIsNone(state["project_count"])
-        self.assertIn("never answered", state["why"])
+        self.assertIn("no session could be read", state["why"])
+        self.assertIn("not a project list on this build", state["why"])
 
     def test_an_editor_that_stops_answering_after_open_is_reported_not_returned(self):
         transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
@@ -468,7 +480,7 @@ class TheToolsSayWhatTheyCanDo(unittest.TestCase):
     def test_every_bridge_tool_is_registered_and_listed(self):
         from pcb_agent_mcp import tools as T
         names = [n for n in T.TOOLS if n.startswith("lceda_pro_")]
-        self.assertEqual(len(names), 10, names)
+        self.assertEqual(len(names), 11, names)
         available = T.TOOLS["calc_capabilities"]["handler"]({})["available"]
         for name in names:
             self.assertIn(name, available)

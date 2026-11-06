@@ -76,6 +76,7 @@ Zero dependencies: hashlib, json, os, socket-free file IO on the pipe, time.
 import hashlib
 import json
 import os
+import sqlite3
 import time
 
 APP_NAME = "JLCEDAPro"
@@ -96,25 +97,34 @@ MAX_TIMEOUT_MS = 60000
 # "no project loaded" - a false negative with the same shape as the false positive
 # this probe exists to kill. `invoke` runs the snippet as an async function body,
 # so `await` is the correct form and is used everywhere below.
+# What is asked, and why NOT getCurrentProjectInfo: measured 2026-11-07 on a project
+# that had certainly opened (window title "F412RG 核心板 LCEDA | 嘉立创EDA(专业版)",
+# file on disk), that getter never settled - 45 s, no value and no rejection - while
+# getAllPcbsInfo() answered 2 PCBs and getAllSchematicsInfo() answered 1 schematic.
+# A gate that waits on it can only ever say "not loaded", so it is not asked at all.
 PROBE_JS = (
-    "var o={loaded:false};"
-    "try{var p=await eda.dmt_Project.getCurrentProjectInfo();p=p||{};"
-    "o.project=p;o.projectKeys=Object.keys(p);o.loaded=o.projectKeys.length>0;"
-    "}catch(e){o.error=String(e&&e.message||e);}"
-    "try{var b=await eda.dmt_Pcb.getAllPcbsInfo();b=b||{};"
-    "o.pcbCount=(typeof b.length==='number')?b.length:Object.keys(b).length;"
-    "}catch(e){}"
-    "try{var u=await eda.dmt_Project.getAllProjectsUuid();u=u||[];"
-    "o.projectCount=(typeof u.length==='number')?u.length:Object.keys(u).length;"
+    "var o={loaded:false,pcbCount:0,schCount:0,pcbs:[],schematics:[],projectUuid:null};"
+    "function n(x){return (typeof x.length==='number')?x.length:Object.keys(x||{}).length;}"
+    "try{var b=await eda.dmt_Pcb.getAllPcbsInfo();b=b||[];o.pcbCount=n(b);"
+    "o.pcbs=(Array.isArray(b)?b:[]).map(function(x){return {name:x&&x.name,uuid:x&&x.uuid};});"
+    "if(b&&b[0]&&b[0].parentProjectUuid){o.projectUuid=b[0].parentProjectUuid;}"
+    "}catch(e){o.pcbError=String(e&&e.message||e);}"
+    "try{var s=await eda.dmt_Schematic.getAllSchematicsInfo();s=s||[];o.schCount=n(s);"
+    "o.schematics=(Array.isArray(s)?s:[]).map(function(x){return {name:x&&x.name,"
+    "uuid:x&&x.uuid,pages:(x&&x.page)?x.page.length:0};});"
+    "if(!o.projectUuid&&s&&s[0]&&s[0].parentProjectUuid){o.projectUuid=s[0].parentProjectUuid;}"
+    "}catch(e){o.schError=String(e&&e.message||e);}"
+    "try{var u=await eda.dmt_Project.getAllProjectsUuid();u=u||[];o.projectCount=n(u);"
     "}catch(e){}"
     "try{var w=await eda.dmt_Workspace.getCurrentWorkspaceInfo();o.workspace=w||null;"
     "}catch(e){}"
+    "o.loaded=(o.pcbCount>0)||(o.schCount>0);"
     "return o;"
 )
-# Fallback when the full probe does not answer in budget. Measured on 4.1.60 with
-# nothing loaded: `await getCurrentProjectInfo()` never resolves (no rejection, no
-# value), so the combined probe times out and would otherwise take the two answers
-# that DO come back down with it. These two are cheap and always answered.
+# Fallback when the full probe does not answer in budget. Both calls here are
+# answered on every measured state (including the empty one), which is exactly why
+# they are worth keeping: they say whether the render is alive and which workspace
+# is selected even when a document list cannot be read.
 CHEAP_PROBE_JS = (
     "var o={};"
     "try{var u=await eda.dmt_Project.getAllProjectsUuid();u=u||[];"
@@ -324,25 +334,227 @@ class PipeTransport(Transport):
         self._buffer = b""
 
 
-def project_container(path):
-    """What the file on disk is, read from its own bytes rather than its extension.
+PROJECT_EXTS = (".eprj2", ".eprj", ".epro2", ".epro")
+CONFIG_NAME = "config.json"
 
-    Measured on this install: the legacy `.eprj` is a SQLite database
-    (`b"SQLite format 3\\x00"`) and `.epro2` is a ZIP (`b"PK\\x03\\x04"`). Opening a
-    SQLite one in 4.1.60 is what puts up "当前工程为V3以下版本 ... 是否确认打开该工程?"
-    and leaves the bridge answering while nothing loads. Knowing this before the
-    call is the difference between refusing and pretending.
+def user_data_dir():
+    """Where the editor keeps its configuration.
+
+    Measured on this machine: OneDrive has redirected Documents, so the real
+    directory is `~/OneDrive/Documents/LCEDA-Pro` and a bare `~/Documents` lookup
+    finds nothing. Candidates are tried in order and the first one holding a
+    config.json wins; the plain path is kept as the fallback so a caller always
+    gets an answer it can print. `LCEDA_PRO_USER_DIR` overrides everything.
     """
-    with open(path, "rb") as handle:
-        head = handle.read(16)
+    override = os.environ.get("LCEDA_PRO_USER_DIR")
+    if override:
+        return override
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Documents", "LCEDA-Pro"),
+        os.path.join(home, "OneDrive", "Documents", "LCEDA-Pro"),
+        os.path.join(home, "OneDrive", "文档", "LCEDA-Pro"),
+        os.path.join(home, "文档", "LCEDA-Pro"),
+    ]
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, CONFIG_NAME)):
+            return path
+    return candidates[0]
+
+def sqlite_version(path):
+    """(db_version, tables) of a project database, read-only. (None, []) if not one.
+
+    Read through SQLite itself rather than by scanning strings: `db_versions` is the
+    editor's own answer to "what version wrote this file", and it is the only
+    discriminator that survived measurement - the container (SQLite vs ZIP) does
+    NOT separate old from current files.
+    """
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path).replace("\\", "/"),
+                              uri=True)
+    except Exception:
+        return None, []
+    try:
+        tables = [str(row[0]) for row in
+                  con.execute("select name from sqlite_master where type='table'")]
+    except Exception:
+        tables = []
+    version = None
+    if "db_versions" in tables:
+        try:
+            for row in con.execute("select * from db_versions"):
+                if len(row) >= 2 and str(row[0]).lower() == "sqlite":
+                    version = str(row[1])
+        except Exception:
+            version = None
+    try:
+        con.close()
+    except Exception:
+        pass
+    return version, tables
+
+def project_container(path):
+    """What the file on disk is: container, format version, whether an upgrade ask is due.
+
+    Measured on this install (2026-11-07), and the earlier rule here was wrong:
+
+        D:\\lcedapro\\project\\F412RG 核心板 LCEDA.eprj2   SQLite  26.08.19.1  current
+        C:\\...\\example-projects\\示例工程_3D外壳设计.eprj    SQLite  0.0.3        legacy
+        ...\\ProPrj_*.epro2                                  ZIP     -            current
+
+    So "SQLite = legacy" would refuse every project the editor is actually using.
+    The version string is the discriminator; the extension is the tie-break when a
+    file cannot be opened as a database.
+    """
+    extension = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16)
+    except OSError as exc:
+        return {"container": "unreadable", "extension": extension, "db_version": None,
+                "needs_upgrade": False, "why": "cannot read the file: %s" % exc}
     if head.startswith(b"SQLite format 3"):
-        return {"container": "sqlite", "needs_upgrade": True,
-                "why": "SQLite container = legacy .eprj; 4.1.60 asks before upgrading it"}
+        version, tables = sqlite_version(path)
+        if version is not None:
+            legacy = version.startswith("0.0.")
+            why = "SQLite database, db_versions=sqlite %s -> %s" % (
+                version, "legacy: 4.1.60 asks before opening it" if legacy
+                else "current format, no upgrade ask expected")
+        else:
+            legacy = extension == ".eprj"
+            why = ("SQLite database with no readable db_versions; judged by the "
+                   "extension %s (legacy only if .eprj)" % (extension or "?"))
+        return {"container": "sqlite", "extension": extension,
+                "db_version": version,
+                "legacy_projects_table": "projects" in tables,
+                "needs_upgrade": bool(legacy), "why": why}
     if head.startswith(b"PK\x03\x04"):
-        return {"container": "zip", "needs_upgrade": False,
-                "why": "ZIP container = .epro2/.epro; no upgrade dialog is expected"}
-    return {"container": "unknown", "needs_upgrade": False,
+        return {"container": "zip", "extension": extension, "db_version": None,
+                "needs_upgrade": False,
+                "why": "ZIP archive (.epro2/.epro); current format, no upgrade ask "
+                       "expected"}
+    return {"container": "unknown", "extension": extension, "db_version": None,
+            "needs_upgrade": False,
             "why": "neither SQLite nor ZIP; the format is not known here"}
+
+def install_config(user_data=None):
+    """The editor's own install configuration, read only.
+
+    This is where the project locations actually live. `eda.dmt_Project
+    .getAllProjectsUuid()` measured [] on a machine holding 7 current projects, so
+    the configuration (and the disk behind it) is the authority, not that API.
+    """
+    base = user_data or user_data_dir()
+    path = os.path.join(base, CONFIG_NAME)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return {"path": path, "found": False, "error": str(exc)}
+    def _list(key):
+        value = data.get(key)
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(v) for v in value if v]
+        return []
+    return {
+        "path": path,
+        "found": True,
+        "type": data.get("type"),
+        "online_service": data.get("onlineService"),
+        "project_dirs": _list("APP_PROJECT_DIR"),
+        "library_dirs": _list("LIB_DIR"),
+        "recovery_dir": (data.get("TMP_BACKUP_DIR") or None),
+        "online_backup_dir": (data.get("ONLINE_BACKUP_DIR") or None),
+    }
+
+def project_roots(user_data=None):
+    """[{role, path, exists}] - every directory the editor stores projects in."""
+    config = install_config(user_data)
+    roots = []
+    for path in config.get("project_dirs") or []:
+        roots.append({"role": "project", "path": path})
+    for key, role in (("recovery_dir", "recovery"),
+                      ("online_backup_dir", "online-backup")):
+        path = config.get(key)
+        if path:
+            roots.append({"role": role, "path": path})
+    for item in roots:
+        item["exists"] = os.path.isdir(item["path"])
+    return roots
+
+def projects_on_disk(user_data=None, limit=200, deep=True, max_depth=2):
+    """The projects that exist on this machine, from disk, with their real format.
+
+    Separate from the editor on purpose: this answers "is there anything to open"
+    without asking an API that may be sitting on an unanswered dialog. `source`
+    says where each root came from, so a caller can tell a live project directory
+    (the ones the editor shows) from a recovery/online backup.
+    """
+    config = install_config(user_data)
+    roots = project_roots(user_data)
+    found, errors = [], []
+    for root in roots:
+        base = root["path"]
+        if not root.get("exists"):
+            errors.append({"path": base, "role": root["role"],
+                           "error": "directory does not exist"})
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            depth = os.path.relpath(dirpath, base).count(os.sep)
+            if depth >= max_depth:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                if os.path.splitext(name)[1].lower() not in PROJECT_EXTS:
+                    continue
+                full = os.path.join(dirpath, name)
+                try:
+                    stat = os.stat(full)
+                except OSError as exc:
+                    errors.append({"path": full, "error": str(exc)})
+                    continue
+                entry = {
+                    "name": os.path.splitext(name)[0],
+                    "file": name,
+                    "path": full,
+                    "source": root["role"],
+                    "size_mb": round(stat.st_size / (1024.0 * 1024.0), 2),
+                    "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                }
+                if deep:
+                    try:
+                        container = project_container(full)
+                    except Exception as exc:
+                        container = {"container": "unreadable", "why": str(exc),
+                                     "needs_upgrade": False, "db_version": None}
+                    entry["extension"] = container.get("extension")
+                    entry["container"] = container.get("container")
+                    entry["db_version"] = container.get("db_version")
+                    entry["needs_upgrade"] = container.get("needs_upgrade")
+                found.append(entry)
+                if len(found) >= limit:
+                    errors.append({"path": base, "error": "stopped at limit %d" % limit})
+                    break
+    found.sort(key=lambda item: item.get("mtime") or "", reverse=True)
+    return {"config": config, "roots": roots, "projects": found,
+            "total": len(found), "errors": errors}
+
+def disk_project_count(user_data=None, live_only=True):
+    """How many project files exist on disk - a cheap, never-raising count.
+
+    Used to keep `project_state()` honest: a zero from the in-app API cannot be
+    reported as "nothing to load" without this number next to it.
+    """
+    try:
+        listing = projects_on_disk(user_data, deep=False)
+        items = listing["projects"]
+    except Exception:
+        return 0
+    if live_only:
+        items = [item for item in items if item.get("source") == "project"]
+    return len(items)
 
 class Client(object):
     """Thin, honest wrapper over the command space.
@@ -373,74 +585,121 @@ class Client(object):
         self.identity = value
         return value
 
-    def project_state(self, session=None, timeout_s=15.0):
-        """Whether a project is actually loaded in the editor, not merely reachable.
+    def project_state(self, session=None, timeout_s=15.0, scan_others=True):
+        """Whether a project is loaded, read from the documents the editor lists.
 
-        The pipe answering says the injected command space is up. It says nothing
-        about whether a project finished opening: measured on 4.1.60, `open` of a
-        pre-V3 `.eprj` answered with a session id while the window sat on a modal
-        "当前工程为V3以下版本 ... 是否确认打开该工程?", and `eda.dmt_Project`
-        .getCurrentProjectInfo() kept returning `{}`. A ping-only canary calls that a
-        success. This probe is the missing measurement, and its positive form is
-        `loaded: true` with the app's own project object.
+        Measured 2026-11-07 against a project that had certainly opened (window title
+        "F412RG 核心板 LCEDA | 嘉立创EDA(专业版)", file on disk):
+
+            eda.dmt_Pcb.getAllPcbsInfo()              answered: 2 PCB documents
+            eda.dmt_Schematic.getAllSchematicsInfo()   answered: 1 schematic (1 page)
+            eda.dmt_Project.getCurrentProjectInfo()    NEVER settled (45 s at a time)
+            eda.dmt_Project.getAllProjectsUuid()       answered [] - always
+
+        Two corrections follow from that. The gate is no longer a non-empty
+        getCurrentProjectInfo (it can never be one), and a session is not the editor:
+        a session is ONE document window, and a second open can create a render that
+        never answers while an earlier render still holds the project. So every live
+        session is read, with a small per-session budget, and the answer says which
+        one holds the documents instead of reporting the newest and stopping.
         """
-        session = session or self.open_session
-        if not session:
-            live = self.sessions(timeout_s)
-            ids = [s.get("sessionId") for s in live if s.get("status") == "alive"]
-            if not ids:
-                return {"loaded": False, "session": None, "sessions": live,
-                        "why": "the editor has no live session"}
-            session = ids[-1]
+        live = []
         try:
-            out = self.invoke(session, _PROBE_JS, timeout_ms=int(timeout_s * 1000))
-        except LiveError as exc:
-            # Do not lose the two facts that are still answerable. A hanging
-            # getCurrentProjectInfo() is itself the reading: with nothing loaded the
-            # promise never settles on 4.1.60.
-            cheap = {}
+            live = [s for s in self.sessions(timeout_s) if s.get("status") == "alive"]
+        except LiveError:
+            live = []
+        named = session or self.open_session
+        ids = [s.get("sessionId") for s in live]
+        if not ids:
+            # No listing (or none alive): still try the one session we were given or
+            # that this client opened, because a listing failure is not proof that no
+            # document can be read.
+            ids = [named] if named else []
+        if not ids:
+            return {"loaded": False, "session": None, "session_loaded": False,
+                    "pcb_count": None, "sch_count": None, "project_uuid": None,
+                    "pcbs": [], "schematics": [], "project_count": None,
+                    "workspace": None, "projects_on_disk": disk_project_count(),
+                    "why": "the editor has no live session"}
+        ordered = ([named] if named in ids else []) + [i for i in ids if i != named]
+        if not scan_others:
+            ordered = ordered[:1]
+        per = max(3.0, min(timeout_s, 8.0))
+        probe_error = None
+        chosen = None
+        checked = []
+        for sid in ordered:
+            entry = {"session": sid, "loaded": False}
             try:
-                cheap = (self.invoke(session, CHEAP_PROBE_JS,
-                                     timeout_ms=int(timeout_s * 1000))
+                value = (self.invoke(sid, _PROBE_JS, timeout_ms=int(per * 1000))
                          .get("value") or {})
-            except LiveError:
-                cheap = {}
-            count = cheap.get("projectCount")
-            if count == 0:
-                why = ("the project getter never answered (%s: %s) and the client's "
-                       "workspace lists 0 projects - there is nothing to load"
-                       % (exc.code, exc.message))
+            except LiveError as exc:
+                entry["error"] = exc.code
+                probe_error = "%s: %s" % (exc.code, exc.message)
+                checked.append(entry)
+                continue
+            pcb_count = value.get("pcbCount") or 0
+            sch_count = value.get("schCount") or 0
+            entry.update({"pcb_count": pcb_count, "sch_count": sch_count,
+                          "loaded": bool(pcb_count or sch_count),
+                          "doc_error": value.get("pcbError") or value.get("schError")})
+            checked.append(entry)
+            if entry["loaded"] and chosen is None:
+                chosen = (sid, value, entry)
+            if chosen is not None and sid == ordered[0]:
+                break
+        state = {"loaded": chosen is not None,
+                 "session": (chosen[0] if chosen else ordered[0]),
+                 "session_loaded": bool(chosen and ordered and chosen[0] == ordered[0]),
+                 "sessions_checked": checked,
+                 "pcb_count": None, "sch_count": None, "project_uuid": None,
+                 "pcbs": [], "schematics": [], "project_count": None,
+                 "workspace": None, "projects_on_disk": disk_project_count()}
+        if chosen:
+            sid, value, entry = chosen
+            state.update({
+                "pcb_count": entry["pcb_count"], "sch_count": entry["sch_count"],
+                "project_uuid": value.get("projectUuid"),
+                "pcbs": value.get("pcbs") or [],
+                "schematics": value.get("schematics") or [],
+                "project_count": value.get("projectCount"),
+                "workspace": value.get("workspace")})
+            if len(checked) > 1 and sid != ordered[0]:
+                state["held_by"] = sid
+                state["why"] = ("session %s exposes no document, but session %s holds "
+                                "%d PCB(s) and %d schematic(s)"
+                                % (ordered[0], sid, entry["pcb_count"],
+                                   entry["sch_count"]))
             else:
-                why = ("the project getter never answered (%s: %s) while the workspace "
-                       "lists %s project(s) - the render is blocked, most likely by a "
-                       "modal dialog" % (exc.code, exc.message, count))
-            return {"loaded": False, "session": session, "project_keys": [],
-                    "project": None, "pcb_count": None, "project_count": count,
-                    "workspace": cheap.get("workspace"), "probe_error": exc.code,
-                    "why": why}
-        value = out.get("value") or {}
-        project = value.get("project")
-        keys = list(value.get("projectKeys") or
-                    (project if isinstance(project, dict) else {}))
-        loaded = bool(keys)
-        count = value.get("projectCount")
-        if loaded:
-            why = "the app returned a project object"
-        elif count == 0:
-            why = ("the client's workspace lists 0 projects - nothing has been imported "
-                   "into it, so there is nothing to load")
+                state["why"] = ("the editor lists %d PCB document(s) and %d "
+                                "schematic(s) for the current project"
+                                % (entry["pcb_count"], entry["sch_count"]))
+            return state
+        # Nothing loaded anywhere. Say which failure it was, because "empty project"
+        # and "the probe could not run" are different facts.
+        answered_empty = [e for e in checked if "error" not in e]
+        if answered_empty:
+            first = answered_empty[0]
+            state["pcb_count"] = first.get("pcb_count") or 0
+            state["sch_count"] = first.get("sch_count") or 0
+            state["why"] = ("every live session lists no PCB and no schematic "
+                            "document - the editor holds an empty project, or the one "
+                            "being opened has not finished")
         else:
-            why = ("the app returned an empty project object - measured cause on "
-                   "4.1.60: the window is on a modal dialog (a pre-V3 project asks "
-                   "before upgrading)")
-        return {"loaded": loaded, "session": session,
-                "project_keys": keys,
-                "project": project if loaded else None,
-                "pcb_count": value.get("pcbCount"),
-                "project_count": count,
-                "workspace": value.get("workspace"),
-                "probe_error": value.get("error"),
-                "why": why}
+            state["why"] = ("no session could be read (%s); getAllProjectsUuid() is "
+                            "not a project list on this build and says nothing about "
+                            "the %d project file(s) on disk"
+                            % (probe_error or "no live session",
+                               disk_project_count()))
+            state["probe_error"] = probe_error
+            try:
+                cheap = (self.invoke(ordered[0], CHEAP_PROBE_JS,
+                                     timeout_ms=int(per * 1000)).get("value") or {})
+                state["project_count"] = cheap.get("projectCount")
+                state["workspace"] = cheap.get("workspace")
+            except LiveError:
+                pass
+        return state
 
     def open_project(self, path, headless=False, timeout_s=45.0, canary_s=3.0,
                      verify_content=True, allow_upgrade=False):
@@ -527,27 +786,39 @@ class Client(object):
         if verify_content:
             state = self.project_state(session, max(canary_s, 5.0))
             self.last_open["content"] = state
-            if not state.get("loaded"):
+            if not state.get("session_loaded"):
+                held = state.get("held_by")
+                if held:
+                    message = (
+                        "the editor answered 'open' with session %s, but that session "
+                        "exposes no document while session %s already holds the "
+                        "project (%s) - this open added no loaded document"
+                        % (session, held, state.get("why")))
+                    app_state = ("a project is open in the editor, but not in the "
+                                 "session this call created")
+                    nxt = ("lceda_pro_sessions lists every session with its render id, "
+                           "so the document can be driven by naming that session; "
+                           "lceda_pro_verify gives the project-wide answer")
+                else:
+                    message = ("the editor answered 'open' with session %s and still "
+                               "answers ping, but that session exposes no PCB and no "
+                               "schematic (%s)" % (session, state.get("why")))
+                    app_state = ("no document in the session this open created; that "
+                                 "is what a blocking dialog or an unfinished load "
+                                 "looks like from here")
+                    nxt = ("look at the window: a dialog can only be clicked there "
+                           "(the injected command space has no `document`); then "
+                           "lceda_pro_verify re-reads the state")
                 raise LiveError(
-                    "OPEN_NOT_CONFIRMED",
-                    "the editor answered 'open' with session %s and still answers ping, "
-                    "but no project is loaded (%s) - the window is almost certainly "
-                    "sitting on a modal dialog, so nothing after this point would "
-                    "touch the project" % (session, state.get("why")),
+                    "OPEN_NOT_CONFIRMED", message,
                     {
                         "path": path,
                         "size_mb": round(size / (1024.0 * 1024.0), 1),
                         "open_seconds": round(elapsed, 2),
                         "open_reply": value,
                         "content_probe": state,
-                        "app_state": "bridge answers, project object empty - this is "
-                                      "what a blocking dialog looks like from here",
-                        "next": "look at the editor window: a pre-V3 project shows '"
-                                "当前工程为V3以下版本 ... 是否确认打开该工程?'. Click 确认/取消 "
-                                "there (the dialog is in the client's own page and is "
-                                "not reachable from the injected command space - "
-                                "`document` is undefined inside it), then retry with "
-                                "lceda_pro_verify",
+                        "app_state": app_state,
+                        "next": nxt,
                     },
                 )
         return value

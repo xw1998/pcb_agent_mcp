@@ -1180,6 +1180,8 @@ def _lceda_pro_verify(args):
     report["instances"] = _lceda_instances()
     report["windows"] = _lceda_windows()
     report["windows_total"] = len(report["windows"])
+    report["title_project"] = next((w["project"] for w in report["windows"]
+                                     if w.get("project")), None)
     if report["windows_total"] > 1:
         report["windows_note"] = (
             "%d titled windows: lceda_pro_close_extra closes the extras with WM_CLOSE "
@@ -1207,9 +1209,20 @@ def _lceda_pro_verify(args):
         client.close()
     report["project"] = state
     report["connected"] = bool(state.get("loaded"))
+    if state.get("loaded") and report.get("title_project"):
+        report["title_agrees"] = True
+    elif not state.get("loaded") and report.get("title_project"):
+        # A title that names a project is the app's own claim that one is open. It is
+        # not enough on its own (that is what the document lists are for), but it
+        # must never be silently dropped when the probe says otherwise.
+        report["title_disagrees"] = (
+            "a window title names %r while the in-app document lists are empty"
+            % report["title_project"])
     if not report["connected"]:
-        return err("the editor answers, but no project is loaded (%s)"
-                   % state.get("why"),
+        return err("the editor answers, but no project is loaded (%s)%s"
+                   % (state.get("why"),
+                      "; note: " + report["title_disagrees"]
+                      if report.get("title_disagrees") else ""),
                    "NO_PROJECT_LOADED",
                    hint="the bridge being alive is not the same as having a project: "
                         "if a dialog is up in the window (this build asks before "
@@ -1243,8 +1256,89 @@ def _lceda_instances():
     return out
 
 def _lceda_windows():
-    return [{"hwnd": w["hwnd"], "pid": w["pid"], "title": w["title"],
-             "area": w["area"]} for w in _desktop.editor_windows("lceda-pro")]
+    """Titled frames, with the project name the app itself puts in the title.
+
+    The title is evidence from outside the bridge: measured 2026-11-07, after a
+    successful open it read "F412RG 核心板 LCEDA | 嘉立创EDA(专业版) - V4.1.60" while
+    every in-app project getter was either empty or hung. Two independent sources
+    for the same fact is the point.
+    """
+    out = []
+    for w in _desktop.editor_windows("lceda-pro"):
+        project = None
+        try:
+            project = _desktop.parse_project_from_title("lceda-pro", w["title"])
+        except Exception:                                     # noqa: BLE001
+            project = None
+        out.append({"hwnd": w["hwnd"], "pid": w["pid"], "title": w["title"],
+                    "area": w["area"], "project": project})
+    return out
+
+def _lceda_pro_projects(args):
+    """Which projects exist on this machine - from disk, next to the app's own answer.
+
+    Written after being wrong: `await eda.dmt_Project.getAllProjectsUuid()` returned
+    [] on a machine holding eight project files under APP_PROJECT_DIR, and that zero
+    was reported as "there is nothing to load". The configuration file names the real
+    directories, so the disk is the authority for "what is there", and the app's own
+    reading is reported beside it rather than in front of it.
+    """
+    listing = _live.projects_on_disk(deep=bool(args.get("deep", True)),
+                                     limit=int(args.get("limit") or 200))
+    projects = listing["projects"]
+    wanted = args.get("source")
+    if wanted:
+        projects = [p for p in projects if p.get("source") == wanted]
+    counts = {}
+    for item in projects:
+        counts[item.get("source")] = counts.get(item.get("source"), 0) + 1
+    report = {
+        "config": listing["config"],
+        "roots": listing["roots"],
+        "counts_by_source": counts,
+        "total": len(projects),
+        "projects": projects,
+        "errors": listing["errors"],
+        "note": ("a disk listing: which project files exist and in what format, not "
+                 "which documents the editor has open"),
+    }
+    if args.get("ask_editor", True):
+        editor = {"asked": False}
+        try:
+            pipe = _live.pipe_report(ping_timeout_s=float(args.get("ping_timeout_s") or 2.0))
+            editor["pipe_state"] = pipe["state"]
+            if pipe["state"] == "healthy":
+                client = _live.Client(_live.PipeTransport(pipe["answering"]))
+                try:
+                    state = client.project_state(None,
+                                                 float(args.get("probe_timeout_s") or 8.0))
+                finally:
+                    client.close()
+                editor.update({"asked": True, "loaded": state.get("loaded"),
+                               "project_count": state.get("project_count"),
+                               "why": state.get("why")})
+        except _live.LiveError as exc:
+            editor.update({"asked": False, "error": exc.code, "message": exc.message})
+        except Exception as exc:                              # noqa: BLE001
+            editor.update({"asked": False, "error": type(exc).__name__,
+                           "message": str(exc)})
+        report["editor_view"] = editor
+        if editor.get("asked") and editor.get("project_count") == 0 and projects:
+            report["disagreement"] = (
+                "getAllProjectsUuid() lists 0 while %d project file(s) exist on disk - "
+                "that call is not the project list on this build" % len(projects))
+    if not projects:
+        return err("no project file (.eprj / .eprj2 / .epro / .epro2) found under the "
+                   "directories named in %s" % (listing["config"].get("path") or "config.json"),
+                   "NO_PROJECTS",
+                   hint="lceda_pro_open takes an absolute path, so a project anywhere "
+                        "on disk can still be opened",
+                   extra=report)
+    return ok(report, "project files on disk", _LIVE_MODEL, _LIVE_BASIS,
+              "counted by walking APP_PROJECT_DIR / recovery / online-backup; "
+              "db_version is read from each file's own db_versions table",
+              {"not_run": "nothing was opened or written"},
+              {"config_path": listing["config"].get("path")})
 
 def _lceda_pro_close_extra(args):
     """Leave exactly one editor window: close the extras, keep one.
@@ -1573,7 +1667,8 @@ _tool(
     "nothing' is unverified - keep a copy when it matters.",
     {"type": "object",
      "properties": dict(_LIVE_ARGS, **{
-         "path": _str("absolute path to an existing .eprj/.epro/.kicad_pcb"),
+         "path": _str("absolute path to an existing project: .eprj2 (current) / "
+                        ".epro2 (current) / .eprj (legacy) / .epro"),
          "headless": _bool("open without taking over the UI (still a live session). "
                            "Defaults to false: a headless open of a large project was "
                            "measured once killing the editor's render process, and the "
@@ -1585,11 +1680,13 @@ _tool(
                               "two windows, so the frame it added is closed again)",
                               False),
          "wait_s": _num("how long to wait for such a window to close", 6),
-         "allow_upgrade": _bool("open a legacy SQLite .eprj anyway. Defaults to false: "
-                                "that container makes the editor put up its V3 upgrade "
-                                "dialog, which the bridge cannot answer, so the call "
-                                "would answer 'open' and load nothing "
-                                "(PROJECT_NEEDS_UPGRADE)", False),
+         "allow_upgrade": _bool("open a legacy pre-V3 project anyway. Defaults to "
+                                "false: those files make the editor put up its V3 "
+                                "upgrade dialog, which the bridge cannot answer, so "
+                                "the call would answer 'open' and load nothing "
+                                "(PROJECT_NEEDS_UPGRADE). Legacy is decided by the "
+                                "file's own db_versions (0.0.x), NOT by being SQLite "
+                                "- current .eprj2 files are SQLite too", False),
      }),
      "required": ["path"]},
     _lceda_pro_open,
@@ -1598,16 +1695,39 @@ _tool(
 _tool(
     "lceda_pro_verify",
     "Answer 'am I really connected to a project' in one call: pipe state, the running "
-    "editor instance(s), the live session, and whether getCurrentProjectInfo() "
-    "returns a non-empty object. The bridge answering a ping does NOT mean a project "
-    "is open - on 4.1.60 an open behind a modal dialog still answered ping while "
-    "every eda.dmt_* call returned an empty object. connected=false is the honest "
-    "answer in that state, and hint says where to look.",
+    "editor instance(s), the titled windows with the project name each title carries, "
+    "and whether any live session lists a PCB or schematic document. The bridge "
+    "answering a ping does NOT mean a project is open, and - measured 2026-11-07 - "
+    "neither getCurrentProjectInfo() (never settles) nor getAllProjectsUuid() "
+    "(always []) can answer it; the document lists can. Sessions are document "
+    "windows, so every live one is read and the answer says which holds the project.",
     {"type": "object", "properties": dict(_LIVE_ARGS, **{
         "session": _str("check this session instead of the newest live one"),
         "probe_timeout_s": _num("budget for the in-editor project probe", 15),
         "ping_timeout_s": _num("budget for the first ping", 3)})},
     _lceda_pro_verify,
+)
+
+_tool(
+    "lceda_pro_projects",
+    "List the project files that exist on this machine, read from disk: every "
+    "directory the editor's own config.json names (APP_PROJECT_DIR, the recovery "
+    "directory, the online-backup directory), each file's container, db_version and "
+    "whether opening it triggers the pre-V3 upgrade ask. Written because "
+    "getAllProjectsUuid() answered [] on a machine holding eight projects - that call "
+    "is not the project list on this build, so this tool reports what is on disk and, "
+    "beside it, what the app said.",
+    {"type": "object",
+     "properties": {
+         "source": _str("only this source: project / recovery / online-backup",
+                         ["project", "recovery", "online-backup"], None),
+         "deep": _bool("read each file's own db_versions (slower, exact)", True),
+         "limit": _num("stop after this many project files", 200),
+         "ask_editor": _bool("also report the running editor's own project count",
+                             True),
+         "probe_timeout_s": _num("budget for the editor probe", 8),
+         "ping_timeout_s": _num("budget for the first ping", 2)}},
+    _lceda_pro_projects,
 )
 
 _tool(
@@ -4728,7 +4848,7 @@ def _capabilities(_args):
             "lceda_api_probe",
             "lceda_pro_status", "lceda_pro_api", "lceda_pro_open",
             "lceda_pro_recover", "lceda_pro_verify", "lceda_pro_sessions",
-            "lceda_pro_close_extra",
+            "lceda_pro_close_extra", "lceda_pro_projects",
             "lceda_pro_close",
             "lceda_pro_run",
             "lceda_pro_steps", "lceda_write_snippet",
@@ -11140,7 +11260,7 @@ CORE_TOOLS = (
     # desktop / LCEDA
     "epro_inspect", "app_detect", "app_status", "lceda_pro_status",
     "lceda_pro_open", "lceda_pro_recover", "lceda_pro_verify",
-    "lceda_pro_close_extra",
+    "lceda_pro_close_extra", "lceda_pro_projects",
     # calc / rules
     "unit_convert", "width_for_current", "current_capacity", "via_resistance",
     "via_current_allowed", "trace_impedance", "width_for_impedance",
