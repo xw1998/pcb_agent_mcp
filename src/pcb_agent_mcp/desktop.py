@@ -222,12 +222,56 @@ def process_created(pid):
         k32.CloseHandle(handle)
 
 
+def process_parent(pid):
+    """Parent pid of `pid`, or None. Used to tell an app's main process from its
+    own children without reading command lines.
+
+    Measured 2026-11-07 on the LCEDA install: 7 processes named `lceda-pro.exe` are
+    alive for ONE editor - the main process plus crashpad-handler, gpu-process,
+    NetworkService and three renderers, and every child's parent is the main pid.
+    Counting the name therefore counts 7 editors that do not exist; the only sound
+    definition of "an instance" is "a process of this exe whose parent is not".
+    """
+    if not IS_WINDOWS:
+        return None
+
+    class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [("Reserved1", ctypes.c_void_p),
+                    ("PebBaseAddress", ctypes.c_void_p),
+                    ("Reserved2", ctypes.c_void_p * 2),
+                    ("UniqueProcessId", ctypes.c_void_p),
+                    ("InheritedFromUniqueProcessId", ctypes.c_void_p)]
+
+    k32 = _kernel32()
+    handle = k32.OpenProcess(0x1000, False, int(pid))     # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        info = PROCESS_BASIC_INFORMATION()
+        written = ctypes.c_ulong(0)
+        status = ctypes.windll.ntdll.NtQueryInformationProcess(
+            handle, 0, ctypes.byref(info), ctypes.sizeof(info), ctypes.byref(written))
+        if status != 0:
+            return None
+        return int(info.InheritedFromUniqueProcessId or 0) or None
+    except Exception:                                        # noqa: BLE001
+        return None
+    finally:
+        k32.CloseHandle(handle)
+
 def process_alive(pid):
     return any(p == int(pid) for p, _ in list_processes())
 
 
-def windows_of(pids):
-    """Visible top-level windows owned by pids: [{pid, hwnd, title}]."""
+# Measured 2026-11-07 on LCEDA 4.1.60: ONE editor exposes TWO visible top-level
+# windows, same title, same rect - the frame plus Chromium's helper window, which is
+# marked WS_EX_TOOLWINDOW (0x80). Counting both makes one editor read as two, which
+# is exactly how "you opened too many" gets reported. Tool windows are therefore
+# listed separately and never counted as editor windows.
+WS_EX_TOOLWINDOW = 0x00000080
+
+def windows_of(pids, include_tool=False):
+    """Visible top-level windows owned by pids: [{pid, hwnd, title, tool, rect}]."""
     if not IS_WINDOWS or not pids:
         return []
     owners = {int(p) for p in pids}
@@ -245,7 +289,20 @@ def windows_of(pids):
                 return True
             buf = ctypes.create_unicode_buffer(512)
             u32.GetWindowTextW(hwnd, buf, 512)
-            out.append({"pid": int(pid.value), "hwnd": int(hwnd), "title": buf.value})
+            ex = u32.GetWindowLongW(hwnd, -20)
+            tool = bool((ex or 0) & WS_EX_TOOLWINDOW)
+            if tool and not include_tool:
+                return True
+
+            class _RECT(ctypes.Structure):
+                _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                            ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+            rect = _RECT()
+            area = 0
+            if u32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+            out.append({"pid": int(pid.value), "hwnd": int(hwnd), "title": buf.value,
+                        "tool": tool, "area": area})
         except Exception:                                        # noqa: BLE001
             pass
         return True
@@ -253,6 +310,36 @@ def windows_of(pids):
     u32.EnumWindows(_cb, 0)
     return out
 
+
+def close_window(hwnd, timeout_s=6.0):
+    """Ask one window to close (WM_CLOSE), then wait until it is gone.
+
+    WM_CLOSE, not TerminateProcess: the app decides what to do about unsaved state,
+    and a window that refuses to close stays visible (reported as still_open) instead
+    of being killed behind the user's back.
+    """
+    if not IS_WINDOWS or not hwnd:
+        return {"status": "error", "reason_code": "ARG_INVALID",
+                "message": "no window handle to close"}
+    WM_CLOSE = 0x0010
+    u32 = _user32()
+    hwnd = int(hwnd)
+    if not u32.IsWindow(hwnd):
+        return {"status": "ok", "hwnd": hwnd, "closed": True, "still_open": False,
+                "why": "the window was already gone"}
+    u32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+    waited = 0.0
+    step = 0.1
+    while waited < float(timeout_s):
+        if not u32.IsWindow(hwnd):
+            return {"status": "ok", "hwnd": hwnd, "closed": True, "still_open": False,
+                    "waited_s": round(waited, 2)}
+        time.sleep(step)
+        waited += step
+    return {"status": "ok", "hwnd": hwnd, "closed": False, "still_open": True,
+            "waited_s": round(waited, 2),
+            "why": "WM_CLOSE was posted but the window is still there - the app is "
+                   "asking something, answer it in the window"}
 
 def focus_window(hwnd):
     if not IS_WINDOWS or not hwnd:
@@ -527,28 +614,91 @@ def parse_project_from_title(app, title):
     return ""
 
 
-def _instances(app):
+def _instance_groups(app):
+    """{main_pid: [pids]} for one app, or {} if it is not running.
+
+    An Electron app is one instance spread over many processes. Grouping by parent
+    is what makes `instances_total` mean what a user means by "how many editors are
+    open"; anything counting exe names reports the child processes as extra editors.
+    """
     spec = APPS[app]
     pids = pids_of(spec["exe_names"])
+    if not pids:
+        return {}
+    known = set(pids)
+    parent = {pid: process_parent(pid) for pid in pids}
+    mains = [pid for pid in pids if parent.get(pid) not in known]
+    groups = {pid: [pid] for pid in mains}
+    # A child whose parent has already exited belongs to nobody: attach it to the
+    # oldest main process so it is still reported (and never counted as an instance).
+    for pid in pids:
+        if pid in groups:
+            continue
+        owner = None
+        walk = parent.get(pid)
+        seen = set()
+        while walk and walk not in seen:
+            if walk in groups:
+                owner = walk
+                break
+            seen.add(walk)
+            walk = parent.get(walk)
+        groups.setdefault(owner or mains[0], []).append(pid)
+    return groups
+
+def editor_windows(app):
+    """Titled, visible, non-helper frames of an app - what a user calls a window."""
+    out = []
+    for inst in _instances(app):
+        pids = inst.get("processes") or [inst["pid"]]
+        for win in windows_of(pids, include_tool=True):
+            if not win.get("title") or win.get("tool") or not win.get("area"):
+                continue
+            row = dict(win)
+            row["instance_pid"] = inst["pid"]
+            out.append(row)
+    out.sort(key=lambda w: (w["pid"], w["hwnd"]))
+    return out
+
+def _instances(app):
+    spec = APPS[app]
+    groups = _instance_groups(app)
+    if not groups:
+        return []
+    all_pids = [pid for members in groups.values() for pid in members]
     by_pid = {}
-    for win in windows_of(pids):
+    for win in windows_of(all_pids, include_tool=True):
+        # Only frames a user would call "an editor window": visible, titled, not a
+        # Chromium helper. Measured: one editor showed 2 titled frames, so windows -
+        # not processes, and titled frames - not raw HWNDs, is the unit that matters.
+        if not win.get("title") or win.get("tool") or not win.get("area"):
+            continue
         by_pid.setdefault(win["pid"], []).append(win)
     out = []
-    for pid in pids:
-        wins = by_pid.get(pid) or []
+    for main_pid, members in groups.items():
+        wins, titles = [], []
+        for pid in members:
+            for win in by_pid.get(pid) or []:
+                wins.append(win)
+                if win.get("title"):
+                    titles.append(win["title"])
         title, hwnd = "", 0
         for win in wins:
             if win.get("title"):
                 title, hwnd = win["title"], win["hwnd"]
                 break
         out.append({
-            "pid": pid,
-            "created": process_created(pid),
+            "pid": main_pid,
+            "created": process_created(main_pid),
             "title": title,
+            "titles": titles,
+            "window_count": len(wins),
             "hwnd": hwnd,
             "has_window": bool(wins),
             "project": parse_project_from_title(app, title),
-            "exe": process_path(pid),
+            "exe": process_path(main_pid),
+            "processes": members,
+            "process_count": len(members),
         })
     out.sort(key=lambda x: (x["created"] is None, x["created"] or 0.0, x["pid"]))
     return out
@@ -573,6 +723,7 @@ def status(app, probe_ports=True):
         "display": spec["display"],
         "running": bool(inst),
         "instances_total": len(inst),
+        "processes_total": sum(i.get("process_count") or 1 for i in inst),
         "instances": inst,
         "projects_open": sorted({i["project"] for i in inst if i["project"]}),
         "api_gateway_ports": ports,

@@ -927,6 +927,14 @@ def _live_hint(code):
                            "app's own and the snippet's logs are in extra.logs",
         "SYNTAX_ERROR": "the snippet does not parse as an async function body",
         "SESSION_NOT_FOUND": "no such session; call lceda_pro_sessions",
+        "CLOSE_NOT_CONFIRMED": "reported the extra windows and closed nothing "
+                               "(confirm=false). Re-run with confirm=true to post "
+                               "WM_CLOSE to the extras; the window kept is chosen by "
+                               "keep_hwnd, then a project title, then the foreground "
+                               "window, then the topmost frame",
+        "CLOSE_INCOMPLETE": "the extras did not all go away - a window that posts back "
+                            "a question stays open on purpose rather than being killed",
+        "NO_WINDOW": "the editor has no titled window right now",
         "PROJECT_NEEDS_UPGRADE": "refused before touching the editor: the file is a "
                                 "legacy SQLite .eprj, and 4.1.60 asks before "
                                 "upgrading it. That dialog is in the client's own "
@@ -1012,6 +1020,18 @@ def _lceda_pro_api(args):
         return _live_error(exc)
     finally:
         client.close()
+    windows_after = _lceda_windows()
+    born = [w for w in windows_after if w["hwnd"] not in before]
+    window_extra = {"windows_before": len(before), "windows_after": len(windows_after),
+                    "windows_born": born}
+    if born and not bool(args.get("keep_window", True)):
+        closed = []
+        for w in born:
+            closed.append({"hwnd": w["hwnd"],
+                           "result": _desktop.close_window(
+                               w["hwnd"], timeout_s=float(args.get("wait_s") or 6))})
+        window_extra["windows_closed"] = closed
+        window_extra["windows_final"] = len(_lceda_windows())
     return _live_done(client, value, {
         "shape": "namespace only -> {types:[{name,comment}], "
                  "callConventions:{entry, classToProperty}}; with class_name -> "
@@ -1022,6 +1042,15 @@ def _lceda_pro_api(args):
     }, verified=True)
 
 def _lceda_pro_open(args):
+    """Open a project, then make sure the call left exactly one editor window.
+
+    Measured 2026-11-07: 4.1.60 answers an open by creating ANOTHER titled frame in
+    the same process, so a single open took the editor from 1 window to 2 - the
+    "you opened two IDEs" complaint was one process, two frames. `windows_before`
+    and `windows_after` are therefore part of the answer, and a frame that appeared
+    during this call is closed again unless keep_window=true.
+    """
+    before = set(w["hwnd"] for w in _lceda_windows())
     try:
         client = _live_client(args)
     except _live.LiveError as exc:
@@ -1051,7 +1080,7 @@ def _lceda_pro_open(args):
         "liveness canary": "a ping runs before and after the open, so a session id is "
                            "never reported without evidence that the app still answers; "
                            "open_trace carries both bridge versions and the duration",
-    }, verified=True, open_trace=client.last_open)
+    }, verified=True, open_trace=client.last_open, **window_extra)
 
 def _lceda_pro_recover(args):
     """Read the command space and, only when asked, replace a dead editor.
@@ -1063,6 +1092,8 @@ def _lceda_pro_recover(args):
     """
     report = _live.pipe_report(ping_timeout_s=float(args.get("ping_timeout_s") or 3.0))
     report["instances"] = _lceda_instances()
+    report["windows"] = _lceda_windows()
+    report["windows_total"] = len(report["windows"])
     if report["state"] == "healthy":
         return ok(report, "pipe enumerated and pinged; the values are the app's own",
                   _LIVE_MODEL, _LIVE_BASIS,
@@ -1147,6 +1178,12 @@ def _lceda_pro_verify(args):
     """
     report = _live.pipe_report(ping_timeout_s=float(args.get("ping_timeout_s") or 3.0))
     report["instances"] = _lceda_instances()
+    report["windows"] = _lceda_windows()
+    report["windows_total"] = len(report["windows"])
+    if report["windows_total"] > 1:
+        report["windows_note"] = (
+            "%d titled windows: lceda_pro_close_extra closes the extras with WM_CLOSE "
+            "and keeps one" % report["windows_total"])
     if report["state"] != "healthy":
         report["connected"] = False
         return err("the editor's command space is %s - nothing can be driven"
@@ -1188,14 +1225,87 @@ def _lceda_pro_verify(args):
               {"endpoint": report["answering"], "verified_against_app": True})
 
 def _lceda_instances():
-    """Running editor processes/windows. Two instances share nothing and fight over
-    the pipe, so this is reported on every connection check."""
+    """Running editor instances. Two instances share nothing and fight over the pipe,
+    so this is reported on every connection check.
+
+    An instance is a main process (its parent is not the same exe), not a process
+    name: measured 2026-11-07, one editor is 6-7 `lceda-pro.exe` processes (main,
+    crashpad, gpu, NetworkService, 3 renderers) and 2 titled frames. Counting names
+    reports 7 editors; counting frames reports 2; there is 1.
+    """
     out = []
     for it in _desktop._instances("lceda-pro"):
         out.append({"pid": it["pid"], "has_window": it["has_window"],
+                    "windows": it["window_count"],
+                    "processes": it["process_count"],
                     "title": it["title"] or None,
                     "project": it["project"] or None})
     return out
+
+def _lceda_windows():
+    return [{"hwnd": w["hwnd"], "pid": w["pid"], "title": w["title"],
+             "area": w["area"]} for w in _desktop.editor_windows("lceda-pro")]
+
+def _lceda_pro_close_extra(args):
+    """Leave exactly one editor window: close the extras, keep one.
+
+    Which one is kept, in order: an explicit hwnd, then a window whose title carries
+    a project name, then the foreground window, then the topmost frame (EnumWindows
+    order). WM_CLOSE is used, never a kill: no project in the closed window is lost
+    silently - the app gets to ask.
+    """
+    confirm = bool(args.get("confirm", False))
+    windows = _lceda_windows()
+    report = {"windows_before": windows, "instances": _lceda_instances()}
+    if not windows:
+        return err("the editor is not running (no titled window)",
+                   "NO_WINDOW", extra=report)
+    if len(windows) == 1:
+        report.update({"kept": windows[0], "closed": [],
+                       "message": "already exactly one editor window"})
+        return ok(report, "editor windows", _LIVE_MODEL, _LIVE_BASIS,
+                  "from a process and window enumeration; one titled visible frame "
+                  "is what a user calls one window",
+                  {"not_run": "nothing was closed"})
+    keep_hwnd = args.get("keep_hwnd")
+    keep = None
+    if keep_hwnd:
+        keep = next((w for w in windows if w["hwnd"] == int(keep_hwnd)), None)
+        if keep is None:
+            return err("keep_hwnd %s is not one of this app's windows" % keep_hwnd,
+                       "ARG_INVALID", extra=report)
+    if keep is None:
+        named = [w for w in windows if w["title"] != windows[0]["title"]
+                 or _desktop.parse_project_from_title("lceda-pro", w["title"])]
+        keep = named[0] if named else None
+    if keep is None:
+        fg = None
+        try:
+            fg = int(_desktop._user32().GetForegroundWindow())
+        except Exception:                                     # noqa: BLE001
+            fg = None
+        keep = next((w for w in windows if w["hwnd"] == fg), None) or windows[0]
+    extra = [w for w in windows if w["hwnd"] != keep["hwnd"]]
+    report.update({"kept": keep, "would_close": extra})
+    if not confirm:
+        return err("there are %d editor windows; nothing was closed (confirm=false)"
+                   % len(windows), "CLOSE_NOT_CONFIRMED",
+                   extra=report)
+    closed, still = [], []
+    for w in extra:
+        res = _desktop.close_window(w["hwnd"], timeout_s=float(args.get("wait_s") or 6))
+        (closed if res.get("closed") else still).append(
+            {"hwnd": w["hwnd"], "title": w["title"], "result": res})
+    after = _lceda_windows()
+    report.update({"closed": closed, "still_open": still, "windows_after": after,
+                   "instances_after": _lceda_instances()})
+    if len(after) != 1:
+        return err("asked %d window(s) to close, %d remain"
+                   % (len(extra), len(after)), "CLOSE_INCOMPLETE", extra=report)
+    return ok(report, "editor windows", _LIVE_MODEL, _LIVE_BASIS,
+              "one titled frame remains; closed means WM_CLOSE was posted and the "
+              "window went away", {"closed": len(closed),
+                                  "still_open": len(still)})
 
 def _lceda_pro_sessions(args):
     try:
@@ -1470,6 +1580,11 @@ _tool(
                            "bridge never answered again", False),
          "canary_s": _num("budget for the ping that runs before and after the open", 3),
          "open_timeout_s": _num("budget for the open itself", 45),
+         "keep_window": _bool("keep a window that this open created (default false: "
+                              "an open that adds a titled frame leaves the editor with "
+                              "two windows, so the frame it added is closed again)",
+                              False),
+         "wait_s": _num("how long to wait for such a window to close", 6),
          "allow_upgrade": _bool("open a legacy SQLite .eprj anyway. Defaults to false: "
                                 "that container makes the editor put up its V3 upgrade "
                                 "dialog, which the bridge cannot answer, so the call "
@@ -1493,6 +1608,22 @@ _tool(
         "probe_timeout_s": _num("budget for the in-editor project probe", 15),
         "ping_timeout_s": _num("budget for the first ping", 3)})},
     _lceda_pro_verify,
+)
+
+_tool(
+    "lceda_pro_close_extra",
+    "Leave exactly one editor window: report every titled frame, then close the extras "
+    "with WM_CLOSE (never a kill). One editor is 6-7 processes and, measured on "
+    "4.1.60, can also be 2 titled windows - so 'how many editors are open' has to be "
+    "answered by counting titled frames, which is what this tool does. Keeps, in "
+    "order: keep_hwnd, a window whose title carries a project, the foreground window, "
+    "the topmost frame.",
+    {"type": "object",
+     "properties": {
+         "confirm": _bool("actually close the extras (default: report only)", False),
+         "keep_hwnd": _num("keep this window handle (from a previous report)", None),
+         "wait_s": _num("how long to wait for each window to disappear", 6)}},
+    _lceda_pro_close_extra,
 )
 
 _tool(
@@ -4597,6 +4728,7 @@ def _capabilities(_args):
             "lceda_api_probe",
             "lceda_pro_status", "lceda_pro_api", "lceda_pro_open",
             "lceda_pro_recover", "lceda_pro_verify", "lceda_pro_sessions",
+            "lceda_pro_close_extra",
             "lceda_pro_close",
             "lceda_pro_run",
             "lceda_pro_steps", "lceda_write_snippet",
@@ -11008,6 +11140,7 @@ CORE_TOOLS = (
     # desktop / LCEDA
     "epro_inspect", "app_detect", "app_status", "lceda_pro_status",
     "lceda_pro_open", "lceda_pro_recover", "lceda_pro_verify",
+    "lceda_pro_close_extra",
     # calc / rules
     "unit_convert", "width_for_current", "current_capacity", "via_resistance",
     "via_current_allowed", "trace_impedance", "width_for_impedance",

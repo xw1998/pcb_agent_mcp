@@ -468,7 +468,7 @@ class TheToolsSayWhatTheyCanDo(unittest.TestCase):
     def test_every_bridge_tool_is_registered_and_listed(self):
         from pcb_agent_mcp import tools as T
         names = [n for n in T.TOOLS if n.startswith("lceda_pro_")]
-        self.assertEqual(len(names), 9, names)
+        self.assertEqual(len(names), 10, names)
         available = T.TOOLS["calc_capabilities"]["handler"]({})["available"]
         for name in names:
             self.assertIn(name, available)
@@ -863,6 +863,76 @@ class TheConnectionCheckSeparatesThreeFacts(unittest.TestCase):
         self.assertEqual(out["reason_code"], "ALREADY_RUNNING")
         self.assertEqual(started, [])
         self.assertEqual(out["instances"][0]["pid"], 4242)
+
+class OneEditorMeansOneWindow(unittest.TestCase):
+    """Measured 2026-11-07: ONE editor is 6-7 `lceda-pro.exe` processes (main,
+    crashpad, gpu, NetworkService, 3 renderers) and, after an `open`, TWO titled
+    frames. So "how many editors are open" is answered by counting titled frames -
+    not processes (says 7) and not raw HWNDs (says more)."""
+
+    def setUp(self):
+        from pcb_agent_mcp import tools as T
+        self.T = T
+        self.orig = (T._desktop._instances, T._desktop.editor_windows,
+                     T._desktop.close_window, T._desktop._user32)
+        self.windows = [
+            {"hwnd": 101, "pid": 1848, "title": "嘉立创EDA(专业版) - V4.1.60",
+             "area": 1298900, "instance_pid": 1848},
+            {"hwnd": 202, "pid": 1848, "title": "嘉立创EDA(专业版) - V4.1.60",
+             "area": 1298900, "instance_pid": 1848},
+        ]
+        self.closed = []
+
+        class _U(object):
+            def GetForegroundWindow(self):
+                return 202
+
+        T._desktop._instances = lambda app: [
+            {"pid": 1848, "has_window": True, "window_count": 2, "process_count": 6,
+             "title": "嘉立创EDA(专业版) - V4.1.60", "titles": [], "hwnd": 101,
+             "project": "", "processes": [1848, 1, 2, 3, 4, 5], "created": 0.0}]
+        T._desktop.editor_windows = lambda app: [dict(w) for w in self.windows
+                                                 if w["hwnd"] not in self.closed]
+        T._desktop.close_window = lambda hwnd, timeout_s=6.0: (
+            self.closed.append(int(hwnd)) or {"status": "ok", "hwnd": int(hwnd),
+                                              "closed": True, "still_open": False})
+        T._desktop._user32 = lambda: _U()
+
+    def tearDown(self):
+        (self.T._desktop._instances, self.T._desktop.editor_windows,
+         self.T._desktop.close_window, self.T._desktop._user32) = self.orig
+
+    def test_one_process_with_two_frames_is_not_one_window(self):
+        out = self.T._lceda_pro_close_extra({})
+        self.assertEqual(out["reason_code"], "CLOSE_NOT_CONFIRMED")
+        self.assertEqual(out["instances"][0]["windows"], 2)
+        self.assertEqual(out["instances"][0]["processes"], 6)
+        self.assertEqual(self.closed, [])
+
+    def test_confirm_closes_the_extra_and_leaves_one(self):
+        out = self.T._lceda_pro_close_extra({"confirm": True})
+        self.assertEqual(out.get("status"), "ok")
+        self.assertEqual(len(self.closed), 1)
+        self.assertEqual(len(out["value"]["windows_after"]), 1)
+        self.assertNotEqual(out["value"]["kept"]["hwnd"], self.closed[0])
+
+    def test_naming_the_window_to_keep_is_honoured(self):
+        out = self.T._lceda_pro_close_extra({"confirm": True, "keep_hwnd": 202})
+        self.assertEqual(out["value"]["kept"]["hwnd"], 202)
+        self.assertEqual(self.closed, [101])
+
+    def test_one_window_is_left_alone(self):
+        self.closed.append(202)
+        out = self.T._lceda_pro_close_extra({"confirm": True})
+        self.assertEqual(out["value"]["closed"], [])
+        self.assertEqual(len(self.closed), 1)
+
+    def test_a_window_that_refuses_to_close_is_reported(self):
+        self.T._desktop.close_window = lambda hwnd, timeout_s=6.0: {
+            "status": "ok", "hwnd": int(hwnd), "closed": False, "still_open": True}
+        out = self.T._lceda_pro_close_extra({"confirm": True})
+        self.assertEqual(out["reason_code"], "CLOSE_INCOMPLETE")
+        self.assertEqual(len(out["still_open"]), 1)
 
 class TheLauncherRefusesToStartASecondCopy(unittest.TestCase):
     """The measured incident: an editor was already up, launch() was called anyway,
