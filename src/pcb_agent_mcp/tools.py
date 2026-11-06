@@ -900,8 +900,23 @@ _LIVE_BASIS = ("the running application's own command space (LCEDA Pro named pip
                "one JSON object per line), not a file and not a reimplementation")
 _LIVE_MODEL = "lceda_pro_command_space"
 
-def _live_hint(code):
+def _live_hint(code, extra=None):
+    extra = extra or {}
+    if code == "OPEN_NOT_CONFIRMED":
+        probe = extra.get("content_probe") or {}
+        if probe.get("held_by"):
+            return ("the editor already holds this project in session %s; the session "
+                    "this open created (%s) exposes no document, so nothing was "
+                    "added. Drive the existing one: lceda_pro_sessions lists every "
+                    "session with its render id, and lceda_pro_verify gives the "
+                    "project-wide answer" % (probe.get("held_by"),
+                                             probe.get("session")))
+        return ("the editor took the open and still answers ping, but no project is "
+                "loaded: look at the window (a dialog can only be clicked there - "
+                "the injected command space has no `document`), then call "
+                "lceda_pro_verify")
     return {
+
         "APP_NOT_RUNNING": "start LCEDA Pro and retry. Two measured reasons, both "
                            "silent: (1) the app is an Electron binary and "
                            "ELECTRON_RUN_AS_NODE=1 is inherited from this server's own "
@@ -934,6 +949,11 @@ def _live_hint(code):
                                "window, then the topmost frame",
         "CLOSE_INCOMPLETE": "the extras did not all go away - a window that posts back "
                             "a question stays open on purpose rather than being killed",
+        "ALREADY_OPEN": "a window title already carries this project name, so "
+                        "nothing was opened. That window is the place to work: "
+                        "lceda_pro_verify reads its documents, lceda_pro_sessions "
+                        "names the session to drive. force=true opens a second "
+                        "copy anyway",
         "NO_WINDOW": "the editor has no titled window right now",
         "PROJECT_NEEDS_UPGRADE": "refused before touching the editor: the file is a "
                                 "legacy SQLite .eprj, and 4.1.60 asks before "
@@ -962,7 +982,7 @@ def _live_error(exc, extra=None):
     extra = dict(extra or {})
     extra.update(exc.extra or {})
     extra.setdefault("vendor_code_kept", exc.code in _live.PASS_THROUGH_CODES)
-    return err(exc.message, exc.code, hint=_live_hint(exc.code), extra=extra)
+    return err(exc.message, exc.code, hint=_live_hint(exc.code, extra), extra=extra)
 
 def _live_done(client, value, assumptions, verified, **extra):
     identity = client.identity or {}
@@ -1007,6 +1027,7 @@ def _lceda_pro_status(args):
     }, verified=True)
 
 def _lceda_pro_api(args):
+    before = set(w["hwnd"] for w in _lceda_windows())
     try:
         client = _live_client(args)
     except _live.LiveError as exc:
@@ -1050,7 +1071,24 @@ def _lceda_pro_open(args):
     and `windows_after` are therefore part of the answer, and a frame that appeared
     during this call is closed again unless keep_window=true.
     """
-    before = set(w["hwnd"] for w in _lceda_windows())
+    windows_before = _lceda_windows()
+    before = set(w["hwnd"] for w in windows_before)
+    # Opening a file that is already open does not focus the existing window on
+    # 4.1.60: measured 2026-11-07, it created a second frame whose render never
+    # exposed a document while the first frame still held the project. That is
+    # exactly the "two editors" the user does not want, so it is refused by
+    # default - with the window named, so the caller knows where to look.
+    stem = os.path.splitext(os.path.basename(args.get("path") or ""))[0]
+    if stem and not args.get("force"):
+        already = [w for w in windows_before if w.get("project")
+                   and w["project"].strip().casefold() == stem.strip().casefold()]
+        if already:
+            return err("that project is already open in window %s - nothing was opened, so no second frame was created" % already[0]["hwnd"],
+                       "ALREADY_OPEN",
+                       hint="drive the window that is already open (lceda_pro_verify reports its documents and sessions); pass force=true only if a second copy of the same project is really wanted",
+                       extra={"path": args.get("path"), "stem": stem,
+                              "windows": windows_before,
+                              "windows_total": len(windows_before)})
     try:
         client = _live_client(args)
     except _live.LiveError as exc:
@@ -1065,6 +1103,18 @@ def _lceda_pro_open(args):
         return _live_error(exc)
     finally:
         client.close()
+    windows_after = _lceda_windows()
+    born = [w for w in windows_after if w["hwnd"] not in before]
+    window_extra = {"windows_before": len(before), "windows_after": len(windows_after),
+                    "windows_born": born}
+    if born and not bool(args.get("keep_window", False)):
+        closed = []
+        for w in born:
+            closed.append({"hwnd": w["hwnd"],
+                           "result": _desktop.close_window(
+                               w["hwnd"], timeout_s=float(args.get("wait_s") or 6))})
+        window_extra["windows_closed"] = closed
+        window_extra["windows_final"] = len(_lceda_windows())
     return _live_done(client, value, {
         "what was measured": "open of a copied 32.5 MB .eprj answered in 849 ms with "
                              "a session id, renderId 3 and an 'alive' status",
@@ -1680,6 +1730,10 @@ _tool(
                               "two windows, so the frame it added is closed again)",
                               False),
          "wait_s": _num("how long to wait for such a window to close", 6),
+         "force": _bool("open even when a window already carries this project "
+                        "name (default false: a second open of the same file "
+                        "was measured creating a frame that never exposes a "
+                        "document)", False),
          "allow_upgrade": _bool("open a legacy pre-V3 project anyway. Defaults to "
                                 "false: those files make the editor put up its V3 "
                                 "upgrade dialog, which the bridge cannot answer, so "

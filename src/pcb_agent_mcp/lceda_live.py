@@ -103,21 +103,34 @@ MAX_TIMEOUT_MS = 60000
 # getAllPcbsInfo() answered 2 PCBs and getAllSchematicsInfo() answered 1 schematic.
 # A gate that waits on it can only ever say "not loaded", so it is not asked at all.
 PROBE_JS = (
+    # Each call is raced against a 5 s timer INSIDE the snippet. Measured 2026-11-07:
+    # in one window getAllPcbsInfo() never returned (30 s) while getAllSchematicsInfo()
+    # answered in the same render, so asking them in sequence would throw away the
+    # answer that exists. A per-call window keeps one hanging call from being the
+    # whole reading.
+    "function __to(p,ms){return Promise.race(["
+    "Promise.resolve(p).catch(function(e){return {__error:String(e&&e.message||e)};}),"
+    "new Promise(function(r){setTimeout(function(){r({__timeout:true});},ms);})]);}"
     "var o={loaded:false,pcbCount:0,schCount:0,pcbs:[],schematics:[],projectUuid:null};"
-    "function n(x){return (typeof x.length==='number')?x.length:Object.keys(x||{}).length;}"
-    "try{var b=await eda.dmt_Pcb.getAllPcbsInfo();b=b||[];o.pcbCount=n(b);"
+    "function __n(x){return (typeof x.length==='number')?x.length:Object.keys(x||{}).length;}"
+    "var b=await __to(eda.dmt_Pcb.getAllPcbsInfo(),5000);"
+    "if(b&&b.__timeout){o.pcbError='timeout after 5000ms';}"
+    "else if(b&&b.__error){o.pcbError=b.__error;}"
+    "else{b=b||[];o.pcbCount=__n(b);"
     "o.pcbs=(Array.isArray(b)?b:[]).map(function(x){return {name:x&&x.name,uuid:x&&x.uuid};});"
-    "if(b&&b[0]&&b[0].parentProjectUuid){o.projectUuid=b[0].parentProjectUuid;}"
-    "}catch(e){o.pcbError=String(e&&e.message||e);}"
-    "try{var s=await eda.dmt_Schematic.getAllSchematicsInfo();s=s||[];o.schCount=n(s);"
+    "if(b&&b[0]&&b[0].parentProjectUuid){o.projectUuid=b[0].parentProjectUuid;}}"
+    "var s=await __to(eda.dmt_Schematic.getAllSchematicsInfo(),5000);"
+    "if(s&&s.__timeout){o.schError='timeout after 5000ms';}"
+    "else if(s&&s.__error){o.schError=s.__error;}"
+    "else{s=s||[];o.schCount=__n(s);"
     "o.schematics=(Array.isArray(s)?s:[]).map(function(x){return {name:x&&x.name,"
     "uuid:x&&x.uuid,pages:(x&&x.page)?x.page.length:0};});"
-    "if(!o.projectUuid&&s&&s[0]&&s[0].parentProjectUuid){o.projectUuid=s[0].parentProjectUuid;}"
-    "}catch(e){o.schError=String(e&&e.message||e);}"
-    "try{var u=await eda.dmt_Project.getAllProjectsUuid();u=u||[];o.projectCount=n(u);"
-    "}catch(e){}"
-    "try{var w=await eda.dmt_Workspace.getCurrentWorkspaceInfo();o.workspace=w||null;"
-    "}catch(e){}"
+    "if(!o.projectUuid&&s&&s[0]&&s[0].parentProjectUuid)"
+    "{o.projectUuid=s[0].parentProjectUuid;}}"
+    "var u=await __to(eda.dmt_Project.getAllProjectsUuid(),5000);"
+    "if(u&&!u.__timeout&&!u.__error){u=u||[];o.projectCount=__n(u);}"
+    "var w=await __to(eda.dmt_Workspace.getCurrentWorkspaceInfo(),5000);"
+    "if(w&&!w.__timeout&&!w.__error){o.workspace=w||null;}"
     "o.loaded=(o.pcbCount>0)||(o.schCount>0);"
     "return o;"
 )
@@ -624,7 +637,7 @@ class Client(object):
         ordered = ([named] if named in ids else []) + [i for i in ids if i != named]
         if not scan_others:
             ordered = ordered[:1]
-        per = max(3.0, min(timeout_s, 8.0))
+        per = max(8.0, min(timeout_s, 15.0))
         probe_error = None
         chosen = None
         checked = []
@@ -642,7 +655,8 @@ class Client(object):
             sch_count = value.get("schCount") or 0
             entry.update({"pcb_count": pcb_count, "sch_count": sch_count,
                           "loaded": bool(pcb_count or sch_count),
-                          "doc_error": value.get("pcbError") or value.get("schError")})
+                          "pcb_error": value.get("pcbError"),
+                          "sch_error": value.get("schError")})
             checked.append(entry)
             if entry["loaded"] and chosen is None:
                 chosen = (sid, value, entry)
@@ -663,7 +677,9 @@ class Client(object):
                 "pcbs": value.get("pcbs") or [],
                 "schematics": value.get("schematics") or [],
                 "project_count": value.get("projectCount"),
-                "workspace": value.get("workspace")})
+                "workspace": value.get("workspace"),
+                "pcb_error": value.get("pcbError"),
+                "sch_error": value.get("schError")})
             if len(checked) > 1 and sid != ordered[0]:
                 state["held_by"] = sid
                 state["why"] = ("session %s exposes no document, but session %s holds "
@@ -674,6 +690,14 @@ class Client(object):
                 state["why"] = ("the editor lists %d PCB document(s) and %d "
                                 "schematic(s) for the current project"
                                 % (entry["pcb_count"], entry["sch_count"]))
+            partial = [name for name, key in (("PCB", "pcb_error"),
+                                              ("schematic", "sch_error"))
+                       if state.get(key)]
+            if partial:
+                state["why"] += ("; the %s list could not be read (%s), so that half "
+                                 "of the count is unmeasured, not zero"
+                                 % (" and ".join(partial),
+                                    state.get("pcb_error") or state.get("sch_error")))
             return state
         # Nothing loaded anywhere. Say which failure it was, because "empty project"
         # and "the probe could not run" are different facts.

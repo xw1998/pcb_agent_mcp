@@ -173,5 +173,54 @@ class TestNonWindowsSafe(unittest.TestCase):
                                          "APP_UNKNOWN", "TOOL_RAISED"))
 
 
+class TestOneEditorAtATime(unittest.TestCase):
+    """Opening a file the window already carries must not create a second frame.
+
+    Measured 2026-11-07 on 4.1.60: a second open of the same project created a
+    frame whose render never exposed a document, while the first frame still
+    held the project - the user's "you opened too many editors". So the refusal
+    has to happen before the transport is used at all, which is what the
+    "no client was built" assertion below checks.
+    """
+
+    def test_a_project_the_window_already_carries_is_not_opened_again(self):
+        frames = [{"hwnd": 2222, "pid": 1, "area": 100,
+                   "title": "F412RG | 嘉立创EDA(专业版)", "project": "F412RG"}]
+        used = []
+
+        def _never(args):
+            used.append(args)
+            raise AssertionError("the transport must not be touched")
+
+        orig_windows, orig_client = tools._lceda_windows, tools._live_client
+        tools._lceda_windows = lambda: frames
+        tools._live_client = _never
+        try:
+            r = tools.call_tool("lceda_pro_open", {"path": r"D:\p\F412RG.eprj2"})
+        finally:
+            tools._lceda_windows, tools._live_client = orig_windows, orig_client
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason_code"], "ALREADY_OPEN")
+        self.assertIn("2222", r["message"])
+        self.assertEqual(r["windows_total"], 1)
+        self.assertEqual(used, [])
+
+    def test_force_is_how_a_second_copy_is_asked_for(self):
+        frames = [{"hwnd": 2222, "pid": 1, "area": 100,
+                   "title": "F412RG | 嘉立创EDA(专业版)", "project": "F412RG"}]
+
+        def _never(args):
+            raise AssertionError("the transport must not be touched")
+
+        orig_windows, orig_client = tools._lceda_windows, tools._live_client
+        tools._lceda_windows = lambda: frames
+        tools._live_client = _never
+        try:
+            r = tools.call_tool("lceda_pro_open",
+                                {"path": r"D:\p\F412RG.eprj2", "force": True})
+        finally:
+            tools._lceda_windows, tools._live_client = orig_windows, orig_client
+        self.assertNotEqual(r["reason_code"], "ALREADY_OPEN")
+
 if __name__ == "__main__":
     unittest.main()
