@@ -161,7 +161,7 @@ class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
                                    _ok({"bridgeVersion": "4.1.60"})])     # ping after
         client = L.Client(transport)
         here = os.path.abspath(__file__)
-        value = client.open_project(here, headless=True)
+        value = client.open_project(here, headless=True, verify_content=False)
         self.assertEqual(value["sessionId"], "s1")
         ops = [c[0] for c in transport.calls]
         self.assertEqual(ops, ["ping", "open", "ping"])
@@ -172,8 +172,100 @@ class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
     def test_open_defaults_to_not_headless(self):
         transport = FakeTransport([_ok({}), _ok({"sessionId": "s1"}), _ok({})])
         client = L.Client(transport)
-        client.open_project(os.path.abspath(__file__))
+        client.open_project(os.path.abspath(__file__), verify_content=False)
         self.assertFalse(transport.calls[1][1]["headless"])
+
+    def test_a_legacy_container_is_refused_before_anything_is_sent(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".eprj", delete=False) as handle:
+            handle.write(b"SQLite format 3\x00" + b"\x00" * 512)
+            legacy = handle.name
+        try:
+            fmt = L.project_container(legacy)
+            self.assertEqual(fmt["container"], "sqlite")
+            self.assertTrue(fmt["needs_upgrade"])
+            transport = FakeTransport([])
+            client = L.Client(transport)
+            with self.assertRaises(L.LiveError) as caught:
+                client.open_project(legacy)
+            self.assertEqual(caught.exception.code, "PROJECT_NEEDS_UPGRADE")
+            self.assertEqual(caught.exception.extra["container"]["container"], "sqlite")
+            self.assertEqual(transport.calls, [])
+            # And saying so on purpose is still allowed (the dialog is then the
+            # caller's problem, which is what allow_upgrade means).
+            transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
+                                       _ok({"sessionId": "s1"}),
+                                       _ok({"bridgeVersion": "4.1.60"})])
+            client = L.Client(transport)
+            client.open_project(legacy, allow_upgrade=True, verify_content=False)
+            self.assertEqual([c[0] for c in transport.calls], ["ping", "open", "ping"])
+        finally:
+            os.unlink(legacy)
+
+    def test_a_zip_container_is_not_refused(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".epro2", delete=False) as handle:
+            handle.write(b"PK\x03\x04" + b"\x00" * 32)
+            modern = handle.name
+        try:
+            fmt = L.project_container(modern)
+            self.assertFalse(fmt["needs_upgrade"])
+            self.assertEqual(fmt["container"], "zip")
+        finally:
+            os.unlink(modern)
+
+    def test_a_project_that_did_not_load_is_not_called_a_success(self):
+        # Measured on 4.1.60: 'open' answers with a session id and the pipe keeps
+        # pinging while the window sits on a modal dialog and the app's own project
+        # object stays {}. A ping-only canary calls that green.
+        transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
+                                   _ok({"sessionId": "s1"}),
+                                   _ok({"bridgeVersion": "4.1.60"}),
+                                   _ok({"project": {}, "pcbCount": 0})])
+        client = L.Client(transport)
+        with self.assertRaises(L.LiveError) as caught:
+            client.open_project(os.path.abspath(__file__))
+        exc = caught.exception
+        self.assertEqual(exc.code, "OPEN_NOT_CONFIRMED")
+        self.assertFalse(exc.extra["content_probe"]["loaded"])
+        self.assertEqual(exc.extra["content_probe"]["project_keys"], [])
+        self.assertEqual(exc.extra["content_probe"]["pcb_count"], 0)
+        self.assertIn("document", exc.extra["next"])
+        self.assertEqual([c[0] for c in transport.calls],
+                         ["ping", "open", "ping", "invoke"])
+        self.assertEqual(transport.calls[3][1]["session"], "s1")
+
+    def test_a_loaded_project_object_is_what_confirms_the_open(self):
+        transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
+                                   _ok({"sessionId": "s1"}),
+                                   _ok({"bridgeVersion": "4.1.60"}),
+                                   _ok({"project": {"id": "p1"},
+                                        "pcbCount": 1, "projectCount": 3})])
+        client = L.Client(transport)
+        value = client.open_project(os.path.abspath(__file__))
+        self.assertEqual(value["sessionId"], "s1")
+        state = client.last_open["content"]
+        self.assertTrue(state["loaded"])
+        self.assertEqual(state["project_keys"], ["id"])
+        self.assertEqual(state["project_count"], 3)
+        self.assertEqual(client.open_session, "s1")
+
+    def test_the_probe_uses_the_last_live_session_when_none_is_named(self):
+        transport = FakeTransport([_ok([{"sessionId": "dead", "status": "dead"},
+                                        {"sessionId": "s2", "status": "alive"}]),
+                                   _ok({"project": {}, "pcbCount": 0})])
+        client = L.Client(transport)
+        state = client.project_state()
+        self.assertFalse(state["loaded"])
+        self.assertEqual(state["session"], "s2")
+        self.assertEqual(transport.calls[1][1]["session"], "s2")
+
+    def test_a_probe_that_cannot_run_is_not_loaded(self):
+        transport = FakeTransport([L.LiveError("APP_TIMEOUT", "no reply")])
+        client = L.Client(transport)
+        state = client.project_state("s1")
+        self.assertFalse(state["loaded"])
+        self.assertEqual(state["why"], "APP_TIMEOUT: no reply")
 
     def test_an_editor_that_stops_answering_after_open_is_reported_not_returned(self):
         transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
@@ -360,7 +452,7 @@ class TheToolsSayWhatTheyCanDo(unittest.TestCase):
     def test_every_bridge_tool_is_registered_and_listed(self):
         from pcb_agent_mcp import tools as T
         names = [n for n in T.TOOLS if n.startswith("lceda_pro_")]
-        self.assertEqual(len(names), 8, names)
+        self.assertEqual(len(names), 9, names)
         available = T.TOOLS["calc_capabilities"]["handler"]({})["available"]
         for name in names:
             self.assertIn(name, available)
@@ -663,6 +755,138 @@ LIVE_ENDPOINTS = L.available_endpoints()
     LIVE_ENDPOINTS,
     "no JLCEDAPro* command-space pipe is open (start LCEDA Pro to run this)",
 )
+class TheConnectionCheckSeparatesThreeFacts(unittest.TestCase):
+    """Pipe answers / a session is alive / a project object comes back.
+
+    Only the third one means a call would land on a project. The measured failure
+    this class exists for: `open` returned a session id and ping kept answering
+    while the window sat on a modal dialog and every `eda.dmt_*` call returned {}.
+    """
+
+    def setUp(self):
+        from pcb_agent_mcp import tools as T
+        self.T = T
+        self.orig = (T._live.pipe_report, T._live_client, T._lceda_instances,
+                     T._desktop.launch)
+        T._lceda_instances = lambda: [{"pid": 4242, "has_window": True,
+                                       "title": "嘉立创EDA(专业版) - V4.1.60",
+                                       "project": None}]
+
+    def tearDown(self):
+        (self.T._live.pipe_report, self.T._live_client, self.T._lceda_instances,
+         self.T._desktop.launch) = self.orig
+
+    def _report(self, state, **kw):
+        rep = {"state": state, "pipes": ["JLCEDAProd"] if state != "not_running" else [],
+               "answering": None, "bridge_version": None, "failures": [],
+               "pipe_root": L.PIPE_ROOT}
+        rep.update(kw)
+        return rep
+
+    def test_a_dead_pipe_is_not_connected(self):
+        self.T._live.pipe_report = lambda **k: self._report("bridge_dead")
+        out = self.T.call_tool("lceda_pro_verify", {})
+        self.assertEqual(out.get("status"), "error")
+        self.assertEqual(out["reason_code"], "NOT_CONNECTED")
+        self.assertFalse(out["connected"])
+        self.assertEqual(len(out["instances"]), 1)
+
+    def test_a_healthy_pipe_with_no_project_is_the_failing_case(self):
+        self.T._live.pipe_report = lambda **k: self._report(
+            "healthy", answering="JLCEDAProd", bridge_version="4.1.60.198f38ab")
+
+        class Client(object):
+            endpoint = "JLCEDAProd"
+
+            def project_state(self, session=None, timeout_s=15.0):
+                return {"loaded": False, "session": "s1", "project_keys": [],
+                        "project": None, "pcb_count": 0, "project_count": 0,
+                        "probe_error": None,
+                        "why": "the app returned an empty project object"}
+
+            def close(self):
+                pass
+
+        self.T._live_client = lambda args: Client()
+        out = self.T.call_tool("lceda_pro_verify", {})
+        self.assertEqual(out["reason_code"], "NO_PROJECT_LOADED")
+        self.assertFalse(out["connected"])
+        self.assertEqual(out["state"], "healthy")
+        self.assertEqual(out["project"]["why"],
+                         "the app returned an empty project object")
+
+    def test_a_project_object_is_what_makes_it_connected(self):
+        self.T._live.pipe_report = lambda **k: self._report(
+            "healthy", answering="JLCEDAProd", bridge_version="4.1.60.198f38ab")
+
+        class Client(object):
+            endpoint = "JLCEDAProd"
+
+            def project_state(self, session=None, timeout_s=15.0):
+                return {"loaded": True, "session": "s1", "project_keys": ["id"],
+                        "project": {"id": "p1"}, "pcb_count": 1, "project_count": 3,
+                        "probe_error": None,
+                        "why": "the app returned a project object"}
+
+            def close(self):
+                pass
+
+        self.T._live_client = lambda args: Client()
+        out = self.T.call_tool("lceda_pro_verify", {})
+        self.assertEqual(out.get("status"), "ok")
+        self.assertTrue(out["value"]["connected"])
+        self.assertEqual(out["value"]["project"]["project_count"], 3)
+
+    def test_a_second_instance_is_refused_instead_of_started(self):
+        # A window is up but no pipe was ever created for it: the one state where
+        # recover would otherwise start a second copy.
+        self.T._live.pipe_report = lambda **k: self._report("not_running")
+        started = []
+        self.T._desktop.launch = lambda *a, **k: started.append(1)
+        out = self.T.call_tool("lceda_pro_recover", {"confirm": True, "wait_s": 5})
+        self.assertEqual(out["reason_code"], "ALREADY_RUNNING")
+        self.assertEqual(started, [])
+        self.assertEqual(out["instances"][0]["pid"], 4242)
+
+class TheLauncherRefusesToStartASecondCopy(unittest.TestCase):
+    """The measured incident: an editor was already up, launch() was called anyway,
+    and a second window appeared that shared nothing with the first."""
+
+    def setUp(self):
+        from pcb_agent_mcp import desktop as D
+        self.D = D
+        self.orig = (D._instances, D.detect, D.subprocess.Popen)
+        D._instances = lambda app: [{"pid": 4242, "has_window": True,
+                                     "title": "嘉立创EDA(专业版) - V4.1.60",
+                                     "project": "", "created": 0.0}]
+
+    def tearDown(self):
+        (self.D._instances, self.D.detect, self.D.subprocess.Popen) = self.orig
+
+    def test_a_running_window_means_no_second_process(self):
+        spawned = []
+        self.D.subprocess.Popen = lambda *a, **k: spawned.append(a) or None
+        out = self.D.launch(os.path.abspath(__file__), [], app="lceda-pro")
+        self.assertEqual(out["reason_code"], "ALREADY_RUNNING")
+        self.assertEqual(spawned, [])
+        self.assertEqual(out["instances"][0]["pid"], 4242)
+
+    def test_saying_so_on_purpose_still_works(self):
+        class P(object):
+            pid = 9999
+        self.D.subprocess.Popen = lambda *a, **k: P()
+        out = self.D.launch(os.path.abspath(__file__), [],
+                            app="lceda-pro", allow_second=True)
+        self.assertEqual(out.get("status"), "ok")
+        self.assertEqual(out["pid"], 9999)
+
+    def test_an_unknown_app_is_not_gated(self):
+        class P(object):
+            pid = 9998
+        self.D.subprocess.Popen = lambda *a, **k: P()
+        out = self.D.launch(os.path.abspath(__file__), [])
+        self.assertEqual(out["pid"], 9998)
+
 class TheRunningEditorAnswersForReal(unittest.TestCase):
     """The only case that proves the bytes are right for the real application."""
 

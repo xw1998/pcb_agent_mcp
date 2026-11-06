@@ -85,6 +85,34 @@ MAX_REPLY_BYTES = 16 * 1024 * 1024
 DEFAULT_TIMEOUT_MS = 60000
 MAX_TIMEOUT_MS = 60000
 
+# Runs inside the injected command space. The namespaces are reachable as
+# `eda.dmt_*` (measured on 4.1.60: bare `dmt_Project` is undefined, `eda.dmt_Project`
+# is a function). An unloaded editor answers with an *empty object*, not an error,
+# so "loaded" has to be read from the object being non-empty - and `document` is not
+# available in here at all, which is why a modal dialog cannot be clicked from here.
+# Every `eda.dmt_*` getter that answers with data is ASYNC: measured on 4.1.60,
+# `eda.dmt_Project.getCurrentProjectInfo()` returns `[object Promise]` and an
+# un-awaited `Object.keys(...)` is therefore always empty. That reads exactly like
+# "no project loaded" - a false negative with the same shape as the false positive
+# this probe exists to kill. `invoke` runs the snippet as an async function body,
+# so `await` is the correct form and is used everywhere below.
+PROBE_JS = (
+    "var o={loaded:false};"
+    "try{var p=await eda.dmt_Project.getCurrentProjectInfo();p=p||{};"
+    "o.project=p;o.projectKeys=Object.keys(p);o.loaded=o.projectKeys.length>0;"
+    "}catch(e){o.error=String(e&&e.message||e);}"
+    "try{var b=await eda.dmt_Pcb.getAllPcbsInfo();b=b||{};"
+    "o.pcbCount=(typeof b.length==='number')?b.length:Object.keys(b).length;"
+    "}catch(e){}"
+    "try{var u=await eda.dmt_Project.getAllProjectsUuid();u=u||[];"
+    "o.projectCount=(typeof u.length==='number')?u.length:Object.keys(u).length;"
+    "}catch(e){}"
+    "try{var w=await eda.dmt_Workspace.getCurrentWorkspaceInfo();o.workspace=w||null;"
+    "}catch(e){}"
+    "return o;"
+)
+_PROBE_JS = PROBE_JS
+
 # Vendor error codes this module passes through unchanged (they are facts about
 # the application, not our vocabulary), so a caller can branch on them.
 PASS_THROUGH_CODES = frozenset(
@@ -282,6 +310,26 @@ class PipeTransport(Transport):
         self._buffer = b""
 
 
+def project_container(path):
+    """What the file on disk is, read from its own bytes rather than its extension.
+
+    Measured on this install: the legacy `.eprj` is a SQLite database
+    (`b"SQLite format 3\\x00"`) and `.epro2` is a ZIP (`b"PK\\x03\\x04"`). Opening a
+    SQLite one in 4.1.60 is what puts up "当前工程为V3以下版本 ... 是否确认打开该工程?"
+    and leaves the bridge answering while nothing loads. Knowing this before the
+    call is the difference between refusing and pretending.
+    """
+    with open(path, "rb") as handle:
+        head = handle.read(16)
+    if head.startswith(b"SQLite format 3"):
+        return {"container": "sqlite", "needs_upgrade": True,
+                "why": "SQLite container = legacy .eprj; 4.1.60 asks before upgrading it"}
+    if head.startswith(b"PK\x03\x04"):
+        return {"container": "zip", "needs_upgrade": False,
+                "why": "ZIP container = .epro2/.epro; no upgrade dialog is expected"}
+    return {"container": "unknown", "needs_upgrade": False,
+            "why": "neither SQLite nor ZIP; the format is not known here"}
+
 class Client(object):
     """Thin, honest wrapper over the command space.
 
@@ -296,6 +344,7 @@ class Client(object):
         self.endpoint = getattr(transport, "endpoint", None)
         self.identity = None
         self.last_open = None
+        self.open_session = None
 
     @property
     def verified(self):
@@ -310,7 +359,56 @@ class Client(object):
         self.identity = value
         return value
 
-    def open_project(self, path, headless=False, timeout_s=45.0, canary_s=3.0):
+    def project_state(self, session=None, timeout_s=15.0):
+        """Whether a project is actually loaded in the editor, not merely reachable.
+
+        The pipe answering says the injected command space is up. It says nothing
+        about whether a project finished opening: measured on 4.1.60, `open` of a
+        pre-V3 `.eprj` answered with a session id while the window sat on a modal
+        "当前工程为V3以下版本 ... 是否确认打开该工程?", and `eda.dmt_Project`
+        .getCurrentProjectInfo() kept returning `{}`. A ping-only canary calls that a
+        success. This probe is the missing measurement, and its positive form is
+        `loaded: true` with the app's own project object.
+        """
+        session = session or self.open_session
+        if not session:
+            live = self.sessions(timeout_s)
+            ids = [s.get("sessionId") for s in live if s.get("status") == "alive"]
+            if not ids:
+                return {"loaded": False, "session": None, "sessions": live,
+                        "why": "the editor has no live session"}
+            session = ids[-1]
+        try:
+            out = self.invoke(session, _PROBE_JS, timeout_ms=int(timeout_s * 1000))
+        except LiveError as exc:
+            return {"loaded": False, "session": session, "why": "%s: %s"
+                    % (exc.code, exc.message)}
+        value = out.get("value") or {}
+        project = value.get("project")
+        keys = list(value.get("projectKeys") or
+                    (project if isinstance(project, dict) else {}))
+        loaded = bool(keys)
+        count = value.get("projectCount")
+        if loaded:
+            why = "the app returned a project object"
+        elif count == 0:
+            why = ("the client's workspace lists 0 projects - nothing has been imported "
+                   "into it, so there is nothing to load")
+        else:
+            why = ("the app returned an empty project object - measured cause on "
+                   "4.1.60: the window is on a modal dialog (a pre-V3 project asks "
+                   "before upgrading)")
+        return {"loaded": loaded, "session": session,
+                "project_keys": keys,
+                "project": project if loaded else None,
+                "pcb_count": value.get("pcbCount"),
+                "project_count": count,
+                "workspace": value.get("workspace"),
+                "probe_error": value.get("error"),
+                "why": why}
+
+    def open_project(self, path, headless=False, timeout_s=45.0, canary_s=3.0,
+                     verify_content=True, allow_upgrade=False):
         """Open a project, then prove the editor is still able to answer.
 
         Opening a project is the one call on this pipe that can take the editor's
@@ -333,6 +431,24 @@ class Client(object):
         if not os.path.exists(path):
             raise LiveError("ARG_INVALID", "no such project file: %s" % path)
         size = os.path.getsize(path)
+        container = project_container(path)
+        if container["needs_upgrade"] and not allow_upgrade:
+            raise LiveError(
+                "PROJECT_NEEDS_UPGRADE",
+                "%s is a legacy container (%s), so the editor will answer 'open' with "
+                "a session id and then sit on '当前工程为V3以下版本 ... 是否确认打开该工"
+                "程?' - nothing after that point would touch a project, and the dialog "
+                "cannot be answered from this bridge (`document` is undefined inside "
+                "it)" % (os.path.basename(path), container["why"]),
+                {
+                    "path": path,
+                    "size_mb": round(size / (1024.0 * 1024.0), 1),
+                    "container": container,
+                    "next": "convert it once by opening it in the editor by hand and "
+                            "saving as .epro2, or pass allow_upgrade=true and answer "
+                            "the dialog in the window yourself",
+                },
+            )
         before = self.ping(min(canary_s, 5.0))
         started = time.time()
         reply = self._call("open", {"path": path, "headless": bool(headless)}, timeout_s)
@@ -371,6 +487,34 @@ class Client(object):
             "canary_before": (before or {}).get("bridgeVersion"),
             "canary_after": (after or {}).get("bridgeVersion"),
         }
+        session = value.get("sessionId")
+        self.open_session = session
+        if verify_content:
+            state = self.project_state(session, max(canary_s, 5.0))
+            self.last_open["content"] = state
+            if not state.get("loaded"):
+                raise LiveError(
+                    "OPEN_NOT_CONFIRMED",
+                    "the editor answered 'open' with session %s and still answers ping, "
+                    "but no project is loaded (%s) - the window is almost certainly "
+                    "sitting on a modal dialog, so nothing after this point would "
+                    "touch the project" % (session, state.get("why")),
+                    {
+                        "path": path,
+                        "size_mb": round(size / (1024.0 * 1024.0), 1),
+                        "open_seconds": round(elapsed, 2),
+                        "open_reply": value,
+                        "content_probe": state,
+                        "app_state": "bridge answers, project object empty - this is "
+                                      "what a blocking dialog looks like from here",
+                        "next": "look at the editor window: a pre-V3 project shows '"
+                                "当前工程为V3以下版本 ... 是否确认打开该工程?'. Click 确认/取消 "
+                                "there (the dialog is in the client's own page and is "
+                                "not reachable from the injected command space - "
+                                "`document` is undefined inside it), then retry with "
+                                "lceda_pro_verify",
+                    },
+                )
         return value
 
     def sessions(self, timeout_s=10.0):

@@ -927,10 +927,32 @@ def _live_hint(code):
                            "app's own and the snippet's logs are in extra.logs",
         "SYNTAX_ERROR": "the snippet does not parse as an async function body",
         "SESSION_NOT_FOUND": "no such session; call lceda_pro_sessions",
+        "PROJECT_NEEDS_UPGRADE": "refused before touching the editor: the file is a "
+                                "legacy SQLite .eprj, and 4.1.60 asks before "
+                                "upgrading it. That dialog is in the client's own "
+                                "page, so nothing here can answer it - convert the file "
+                                "once (open it by hand, save as .epro2), or pass "
+                                "allow_upgrade=true and click the dialog yourself",
+        "OPEN_NOT_CONFIRMED": "the editor took the open and still answers ping, but no "
+                             "project is loaded: look at the window, a modal dialog is "
+                             "up (this build asks before upgrading a pre-V3 project). "
+                             "The dialog lives in the client's own page and cannot be "
+                             "clicked from the injected command space, so it needs a "
+                             "click in the window; then call lceda_pro_verify",
+        "NO_PROJECT_LOADED": "the bridge is connected but no project is open in it. "
+                            "Open a project in the editor (or lceda_pro_open) and call "
+                            "lceda_pro_verify again - a live pipe is not a live project",
+        "NOT_CONNECTED": "the pipe does not answer, so no tool call can land. "
+                         "lceda_pro_recover reports the same state and restarts the "
+                         "editor with confirm=true",
+        "ALREADY_RUNNING": "one instance per user: reuse the running editor instead of "
+                          "starting a second one. Only bridge_dead (pipe exists, never "
+                          "answers) justifies replacing it",
     }.get(code)
 
-def _live_error(exc):
-    extra = dict(exc.extra or {})
+def _live_error(exc, extra=None):
+    extra = dict(extra or {})
+    extra.update(exc.extra or {})
     extra.setdefault("vendor_code_kept", exc.code in _live.PASS_THROUGH_CODES)
     return err(exc.message, exc.code, hint=_live_hint(exc.code), extra=extra)
 
@@ -1008,7 +1030,8 @@ def _lceda_pro_open(args):
         value = client.open_project(args.get("path"),
                                     headless=bool(args.get("headless", False)),
                                     timeout_s=float(args.get("open_timeout_s") or 45.0),
-                                    canary_s=float(args.get("canary_s") or 3.0))
+                                    canary_s=float(args.get("canary_s") or 3.0),
+                                    allow_upgrade=bool(args.get("allow_upgrade", False)))
     except _live.LiveError as exc:
         return _live_error(exc)
     finally:
@@ -1039,6 +1062,7 @@ def _lceda_pro_recover(args):
     stop-then-start - which discards unsaved edits, hence the explicit confirm.
     """
     report = _live.pipe_report(ping_timeout_s=float(args.get("ping_timeout_s") or 3.0))
+    report["instances"] = _lceda_instances()
     if report["state"] == "healthy":
         return ok(report, "pipe enumerated and pinged; the values are the app's own",
                   _LIVE_MODEL, _LIVE_BASIS,
@@ -1063,11 +1087,27 @@ def _lceda_pro_recover(args):
         report["tried"] = found.get("tried")
         return err("LCEDA Pro was not found on this machine", "APP_NOT_INSTALLED",
                    extra=report)
+    # One instance per user. Launching a second exe while one is already up gives two
+    # windows that share no state and compete for the same pipe name - measured once:
+    # the second window opened and the first one stopped being the one we talked to.
+    if report["state"] != "bridge_dead" and report["instances"]:
+        return err("the editor is already running (%d process(es), %d with a window) "
+                   "and its command space is %s - starting another instance would "
+                   "leave two editors that share nothing"
+                   % (len(report["instances"]),
+                      sum(1 for i in report["instances"] if i.get("has_window")),
+                      report["state"].replace("_", " ")),
+                   "ALREADY_RUNNING",
+                   hint="nothing was started. Wait for the running editor to finish "
+                        "loading (about 18 s cold, 1 s warm); only bridge_dead - a pipe "
+                        "that exists and never answers - is a reason to replace it",
+                   extra=report)
     steps = []
     if report["state"] == "bridge_dead":
         steps.append({"step": "close",
                       "result": _desktop.close("lceda-pro", force=True, timeout=15.0)})
-    steps.append({"step": "launch", "result": _desktop.launch(found["exe"], [])})
+    steps.append({"step": "launch",
+                  "result": _desktop.launch(found["exe"], [], app="lceda-pro")})
     started = time.time()
     deadline = started + float(args.get("wait_s") or 60.0)
     after = None
@@ -1094,6 +1134,68 @@ def _lceda_pro_recover(args):
                     "longer wait means the exe started but no window opened (check "
                     "the process list) or the app is sitting on a modal dialog",
                extra=report)
+
+def _lceda_pro_verify(args):
+    """Answer "am I actually connected to a project" in one call.
+
+    Three separate facts, deliberately not merged: the pipe answers, the editor has a
+    live session, and a project object comes back non-empty. Only the third one means
+    a tool call would land on a project. Measured failure this exists for: `open`
+    answered with a session id and ping kept succeeding while the window sat on
+    "当前工程为V3以下版本 ... 是否确认打开该工程?" and every `eda.dmt_*` call
+    returned an empty object.
+    """
+    report = _live.pipe_report(ping_timeout_s=float(args.get("ping_timeout_s") or 3.0))
+    report["instances"] = _lceda_instances()
+    if report["state"] != "healthy":
+        report["connected"] = False
+        return err("the editor's command space is %s - nothing can be driven"
+                   % report["state"].replace("_", " "),
+                   "NOT_CONNECTED",
+                   hint="lceda_pro_recover reports the same state and, with "
+                        "confirm=true, restarts the editor",
+                   extra=report)
+    try:
+        client = _live_client(args)
+    except _live.LiveError as exc:
+        report["connected"] = False
+        return _live_error(exc, extra=report)
+    try:
+        state = client.project_state(args.get("session"),
+                                     float(args.get("probe_timeout_s") or 15.0))
+    except _live.LiveError as exc:
+        report["connected"] = False
+        return _live_error(exc, extra=report)
+    finally:
+        client.close()
+    report["project"] = state
+    report["connected"] = bool(state.get("loaded"))
+    if not report["connected"]:
+        return err("the editor answers, but no project is loaded (%s)"
+                   % state.get("why"),
+                   "NO_PROJECT_LOADED",
+                   hint="the bridge being alive is not the same as having a project: "
+                        "if a dialog is up in the window (this build asks before "
+                        "upgrading a pre-V3 project) click it there and call this "
+                        "again; otherwise open a project in the editor first",
+                   extra=report)
+    return ok(report, "pipe state, the editor's own session list and the app's own "
+                      "project object",
+              _LIVE_MODEL, _LIVE_BASIS,
+              "loaded=true means getCurrentProjectInfo() returned a non-empty object; "
+              "it does not prove which document is active inside the project",
+              {"not_run": "no write, no open, no close"},
+              {"endpoint": report["answering"], "verified_against_app": True})
+
+def _lceda_instances():
+    """Running editor processes/windows. Two instances share nothing and fight over
+    the pipe, so this is reported on every connection check."""
+    out = []
+    for it in _desktop._instances("lceda-pro"):
+        out.append({"pid": it["pid"], "has_window": it["has_window"],
+                    "title": it["title"] or None,
+                    "project": it["project"] or None})
+    return out
 
 def _lceda_pro_sessions(args):
     try:
@@ -1368,9 +1470,29 @@ _tool(
                            "bridge never answered again", False),
          "canary_s": _num("budget for the ping that runs before and after the open", 3),
          "open_timeout_s": _num("budget for the open itself", 45),
+         "allow_upgrade": _bool("open a legacy SQLite .eprj anyway. Defaults to false: "
+                                "that container makes the editor put up its V3 upgrade "
+                                "dialog, which the bridge cannot answer, so the call "
+                                "would answer 'open' and load nothing "
+                                "(PROJECT_NEEDS_UPGRADE)", False),
      }),
      "required": ["path"]},
     _lceda_pro_open,
+)
+
+_tool(
+    "lceda_pro_verify",
+    "Answer 'am I really connected to a project' in one call: pipe state, the running "
+    "editor instance(s), the live session, and whether getCurrentProjectInfo() "
+    "returns a non-empty object. The bridge answering a ping does NOT mean a project "
+    "is open - on 4.1.60 an open behind a modal dialog still answered ping while "
+    "every eda.dmt_* call returned an empty object. connected=false is the honest "
+    "answer in that state, and hint says where to look.",
+    {"type": "object", "properties": dict(_LIVE_ARGS, **{
+        "session": _str("check this session instead of the newest live one"),
+        "probe_timeout_s": _num("budget for the in-editor project probe", 15),
+        "ping_timeout_s": _num("budget for the first ping", 3)})},
+    _lceda_pro_verify,
 )
 
 _tool(
@@ -3673,7 +3795,12 @@ def _launch_app(app):
     if not found.get("found"):
         return err("%s is not installed (or not found)" % _desktop.APPS[app]["display"],
                    "APP_NOT_INSTALLED", extra={"tried": found.get("tried")})
-    return _desktop.launch(found["exe"], [])
+    started = _desktop.launch(found["exe"], [], app=app)
+    if started.get("reason_code") == "ALREADY_RUNNING":
+        return err(started["message"], "ALREADY_RUNNING",
+                   hint=started["hint"],
+                   extra={"instances": started["instances"]})
+    return started
 
 def _epro_inspect(args):
     import os
@@ -4469,7 +4596,8 @@ def _capabilities(_args):
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
             "lceda_api_probe",
             "lceda_pro_status", "lceda_pro_api", "lceda_pro_open",
-            "lceda_pro_recover", "lceda_pro_sessions", "lceda_pro_close",
+            "lceda_pro_recover", "lceda_pro_verify", "lceda_pro_sessions",
+            "lceda_pro_close",
             "lceda_pro_run",
             "lceda_pro_steps", "lceda_write_snippet",
             "lceda_step_record", "lceda_step_replay",
@@ -10879,7 +11007,7 @@ CORE_TOOLS = (
     "schematic_apply", "schematic_pcb_diff", "schematic_pcb_sync",
     # desktop / LCEDA
     "epro_inspect", "app_detect", "app_status", "lceda_pro_status",
-    "lceda_pro_open", "lceda_pro_recover",
+    "lceda_pro_open", "lceda_pro_recover", "lceda_pro_verify",
     # calc / rules
     "unit_convert", "width_for_current", "current_capacity", "via_resistance",
     "via_current_allowed", "trace_impedance", "width_for_impedance",

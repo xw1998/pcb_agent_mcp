@@ -606,11 +606,35 @@ def _child_env():
     dropped = [k for k in _DROP_FROM_CHILD_ENV if env.pop(k, None) is not None]
     return env, dropped
 
-def launch(exe, args=None):
-    """Start an exe detached from this process's job, so it outlives the MCP call."""
+def launch(exe, args=None, app=None, allow_second=False):
+    """Start an exe detached from this process's job, so it outlives the MCP call.
+
+    `app` is optional but should always be given for a known application: it turns
+    this into a one-instance launcher. Measured failure this exists for: calling
+    launch() for an editor that was already up produced a second window that shared
+    no state with the first and competed for the same pipe name, and the original
+    window silently stopped being the one being driven. Starting another process is
+    therefore a decision, not a default - `allow_second` is the way to say it on
+    purpose.
+    """
     if not exe or not os.path.isfile(exe):
         return {"status": "error", "reason_code": "EXE_NOT_FOUND",
                 "message": "executable not found: %r" % exe}
+    running = []
+    if app and not allow_second:
+        running = [i for i in _instances(app) if i.get("has_window")]
+        if running:
+            return {"status": "error", "reason_code": "ALREADY_RUNNING",
+                    "message": "%s is already running (%d window(s): %s) - a second "
+                               "instance would share nothing with it"
+                               % (app, len(running),
+                                  ", ".join("pid %s %r" % (i["pid"], i["title"])
+                                            for i in running[:3])),
+                    "hint": "use the running window (app_open_project reuses it when "
+                            "the title already names the project), or close it first; "
+                            "pass allow_second=true only if two copies is what you want",
+                    "instances": [{"pid": i["pid"], "title": i["title"],
+                                   "project": i["project"]} for i in running]}
     cmd = [exe] + list(args or [])
     env, dropped = _child_env()
     base = 0
@@ -724,7 +748,7 @@ def open_project(app, path, reuse=True, wait=25.0):
         return {"status": "error", "reason_code": "APP_NOT_INSTALLED",
                 "message": "%s not found on this machine" % spec["display"],
                 "tried": found.get("tried")}
-    started = launch(found["exe"], [path])
+    started = launch(found["exe"], [path], app=app)
     if started.get("status") != "ok":
         return started
     deadline = time.monotonic() + float(wait)
