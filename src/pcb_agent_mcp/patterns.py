@@ -391,7 +391,7 @@ def plan_layout(ident, x_mm=None, y_mm=None, rotation_deg=0.0, mirror=False):
 
     Returns coordinates, not a board. Nothing is written; the caller decides.
     """
-    entry = get(ident, touch=True)
+    entry = get(ident)
     if entry.get("kind") != "layout":
         raise ValueError("%s is a %s, not a layout" % (ident, entry.get("kind")))
     if entry.get("status") != "verified":
@@ -399,6 +399,10 @@ def plan_layout(ident, x_mm=None, y_mm=None, rotation_deg=0.0, mirror=False):
             "%s is %r: a candidate layout has not been checked against a board yet, "
             "so planning from it would produce coordinates nobody vouched for"
             % (ident, entry.get("status")))
+    # Counted as a use only after the refusal above: a plan that was rejected
+    # never placed anything, and counting it would make "used N times" a count of
+    # attempts rather than of applications.
+    entry = get(ident, touch=True)
     if not _is_number(x_mm) or not _is_number(y_mm):
         raise ValueError("x_mm and y_mm are required: the plan needs the place the "
                          "anchor really goes")

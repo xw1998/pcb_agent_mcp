@@ -4852,12 +4852,29 @@ def _capabilities(_args):
                           "needs confirm=true and a human reason), learn from the "
                           "board it is checking (experience_check writes nothing), "
                           "or cover anything the seven metrics do not measure - no "
-                          "impedance, no EMC, no placement. The seed numbers come "
+                          "impedance, no EMC, no placement. A board IS learned from, "
+                          "but by a different call: experience_harvest measures one "
+                          "board and writes its readings down as candidates (and a "
+                          "counterexample where it disagrees with an active habit), "
+                          "while experience_check itself still writes nothing. The "
+                          "seed numbers come "
                           "from 20 real LCEDA-Pro boards with copper (16522 track "
                           "segments, 12805 vias, plus 6 packed projects for the pad "
                           "rules) and are read-only: a "
                           "shipped number that a local edit could change is not "
                           "evidence",
+            "patterns": "artefacts a person applies again, separate from the rules "
+                        "above: a RECIPE (a solution with the numbers that made it "
+                        "work - every parameter must carry a source, because a bare "
+                        "number is a guess and a reused guess is worse than no "
+                        "library) and a LAYOUT (where parts sat, in mm from one "
+                        "anchor element). A candidate is never applied: "
+                        "pattern_verify needs confirm=true, a reason and at least one "
+                        "{from, reading}. pattern_layout_plan turns a verified layout "
+                        "into absolute coordinates and reports what would collide "
+                        "(outside the outline, a reference already on the board, "
+                        "closer than min_gap_mm) - it writes no board, because this "
+                        "server has no automatic placement",
             "parts": "the real part catalogue, not a part generator. Offline it reads "
                      "the SQLite library LCEDA Pro ships (lceda-std.elib: 16k devices, "
                      "21k symbol/footprint documents, 385k attribute rows with real "
@@ -10936,6 +10953,14 @@ def _experience_report(args):
                           % (len(got["unverified"]), ", ".join(got["unverified"])))
     else:
         out["message"] = "no hard violation on this board"
+    # The next step that keeps the library from going quiet again: the same board
+    # can be written down with the same code that just checked it.
+    out["next_step"] = ("experience_harvest path=%r writes this board's own readings "
+                        "down as candidates (and a counterexample where it disagrees "
+                        "with an active habit); nothing it writes is applied until "
+                        "experience_promote(confirm=true, reason=...) - see "
+                        "experience_status for what is waiting"
+                        % (args.get("path"),))
     return out
 
 _tool(
