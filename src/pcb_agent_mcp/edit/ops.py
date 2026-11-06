@@ -456,6 +456,63 @@ op("add_outline_polygon", {"outline"},
    {"points": "[[x,y], ...] mm Y-up, >= 3 points", "width": "mm"},
    _run_outline_polygon, _verify_outline_polygon)
 
+def _run_set_board_outline_polygon(ed, o, seed):
+    """Replace the board edge with ONE closed polygon.
+
+    `set_board_outline` can only write a rectangle, so an arbitrarily shaped
+    board (rounded corners, a notched outline, the shape a real enclosure
+    forces) could not be produced by the gated path at all: it had to be
+    hand-edited outside every gate. Two outlines on one board is not a
+    cosmetic problem - every rule that reads Edge.Cuts sees two boards.
+    """
+    removed = 0
+    for node in list(ed.edge_items()):
+        if S.head(node) not in ("gr_line", "gr_arc", "gr_rect", "gr_circle",
+                                "gr_poly", "gr_curve"):
+            continue
+        ed.remove(node)
+        removed += 1
+    points = _points(o)
+    if len(points) < 3:
+        raise OpError("outline polygon needs at least 3 points", "ARG_INVALID")
+    w = _width(o, ed, default=0.1)
+    if points[0] != points[-1]:
+        points = points + [points[0]]
+    nodes = _polygon_nodes(points, OUTLINE_LAYER, w, ed.sp, seed, close=True)
+    for n in nodes:
+        ed.append(n)
+    return {"nodes_removed": removed, "nodes_added": len(nodes),
+            "vertices": len(points) - 1}
+
+def _verify_set_board_outline_polygon(ed, o, record=None):
+    points = _points(o)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    edge = list(ed.edge_items())
+    polys = [n for n in edge if S.head(n) == "gr_poly"]
+    ok = len(edge) == 1 and len(polys) == 1
+    got = None
+    if len(polys) == 1:
+        pts_node = S.child(polys[0], "pts")
+        if pts_node is not None:
+            got = [(round(S.arg_num(p, 1, 0.0), 4), round(-S.arg_num(p, 2, 0.0), 4))
+                   for p in S.children(pts_node, "xy")]
+    if got:
+        ok = ok and abs(max(x for x, _ in got) - max(xs)) < 1e-3 \
+                and abs(min(y for _, y in got) - min(ys)) < 1e-3 \
+                and abs(max(y for _, y in got) - max(ys)) < 1e-3 \
+                and abs(min(x for x, _ in got) - min(xs)) < 1e-3
+    return {"ok": bool(ok), "edge_items": len(edge), "polygons": len(polys),
+            "expected_bbox": [min(xs), min(ys), max(xs), max(ys)]}
+
+op("set_board_outline_polygon", {"outline"},
+   "Replace the board edge with ONE closed polygon on Edge.Cuts: the old "
+   "Edge.Cuts geometry is removed first, then the polygon is written. This is "
+   "the only way to give a board a shape that is not a rectangle (rounded or "
+   "notched outline) without leaving a second outline behind.",
+   {"points": "[[x,y], ...] mm Y-up, >= 3 points", "width": "mm (default 0.1)"},
+   _run_set_board_outline_polygon, _verify_set_board_outline_polygon)
+
 def _run_outline_circle(ed, o, seed):
     cx, cy = _num(o, "cx"), _num(o, "cy")
     r = _num(o, "r", positive=True)

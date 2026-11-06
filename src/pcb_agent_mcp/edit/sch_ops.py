@@ -287,6 +287,12 @@ def stroke(width=0, kind="default"):
     return L(A("stroke"), L(A("width"), A(num(width))),
              L(A("type"), A(kind)))
 
+# KiCad renders these fields hidden by default: they are data, not silkscreen.
+# Footprint used to be written visible, which dumped the footprint UUID / name
+# onto the drawing as a floating string.
+_HIDDEN_FIELDS = ("Footprint", "Datasheet", "Description")
+
+
 def effects(size=1.27, justify=None, hide=False, bold=False, italic=False):
     font = [A("font"), L(A("size"), A(num(size)), A(num(size)))]
     if bold:
@@ -849,7 +855,7 @@ def _run_add_symbol(ed, o, seed):
             continue
         seen.add(name)
         written.append(prop(name, str(value), x, y - 2.54, 0,
-                            hide=name in ("Datasheet", "Description")))
+                            hide=name in _HIDDEN_FIELDS))
     # Reference and Value must exist even if the library did not declare them
     for name in ("Reference", "Value"):
         if name not in seen:
@@ -951,7 +957,7 @@ def _run_set_symbol_field(ed, o, seed):
     at_node = S.child(node, "at")
     x = S.arg_num(at_node, 1, 0.0)
     y = S.arg_num(at_node, 2, 0.0)
-    hide = field in ("Datasheet", "Description")
+    hide = field in _HIDDEN_FIELDS
     S.append_child(node, prop(field, value, x, y - 2.54, 0, hide=hide))
     return {"reference": reference, "field": field, "old": None, "new": value,
             "field_created": True,

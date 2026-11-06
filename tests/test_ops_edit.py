@@ -466,6 +466,26 @@ class ZoneParams(EditBase):
                         "clearance": 0.3})
         self.assertEqual(ctx.exception.code, "TARGET_NOT_FOUND")
 
+    def test_a_keep_out_spells_out_every_rule_flag(self):
+        """A rule flag left out of the file is read by KiCad as not_allowed.
+
+        Measured on a 96-footprint clone: rule areas written with only
+        `(copperpour not_allowed)` raised 199 `items_not_allowed` errors on
+        ordinary tracks; spelling `(tracks allowed)` and friends out took them
+        to 0. So the gold content is not the one word asked for - it is the
+        five flags, four of them `allowed`.
+        """
+        self.apply({"op": "add_keepout", "layer": "F.Cu", "rules": ["copperpour"],
+                    "points": [[1, 1], [2, 1], [2, 2], [1, 2]]})
+        keepout = [z for z in self.editor().items("zone")
+                   if S.child(z, "keepout") is not None][0]
+        ko = S.child(keepout, "keepout")
+        got = {S.head(n): S.arg_text(n, 1) for n in ko.items[1:]
+               if isinstance(n, S.Seq)}
+        self.assertEqual(got, {"tracks": "allowed", "vias": "allowed",
+                               "pads": "allowed", "copperpour": "not_allowed",
+                               "footprints": "allowed"})
+
     def test_a_keep_out_has_no_fill_parameters(self):
         self.apply({"op": "add_keepout", "layer": "F.Cu",
                     "points": [[1, 1], [2, 1], [2, 2], [1, 2]]})
@@ -1307,3 +1327,38 @@ class TranslateBoard(EditBase):
         self.assertFalse(out["all_verified"], out)
         self.assertIn("not the ones the run computed",
                       " ".join(out["operations"][0]["detail"].get("problems") or []))
+
+
+class SetBoardOutlinePolygon(EditBase):
+    """`set_board_outline` only writes a rectangle.
+
+    A real enclosure forces a shape a rectangle cannot express (rounded
+    corners, a notch). Before this operation the only way was to hand-edit
+    Edge.Cuts outside every gate, and the failure mode of a half-done edit is
+    not cosmetic: two outlines on one board are two boards to every rule that
+    reads Edge.Cuts.
+    """
+
+    def test_replaces_the_edge_with_one_closed_polygon(self):
+        shape = [[2, 2], [18, 2], [18, 17], [2, 17], [10, 9]]
+        self.apply({"op": "set_board_outline_polygon", "points": shape})
+        edge = self.editor().edge_items()
+        # ONE item, not five: an unclosed polygon plus the old rectangle would
+        # read as two boards
+        self.assertEqual([S.head(n) for n in edge], ["gr_poly"])
+        got = [(round(S.arg_num(p, 1), 4), round(-S.arg_num(p, 2), 4))
+               for _path, p in S.walk(edge[0]) if S.head(p) == "xy"]
+        for x, y in shape:
+            self.assertIn((round(x, 4), round(y, 4)), got)
+        # the file stores y DOWN, so (10, 9) mm Y up is written `(xy 10 -9)`
+        self.assertIn((10.0, 9.0), got)
+        self.assertEqual(len(got), 6, got)  # 5 vertices + the closing one
+
+    def test_a_two_point_outline_is_refused(self):
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_board_outline_polygon",
+                        "points": [[0, 0], [10, 10]]})
+        self.assertEqual(ctx.exception.code, "ARG_INVALID")
+        # refused means the old edge is still there - a delete that ran before
+        # the check would leave the board with no edge at all
+        self.assertEqual(len(self.editor().edge_items()), 4)

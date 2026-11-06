@@ -190,8 +190,17 @@ def zone_polygon_conf(net_code, net_name, layer, points, sp, uid,
     items.append(sp.id_node(uid))
     items.append(L(A("hatch"), A("edge"), A(num(hatch))))
     if keepout is not None:
+        # Every rule flag has to be spelled out, allowed ones included. KiCad reads
+        # a MISSING flag as not_allowed (its parser defaults the whole mask to
+        # "prohibit" and then clears what it finds in the file), so writing only
+        # `(copperpour not_allowed)` really means "forbid tracks, vias and pads
+        # too". Measured on the 96-footprint clone board: 14 rule areas written
+        # the short way produced 199 `items_not_allowed` errors on ordinary
+        # tracks; the same 14 areas with the four `allowed` flags explicit gave 0.
+        _flags = ("tracks", "vias", "pads", "copperpour", "footprints")
         items.append(L(A("keepout"),
-                       *[L(A(rule), A("not_allowed")) for rule in keepout]))
+                       *[L(A(rule), A("not_allowed" if rule in keepout else "allowed"))
+                         for rule in _flags]))
     else:
         # a thermal relief is spelled by writing no mode word at all
         words = {"solid": "yes", "yes": "yes", "none": "no", "no": "no",

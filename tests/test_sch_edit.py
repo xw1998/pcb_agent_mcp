@@ -494,6 +494,17 @@ class TestSchOps(_Tmp):
         names = [S.arg_text(p, 1) for p in S.children(_node, "property")]
         self.assertIn("MPN", names)
 
+    def test_set_symbol_field_hides_the_footprint_field(self):
+        # KiCad draws Footprint/Datasheet/Description hidden: they are data, not
+        # silkscreen.  A visible Footprint field dumped its UUID across the page.
+        doc, _ = self.run_ops(schematic_text(with_symbol=True), [
+            {"op": "set_symbol_field", "reference": "R1", "field": "Footprint",
+             "value": "Lib:0402"}])
+        node, _entry = SO.SchEditor(doc).find_symbol("R1")
+        field = [p for p in S.children(node, "property")
+                 if S.arg_text(p, 1) == "Footprint"][0]
+        self.assertIsNotNone(S.child(S.child(field, "effects"), "hide"))
+
     def test_set_symbol_field_requires_an_explicit_value(self):
         with self.assertRaises(SO.OpError) as ctx:
             self.run_ops(schematic_text(with_symbol=True), [
