@@ -228,6 +228,53 @@ class TestPlanningIsArithmeticAndNothingElse(PatternCase):
         self.assertIn("outside the board outline", whys)
 
 
+class TestATemplateComesFromARealBoard(PatternCase):
+    """The loop for layouts: read a cluster off a board, then plan it somewhere else.
+
+    The sample board carries R1 at (110, -110) and C1 at (110, -120) in the canonical
+    view, so the offset is a fact that can be checked, not a number typed by hand.
+    """
+
+    def test_offsets_are_read_from_the_board_and_land_as_a_candidate(self):
+        out = tools.call_tool("pattern_layout_from_board",
+                              {"path": SAMPLE, "anchor_ref": "R1"})
+        self.assertEqual(out["status"], "ok", out)
+        entry = out["value"]["entry"]
+        self.assertEqual(entry["status"], "candidate")
+        rows = {e["ref"]: e for e in entry["elements"]}
+        self.assertTrue(rows["R1"]["anchor"])
+        self.assertAlmostEqual(rows["C1"]["dx_mm"], 0.0, places=4)
+        self.assertAlmostEqual(rows["C1"]["dy_mm"], -10.0, places=4)
+        self.assertEqual(out["value"]["coordinate_system"], "canonical (mm, Y up)")
+
+    def test_an_anchor_that_is_not_on_the_board_is_refused(self):
+        out = tools.call_tool("pattern_layout_from_board",
+                              {"path": SAMPLE, "anchor_ref": "U99"})
+        self.assertEqual(out["status"], "error")
+        self.assertIn("no footprint with reference", out["message"])
+
+    def test_a_cluster_of_one_is_not_a_layout(self):
+        out = tools.call_tool("pattern_layout_from_board",
+                              {"path": SAMPLE, "anchor_ref": "R1", "refs": ["R1"]})
+        self.assertEqual(out["status"], "error")
+        self.assertIn("at least one more part", out["message"])
+
+    def test_the_payload_goes_through_the_same_doors(self):
+        made = tools.call_tool("pattern_layout_from_board",
+                               {"path": SAMPLE, "anchor_ref": "R1"})["value"]["entry"]
+        added = tools.call_tool("pattern_add", {"kind": "layout", "entry": made})
+        self.assertEqual(added["status"], "ok", added)
+        self.assertEqual(added["value"]["entry"]["status"], "candidate")
+        self._verify(made["id"], reading="sample board, 2 footprints",
+                     where=SAMPLE)
+        plan = tools.call_tool("pattern_layout_plan",
+                               {"id": made["id"], "x_mm": 100, "y_mm": -100})
+        rows = {e["ref"]: e for e in plan["value"]["elements"]}
+        self.assertAlmostEqual(rows["C1"]["x_mm"], 100.0, places=4)
+        self.assertAlmostEqual(rows["C1"]["y_mm"], -110.0, places=4)
+        self.assertIn("Y up", plan["value"]["coordinate_system"])
+
+
 class TestIsItActuallyUsed(PatternCase):
 
     def test_uses_are_counted_and_unused_verified_entries_are_named(self):

@@ -120,6 +120,16 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
+def _slug(text):
+    keep = []
+    for ch in str(text or ""):
+        keep.append(ch.lower() if ch.isalnum() else "-")
+    out = "".join(keep).strip("-")
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out[:40] or "part"
+
+
 def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -376,6 +386,87 @@ def use(ident, outcome, note=None):
     return entry
 
 
+# --------------------------------------------------------- from a real board
+def from_board(board, anchor_ref, refs=None, radius_mm=None, ident=None,
+               title=None, klass=None):
+    """Turn a cluster that already exists on a board into a LAYOUT payload.
+
+    The offsets come from the parsed board, not from somebobdy reading a screenshot:
+    `dx = ref.x - anchor.x` in the canonical view (mm, Y up). That is a fact about
+    this one board, so the payload is a CANDIDATE by construction - it still has to
+    go through `pattern_verify` with a reading before anything can plan from it.
+
+    Returns the payload plus what was left out and why. A part with no position
+    is skipped by name rather than placed at (0, 0), because a missing coordinate
+    that silently becomes zero is how a template quietly turns into a pile.
+    """
+    footprints = list(getattr(board, "footprints", []) or [])
+    by_ref = {}
+    for fp in footprints:
+        ref = str(fp.get("ref") or "").strip()
+        if ref:
+            by_ref[ref] = fp
+    anchor = by_ref.get(str(anchor_ref or "").strip())
+    if anchor is None:
+        raise ValueError("no footprint with reference %r on this board (it carries: "
+                         "%s)" % (anchor_ref,
+                                   ", ".join(sorted(by_ref)[:12]) or "none"))
+    if anchor.get("x") is None or anchor.get("y") is None:
+        raise ValueError("the anchor %r has no position in the file" % anchor_ref)
+    ax, ay = float(anchor["x"]), float(anchor["y"])
+    wanted = [str(r).strip() for r in (refs or []) if str(r).strip()]
+    missing = [r for r in wanted if r not in by_ref]
+    elements, skipped = [], []
+    for fp in footprints:
+        ref = str(fp.get("ref") or "").strip()
+        if not ref or (wanted and ref not in wanted):
+            continue
+        if fp.get("x") is None or fp.get("y") is None:
+            skipped.append({"ref": ref, "why": "no position in the file"})
+            continue
+        dx = float(fp["x"]) - ax
+        dy = float(fp["y"]) - ay
+        if radius_mm is not None and _math.hypot(dx, dy) > float(radius_mm):
+            continue
+        layer = str(fp.get("layer") or "")
+        side = "bottom" if layer.startswith("B") else "top"
+        elements.append({
+            "role": (fp.get("value") or ref),
+            "ref": ref,
+            "dx_mm": round(dx, 4),
+            "dy_mm": round(dy, 4),
+            "rotation_deg": float(fp.get("rotation") or 0.0),
+            "side": side,
+            "anchor": ref == str(anchor_ref).strip(),
+        })
+    if len(elements) < 2:
+        raise ValueError("the cluster has %d element(s): a layout needs the anchor and "
+                         "at least one more part (refs=%s)"
+                         % (len(elements), ", ".join(wanted) or "radius only"))
+    name = ident or ("pat.layout.%s-cluster" % _slug(anchor_ref))
+    payload = {
+        "id": name,
+        "title": title or ("%s cluster taken from %s"
+                           % (anchor_ref, os.path.basename(str(
+                               (getattr(board, "source", None) or {}).get("path")
+                               or "a board")))),
+        "class": klass or "cluster",
+        "applies_to": {"anchor_ref": str(anchor_ref)},
+        "elements": elements,
+        "status": "candidate",
+        "constraints": {"min_gap_mm": None,
+                        "notes": "min_gap_mm was not measured; set it before "
+                                 "trusting the plan's collision report"},
+    }
+    return {"entry": payload, "skipped": skipped, "missing": missing,
+            "coordinate_system": "canonical (mm, Y up)",
+            "read_from": (getattr(board, "source", None) or {}).get("path"),
+            "status": "candidate",
+            "why_a_candidate": ("these offsets are a fact about one board; they "
+                                "become a template only after pattern_verify with a "
+                                "reading behind it")}
+
+
 # ----------------------------------------------------------------- geometry
 def rotate(dx, dy, degrees):
     """Rotate an offset about the origin. Positive degrees turn the same way
@@ -429,6 +520,10 @@ def plan_layout(ident, x_mm=None, y_mm=None, rotation_deg=0.0, mirror=False):
         })
     return {"id": ident, "title": entry.get("title"), "elements": placed,
             "constraints": entry.get("constraints") or {},
+            "coordinate_system": "canonical (mm, Y up)",
+            "y_note": ("a KiCad file stores Y downward, so a write path that takes "
+                       "file coordinates has to negate Y; this answer never converts "
+                       "silently"),
             "writes_nothing": True}
 
 

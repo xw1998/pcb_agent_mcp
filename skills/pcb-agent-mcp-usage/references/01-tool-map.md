@@ -257,12 +257,13 @@
 - `experience_harvest` — Read ONE board and write down what it says, as candidates (single-board metrics only; a hard rule is refused).
 - `experience_status` — Is the library alive: active count, candidates nobody confirmed, file mtime.
 
-## 方案与布局库（6）
+## 方案与布局库（7）
 
 - `pattern_recall` — Read recipes (parameters + steps + a reading) and layouts (mm offsets from one anchor).
 - `pattern_add` — Write a recipe or layout as a CANDIDATE; a parameter without a source is refused.
 - `pattern_verify` — candidate -> verified; needs confirm=true, a reason, and at least one {from, reading}.
 - `pattern_layout_plan` — Absolute coordinates for one board from a verified layout, plus what would collide; writes nothing.
+- `pattern_layout_from_board` — Read a cluster off a real board into a layout payload (candidate).
 - `pattern_use` — Record worked/failed after applying an artefact.
 - `pattern_status` — Counts, and which verified entries have never been applied.
 

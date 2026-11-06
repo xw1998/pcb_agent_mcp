@@ -5008,7 +5008,8 @@ def _capabilities(_args):
             "experience_promote", "experience_outcome", "experience_export",
             "experience_import", "experience_harvest", "experience_status",
             "pattern_recall", "pattern_add", "pattern_verify",
-            "pattern_layout_plan", "pattern_use", "pattern_status",
+            "pattern_layout_plan", "pattern_layout_from_board", "pattern_use",
+            "pattern_status",
         ],
         "fail_closed_pending_data": {
             "creepage_required": "only for safety_standard families other than "
@@ -11533,6 +11534,59 @@ def _pattern_layout_plan(args):
                                             "counts as a use, the board does not "
                                             "change",
                            "auto_placement": "not implemented by design"})
+
+
+_tool(
+    "pattern_layout_from_board",
+    "Turn a cluster that already exists on a real board into a layout payload: every "
+    "part's offset from one anchor, read from the parsed board rather than from a "
+    "screenshot. What comes back is a CANDIDATE payload - these offsets are a fact "
+    "about one board, and they become a template only after pattern_add + "
+    "pattern_verify with a reading behind it. Nothing is written: the payload is "
+    "returned so it can be inspected before it is stored.",
+    {"type": "object",
+     "properties": dict({
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "anchor_ref": _str("reference designator the offsets are measured from"),
+         "refs": _arr("only these references (default: everything within radius_mm)"),
+         "radius_mm": _num("keep parts within this distance of the anchor"),
+         "id": _str("entry id to use (default pat.layout.<anchor>-cluster)"),
+         "title": _str("title for the payload"),
+         "class": _str("class tag, e.g. mcu_cluster / usb_c / qspi"),
+     }, **{"member": _str("member inside an .epro archive"),
+          "project": _str("project directory inside an .epro archive")}),
+     "required": ["path", "anchor_ref"]},
+    lambda a: _guarded(lambda: _pattern_layout_from_board(a)),
+)
+
+
+def _pattern_layout_from_board(args):
+    pat, e = _patterns()
+    if e:
+        return e
+    board, e = _load_board(args)
+    if e:
+        return e
+    try:
+        got = pat.from_board(board, args.get("anchor_ref"), refs=args.get("refs"),
+                            radius_mm=args.get("radius_mm"),
+                            ident=args.get("id"), title=args.get("title"),
+                            klass=args.get("class"))
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    out = ok(got, "layout payload",
+             model="offsets read from the parsed board (canonical mm, Y up), one anchor",
+             basis="the board's own footprint positions; nothing was measured by hand",
+             precision="positions to 1e-4 mm; the file's own rotation is carried "
+                       "verbatim",
+             assumptions={"writes_nothing": True, "applied": False})
+    out["next_step"] = ("inspect it, then pattern_add kind='layout' entry=<this entry>; "
+                        "planning from it needs pattern_verify(confirm=true, reason, "
+                        "evidence)")
+    if got.get("missing"):
+        out["message"] = ("%d requested reference(s) are not on this board: %s"
+                          % (len(got["missing"]), ", ".join(got["missing"])))
+    return out
 
 
 _tool(
