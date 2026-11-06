@@ -261,11 +261,27 @@ class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
         self.assertEqual(transport.calls[1][1]["session"], "s2")
 
     def test_a_probe_that_cannot_run_is_not_loaded(self):
-        transport = FakeTransport([L.LiveError("APP_TIMEOUT", "no reply")])
+        # A getter that never settles takes the whole probe down; the cheap fallback
+        # still answers, so the two facts that are knowable are not lost with it.
+        transport = FakeTransport([L.LiveError("APP_TIMEOUT", "no reply"),
+                                   _ok({"projectCount": 4,
+                                        "workspace": {"uuid": "Personal"}})])
         client = L.Client(transport)
         state = client.project_state("s1")
         self.assertFalse(state["loaded"])
-        self.assertEqual(state["why"], "APP_TIMEOUT: no reply")
+        self.assertEqual(state["project_count"], 4)
+        self.assertEqual(state["workspace"], {"uuid": "Personal"})
+        self.assertIn("APP_TIMEOUT: no reply", state["why"])
+        self.assertIn("render is blocked", state["why"])
+
+    def test_a_fallback_that_also_fails_still_answers(self):
+        transport = FakeTransport([L.LiveError("APP_TIMEOUT", "no reply"),
+                                   L.LiveError("APP_TIMEOUT", "no reply")])
+        client = L.Client(transport)
+        state = client.project_state("s1")
+        self.assertFalse(state["loaded"])
+        self.assertIsNone(state["project_count"])
+        self.assertIn("never answered", state["why"])
 
     def test_an_editor_that_stops_answering_after_open_is_reported_not_returned(self):
         transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),

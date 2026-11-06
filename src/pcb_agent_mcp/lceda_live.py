@@ -111,6 +111,20 @@ PROBE_JS = (
     "}catch(e){}"
     "return o;"
 )
+# Fallback when the full probe does not answer in budget. Measured on 4.1.60 with
+# nothing loaded: `await getCurrentProjectInfo()` never resolves (no rejection, no
+# value), so the combined probe times out and would otherwise take the two answers
+# that DO come back down with it. These two are cheap and always answered.
+CHEAP_PROBE_JS = (
+    "var o={};"
+    "try{var u=await eda.dmt_Project.getAllProjectsUuid();u=u||[];"
+    "o.projectCount=(typeof u.length==='number')?u.length:Object.keys(u).length;"
+    "}catch(e){o.error=String(e&&e.message||e);}"
+    "try{var w=await eda.dmt_Workspace.getCurrentWorkspaceInfo();o.workspace=w||null;"
+    "}catch(e){}"
+    "return o;"
+)
+
 _PROBE_JS = PROBE_JS
 
 # Vendor error codes this module passes through unchanged (they are facts about
@@ -381,8 +395,29 @@ class Client(object):
         try:
             out = self.invoke(session, _PROBE_JS, timeout_ms=int(timeout_s * 1000))
         except LiveError as exc:
-            return {"loaded": False, "session": session, "why": "%s: %s"
-                    % (exc.code, exc.message)}
+            # Do not lose the two facts that are still answerable. A hanging
+            # getCurrentProjectInfo() is itself the reading: with nothing loaded the
+            # promise never settles on 4.1.60.
+            cheap = {}
+            try:
+                cheap = (self.invoke(session, CHEAP_PROBE_JS,
+                                     timeout_ms=int(timeout_s * 1000))
+                         .get("value") or {})
+            except LiveError:
+                cheap = {}
+            count = cheap.get("projectCount")
+            if count == 0:
+                why = ("the project getter never answered (%s: %s) and the client's "
+                       "workspace lists 0 projects - there is nothing to load"
+                       % (exc.code, exc.message))
+            else:
+                why = ("the project getter never answered (%s: %s) while the workspace "
+                       "lists %s project(s) - the render is blocked, most likely by a "
+                       "modal dialog" % (exc.code, exc.message, count))
+            return {"loaded": False, "session": session, "project_keys": [],
+                    "project": None, "pcb_count": None, "project_count": count,
+                    "workspace": cheap.get("workspace"), "probe_error": exc.code,
+                    "why": why}
         value = out.get("value") or {}
         project = value.get("project")
         keys = list(value.get("projectKeys") or
