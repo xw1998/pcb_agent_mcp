@@ -446,6 +446,31 @@ class TestSchOps(_Tmp):
         self.assertEqual(len(doc.items("bus")), 1)
         self.assertEqual(len(doc.items("bus_entry")), 1)
 
+    def test_arc_and_circle(self):
+        doc, recs = self.run_ops(schematic_text(), [
+            {"op": "add_arc", "start_x": 1, "start_y": 1, "mid_x": 2,
+             "mid_y": 0, "end_x": 3, "end_y": 1},
+            {"op": "add_circle", "center_x": 10, "center_y": 10,
+             "radius": 2.5}])
+        arc = doc.items("arc")[0]
+        self.assertEqual(S.arg_num(S.child(arc, "mid"), 1), 2)
+        self.assertEqual(S.arg_num(S.child(arc, "mid"), 2), 0)
+        self.assertIsNotNone(S.child(arc, "stroke"))
+        circ = doc.items("circle")[0]
+        self.assertEqual(S.arg_num(S.child(circ, "radius"), 1), 2.5)
+        self.assertEqual([r["detail"].get("uuid") is not None for r in recs],
+                         [True, True])
+
+    def test_arc_refuses_degenerate_input(self):
+        with self.assertRaises(SO.OpError):
+            self.run_ops(schematic_text(), [
+                {"op": "add_arc", "start_x": 1, "start_y": 1, "mid_x": 2,
+                 "mid_y": 0, "end_x": 1, "end_y": 1}])
+        with self.assertRaises(SO.OpError):
+            self.run_ops(schematic_text(), [
+                {"op": "add_circle", "center_x": 1, "center_y": 1,
+                 "radius": 0}])
+
     def test_add_symbol_embeds_the_definition_and_annotates(self):
         doc, recs = self.run_ops_from_file(schematic_text(), [
             {"op": "add_symbol", "lib_id": "Test:NEWR", "x": 100, "y": 100,

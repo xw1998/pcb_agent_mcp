@@ -685,6 +685,81 @@ op("add_rectangle", ["text"],
     "width": "default 0", "fill": "none|outline|background"},
    _run_add_rectangle, _verify_add_rectangle)
 
+
+def _run_add_arc(ed, o, seed):
+    x0, y0 = _xy(o, "start_")
+    xm, ym = _xy(o, "mid_")
+    x1, y1 = _xy(o, "end_")
+    if (round(x0, 6), round(y0, 6)) == (round(x1, 6), round(y1, 6)):
+        raise OpError("arc start and end are the same point", "ARG_INVALID")
+    width = _num(o, "width", required=False, default=0)
+    node = L(A("arc"), L(A("start"), A(num(x0)), A(num(y0))),
+             L(A("mid"), A(num(xm)), A(num(ym))),
+             L(A("end"), A(num(x1)), A(num(y1))),
+             stroke(width, _str(o, "stroke_type", required=False, default="default")),
+             L(A("fill"), L(A("type"), A(_str(o, "fill", required=False,
+                                             default="none")))),
+             ed.sp.id_node(ed.uid()))
+    ed.add_object(node)
+    return {"uuid": _id(node), "start": [x0, y0], "mid": [xm, ym],
+            "end": [x1, y1]}
+
+def _verify_add_arc(ed, o):
+    pts = [(_xy(o, "start_"), "start"), (_xy(o, "mid_"), "mid"),
+           (_xy(o, "end_"), "end")]
+    for node in ed.doc.items("arc"):
+        ok = True
+        for (x, y), role in pts:
+            n = S.child(node, role)
+            if n is None or abs(S.arg_num(n, 1) - x) > 1e-4 \
+                    or abs(S.arg_num(n, 2) - y) > 1e-4:
+                ok = False
+                break
+        if ok:
+            return {"ok": True, "uuid": _id(node)}
+    return {"ok": False, "error": "no arc with those start/mid/end points"}
+
+op("add_arc", ["text"],
+   "Arc graphic (not a wire) - three points, KiCad derives the centre itself.",
+   {"start_x": "mm", "start_y": "mm", "mid_x": "mm", "mid_y": "mm",
+    "end_x": "mm", "end_y": "mm", "width": "default 0",
+    "fill": "none|outline|background", "stroke_type": "default|solid|dash|..."},
+   _run_add_arc, _verify_add_arc)
+
+def _run_add_circle(ed, o, seed):
+    cx, cy = _xy(o, "center_")
+    radius = _num(o, "radius")
+    if radius <= 0:
+        raise OpError("radius must be > 0, got %r" % (radius,), "ARG_INVALID")
+    width = _num(o, "width", required=False, default=0)
+    node = L(A("circle"), L(A("center"), A(num(cx)), A(num(cy))),
+             L(A("radius"), A(num(radius))),
+             stroke(width, _str(o, "stroke_type", required=False, default="default")),
+             L(A("fill"), L(A("type"), A(_str(o, "fill", required=False,
+                                             default="none")))),
+             ed.sp.id_node(ed.uid()))
+    ed.add_object(node)
+    return {"uuid": _id(node), "center": [cx, cy], "radius": radius}
+
+def _verify_add_circle(ed, o):
+    cx, cy = _xy(o, "center_")
+    radius = _num(o, "radius")
+    for node in ed.doc.items("circle"):
+        c, r = S.child(node, "center"), S.child(node, "radius")
+        if c is None or r is None:
+            continue
+        if (abs(S.arg_num(c, 1) - cx) < 1e-4 and abs(S.arg_num(c, 2) - cy) < 1e-4
+                and abs(S.arg_num(r, 1) - radius) < 1e-4):
+            return {"ok": True, "uuid": _id(node)}
+    return {"ok": False, "error": "no circle with that centre and radius"}
+
+op("add_circle", ["text"],
+   "Circle graphic (not a wire).",
+   {"center_x": "mm", "center_y": "mm", "radius": "mm, > 0",
+    "width": "default 0", "fill": "none|outline|background",
+    "stroke_type": "default|solid|dash|..."},
+   _run_add_circle, _verify_add_circle)
+
 # ---------------------------------------------------------------- symbols
 def _pin_numbers(definition):
     """Pin numbers declared by a library symbol, in declaration order."""

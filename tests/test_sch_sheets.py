@@ -485,9 +485,10 @@ class TestSheetOps(_Tmp):
 
     def test_the_four_sheet_ops_are_in_the_catalogue(self):
         names = {o["op"] for o in E.describe_sch_ops()}
-        for op in ("add_sheet", "add_sheet_pin", "set_sheet_field", "delete_sheet"):
+        for op in ("add_sheet", "add_sheet_pin", "set_sheet_field", "delete_sheet",
+                   "add_arc", "add_circle"):
             self.assertIn(op, names)
-        self.assertEqual(len(names), 22)
+        self.assertEqual(len(names), 24)
 
     def test_an_edit_inserts_a_block_and_leaves_every_other_byte_alone(self):
         root = self.project()
