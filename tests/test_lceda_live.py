@@ -1023,5 +1023,61 @@ class TheRunningEditorAnswersForReal(unittest.TestCase):
         self.assertEqual(mapping.get("DMT_Pcb"), "dmt_Pcb")
 
 
+class TestTheProjectFileItselfSaysWhatIsInIt(unittest.TestCase):
+    """A timed-out document list is not an empty project.
+
+    Measured 2026-11-07: `getAllPcbsInfo()` timed out against a project whose own
+    database names two PCBs. The file is readable while the editor is not, so it is
+    used as corroboration - never as a substitute for the in-app answer.
+    """
+
+    def _write(self, rows):
+        import json as _json
+        import sqlite3
+        import tempfile
+        handle = tempfile.NamedTemporaryFile(suffix=".eprj2", delete=False)
+        handle.close()
+        con = sqlite3.connect(handle.name)
+        con.execute("create table project_structures (id integer primary key, "
+                    "ticket text, project_uuid text, branch_uuid text, structure text)")
+        for index, structure in enumerate(rows):
+            con.execute("insert into project_structures values (?,?,?,?,?)",
+                        (index + 1, "t", "p", "b", _json.dumps(structure)))
+        con.commit()
+        con.close()
+        return handle.name
+
+    def test_the_newest_row_decides_and_pcbs_are_counted(self):
+        old = {"pcbs": {}, "schematics": {}}
+        new = {"pcbs": {"a": {"uuid": "a", "title": "PCB1"},
+                        "b": {"uuid": "b", "title": "PCB2"}},
+               "schematics": {"s": {"uuid": "s", "name": "Schematic1"}},
+               "sheets": {"h": {"uuid": "h", "title": "P1"}},
+               "boards": {"d": {"uuid": "d", "title": "Board1"}},
+               "panels": {}}
+        path = self._write([old, new])
+        try:
+            reading = L.project_structure(path)
+        finally:
+            os.unlink(path)
+        self.assertTrue(reading["readable"])
+        self.assertEqual(reading["row_id"], 2)
+        self.assertEqual(reading["counts"]["pcbs"], 2)
+        self.assertEqual(reading["counts"]["schematics"], 1)
+        self.assertEqual(reading["counts"]["panels"], 0)
+        self.assertEqual([p["name"] for p in reading["pcbs"]], ["PCB1", "PCB2"])
+
+    def test_a_file_that_is_not_a_project_database_says_so(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".epro2", delete=False) as handle:
+            handle.write(b"PK\x03\x04" + b"\x00" * 32)
+            path = handle.name
+        try:
+            reading = L.project_structure(path)
+        finally:
+            os.unlink(path)
+        self.assertFalse(reading["readable"])
+        self.assertIn("database", reading["why"].lower())
+
 if __name__ == "__main__":
     unittest.main()

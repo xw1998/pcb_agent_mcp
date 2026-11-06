@@ -406,6 +406,61 @@ def sqlite_version(path):
         pass
     return version, tables
 
+def project_structure(path):
+    """What documents the project holds, read from the project database itself.
+
+    Measured 2026-11-07 on D:\\lcedapro\\project\\F412RG \u6838\u5fc3\u677f LCEDA.eprj2: the
+    `project_structures` table carries the editor's own view of the project -
+    `{"boards":{...},"schematics":{...},"sheets":{...},"pcbs":{...},"panels":{...}}` -
+    and it names two PCBs (PCB1, PCB2) for a project whose in-app
+    `getAllPcbsInfo()` had just timed out. That matters twice: a timeout is not
+    an empty project, and this file can be read without the editor running at all.
+
+    Only the newest row counts (id is monotonic; older rows are snapshots).
+    """
+    empty = {"readable": False, "why": "not a SQLite project database"}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path).replace("\\", "/"),
+                              uri=True)
+    except Exception as exc:
+        return dict(empty, why="cannot open as SQLite: %s" % exc)
+    try:
+        tables = [str(row[0]) for row in
+                  con.execute("select name from sqlite_master where type='table'")]
+        if "project_structures" not in tables:
+            return dict(empty, why="no project_structures table (tables: %s)"
+                                 % ", ".join(tables[:12]))
+        row = con.execute("select id, ticket, structure from project_structures "
+                          "order by id desc limit 1").fetchone()
+    except Exception as exc:
+        return dict(empty, why="query failed: %s" % exc)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    if not row:
+        return dict(empty, readable=True, why="project_structures is empty")
+    try:
+        structure = json.loads(row[2]) if isinstance(row[2], str) else {}
+    except ValueError as exc:
+        return dict(empty, readable=True, why="structure is not JSON: %s" % exc)
+    out = {"readable": True, "row_id": row[0], "ticket": row[1],
+           "boards": [], "schematics": [], "sheets": [], "pcbs": [], "panels": []}
+    for key, label in (("boards", "title"), ("schematics", "name"),
+                       ("sheets", "title"), ("pcbs", "title"), ("panels", "title")):
+        for uuid, doc in (structure.get(key) or {}).items():
+            if not isinstance(doc, dict):
+                continue
+            out[key].append({"uuid": doc.get("uuid") or uuid,
+                             "name": doc.get(label),
+                             "board": doc.get("board"),
+                             "schematic": doc.get("schematic_uuid"),
+                             "update_time": doc.get("updateTime")})
+    out["counts"] = {key: len(out[key]) for key in
+                     ("boards", "schematics", "sheets", "pcbs", "panels")}
+    return out
+
 def project_container(path):
     """What the file on disk is: container, format version, whether an upgrade ask is due.
 
@@ -546,6 +601,11 @@ def projects_on_disk(user_data=None, limit=200, deep=True, max_depth=2):
                     entry["container"] = container.get("container")
                     entry["db_version"] = container.get("db_version")
                     entry["needs_upgrade"] = container.get("needs_upgrade")
+                    if container.get("container") == "sqlite":
+                        try:
+                            entry["docs"] = project_structure(full).get("counts")
+                        except Exception as exc:
+                            entry["docs"] = {"error": str(exc)}
                 found.append(entry)
                 if len(found) >= limit:
                     errors.append({"path": base, "error": "stopped at limit %d" % limit})

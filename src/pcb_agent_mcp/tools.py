@@ -1259,6 +1259,27 @@ def _lceda_pro_verify(args):
         client.close()
     report["project"] = state
     report["connected"] = bool(state.get("loaded"))
+    if report.get("title_project") and (state.get("pcb_error") or state.get("sch_error")):
+        # One list timing out does not make the project empty, but it does leave a
+        # number unmeasured. The project file itself holds the same structure, so
+        # it is read from disk as corroboration - never as a substitute for the
+        # in-app answer, and labelled as coming from the file.
+        try:
+            disk = _live.projects_on_disk(limit=400)
+            match = [p for p in disk.get("projects") or []
+                     if (p.get("name") or "").strip().casefold()
+                     == str(report["title_project"]).strip().casefold()]
+            if match:
+                structure = _live.project_structure(match[0]["path"])
+                report["disk_structure"] = {
+                    "path": match[0]["path"],
+                    "source": match[0].get("source"),
+                    "counts": structure.get("counts"),
+                    "readable": structure.get("readable"),
+                    "why": "read from the project file on disk, not from the app; "
+                           "the in-app list that timed out stays unmeasured"}
+        except Exception as exc:  # a corroboration must never break the answer
+            report["disk_structure"] = {"error": str(exc)}
     if state.get("loaded") and report.get("title_project"):
         report["title_agrees"] = True
     elif not state.get("loaded") and report.get("title_project"):
@@ -1282,8 +1303,10 @@ def _lceda_pro_verify(args):
     return ok(report, "pipe state, the editor's own session list and the app's own "
                       "project object",
               _LIVE_MODEL, _LIVE_BASIS,
-              "loaded=true means getCurrentProjectInfo() returned a non-empty object; "
-              "it does not prove which document is active inside the project",
+              "loaded=true means a live session answered the document lists with at "
+              "least one PCB or schematic; it does not prove which document is active "
+              "inside the project, and a list that timed out is reported as "
+              "unmeasured (pcb_error/sch_error), never as zero",
               {"not_run": "no write, no open, no close"},
               {"endpoint": report["answering"], "verified_against_app": True})
 
