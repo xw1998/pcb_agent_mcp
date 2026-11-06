@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import time
 
 from . import jsonsafe as _jsonsafe
 from . import geometry as G
@@ -1005,8 +1006,9 @@ def _lceda_pro_open(args):
         return _live_error(exc)
     try:
         value = client.open_project(args.get("path"),
-                                    headless=bool(args.get("headless", True)),
-                                    timeout_s=float(args.get("open_timeout_s") or 45.0))
+                                    headless=bool(args.get("headless", False)),
+                                    timeout_s=float(args.get("open_timeout_s") or 45.0),
+                                    canary_s=float(args.get("canary_s") or 3.0))
     except _live.LiveError as exc:
         return _live_error(exc)
     finally:
@@ -1018,8 +1020,80 @@ def _lceda_pro_open(args):
                         "the project bytes were not compared before and after, so "
                         "treat 'open does not modify the project' as unproven",
         "headless": "headless=true still creates a live session in the running app; "
-                    "it does not hide the editor window",
-    }, verified=True)
+                    "it does not hide the editor window. It now defaults to false: a "
+                    "headless open of a 32 MB project was measured once leaving the "
+                    "editor with no render process and a bridge that never answers "
+                    "again (see APP_DIED_DURING_OPEN). The mechanism is unknown, so "
+                    "this is a risk being avoided, not a cause being fixed",
+        "liveness canary": "a ping runs before and after the open, so a session id is "
+                           "never reported without evidence that the app still answers; "
+                           "open_trace carries both bridge versions and the duration",
+    }, verified=True, open_trace=client.last_open)
+
+def _lceda_pro_recover(args):
+    """Read the command space and, only when asked, replace a dead editor.
+
+    The state this exists for: the window shows "未找到 Bridge 服务，3 秒后重试" and
+    the pipe with the right name is still there but nothing answers it. A second
+    editor instance would not help (one instance per user), so the only move is
+    stop-then-start - which discards unsaved edits, hence the explicit confirm.
+    """
+    report = _live.pipe_report(ping_timeout_s=float(args.get("ping_timeout_s") or 3.0))
+    if report["state"] == "healthy":
+        return ok(report, "pipe enumerated and pinged; the values are the app's own",
+                  _LIVE_MODEL, _LIVE_BASIS,
+                  "only the enumeration and the bridge version are facts; nothing "
+                  "here proves which project is open",
+                  {"not_run": "no write, no restart, no open"},
+                  {"endpoint": report["answering"],
+                   "verified_against_app": True})
+    found = _desktop.detect("lceda-pro")
+    report["executable"] = found.get("exe")
+    if not args.get("confirm"):
+        return err(
+            "the editor's command space is %s" % report["state"].replace("_", " "),
+            "RECOVER_NOT_CONFIRMED",
+            hint="nothing was changed. confirm=true starts the editor (state "
+                 "not_running) or, when a pipe exists but never answers, force-closes "
+                 "the dead instance first - that is exactly the '未找到 Bridge 服务' "
+                 "state, and it loses any edit that was not saved to disk",
+            extra=report,
+        )
+    if not found.get("found"):
+        report["tried"] = found.get("tried")
+        return err("LCEDA Pro was not found on this machine", "APP_NOT_INSTALLED",
+                   extra=report)
+    steps = []
+    if report["state"] == "bridge_dead":
+        steps.append({"step": "close",
+                      "result": _desktop.close("lceda-pro", force=True, timeout=15.0)})
+    steps.append({"step": "launch", "result": _desktop.launch(found["exe"], [])})
+    started = time.time()
+    deadline = started + float(args.get("wait_s") or 60.0)
+    after = None
+    while time.time() < deadline:
+        after = _live.pipe_report(ping_timeout_s=2.0)
+        if after["state"] == "healthy":
+            break
+        time.sleep(0.5)
+    report["steps"] = steps
+    report["after"] = after
+    report["seconds_to_answering_pipe"] = round(time.time() - started, 1)
+    if after and after["state"] == "healthy":
+        report["state"] = "restarted"
+        return ok(report, "each step's own result, unmodified", _LIVE_MODEL, _LIVE_BASIS,
+                  "a pipe that answers a ping proves a process speaking this protocol; "
+                  "it does not prove the project you had open is open again",
+                  {"unsaved work": "force-closing the dead instance discarded anything "
+                                   "that was not on disk",
+                   "not_run": "no project was opened"},
+                  {"endpoint": after["answering"], "verified_against_app": True})
+    return err("the editor did not come back within the wait budget",
+               "RECOVER_TIMEOUT",
+               hint="the pipe appears about a second after a clean start; a much "
+                    "longer wait means the exe started but no window opened (check "
+                    "the process list) or the app is sitting on a modal dialog",
+               extra=report)
 
 def _lceda_pro_sessions(args):
     try:
@@ -1288,12 +1362,32 @@ _tool(
     {"type": "object",
      "properties": dict(_LIVE_ARGS, **{
          "path": _str("absolute path to an existing .eprj/.epro/.kicad_pcb"),
-         "headless": _bool("open without taking over the UI (still a live session)",
-                           True),
+         "headless": _bool("open without taking over the UI (still a live session). "
+                           "Defaults to false: a headless open of a large project was "
+                           "measured once killing the editor's render process, and the "
+                           "bridge never answered again", False),
+         "canary_s": _num("budget for the ping that runs before and after the open", 3),
          "open_timeout_s": _num("budget for the open itself", 45),
      }),
      "required": ["path"]},
     _lceda_pro_open,
+)
+
+_tool(
+    "lceda_pro_recover",
+    "Report the editor's command space as one of healthy / bridge_dead / not_running. "
+    "bridge_dead is the state behind the editor's own '未找到 Bridge 服务，3 秒后重试' "
+    "dialog: the pipe exists and nothing answers it, and the app never rebuilds it "
+    "without a restart. Nothing is changed unless confirm=true, and then the dead "
+    "instance is force-closed first - unsaved edits in it are lost.",
+    {"type": "object",
+     "properties": {
+         "confirm": _bool("actually start/restart the editor (default: report only)",
+                          False),
+         "wait_s": _num("how long to wait for a pipe that answers", 60),
+         "ping_timeout_s": _num("budget for the first ping", 3),
+     }},
+    _lceda_pro_recover,
 )
 
 _tool(
@@ -4375,7 +4469,8 @@ def _capabilities(_args):
             "app_detect", "app_status", "app_launch", "app_close", "app_open_project",
             "lceda_api_probe",
             "lceda_pro_status", "lceda_pro_api", "lceda_pro_open",
-            "lceda_pro_sessions", "lceda_pro_close", "lceda_pro_run",
+            "lceda_pro_recover", "lceda_pro_sessions", "lceda_pro_close",
+            "lceda_pro_run",
             "lceda_pro_steps", "lceda_write_snippet",
             "lceda_step_record", "lceda_step_replay",
             "feedline_impedance", "feedline_width",
@@ -10784,7 +10879,7 @@ CORE_TOOLS = (
     "schematic_apply", "schematic_pcb_diff", "schematic_pcb_sync",
     # desktop / LCEDA
     "epro_inspect", "app_detect", "app_status", "lceda_pro_status",
-    "lceda_pro_open",
+    "lceda_pro_open", "lceda_pro_recover",
     # calc / rules
     "unit_convert", "width_for_current", "current_capacity", "via_resistance",
     "via_current_allowed", "trace_impedance", "width_for_impedance",

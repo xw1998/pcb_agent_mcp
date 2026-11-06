@@ -791,6 +791,27 @@ def _load_definition(ed, o):
     return node, {"source": source, "added_to_lib_symbols": True,
                   "definition_version": version}
 
+def _field_positions(o):
+    """Normalise the optional `property_positions` argument into {name: (x, y, rot)}."""
+    raw = o.get("property_positions") or {}
+    if not isinstance(raw, dict):
+        raise OpError("property_positions must be an object {field: {x, y, rotation}}",
+                      "ARG_INVALID")
+    out = {}
+    for name, v in raw.items():
+        if isinstance(v, dict):
+            if "x" not in v or "y" not in v:
+                raise OpError("property_positions[%r] needs both x and y" % name,
+                              "ARG_INVALID")
+            out[name] = (float(v["x"]), float(v["y"]), int(v.get("rotation") or 0) % 360)
+        elif isinstance(v, (list, tuple)) and len(v) >= 2:
+            out[name] = (float(v[0]), float(v[1]),
+                         int(v[2]) % 360 if len(v) > 2 else 0)
+        else:
+            raise OpError("property_positions[%r] must be {x, y, rotation} or [x, y]"
+                          % name, "ARG_INVALID")
+    return out
+
 def _run_add_symbol(ed, o, seed):
     lib_id = _str(o, "lib_id")
     x, y = _xy(o)
@@ -839,6 +860,18 @@ def _run_add_symbol(ed, o, seed):
               L(A("dnp"), A("yes" if _bool(o, "dnp") else "no")),
               ed.sp.id_node(ed.uid())]
 
+    # `property_positions` lets the caller pin a field where the source drawing put
+    # it: {name: {x, y, rotation}} (or [x, y]).  Without it every field lands at the
+    # library offset rotated by the placement, which is exactly how two copies of the
+    # same designator end up stacked on the body when the caller also draws text.
+    fpos = _field_positions(o)
+
+    def _placed(name, fallback):
+        got = fpos.get(name)
+        if got is None:
+            return fallback
+        return (got[0], got[1], got[2])
+
     written = []
     seen = set()
     for p in props:
@@ -847,14 +880,15 @@ def _run_add_symbol(ed, o, seed):
         seen.add(p["name"])
         value = overrides.get(p["name"], p["value"] or "")
         dx, dy = _rotate(p["x"], p["y"], rot)
-        written.append(prop(p["name"], value, x + dx, y + dy,
-                            (p["rotation"] + rot) % 360 if p["rotation"] else 0,
-                            hide=p["hide"]))
+        fx, fy, frot = _placed(p["name"], (x + dx, y + dy,
+                                           (p["rotation"] + rot) % 360 if p["rotation"] else 0))
+        written.append(prop(p["name"], value, fx, fy, frot, hide=p["hide"]))
     for name, value in overrides.items():
         if name in seen:
             continue
         seen.add(name)
-        written.append(prop(name, str(value), x, y - 2.54, 0,
+        fx, fy, frot = _placed(name, (x, y - 2.54, 0))
+        written.append(prop(name, str(value), fx, fy, frot,
                             hide=name in _HIDDEN_FIELDS))
     # Reference and Value must exist even if the library did not declare them
     for name in ("Reference", "Value"):
@@ -931,6 +965,9 @@ op("add_symbol", ["symbols", "connectivity"],
     "symbol": "entry name inside that library (default: after the colon)",
     "definition": "alternative to `library`: raw (symbol \"NAME\" ...) S-expression",
     "properties": "optional {name: value} for extra fields",
+    "property_positions": "optional {name: {x, y, rotation}} or {name: [x, y]} "
+                          "- global mm; pins a field where the drawing put it instead of the "
+                          "library offset",
     "dnp": "bool", "exclude_from_bom": "bool", "exclude_from_board": "bool"},
    _run_add_symbol, _verify_add_symbol)
 

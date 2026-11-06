@@ -295,6 +295,7 @@ class Client(object):
         self.transport = transport
         self.endpoint = getattr(transport, "endpoint", None)
         self.identity = None
+        self.last_open = None
 
     @property
     def verified(self):
@@ -309,14 +310,68 @@ class Client(object):
         self.identity = value
         return value
 
-    def open_project(self, path, headless=False, timeout_s=45.0):
+    def open_project(self, path, headless=False, timeout_s=45.0, canary_s=3.0):
+        """Open a project, then prove the editor is still able to answer.
+
+        Opening a project is the one call on this pipe that can take the editor's
+        own render process down: measured once on 4.1.60 with a 32 MB .eprj opened
+        headless, the processes were gone and the window sat on "未找到 Bridge 服务，
+        3 秒后重试" while the pipe stayed open. The mechanism is NOT known, so this
+        method does not claim to prevent it - it refuses to hide it:
+
+          * a ping BEFORE the open, so a half-dead editor is not asked to open
+            anything (that state is how the pipe gets wedged in the first place),
+          * a ping AFTER the reply, so a session id is never handed back as if it
+            were usable when the app that owns it has stopped answering.
+
+        `last_open` keeps the timing and the canary result; nothing is added to the
+        application's own reply.
+        """
         if not path:
             raise LiveError("ARG_REQUIRED", "path is required")
         path = os.path.abspath(path)
         if not os.path.exists(path):
             raise LiveError("ARG_INVALID", "no such project file: %s" % path)
+        size = os.path.getsize(path)
+        before = self.ping(min(canary_s, 5.0))
+        started = time.time()
         reply = self._call("open", {"path": path, "headless": bool(headless)}, timeout_s)
-        return reply.get("value") or {}
+        value = reply.get("value") or {}
+        elapsed = time.time() - started
+        try:
+            after = self.ping(canary_s)
+        except LiveError as exc:
+            raise LiveError(
+                "APP_DIED_DURING_OPEN",
+                "the editor answered 'open' in %.1f s and then stopped answering "
+                "(%s: %s)" % (elapsed, exc.code, exc.message),
+                {
+                    "path": path,
+                    "size_bytes": size,
+                    "size_mb": round(size / (1024.0 * 1024.0), 1),
+                    "headless": bool(headless),
+                    "open_seconds": round(elapsed, 2),
+                    "open_reply": value,
+                    "bridge_before": {"code": "OK",
+                                      "bridge_version": (before or {}).get("bridgeVersion")},
+                    "bridge_after": {"code": exc.code, "message": exc.message,
+                                     "endpoint": self.endpoint},
+                    "app_state": "the window shows '未找到 Bridge 服务，3 秒后重试' "
+                                  "and this app does not rebuild the pipe on its own",
+                    "next": "lceda_pro_recover reports the pipe state and, with "
+                            "confirm=true, restarts the editor and waits for the "
+                            "pipe to answer again",
+                },
+            )
+        self.last_open = {
+            "path": path,
+            "size_bytes": size,
+            "headless": bool(headless),
+            "open_seconds": round(elapsed, 2),
+            "canary_before": (before or {}).get("bridgeVersion"),
+            "canary_after": (after or {}).get("bridgeVersion"),
+        }
+        return value
 
     def sessions(self, timeout_s=10.0):
         reply = self._call("session.list", {}, timeout_s)
@@ -363,6 +418,48 @@ class Client(object):
     def close(self):
         self.transport.close()
 
+
+def pipe_report(prefix=APP_NAME, ping_timeout_s=3.0):
+    """What the command space looks like right now - one read, no repair.
+
+    Three states, and the difference matters because only the first two are
+    recoverable by starting the editor again:
+
+      healthy      a pipe answered a ping (bridge_version is filled in)
+      bridge_dead  a pipe with the right name exists but nothing answers it. This
+                   is the state behind the editor's own "未找到 Bridge 服务，3 秒后
+                   重试" dialog; the app never rebuilds the pipe without a restart,
+                   and a restart is a NEW process, so anything unsaved in the old
+                   one is gone whatever we do next.
+      not_running  no pipe with that name at all
+    """
+    names = available_endpoints(prefix)
+    out = {
+        "pipe_root": PIPE_ROOT,
+        "pipes": names,
+        "answering": None,
+        "bridge_version": None,
+        "failures": [],
+    }
+    for name in names:
+        client = Client(PipeTransport(name))
+        try:
+            identity = client.ping(ping_timeout_s)
+        except LiveError as exc:
+            out["failures"].append(
+                {"endpoint": name, "code": exc.code, "message": exc.message}
+            )
+            continue
+        finally:
+            client.close()
+        out["answering"] = name
+        out["bridge_version"] = (identity or {}).get("bridgeVersion")
+        out["identity"] = identity
+        break
+    out["state"] = (
+        "healthy" if out["answering"] else ("bridge_dead" if names else "not_running")
+    )
+    return out
 
 def connect(endpoint=None, timeout_s=10.0):
     """Connect to a running editor, or raise APP_NOT_RUNNING with the reason.

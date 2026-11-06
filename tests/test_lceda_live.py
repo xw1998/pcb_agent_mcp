@@ -102,6 +102,52 @@ class NoEditorMeansNoAnswer(unittest.TestCase):
         self.assertEqual(len(caught.exception.extra["failures"]), 1)
 
 
+class ThePipeReportNamesTheStateNotAGuess(unittest.TestCase):
+    """healthy / bridge_dead / not_running - the three states the user sees as
+    'works', '未找到 Bridge 服务，3 秒后重试', and 'no window at all'."""
+
+    def _with(self, names, ping):
+        original_enum = L.available_endpoints
+        original_cls = L.PipeTransport
+        L.available_endpoints = lambda prefix=L.APP_NAME: list(names)
+
+        class T(original_cls):
+            live = True
+
+            def call(self, op, payload, timeout_s):
+                return ping(op, payload, timeout_s)
+
+        L.PipeTransport = T
+        try:
+            return L.pipe_report()
+        finally:
+            L.PipeTransport = original_cls
+            L.available_endpoints = original_enum
+
+    def test_no_pipe_is_not_running(self):
+        report = self._with([], lambda *a: self.fail("nothing to ping"))
+        self.assertEqual(report["state"], "not_running")
+        self.assertEqual(report["pipes"], [])
+
+    def test_a_pipe_that_answers_is_healthy_and_keeps_the_version(self):
+        report = self._with(
+            ["JLCEDAProabcd1234"],
+            lambda op, payload, t: {"id": 1, "ok": True,
+                                    "value": {"bridgeVersion": "4.1.60"}, "logs": []},
+        )
+        self.assertEqual(report["state"], "healthy")
+        self.assertEqual(report["answering"], "JLCEDAProabcd1234")
+        self.assertEqual(report["bridge_version"], "4.1.60")
+
+    def test_a_pipe_that_never_answers_is_bridge_dead(self):
+        def never(op, payload, t):
+            raise L.LiveError("APP_TIMEOUT", "no reply to 'ping'")
+
+        report = self._with(["JLCEDAProabcd1234"], never)
+        self.assertEqual(report["state"], "bridge_dead")
+        self.assertIsNone(report["answering"])
+        self.assertEqual(report["failures"][0]["code"], "APP_TIMEOUT")
+
 class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
     def test_ping_keeps_the_identity_and_marks_the_transport_as_not_live(self):
         client = L.Client(FakeTransport([_ok({"endpoint": "FAKE0", "bridgeVersion": "4.1.60"})]))
@@ -110,14 +156,47 @@ class TheClientPassesThroughWhatTheAppSaid(unittest.TestCase):
         self.assertFalse(client.verified)
 
     def test_open_sends_an_absolute_path_and_the_headless_flag(self):
-        transport = FakeTransport([_ok({"sessionId": "s1", "headless": True})])
+        transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),      # ping before
+                                   _ok({"sessionId": "s1", "headless": True}),
+                                   _ok({"bridgeVersion": "4.1.60"})])     # ping after
         client = L.Client(transport)
         here = os.path.abspath(__file__)
-        client.open_project(here, headless=True)
-        op, payload, _ = transport.calls[0]
-        self.assertEqual(op, "open")
-        self.assertEqual(payload["path"], here)
-        self.assertTrue(payload["headless"])
+        value = client.open_project(here, headless=True)
+        self.assertEqual(value["sessionId"], "s1")
+        ops = [c[0] for c in transport.calls]
+        self.assertEqual(ops, ["ping", "open", "ping"])
+        open_call = transport.calls[1]
+        self.assertEqual(open_call[1]["path"], here)
+        self.assertTrue(open_call[1]["headless"])
+
+    def test_open_defaults_to_not_headless(self):
+        transport = FakeTransport([_ok({}), _ok({"sessionId": "s1"}), _ok({})])
+        client = L.Client(transport)
+        client.open_project(os.path.abspath(__file__))
+        self.assertFalse(transport.calls[1][1]["headless"])
+
+    def test_an_editor_that_stops_answering_after_open_is_reported_not_returned(self):
+        transport = FakeTransport([_ok({"bridgeVersion": "4.1.60"}),
+                                   _ok({"sessionId": "s1", "renderId": 3}),
+                                   L.LiveError("APP_TIMEOUT", "no reply to 'ping'")])
+        client = L.Client(transport)
+        with self.assertRaises(L.LiveError) as caught:
+            client.open_project(os.path.abspath(__file__), headless=True)
+        exc = caught.exception
+        self.assertEqual(exc.code, "APP_DIED_DURING_OPEN")
+        self.assertEqual(exc.extra["open_reply"]["sessionId"], "s1")
+        self.assertTrue(exc.extra["headless"])
+        self.assertGreater(exc.extra["size_bytes"], 0)
+        self.assertEqual(exc.extra["bridge_after"]["code"], "APP_TIMEOUT")
+        self.assertEqual(exc.extra["bridge_before"]["bridge_version"], "4.1.60")
+
+    def test_a_half_dead_editor_is_not_asked_to_open_anything(self):
+        transport = FakeTransport([L.LiveError("APP_TIMEOUT", "no reply to 'ping'")])
+        client = L.Client(transport)
+        with self.assertRaises(L.LiveError) as caught:
+            client.open_project(os.path.abspath(__file__))
+        self.assertEqual(caught.exception.code, "APP_TIMEOUT")
+        self.assertEqual([c[0] for c in transport.calls], ["ping"])
 
     def test_a_missing_path_is_refused_before_anything_is_sent(self):
         transport = FakeTransport([])
@@ -281,7 +360,7 @@ class TheToolsSayWhatTheyCanDo(unittest.TestCase):
     def test_every_bridge_tool_is_registered_and_listed(self):
         from pcb_agent_mcp import tools as T
         names = [n for n in T.TOOLS if n.startswith("lceda_pro_")]
-        self.assertEqual(len(names), 7, names)
+        self.assertEqual(len(names), 8, names)
         available = T.TOOLS["calc_capabilities"]["handler"]({})["available"]
         for name in names:
             self.assertIn(name, available)
@@ -295,6 +374,54 @@ class TheToolsSayWhatTheyCanDo(unittest.TestCase):
         # whether or not an editor is running.
         out = T.call_tool("lceda_pro_run", {"session": "", "code": "return 1;"})
         self.assertEqual(out.get("reason_code"), "ARG_REQUIRED")
+
+class RecoverChangesNothingUnlessItIsTold(unittest.TestCase):
+    """The tool exists for one state: a pipe that is there and never answers. It
+    must be impossible to lose unsaved work by merely LOOKING at that state."""
+
+    def setUp(self):
+        from pcb_agent_mcp import tools as T
+        self.T = T
+        self.orig = (T._live.pipe_report, T._desktop.detect,
+                     T._desktop.launch, T._desktop.close)
+        self.calls = []
+        T._desktop.detect = lambda app: {"found": True, "exe": r"C:\\fake\\lceda-pro.exe"}
+        T._desktop.launch = lambda *a, **k: self.calls.append(("launch",)) or {"status": "ok"}
+        T._desktop.close = lambda *a, **k: self.calls.append(("close",)) or {"status": "ok"}
+
+    def tearDown(self):
+        (self.T._live.pipe_report, self.T._desktop.detect,
+         self.T._desktop.launch, self.T._desktop.close) = self.orig
+
+    def _report(self, state):
+        return {"state": state, "pipes": [] if state == "not_running" else ["JLCEDAProd"],
+                "answering": None, "bridge_version": None, "failures": [],
+                "pipe_root": L.PIPE_ROOT}
+
+    def test_a_healthy_bridge_is_reported_and_nothing_is_started(self):
+        self.T._live.pipe_report = lambda **k: dict(self._report("healthy"),
+                                                    answering="JLCEDAProd",
+                                                    bridge_version="4.1.60")
+        out = self.T.call_tool("lceda_pro_recover", {})
+        self.assertEqual(out.get("status"), "ok")
+        self.assertEqual(out["value"]["state"], "healthy")
+        self.assertEqual(self.calls, [])
+
+    def test_without_confirm_a_dead_bridge_is_only_reported(self):
+        self.T._live.pipe_report = lambda **k: self._report("bridge_dead")
+        out = self.T.call_tool("lceda_pro_recover", {})
+        self.assertEqual(out.get("reason_code"), "RECOVER_NOT_CONFIRMED")
+        self.assertEqual(self.calls, [])
+
+    def test_confirm_on_a_dead_bridge_closes_first_then_launches(self):
+        states = [self._report("bridge_dead"), self._report("healthy")]
+        states[1]["answering"] = "JLCEDAProd"
+        seq = list(states)
+        self.T._live.pipe_report = lambda **k: seq.pop(0) if seq else self._report("healthy")
+        out = self.T.call_tool("lceda_pro_recover", {"confirm": True, "wait_s": 5})
+        self.assertEqual(out.get("status"), "ok")
+        self.assertEqual([c[0] for c in self.calls], ["close", "launch"])
+        self.assertEqual(out["value"]["state"], "restarted")
 
 class FakeEditor(object):
     """Just enough of `lceda_live.Client` for the write path: invoke() + close()."""
