@@ -109,7 +109,7 @@ def emit(m, origin, out):
         A('  (zone (net %d) (net_name "%s") (layer "%s") (uuid "%s") (priority %d)'
           % (idx[net], net, layer, uuid.uuid5(uuid.NAMESPACE_DNS, 'sky-%d-%s' % (k, net)), prio))
         A('    (hatch edge 0.5) (connect_pads yes (clearance 0.2)) (min_thickness 0.2)')
-        A('    (fill yes (thermal_gap 0.2) (thermal_bridge_width 0.2))')
+        A('    (fill yes (thermal_gap 0.2) (thermal_bridge_width 0.2) (island_removal_mode 0))')
         A('    (polygon (pts %s))' % ' '.join('(xy %s %s)' % (f(x + OX), f(-y + OY)) for x, y in pts))
         A('  )')
     A('  (gr_rect (start %s %s) (end %s %s) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts"))'

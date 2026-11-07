@@ -99,7 +99,9 @@ VIAS = [
 
 
 def build(rt):
-    for net, layer, pts in SEGS:
-        rt.poly(net, layer, pts, W)
+    for item in SEGS:
+        net, layer, pts = item[0], item[1], item[2]
+        w = item[3] if len(item) > 3 else W
+        rt.poly(net, layer, pts, w)
     for net, x, y in VIAS:
         rt.via(net, x, y)
