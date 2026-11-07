@@ -3,6 +3,9 @@ import re, sys, json, uuid
 
 NAMESPACE = uuid.UUID('6f1e9a52-0f2d-4c39-9ac2-7b8f6a1d2e34')
 
+# same sheet offset as _sky_emit2: board centre -> A4 page centre
+OX, OY = 148.5, 105.0
+
 
 def strip_zones(text):
     out = []
@@ -58,12 +61,12 @@ def main():
         nid = netref(tab, s['net'])
         (x1, y1), (x2, y2) = s['pts']
         rows.append('  (segment (start %s %s) (end %s %s) (width %s) (layer "%s") (net %s) (uuid "%s"))'
-                    % (f(x1), f(-y1), f(x2), f(-y2), f(s['w']), s['layer'], nid,
+                    % (f(x1 + OX), f(-y1 + OY), f(x2 + OX), f(-y2 + OY), f(s['w']), s['layer'], nid,
                        uuid.uuid5(NAMESPACE, 'seg%d' % i)))
     for i, v in enumerate(rt['vias']):
         nid = netref(tab, v['net'])
         rows.append('  (via (at %s %s) (size %s) (drill %s) (layers "F.Cu" "B.Cu") (net %s) (uuid "%s"))'
-                    % (f(v['x']), f(-v['y']), f(v['size']), f(v['drill']), nid,
+                    % (f(v['x'] + OX), f(-v['y'] + OY), f(v['size']), f(v['drill']), nid,
                        uuid.uuid5(NAMESPACE, 'via%d' % i)))
     k = text.rstrip().rfind(')')
     out = text[:k] + '\n'.join(rows) + '\n' + text[k:]

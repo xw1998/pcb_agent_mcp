@@ -5,7 +5,7 @@ No router.  It only answers "does this polyline break a rule".
 import json, math
 
 CLR = 0.15
-EDGE = 0.3          # copper to board edge
+EDGE = 0.5         # copper (not centreline) to board edge, DRC rule 0.5
 BX, BY = 22.0, 36.0
 
 N = json.load(open('_scratch/sky/_nets.json'))
@@ -85,9 +85,12 @@ def check(segs, vias, verbose=True):
                 bad.append('pad %s.%s %s: d=%.3f<%.3f at %s-%s' %
                            (p.ref, p.num, net, d, need, a, b))
         for x, y in (a, b):
-            if abs(x) > BX - EDGE or abs(y) > BY - EDGE:
-                bad.append('edge %s at %s' % (net, (x, y)))
+            if BX - abs(x) < EDGE + w / 2 or BY - abs(y) < EDGE + w / 2:
+                bad.append('edge %s at %s (copper %.3f from edge)'
+                           % (net, (x, y), min(BX - abs(x), BY - abs(y)) - w / 2))
     for i, (n1, x1, y1, d1, s1) in enumerate(vias):
+        if min(BX - abs(x1), BY - abs(y1)) < EDGE + s1 / 2:
+            bad.append('edge via %s at %s' % (n1, (x1, y1)))
         for p in PADS:
             if p.net == n1:
                 continue

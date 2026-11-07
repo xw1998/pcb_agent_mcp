@@ -6,6 +6,9 @@ from _sky_model import model
 
 MIL = 0.0254
 BW, BH = 44.0, 72.0
+# A4 sheet is 297 x 210; put the board centre on the sheet centre so the
+# drawing opens inside the page frame instead of hanging off its corner.
+OX, OY = 148.5, 105.0
 LAYERS = [
     (0, 'F.Cu', 'signal'), (31, 'B.Cu', 'signal'),
     (36, 'B.SilkS', 'user', 'B.Silkscreen'), (37, 'F.SilkS', 'user', 'F.Silkscreen'),
@@ -46,7 +49,7 @@ def emit(m, origin, out):
         c = byref[ref]
         side = 'B' if layer == 2 else 'F'
         A('  (footprint "LCEDA:%s" (layer "%s.Cu") (at %s %s %s) (attr smd)'
-          % (ref, side, f(ox), f(-oy), f(rot)))
+          % (ref, side, f(ox + OX), f(-oy + OY), f(rot)))
         hide = ' hide' if ref[:1] in 'RCD' or ref.startswith(('LED', 'RN')) else ''
         mir = ' (justify mirror)' if layer == 2 else ''
         A('    (property "Reference" "%s" (at 0 %s 0) (layer "%s.SilkS") (effects (font (size 0.8 0.8) (thickness 0.13))%s%s))'
@@ -80,8 +83,8 @@ def emit(m, origin, out):
     #          fills what is left.
     import uuid
     ZONES = [
-        ('GND', 'B.Cu', 0, [(-18.5, -35.5), (18.5, -35.5), (21.5, -32.5), (21.5, 32.5),
-                            (18.5, 35.5), (-18.5, 35.5), (-21.5, 32.5), (-21.5, -32.5)]),
+        ('GND', 'B.Cu', 0, [(-17.8, -34.8), (17.8, -34.8), (20.8, -31.8), (20.8, 31.8),
+                            (17.8, 34.8), (-17.8, 34.8), (-20.8, 31.8), (-20.8, -31.8)]),
         ('+3V3', 'F.Cu', 2, [(-8.55, 7.85), (7.20, 7.85), (7.20, 8.55), (-8.30, 8.55),
                              (-8.55, 8.30)]),
         ('+3V3', 'F.Cu', 2, [(-8.30, -7.85), (7.20, -7.85), (7.20, -8.55), (-8.55, -8.30)]),
@@ -97,7 +100,7 @@ def emit(m, origin, out):
         ('+5V', 'F.Cu', 3, [(-11.90, -25.60), (9.20, -25.60), (9.20, -24.90),
                             (-5.65, -24.90), (-5.65, -24.20), (-6.60, -24.20),
                             (-6.60, -24.90), (-11.90, -24.90)]),
-        ('GND', 'F.Cu', 0, [(-21.0, -35.0), (21.0, -35.0), (21.0, 35.0), (-21.0, 35.0)]),
+        ('GND', 'F.Cu', 0, [(-20.8, -34.8), (20.8, -34.8), (20.8, 34.8), (-20.8, 34.8)]),
     ]
     for k, (net, layer, prio, pts) in enumerate(ZONES):
         prio = prio + (k if prio else 0)
@@ -107,10 +110,10 @@ def emit(m, origin, out):
           % (idx[net], net, layer, uuid.uuid5(uuid.NAMESPACE_DNS, 'sky-%d-%s' % (k, net)), prio))
         A('    (hatch edge 0.5) (connect_pads yes (clearance 0.2)) (min_thickness 0.2)')
         A('    (fill yes (thermal_gap 0.2) (thermal_bridge_width 0.2))')
-        A('    (polygon (pts %s))' % ' '.join('(xy %s %s)' % (f(x), f(-y)) for x, y in pts))
+        A('    (polygon (pts %s))' % ' '.join('(xy %s %s)' % (f(x + OX), f(-y + OY)) for x, y in pts))
         A('  )')
     A('  (gr_rect (start %s %s) (end %s %s) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts"))'
-      % (f(-BW / 2), f(-BH / 2), f(BW / 2), f(BH / 2)))
+      % (f(-BW / 2 + OX), f(-BH / 2 + OY), f(BW / 2 + OX), f(BH / 2 + OY)))
     A(')')
     open(out, 'w', encoding='utf-8').write('\n'.join(L) + '\n')
     return out
