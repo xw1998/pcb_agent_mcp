@@ -17,11 +17,14 @@ W = R.W
 NETS = R.N
 
 XN = -9.70      # first lane (L class)
-LANE = 0.55
+LANE = 0.43      # 15 outer lanes must fit between the last pad edge
+                 # (-15.78) and XN; 0.55 would run into the inner pad column
 XVIA = (-8.80, -9.30)
 XVIA2 = -18.25
 XPN = -16.93
 XPW = -19.47
+XPI = 16.93      # right header, inner column pad centre
+XPO = 19.47      # right header, outer column pad centre
 
 
 def net_of(ref, num):
@@ -77,14 +80,12 @@ def build_B(rt, rows):
 
     def emit(i, p, m, outer, yc, xl, d):
         sy = p['y']
-        ay = sy + 0.3 if not outer else sy - 0.3
-        xe = XVIA2 if outer else -15.5
-        rt.poly(net_of('P1', p['num'])[0] and p['net'] and 'F.Cu' or 'F.Cu', 'F.Cu', []) if False else None
         net = p['net']
         rt.poly(net, 'F.Cu', [(m['x'], m['y']), (m['x'], d)])
         rt.via(net, m['x'], d)
-        rt.poly(net, 'B.Cu', [(m['x'], d), (m['x'], yc), (xl, yc), (xl, ay), (xe, ay)],
-                bevel=1.20)
+        ay = sy + 0.3 if not outer else sy - 0.3
+        xe = XVIA2 if outer else -15.5
+        rt.poly(net, 'B.Cu', [(m['x'], d), (m['x'], yc), (xl, yc), (xl, ay), (xe, ay)])
         rt.via(net, xe, ay)
         rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], sy)])
 
@@ -123,12 +124,14 @@ XRO = 18.25     # outer-column via x (0.74 gap between the two pad columns)
 
 
 def build_R(rt, rows):
-    """MCU right column -> header.  Long run on B.Cu; lanes nest outward."""
+    """MCU right column -> header.  One via, then B.Cu all the way in.
+
+    Both header columns are single-sided SMD pads in this footprint set, so the
+    lane has to hop back to F.Cu at the target column.
+    """
     rows = sorted(rows, key=lambda r: -r[0]['y'])
     for i, (p, m, outer, _) in enumerate(rows):
         net, sy = p['net'], p['y']
-        # outer rows drop 0.45 so the via never sits on the inner pad row and
-        # the corridor clears PC3's pad-row approach at 3.81
         ay = sy + (-0.55 if outer else 0.3)
         xc = XR0 - RSTEP * i
         xv = 8.8 if i % 2 == 0 else 9.3
@@ -139,7 +142,6 @@ def build_R(rt, rows):
         rt.via(net, xe, ay)
         rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], sy)])
 
-
 def build_B2(rt, rows):
     """Three bottom-row nets that reach the right header under the switches."""
     # PC7 (outer) runs *above* PC6 so PC6's horizontal never has to cross the
@@ -149,6 +151,7 @@ def build_B2(rt, rows):
             'PC6': dict(vy=-9.90, ry=-19.55, xe=XRI, ay=-19.05)}
     for p, m, outer, _ in rows:
         pl = plan[p['net']]
+        sy = p['y']
         rt.poly(p['net'], 'F.Cu', [(m['x'], m['y']), (m['x'], pl['vy'])])
         rt.via(p['net'], m['x'], pl['vy'])
         rt.poly(p['net'], 'B.Cu', [(m['x'], pl['vy']), (m['x'], pl['ry']),
@@ -172,6 +175,7 @@ def build_T2(rt, rows):
 
     def drop(net, vx, vy, yknee, path, xe, ay):
         p, m, outer, _ = by[net]
+        sy = p['y']
         rt.poly(net, 'F.Cu', [(m['x'], m['y']), (m['x'], yknee), (vx, vy)],
                 bevel=1.20)
         rt.via(net, vx, vy)
@@ -230,17 +234,20 @@ def main():
     rt.finalize()
     out = dict(segs=[dict(net=n, layer=l, w=w, pts=[a, b])
                      for n, l, w, a, b in rt.segs],
+               arcs=[dict(net=n, layer=l, w=w, start=a, mid=m, end=b)
+                     for n, l, w, a, m, b in rt.arcs],
                vias=[dict(net=n, x=x, y=y, drill=d, size=s)
                      for n, x, y, d, s in rt.vias])
     json.dump(out, open('_scratch/sky/_routes.json', 'w'), indent=1)
-    print('segs', len(out['segs']), 'vias', len(out['vias']))
-    return out
+    print('segs', len(out['segs']), 'arcs', len(out['arcs']), 'vias', len(out['vias']))
+    return out, rt
 
 
 if __name__ == '__main__':
-    out = main()
+    out, rt = main()
     sys.path.insert(0, '_scratch/sky')
     import _chk
-    _chk.check([(s['net'], s['layer'], s['w'], tuple(s['pts'][0]), tuple(s['pts'][1]))
-                for s in out['segs']],
-               [(v['net'], v['x'], v['y'], v['drill'], v['size']) for v in out['vias']])
+    # use the same flattening the solver used, so the standalone checker never
+    # disagrees with it about where an arc actually runs
+    segs = list(rt.chk_segs)
+    _chk.check(segs, [(v['net'], v['x'], v['y'], v['drill'], v['size']) for v in out['vias']])

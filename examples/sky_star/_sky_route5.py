@@ -8,7 +8,7 @@ and its GND / 3V3 partner faces down (-19.533) into the pour.  That leaves one
 open horizontal lane at y = -17.95 (keys end at -17.55, part pads start at
 -18.397) and each cluster needs only its own 2.4 mm of it.
 """
-W = 0.2
+W = 0.15
 LANE = -17.95
 
 SEGS = [

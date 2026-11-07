@@ -77,7 +77,7 @@ def check(segs, vias, verbose=True):
         for p in PADS:
             if p.net == net:
                 continue
-            if not layer.startswith(p.layer):
+            if p.layer not in (layer[0], 'FB'):
                 continue
             d = p.dist_seg(a, b)
             need = CLR + w / 2

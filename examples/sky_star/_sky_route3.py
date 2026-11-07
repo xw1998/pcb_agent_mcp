@@ -18,7 +18,7 @@ Two nets are long jumps and take B.Cu:
   * $1N1161 : diode point -> R21.2 at x 10.1 (y 18.833), on B.Cu at y 20.825
   * SDIO_CLK: RN1.4 (x -0.45) -> R21.1 at x 10.1 (y 17.967), B.Cu at y 17.85
 """
-W = 0.2
+W = 0.15
 
 SEGS = [
     # ---- _SDIO_D2 : CARD.1 - D5.1 - R18.1 - RN1.1 -------------------------

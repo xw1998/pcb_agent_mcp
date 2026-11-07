@@ -63,6 +63,12 @@ def main():
         rows.append('  (segment (start %s %s) (end %s %s) (width %s) (layer "%s") (net %s) (uuid "%s"))'
                     % (f(x1 + OX), f(-y1 + OY), f(x2 + OX), f(-y2 + OY), f(s['w']), s['layer'], nid,
                        uuid.uuid5(NAMESPACE, 'seg%d' % i)))
+    for i, a in enumerate(rt.get('arcs', [])):
+        nid = netref(tab, a['net'])
+        (x1, y1), (xm, ym), (x2, y2) = a['start'], a['mid'], a['end']
+        rows.append('  (arc (start %s %s) (mid %s %s) (end %s %s) (width %s) (layer "%s") (net %s) (uuid "%s"))'
+                    % (f(x1 + OX), f(-y1 + OY), f(xm + OX), f(-ym + OY), f(x2 + OX), f(-y2 + OY),
+                       f(a['w']), a['layer'], nid, uuid.uuid5(NAMESPACE, 'arc%d' % i)))
     for i, v in enumerate(rt['vias']):
         nid = netref(tab, v['net'])
         rows.append('  (via (at %s %s) (size %s) (drill %s) (layers "F.Cu" "B.Cu") (net %s) (uuid "%s"))'

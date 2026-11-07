@@ -11,7 +11,7 @@ Geometry decisions
   * $1N1206 leaves U5 on the right (through the 15.62 gap between the flash and
     P2) and comes back over the top, above every lane it would otherwise cut.
 """
-W = 0.2
+W = 0.15
 
 SEGS = [
     # ---- _SPI_CS : U5.1 - RN3.4 - R22.1 -----------------------------------

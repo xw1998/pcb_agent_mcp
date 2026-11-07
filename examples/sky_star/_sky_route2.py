@@ -13,7 +13,7 @@ Topology notes
   * The 1N4752 corridor (B.Cu, y=16.51) walls off the two halves of $2N1173,
     so the halves are joined by the F.Cu run at y=14.40 that hops over the wall.
 """
-W = 0.2
+W = 0.15
 
 SEGS = [
     # ---- OSC32_IN : U1.8 / X2.1 / C3.2 ------------------------------------
