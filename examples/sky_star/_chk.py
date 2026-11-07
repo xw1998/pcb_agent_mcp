@@ -34,7 +34,12 @@ class Pad:
     __slots__ = ('x', 'y', 'w', 'h', 'a', 'layer', 'net', 'ref', 'num')
     def __init__(self, d, net):
         self.x, self.y = d['x'], d['y']
-        self.w, self.h, self.a = d['w'], d['h'], d['a']
+        # pads that the netlist carries as a zero-size point (the LIB part has
+        # no copper) are 0.6 x 0.6 once _sky_emit2 back-fills them; checking
+        # against a point would let a track sit inside real copper.
+        self.w = d['w'] if d['w'] >= 0.05 else 0.6
+        self.h = d['h'] if d['h'] >= 0.05 else 0.6
+        self.a = d['a']
         self.layer = 'F' if d['layer'].startswith('F') else 'B'
         self.net, self.ref, self.num = net, d['ref'], d['num']
 

@@ -55,11 +55,11 @@ def build_L(rt, rows):
         net = p['net']
         xc = XN - LANE * i
         xv = XVIA[i % 2]
-        rt.poly(net, 'F.Cu', [(m['x'], m['y']), (xv, m['y'])], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(m['x'], m['y']), (xv, m['y'])])
         rt.via(net, xv, m['y'])
         rt.poly(net, 'B.Cu', [(xv, m['y']), (xc, m['y']), (xc, p['y']), (XVIA2, p['y'])])
         rt.via(net, XVIA2, p['y'])
-        rt.poly(net, 'F.Cu', [(XVIA2, p['y']), (XPW, p['y'])], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(XVIA2, p['y']), (XPW, p['y'])])
 
 
 def build_B(rt, rows):
@@ -79,14 +79,14 @@ def build_B(rt, rows):
         sy = p['y']
         ay = sy + 0.3 if not outer else sy - 0.3
         xe = XVIA2 if outer else -15.5
-        rt.poly(net_of('P1', p['num'])[0] and p['net'] and 'F.Cu' or 'F.Cu', 'F.Cu', [], bevel=0.001) if False else None
+        rt.poly(net_of('P1', p['num'])[0] and p['net'] and 'F.Cu' or 'F.Cu', 'F.Cu', []) if False else None
         net = p['net']
-        rt.poly(net, 'F.Cu', [(m['x'], m['y']), (m['x'], d)], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(m['x'], m['y']), (m['x'], d)])
         rt.via(net, m['x'], d)
         rt.poly(net, 'B.Cu', [(m['x'], d), (m['x'], yc), (xl, yc), (xl, ay), (xe, ay)],
-                bevel=0.12)
+                bevel=1.20)
         rt.via(net, xe, ay)
-        rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], sy)], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], sy)])
 
     for i, (p, m, outer, _) in enumerate(rise):
         emit(i, p, m, outer, yc=-10.0 - 0.5 * i, xl=-9.7 - 0.5 * i,
@@ -107,11 +107,11 @@ def build_T(rt, rows):
         p, m, outer, _ = fin[num]
         net = p['net']
         rt.poly(net, 'F.Cu', [(m['x'], m['y']), (m['x'], pl['jog']), (pl['xv'], pl['jog'])],
-                bevel=0.001)
+                bevel=1.20)
         rt.via(net, pl['xv'], pl['jog'])
         rt.poly(net, 'B.Cu', [(pl['xv'], pl['jog']), (pl['xv'], pl['sy']), (pl['xe'], pl['sy'])])
         rt.via(net, pl['xe'], pl['sy'])
-        rt.poly(net, 'F.Cu', [(pl['xe'], pl['sy']), (p['x'], p['y'])], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(pl['xe'], pl['sy']), (p['x'], p['y'])])
 
 
 
@@ -133,11 +133,11 @@ def build_R(rt, rows):
         xc = XR0 - RSTEP * i
         xv = 8.8 if i % 2 == 0 else 9.3
         xe = XRO if outer else XRI
-        rt.poly(net, 'F.Cu', [(m['x'], m['y']), (xv, m['y'])], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(m['x'], m['y']), (xv, m['y'])])
         rt.via(net, xv, m['y'])
-        rt.poly(net, 'B.Cu', [(xv, m['y']), (xc, m['y']), (xc, ay), (xe, ay)], bevel=0.12)
+        rt.poly(net, 'B.Cu', [(xv, m['y']), (xc, m['y']), (xc, ay), (xe, ay)])
         rt.via(net, xe, ay)
-        rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], sy)], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], sy)])
 
 
 def build_B2(rt, rows):
@@ -149,12 +149,12 @@ def build_B2(rt, rows):
             'PC6': dict(vy=-9.90, ry=-19.55, xe=XRI, ay=-19.05)}
     for p, m, outer, _ in rows:
         pl = plan[p['net']]
-        rt.poly(p['net'], 'F.Cu', [(m['x'], m['y']), (m['x'], pl['vy'])], bevel=0.001)
+        rt.poly(p['net'], 'F.Cu', [(m['x'], m['y']), (m['x'], pl['vy'])])
         rt.via(p['net'], m['x'], pl['vy'])
         rt.poly(p['net'], 'B.Cu', [(m['x'], pl['vy']), (m['x'], pl['ry']),
-                                   (pl['xe'], pl['ry'])], bevel=0.12)
+                                   (pl['xe'], pl['ry'])])
         rt.via(p['net'], pl['xe'], pl['ry'])
-        rt.poly(p['net'], 'F.Cu', [(pl['xe'], pl['ry']), (p['x'], p['y'])], bevel=0.001)
+        rt.poly(p['net'], 'F.Cu', [(pl['xe'], pl['ry']), (p['x'], p['y'])])
 
 
 def build_T2(rt, rows):
@@ -173,11 +173,11 @@ def build_T2(rt, rows):
     def drop(net, vx, vy, yknee, path, xe, ay):
         p, m, outer, _ = by[net]
         rt.poly(net, 'F.Cu', [(m['x'], m['y']), (m['x'], yknee), (vx, vy)],
-                bevel=0.12)
+                bevel=1.20)
         rt.via(net, vx, vy)
-        rt.poly(net, 'B.Cu', [(vx, vy)] + path, bevel=0.12)
+        rt.poly(net, 'B.Cu', [(vx, vy)] + path)
         rt.via(net, xe, ay)
-        rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], p['y'])], bevel=0.001)
+        rt.poly(net, 'F.Cu', [(xe, ay), (p['x'], p['y'])])
 
     # --- pads 3.0..6.0: one via row 0.60 apart, knee at the pad tip so the
     # fan never clips a neighbour pad; U1.6 escapes through a via just above
@@ -192,11 +192,11 @@ def build_T2(rt, rows):
     # PE2 has no neighbour on its right, so it can take a straight diagonal and
     # leave the knee slot to PE3.
     p, m, outer, _ = by['PE2']
-    rt.poly('PE2', 'F.Cu', [(m['x'], m['y']), (6.40, 8.78)], bevel=0.001)
+    rt.poly('PE2', 'F.Cu', [(m['x'], m['y']), (6.40, 8.78)])
     rt.via('PE2', 6.40, 8.78)
-    rt.poly('PE2', 'B.Cu', [(6.40, 8.78), (6.40, 8.89), (XRI, 8.89)], bevel=0.12)
+    rt.poly('PE2', 'B.Cu', [(6.40, 8.78), (6.40, 8.89), (XRI, 8.89)])
     rt.via('PE2', XRI, 8.89)
-    rt.poly('PE2', 'F.Cu', [(XRI, 8.89), (p['x'], p['y'])], bevel=0.001)
+    rt.poly('PE2', 'F.Cu', [(XRI, 8.89), (p['x'], p['y'])])
 
     # --- pads -2.5..-1.0: vias fanned left, two staggered rows --------------
     drop('PC3', -2.50, 9.60, 8.55, [(-2.50, 5.50), (15.30, 5.50), (15.30, 3.81),
@@ -225,6 +225,9 @@ def main():
     _sky_route4.build(rt)
     import _sky_route5
     _sky_route5.build(rt)
+    import _sky_route6
+    _sky_route6.build(rt)
+    rt.finalize()
     out = dict(segs=[dict(net=n, layer=l, w=w, pts=[a, b])
                      for n, l, w, a, b in rt.segs],
                vias=[dict(net=n, x=x, y=y, drill=d, size=s)
