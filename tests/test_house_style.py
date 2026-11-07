@@ -228,6 +228,38 @@ class TestClearanceRoom(unittest.TestCase):
         # the pad box edge is 0.25 from the track centre -> 2*(0.25-0.15) = 0.2
         self.assertAlmostEqual(H.clearance_room(board)["max_width_mm"]["A"], 0.2, places=4)
 
+class TestARotatedPadIsNotAnAxisAlignedBox(unittest.TestCase):
+    """J1 on the F412 board is a 270 degree socket: read unrotated, its 0.4 x 1.35
+    pads reach 0.46 mm further than they do and VBUS reads 0.15 instead of 0.30."""
+
+    def _board(self, deg):
+        board = Board("test", "memory")
+        board.tracks = [_track("A", (0, 0), (10, 0), 0.15)]
+        board.vias = []
+        board.outline = []
+        board.rules = {"clearance": {"min_clearance": 0.15}}
+        board.footprints = [{"ref": "J1", "value": "USB", "x": 5, "y": 0.9,
+                             "rotation": deg, "layer": "F.Cu",
+                             "pads": [{"number": "1", "net": "B", "x": 5, "y": 0.9,
+                                       "w": 0.4, "h": 1.35, "rotation": deg,
+                                       "layers": ["F.Cu"]}]}]
+        return board
+
+    def test_at_270_degrees_the_pad_points_along_x_and_the_track_fits(self):
+        # box half-height is 0.2, track centre 0.9 away -> 2*(0.7-0.15) = 1.1
+        got = H.clearance_room(self._board(270.0))["max_width_mm"]["A"]
+        self.assertAlmostEqual(got, 1.1, places=3)
+
+    def test_at_0_degrees_the_same_pad_reaches_further_and_allows_less(self):
+        # box half-height is 0.675, track centre 0.9 away -> 2*(0.225-0.15) = 0.15
+        got = H.clearance_room(self._board(0.0))["max_width_mm"]["A"]
+        self.assertAlmostEqual(got, 0.15, places=3)
+
+    def test_the_answer_names_the_neighbour_that_binds(self):
+        got = H.clearance_room(self._board(0.0))
+        self.assertEqual(got["bound_by"]["A"]["kind"], "pad")
+        self.assertEqual(got["bound_by"]["A"]["neighbour"], "J1.1")
+
 class TestThePairIsOneDecision(unittest.TestCase):
     def test_a_differential_pair_takes_the_tighter_side(self):
         board = Board("test", "memory")

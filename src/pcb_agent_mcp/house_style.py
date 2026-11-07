@@ -22,6 +22,7 @@ Read 2026-11-07 for the numbers quoted above (see `docs/122`). Nothing here
 writes: `fix_list` names the net, the width it has and the width the rule asks
 for, and the edit is a `set_track_width` the caller applies one net at a time.
 """
+import math
 
 
 #: A net whose name is on this list is power and is expected to be wider than a
@@ -113,6 +114,23 @@ def _segment_box_distance(a, b, cx, cy, hw, hh):
                _point_box_distance(b, cx, cy, hw, hh))
     return best
 
+def _segment_obox_distance(a, b, cx, cy, hw, hh, deg):
+    """Distance from a segment to a rectangle rotated by `deg` about its centre.
+
+    Measured need: J1 on the F412 board is a micro-USB socket at 270 degrees, so
+    its 0.4 x 1.35 mm pads point along x, not along y. Read as an axis-aligned box
+    the pad reaches 0.46 mm further than it really does, and the reachable width
+    for VBUS came out at 0.15 against a real 0.30.
+    """
+    theta = math.radians(deg or 0.0)
+    ca, sa = math.cos(theta), math.sin(theta)
+
+    def back(point):
+        dx, dy = point[0] - cx, point[1] - cy
+        return (dx * ca + dy * sa, -dx * sa + dy * ca)
+
+    return _segment_box_distance(back(a), back(b), 0.0, 0.0, hw, hh)
+
 def clearance_room(board, clearance_mm=None, rows=None, planned_widths=None):
     """How wide each net's copper could get before it breaks clearance.
 
@@ -170,16 +188,22 @@ def clearance_room(board, clearance_mm=None, rows=None, planned_widths=None):
             layers = [l for l in (pad.get("layers") or []) if l.endswith(".Cu")]
             hw = float(pad.get("w") or 0.0) / 2.0
             hh = float(pad.get("h") or 0.0) / 2.0
+            deg = pad.get("rotation")
+            if deg is None:
+                deg = fp.get("rotation") or 0.0
+            tag = "%s.%s" % (fp.get("ref"), pad.get("number"))
             for row in rows:
                 if row["net"] == pad["net"] or row.get("width_mm") is None:
                     continue
                 if layers and row["layer"] not in layers and "*.Cu" not in layers:
                     continue
-                distance = _segment_box_distance(row["start"], row["end"],
-                                                 float(pad["x"]), float(pad["y"]), hw, hh)
+                distance = _segment_obox_distance(row["start"], row["end"],
+                                                  float(pad["x"]), float(pad["y"]),
+                                                  hw, hh, deg)
                 if distance > 2.0:
                     continue
-                fixed_pairs.append((row["net"], 2.0 * (distance - clearance_mm)))
+                fixed_pairs.append((row["net"], 2.0 * (distance - clearance_mm),
+                                    ("pad", tag, distance)))
     for via in getattr(board, "vias", []) or []:
         if via.get("net") is None or via.get("x") is None:
             continue
@@ -195,14 +219,20 @@ def clearance_room(board, clearance_mm=None, rows=None, planned_widths=None):
                         - radius)
             if distance > 1.5:
                 continue
-            fixed_pairs.append((row["net"], 2.0 * (distance - clearance_mm)))
+            fixed_pairs.append((row["net"], 2.0 * (distance - clearance_mm),
+                                ("via", "%s at (%.2f, %.2f)" % (via.get("net"),
+                                                               float(via["x"]),
+                                                               float(via["y"])),
+                                 distance)))
 
     room = {}
+    bound_by = {}
     for net in widths:
         limit = None
-        for owner, allowed in fixed_pairs:
+        binding = None
+        for owner, allowed, what in fixed_pairs:
             if owner == net and (limit is None or allowed < limit):
-                limit = allowed
+                limit, binding = allowed, what
         for a, b, distance in track_pairs:
             if net not in (a, b):
                 continue
@@ -214,10 +244,16 @@ def clearance_room(board, clearance_mm=None, rows=None, planned_widths=None):
                 allowed = 2.0 * (distance - clearance_mm) - other_w
             if limit is None or allowed < limit:
                 limit = allowed
+                binding = ("track", other, distance)
         if limit is not None:
             room[net] = max(widths[net], round(limit, 4))
+            if binding:
+                bound_by[net] = {"kind": binding[0], "neighbour": binding[1],
+                                 "centre_distance_mm": round(binding[2], 4),
+                                 "allows_mm": round(limit, 4)}
     return {"clearance_mm": clearance_mm,
             "max_width_mm": room,
+            "bound_by": bound_by,
             "planned_widths_mm": planned,
             "method": ("segment-to-segment and segment-to-box distances on the same "
                        "layer; a pair of nets that are BOTH being widened uses the "
