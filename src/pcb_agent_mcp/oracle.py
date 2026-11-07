@@ -215,6 +215,60 @@ def _bucketize(items, cell, pad=0.0):
                 grid.setdefault((gx, gy), []).append(idx)
     return grid
 
+def _bbox_list(items):
+    """Bounding boxes once per item, in the same order.
+
+    `_nearest_from` needs them to skip items that are certainly farther than the
+    best found so far; a 200-cell-wide band otherwise calls the exact
+    polygon/segment distance on every candidate in nine cells per sample point.
+    """
+    return [_item_bbox(it) for it in items]
+
+def _nearest_from(items, buckets, cell, px, py, rings=3, bboxes=None):
+    """The nearest item to the point (px, py), or None.
+
+    Ring by ring, stopping once something has been found: an item 0.5 mm away sits
+    in the NEXT cell when the sample lands near a cell boundary, so a single-cell
+    lookup reported "nothing nearby" and every distance collapsed to whatever the
+    bounds allowed - the bug that made a via look legal on top of a pad.
+
+    Returns (distance, item). One implementation for every caller, because two
+    copies of this drifted apart once already.
+    """
+    if not items:
+        return None
+    gx = int(math.floor(px / cell))
+    gy = int(math.floor(py / cell))
+    probe = {"seg": ((px, py), (px, py), 0.0)}
+    best = None
+    for r in range(rings + 1):
+        for ox in range(-r, r + 1):
+            for oy in range(-r, r + 1):
+                if r and max(abs(ox), abs(oy)) != r:
+                    continue
+                for idx in (buckets.get((gx + ox, gy + oy)) or ()):
+                    it = items[idx]
+                    if bboxes is not None and best is not None:
+                        bb = bboxes[idx]
+                        gap_x = max(0.0, bb[0] - px, px - bb[2])
+                        gap_y = max(0.0, bb[1] - py, py - bb[3])
+                        # The point-to-bbox gap is a LOWER bound on the point-to-
+                        # copper distance, and a track's `_dist` subtracts half its
+                        # width from the centreline distance, so give that half
+                        # width back before comparing - a bound that is too high
+                        # would skip a genuinely nearer item.
+                        bound = math.hypot(gap_x, gap_y)
+                        if it.get("seg"):
+                            bound -= it["seg"][2] / 2.0
+                        if bound >= best[0]:
+                            continue
+                    d = _dist(probe, it)
+                    if best is None or d < best[0]:
+                        best = (d, it)
+        if best is not None and r >= 1:
+            break
+    return best
+
 
 # ------------------------------------------------------------------- queries
 def _stackup_total_mm(board):
@@ -1682,30 +1736,8 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
     rings = [p for p in (board.outline or []) if len(p) >= 3]
 
     def _lookup(items, buckets, px, py, rings=3):
-        """The nearest item within `rings` cells, or None.
-
-        Ring by ring, stopping once something has been found: an item 0.5 mm away
-        sits in the NEXT cell when the sample lands near a cell boundary, so a
-        single-cell lookup reported "nothing nearby" and every room figure collapsed
-        to the board-edge bound. Ring 0 then ring 1, and stop.
-        """
-        gx = int(math.floor(px / cell))
-        gy = int(math.floor(py / cell))
-        probe = {"seg": ((px, py), (px, py), 0.0)}
-        best = None
-        for r in range(rings + 1):
-            for ox in range(-r, r + 1):
-                for oy in range(-r, r + 1):
-                    if r and max(abs(ox), abs(oy)) != r:
-                        continue
-                    for idx in (buckets.get((gx + ox, gy + oy)) or ()):
-                        it = items[idx]
-                        d = _dist(probe, it)
-                        if best is None or d < best[0]:
-                            best = (d, it)
-            if best is not None and r >= 1:
-                break
-        return best
+        """The nearest item within `rings` cells (`_nearest_from`, same cell)."""
+        return _nearest_from(items, buckets, cell, px, py, rings=rings)
 
     def _nearest(name, px, py):
         items, buckets = layer_buckets[name]
@@ -1833,6 +1865,480 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
                                     "needs one here"},
     )
 
+
+def _cluster_points(points, join_mm):
+    """Groups of points that hang together within `join_mm` (single linkage).
+
+    Single linkage is the right rule here and not a shortcut: a power net's pads are
+    a ROW whose two ends can be 15 mm apart while every pad is 0.5 mm from its
+    neighbour, and the row is one place on the board. Grouping by distance to a
+    centre instead would split it into as many clusters as it has pads, and the plan
+    would then describe twenty corridors of length zero.
+    """
+    n = len(points)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    lim2 = float(join_mm) ** 2
+    for i in range(n):
+        xi, yi = points[i]
+        for j in range(i + 1, n):
+            dx, dy = xi - points[j][0], yi - points[j][1]
+            if dx * dx + dy * dy > lim2:
+                continue
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+def _prim_tree(points):
+    """Prim's minimum spanning tree, returning the EDGES, not just the total.
+
+    `_prim_mst` above answers "how short could this net be"; a plan needs to know
+    WHICH pairs to look at the floor between, which is exactly the tree's edges.
+    """
+    n = len(points)
+    if n < 2:
+        return []
+    inf = float("inf")
+    best = [inf] * n
+    prev = [-1] * n
+    used = [False] * n
+    best[0] = 0.0
+    out = []
+    for _ in range(n):
+        k = -1
+        for i in range(n):
+            if not used[i] and (k < 0 or best[i] < best[k]):
+                k = i
+        used[k] = True
+        if prev[k] >= 0:
+            out.append((prev[k], k, best[k]))
+        px, py = points[k]
+        for i in range(n):
+            if used[i]:
+                continue
+            d = math.hypot(points[i][0] - px, points[i][1] - py)
+            if d < best[i]:
+                best[i] = d
+                prev[i] = k
+    return out
+
+def _widest_through(widths, nx, ny, starts, ends):
+    """The largest width at which some route of cells joins `starts` to `ends`.
+
+    This is the MAXIMUM-BOTTLENECK path, and it is what makes the answer useful: a
+    straight line between two pad clusters usually crosses a row of other pads and
+    reads as "nothing fits", while a track can step around them and be 0.35 wide the
+    whole way. Sorting the cells from widest to narrowest and adding them one at a
+    time, the moment a start and an end land in the same component, the width being
+    added IS the answer - no bisection, one pass.
+
+    Each component carries `has_start` / `has_end` flags so the join is detected on
+    the union that creates it, not by re-walking the grid every step.
+
+    Returns (width, cell_index) or (None, None) when even width 0 does not connect.
+    """
+    total = nx * ny
+    parent = [-1] * total            # -1 = cell not added yet
+    has_s = bytearray(total)
+    has_e = bytearray(total)
+    order = sorted(range(total), key=lambda c: -widths[c])
+    for c in order:
+        w = widths[c]
+        if w < 0:
+            break                    # everything from here on is inside copper
+        parent[c] = c
+        has_s[c] = 1 if c in starts else 0
+        has_e[c] = 1 if c in ends else 0
+        ix, iy = divmod(c, ny)
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            jx, jy = ix + dx, iy + dy
+            if jx < 0 or jy < 0 or jx >= nx or jy >= ny:
+                continue
+            n = jx * ny + jy
+            if parent[n] < 0:
+                continue
+            a, b = c, n
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            while parent[b] != b:
+                parent[b] = parent[parent[b]]
+                b = parent[b]
+            if a == b:
+                continue
+            parent[a] = b
+            has_s[b] = 1 if (has_s[a] or has_s[b]) else 0
+            has_e[b] = 1 if (has_e[a] or has_e[b]) else 0
+            if has_s[b] and has_e[b]:
+                # The width that closed the circuit is the bottleneck; report the
+                # cell that carries it so the caller knows where the throat is.
+                return w, c
+    return None, None
+
+def trunk_plan(board, net, track_mm=None, clearance_mm=None, edge_clearance_mm=None,
+               layer=None, cluster_mm=5.0, band_mm=4.0, grid_mm=0.25,
+               max_edges=12, pours_block=False, max_cells=200000):
+    """How wide a trunk of this net can join its pad clusters, and where does it
+    get squeezed?
+
+    The unfinished sky_star board has 38 unconnected +3V3 pads and every tool here
+    could say so; none could say whether a 0.4 mm trunk between the pad groups is
+    possible at all, or which millimetre of floor refuses it. That question decides
+    whether the net gets finished or the floorplan moves, and it is a measurement,
+    not a route:
+
+    * the net's pads are grouped (single linkage at `cluster_mm`), and the cluster
+      centres are joined by a minimum spanning tree - n clusters, n-1 segments;
+    * around each segment a BAND of `band_mm` either side is rasterised at `grid_mm`,
+      and at every cell the widest track whose centre sits there is computed: half of
+      it must clear the nearest other-net copper by `clearance_mm`, and the board
+      edge by the edge clearance;
+    * the widest trunk from cluster i to cluster j is the maximum-bottleneck path
+      through those cells, so stepping around a pad row is allowed while teleporting
+      across one is not.
+
+    The answer is therefore a width that CAN be routed, with the cell that limits it
+    - not a claim that anyone has routed it. Returned per copper layer, because the
+    question "which layer" is answered by the same raster.
+
+    POURS are not obstacles, for the same reason `board_cut_capacity` and
+    `via_sites` ignore them: the filler cuts a pour back around whatever is added, so
+    another net's plane is not a wall. `pours_block=True` restores the strict
+    reading.
+    """
+    if not net:
+        # Without a name this would match every pad with no net at all - the
+        # unconnected ones - and answer a question nobody asked.
+        return err("which net? `net` is required and must not be empty",
+                   "ARG_INVALID",
+                   hint="pads with no net assignment are not a trunk; name the net "
+                        "you want to join, e.g. +3V3")
+    rules = board.rules or {}
+    classes = dict((k, v) for k, v in (rules.get("net_classes") or {}).items()
+                   if isinstance(v, dict))
+    default_cls = classes.get("Default") or {}
+    rule_clr = default_cls.get("clearance")
+    if rule_clr is None:
+        clrs = [float(v.get("clearance")) for v in classes.values()
+                if isinstance(v.get("clearance"), (int, float))]
+        rule_clr = min(clrs) if clrs else None
+    rule_tw = default_cls.get("track_width") or default_cls.get("trace_width")
+    if rule_tw is None:
+        tws = [float(v.get("track_width") or v.get("trace_width"))
+               for v in classes.values()
+               if isinstance(v.get("track_width") or v.get("trace_width"),
+                             (int, float))]
+        rule_tw = min(tws) if tws else None
+    clr = float(clearance_mm) if clearance_mm is not None else float(rule_clr or 0.2)
+    tw = float(track_mm) if track_mm is not None else float(rule_tw or 0.25)
+    edge = (float(edge_clearance_mm) if edge_clearance_mm is not None
+            else float((rules.get("clearance") or {}).get("min_copper_edge_clearance")
+                       or clr))
+    if clr < 0 or tw <= 0:
+        return err("clearance_mm must be >= 0 and track_mm > 0", "ARG_RANGE")
+    step = float(grid_mm or 0.25)
+    if step <= 0:
+        return err("grid_mm must be > 0", "ARG_RANGE")
+    band = float(band_mm or 0.0)
+    if band <= 0:
+        return err("band_mm must be > 0", "ARG_RANGE")
+    join = float(cluster_mm if cluster_mm else 5.0)
+    if join <= 0:
+        return err("cluster_mm must be > 0", "ARG_RANGE")
+
+    copper = _copper_layers(board)
+    coin = [layer] if layer else list(copper)
+    for name in coin:
+        if name not in copper:
+            return err("no such copper layer: %r (board has %s)"
+                       % (name, ", ".join(copper)), "ARG_INVALID")
+    if not board.outline:
+        return err("this board has no outline", "NO_GEOMETRY",
+                   hint="without Edge.Cuts there is no floor between the clusters "
+                        "to measure, and every width would be an invention")
+
+    pts, wires = [], []
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            if pad.get("net") != net:
+                continue
+            px, py = _pad_xy(fp, pad)
+            if px is None:
+                continue
+            pts.append((px, py))
+            wires.append("%s.%s" % (fp.get("ref") or "?", pad.get("number") or "?"))
+    if not pts:
+        return err("no pad on this board belongs to net %r" % (net,), "NO_GEOMETRY",
+                   hint="this net has no pads, so there is nothing to join")
+    if len(pts) == 1:
+        return err("net %r has a single pad" % (net,), "NO_GEOMETRY",
+                   hint="one pad needs no trunk; there is no second point to reach")
+
+    groups = _cluster_points(pts, join)
+    groups.sort(key=lambda g: -len(g))
+    clusters = []
+    for gi, g in enumerate(groups):
+        xs = [pts[i][0] for i in g]
+        ys = [pts[i][1] for i in g]
+        clusters.append({"id": gi, "pads": len(g),
+                         "center": [sum(xs) / len(xs), sum(ys) / len(ys)],
+                         "bbox": [min(xs), min(ys), max(xs), max(ys)],
+                         "pads_at": [[round(pts[i][0], 3), round(pts[i][1], 3)]
+                                     for i in g[:6]]})
+    centers = [c["center"] for c in clusters]
+    tree = _prim_tree(centers)
+    if not tree:
+        return err("all pads of %r are in one cluster" % (net,), "NO_GEOMETRY",
+                   hint="raise cluster_mm to group them, or the net needs no trunk")
+
+    # Other-net copper per layer (own copper is never in the way), plus the pour
+    # edges only when the caller insists the planes are fixed copper.
+    # Bucket cell, and with it the REACH of the nearest-copper search: three rings
+    # of a 2 mm cell is 6.3 mm of floor, i.e. a 12 mm aperture. Shrinking the cell to
+    # 1 mm looked 15 % faster and quietly LOWERED a reported width on the real board
+    # (3.53 -> 4.15), because beyond the last ring "no copper found" is an UPPER
+    # BOUND and not a measurement. So the cell stays wide and the bound is reported
+    # as a bound (`limited_by.kind = beyond_reach`).
+    cell = max(1.0, 2.0 + clr)
+    reach_mm = 3.0 * cell
+    max_w = 2.0 * (reach_mm - clr)
+    layer_items, layer_buckets, layer_bboxes = {}, {}, {}
+    own_items, own_buckets = {}, {}
+    pour_items, pour_buckets, pour_bboxes = {}, {}, {}
+    for name in coin:
+        its, own = [], []
+        for it in _items(board, layer=name):
+            if it.get("kind") not in ("pad", "via", "track"):
+                continue
+            (own if it.get("net") == net else its).append(it)
+        layer_items[name] = its
+        layer_bboxes[name] = _bbox_list(its)
+        layer_buckets[name] = _bucketize(its, cell, pad=clr) if its else {}
+        own_items[name] = own
+        own_buckets[name] = _bucketize(own, cell) if own else {}
+        segs = []
+        if pours_block:
+            for zi, zone in enumerate(board.zones or []):
+                if name not in [str(l) for l in (zone.get("layers") or [])]:
+                    continue
+                if zone.get("net") == net:
+                    continue
+                for pi, poly in enumerate(zone.get("filled_polygons") or []):
+                    n = len(poly)
+                    for i in range(n):
+                        p0, p1 = poly[i], poly[(i + 1) % n]
+                        if p0 == p1:
+                            continue
+                        segs.append({"kind": "zone", "net": zone.get("net"),
+                                     "ref": "zone%d.%d" % (zi, pi), "layer": name,
+                                     "seg": ((p0[0], p0[1]), (p1[0], p1[1]), 0.0)})
+        pour_items[name] = segs
+        pour_bboxes[name] = _bbox_list(segs)
+        pour_buckets[name] = _bucketize(segs, cell, pad=clr) if segs else {}
+    rings = [p for p in (board.outline or []) if len(p) >= 3]
+
+    def width_on(name, px, py, edge_w):
+        """Widest track with its centre here on one layer, and what limits it.
+
+        `edge_w` is the board-edge bound already computed for this point, which is
+        the same on every layer - recomputing it per layer doubled the cost of a
+        search that walks tens of thousands of cells.
+        """
+        w = None
+        why = None
+        got = _nearest_from(layer_items[name], layer_buckets[name], cell, px, py,
+                            bboxes=layer_bboxes[name])
+        if got is not None:
+            d, it = got
+            w = 2.0 * (d - clr)
+            why = {"kind": it.get("kind"), "net": it.get("net"),
+                   "ref": it.get("ref"), "on": name}
+        else:
+            # No copper within reach: an UPPER BOUND on the aperture, not a
+            # measurement. Said so, so it can never be read as "measured 12 mm of
+            # clear floor".
+            w = max_w
+            why = {"kind": "beyond_reach", "net": None,
+                   "ref": "no copper within %.2f mm" % reach_mm, "on": name}
+        if pours_block:
+            got = _nearest_from(pour_items[name], pour_buckets[name], cell, px, py,
+                                bboxes=pour_bboxes[name])
+            if got is not None and (w is None or 2.0 * (got[0] - clr) < w):
+                w = 2.0 * (got[0] - clr)
+                why = {"kind": "pour_edge", "net": got[1].get("net"),
+                       "ref": got[1].get("ref"), "on": name}
+        if w is None or edge_w < w:
+            w = edge_w
+            why = {"kind": "board_edge", "net": None, "ref": "Edge.Cuts",
+                   "on": name}
+        return max(-1.0, w), why
+
+    edges, throttled = [], []
+    cells_used = 0
+    for (i, j, length) in sorted(tree, key=lambda e: -e[2])[:int(max_edges)]:
+        a, b = centers[i], centers[j]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        ln = math.hypot(dx, dy)
+        ux, uy = dx / ln, dy / ln
+        nxv, nyv = -uy, ux                       # perpendicular
+        # The band starts where the cluster's own box ends: measuring inside a
+        # package measures the fan-out, which is a different question.
+        def _exit(c):
+            bb = clusters[c]["bbox"]
+            got = _cut_t_range(a, (dx, dy),
+                               (bb[0] - 1e-6, bb[1] - 1e-6,
+                                bb[2] + 1e-6, bb[3] + 1e-6))
+            return got[1] if got else 0.0
+
+        def _enter(c):
+            bb = clusters[c]["bbox"]
+            got = _cut_t_range(a, (dx, dy),
+                               (bb[0] - 1e-6, bb[1] - 1e-6,
+                                bb[2] + 1e-6, bb[3] + 1e-6))
+            return got[0] if got else 1.0
+
+        t0, t1 = _exit(i), _enter(j)
+        if t1 <= t0:
+            edges.append({"from": i, "to": j,
+                          "centers": [[round(a[0], 3), round(a[1], 3)],
+                                      [round(b[0], 3), round(b[1], 3)]],
+                          "straight_mm": round(length, 3), "open_span_mm": 0.0,
+                          "verdict": "clusters_overlap", "layers": {},
+                          "best": None, "fits_on": []})
+            continue
+        s0, s1 = t0 * length, t1 * length
+        ns = max(2, int(math.ceil((s1 - s0) / step)) + 1)
+        nb = max(2, int(math.ceil(2.0 * band / step)) + 1)
+        cells_used += ns * nb * len(coin)
+        if cells_used > int(max_cells):
+            return err("the corridor band needs %d cells at %.3f mm" % (cells_used, step),
+                       "ARG_RANGE",
+                       hint="raise grid_mm to about %.2f mm, narrow band_mm, raise "
+                            "cluster_mm so there are fewer cluster pairs, or raise "
+                            "max_cells if you meant that raster"
+                            % (step * math.sqrt(cells_used / float(max_cells))
+                               * 1.05))
+        per_layer = {}
+        fits_on = []
+        widths = dict((name, []) for name in coin)
+        limits = dict((name, []) for name in coin)
+        for si in range(ns):
+            s = s0 + si * step
+            for bi in range(nb):
+                off = -band + bi * step
+                px = a[0] + ux * s + nxv * off
+                py = a[1] + uy * s + nyv * off
+                inside = any(G.point_in_polygon((px, py), r) for r in rings)
+                edge_w = min(2.0 * (G.dist_point_polygon((px, py), r) - edge)
+                             for r in rings)
+                for name in coin:
+                    if not inside:
+                        widths[name].append(-1.0)
+                        limits[name].append(None)
+                        continue
+                    w, why = width_on(name, px, py, edge_w)
+                    widths[name].append(round(w, 3))
+                    limits[name].append(why)
+        for name in coin:
+            # Start column = the cells nearest the first cluster, end column = the
+            # last: a path only counts when it spans the whole corridor.
+            starts = set(range(0, nb))
+            ends = set((ns - 1) * nb + bi for bi in range(nb))
+            wbest, cbest = _widest_through(widths[name], ns, nb, starts, ends)
+            if wbest is None:
+                per_layer[name] = {"widest_mm": None, "verdict": "no_path",
+                                   "at": None, "limited_by": None}
+                continue
+            si, bi = divmod(cbest, nb)
+            per_layer[name] = {
+                "widest_mm": round(wbest, 3),
+                "verdict": "fits" if wbest >= tw - 1e-9 else "throttled",
+                "at": [round(a[0] + ux * (s0 + si * step) + nxv * (-band + bi * step), 3),
+                       round(a[1] + uy * (s0 + si * step) + nyv * (-band + bi * step), 3)],
+                "limited_by": limits[name][cbest]}
+            if wbest >= tw - 1e-9:
+                fits_on.append(name)
+        best = None
+        for name, r in per_layer.items():
+            if r["widest_mm"] is not None and (best is None
+                                               or r["widest_mm"] > best["widest_mm"]):
+                best = {"layer": name, "widest_mm": r["widest_mm"],
+                        "at": r["at"], "limited_by": r["limited_by"]}
+        entry = {"from": i, "to": j,
+                 "centers": [[round(a[0], 3), round(a[1], 3)],
+                             [round(b[0], 3), round(b[1], 3)]],
+                 "straight_mm": round(length, 3),
+                 "open_span_mm": round(s1 - s0, 3),
+                 "verdict": "fits" if fits_on else "throttled",
+                 "best": best, "fits_on": fits_on, "layers": per_layer}
+        edges.append(entry)
+        if not fits_on:
+            throttled.append(entry)
+
+    verdict = "trunk_throttled" if throttled else "trunk_fits"
+    return ok(
+        value={
+            "verdict": verdict,
+            "net": net,
+            "track_mm": tw,
+            "pads": len(pts),
+            "cluster_count": len(clusters),
+            "clusters": [{"id": c["id"], "pads": c["pads"],
+                          "center": [round(c["center"][0], 3),
+                                     round(c["center"][1], 3)],
+                          "bbox": [round(v, 3) for v in c["bbox"]],
+                          "pads_at": c["pads_at"]} for c in clusters],
+            "edges": edges,
+            "throttled_edges": len(throttled),
+            "layers": coin,
+            "measured_up_to_mm": round(max_w, 3),
+        },
+        unit="mm, count",
+        model="pad clustering + spanning tree + maximum-bottleneck width over a band",
+        basis="copper of one net sits on clusters of near-touching pads, and a trunk "
+              "has to run from cluster to cluster. In a band of band_mm either side of "
+              "the straight line between two cluster centres, each grid cell is worth "
+              "the widest track whose centre sits there: 2*min(distance to other-net "
+              "copper - clearance, distance to the board edge - edge clearance). The "
+              "widest trunk that joins the two clusters is the maximum-bottleneck path "
+              "through those cells, so it may step around copper but not over it",
+        precision="widths are exact distances to the nearest copper sampled on a "
+                  "%.2f mm grid, so a lane narrower than the grid can be missed - a "
+                  "no_path verdict or a width of 0 can be a grid artefact, and "
+                  "re-running at a quarter of the width is the check; a real width "
+                  "may be up to one grid step wider than reported. Apertures wider "
+                  "than %.2f mm are NOT measured: the search reaches %.2f mm and a "
+                  "cell with nothing in reach reports that bound with "
+                  "limited_by.kind = beyond_reach. The path is 4-connected cells, so "
+                  "a track along it bends within one grid step. Footprint bodies and "
+                  "keepouts are not obstacles, and pours are not obstacles unless "
+                  "pours_block. The width is what fits; no path is written"
+                  % (step, max_w, reach_mm),
+        assumptions={"clearance_mm": clr, "edge_clearance_mm": edge,
+                     "cluster_mm": join, "band_mm": band, "grid_mm": step,
+                     "clearance_from": ("caller" if clearance_mm is not None
+                                        else "net class Default" if rule_clr
+                                        else "nothing in the file, 0.2 mm assumed"),
+                     "track_from": ("caller" if track_mm is not None
+                                    else "net class Default" if rule_tw
+                                    else "nothing in the file, 0.25 mm assumed"),
+                     "pours_counted": bool(pours_block),
+                     "edges_shown": min(len(tree), int(max_edges)),
+                     "not_claimed": "this is not a route and does not choose one: it "
+                                    "says a trunk of this width CAN join the clusters "
+                                    "inside this band, and names the cell that limits "
+                                    "it. Outside the band it says nothing"},
+    )
 
 def _occupancy(board, items, keepouts, step, margin):
     """A per-layer grid where None = outside the board, False = free, a net name =

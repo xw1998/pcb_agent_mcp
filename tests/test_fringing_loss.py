@@ -399,7 +399,7 @@ class TestRegistration(unittest.TestCase):
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 226)
+        self.assertEqual(len(tools.TOOLS), 227)
 
     def test_the_capability_list_knows_it(self):
         h = tools.TOOLS["calc_capabilities"]["handler"]

@@ -3888,6 +3888,62 @@ _tool(
     _board_tool(_board_cut_capacity, derived=True),
 )
 
+def _board_trunk_plan(b, args):
+    return _oracle.trunk_plan(
+        b, args.get("net"), track_mm=args.get("track_mm"),
+        clearance_mm=args.get("clearance_mm"),
+        edge_clearance_mm=args.get("edge_clearance_mm"),
+        layer=args.get("layer"), cluster_mm=args.get("cluster_mm", 5.0),
+        band_mm=args.get("band_mm", 4.0), grid_mm=args.get("grid_mm", 0.25),
+        max_edges=args.get("max_edges", 12),
+        pours_block=args.get("pours_block", False),
+        max_cells=args.get("max_cells", 200000))
+
+_tool(
+    "board_trunk_plan",
+    "Can a trunk of this net actually join its pad clusters, and where does it get "
+    "squeezed? The point of the question is the sky_star board: 38 unconnected +3V3 "
+    "pads, and every tool here could report the count but none could say whether a "
+    "0.4 mm trunk between the pad groups is possible at all, or which millimetre of "
+    "floor refuses it. This clusters the net's pads (single linkage), joins the "
+    "cluster centres with a minimum spanning tree, and for each pair measures the "
+    "WIDEST trunk that can get from one to the other inside a band around the "
+    "straight line: every grid cell is worth 2*min(distance to other-net copper - "
+    "clearance, distance to the board edge - edge clearance), and the answer is the "
+    "maximum-bottleneck path through those cells - so a trunk may step around a pad "
+    "row but not across it. Per copper layer, with the throat's coordinate and the "
+    "object that limits it. A pass is constructive; a failure names the millimetre "
+    "to move. It does not route and writes nothing. Pours are not obstacles unless "
+    "you say so (the filler re-cuts them). " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "net": _str("the net to plan, e.g. +3V3"),
+         "track_mm": _num("the width the trunk needs; below it an edge reads as "
+                          "throttled (default: the net class figure)"),
+         "clearance_mm": _num("clearance kept from other nets' copper (default: the "
+                              "net class figure)"),
+         "edge_clearance_mm": _num("clearance kept from the board edge (default: the "
+                                   "board rule min_copper_edge_clearance)"),
+         "layer": _str("only this copper layer (default: every copper layer)"),
+         "cluster_mm": _num("pads within this of each other belong to one cluster - "
+                            "raise it to treat a whole pad row as one place (5.0)",
+                            5.0),
+         "band_mm": _num("how far either side of the straight line the trunk may "
+                         "wander (4.0)", 4.0),
+         "grid_mm": _num("raster pitch of that band (0.25)", 0.25),
+         "max_edges": _num("how many cluster pairs to measure, longest first (12)",
+                           12),
+         "pours_block": _bool("treat another net's POUR as fixed copper. Off by "
+                              "default: the filler cuts it back around what is added",
+                              False),
+         "max_cells": _num("cap on raster cells over the whole call; raise it when "
+                           "you refine grid_mm, or the finer raster is refused "
+                           "instead of measured (200000)", 200000),
+     }, **_COMMON),
+     "required": ["path", "net"]},
+    _board_tool(_board_trunk_plan, derived=True),
+)
+
 def _board_via_sites(b, args):
     region = args.get("region")
     if region:
