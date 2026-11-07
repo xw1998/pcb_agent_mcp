@@ -3840,6 +3840,54 @@ _tool(
     _board_tool(_board_pour_fragments, derived=True),
 )
 
+def _board_cut_capacity(b, args):
+    return _oracle.cut_capacity(
+        b, x=args.get("x"), y=args.get("y"),
+        angle_deg=args.get("angle_deg", 90.0), span_mm=args.get("span_mm"),
+        layer=args.get("layer"), track_mm=args.get("track_mm"),
+        clearance_mm=args.get("clearance_mm"),
+        obstacles=args.get("obstacles"), max_gaps=args.get("max_gaps", 40))
+
+_tool(
+    "board_cut_capacity",
+    "Draw one line across the board and ask the only question a floorplan can fail "
+    "before any routing: how many tracks fit across this line, and how many nets "
+    "MUST cross it? A net with pads on both sides has to carry copper over, and each "
+    "crossing costs one lane, so 'must_cross > capacity' is a NECESSARY condition "
+    "that no router, layer assignment or patience can get around. It is what the "
+    "sky_star board died on: turning the headers into through-holes cut B.Cu into a "
+    "few gaps while 12 nets still had pads on both sides. Reports, per copper layer: "
+    "every free gap with its width and how many tracks of the given width fit in it, "
+    "what is standing in the way (kind/net/reference/how much of the line it covers), "
+    "the nets that must cross, the ones already crossing, and a `sensitivity` block "
+    "saying what the existing tracks and the pours each cost - so 'full' never means "
+    "'full because of copper that will be re-poured'. Pours are NOT counted as "
+    "obstacles unless asked, because the filler re-cuts them around whatever crosses. "
+    "It does not choose which net takes which lane. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "x": _num("x of a point on the cut line (default: board centre)"),
+         "y": _num("y of a point on the cut line (default: board centre)"),
+         "angle_deg": _num("direction the line RUNS, in degrees; 90 = vertical, "
+                            "0 = horizontal", 90.0),
+         "span_mm": _num("total length of the line; default spans the board's "
+                          "bbox diagonal x 1.5 so it always crosses both edges"),
+         "layer": _str("only this copper layer (default: every copper layer)"),
+         "track_mm": _num("width of the track that has to get across (default: "
+                          "the net class figure)"),
+         "clearance_mm": _num("clearance that keeps a lane free of the copper "
+                              "next to it (default: the net class figure)"),
+         "obstacles": _arr("which drawn copper blocks a lane: pads, vias, tracks, "
+                            "zones. Default pads+vias+tracks - a lane a track "
+                            "already occupies is not free, but a POUR is re-cut "
+                            "around what crosses it so counting it would report "
+                            "every poured line as full"),
+         "max_gaps": _num("how many gaps and blockers to list per layer", 40),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_board_cut_capacity, derived=True),
+)
+
 _tool(
     "board_net_report",
     "Per net: routed length, segments, vias, pads, and detour_ratio = length / "

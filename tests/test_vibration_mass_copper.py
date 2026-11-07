@@ -640,7 +640,7 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # islands, and to LOOK at the copper are three separate questions,
         # each of which the previous 200 tools could not answer.
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 224)
+        self.assertEqual(len(tools.TOOLS), 225)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

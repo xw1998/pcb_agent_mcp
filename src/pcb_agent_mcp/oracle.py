@@ -1013,6 +1013,478 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
                                     "not that the whole net can be connected"},
     )
 
+def _cut_t_range(a, d, box):
+    """The parameter interval where `a + t*d` is inside an axis-aligned box.
+
+    Standard slab clipping. Returns None when the segment misses the box entirely,
+    which is what keeps a 400-item layer from being sampled at a place it cannot
+    possibly be.
+    """
+    t0, t1 = 0.0, 1.0
+    for k in (0, 1):
+        lo, hi = box[k], box[k + 2]
+        if abs(d[k]) < 1e-12:
+            if not (lo - 1e-12 <= a[k] <= hi + 1e-12):
+                return None
+            continue
+        ta = (lo - a[k]) / d[k]
+        tb = (hi - a[k]) / d[k]
+        if ta > tb:
+            ta, tb = tb, ta
+        t0 = max(t0, ta)
+        t1 = min(t1, tb)
+    if t1 < t0 - 1e-12:
+        return None
+    return max(0.0, t0), min(1.0, t1)
+
+
+def _cut_polygon_spans(poly, a, d, length, clr):
+    """Where a line is covered by a polygon, widened by `clr`, WITHOUT sampling.
+
+    A filled pour is one polygon with tens of thousands of vertices - 21 451 on the
+    sky_star ground plane - and sampling it at 0.05 mm cost 8 s for a single line.
+    Crossings are solved directly instead, so this is O(vertices) with no grid.
+
+    Two details make it safe rather than merely fast:
+
+    * the line is nudged 0.004 mm sideways first, so it does not run exactly
+      THROUGH a vertex. A line through a vertex is a case where "did this edge
+      cross?" has no right answer, and the answer moves by less than a sampling
+      step anyway;
+    * `clr` is applied by widening each interval end by clr/|sin(angle between the
+      line and the edge)| - exact for an edge across the line, and LONGER than the
+      true reach for an oblique one, so the pour can only be over-stated. A lane is
+      never reported that the copper closes.
+    """
+    n = len(poly)
+    if n < 3:
+        return []
+    ln = math.hypot(d[0], d[1])
+    ux, uy = d[0] / ln, d[1] / ln
+    # perpendicular nudge, deliberately not a round number so it cannot land on grid
+    a2 = (a[0] - uy * 0.0037, a[1] + ux * 0.0037)
+
+    def side(p):
+        return ux * (p[1] - a2[1]) - uy * (p[0] - a2[0])
+
+    cuts = []
+    for i in range(n):
+        p = poly[i]
+        q = poly[(i + 1) % n]
+        sp, sq = side(p), side(q)
+        if (sp > 0) == (sq > 0):
+            continue                     # no sign change: no crossing, vertex or not
+        ex, ey = q[0] - p[0], q[1] - p[1]
+        den = d[0] * ey - d[1] * ex
+        if abs(den) < 1e-15:
+            continue
+        wx, wy = p[0] - a[0], p[1] - a[1]
+        t = (wx * ey - wy * ex) / den
+        sn = abs(den) / (ln * math.hypot(ex, ey))
+        reach = clr / sn if sn > 1e-6 else 0.0
+        cuts.append((t, reach))
+    if len(cuts) < 2:
+        return []
+    cuts.sort()
+    out = []
+    for k in range(0, len(cuts) - 1, 2):
+        t0, r0 = cuts[k]
+        t1, r1 = cuts[k + 1]
+        s0 = (t0 * length) - r0
+        s1 = (t1 * length) + r1
+        if s1 > s0:
+            out.append((max(0.0, s0), min(length, s1)))
+    return [(x, y) for x, y in out if y > x]
+
+
+def _cut_obstacle_span(a, d, length, item, clr, step):
+    """Where along the cut line this item stands in the way, in mm from the start.
+
+    Sampled then bisected rather than solved: the items here are pads (possibly
+    rotated), tracks (capsules) and vias (circles), and a closed form for each
+    would be three separate pieces of geometry to get wrong. Sampling at `step`
+    and bisecting each boundary to 0.002 mm gives the same number for every shape
+    and one code path.
+    """
+    bx = _item_bbox(item)
+    box = (bx[0] - clr, bx[1] - clr, bx[2] + clr, bx[3] + clr)
+    got = _cut_t_range(a, d, box)
+    if got is None:
+        return None
+    t0, t1 = got
+    point = {"seg": None}
+
+    def hits(t):
+        p = (a[0] + d[0] * t, a[1] + d[1] * t)
+        point["seg"] = (p, p, 0.0)
+        return _dist(point, item) <= clr - 1e-9
+
+    n = max(2, int(math.ceil((t1 - t0) * length / step)) + 1)
+    lo = hi = None
+    prev = None
+    for i in range(n):
+        t = t0 + (t1 - t0) * i / (n - 1.0)
+        if hits(t):
+            if lo is None:
+                lo = t if prev is None else _cut_edge(hits, t, prev, 0.001, length)
+            hi = t
+        elif lo is not None:
+            hi = _cut_edge(hits, prev, t, 0.001, length)
+            break
+        prev = t
+    if lo is None:
+        return None
+    if hi is None:
+        hi = t1
+    return (lo * length, hi * length)
+
+
+def _cut_edge(hits, s_hit, s_miss, res_mm, length):
+    """The boundary between a point that hits and a point that misses, to `res_mm`.
+
+    Both ends are given explicitly and in any order, because the two callers want
+    opposite things: entering a blocked span the hit is the LATER sample, leaving
+    one it is the EARLIER. An earlier version encoded that as a comparison of the
+    two parameters and got one of the two cases backwards - the blocked span came
+    back 0.10 mm short on one side, which is invisible until a test asks for the
+    exact number.
+
+    Returns the MIDPOINT of the final bracket, so the error is at most res_mm/2.
+    """
+    a, b = float(s_hit), float(s_miss)
+    for _ in range(60):
+        if abs(b - a) * length <= res_mm:
+            break
+        m = (a + b) / 2.0
+        if hits(m):
+            a = m
+        else:
+            b = m
+    return (a + b) / 2.0
+
+
+def cut_capacity(board, x=None, y=None, angle_deg=90.0, span_mm=None, layer=None,
+                 track_mm=None, clearance_mm=None, obstacles=None, max_gaps=40):
+    """How many tracks can cross this line, and how many must?
+
+    Every other tool here answers about ONE object (can this pad leave, is this
+    pour in pieces). A floorplan fails at a different level: a net with copper on
+    both sides of a line has to get across it, and the crossings it needs cannot be
+    fewer than the lanes the line offers. That makes a **necessary** condition - no
+    router, no layer assignment and no amount of patience gets 12 nets across a pad
+    row that leaves 5 lanes - and it is the condition the sky_star board actually
+    died on: the header rows, turned into through-holes, cut B.Cu into a few gaps
+    while 12 nets still had pads on both sides.
+
+    What stands in the way is the caller's decision, stated in the answer:
+
+    * pads, vias and tracks are counted by default - they are drawn copper, and a
+      lane a track already occupies is not free;
+    * POURS are not counted by default, because the filler re-cuts them around
+      whatever crosses them. Counting the pour would report every line on a poured
+      layer as fully blocked - the same false alarm `board_pad_obstacle_map` avoids
+      by not treating footprint bodies as obstacles. `sensitivity` still reports the
+      number WITH the pours, so the cost is visible instead of hidden.
+
+    Obstacles are harvested ONCE per item and then unioned per subset, so the three
+    sensitivity readings do not cost three scans.
+    """
+    if not board.outline:
+        return err("this board has no outline", "NO_GEOMETRY",
+                   hint="a cut line has to cross a board; without Edge.Cuts there is "
+                        "no interior to measure and '0 lanes' would be an invention")
+    rules = board.rules or {}
+    classes = dict((k, v) for k, v in (rules.get("net_classes") or {}).items()
+                   if isinstance(v, dict))
+    default_cls = classes.get("Default") or {}
+    rule_clr = default_cls.get("clearance")
+    if rule_clr is None:
+        clrs = [float(v.get("clearance")) for v in classes.values()
+                if isinstance(v.get("clearance"), (int, float))]
+        rule_clr = min(clrs) if clrs else None
+    rule_tw = default_cls.get("track_width") or default_cls.get("trace_width")
+    if rule_tw is None:
+        tws = [float(v.get("track_width") or v.get("trace_width"))
+               for v in classes.values()
+               if isinstance(v.get("track_width") or v.get("trace_width"),
+                             (int, float))]
+        rule_tw = min(tws) if tws else None
+    clr = float(clearance_mm) if clearance_mm is not None else float(rule_clr or 0.2)
+    tw = float(track_mm) if track_mm is not None else float(rule_tw or 0.25)
+    if clr < 0 or tw <= 0:
+        return err("clearance_mm must be >= 0 and track_mm > 0", "ARG_RANGE")
+
+    xs, ys = [], []
+    for poly in (board.outline or []):
+        for p in poly:
+            xs.append(p[0])
+            ys.append(p[1])
+    if not xs:
+        return err("the outline carries no points", "NO_GEOMETRY")
+    bx0, bx1, by0, by1 = min(xs), max(xs), min(ys), max(ys)
+    if x is None or y is None:
+        x = (bx0 + bx1) / 2.0
+        y = (by0 + by1) / 2.0
+    x, y = float(x), float(y)
+    ang = math.radians(float(angle_deg))
+    dx, dy = math.cos(ang), math.sin(ang)
+    half_span = (float(span_mm) / 2.0 if span_mm else
+                 math.hypot(bx1 - bx0, by1 - by0) * 0.75)
+    a = (x - dx * half_span, y - dy * half_span)
+    d = (dx * 2.0 * half_span, dy * 2.0 * half_span)
+    length = math.hypot(d[0], d[1])
+    if length <= 0:
+        return err("the cut line has zero length", "ARG_RANGE")
+
+    # Clip to the board interior so 'free lanes' can never include the space off
+    # the edge of the board, which is not a lane at all.
+    rings = [p for p in (board.outline or []) if len(p) >= 3]
+
+    def inside(t):
+        p = (a[0] + d[0] * t, a[1] + d[1] * t)
+        return any(G.point_in_polygon(p, r) for r in rings)
+
+    m = 401
+    first = last = None
+    prev = None
+    for i in range(m):
+        t = i / (m - 1.0)
+        if inside(t):
+            if first is None:
+                first = 0.0 if prev is None else _cut_edge(inside, t, prev, 0.001,
+                                                           length)
+            last = t
+        elif first is not None:
+            last = _cut_edge(inside, prev, t, 0.001, length)
+            break
+        prev = t
+    if first is None:
+        return err("the cut line does not cross the board outline", "OUTSIDE_BOARD",
+                   hint="give x/y inside the board, or a shorter span_mm centred on it")
+    s_in, s_out = first * length, last * length
+    usable = s_out - s_in
+    if usable <= 1e-9:
+        return err("the cut line only touches the outline", "OUTSIDE_BOARD")
+
+    wanted = obstacles or ["pads", "vias", "tracks"]
+    kinds = set()
+    for k in wanted:
+        k = str(k).strip().lower()
+        if k in ("pad", "pads"):
+            kinds.add("pad")
+        elif k in ("via", "vias"):
+            kinds.add("via")
+        elif k in ("track", "tracks"):
+            kinds.add("track")
+        elif k in ("zone", "zones", "pour", "pours"):
+            kinds.add("zone")
+        else:
+            return err("unknown obstacle kind %r" % (k,), "ARG_INVALID",
+                       hint="use pads / vias / tracks / zones")
+
+    layers = [layer] if layer else list(_copper_layers(board))
+    for name in layers:
+        if name not in _copper_layers(board):
+            return err("no such copper layer: %r (board has %s)"
+                       % (name, ", ".join(_copper_layers(board))), "ARG_INVALID")
+
+    step = max(0.01, min(0.05, tw / 4.0))
+    spans = {}          # layer -> [(kind, net, ref, s0, s1)]
+    crossings = {}      # net -> crossings already drawn on any scanned layer
+    for name in layers:
+        got = []
+        items = [it for it in _items(board, layer=name)
+                 if it.get("kind") in ("pad", "via", "track")]
+        # Which of them can even reach the line? Without this prefilter every item
+        # whose bbox the line merely grazes is sampled across its full extent - on a
+        # 296-segment board that was 7.4 s for an answer about one line. The bucket
+        # grid is built once per layer and walked at a quarter cell, collecting the
+        # 2x2 block of cells around each sample so a line clipping a cell corner
+        # cannot be missed.
+        cand = set()
+        if items:
+            cell = max(1.0, clr + tw + 1.0)
+            buckets = _bucketize(items, cell, pad=clr)
+            n_walk = max(1, int(math.ceil(length / (cell / 4.0))))
+            for i in range(n_walk + 1):
+                t = i / float(n_walk)
+                gx = int(math.floor((a[0] + d[0] * t) / cell))
+                gy = int(math.floor((a[1] + d[1] * t) / cell))
+                for ox in (0, 1):
+                    for oy in (0, 1):
+                        hit = buckets.get((gx + ox, gy + oy))
+                        if hit:
+                            cand.update(hit)
+        for idx in sorted(cand):
+            it = items[idx]
+            span = _cut_obstacle_span(a, d, length, it, clr, step)
+            if span is None:
+                continue
+            got.append((it.get("kind"), it.get("net"), it.get("ref"),
+                        span[0], span[1]))
+            if it.get("kind") == "track" and it.get("net"):
+                # A track that merely runs CLOSE to the line is not a crossing - it
+                # only occupies a lane. Counting proximity as a crossing would one
+                # day retire a net from the demand that never got across.
+                p0, p1 = it["seg"][0], it["seg"][1]
+                if G.segments_intersect(p0, p1, a, (a[0] + d[0], a[1] + d[1])):
+                    crossings[it["net"]] = crossings.get(it["net"], 0) + 1
+        # Pours are harvested whatever the caller asked for, so `sensitivity` can
+        # say what they would cost - but they only block the primary answer when
+        # the caller put them in `obstacles`.
+        for zi, zone in enumerate(board.zones or []):
+            if name not in [str(l) for l in (zone.get("layers") or [])]:
+                continue
+            for pi, poly in enumerate(zone.get("filled_polygons") or []):
+                for sp in _cut_polygon_spans(poly, a, d, length, clr):
+                    got.append(("zone", zone.get("net"),
+                                "zone%d.%d" % (zi, pi), sp[0], sp[1]))
+        spans[name] = got
+
+    def _free(cur, subset):
+        blocks = sorted((s0, s1) for k, _n, _r, s0, s1 in cur if k in subset)
+        merged = []
+        for s0, s1 in blocks:
+            if merged and s0 <= merged[-1][1] + 1e-9:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], s1))
+            else:
+                merged.append((s0, s1))
+        out = []
+        cur_s = s_in
+        for s0, s1 in merged:
+            s0c, s1c = max(s0, s_in), min(s1, s_out)
+            if s1c <= s0c:
+                continue
+            if s0c - cur_s > 1e-6:
+                out.append((cur_s, s0c))
+            cur_s = max(cur_s, s1c)
+        if s_out - cur_s > 1e-6:
+            out.append((cur_s, s_out))
+        return merged, out
+
+    def _fits(width):
+        # n tracks of `tw` with `clr` between them need n*tw + (n-1)*clr <= width
+        if width < tw - 1e-9:
+            return 0
+        return int(math.floor((width + clr) / (tw + clr) + 1e-9))
+
+    per_layer, total = {}, 0
+    for name in layers:
+        merged, free = _free(spans[name], kinds)
+        gaps = []
+        for s0, s1 in free:
+            w = s1 - s0
+            mid = (s0 + s1) / 2.0
+            gaps.append({
+                "width_mm": round(w, 3),
+                "tracks_fit": _fits(w),
+                "from": [round(a[0] + d[0] * (s0 / length), 3),
+                         round(a[1] + d[1] * (s0 / length), 3)],
+                "to": [round(a[0] + d[0] * (s1 / length), 3),
+                       round(a[1] + d[1] * (s1 / length), 3)],
+                "center": [round(a[0] + d[0] * (mid / length), 3),
+                           round(a[1] + d[1] * (mid / length), 3)],
+            })
+        gaps.sort(key=lambda g: -g["width_mm"])
+        cap = sum(g["tracks_fit"] for g in gaps)
+        total += cap
+        blockers = [{"kind": k, "net": n, "ref": r,
+                     "covers_mm": round(s1 - s0, 3)}
+                    for k, n, r, s0, s1 in spans[name]]
+        blockers.sort(key=lambda b: -b["covers_mm"])
+        per_layer[name] = {
+            "gaps": gaps[:int(max_gaps)],
+            "gap_count": len(gaps),
+            "wide_enough": len([g for g in gaps if g["tracks_fit"] > 0]),
+            "capacity": cap,
+            "usable_mm": round(usable, 3),
+            "blocked_mm": round(usable - sum(g["width_mm"] for g in gaps), 3),
+            "blockers": blockers[:int(max_gaps)],
+        }
+
+    # Who HAS to cross: a net with pads on both sides of the line. A pad whose
+    # centre sits on the line decides nothing, so it is excluded from the side
+    # test and reported separately.
+    side = {}
+    on_line = set()
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            net = pad.get("net")
+            if not net:
+                continue
+            px, py = _pad_xy(fp, pad)
+            if px is None:
+                continue
+            off = (px - x) * dy - (py - y) * dx       # signed distance from the line
+            if abs(off) <= 0.05:
+                on_line.add(net)
+                continue
+            side.setdefault(net, set()).add(1 if off > 0 else -1)
+    both = sorted(n for n, s in side.items() if len(s) == 2)
+    already = [n for n in both if crossings.get(n)]
+    must = [n for n in both if not crossings.get(n)]
+    demand = len(must)
+
+    # Three answers to "how much would ignoring this buy" - the same harvested
+    # spans, unioned per subset, so the caller can see what the tracks and the pour
+    # each cost instead of having to guess why a line reads as full.
+    sens = {}
+    for label, subset in (("pads_vias", {"pad", "via"}),
+                          ("pads_vias_tracks", {"pad", "via", "track"}),
+                          ("with_pours_too", set(kinds) | {"zone"})):
+        sens[label] = sum(_fits(s1 - s0)
+                          for name in layers
+                          for s0, s1 in _free(spans[name], subset)[1])
+
+    slack = total - demand
+    verdict = "capacity_exceeded" if slack < 0 else "within_capacity"
+    return ok(
+        value={
+            "verdict": verdict,
+            "capacity": total,
+            "must_cross": demand,
+            "slack": slack,
+            "angle_deg": float(angle_deg),
+            "line": {"from": [round(a[0], 3), round(a[1], 3)],
+                     "to": [round(a[0] + d[0], 3), round(a[1] + d[1], 3)],
+                     "at": [round(x, 3), round(y, 3)],
+                     "usable_mm": round(usable, 3)},
+            "layers": per_layer,
+            "must_cross_nets": must[:int(max_gaps)],
+            "already_crossing": already[:int(max_gaps)],
+            "pads_on_the_line": sorted(on_line)[:int(max_gaps)],
+            "sensitivity": sens,
+            "obstacles": sorted(kinds),
+        },
+        unit="count of tracks, mm",
+        model="planar cut-line lane count vs nets with pads on both sides",
+        basis="a net whose pads lie on both sides of a line must carry copper across "
+              "it; every crossing occupies one lane on one copper layer, so the sum "
+              "of the lanes the line offers over all scanned layers is an upper "
+              "bound on the nets that can be connected. Lanes are measured as the "
+              "free spans of the line inside the board outline, each grown by the "
+              "clearance so that n tracks of `track_mm` fit when "
+              "n*track + (n-1)*clearance <= span",
+        precision="lane edges are sampled at %.3f mm then bisected to 0.002 mm; a "
+                  "gap narrower than the sample step can be missed. Track crossings "
+                  "already drawn are counted from centreline/line intersection, not "
+                  "from copper overlap, so a track that ends ON the line is not a "
+                  "crossing" % step,
+        assumptions={"clearance_mm": clr, "track_mm": tw,
+                     "clearance_from": ("caller" if clearance_mm is not None
+                                        else "net class Default" if rule_clr
+                                        else "nothing in the file, 0.2 mm assumed"),
+                     "track_from": ("caller" if track_mm is not None
+                                    else "net class Default" if rule_tw
+                                    else "nothing in the file, 0.25 mm assumed"),
+                     "obstacles": sorted(kinds),
+                     "pours_counted": "zone" in kinds,
+                     "not_claimed": "this is a lower bound on what is IN THE WAY, not "
+                                    "a route: it does not say which net takes which "
+                                    "lane, and a net may cross on a layer not scanned"},
+    )
+
+
 def _occupancy(board, items, keepouts, step, margin):
     """A per-layer grid where None = outside the board, False = free, a net name =
     copper owned by that net, True = blocked for everybody (two nets or a keepout).
