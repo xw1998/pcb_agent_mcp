@@ -47,8 +47,10 @@ def emit(m, origin, out):
         side = 'B' if layer == 2 else 'F'
         A('  (footprint "LCEDA:%s" (layer "%s.Cu") (at %s %s %s) (attr smd)'
           % (ref, side, f(ox), f(-oy), f(rot)))
-        A('    (property "Reference" "%s" (at 0 %s 0) (layer "%s.SilkS") (effects (font (size 0.7 0.7) (thickness 0.12))))'
-          % (ref, f(-1.6 if layer == 1 else 1.6), side))
+        hide = ' hide' if ref[:1] in 'RCD' or ref.startswith(('LED', 'RN')) else ''
+        mir = ' (justify mirror)' if layer == 2 else ''
+        A('    (property "Reference" "%s" (at 0 %s 0) (layer "%s.SilkS") (effects (font (size 0.8 0.8) (thickness 0.13))%s%s))'
+          % (ref, f(-1.6 if layer == 1 else 1.6), side, mir, hide))
         A('    (property "Value" "%s" (at 0 %s 0) (layer "%s.Fab") (effects (font (size 0.6 0.6) (thickness 0.1)) hide))'
           % (c['device'][:24], f(1.8), side))
         for p in c['pads']:
@@ -57,6 +59,10 @@ def emit(m, origin, out):
             netstr = ' (net %d "%s")' % (idx[net], net.replace('"', '')) if net in idx else ''
             w = (p['w'] or 0) * MIL
             h = (p['h'] or 0) * MIL
+            if w < 0.05:
+                w = 0.6
+            if h < 0.05:
+                h = 0.6
             if abs(w - h) < 1e-6:
                 pang = 0.0
             else:
@@ -99,8 +105,8 @@ def emit(m, origin, out):
             continue
         A('  (zone (net %d) (net_name "%s") (layer "%s") (uuid "%s") (priority %d)'
           % (idx[net], net, layer, uuid.uuid5(uuid.NAMESPACE_DNS, 'sky-%d-%s' % (k, net)), prio))
-        A('    (hatch edge 0.5) (connect_pads (clearance 0.2)) (min_thickness 0.2)')
-        A('    (fill yes (thermal_gap 0.3) (thermal_bridge_width 0.3))')
+        A('    (hatch edge 0.5) (connect_pads yes (clearance 0.2)) (min_thickness 0.2)')
+        A('    (fill yes (thermal_gap 0.2) (thermal_bridge_width 0.2))')
         A('    (polygon (pts %s))' % ' '.join('(xy %s %s)' % (f(x), f(-y)) for x, y in pts))
         A('  )')
     A('  (gr_rect (start %s %s) (end %s %s) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts"))'
