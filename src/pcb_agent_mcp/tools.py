@@ -3888,6 +3888,62 @@ _tool(
     _board_tool(_board_cut_capacity, derived=True),
 )
 
+def _board_via_sites(b, args):
+    region = args.get("region")
+    if region:
+        try:
+            region = [float(v) for v in region]
+        except (TypeError, ValueError):
+            return _oracle.err("region must be four numbers: x0, y0, x1, y1",
+                               "ARG_INVALID")
+    near = None
+    if args.get("x") is not None and args.get("y") is not None:
+        near = [args.get("x"), args.get("y")]
+    return _oracle.via_sites(
+        b, near=near, radius_mm=args.get("radius_mm"), region=region,
+        grid_mm=args.get("grid_mm", 0.2), diameter_mm=args.get("diameter_mm"),
+        drill_mm=args.get("drill_mm"), clearance_mm=args.get("clearance_mm"),
+        edge_clearance_mm=args.get("edge_clearance_mm"),
+        hole_to_hole_mm=args.get("hole_to_hole_mm"), net=args.get("net"),
+        layers=args.get("layers"), max_sites=args.get("max_sites", 20))
+
+_tool(
+    "board_via_sites",
+    "Where may a via legally go, and how much room has it got? The via tools here "
+    "could compute a via or place ground stitching vias on a grid; none could answer "
+    "the question a route actually asks - is there a legal hole near this point, and "
+    "which one has the most room. That gap cost a whole round: of sixteen ground "
+    "islands only four had room for a 0.45 hole, and two of those four put the hole "
+    "into PD13/PD14's track, which was only discovered by rebuilding and reading DRC. "
+    "A candidate is legal when it is inside the outline by the edge clearance plus its "
+    "radius, `clearance` plus its radius from every pad/track/via/POUR of another net "
+    "on every copper layer, and min_hole_to_hole from every existing drill. `net` is "
+    "what makes it useful: a via of that net may sit on its own copper (that is how it "
+    "connects), while drill-to-drill is a fab rule and never waived. `room_mm` is the "
+    "tightest margin, so a site with 0.05 has 0.05 mm to spare. Search with x/y+"
+    "radius_mm for one spot, or region=[x0,y0,x1,y1] for an area. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "x": _num("x of the point to search around"),
+         "y": _num("y of the point to search around"),
+         "radius_mm": _num("how far around x/y to search (default 2.0)", 2.0),
+         "region": _arr("search this rectangle instead: x0, y0, x1, y1 in mm"),
+         "grid_mm": _num("search pitch (default 0.2)", 0.2),
+         "net": _str("the net the via will belong to; its own copper does not block. "
+                     "Omit to treat ALL copper as blocking"),
+         "layers": _arr("copper layers the via passes through (default: all)"),
+         "diameter_mm": _num("via copper diameter (default: drill + 2x annular ring)"),
+         "drill_mm": _num("via drill (default 0.3, raised to the board's floor)"),
+         "clearance_mm": _num("copper clearance (default: the board's minimum)"),
+         "edge_clearance_mm": _num("board-edge clearance (default: the board's rule)"),
+         "hole_to_hole_mm": _num("minimum drill-to-drill wall (default: the board's "
+                                 "min_hole_to_hole, else 0.25)"),
+         "max_sites": _num("how many legal sites to list, most room first (20)", 20),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_board_via_sites, derived=True),
+)
+
 _tool(
     "board_net_report",
     "Per net: routed length, segments, vias, pads, and detour_ratio = length / "

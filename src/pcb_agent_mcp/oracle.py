@@ -1485,6 +1485,328 @@ def cut_capacity(board, x=None, y=None, angle_deg=90.0, span_mm=None, layer=None
     )
 
 
+def _pour_mask(polys, qx0, qy0, step, nx, ny):
+    """Which grid points lie INSIDE any of these pour polygons.
+
+    Scanline conversion, bucketed per row: every edge is visited once and appended
+    to the rows it spans, so the cost is O(edges + rows*cols) rather than
+    O(edges*rows). The ground plane on a real board is one polygon of 21 451
+    vertices, and asking `point_in_polygon` per candidate put 35 M edge tests in the
+    way of an 8 mm search.
+    """
+    rows = [[] for _ in range(ny)]
+    for poly in polys:
+        n = len(poly)
+        for i in range(n):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % n]
+            if y0 == y1:
+                continue
+            lo, hi = (y0, y1) if y0 < y1 else (y1, y0)
+            i0 = max(0, int(math.ceil((lo - qy0) / step)))
+            i1 = min(ny - 1, int(math.floor((hi - qy0) / step)))
+            for iy in range(i0, i1 + 1):
+                y = qy0 + iy * step
+                t = (y - y0) / (y1 - y0)
+                rows[iy].append(x0 + t * (x1 - x0))
+    mask = []
+    for iy in range(ny):
+        xs = sorted(rows[iy])
+        row = bytearray(nx)
+        for k in range(0, len(xs) - 1, 2):
+            xa, xb = xs[k], xs[k + 1]
+            ia = max(0, int(math.ceil((xa - qx0) / step)))
+            ib = min(nx - 1, int(math.floor((xb - qx0) / step)))
+            for ix in range(ia, ib + 1):
+                row[ix] = 1
+        mask.append(row)
+    return mask
+
+
+def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
+              diameter_mm=None, drill_mm=None, clearance_mm=None,
+              edge_clearance_mm=None, hole_to_hole_mm=None, net=None,
+              layers=None, max_sites=20):
+    """Where may a via legally go, and how much room has it got?
+
+    Every via tool here could compute a via (current, resistance, thermal fence) or
+    PLACE ground vias on a stitching grid; none could answer the question a route
+    actually asks - "is there a legal hole anywhere near this point, and which one
+    has the most room". The stitching round demonstrated the cost of not having it:
+    of sixteen ground islands only four had room for a 0.45 hole, and two of those
+    four put the hole into PD13/PD14's track, which the script only found by
+    rebuilding the board and reading DRC.
+
+    This is legality, not placement: it returns the sites and what is nearest to
+    each, in this order and no other. `net` decides what counts as own copper - a
+    via of net X may sit on X's track or pad (that is how it connects) but not
+    inside another net's copper. Drill-to-drill is a fab rule and is never waived,
+    so an existing hole blocks a candidate whatever its net.
+    """
+    if not board.outline:
+        return err("this board has no outline", "NO_GEOMETRY",
+                   hint="edge clearance cannot be measured without Edge.Cuts")
+    rules = board.rules or {}
+    viar = rules.get("via") or {}
+    ann = float(viar.get("min_via_annular_width") or 0.1)
+    floor_dia = float(viar.get("min_via_diameter") or 0.0) or None
+    floor_hole = float(viar.get("min_through_hole_diameter") or 0.0) or None
+    h2h = (float(hole_to_hole_mm) if hole_to_hole_mm is not None
+           else float(viar.get("min_hole_to_hole") or 0.25))
+    clr = (float(clearance_mm) if clearance_mm is not None
+           else float((rules.get("clearance") or {}).get("min_clearance") or 0.2))
+    edge = (float(edge_clearance_mm) if edge_clearance_mm is not None
+            else float((rules.get("clearance") or {}).get("min_copper_edge_clearance")
+                       or clr))
+
+    if drill_mm is not None:
+        drill = float(drill_mm)
+    elif diameter_mm is not None:
+        drill = max(0.1, float(diameter_mm) - 2.0 * ann)
+    else:
+        drill = 0.3
+    if diameter_mm is not None:
+        dia = float(diameter_mm)
+    else:
+        dia = drill + 2.0 * ann
+    if floor_dia:
+        dia = max(dia, floor_dia)
+    if floor_hole:
+        drill = max(drill, floor_hole)
+    if dia <= drill:
+        return err("diameter_mm must exceed drill_mm", "ARG_RANGE")
+    step = float(grid_mm or 0.2)
+    if step <= 0:
+        return err("grid_mm must be > 0", "ARG_RANGE")
+
+    coin = list(layers) if layers else list(_copper_layers(board))
+    for name in coin:
+        if name not in _copper_layers(board):
+            return err("no such copper layer: %r (board has %s)"
+                       % (name, ", ".join(_copper_layers(board))), "ARG_INVALID")
+    reach = clr + dia / 2.0
+
+    xs, ys = [], []
+    for poly in (board.outline or []):
+        for p in poly:
+            xs.append(p[0])
+            ys.append(p[1])
+    bx0, bx1, by0, by1 = min(xs), max(xs), min(ys), max(ys)
+    if region is not None:
+        try:
+            rx0, ry0, rx1, ry1 = [float(v) for v in region]
+        except (TypeError, ValueError):
+            return err("region must be [x0, y0, x1, y1] in mm", "ARG_INVALID")
+        qx0, qx1 = max(bx0, min(rx0, rx1)), min(bx1, max(rx0, rx1))
+        qy0, qy1 = max(by0, min(ry0, ry1)), min(by1, max(ry0, ry1))
+    elif near is not None:
+        try:
+            cx, cy = float(near[0]), float(near[1])
+        except (TypeError, ValueError, IndexError):
+            return err("near must be [x, y] in mm", "ARG_INVALID")
+        r = float(radius_mm) if radius_mm else 2.0
+        qx0, qx1 = max(bx0, cx - r), min(bx1, cx + r)
+        qy0, qy1 = max(by0, cy - r), min(by1, cy + r)
+    else:
+        qx0, qx1, qy0, qy1 = bx0, bx1, by0, by1
+    if qx1 < qx0 - 1e-9 or qy1 < qy0 - 1e-9:
+        return err("the search window is empty", "ARG_RANGE",
+                   hint="the region / near point lies outside the board")
+
+    # Other-net copper per layer, bucketed so one candidate is one lookup.
+    cell = max(1.0, reach + step * 2.0)
+    layer_buckets = {}
+    pours = []
+    for name in coin:
+        items = [it for it in _items(board, layer=name)
+                 if it.get("kind") in ("pad", "via", "track")
+                 and not (net is not None and it.get("net") == net)]
+        # A pour is carried as its EDGES, not as one polygon: the bucket then only
+        # touches the edges nearby instead of all 21 451 of them, and "inside the
+        # pour" (which the edges cannot answer) comes from the scanline mask below.
+        for zi, zone in enumerate(board.zones or []):
+            if name not in [str(l) for l in (zone.get("layers") or [])]:
+                continue
+            if net is not None and zone.get("net") == net:
+                continue
+            for pi, poly in enumerate(zone.get("filled_polygons") or []):
+                if len(poly) < 3:
+                    continue
+                pours.append(poly)
+                n = len(poly)
+                for i in range(n):
+                    p0, p1 = poly[i], poly[(i + 1) % n]
+                    if p0 == p1:
+                        continue
+                    items.append({"kind": "zone", "net": zone.get("net"),
+                                  "ref": "zone%d.%d" % (zi, pi), "layer": name,
+                                  "seg": ((p0[0], p0[1]), (p1[0], p1[1]), 0.0)})
+        layer_buckets[name] = (items, _bucketize(items, cell, pad=reach))
+
+    # Drills are a fab rule, not an electrical one: another net's hole blocks the
+    # candidate exactly as hard as one of our own.
+    holes = []
+    for via in board.vias:
+        holes.append((float(via["x"]), float(via["y"]),
+                      float(via.get("drill") or via.get("diameter") or 0.3)))
+    for fp in board.footprints:
+        for pad in fp.get("pads") or []:
+            hole = pad.get("hole_mm")
+            if not hole:
+                continue
+            px, py = _pad_xy(fp, pad)
+            if px is not None:
+                holes.append((px, py, float(hole)))
+    # A hole is a POINT plus a radius applied later, not a circle: measuring the
+    # distance to a circle of radius drill/2 and then subtracting drill/2 again
+    # counted the radius twice and refused a site 0.10 mm clear of the drill rule.
+    hole_items = [{"kind": "hole", "net": None, "drill_mm": hd,
+                   "seg": ((hx, hy), (hx, hy), 0.0),
+                   "ref": "hole@(%.2f,%.2f)" % (hx, hy)}
+                  for hx, hy, hd in holes]
+    hole_buckets = _bucketize(hole_items, cell, pad=reach) if hole_items else {}
+
+    rings = [p for p in (board.outline or []) if len(p) >= 3]
+
+    def _lookup(items, buckets, px, py, rings=3):
+        """The nearest item within `rings` cells, or None.
+
+        Ring by ring, stopping once something has been found: an item 0.5 mm away
+        sits in the NEXT cell when the sample lands near a cell boundary, so a
+        single-cell lookup reported "nothing nearby" and every room figure collapsed
+        to the board-edge bound. Ring 0 then ring 1, and stop.
+        """
+        gx = int(math.floor(px / cell))
+        gy = int(math.floor(py / cell))
+        probe = {"seg": ((px, py), (px, py), 0.0)}
+        best = None
+        for r in range(rings + 1):
+            for ox in range(-r, r + 1):
+                for oy in range(-r, r + 1):
+                    if r and max(abs(ox), abs(oy)) != r:
+                        continue
+                    for idx in (buckets.get((gx + ox, gy + oy)) or ()):
+                        it = items[idx]
+                        d = _dist(probe, it)
+                        if best is None or d < best[0]:
+                            best = (d, it)
+            if best is not None and r >= 1:
+                break
+        return best
+
+    def _nearest(name, px, py):
+        items, buckets = layer_buckets[name]
+        return _lookup(items, buckets, px, py)
+
+    def _nearest_hole(px, py):
+        if not hole_buckets:
+            return None
+        return _lookup(hole_items, hole_buckets, px, py)
+
+    nx = int(math.floor((qx1 - qx0) / step)) + 1
+    ny = int(math.floor((qy1 - qy0) / step)) + 1
+    # A whole 44 x 72 mm board at 0.2 mm is 79 200 candidates and took minutes; a
+    # search that wide is the caller asking a question that has too many answers to
+    # be an answer. Refuse and say what would fit, rather than time out.
+    if nx * ny > 20000:
+        fit = math.sqrt((qx1 - qx0) * (qy1 - qy0) / 20000.0)
+        return err("%d candidates at %.3f mm is too many to scan" % (nx * ny, step),
+                   "ARG_RANGE",
+                   hint="give x/y with radius_mm, or a smaller region; a grid_mm of "
+                        "about %.2f mm would fit this window" % max(step, fit))
+    mask = _pour_mask(pours, qx0, qy0, step, nx, ny) if pours else None
+    tried = legal = 0
+    kill = {"off_board": 0, "edge_clearance": 0, "copper_clearance": 0,
+            "pour_interior": 0, "hole_to_hole": 0}
+    sites = []
+    for iy in range(ny):
+        py = qy0 + iy * step
+        for ix in range(nx):
+            px = qx0 + ix * step
+            tried += 1
+            if not any(G.point_in_polygon((px, py), r) for r in rings):
+                kill["off_board"] += 1
+                continue
+            if mask is not None and mask[iy][ix]:
+                # Inside another net's pour: the boundary distance says nothing
+                # about that, and a hole there is a short, not a tight fit.
+                kill["pour_interior"] += 1
+                continue
+            room = None
+            src = "edge_clearance"
+            why = None
+            for r in rings:
+                d = G.dist_point_polygon((px, py), r)
+                slack = d - (edge + dia / 2.0)
+                if room is None or slack < room:
+                    room, src, why = slack, "edge_clearance", ("board edge", r)
+            for name in coin:
+                got = _nearest(name, px, py)
+                if got is None:
+                    continue
+                slack = got[0] - reach
+                if slack < room:
+                    room, src = slack, "copper_clearance"
+                    why = ("%s on %s" % (got[1].get("kind"), name), got[1])
+            if room < 0:
+                kill[src] += 1
+                continue
+            got = _nearest_hole(px, py)
+            if got is not None:
+                slack = got[0] - drill / 2.0 - got[1].get("drill_mm", 0.0) / 2.0 - h2h
+                if slack < room:
+                    room, src = slack, "hole_to_hole"
+                    why = ("existing hole", got[1])
+                if room < 0:
+                    kill["hole_to_hole"] += 1
+                    continue
+            legal += 1
+            nearest = None
+            if why and isinstance(why[1], dict):
+                it = why[1]
+                nearest = {"kind": it.get("kind"), "net": it.get("net"),
+                           "ref": it.get("ref")}
+            sites.append({"at": [round(px, 3), round(py, 3)],
+                          "room_mm": round(room, 3),
+                          "limited_by": why[0] if why else None,
+                          "nearest": nearest})
+    sites.sort(key=lambda s: -s["room_mm"])
+    top = sites[:int(max_sites)]
+    best = top[0]["room_mm"] if top else None
+    return ok(
+        value={
+            "verdict": ("sites_exist" if legal else "no_legal_site"),
+            "legal_sites": legal,
+            "candidates_tried": tried,
+            "best_room_mm": best,
+            "sites": top,
+            "killed_by": kill,
+            "window": {"x0": round(qx0, 3), "y0": round(qy0, 3),
+                       "x1": round(qx1, 3), "y1": round(qy1, 3),
+                       "grid_mm": step},
+            "via": {"diameter_mm": round(dia, 4), "drill_mm": round(drill, 4)},
+            "layers": coin,
+        },
+        unit="mm, count",
+        model="point-in-board + clearance distance field + drill keepout",
+        basis="a via centre is legal when it is inside the outline by the edge "
+              "clearance plus its radius, at least `clearance` plus its radius from "
+              "every pad/track/via/pour of another net on every copper layer it "
+              "passes through, and its drill is at least min_hole_to_hole from every "
+              "existing drill. room_mm is the smallest of those margins, so a site "
+              "with room 0.05 has 0.05 mm to spare on its tightest side",
+        precision="distance is exact point-to-segment / point-to-polygon against the "
+                  "same geometry DRC uses; the search is a %.3f mm grid, so a legal "
+                  "spot between two grid points is not reported" % step,
+        assumptions={"clearance_mm": clr, "edge_clearance_mm": edge,
+                     "hole_to_hole_mm": h2h, "net": net or "(any - all copper blocks)",
+                     "own_copper_ignored": net is not None,
+                     "not_claimed": "this is legality, not placement: it does not say "
+                                    "the via is useful, reachable, or that the route "
+                                    "needs one here"},
+    )
+
+
 def _occupancy(board, items, keepouts, step, margin):
     """A per-layer grid where None = outside the board, False = free, a net name =
     copper owned by that net, True = blocked for everybody (two nets or a keepout).
