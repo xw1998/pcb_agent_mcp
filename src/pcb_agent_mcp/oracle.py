@@ -2340,6 +2340,380 @@ def trunk_plan(board, net, track_mm=None, clearance_mm=None, edge_clearance_mm=N
                                     "it. Outside the band it says nothing"},
     )
 
+def _clearance_rule(board, clearance_mm=None, edge_clearance_mm=None):
+    """(clearance, edge clearance, where the clearance came from).
+
+    One implementation, because a second copy of "which net class" drifts: the
+    caller's argument wins, then the Default class, then the loosest class in the
+    file, and only then an assumed 0.2 - and the assumption is reported, not
+    silently applied.
+    """
+    rules = board.rules or {}
+    classes = dict((k, v) for k, v in (rules.get("net_classes") or {}).items()
+                   if isinstance(v, dict))
+    default_cls = classes.get("Default") or {}
+    rule_clr = default_cls.get("clearance")
+    if rule_clr is None:
+        clrs = [float(v.get("clearance")) for v in classes.values()
+                if isinstance(v.get("clearance"), (int, float))]
+        rule_clr = min(clrs) if clrs else None
+    clr = float(clearance_mm) if clearance_mm is not None else float(rule_clr or 0.2)
+    edge = (float(edge_clearance_mm) if edge_clearance_mm is not None
+            else float((rules.get("clearance") or {}).get("min_copper_edge_clearance")
+                       or clr))
+    src = ("caller" if clearance_mm is not None
+           else "net class Default" if rule_clr
+           else "nothing in the file, 0.2 mm assumed")
+    return clr, edge, src
+
+
+def teardrop_room(board, length_mm=0.5, clearance_mm=None, edge_clearance_mm=None,
+                  layers=None, region=None, limit=40, grid_mm=0.05,
+                  max_length_mm=2.0, pours_block=False):
+    """How much room has each pad/track corner got for a teardrop, and how long can
+    that teardrop be before it breaks a clearance?
+
+    The reference board has 762 teardrops and every board drawn here has none, so
+    "why does mine look worse" has a measurable part and this is it. KiCad can
+    always DRAW a teardrop; the question a layout actually asks is whether the
+    corner has room - the added copper has to stay `clearance_mm` off other nets
+    and `edge_clearance_mm` off the board edge, and in a 0.3 mm fan-out it often
+    does not.
+
+    A corner is a track endpoint on a pad of the same net whose OTHER end is off
+    that pad; a track that stops inside its own pad is a stub, not a corner.
+
+    The envelope measured: from the point where the track's CENTRELINE leaves the
+    pad, a triangle whose half-width is the pad's chord there (perpendicular to the
+    track), never less than the track, tapering to the track width at distance
+    `length_mm`. Width is taken at the pad's boundary and not at the pad's farthest
+    corner, because the copper a teardrop adds there is the pad itself - taking the
+    diagonal instead made a 45-degree exit from a 0.3 x 1.6 pad read 1.6 wide. Its
+    two slanted edges and its end cap are sampled at `grid_mm` and every sample must
+    clear, so `room_mm` is the minimum over samples and `limited_by` names what set
+    it. `max_length_mm` is the longest length, searched in 0.1 mm steps upward from
+    `length_mm` (or downward when that already fails), whose whole envelope still
+    clears - zero when nothing fits.
+
+    POURS are not obstacles unless `pours_block=True`, for the same reason the
+    other board tools ignore them: the filler cuts a plane back around new copper.
+    """
+    if not board.outline:
+        return err("this board has no outline", "NO_GEOMETRY",
+                   hint="a teardrop near the edge is measured against Edge.Cuts")
+    clr, edge, clr_src = _clearance_rule(board, clearance_mm, edge_clearance_mm)
+    L = float(length_mm)
+    if L <= 0:
+        return err("length_mm must be > 0", "ARG_RANGE")
+    step = float(grid_mm or 0.05)
+    if step <= 0:
+        return err("grid_mm must be > 0", "ARG_RANGE")
+    cap = max(float(max_length_mm or 2.0), L)
+    all_layers = _copper_layers(board)
+    coin = list(layers) if layers else list(all_layers)
+    for name in coin:
+        if name not in all_layers:
+            return err("no such copper layer: %r (board has %s)"
+                       % (name, ", ".join(all_layers)), "ARG_INVALID")
+    qbox = None
+    if region is not None:
+        try:
+            rx0, ry0, rx1, ry1 = [float(v) for v in region]
+        except (TypeError, ValueError):
+            return err("region must be [x0, y0, x1, y1] in mm", "ARG_INVALID")
+        qbox = (min(rx0, rx1), min(ry0, ry1), max(rx0, rx1), max(ry0, ry1))
+    rings = [poly for poly in (board.outline or []) if len(poly) >= 3]
+
+    cell = max(1.0, 2.0 + clr + step)
+    entries = []
+    junctions = 0
+    non_region = 0
+    degenerate = 0
+    for name in coin:
+        items = [it for it in _items(board, layer=name)
+                 if it.get("kind") in ("pad", "via", "track")]
+        if pours_block:
+            # A pour becomes its EDGES, not one 20k-vertex polygon: the bucket then
+            # only touches the edges that are near a sample.
+            for zi, zone in enumerate(board.zones or []):
+                if name not in [str(l) for l in (zone.get("layers") or [])]:
+                    continue
+                for pi, poly in enumerate(zone.get("filled_polygons") or []):
+                    npoly = len(poly)
+                    for i in range(npoly):
+                        e0, e1 = poly[i], poly[(i + 1) % npoly]
+                        if e0 == e1:
+                            continue
+                        items.append({"kind": "zone", "net": zone.get("net"),
+                                      "ref": "zone%d.%d" % (zi, pi), "layer": name,
+                                      "seg": ((e0[0], e0[1]), (e1[0], e1[1]), 0.0)})
+        # Obstacles are PER NET: a teardrop of net X may touch X's own copper (that
+        # is where it lives), so the same-net items must not be in the search at
+        # all. Filtering the single nearest result afterwards is not enough - the
+        # nearest thing was the track the teardrop grows out of, and every junction
+        # read as blocked by exactly one clearance.
+        _obs = {}
+
+        def _obstacles(for_net):
+            key = for_net
+            if key not in _obs:
+                keep = [it for it in items if it.get("net") != for_net]
+                _obs[key] = (keep, _bucketize(keep, cell, pad=clr + step),
+                             _bbox_list(keep))
+            return _obs[key]
+
+        pads = [it for it in items if it.get("kind") == "pad"]
+        pad_boxes = _bbox_list(pads)
+        pad_buckets = _bucketize(pads, cell, pad=clr + step) if pads else {}
+        for it in items:
+            if it.get("kind") != "track":
+                continue
+            a, b, w = it["seg"]
+            net = it.get("net")
+            for p, q in ((a, b), (b, a)):
+                # The pad the track lands on: same net, and the end point is in it
+                # (or within a hair of it, because a track may stop on the pad's
+                # boundary). Ring by ring, because a pad 0.3 mm away sits in the
+                # next cell.
+                pad = None
+                gx = int(math.floor(p[0] / cell))
+                gy = int(math.floor(p[1] / cell))
+                for rr in (0, 1, 2):
+                    for ox in range(-rr, rr + 1):
+                        for oy in range(-rr, rr + 1):
+                            if rr and max(abs(ox), abs(oy)) != rr:
+                                continue
+                            for idx in (pad_buckets.get((gx + ox, gy + oy)) or ()):
+                                cand = pads[idx]
+                                if net is not None and cand.get("net") != net:
+                                    continue
+                                if G.point_in_polygon(p, cand["poly"]) or \
+                                        G.dist_point_polygon(p, cand["poly"]) <= 0.01:
+                                    pad = cand
+                                    break
+                            if pad is not None:
+                                break
+                        if pad is not None:
+                            break
+                    if pad is not None:
+                        break
+                if pad is None:
+                    continue
+                poly = pad["poly"]
+                # The FAR end has to be off the pad. A track that runs from inside
+                # the pad to its own far edge (a stub inside a 1.6 mm pad does) gave
+                # a direction INTO the pad, and the envelope then grew backwards
+                # through the pad and out over its neighbours' pads.
+                if G.point_in_polygon(q, poly) or \
+                        G.dist_point_polygon(q, poly) <= 0.01:
+                    continue
+                nv = float(len(poly))
+                cx = sum(v[0] for v in poly) / nv
+                cy = sum(v[1] for v in poly) / nv
+                # The direction is the TRACK's own, not centroid-to-far-end: a
+                # track that stops a fraction of a millimetre from the pad's
+                # centroid gave a direction of its own numerical noise (0.0002 mm
+                # long, so direction (-1, 0)), and the envelope then grew out of
+                # the pad's left edge across the neighbour's pad - that was seven of
+                # the twenty worst corners on the real board.
+                dx, dy = q[0] - p[0], q[1] - p[1]
+                ln = math.hypot(dx, dy)
+                if ln <= 1e-6:
+                    degenerate += 1
+                    continue
+                u = (dx / ln, dy / ln)
+                nrm = (-u[1], u[0])
+                ts = [(v[0] - cx) * u[0] + (v[1] - cy) * u[1] for v in poly]
+                ns = [(v[0] - cx) * nrm[0] + (v[1] - cy) * nrm[1] for v in poly]
+                # Where the centreline LEAVES the pad. The copper a teardrop adds at
+                # that boundary is the pad itself, so the envelope's wide end is the
+                # pad's chord there - perpendicular to the track - and never
+                # narrower than the track. Using the pad's extreme along the track
+                # instead made a 45-degree exit from a rectangular pad 1.3x its own
+                # width, which reported whole rows of tight pads as blocked.
+                npoly = len(poly)
+                ex_, ey_ = q[0] - p[0], q[1] - p[1]
+                tmax = None
+                for i in range(npoly):
+                    v0, v1 = poly[i], poly[(i + 1) % npoly]
+                    wx, wy = v1[0] - v0[0], v1[1] - v0[1]
+                    den = ex_ * wy - ey_ * wx
+                    if abs(den) < 1e-12:
+                        continue
+                    tt = ((v0[0] - p[0]) * wy - (v0[1] - p[1]) * wx) / den
+                    ss = ((v0[0] - p[0]) * ey_ - (v0[1] - p[1]) * ex_) / den
+                    if -1e-9 <= ss <= 1.0 + 1e-9 and -1e-9 <= tt <= 1.0 + 1e-9:
+                        if tmax is None or tt > tmax:
+                            tmax = tt
+                if tmax is None:
+                    # No crossing means the endpoint is already ON the pad and the
+                    # track leaves from there, so that IS the exit point. Falling
+                    # back to the pad's extreme along the track put two of U1's
+                    # corners 0.4 mm outside their own pad.
+                    p0 = p
+                else:
+                    p0 = (p[0] + ex_ * tmax, p[1] + ey_ * tmax)
+                if qbox is not None and not (qbox[0] <= p0[0] <= qbox[2]
+                                             and qbox[1] <= p0[1] <= qbox[3]):
+                    non_region += 1
+                    continue
+                junctions += 1
+                s_lo = s_hi = None
+                for i in range(npoly):
+                    v0, v1 = poly[i], poly[(i + 1) % npoly]
+                    wx, wy = v1[0] - v0[0], v1[1] - v0[1]
+                    den = nrm[0] * wy - nrm[1] * wx
+                    if abs(den) < 1e-12:
+                        continue
+                    ss = ((v0[0] - p0[0]) * wy - (v0[1] - p0[1]) * wx) / den
+                    tt = ((v0[0] - p0[0]) * nrm[1] - (v0[1] - p0[1]) * nrm[0]) / den
+                    if -1e-9 <= tt <= 1.0 + 1e-9:
+                        s_lo = ss if s_lo is None else min(s_lo, ss)
+                        s_hi = ss if s_hi is None else max(s_hi, ss)
+                if s_lo is None:
+                    half_chord = (max(ns) - min(ns)) / 2.0
+                else:
+                    # HALF the chord: a teardrop is symmetric about its track, so
+                    # one side of the chord is the pad and the other is the mirror
+                    # of it - taking the whole chord doubled the pad on one side.
+                    half_chord = (s_hi - s_lo) / 2.0
+                hw0 = max(half_chord, w / 2.0)
+                hw1 = w / 2.0
+
+                obs_items, obs_buckets, obs_boxes = _obstacles(net)
+
+                def _measure(Lv, _p0=p0, _u=u, _n=nrm, _h0=hw0, _h1=hw1,
+                             _it=obs_items, _bu=obs_buckets, _bx=obs_boxes,
+                             _on=name):
+                    """(room_mm, limited_by, at) for an envelope of length Lv.
+
+                    room < 0 means the envelope would be illegal by that much, so
+                    the sign is a verdict and the magnitude is a distance - one
+                    number, both readings.
+                    """
+                    npts = max(4, int(math.ceil(Lv / step)))
+                    best = None
+                    for k in range(npts + 1):
+                        t = Lv * k / npts
+                        hw = _h0 + (_h1 - _h0) * (t / Lv)
+                        bx = _p0[0] + _u[0] * t
+                        by = _p0[1] + _u[1] * t
+                        pts = [(bx + _n[0] * hw, by + _n[1] * hw),
+                               (bx - _n[0] * hw, by - _n[1] * hw)]
+                        if k == npts:
+                            pts.append((bx, by))      # the cap's midpoint
+                        for pt in pts:
+                            inside = any(G.point_in_polygon(pt, r) for r in rings)
+                            de = min(G.dist_point_polygon(pt, r) for r in rings)
+                            if not inside:
+                                de = -de            # outside: illegal by de + edge
+                            room = de - edge
+                            near_mm = de
+                            info = {"kind": "board_edge", "net": None,
+                                    "ref": "Edge.Cuts", "on": _on}
+                            near = _nearest_from(_it, _bu, cell, pt[0], pt[1],
+                                                 rings=3, bboxes=_bx)
+                            if near is not None:
+                                d, obj = near
+                                rc = d - clr
+                                if rc < room:
+                                    room = rc
+                                    near_mm = d
+                                    info = {"kind": obj.get("kind"),
+                                            "net": obj.get("net"),
+                                            "ref": obj.get("ref"), "on": _on}
+                            if best is None or room < best[0]:
+                                best = (room, dict(info, distance_mm=round(near_mm, 3)),
+                                        (pt[0], pt[1]))
+                    return best
+
+                room, info, at = _measure(L)
+                # The length search is the expensive part (a full re-sample per
+                # 0.1 mm probe) and it is only ever reported for the corners
+                # printed, so it is deferred until the sort has picked them.
+                entries.append(({
+                    "ref": pad.get("ref") or "?",
+                    "net": net,
+                    "layer": name,
+                    "at": [round(p0[0], 3), round(p0[1], 3)],
+                    "pad_width_mm": round(2.0 * hw0, 3),
+                    "track_mm": round(w, 3),
+                    "room_mm": round(room, 3),
+                    "fits": room >= 0.0,
+                    "max_length_mm": 0.0,
+                    "limited_by": info,
+                }, _measure, room))
+    if junctions == 0:
+        return err("no track ends on a pad of its own net", "NO_GEOMETRY",
+                   hint="a teardrop lives in the corner where a track meets a pad; "
+                        "this board has no such corner on the layers asked for")
+    entries.sort(key=lambda t: (t[2], t[0]["ref"] or ""))
+    blocked = [e for e in entries if not e[0]["fits"]]
+    shown = entries[:max(1, int(limit))]
+    for entry, measure, room in shown:
+        longest = 0.0
+        if room >= 0.0:
+            longest = L
+            probe = L + 0.1
+            while probe <= cap + 1e-9:
+                if measure(probe)[0] < 0.0:
+                    break
+                longest = probe
+                probe += 0.1
+        else:
+            probe = L - 0.1
+            while probe >= 0.1 - 1e-9:
+                if measure(probe)[0] >= 0.0:
+                    longest = probe
+                    break
+                probe -= 0.1
+        entry["max_length_mm"] = round(longest, 3)
+    entries = [t[0] for t in entries]
+    return ok(
+        value={
+            "verdict": "teardrops_blocked" if blocked else "teardrops_fit",
+            "length_mm": round(L, 3),
+            "junction_count": junctions,
+            "fits": len(entries) - len(blocked),
+            "blocked": len(blocked),
+            "worst": shown and [t[0] for t in shown] or [],
+            "skipped": {"outside_region": non_region, "zero_length_track":
+                        degenerate},
+            "search_step_mm": 0.1,
+            "max_length_mm": round(cap, 3),
+        },
+        unit="mm, count",
+        model="pad/track corner envelope sampled against other-net copper and the "
+              "board edge",
+        basis="a teardrop is copper added in the corner where a track leaves a pad. "
+              "Its envelope runs from the pad's far side along the track direction, "
+              "its width at the pad is the pad's own width across the track and it "
+              "tapers to the track width after length_mm. Every sample on its two "
+              "slanted edges and its end cap has to clear other nets' copper by the "
+              "clearance and the board edge by the edge clearance; the minimum over "
+              "samples is room_mm, and a negative room is the distance by which the "
+              "envelope would be illegal",
+        precision="samples are taken at %.2f mm along the envelope, so room_mm is "
+                  "exact to that sampling and a corner that is narrow by less than "
+                  "one sample can be missed; `pad_width_mm` is the pad's chord at "
+                  "the point where the track leaves it, doubled (the track width "
+                  "when the pad is narrower there); copper farther than "
+                  "three search cells (about %.2f mm) is treated as clear, which "
+                  "makes room_mm an UPPER bound when the whole corner is empty; "
+                  "max_length_mm is searched in 0.1 mm steps, so it is a lower bound "
+                  "of the true limit"
+                  % (step, 3.0 * cell),
+        assumptions={"clearance_mm": clr, "edge_clearance_mm": edge,
+                     "clearance_from": clr_src,
+                     "layers": coin, "pours_counted": bool(pours_block),
+                     "worst_shown": min(len(entries), max(1, int(limit))),
+                     "not_claimed": "this is not a teardrop and not a KiCad setting: "
+                                    "it says the corner has room for an envelope of "
+                                    "this shape and how long it may be, not which "
+                                    "curve to draw, not the hole, not silk or mask"},
+    )
+
+
 def _occupancy(board, items, keepouts, step, margin):
     """A per-layer grid where None = outside the board, False = free, a net name =
     copper owned by that net, True = blocked for everybody (two nets or a keepout).

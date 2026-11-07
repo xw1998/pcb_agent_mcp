@@ -3944,6 +3944,54 @@ _tool(
     _board_tool(_board_trunk_plan, derived=True),
 )
 
+def _board_teardrop_room(b, args):
+    return _oracle.teardrop_room(
+        b, length_mm=args.get("length_mm", 0.5),
+        clearance_mm=args.get("clearance_mm"),
+        edge_clearance_mm=args.get("edge_clearance_mm"),
+        layers=args.get("layers"), region=args.get("region"),
+        limit=args.get("limit", 40), grid_mm=args.get("grid_mm", 0.05),
+        max_length_mm=args.get("max_length_mm", 2.0),
+        pours_block=args.get("pours_block", False))
+
+_tool(
+    "board_teardrop_room",
+    "Has each pad/track corner got room for a teardrop, and how long may it be? "
+    "The reference board has 762 teardrops and every board drawn here has none, so "
+    "'why does mine look worse' has a measurable part and this is it: KiCad can "
+    "always DRAW the teardrop, but the copper it adds still has to clear other nets "
+    "and the board edge, and in a 0.3 mm fan-out it often cannot. For every corner "
+    "where a track ends on a pad of its own net it builds the envelope a teardrop "
+    "would occupy - from where the track's centreline leaves the pad, as wide as "
+    "the pad's own chord there and tapering to the track width after length_mm - "
+    "samples both slanted edges and the end cap at grid_mm, and reports the "
+    "tightest margin (negative = "
+    "would be illegal by that much, with the object that sets it) plus the longest "
+    "length whose whole envelope still clears. Other nets' copper is the obstacle; "
+    "the net's OWN copper is not (that is what the teardrop merges with). It draws "
+    "nothing and picks no curve. Pours are not obstacles unless you say so. "
+    + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "length_mm": _num("the teardrop length the corner is judged at (0.5)", 0.5),
+         "clearance_mm": _num("clearance kept from other nets' copper (default: the "
+                              "net class figure)"),
+         "edge_clearance_mm": _num("clearance kept from the board edge (default: "
+                                   "the board rule min_copper_edge_clearance)"),
+         "layers": _arr("only these copper layers (default: all)"),
+         "region": _arr("only corners inside this rectangle: x0, y0, x1, y1 in mm"),
+         "limit": _num("how many corners to list, tightest first (40)", 40),
+         "grid_mm": _num("sampling pitch along the envelope (0.05)", 0.05),
+         "max_length_mm": _num("stop growing the envelope here when the longest "
+                               "legal length is searched for (2.0)", 2.0),
+         "pours_block": _bool("treat another net's POUR as fixed copper. Off by "
+                              "default: the filler cuts it back around what is "
+                              "added", False),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_board_teardrop_room, derived=True),
+)
+
 def _board_via_sites(b, args):
     region = args.get("region")
     if region:
