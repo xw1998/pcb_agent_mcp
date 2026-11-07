@@ -2714,6 +2714,391 @@ def teardrop_room(board, length_mm=0.5, clearance_mm=None, edge_clearance_mm=Non
     )
 
 
+def _poly_bands(poly, band=0.5):
+    """Edges of a polygon bucketed by the y bands they span (for point-in-polygon).
+
+    Ray casting only ever tests the edges whose y-range straddles the query's y,
+    so this index gives the SAME answer as a full scan while making the cost
+    independent of the vertex count. That is the whole point: a GND fill on the
+    reference board has 20 168 vertices, and the naive test would run once per
+    track endpoint of that net.
+    """
+    bands = {}
+    n = len(poly)
+    for i in range(n):
+        y1, y2 = poly[i][1], poly[(i + 1) % n][1]
+        lo, hi = (y1, y2) if y1 <= y2 else (y2, y1)
+        for k in range(int(math.floor(lo / band)), int(math.floor(hi / band)) + 1):
+            bands.setdefault(k, []).append(i)
+    return bands
+
+
+def _poly_holds(poly, bands, band, px, py):
+    """Is (px, py) inside the polygon? Same ray casting as G.point_in_polygon,
+    restricted to the edges that can cross the ray.
+
+    A point ON the boundary is not counted here: the caller's touch test already
+    unions anything that overlaps, so a boundary point is never only-held.
+    """
+    edges = bands.get(int(math.floor(py / band)))
+    if not edges:
+        return False
+    n = len(poly)
+    inside = False
+    for i in edges:
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > py) != (y2 > py):
+            if x1 + (py - y1) * (x2 - x1) / (y2 - y1) > px:
+                inside = not inside
+    return inside
+
+
+def _net_copper(board, net, pours_connect=True):
+    """One net's copper as distance-comparable items, filled pours included.
+
+    `_items` covers pads, tracks and vias but not the filled copper of a zone, and
+    on a board with pours that omission is the largest piece of the net: the
+    question 'why is this rail still in pieces' cannot even be asked without it.
+    Each filled_polygon of a same-net zone becomes one item of kind "zone",
+    tagged with the zone's index and its piece number so a report can name it.
+    """
+    items = [dict(it) for it in _items(board) if it.get("net") == net]
+    pours = 0
+    if pours_connect:
+        for zi, z in enumerate(board.zones or []):
+            if z.get("net") != net or z.get("is_keepout"):
+                continue
+            for layer in (z.get("layers") or []):
+                for k, poly in enumerate(z.get("filled_polygons") or []):
+                    if len(poly) < 3:
+                        continue
+                    items.append({"kind": "zone", "net": net, "layer": layer,
+                                  "layers": [layer],
+                                  "poly": [(float(x), float(y)) for x, y in poly],
+                                  "ref": "zone%d.piece%d" % (zi, k),
+                                  "zone": zi, "priority": z.get("priority")})
+                    pours += 1
+    return items, pours
+
+
+def _copper_edges(items):
+    """Every item as flat segments: a track is ONE segment with half its width, a
+    polygon is its boundary with zero width.
+
+    Connectivity is exact this way and cheap. A track with round ends is exactly
+    the set of points within w/2 of its centreline, so two tracks touch when the
+    centreline distance is under the sum of the half-widths, and a track touches a
+    polygon when its centreline comes within w/2 of the boundary or one of its ends
+    is inside. Distance between two polygon boundaries is a plain segment-pair
+    minimum, which the grid makes local instead of quadratic in the vertex count
+    (the 20 168-vertex fill against a 3 000-track net).
+    """
+    prims = []
+    for idx, it in enumerate(items):
+        if "seg" in it:
+            a, b, w = it["seg"]
+            prims.append((idx, (a[0], a[1]), (b[0], b[1]), w / 2.0))
+        else:
+            poly = it["poly"]
+            n = len(poly)
+            for i in range(n):
+                p, q = poly[i], poly[(i + 1) % n]
+                prims.append((idx, (p[0], p[1]), (q[0], q[1]), 0.0))
+    return prims
+
+
+def _edge_grid(prims, cell):
+    """Segment index. Each segment is filed in every cell its inflated bbox covers,
+    so two segments within (hw_a + hw_b) always share at least one cell."""
+    grid = {}
+    for k, (idx, a, b, hw) in enumerate(prims):
+        x0, y0 = min(a[0], b[0]) - hw, min(a[1], b[1]) - hw
+        x1, y1 = max(a[0], b[0]) + hw, max(a[1], b[1]) + hw
+        for gx in range(int(math.floor(x0 / cell)), int(math.floor(x1 / cell)) + 1):
+            for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
+                grid.setdefault((gx, gy), []).append(k)
+    return grid
+
+
+def _copper_groups(items, prims, grid, cell=1.0, tol=1e-6):
+    """Union-find over one net's copper: which pieces are actually one conductor.
+
+    Two items are joined when their metal overlaps or touches - a segment pair
+    closer than the sum of the half-widths - or when one of them lies inside the
+    other (a via under a pour, a track inside a fill). Touching is judged on the
+    geometry alone, at `tol`, which is the same rule KiCad's connectivity engine
+    applies to stored copper; silk, mask and keepouts play no part.
+    """
+    n = len(items)
+    par = list(range(n))
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            par[rb] = ra
+
+    for bucket in grid.values():
+        for i in range(len(bucket)):
+            for j in range(i + 1, len(bucket)):
+                pa, pb = prims[bucket[i]], prims[bucket[j]]
+                ia, ib = pa[0], pb[0]
+                if ia == ib or find(ia) == find(ib):
+                    continue
+                if not set(items[ia]["layers"]) & set(items[ib]["layers"]):
+                    continue
+                d = G.dist_segment_segment(pa[1], pa[2], pb[1], pb[2])
+                if d <= pa[3] + pb[3] + tol:
+                    union(ia, ib)
+
+    # A piece wholly inside another leaves no boundary intersection (a via under a
+    # pour, a pad under a solid-connected fill), so every segment end is also
+    # tested against the polygons whose bbox covers it.
+    poly_of = {}
+    cover = {}
+    for idx, it in enumerate(items):
+        if "poly" not in it or len(it["poly"]) < 3:
+            continue
+        poly_of[idx] = (_poly_bands(it["poly"]), it["poly"])
+    if poly_of:
+        for idx in poly_of:
+            x0, y0, x1, y1 = G.bbox_of(items[idx]["poly"])
+            for gx in range(int(math.floor(x0 / cell)), int(math.floor(x1 / cell)) + 1):
+                for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
+                    cover.setdefault((gx, gy), []).append(idx)
+    for (idx, a, b, _hw) in prims:
+        if not cover:
+            break
+        for pt in (a, b):
+            for pidx in cover.get((int(math.floor(pt[0] / cell)),
+                                   int(math.floor(pt[1] / cell))), ()):
+                if pidx == idx or find(pidx) == find(idx):
+                    continue
+                bands, poly = poly_of[pidx]
+                if _poly_holds(poly, bands, 0.5, pt[0], pt[1]):
+                    union(pidx, idx)
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values()), find
+
+
+def _piece_gap(prims_a, prims_b, grid_b, cell, limit_mm):
+    """Smallest boundary distance between two pieces, or None if beyond limit_mm.
+
+    Searched from the SMALLER piece outward, so a pour with 20 000 edges never
+    drives the loop: the rings are walked only as far as limit_mm, and the answer
+    is either the exact minimum inside that radius or an honest 'not within'.
+    """
+    rings = max(1, int(math.ceil(limit_mm / cell)))
+    best = None
+    for (idx, a, b, hw) in prims_a:
+        gx = int(math.floor(min(a[0], b[0]) / cell))
+        gy = int(math.floor(min(a[1], b[1]) / cell))
+        hx = int(math.floor(max(a[0], b[0]) / cell))
+        hy = int(math.floor(max(a[1], b[1]) / cell))
+        seen = set()
+        for cx in range(gx - rings, hx + rings + 1):
+            for cy in range(gy - rings, hy + rings + 1):
+                for k in grid_b.get((cx, cy), ()):
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    pb = prims_b[k]
+                    d = G.dist_segment_segment(a, b, pb[1], pb[2]) - hw - pb[3]
+                    if best is None or d < best[0]:
+                        best = (d, (idx, a, b), pb)
+    if best is None or best[0] > limit_mm:
+        return None
+    return best
+
+
+def net_gaps(board, net=None, pours_connect=True, gap_limit_mm=5.0, limit=12,
+             cell_mm=1.0):
+    """Which pieces of one net's copper are still separate, and how far apart.
+
+    DRC says 115 unconnected on the reference board and stops there: it counts
+    ratsnest edges, it does not say that +3V3 alone is 38 of them, that they split
+    into 39 pieces, or where the nearest two pieces of a piece are. This walks the
+    net's own copper as geometry - pads, tracks, vias and the filled polygons of
+    its pours - unions what touches, and reports the pieces and the shortest gap
+    between each pair of neighbours.
+
+    Pads COUNT as copper, which is a real decision and not a detail: a pour island
+    held on only by the thermal spokes of a pad that the main pour also touches is
+    one conductor to this walker. KiCad's DRC disagrees on exactly that case -
+    GND on the reference board comes back as 4 pieces here and 15 in the DRC,
+    while +3V3 (38), AGND (9), $1I8749/$2N1188 (6) and $1I8749/VDDA (5) agree
+    exactly. Where the two disagree, KiCad decides whether the board passes; this
+    tool tells you where the copper is apart and how far.
+
+    It routes nothing and moves nothing: the numbers say which two clusters are
+    worth joining and how far apart they are, the join stays a decision.
+
+    With no `net`, every net is counted and only the counts come back - that is
+    the cross-check against DRC (sum of pieces-1 should equal unconnected).
+    """
+    if not cell_mm or cell_mm <= 0:
+        return err("cell_mm must be positive", "ARG_RANGE")
+    if gap_limit_mm is None or gap_limit_mm <= 0:
+        return err("gap_limit_mm must be positive", "ARG_RANGE")
+    cell = float(cell_mm)
+
+    nets = []
+    if net is None:
+        seen = set()
+        for it in _items(board):
+            if it.get("net") and it["net"] not in seen:
+                seen.add(it["net"].__str__())
+                nets.append(it["net"])
+        for z in (board.zones or []):
+            if z.get("net") and str(z["net"]) not in seen and not z.get("is_keepout"):
+                seen.add(str(z["net"]))
+                nets.append(z["net"])
+    else:
+        nets = [net]
+
+    summary, keep, pours_total = [], {}, 0
+    for name in nets:
+        items, pours = _net_copper(board, name, pours_connect=pours_connect)
+        pours_total += pours
+        if not items:
+            continue
+        prims = _copper_edges(items)
+        grid = _edge_grid(prims, cell)
+        groups, find = _copper_groups(items, prims, grid, cell)
+        summary.append({"net": name, "pieces": len(groups),
+                        "items": len(items), "pours": pours,
+                        "edges_needed": max(0, len(groups) - 1)})
+        if net is not None:
+            keep[name] = (items, prims, groups, find)
+
+    if net is not None and not summary:
+        return err("no copper of that net on this board", "NO_GEOMETRY",
+                   hint="net names are the board's own; use board_nets to see them")
+
+    value = {"nets": sorted(summary, key=lambda s: (-s["edges_needed"], str(s["net"]))),
+             "edges_needed_total": sum(s["edges_needed"] for s in summary),
+             "pours_counted_as_copper": int(pours_total)}
+    assumptions = {"pours_connect": bool(pours_connect),
+                   "cell_mm": cell,
+                   "gap_limit_mm": None if net is None else float(gap_limit_mm),
+                   "touch_tolerance_mm": 1e-6,
+                   "silk_mask_keepout_ignored": True,
+                   "pads_are_copper": True,
+                   "not_claimed": "this routes nothing and joins nothing: it says "
+                                  "which pieces of one net are apart, how far and "
+                                  "where, and leaves the join, the layer and the "
+                                  "width to you",
+                   "cross_check": "edges_needed per net was measured against "
+                                  "board_drc().unconnected on the reference board: "
+                                  "+3V3 38/38, AGND 9/9, $1I8749/$2N1188 6/6, "
+                                  "$1I8749/VDDA 5/5 agree; GND does not (4 here, 15 in "
+                                  "the DRC) - the 11 spare edges are pour islands held "
+                                  "on only by the thermal spokes of a pad the main pour "
+                                  "also touches, so they are separate to KiCad and "
+                                  "joined to this walker"}
+
+    if net is None:
+        return ok(value=value, unit="count",
+                  model="union-find over one net's copper geometry (pads, tracks, "
+                        "vias, filled pour pieces)",
+                  basis="two pieces of the same net are joined when their copper "
+                        "touches or overlaps on a shared copper layer, or when one "
+                        "lies inside the other; every net is walked separately",
+                  precision="touching is judged at %.0e mm, so copper stored with a "
+                            "hairline gap reads as separate (DRC applies the same "
+                            "rule); a zone that was never filled contributes no "
+                            "copper at all and its net is under-counted" % 1e-6,
+                  assumptions=assumptions)
+
+    items, prims, groups, find = keep[net]
+    groups.sort(key=lambda g: -len(g))
+    pieces = []
+    for gi, g in enumerate(groups):
+        pads = [items[i] for i in g if items[i]["kind"] == "pad"]
+        bxs = [G.bbox_of(items[i]["poly"]) if "poly" in items[i]
+               else _item_bbox(items[i]) for i in g]
+        pieces.append({
+            "piece": gi,
+            "items": len(g),
+            "pads": len(pads),
+            "refs": [p.get("ref") for p in pads][:12],
+            "tracks": len([i for i in g if items[i]["kind"] == "track"]),
+            "vias": len([i for i in g if items[i]["kind"] == "via"]),
+            "pour_pieces": len([i for i in g if items[i]["kind"] == "zone"]),
+            "bbox": [round(min(b[0] for b in bxs), 3), round(min(b[1] for b in bxs), 3),
+                     round(max(b[2] for b in bxs), 3), round(max(b[3] for b in bxs), 3)],
+        })
+
+    # nearest gap between every pair of pieces that has one inside gap_limit_mm
+    prims_of = [[p for p in prims if find(p[0]) == find(g[0])] for g in groups]
+    grids = {gi: _edge_grid(ps, cell) for gi, ps in enumerate(prims_of)}
+    gaps = []
+    for gi in range(len(groups)):
+        for gj in range(gi + 1, len(groups)):
+            if len(prims_of[gi]) <= len(prims_of[gj]):
+                small, big, grid_big = prims_of[gi], prims_of[gj], grids[gj]
+                si, sj = gi, gj
+            else:
+                small, big, grid_big = prims_of[gj], prims_of[gi], grids[gi]
+                si, sj = gj, gi
+            hit = _piece_gap(small, big, grid_big, cell, float(gap_limit_mm))
+            if hit is None:
+                continue
+            d, seg_a, seg_b = hit
+            gaps.append({"from": si, "to": sj, "gap_mm": round(d, 3),
+                         "on": sorted(set(items[seg_a[0]]["layers"]) &
+                                      set(items[seg_b[0]]["layers"])),
+                         "a": {"ref": items[seg_a[0]].get("ref"),
+                               "seg": [[round(c, 3) for c in seg_a[1]],
+                                       [round(c, 3) for c in seg_a[2]]]},
+                         "b": {"ref": items[seg_b[0]].get("ref"),
+                               "seg": [[round(c, 3) for c in seg_b[1]],
+                                       [round(c, 3) for c in seg_b[2]]]}})
+    gaps.sort(key=lambda g: g["gap_mm"])
+    shown = gaps[:max(1, int(limit))]
+    reachable = set()
+    for g in gaps:
+        reachable.add(g["from"])
+        reachable.add(g["to"])
+    value.update({
+        "net": net,
+        "pieces_detail": pieces[:max(1, int(limit))],
+        "piece_count": len(groups),
+        "edges_needed": max(0, len(groups) - 1),
+        "gaps": shown,
+        "gaps_found": len(gaps),
+        "pairs_beyond_limit": max(0, len(groups) * (len(groups) - 1) // 2 - len(gaps)),
+        "pieces_with_no_neighbour_within_limit": [p["piece"] for p in pieces
+                                                  if p["piece"] not in reachable],
+    })
+    return ok(
+        value=value,
+        unit="mm, count",
+        model="union-find over one net's copper geometry, then edge-to-edge distance "
+              "between the pieces that came out",
+        basis="two pieces of the same net are one conductor when their copper "
+              "touches or overlaps on a shared copper layer, or when one lies "
+              "inside the other; gap_mm is the smallest distance between the metal "
+              "of two pieces, measured segment to segment on the pair printed in "
+              "`a` and `b` - the join is yours to draw, this says how far apart "
+              "they are and where",
+        precision="touching is judged at 1e-6 mm and pours are counted only when "
+                  "the zone stored a fill result, so gaps are exact to the stored "
+                  "geometry but a pair farther apart than gap_limit_mm is not "
+                  "measured (counted in pairs_beyond_limit instead); `seg` is the "
+                  "closest pair of SEGMENTS, not the single closest pair of points",
+        assumptions=assumptions,
+    )
+
+
 def _occupancy(board, items, keepouts, step, margin):
     """A per-layer grid where None = outside the board, False = free, a net name =
     copper owned by that net, True = blocked for everybody (two nets or a keepout).

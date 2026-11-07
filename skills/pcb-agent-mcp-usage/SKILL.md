@@ -1,6 +1,6 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——228 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——229 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
@@ -14,12 +14,12 @@ description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路—�
 
 ## 三件必须先知道的事
 
-1. **它注册了 228 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
+1. **它注册了 229 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
    这是故意的：把 301 KB 的工具清单塞进上下文会直接把对话撑爆。
    ⇒ 想用的工具不在清单里，就先 `tool_search`（按**任务**搜，支持中文任务名词，
    例如「阻抗」「回流」「铺铜」），再 `tool_call` 执行。**不要臆造工具名，也不要因为
    「清单里没有」就断言「这个服务做不到」。**
-2. **工具数与环境变量会变。** 本文写的 228 是当前数；任何判断以
+2. **工具数与环境变量会变。** 本文写的 229 是当前数；任何判断以
    `calc_capabilities` / `tools/list` 的当前返回为准。`PCB_AGENT_TOOLSET=all` 可广告全部。
 3. **它不替你设计。** 它给事实、给度量、给规则判定；摆哪里、走哪条，是人（或按
    `pcb-layout-methodology` 技能）决定的。`board_route` / `board_fanout` 已**退休**，
@@ -68,6 +68,7 @@ footprints、pads、tracks、vias、zones（含填充多边形）、Edge.Cuts、
 | **这附近有没有合法过孔、余量多少** | `board_via_sites` | 这个孔有没有用、该不该放 |
 | **这一网的焊盘簇之间，主干能走多宽、卡在哪一格** | `board_trunk_plan`（`net` 必填） | 路径怎么写、该走哪层 |
 | **每个焊盘角上还有没有位置放泪滴、最长多少** | `board_teardrop_room` | 该不该加、给什么 curve |
+| **这一网的铜断成几块、最近两块差多远在哪** | `board_net_gaps`（不给 `net` 就数全板） | 先连哪两块、换层还是挪件 |
 
 判读要点：**「焊盘出不去」是摆放级硬阻断，任何路由器都修不了**；
 「需要 dogleg 才能出」对人没问题，对直线扇出就不行。
@@ -90,6 +91,12 @@ footprints、pads、tracks、vias、zones（含填充多边形）、Edge.Cuts、
   `room_mm` 为负读成「放不下这么多」，不是「差这么多间距」；`max_length_mm` 不传给
   `limit` 之外的角（`limit=100000` 会从 5 s 变 98 s）。真板 238 个角只有 4 个不行，
   最紧 `R19.1 room −0.100`。
+- **`board_net_gaps` 的「块」是我的几何口径，不是 DRC 的判词**：真板对得上的是
+  `+3V3 38/38 / AGND 9/9 / $2N1188 6/6 / VDDA 5/5`（我的 `edges_needed` 对
+  `board_drc().unconnected`），**对不上的是 GND（我 4、DRC 15）**——差的 11 条是
+  只靠一个焊盘的散热辐条挂住的铺铜岛，我把它算成一个导体、KiCad 不算。
+  过不过板子听 DRC 的；这个工具回答的是「在哪、差多远」。`gap_mm` 是金属到金属，
+  量在它给出的那对 `seg` 上；超过 `gap_limit_mm` 的只计数不测量。
 - **`board_routability` 不给线宽就是旧答案**：`width_scan_mm` 不传，`widest_escape`
   这个字段根本不出现——不是返回 0。
 

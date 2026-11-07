@@ -333,7 +333,7 @@ class TestToolLayer(unittest.TestCase):
 
     def test_tool_count_did_not_change(self):
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 228)
+        self.assertEqual(len(tools.TOOLS), 229)
 
     def test_gap_is_registered(self):
         # 0.0.88 closed the "melting, by name" gap on all three tools, so that entry

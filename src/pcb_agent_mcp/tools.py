@@ -3992,6 +3992,47 @@ _tool(
     _board_tool(_board_teardrop_room, derived=True),
 )
 
+def _board_net_gaps(b, args):
+    return _oracle.net_gaps(
+        b, net=args.get("net"),
+        pours_connect=args.get("pours_connect", True),
+        gap_limit_mm=args.get("gap_limit_mm", 5.0),
+        limit=args.get("limit", 12), cell_mm=args.get("cell_mm", 1.0))
+
+_tool(
+    "board_net_gaps",
+    "One net's copper is in how many pieces, and where are the nearest two pieces? "
+    "DRC says 'unconnected: 115' and stops; it counts ratsnest edges, it does not "
+    "say that +3V3 is 38 of them in 39 pieces or that the nearest two pieces of the "
+    "rail are 0.05 mm apart at a named pair of segments. This walks the net's own "
+    "copper as geometry - pads, tracks, vias and the filled polygons of its pours "
+    "(which _items does not carry, and on a poured board the pour is usually the "
+    "biggest piece of the net) - unions what touches or overlaps on a shared copper "
+    "layer, and reports each piece with its pads and bbox plus the shortest "
+    "edge-to-edge gap between every pair of neighbouring pieces, with the segment "
+    "pair the gap was measured on. Call it with no `net` and every net is counted: "
+    "that is the cross-check, since pieces-1 should be the net's DRC unconnected "
+    "count (it agrees on +3V3, AGND, $1I8749/$2N1188 and $1I8749/VDDA on the "
+    "reference board and is 11 short on GND, where island-to-island pairs that "
+    "KiCad calls unconnected are joined here through the pads they share). "
+    "It routes nothing and moves nothing: where to join stays your decision. "
+    + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "net": _str("the net to walk; omit to count every net on the board"),
+         "pours_connect": _bool("count a same-net zone's filled copper as part of "
+                                "the net (true). false answers 'how many pieces if "
+                                "the pours were not there'"),
+         "gap_limit_mm": _num("stop measuring gaps beyond this (5.0); a pair "
+                              "farther apart is counted, not measured"),
+         "limit": _num("how many pieces and gaps to list, nearest first (12)", 12),
+         "cell_mm": _num("spatial index pitch; smaller is slower and never changes "
+                         "an answer (1.0)", 1.0),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_board_net_gaps, derived=True),
+)
+
 def _board_via_sites(b, args):
     region = args.get("region")
     if region:
