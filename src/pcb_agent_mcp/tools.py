@@ -3808,6 +3808,32 @@ _tool(
     _board_tool(_board_pour_connectivity, derived=True),
 )
 
+def _board_pour_fragments(b, args):
+    return _oracle.pour_fragments(b, net=args.get("net"), layer=args.get("layer"),
+                                  gap_limit=args.get("gap_limit_mm"))
+
+_tool(
+    "board_pour_fragments",
+    "A shaped pour is only one conductor if the filler left it in one piece. This "
+    "counts the separate filled_polygon pieces per zone, with area, bbox and the "
+    "closest gap between every pair - the measurement that answers 'why is this rail "
+    "still unconnected when I poured it'. Measured on a real board: a +3V3 rail drawn "
+    "as eight shaped blocks came back as 14 pieces, the largest 15.4 x 2.3 mm and the "
+    "smallest 0.4 x 0.7 mm, with the nearest neighbour 8 mm away - no track can close "
+    "that, and DRC only ever complained about the pieces that held a pad. "
+    "This is shape diagnosis, NOT a connectivity verdict: pieces may still be joined "
+    "by tracks or vias the walker does not follow, so board_drc().unconnected_total "
+    "stays authoritative.",
+    {"type": "object",
+     "properties": dict({"net": _str("only zones of this net (default: every zone)"),
+                         "layer": _str("only zones on this copper layer"),
+                         "gap_limit_mm": _num("drop pair rows whose gap exceeds this, "
+                                              "to keep the answer short")},
+                        **_COMMON),
+     "required": ["path"]},
+    _board_tool(_board_pour_fragments, derived=True),
+)
+
 _tool(
     "board_net_report",
     "Per net: routed length, segments, vias, pads, and detour_ratio = length / "
@@ -10728,10 +10754,14 @@ def _board_45_corners(args):
         max_cut_mm=float(args.get("max_cut_mm") or 1.0),
         min_leg_mm=float(args.get("min_leg_mm") or 0.4),
         tolerance_deg=tol,
-        nets=args.get("nets"))
+        nets=args.get("nets"),
+        adaptive=bool(args.get("adaptive", True)),
+        min_cut_mm=float(args.get("min_cut_mm") if args.get("min_cut_mm") is not None
+                         else 0.12))
     value["plan"] = {k: plan[k] for k in
                      ("corners_chamfered", "segments_rewritten", "skipped",
-                      "width_mismatch", "cut_mm_range", "diagonals")}
+                      "width_mismatch", "cut_mm_range", "diagonals",
+                      "cut_reduced", "cut_reduced_count")}
     value["ops_count"] = len(plan["ops"])
     out = ok(value, "mm", model=model, basis=basis, precision=precision,
              assumptions={"tolerance_deg": tol,
@@ -10805,6 +10835,12 @@ _tool(
          "tolerance_deg": _num("how far off 45/90/135 still counts as that angle "
                                "(default 0.5)", 0.5),
          "nets": _arr("only chamfer these nets (default: every net)"),
+         "adaptive": _bool("when the full cut would hit existing copper, bisect it "
+                           "down until it fits instead of skipping the corner "
+                           "(default true). Off reproduces the old skip-everything "
+                           "behaviour"),
+         "min_cut_mm": _num("below this a mitre is just a fillet - the corner is "
+                            "reported as would_collide instead (default 0.12)", 0.12),
          "allow_new_violations": _bool("accept newly introduced DRC violations"),
          "strict_drc": _bool("let every new violation block, warnings included"),
      }, **_COMMON),

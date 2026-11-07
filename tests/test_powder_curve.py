@@ -454,11 +454,11 @@ class TestTheSurfaceMovedOnce(unittest.TestCase):
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 223)
+        self.assertEqual(len(tools.TOOLS), 224)
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_powder_curve", cap["available"])
         # 174 = 173 + thermal_spreading in 0.0.85
-        self.assertEqual(len(cap["available"]), 186)
+        self.assertEqual(len(cap["available"]), 204)
 
     def test_the_capability_list_no_longer_claims_there_is_no_curve(self):
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})

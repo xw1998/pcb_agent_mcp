@@ -345,7 +345,7 @@ def _diagonal_hits(a, b, layer, net, width, obstacles, clearance):
 
 
 def chamfer_ops(board, max_cut_mm=1.0, min_leg_mm=0.4, tolerance_deg=0.5,
-                nets=None, clearance_mm=0.25):
+                nets=None, clearance_mm=0.25, adaptive=True, min_cut_mm=0.12):
     """Plan a symmetric 45 degree mitre at every right-angle corner.
 
     The topology is not changed: each corner's vertex is replaced by two points
@@ -361,6 +361,16 @@ def chamfer_ops(board, max_cut_mm=1.0, min_leg_mm=0.4, tolerance_deg=0.5,
       width and listed under ``width_mismatch`` - a joint that steps in width is
       a real thing on a fan-out, but the caller should see it;
     * junctions (3+ segments), acute corners and arcs are never touched.
+      (A junction is not a corner: cutting one leg leaves the other two
+      pointing at empty copper, and the joint comes apart.)
+
+    ``adaptive`` changes what happens when the symmetric cut at `max_cut_mm`
+    would run into existing copper. Instead of skipping the corner outright, the
+    cut is bisected down until it fits (14 halvings, so ~0.006% resolution) and
+    only refused below `min_cut_mm`, where the "45 degree" reading has already
+    become a fillet. This matters on a fan-out: lanes 0.4 mm apart cannot take a
+    1 mm mitre, but they can take 0.13 mm, and skipping them is how a board ends
+    up with a handful of 45 degree turns and a hundred bare right angles.
 
     Returns the ops in the order they must be applied: every delete first, then
     every add, so an intermediate state never carries two copies of a segment.
@@ -376,7 +386,7 @@ def chamfer_ops(board, max_cut_mm=1.0, min_leg_mm=0.4, tolerance_deg=0.5,
     obstacles = _obstacles(board)
     cuts = {}            # (index, which_end) -> cut length
     diagonals = []       # (vertex-based points, width)
-    skipped, mismatch = [], []
+    skipped, mismatch, reduced = [], [], []
     # Shortest corners first. Two corners can share one segment - a 0.5 mm jog
     # between two bends has a leg at each end and cannot give both of them 1 mm
     # back. Assigning greedily by remaining leg length is what keeps a rebuild
@@ -430,13 +440,35 @@ def chamfer_ops(board, max_cut_mm=1.0, min_leg_mm=0.4, tolerance_deg=0.5,
         # a mitre: both corners get cut, and the two diagonals cross. Measuring the
         # diagonal against the copper that is already there is the only way to know
         # before writing it.
+        asked = cut
         hit = _diagonal_hits(pa, pb, c["layer"], c["net"], width_here,
                              obstacles, float(clearance_mm))
+        if hit and adaptive:
+            lo, hi, fit = 0.0, cut, None
+            for _ in range(14):
+                mid = (lo + hi) / 2.0
+                qa = (v[0] + ua[0] * mid, v[1] + ua[1] * mid)
+                qb = (v[0] + ub[0] * mid, v[1] + ub[1] * mid)
+                if _diagonal_hits(qa, qb, c["layer"], c["net"], width_here,
+                                  obstacles, float(clearance_mm)) is None:
+                    fit, lo = mid, mid
+                else:
+                    hi = mid
+            if fit is not None and fit >= float(min_cut_mm):
+                cut = fit
+                pa = (v[0] + ua[0] * cut, v[1] + ua[1] * cut)
+                pb = (v[0] + ub[0] * cut, v[1] + ub[1] * cut)
+                reduced.append({"vertex_mm": c["vertex_mm"], "net": c["net"],
+                                "asked_mm": round(asked, 4),
+                                "used_mm": round(cut, 4),
+                                "blocked_by": hit["what"], "by_net": hit["net"]})
+                hit = None
         if hit:
             skipped.append({"vertex_mm": c["vertex_mm"], "net": c["net"],
                             "reason": "would_collide", "with": hit["what"],
                             "with_net": hit["net"], "gap_mm": hit["gap_mm"],
-                            "cut_mm": round(cut, 4)})
+                            "cut_mm": round(cut, 4),
+                            "smallest_tried_mm": round(float(min_cut_mm), 4)})
             continue
         cuts[(ia, ea)] = cut
         cuts[(ib, eb)] = cut
@@ -481,6 +513,8 @@ def chamfer_ops(board, max_cut_mm=1.0, min_leg_mm=0.4, tolerance_deg=0.5,
         "segments_rewritten": len(deletes),
         "skipped": skipped,
         "width_mismatch": mismatch,
+        "cut_reduced": reduced,
+        "cut_reduced_count": len(reduced),
         "cut_mm_range": [min([d["cut_mm"] for d in diagonals], default=None),
                          max([d["cut_mm"] for d in diagonals], default=None)],
         "diagonals": diagonals[:20],

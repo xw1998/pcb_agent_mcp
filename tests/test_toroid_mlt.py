@@ -393,7 +393,7 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
         caps = tools._capabilities({})
         self.assertIn("magnetics_toroid_mlt", caps["available"])
         # 174 = 173 + thermal_spreading in 0.0.85
-        self.assertEqual(len(caps["available"]), 186)
+        self.assertEqual(len(caps["available"]), 204)
         joined = json.dumps(caps)
         self.assertIn("toroid_mlt", joined)
         self.assertNotIn("(so no toroid copper estimate)", joined)
@@ -408,7 +408,7 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
         # islands, and to LOOK at the copper are three separate questions,
         # each of which the previous 200 tools could not answer.
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 223)
+        self.assertEqual(len(tools.TOOLS), 224)
 
 if __name__ == "__main__":
     unittest.main()

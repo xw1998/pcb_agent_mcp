@@ -132,6 +132,40 @@ class TestChamfer(unittest.TestCase):
         self.assertEqual(plan["corners_chamfered"], 0)
         self.assertEqual([s["reason"] for s in plan["skipped"]], ["leg_too_short"])
 
+    def test_adaptive_shortens_instead_of_skipping(self):
+        # A second net runs diagonally across the corner at (10,10). The full
+        # 1.0 mm mitre would cross it; adaptive has to bisect down to something
+        # that fits rather than walk away from the corner.
+        #
+        # Negative control: the same two nets with the blocker moved 6 mm away
+        # must come back with the full cut and reduced == 0. Without that, a
+        # "reduced" row would only prove the cut was shortened, not that it was
+        # shortened *because of an obstacle*.
+        blocker = [_seg("x", "N2", "F.Cu", (10.15, 9.45), (10.90, 9.45))]
+        near = C.chamfer_ops(_Board(_L() + blocker), max_cut_mm=1.0,
+                             min_leg_mm=0.1, clearance_mm=0.25)
+        self.assertEqual(near["corners_chamfered"], 1)
+        self.assertEqual(near["cut_reduced_count"], 1)
+        self.assertLess(near["cut_reduced"][0]["used_mm"],
+                        near["cut_reduced"][0]["asked_mm"])
+        self.assertGreater(near["cut_reduced"][0]["used_mm"], 0.0)
+
+        far = C.chamfer_ops(
+            _Board(_L() + [_seg("x", "N2", "F.Cu", (10.15, 16.0), (10.90, 16.0))]),
+            max_cut_mm=1.0, min_leg_mm=0.1, clearance_mm=0.25)
+        self.assertEqual(far["cut_reduced_count"], 0,
+                         "a blocker 6 mm away must not shorten anything")
+        self.assertEqual(far["corners_chamfered"], 1)
+
+    def test_adaptive_off_reproduces_the_old_skip(self):
+        # The switch has to be real: with adaptive off the very same geometry
+        # must be skipped, not silently reduced.
+        blocker = [_seg("x", "N2", "F.Cu", (10.15, 9.45), (10.90, 9.45))]
+        off = C.chamfer_ops(_Board(_L() + blocker), max_cut_mm=1.0,
+                            min_leg_mm=0.1, clearance_mm=0.25, adaptive=False)
+        self.assertEqual(off["corners_chamfered"], 0)
+        self.assertEqual([s["reason"] for s in off["skipped"]], ["would_collide"])
+
     def test_vertex_on_a_pad_is_refused(self):
         pads = [{"net": "N1", "x": 10.0, "y": 10.0, "w": 1.0, "h": 1.0,
                  "rotation": 0.0}]

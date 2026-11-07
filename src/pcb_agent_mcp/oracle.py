@@ -1075,6 +1075,134 @@ def _occupancy(board, items, keepouts, step, margin):
             "cells": cells}
 
 
+def _poly_area(poly):
+    """Shoelace area, mm^2, always positive."""
+    a = 0.0
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        a += x1 * y2 - x2 * y1
+    return abs(a) / 2.0
+
+
+def _poly_bbox(poly):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _sampled(poly, limit=90):
+    """Evenly thinned vertex list, so a 600-vertex island costs the same as a small one."""
+    if len(poly) <= limit:
+        return poly
+    step = max(1, len(poly) // limit)
+    return poly[::step]
+
+
+def _gap_between(a, b, limit=90):
+    """Closest vertex pair between two polygons, plus its distance."""
+    A, B = _sampled(a, limit), _sampled(b, limit)
+    best = None
+    for p in A:
+        for q in B:
+            d = math.hypot(p[0] - q[0], p[1] - q[1])
+            if best is None or d < best[0]:
+                best = (d, p, q)
+    return best
+
+
+def pour_fragments(board, net=None, layer=None, gap_limit=None):
+    """How many separate pieces is this pour cut into, and how far apart are they?
+
+    The filler will not tell you this and DRC only reports the pieces that happen
+    to hold a pad. A shaped rail that is chopped by every signal that crosses it
+    is *not* one conductor, and the only way to know is to count the pieces.
+
+    Every number here comes from the stored `filled_polygon` geometry: area by
+    the shoelace formula, gap by the closest vertex pair between two pieces
+    (thinned to 90 vertices each, so the gap is an upper bound, never a guess).
+    Whether a piece *can* be joined to its neighbour is not decided here - that
+    depends on the tracks and pads between them, which is `board_routability`.
+    """
+    if not board.zones:
+        return err("no zones in this board", "NO_GEOMETRY",
+                   hint="a pour is a ZONE/POUR object; the fragments of a pour that "
+                        "does not exist are not zero, they are undefined")
+    rows = []
+    for zi, zone in enumerate(board.zones):
+        znet = zone.get("net")
+        if net is not None and znet != net:
+            continue
+        zlayers = [str(x) for x in (zone.get("layers") or [])]
+        if layer is not None and layer not in zlayers:
+            continue
+        polys = [p for p in (zone.get("filled_polygons") or []) if len(p) >= 3]
+        if not polys:
+            rows.append({"zone_index": zi, "net": znet, "layers": zlayers,
+                         "fragments": None, "status": "pour_not_filled",
+                         "detail": "the zone exists but carries no filled_polygon: the "
+                                   "vendor engine has not poured it, so its fragment "
+                                   "count is unknown, not zero"})
+            continue
+        frags = []
+        for k, poly in enumerate(polys):
+            bb = _poly_bbox(poly)
+            frags.append({
+                "index": k,
+                "area_mm2": round(_poly_area(poly), 4),
+                "bbox": [round(v, 3) for v in bb],
+                "centroid": [round((bb[0] + bb[2]) / 2, 3), round((bb[1] + bb[3]) / 2, 3)],
+                "vertex_count": len(poly),
+            })
+        frags.sort(key=lambda f: -f["area_mm2"])
+        pairs = []
+        for i in range(len(polys)):
+            for j in range(i + 1, len(polys)):
+                g = _gap_between(polys[i], polys[j])
+                if g is None:
+                    continue
+                if gap_limit is not None and g[0] > float(gap_limit):
+                    continue
+                pairs.append({"a": i, "b": j,
+                              "gap_mm": round(g[0], 4),
+                              "closest_a": [round(g[1][0], 3), round(g[1][1], 3)],
+                              "closest_b": [round(g[2][0], 3), round(g[2][1], 3)]})
+        pairs.sort(key=lambda r: r["gap_mm"])
+        rows.append({
+            "zone_index": zi, "net": znet, "layers": zlayers,
+            "fragments": len(frags), "detail": frags,
+            "nearest_pairs": pairs[:24],
+            "largest_share": (round(frags[0]["area_mm2"] /
+                                    max(1e-9, sum(f["area_mm2"] for f in frags)), 4)
+                              if frags else None),
+        })
+    tot = sum(r.get("fragments") or 0 for r in rows)
+    return ok(
+        value={"zones": rows, "fragment_total": tot,
+               "read_it_like_this": (
+                   "one fragment = one conductor piece. A net whose pour is in N pieces "
+                   "is N pieces until a track, a via or a same-net plane joins them; "
+                   "DRC only complains about the pieces that contain a pad"),
+               "not_a_connectivity_verdict": (
+                   "fragments are counted from filled_polygon geometry alone. Pieces "
+                   "may still be joined by tracks or vias that this function does not "
+                   "walk - board_drc().unconnected_total is the authoritative answer "
+                   "for what is electrically disconnected"),
+               },
+        unit="count",
+        model="shoelace area + nearest-vertex gap over stored filled_polygons",
+        basis="filled_polygon vertex rings as written by the vendor fill engine; gap is "
+              "the minimum distance between two vertex samples (90 per polygon), so it "
+              "is an upper bound on the true minimum separation",
+        precision="exact for area and vertex count; the gap is sampled, never smaller "
+                  "than the true gap and shrinking as the sample grows",
+        assumptions={"source": "the poured geometry stored in the file (filled_polygon); "
+                               "a zone that was never filled reports pour_not_filled",
+                     "net_filter": net, "layer_filter": layer},
+    )
+
+
 def pour_connectivity(board, zone_index=0):
     """Do the zone's net pads actually land inside the pour?
 

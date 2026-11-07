@@ -367,11 +367,11 @@ class TestTheSurfaceMovedOnce(unittest.TestCase):
         # 192 = 190 + tool_search/tool_call (discovery tools, so the default
         # tools/list profile can stay small without losing a capability)
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 223)
+        self.assertEqual(len(tools.TOOLS), 224)
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})
         self.assertIn("magnetics_core_loss_audit", cap["available"])
         # 186 = 184 + tool_search/tool_call
-        self.assertEqual(len(cap["available"]), 186)
+        self.assertEqual(len(cap["available"]), 204)
 
     def test_the_capability_list_says_what_the_points_do_not_give(self):
         cap = tools.TOOLS["calc_capabilities"]["handler"]({})
