@@ -2582,6 +2582,12 @@ _tool(
          "track_mm": _num("width of the track that has to get out", None),
          "escape_mm": _num("how far past the pad edge the lane must be free", 1.5),
          "worst": _num("how many pads to list", 20),
+         "width_scan_mm": _arr("also report, per escape direction, the WIDEST "
+                               "track that still gets out - pass the width ladder "
+                               "to try, largest first (e.g. 0.6, 0.5, 0.4, 0.3, "
+                               "0.25, 0.2, 0.15). Answers 'why can this 0.4 mm "
+                               "rail not leave this pad' with the number that "
+                               "does fit"),
          "intent": _str("design intent (same object board_route reads): its "
                         "constraints.clearance_mm / constraints.track_mm and "
                         "nets.layers are used here, so the board is MEASURED with "
@@ -4183,7 +4189,8 @@ def _routability_with_intent(board, args):
     from .route import intent as _intent
     kw = {"layer": args.get("layer"), "grid_mm": args.get("grid_mm", 0.2),
           "clearance_mm": args.get("clearance_mm"), "track_mm": args.get("track_mm"),
-          "escape_mm": args.get("escape_mm", 1.5), "worst": args.get("worst", 20)}
+          "escape_mm": args.get("escape_mm", 1.5), "worst": args.get("worst", 20),
+          "width_scan": (args.get("width_scan_mm") or None)}
     report = None
     if args.get("intent"):
         try:

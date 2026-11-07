@@ -625,7 +625,7 @@ def _free_rects(blocked, rows, cols, x0, y0, step):
 
 
 def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None,
-                escape_mm=1.5, worst=20):
+                escape_mm=1.5, worst=20, width_scan=None):
     """Can each pad get out of its own courtyard, and how crowded is the layer?
 
     This is NOT a router and does not claim a net is routable. It answers the two
@@ -754,7 +754,8 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
             (0.7071, 0.7071), (-0.7071, 0.7071),
             (0.7071, -0.7071), (-0.7071, -0.7071)]
 
-    def _lane_blocked(name, x, y, dx, dy, half, net, pad_clr, esc=None):
+    def _lane_blocked(name, x, y, dx, dy, half, net, pad_clr, esc=None,
+                      tw_override=None):
         """Is the straight lane out of this pad in this direction illegal?
 
         Returns `(blocked, why)`, where `why` names the obstacle and how much
@@ -762,9 +763,10 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
         short of C4 on B's clearance".
         """
         esc = escape if esc is None else esc
+        twl = tw if tw_override is None else tw_override
         end = (x + dx * (half + esc), y + dy * (half + esc))
-        lane = {"seg": ((x, y), end, tw)}
-        slack = pad_clr + tw / 2.0 + 0.05
+        lane = {"seg": ((x, y), end, twl)}
+        slack = pad_clr + twl / 2.0 + 0.05
         bx = _item_bbox(lane)
         cand = set()
         for gx in range(int(math.floor((bx[0] - slack) / cell)),
@@ -812,8 +814,8 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
             probes = [(x + dx * t, y + dy * t) for t in (0.0, (half + esc) / 2.0,
                                                          half + esc)]
             nx, ny = -dy, dx
-            probes.append((end[0] + nx * tw / 2.0, end[1] + ny * tw / 2.0))
-            probes.append((end[0] - nx * tw / 2.0, end[1] - ny * tw / 2.0))
+            probes.append((end[0] + nx * twl / 2.0, end[1] + ny * twl / 2.0))
+            probes.append((end[0] - nx * twl / 2.0, end[1] - ny * twl / 2.0))
             for pt in probes:
                 if not any(G.point_in_polygon(pt, ring) for ring in outline):
                     return True, {"layer": name, "reason": "board_edge",
@@ -842,15 +844,26 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
                 continue
             half = max(float(pad.get("w") or 0), float(pad.get("h") or 0)) / 2.0
             pad_clr = max(clr, clr_by_net.get(net, clr))
-            open_dirs, asked = [], []
+            open_dirs, asked, width_by_dir = [], [], []
             for name in pad_layers:
                 for dx, dy in dirs:
                     blocked, why = _lane_blocked(name, x, y, dx, dy, half, net,
                                                  pad_clr)
                     if blocked:
                         asked.append(why)
-                    else:
-                        open_dirs.append((name, (dx, dy)))
+                        continue
+                    open_dirs.append((name, (dx, dy)))
+                    if width_scan:
+                        # widest track that still fits, on the sizes a layout
+                        # actually uses - largest first, stop at the first fit
+                        for w in width_scan:
+                            b2, _w2 = _lane_blocked(name, x, y, dx, dy, half, net,
+                                                    pad_clr, tw_override=float(w))
+                            if not b2:
+                                width_by_dir.append({"layer": name,
+                                                     "dir": [dx, dy],
+                                                     "max_width_mm": float(w)})
+                                break
             done = _touches(net, x, y, half)
             kind = None
             best = None
@@ -876,6 +889,10 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
                      "layers_with_an_escape": sorted({d[0] for d in open_dirs}),
                      "already_connected": done, "blocker_kind": kind,
                      "why_blocked": best}
+            if width_scan:
+                entry["widest_escape"] = (max(width_by_dir,
+                                              key=lambda d: d["max_width_mm"])
+                                          if width_by_dir else None)
             per_net.setdefault(net, {"pads": 0, "blocked": 0, "connected": 0})
             per_net[net]["pads"] += 1
             if done:
@@ -883,6 +900,18 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
             elif not open_dirs:
                 per_net[net]["blocked"] += 1
             pads_out.append(entry)
+
+    narrow = []
+    if width_scan:
+        for p_ in pads_out:
+            w = p_.get("widest_escape")
+            if w:
+                narrow.append({"reference": p_["reference"], "pad": p_["pad"],
+                               "net": p_["net"], "layer": w["layer"],
+                               "dir": w["dir"],
+                               "max_width_mm": w["max_width_mm"]})
+        narrow.sort(key=lambda r: (r["max_width_mm"], r["reference"]))
+        narrow = narrow[:int(worst)]
 
     if not pads_out:
         return err("no pad on this board carries a net, so there is nothing to "
@@ -957,6 +986,7 @@ def routability(board, layer=None, grid_mm=0.2, clearance_mm=None, track_mm=None
             "one_way": tight[:int(worst)],
             "per_net": {k: v for k, v in sorted(per_net.items())[:int(worst)]},
             "congestion_by_layer": congestion,
+            "narrowest_escapes": narrow,
             "grid": {"step_mm": step, "layers": layers,
                      "margin_mm": round(clr + tw / 2.0, 3)},
         },

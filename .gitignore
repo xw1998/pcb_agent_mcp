@@ -12,3 +12,9 @@ _scratch/
 # 本地大文件证据（不提交）：88.7 MB 的 jetson 板副本只作 DRC 超时实测的物证，
 # 结论已写进 README 诚实清单与 docs/15，文件本身不入库。
 /jetson-agx-thor-baseboard.kicad_pcb
+
+# 仓库根目录的单次探针脚本与日志：只服务「先量后写」的当场取证，结论写进
+# docs/ 之后就没有留库价值。放在根目录的 _foo.py / _foo.log / _drc*.json 一律不入库。
+/_*.py
+/_*.log
+/_*.json
