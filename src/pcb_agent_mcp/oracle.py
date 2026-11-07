@@ -1526,7 +1526,7 @@ def _pour_mask(polys, qx0, qy0, step, nx, ny):
 def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
               diameter_mm=None, drill_mm=None, clearance_mm=None,
               edge_clearance_mm=None, hole_to_hole_mm=None, net=None,
-              layers=None, max_sites=20):
+              layers=None, max_sites=20, pours_block=False):
     """Where may a via legally go, and how much room has it got?
 
     Every via tool here could compute a via (current, resistance, thermal fence) or
@@ -1542,6 +1542,15 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
     via of net X may sit on X's track or pad (that is how it connects) but not
     inside another net's copper. Drill-to-drill is a fab rule and is never waived,
     so an existing hole blocks a candidate whatever its net.
+
+    POURS ARE NOT OBSTACLES by default, for the same reason `board_cut_capacity`
+    does not count them: the filler cuts the pour back around whatever is added, so
+    a hole inside another net's plane is not a short - it costs a bite out of the
+    plane. `inside_pours` reports which planes would be bitten, and
+    `pours_block=True` restores the strict reading. The first version made pours
+    hard obstacles and reported the +3V3 fan-out as having 2 legal points out of
+    441 in a region that is, in fact, full of room - a confidently wrong answer
+    caused by a rule the fabricator never applies.
     """
     if not board.outline:
         return err("this board has no outline", "NO_GEOMETRY",
@@ -1616,14 +1625,16 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
     # Other-net copper per layer, bucketed so one candidate is one lookup.
     cell = max(1.0, reach + step * 2.0)
     layer_buckets = {}
-    pours = []
+    pour_buckets = {}
+    pours = []                     # [(net, polygon)] - one entry per filled piece
     for name in coin:
         items = [it for it in _items(board, layer=name)
                  if it.get("kind") in ("pad", "via", "track")
                  and not (net is not None and it.get("net") == net)]
-        # A pour is carried as its EDGES, not as one polygon: the bucket then only
-        # touches the edges nearby instead of all 21 451 of them, and "inside the
-        # pour" (which the edges cannot answer) comes from the scanline mask below.
+        edges = []
+        # A pour is carried as its EDGES when it counts as an obstacle, not as one
+        # polygon: the bucket then only touches the edges nearby instead of all
+        # 21 451 of them, and "inside the pour" comes from the scanline mask below.
         for zi, zone in enumerate(board.zones or []):
             if name not in [str(l) for l in (zone.get("layers") or [])]:
                 continue
@@ -1632,16 +1643,18 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
             for pi, poly in enumerate(zone.get("filled_polygons") or []):
                 if len(poly) < 3:
                     continue
-                pours.append(poly)
+                pours.append((zone.get("net"), poly, "zone%d.%d" % (zi, pi)))
                 n = len(poly)
                 for i in range(n):
                     p0, p1 = poly[i], poly[(i + 1) % n]
                     if p0 == p1:
                         continue
-                    items.append({"kind": "zone", "net": zone.get("net"),
+                    edges.append({"kind": "zone", "net": zone.get("net"),
                                   "ref": "zone%d.%d" % (zi, pi), "layer": name,
                                   "seg": ((p0[0], p0[1]), (p1[0], p1[1]), 0.0)})
         layer_buckets[name] = (items, _bucketize(items, cell, pad=reach))
+        pour_buckets[name] = (edges, _bucketize(edges, cell, pad=reach) if edges
+                              else {})
 
     # Drills are a fab rule, not an electrical one: another net's hole blocks the
     # candidate exactly as hard as one of our own.
@@ -1714,7 +1727,10 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
                    "ARG_RANGE",
                    hint="give x/y with radius_mm, or a smaller region; a grid_mm of "
                         "about %.2f mm would fit this window" % max(step, fit))
-    mask = _pour_mask(pours, qx0, qy0, step, nx, ny) if pours else None
+    pour_masks = []
+    for pnet, poly, pref in pours:
+        pour_masks.append((pnet, pref,
+                           _pour_mask([poly], qx0, qy0, step, nx, ny)))
     tried = legal = 0
     kill = {"off_board": 0, "edge_clearance": 0, "copper_clearance": 0,
             "pour_interior": 0, "hole_to_hole": 0}
@@ -1727,9 +1743,10 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
             if not any(G.point_in_polygon((px, py), r) for r in rings):
                 kill["off_board"] += 1
                 continue
-            if mask is not None and mask[iy][ix]:
-                # Inside another net's pour: the boundary distance says nothing
-                # about that, and a hole there is a short, not a tight fit.
+            inside = [pn for pn, _pr, m in pour_masks if m[iy][ix]]
+            if inside and pours_block:
+                # Only when the caller says the plane is fixed copper. By default
+                # the filler bites around the hole and this is not a short.
                 kill["pour_interior"] += 1
                 continue
             room = None
@@ -1742,12 +1759,20 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
                     room, src, why = slack, "edge_clearance", ("board edge", r)
             for name in coin:
                 got = _nearest(name, px, py)
-                if got is None:
+                if got is not None:
+                    slack = got[0] - reach
+                    if slack < room:
+                        room, src = slack, "copper_clearance"
+                        why = ("%s on %s" % (got[1].get("kind"), name), got[1])
+                if not pours_block:
                     continue
-                slack = got[0] - reach
-                if slack < room:
-                    room, src = slack, "copper_clearance"
-                    why = ("%s on %s" % (got[1].get("kind"), name), got[1])
+                pedges, pbuckets = pour_buckets[name]
+                got = _lookup(pedges, pbuckets, px, py)
+                if got is not None:
+                    slack = got[0] - reach
+                    if slack < room:
+                        room, src = slack, "copper_clearance"
+                        why = ("%s on %s" % ("pour edge", name), got[1])
             if room < 0:
                 kill[src] += 1
                 continue
@@ -1769,7 +1794,8 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
             sites.append({"at": [round(px, 3), round(py, 3)],
                           "room_mm": round(room, 3),
                           "limited_by": why[0] if why else None,
-                          "nearest": nearest})
+                          "nearest": nearest,
+                          "inside_pours": sorted(set(inside))})
     sites.sort(key=lambda s: -s["room_mm"])
     top = sites[:int(max_sites)]
     best = top[0]["room_mm"] if top else None
@@ -1800,6 +1826,7 @@ def via_sites(board, near=None, radius_mm=None, region=None, grid_mm=0.2,
                   "spot between two grid points is not reported" % step,
         assumptions={"clearance_mm": clr, "edge_clearance_mm": edge,
                      "hole_to_hole_mm": h2h, "net": net or "(any - all copper blocks)",
+                     "pours_block": bool(pours_block),
                      "own_copper_ignored": net is not None,
                      "not_claimed": "this is legality, not placement: it does not say "
                                     "the via is useful, reachable, or that the route "

@@ -3905,7 +3905,8 @@ def _board_via_sites(b, args):
         drill_mm=args.get("drill_mm"), clearance_mm=args.get("clearance_mm"),
         edge_clearance_mm=args.get("edge_clearance_mm"),
         hole_to_hole_mm=args.get("hole_to_hole_mm"), net=args.get("net"),
-        layers=args.get("layers"), max_sites=args.get("max_sites", 20))
+        layers=args.get("layers"), max_sites=args.get("max_sites", 20),
+        pours_block=args.get("pours_block", False))
 
 _tool(
     "board_via_sites",
@@ -3939,6 +3940,11 @@ _tool(
          "hole_to_hole_mm": _num("minimum drill-to-drill wall (default: the board's "
                                  "min_hole_to_hole, else 0.25)"),
          "max_sites": _num("how many legal sites to list, most room first (20)", 20),
+         "pours_block": _bool("treat another net's POUR as fixed copper. Off by "
+                              "default: the filler cuts the pour back around what "
+                              "is added, so a hole inside a plane is not a short but "
+                              "a bite out of it - `inside_pours` always says which "
+                              "planes would be bitten", False),
      }, **_COMMON),
      "required": ["path"]},
     _board_tool(_board_via_sites, derived=True),

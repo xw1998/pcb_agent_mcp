@@ -109,7 +109,7 @@ class TestDrillRule(_Sites):
 
 
 class TestPourBlocksOnlyOtherNets(_Sites):
-    def _pour(self, net):
+    def _pour(self, net, pours_block=False):
         self.apply({"op": "add_net", "name": "GND"},
                    {"op": "add_zone", "net": "GND", "layer": "F.Cu",
                     "x0": 20, "y0": 10, "x1": 40, "y1": 30})
@@ -117,26 +117,39 @@ class TestPourBlocksOnlyOtherNets(_Sites):
         self.assertIsNone(e, e)
         board.zones[0]["filled_polygons"] = [
             [(20.0, 10.0), (40.0, 10.0), (40.0, 30.0), (20.0, 30.0)]]
-        return oracle.via_sites(board, region=[30, 20, 30, 20], net=net)["value"]
+        return oracle.via_sites(board, region=[30, 20, 30, 20], net=net,
+                                pours_block=pours_block)["value"]
 
-    def test_a_pour_of_another_net_refuses_the_hole(self):
+    def test_another_nets_pour_is_reported_not_refused(self):
+        # The filler cuts a plane back around whatever is added, so a hole inside
+        # another net's pour is a bite out of the plane, not a short. The answer has
+        # to SAY which plane would be bitten, or the caller cannot tell the two
+        # apart.
         v = self._pour("+3V3")
+        self.assertEqual(v["verdict"], "sites_exist", v["killed_by"])
+        self.assertEqual(v["sites"][0]["inside_pours"], ["GND"])
+
+    def test_asking_for_strict_pours_refuses_it(self):
+        # Control for the test above: the same geometry, one flag, opposite answer.
+        v = self._pour("+3V3", pours_block=True)
         self.assertEqual(v["verdict"], "no_legal_site")
         self.assertEqual(v["killed_by"]["pour_interior"], 1)
 
     def test_a_pour_of_the_same_net_is_where_the_via_belongs(self):
         # Control: a stitching via inside its own pour is the normal case, so the
-        # same geometry on the same net must be legal.
+        # same geometry on the same net must be legal and bite nothing.
         v = self._pour("GND")
         self.assertEqual(v["verdict"], "sites_exist", v["killed_by"])
+        self.assertEqual(v["sites"][0]["inside_pours"], [])
 
-    def test_just_outside_the_pour_the_room_is_the_gap(self):
-        # 0.5 mm outside the pour edge, the pour is still the limit.
-        v = self._pour_at(19.5, 20.0, "+3V3")
-        self.assertEqual(v["sites"][0]["limited_by"], "zone on F.Cu")
+    def test_just_outside_a_strict_pour_the_room_is_the_gap(self):
+        # 0.5 mm outside the pour edge, with the plane held fixed, the pour is the
+        # limit and the room is that gap minus the clearance and the radius.
+        v = self._pour_at(19.5, 20.0, "+3V3", pours_block=True)
+        self.assertEqual(v["sites"][0]["limited_by"], "pour edge on F.Cu")
         self.assertLess(v["sites"][0]["room_mm"], 0.5)
 
-    def _pour_at(self, x, y, net):
+    def _pour_at(self, x, y, net, pours_block=False):
         self.apply({"op": "add_net", "name": "GND"},
                    {"op": "add_zone", "net": "GND", "layer": "F.Cu",
                     "x0": 20, "y0": 10, "x1": 40, "y1": 30})
@@ -144,7 +157,8 @@ class TestPourBlocksOnlyOtherNets(_Sites):
         self.assertIsNone(e, e)
         board.zones[0]["filled_polygons"] = [
             [(20.0, 10.0), (40.0, 10.0), (40.0, 30.0), (20.0, 30.0)]]
-        return oracle.via_sites(board, region=[x, y, x, y], net=net)["value"]
+        return oracle.via_sites(board, region=[x, y, x, y], net=net,
+                                pours_block=pours_block)["value"]
 
 
 class TestWindow(_Sites):
