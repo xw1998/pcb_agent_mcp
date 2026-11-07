@@ -262,6 +262,12 @@
 - `board_layout_metrics` — Continuous layout readings (spacing rhythm, orientation, alignment, edge margin, density, cluster separation) with percentiles against a reference set.
 - `board_topology` — Functional groups, the nets between them, and the order power flows; the partition step before coordinates.
 
+## 布线纪律（3）
+
+- `board_routing_profile` — Routing shape as numbers (segment lengths, diagonal share, off-grid share, crossings, bends/vias per net, fan-out), per layer with preferred direction; distances to a reference set.
+- `board_house_style` — House rules: width ladder and per-role widths, via families, corner style; takes ratios (not millimetres) from a reference board and returns a `fix` list plus `blocked` nets that cannot grow at the board's clearance.
+- `board_routing_violations` — The redraw list: over-long segments, off-grid segments, nets over a bend limit, layers with no preferred direction, with uuid/net/layer/length/endpoints.
+
 ## 方案与布局库（7）
 
 - `pattern_recall` — Read recipes (parameters + steps + a reading) and layouts (mm offsets from one anchor).

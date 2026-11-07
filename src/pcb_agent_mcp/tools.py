@@ -2729,6 +2729,234 @@ _tool(
     _board_tool(lambda b, a: _topology(b), derived=True),
 )
 
+def _collect_references(args):
+    """Reference boards named directly or collected from a directory, plus what was
+    skipped and why. Loading a reference is allowed to fail; a silent failure is not.
+    """
+    references, skipped = [], []
+    for path in [str(p) for p in (args.get("reference") or []) if p]:
+        other, e = _load_board({"path": path, "member": args.get("member"),
+                                "project": args.get("project")})
+        if e:
+            skipped.append({"path": path, "why": e.get("message") or e.get("reason_code")})
+            continue
+        references.append(other)
+    directory = args.get("reference_dir")
+    if directory:
+        import glob
+        limit = int(args.get("reference_limit") or 12)
+        here = os.path.abspath(args.get("path") or "")
+        for path in sorted(glob.glob(os.path.join(directory, "**", "*.kicad_pcb"),
+                                     recursive=True)):
+            if len(references) >= limit:
+                skipped.append({"path": directory,
+                                "why": "stopped at reference_limit=%d" % limit})
+                break
+            if os.path.abspath(path) == here:
+                continue
+            other, e = _load_board({"path": path})
+            if e:
+                skipped.append({"path": path,
+                                "why": e.get("message") or e.get("reason_code")})
+                continue
+            references.append(other)
+    return references, skipped
+
+def _routing_profile_with_reference(board, args):
+    from . import routing_profile as _rp
+    references, skipped = _collect_references(args)
+    got = _rp.profile(board, net_scope=args.get("net"))
+    if args.get("net"):
+        got["compare_skipped"] = ("a single net was measured, so the board-to-board "
+                                  "comparison was not run")
+    elif references:
+        others = [_rp.profile(r) for r in references]
+        got["reference"] = _rp.compare(got, others)
+        got["reference_boards"] = [o.get("board") for o in others]
+    else:
+        got["reference"] = _rp.compare(got, [])
+    got["reference_skipped"] = skipped
+    out = ok(got, "routing shape as numbers, and the reading-by-reading distance to a "
+                  "reference set",
+             model="segments bucketed by angle at ANGLE_TOL_DEG, per-net bend counts "
+                   "from the endpoint graph, fan-out from pad proximity; every "
+                   "threshold is echoed with the answer",
+             basis="the board's own track records and pad positions; no reference "
+                   "means absolute readings only",
+             precision="lengths to 1e-3 mm, shares are per-segment counts",
+             assumptions={"writes_nothing": True, "does_not_route": True},
+             extra={"writes_nothing": True, "routes_nothing": True})
+    compare = got.get("reference") or {}
+    if not references:
+        out["message"] = ("no reference set: these are absolute readings. Whether they "
+                          "are 'like a good board' is not answered")
+    else:
+        further = compare.get("further") or []
+        out["message"] = (("%d reading(s) sit further out than the reference: %s"
+                           % (len(further), ", ".join(further))) if further
+                          else "every reading is at or better than the reference")
+    out["next_step"] = ("shape numbers do not separate a busy board from a sloppy one - "
+                        "on this machine's two boards the hobby board reads better than "
+                        "the production one on detour and on how far a net strays. "
+                        "Try board_house_style next: the widths and vias are what "
+                        "actually differ")
+    return out
+
+def _house_style_with_rules(board, args):
+    from . import house_style as _hs
+    references, skipped = _collect_references(args)
+    got = _hs.style(board)
+    styles = [_hs.style(r) for r in references]
+    baseline = args.get("baseline_width_mm")
+    if baseline is None:
+        baseline = (got.get("width") or {}).get("dominant_mm")
+    rule_set = _hs.rules(styles, baseline_width_mm=baseline,
+                         ladder_step_mm=float(args.get("ladder_step_mm") or 0.05))
+    got["rules"] = rule_set
+    got["reference_boards"] = [s.get("board") for s in styles]
+    got["reference_skipped"] = skipped
+    got["fix"] = _hs.diffs(board, rule_set) if styles else None
+    out = ok(got, "the house rules this board follows and the same rules read off a "
+                  "reference, then the nets that depart from them",
+             model="width ladder and per-role widths, via families, turn angles; the "
+                   "reference contributes RATIOS (its role width over its own signal "
+                   "width), not its millimetres",
+             basis="the board's own track and via records; a reference set of one is "
+                   "reported as confidence 'one board'",
+             precision="widths to 1e-4 mm grouped at 5 um; shares are per-segment",
+             assumptions={"writes_nothing": True, "applies_nothing": True},
+             extra={"writes_nothing": True})
+    if not styles:
+        out["message"] = ("no reference: this is what the board does, not what it should "
+                          "do. Pass reference=[...] for the fix list")
+        out["next_step"] = "pass a board you consider well drawn as reference=[...]"
+        return out
+    fix = (got.get("fix") or {}).get("fix") or []
+    blocked = (got.get("fix") or {}).get("blocked") or []
+    blocked_text = (("%d net(s) cannot take the rule set's width at this board's "
+                     "clearance and are listed under `blocked` instead: %s. ")
+                    % (len(blocked), ", ".join(b["net"] for b in blocked[:6]))) \
+        if blocked else ""
+    out["message"] = (blocked_text
+                      + (("%d net(s) depart from the rule set, %d already match; the fix "
+                       "list is %s"
+                       % (len(fix), (got["fix"] or {}).get("nets_already_right"),
+                            ", ".join(r["net"] for r in fix[:6]))) if fix
+                          else ("no net can take the rule set's width at this board's "
+                                "clearance: the neighbours have to move before the "
+                                "widths can" if blocked
+                                else "every net matches the rule set")))
+    out["next_step"] = ("each fix row is one set_track_width; apply them one net at a "
+                        "time through board_apply so the DRC diff gate reads the "
+                        "clearance the wider copper needs")
+    return out
+
+def _routing_violations(board, args):
+    from . import routing_profile as _rp
+    limits = {}
+    for key, arg in (("max_segment_mm", "max_segment_mm"),
+                     ("max_bends_per_net", "max_bends_per_net"),
+                     ("diagonal_share_limit", "diagonal_share_limit")):
+        value = args.get(arg)
+        if value is not None:
+            limits[key] = float(value)
+    got = _rp.violations(board, limits=limits)
+    out = ok(got, "the segments and nets that break a rule, named so they can be redrawn",
+             model="same bucketing as board_routing_profile; a violation is a segment "
+                   "over the length limit, off the 45 degree grid, or a net over its "
+                   "bend limit",
+             basis="the limits echoed back under `limits` - defaults are the crossing "
+                   "share and the discipline anchors, and changing one changes the list",
+             precision="lengths to 1e-3 mm",
+             assumptions={"writes_nothing": True, "it_is_a_list_not_a_router": True},
+             extra={"writes_nothing": True, "routes_nothing": True})
+    if not got.get("long_segment_count") and not got.get("off_grid_segments"):
+        out["message"] = "nothing breaks the current limits"
+    else:
+        out["message"] = ("%d segment(s) over %.2f mm and %d off the 45 degree grid"
+                          % (got.get("long_segment_count") or 0,
+                             (got.get("limits") or {}).get("max_segment_mm") or 0,
+                             got.get("off_grid_segments") or 0))
+    out["next_step"] = ("redraw the top rows by hand - this server does not route, and "
+                        "the list is ordered longest-first so the first few are the "
+                        "ones that read as wrong")
+    return out
+
+_tool(
+    "board_routing_profile",
+    "A routing as numbers, so 'like the reference' stops being an opinion. Shape only: "
+    "segment length distribution, share of copper running diagonally, how much of it "
+    "is off the 45 degree grid, how many segments span the board instead of serving a "
+    "neighbourhood, bends per net, vias per net, and how far a track travels before it "
+    "leaves its pad - per layer too, with that layer's preferred direction. Pass a "
+    "reference set and every reading also reports the distance to it. Read this file's "
+    "docstring before trusting the numbers on a small board: measured 2026-11-07, a "
+    "53 mm hobby board scored BETTER than a production 230 mm carrier on detour ratio "
+    "(1.089 vs 1.258) and on net spread (1.000 vs 1.013) - shape is not what makes a "
+    "board read as designed. Writes nothing, routes nothing.",
+    {"type": "object",
+     "properties": dict({
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "reference": _arr("reference boards (paths) to compare against"),
+         "reference_dir": _str("directory to collect reference .kicad_pcb files from"),
+         "reference_limit": _num("stop collecting references after this many", 12),
+         "net": _str("measure one net only; the comparison is then skipped"),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _routing_profile_with_reference(b, a), derived=True),
+)
+
+_tool(
+    "board_house_style",
+    "The rules a routing obeys, which DRC cannot see: one width per ROLE drawn from a "
+    "short ladder, one via family, turns taken the same way, a preferred direction per "
+    "layer. Measured 2026-11-07: the F412 core board runs all 556 of its segments at "
+    "0.15 mm - +3V3, VBUS, USB_DP and a 3.3 V LED alike - while a production carrier "
+    "uses 13 rungs (0.10 signal, 0.19 medium, up to 2.0 power) and exactly one via "
+    "family. Every one of those 556 segments is legal, which is why no check ever "
+    "flagged it: it is a style defect, and style is measurable. Pass a reference board "
+    "and you get the rules read off it plus `fix`: net by net, the width it has and the "
+    "width the rule asks for, already shaped as set_track_width calls. The reference "
+    "contributes ratios, not millimetres - a 0.10 mm signal on a 230 mm carrier is not "
+    "a width for a 53 mm board. Writes nothing.",
+    {"type": "object",
+     "properties": dict({
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "reference": _arr("reference boards (paths) to read the house rules off"),
+         "reference_dir": _str("directory to collect reference .kicad_pcb files from"),
+         "reference_limit": _num("stop collecting references after this many", 12),
+         "baseline_width_mm": _num("this board's signal width, the one the reference's "
+                                   "ratios are applied to; defaults to the board's own "
+                                   "dominant width", None),
+         "ladder_step_mm": _num("the reference's width ladder step used when snapping a "
+                                "scaled target", 0.05),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _house_style_with_rules(b, a), derived=True),
+)
+
+_tool(
+    "board_routing_violations",
+    "The redraw list, ordered by damage: segments longer than a share of the board "
+    "diagonal, segments off the 45 degree grid, nets carrying more bends than allowed, "
+    "layers with no preferred direction. Every row names the segment's uuid, net, layer, "
+    "length and both endpoints, so it can be found and redrawn by hand. Defaults come "
+    "from the crossing share and the discipline anchors and every one is echoed back; "
+    "pass limits to use your own. This is a list, not a router: no tool in this server "
+    "moves copper to satisfy it. Writes nothing.",
+    {"type": "object",
+     "properties": dict({
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "max_segment_mm": _num("a segment longer than this is listed; default is "
+                                "0.25 x the board diagonal", None),
+         "max_bends_per_net": _num("nets with more bends than this are listed; "
+                                   "default off", None),
+         "diagonal_share_limit": _num("unused threshold echoed for symmetry", 0.30),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _routing_violations(b, a), derived=True),
+)
+
 _tool(
     "board_intent",
     "Check a DESIGN INTENT against a board before anything is routed. The intent "
@@ -5144,6 +5372,8 @@ def _capabilities(_args):
             "schematic_pcb_diff", "schematic_pcb_sync", "schematic_export",
             "board_blockers", "board_run_ledger", "board_fanout", "board_intent",
             "board_layout_metrics", "board_topology",
+            "board_routing_profile", "board_routing_violations",
+            "board_house_style",
             "lceda_pcb_write",
             "experience_recall", "experience_check", "experience_candidate",
             "experience_promote", "experience_outcome", "experience_export",

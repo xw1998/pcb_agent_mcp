@@ -1,6 +1,6 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——220 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——223 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
@@ -173,6 +173,29 @@ postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、
 
 纪律：这三样**都不写板、都不自动布局**。度量是 `authoritative: false`，最终判词仍只由
 `board_drc` 给。
+
+## 布线纪律（走线「像参考板」怎么量）
+
+`docs/122` 的结论先说：**形状不是眼睛在读的东西**。实测 F412 那块 53 mm 板在斜线占比、
+绕行率（1.089 对 1.258）、网离散度（1.000 对 1.013）、拐角 45° 占比（96% 对 95%）上全部
+不输生产板，唯一巨大差异是**线宽梯级 1 级 vs 13 级**。所以三个工具各管一层：
+
+1. `board_routing_profile path=板子 [reference=[...]]` — 形状：段长中位/p90/最大、斜线占比、
+   离 45° 网格占比、跨板长段数、每网拐角与过孔中位、扇出长度；`layers` 每层给方向偏好强度。
+   给参考集时 `reference.rows` 逐项给 `delta` 与 `verdict`。**形状读数不能判丑**，别拿它当判词。
+2. `board_house_style path=板子 reference=[参考板...]` — 规矩：`width.ladder`（本板线宽梯级）、
+   `by_role`（电源/差分/信号各取什么宽）、`vias.families`、`corners`。参考板只贡献**比例**
+   （`rules.scaled_from` 印出算式：本板中线宽 × 参考的同角色/其信号宽），**不贡献毫米**——
+   生产板的 0.10 mm 信号线不是 53 mm 板子的宽度。结果：
+   - `fix.fix`：可以改的，每行就是一次 `set_track_width`（走 `board_apply` 过 DRC 差集闸门）
+   - `fix.blocked`：规则想要的宽度**放不下**，写清 `fits_mm` 与「先挪邻居」
+   - `fix.capped` / `fix.pair_capped`：被余量砍到多少、差分对被拉平到较紧的一侧
+   - `clearance_room`：逐网「最宽能到多少」（邻网也加宽用对称界 `d−clearance`）
+3. `board_routing_violations path=板子 [limits]` — 重画清单：超长段（默认 0.25×对角线）、
+   离网格段、拐角超限的网、无方向偏好的层，每条带 uuid/网/层/长度/两端坐标，按长度降序。
+
+纪律：三者**都不写盘、都不布线**。想让板子真的有线宽梯级，是要在**扇出时留通道**——
+`blocked` 里那几条（0.5 mm 节距出线、差分对 0.389 mm 间距）一旦画完，加宽就没空间了。
 
 ## 方案与布局库（`pattern_*`）
 

@@ -440,7 +440,8 @@ class TestTheTool(unittest.TestCase):
         # the vendor's printed points is a different question from evaluating a fit)
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
-        self.assertEqual(len(tools.TOOLS), 205)
+        # 223 = 220 + the three routing-discipline tools in 0.0.122
+        self.assertEqual(len(tools.TOOLS), 223)
         self.assertIn("magnetics_dc_bias", tools.TOOLS)
         spec = tools.TOOLS["magnetics_dc_bias"]
         props = spec["inputSchema"]["properties"]
