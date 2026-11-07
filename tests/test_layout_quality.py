@@ -106,6 +106,37 @@ class TestTheReadingsCanComeOutBadly(unittest.TestCase):
         self.assertEqual([g["name"] for g in got["groups"] if g["name"] == "mcu"], ["mcu"])
 
 
+class TestTheLayerIsTheFootprintsOwn(unittest.TestCase):
+    """A copper graphic inside a footprint must not rename the footprint's layer.
+
+    Measured 2026-11-07 on the F412 core board: 30 of 32 parts came back as "F.Fab"
+    and 2 as "B.Fab", because the graphic loop reused the variable `layer`. Every
+    side-dependent answer inherited that: board_components(layer="B.Cu") was empty
+    and `side` in an extracted layout was a coin toss.
+    """
+
+    SRC = """(kicad_pcb (version 20221018) (generator t)
+      (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+      (net 0 "")
+      (footprint "Test:LED" (layer "B.Cu") (at 10 10 0)
+        (fp_poly (pts (xy 0 0) (xy 1 0) (xy 1 1))
+          (stroke (width 0.1) (type solid)) (fill yes) (layer "F.Cu"))
+        (pad "1" smd roundrect (at 0 0) (size 1 1) (layers "F.Cu") (net 0 ""))))"""
+
+    def test_a_copper_graphic_does_not_overwrite_the_layer(self):
+        from pcb_agent_mcp.adapters import kicad_pcb as K
+        board = K.parse_board_text(self.SRC)
+        self.assertEqual(board.footprints[0]["layer"], "B.Cu")
+        self.assertEqual(len(board.footprints[0]["graphics"]), 1)
+
+    def test_a_board_on_disk_reports_copper_sides_not_fab_layers(self):
+        out = tools.call_tool("board_components", {"path": SAMPLE})
+        rows = out["value"]
+        for row in rows:
+            self.assertNotIn("Fab", str(row.get("layer")),
+                             "%s came back on %r" % (row.get("ref"), row.get("layer")))
+
+
 class TestPercentilesNeedACorpus(unittest.TestCase):
 
     def test_no_reference_means_no_percentile_and_it_says_why(self):

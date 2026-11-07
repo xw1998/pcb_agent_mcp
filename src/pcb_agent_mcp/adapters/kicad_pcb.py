@@ -748,8 +748,12 @@ def _footprint(node, mask_expansion=0.0):
     for g in node:
         if not (isinstance(g, list) and g and g[0] in _GRAPHIC_KINDS):
             continue
-        layer = atom(child(g, "layer"), 1, "")
-        if not _is_copper(layer):
+        # NOT `layer`: reusing the footprint's own name here overwrote it, and every
+        # footprint on a board with copper graphics came back as F.Fab/B.Fab. Measured
+        # 2026-11-07 on the F412 core board: 30 of 32 parts read "F.Fab", so
+        # board_components(layer="B.Cu") was empty and every side test was a guess.
+        glayer = atom(child(g, "layer"), 1, "")
+        if not _is_copper(glayer):
             continue
         poly = _graphic_poly(g)
         if not poly:

@@ -39,10 +39,14 @@ LONELY_MM = 20.0
 #: `ALIGN_REACH_MM`. A quarter millimetre is under one 0.1 mm grid step of slack.
 ALIGN_TOL_MM = 0.25
 ALIGN_REACH_MM = 30.0
-#: Density is counted on this grid. 5 mm is a coarse enough cell to see a hole in
-#: the placement and fine enough to see the difference between an MCU corner and a
-#: power stage.
-GRID_MM = 5.0
+#: Density is counted on a grid whose cell is derived from the board and the part
+#: count, clamped to this range. A fixed cell does not travel: measured 2026-11-07
+#: on a 53x30 mm board with 32 parts, a 5 mm grid gives 77 cells and 0.42 parts per
+#: cell, so 73 % of cells are empty by arithmetic and the CV reads "collapsed" for a
+#: board whose parts are in fact spread evenly. The cell that makes the reading
+#: mean something has about one part per cell.
+GRID_MM_MIN = 4.0
+GRID_MM_MAX = 20.0
 #: A net is treated as local evidence of a cluster only when it touches this few
 #: parts. A ground net touches everything and would merge the whole board into one
 #: cluster - that is a fact about grounds, not about grouping.
@@ -408,12 +412,16 @@ def _one(board):
         ys = [p[1] for p in spans]
         x0, x1 = (box[0], box[2]) if box else (min(xs), max(xs))
         y0, y1 = (box[1], box[3]) if box else (min(ys), max(ys))
-        cols = max(1, int(math.ceil((x1 - x0) / GRID_MM)))
-        rows = max(1, int(math.ceil((y1 - y0) / GRID_MM)))
+        area = max(1e-6, (x1 - x0) * (y1 - y0))
+        # one part per cell, clamped: the grid has to be a measuring instrument for
+        # this board, not a fixed ruler that calls every small board collapsed
+        cell = max(GRID_MM_MIN, min(GRID_MM_MAX, 2.0 * math.sqrt(area / len(spans))))
+        cols = max(1, int(math.ceil((x1 - x0) / cell)))
+        rows = max(1, int(math.ceil((y1 - y0) / cell)))
         grid = [[0] * cols for _ in range(rows)]
         for x, y in spans:
-            cx = min(cols - 1, max(0, int((x - x0) / GRID_MM)))
-            cy = min(rows - 1, max(0, int((y - y0) / GRID_MM)))
+            cx = min(cols - 1, max(0, int((x - x0) / cell)))
+            cy = min(rows - 1, max(0, int((y - y0) / cell)))
             grid[cy][cx] += 1
         cells = [n for row in grid for n in row]
         mean = sum(cells) / float(len(cells)) if cells else 0.0
@@ -422,15 +430,19 @@ def _one(board):
             out["density_cv"] = {
                 "value": round((variance ** 0.5) / mean, 4),
                 "unit": "ratio", "better_when": "lower",
-                "grid_mm": GRID_MM, "cells": len(cells),
-                "how": "coefficient of variation of footprint count over a %s mm "
-                       "grid: an empty half with everything jammed in one corner "
-                       "scores high even when every clearance passes" % GRID_MM}
+                "grid_mm": round(cell, 3), "cells": len(cells),
+                "parts_per_cell": round(mean, 3),
+                "how": "coefficient of variation of footprint count over a grid "
+                       "whose cell is sized to about one part per cell (2*sqrt(area/"
+                       "parts), clamped to %s..%s mm): an empty half with everything "
+                       "jammed in one corner scores high even when every clearance "
+                       "passes" % (GRID_MM_MIN, GRID_MM_MAX)}
             out["density_empty_share"] = {
                 "value": round(_share(cells, lambda c: c == 0), 4),
                 "unit": "share", "better_when": "no_direction",
-                "grid_mm": GRID_MM,
-                "how": "share of grid cells with no footprint on them"}
+                "grid_mm": round(cell, 3),
+                "how": "share of grid cells with no footprint on them, on the same "
+                       "cell as density_cv"}
 
     got = groups(board)
     sizes = [len(g["refs"]) for g in got["groups"] if g["name"] != "misc"]
@@ -484,7 +496,8 @@ def _one(board):
     out["thresholds"] = {
         "crowded_mm": CROWDED_MM, "lonely_mm": LONELY_MM,
         "align_tol_mm": ALIGN_TOL_MM, "align_reach_mm": ALIGN_REACH_MM,
-        "grid_mm": GRID_MM, "on_axis_tol_deg": ON_AXIS_TOL_DEG,
+        "grid_mm_range": [GRID_MM_MIN, GRID_MM_MAX],
+        "on_axis_tol_deg": ON_AXIS_TOL_DEG,
         "adopt_mm": ADOPT_MM,
         "note": "these are the assumptions of the judgements, not measurements of "
                 "the world; changing one changes every share below it",
