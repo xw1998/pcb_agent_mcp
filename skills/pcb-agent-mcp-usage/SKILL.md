@@ -1,6 +1,6 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——217 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——220 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
@@ -152,11 +152,34 @@ postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、
    **hard 规则不从单板学**（板厂能力/规范才给），调用会直接拒。
 7. 库活着吗 → `experience_status`：active 几条、候选几条没人确认、文件最后写入时间。
 
+## 布局质量与拓扑（先量，再分区，才落坐标）
+
+`board_drc` 只有通过/不通过：在「勉强合规」到「正常」那一片区域里它是平的，**没有梯度**，
+所以照着它生成的板子会「合规但丑」。这两层补上梯度和约束顺序：
+
+1. `board_layout_metrics path=板子` — 8 个连续读数：最近邻间距（中位/CV/拥挤比例）、
+   朝向在轴比例、对齐比例、板边留白、5 mm 网格密度 CV 与空格比例、簇分离比。
+   每个读数带 `how` 与所用阈值。**要判断「离不离群」必须给参考集**：
+   `reference=[路径...]` 或 `reference_dir=目录 reference_limit=12`。
+   没给就没有分位（它明说）；参考集是同族备份副本时判 `usable_for_judgement: false`。
+   落在 p10 以下是**问题**不是缺陷。
+2. `board_topology path=板子` — 主控（焊盘最多 ≥16）→ `mcu`；其余按网名命中数投票分到
+   memory/clock/usb/debug/uart；只碰电源轨的算 `power`；15 mm 内就近并入，否则 `unclassified`；
+   `flow` 从 power 做 BFS。**先按 flow 给每组划区域，再在组内落坐标**——跳过这一步就是
+   「合规但丑」的典型来源。
+3. 读数在边缘、并且你知道「为什么丑」时，用 `pattern_add kind='pitfall'` 记一条：
+   `symptom` / `cause` / `fix`（各 ≥8 字）+ 可选 `metric`（必须是上面某个读数名）与
+   `below_percentile`。绑不到读数的症状会被拒。
+
+纪律：这三样**都不写板、都不自动布局**。度量是 `authoritative: false`，最终判词仍只由
+`board_drc` 给。
+
 ## 方案与布局库（`pattern_*`）
 
 经验库存的是「能被测量反驳的说法」，这里存的是「能被人再来一遍的东西」：
 - **recipe**（已验证方案）：参数 + 步骤 + 一条读数。例：USB-C 受电端 CC1/CC2 各 5.1 kΩ。
 - **layout**（可复用布局）：相对**一个 anchor** 的毫米偏移。
+- **pitfall**（差样本）：症状 / 原因 / 修法，可绑 `board_layout_metrics` 的一个读数。
 
 规矩（会被拒，不是建议）：
 1. `parameters` 每项必须 `{value, unit, source}`；裸数字直接拒——没来源的数字是猜，

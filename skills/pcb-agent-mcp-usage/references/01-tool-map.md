@@ -257,6 +257,11 @@
 - `experience_harvest` — Read ONE board and write down what it says, as candidates (single-board metrics only; a hard rule is refused).
 - `experience_status` — Is the library alive: active count, candidates nobody confirmed, file mtime.
 
+## 布局质量与拓扑（2）
+
+- `board_layout_metrics` — Continuous layout readings (spacing rhythm, orientation, alignment, edge margin, density, cluster separation) with percentiles against a reference set.
+- `board_topology` — Functional groups, the nets between them, and the order power flows; the partition step before coordinates.
+
 ## 方案与布局库（7）
 
 - `pattern_recall` — Read recipes (parameters + steps + a reading) and layouts (mm offsets from one anchor).

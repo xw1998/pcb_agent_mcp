@@ -2592,6 +2592,143 @@ _tool(
     _board_tool(lambda b, a: _routability_with_intent(b, a), derived=True),
 )
 
+def _layout_metrics_with_reference(board, args):
+    """Metrics plus a reference set, and an honest account of what was skipped."""
+    from . import layout_quality as _lq
+    references, skipped = [], []
+    wanted = [str(p) for p in (args.get("reference") or []) if p]
+    for path in wanted:
+        other, e = _load_board({"path": path, "member": args.get("member"),
+                                "project": args.get("project")})
+        if e:
+            skipped.append({"path": path,
+                            "why": e.get("message") or e.get("reason_code")})
+            continue
+        references.append(other)
+    directory = args.get("reference_dir")
+    if directory:
+        import glob
+        limit = int(args.get("reference_limit") or 12)
+        here = os.path.abspath(args.get("path") or "")
+        for path in sorted(glob.glob(os.path.join(directory, "**", "*.kicad_pcb"),
+                                     recursive=True)):
+            if len(references) >= limit:
+                skipped.append({"path": directory,
+                                "why": "stopped at reference_limit=%d" % limit})
+                break
+            if os.path.abspath(path) == here:
+                continue
+            other, e = _load_board({"path": path})
+            if e:
+                skipped.append({"path": path,
+                                "why": e.get("message") or e.get("reason_code")})
+                continue
+            references.append(other)
+    got = _lq.metrics(board, reference=references)
+    got["reference_skipped"] = skipped
+    out = ok(got, "readings with the thresholds that produced them",
+             model="continuous layout readings computed from footprint geometry and "
+                   "net names; percentiles only against a reference set the caller "
+                   "named",
+             basis="thresholds are assumptions of the judgement and are printed with "
+                   "every answer; the board outside those numbers was not measured",
+             precision="positions to 1e-4 mm; shares are counts over the footprints "
+                       "the board actually carries",
+             assumptions={"writes_nothing": True,
+                          "not_a_pass_fail": "a low percentile is a question, not a "
+                                             "defect: board_drc is the only verdict"})
+    reference = got.get("reference")
+    if reference is None:
+        out["message"] = ("no reference set: these are absolute readings. Pass "
+                          "reference=[...] or reference_dir=... to get percentiles - "
+                          "that is what turns 'it looks wrong' into a number")
+    elif not reference.get("usable_for_judgement"):
+        out["message"] = (
+            "percentiles were computed and are NOT usable for a judgement: %s"
+            % ("all %d reference board(s) carry the same references as this one - a "
+               "backup folder is copies, not a corpus"
+               % reference.get("same_reference_set_as_this_board")
+               if reference.get("same_reference_set_as_this_board")
+               else "fewer than five reference boards"))
+    else:
+        odd = (got.get("below_reference_p10") or []) + (got.get("above_reference_p90")
+                                                       or [])
+        if odd:
+            out["message"] = ("%d reading(s) sit at the edge of the reference set: %s"
+                              % (len(odd), ", ".join(odd)))
+        else:
+            out["message"] = "every reading sits inside the reference set's body"
+    out["next_step"] = ("a reading at the edge of the reference set is a question, "
+                        "not a defect: write down WHY it looks wrong with pattern_add "
+                        "kind='pitfall' (symptom / cause / fix, optionally this "
+                        "metric and below_percentile) so the next board does not "
+                        "repeat it")
+    return out
+
+
+def _topology(board):
+    from . import layout_quality as _lq
+    got = _lq.topology(board)
+    out = ok(got, "groups, links and flow order",
+             model="functional groups inferred from pad fan-out and net names; a "
+                   "partition, not a placement",
+             basis="the board's own nets and footprint positions",
+             precision="group membership is a heuristic and each rule that decided it "
+                       "is printed; a part that matched nothing is listed as "
+                       "unclassified rather than guessed into a group",
+             assumptions={"writes_nothing": True,
+                          "no_placement": "this names the constraint order, it does "
+                                          "not move anything"})
+    if got.get("unclassified"):
+        out["message"] = ("%d part(s) could not be grouped: %s"
+                          % (len(got["unclassified"]),
+                             ", ".join(got["unclassified"][:8])))
+    return out
+
+
+_tool(
+    "board_layout_metrics",
+    "Layout quality as CONTINUOUS numbers, which is what a check like board_drc "
+    "cannot give: DRC is a yes/no, so across the wide region of 'mostly fine' boards "
+    "every arrangement scores the same and nothing can tell a good one from a bad "
+    "one. Measured reason this exists: a real board with clearance 0, isolated copper "
+    "0 and clean corners still had zero stitching vias between its two ground pours "
+    "(docs/117). These readings cover spacing rhythm (nearest-neighbour median and "
+    "its variation), orientation on axis, how many parts line up, board-edge margin, "
+    "density variation over a grid, and how tight the functional groups are against "
+    "how far apart they sit. Each says which direction is better; pass a reference "
+    "set (or reference_dir) and each also reports the percentile this board sits at. "
+    "With no reference there are no percentiles and it says so - a percentile without "
+    "a corpus is a number with nothing behind it. Writes nothing.",
+    {"type": "object",
+     "properties": dict({
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "reference": _arr("reference boards (paths) to compare against; at least "
+                           "5 makes the percentile usable for a judgement"),
+         "reference_dir": _str("directory to collect reference .kicad_pcb files from"),
+         "reference_limit": _num("stop collecting references after this many", 12),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _layout_metrics_with_reference(b, a), derived=True),
+)
+
+_tool(
+    "board_topology",
+    "The layer people work in BEFORE coordinates: which parts serve the same "
+    "function (controller by pad fan-out, then memory / clock / usb / debug / uart by "
+    "net-name votes, power by rails only, leftovers adopted into the nearest group), "
+    "how those groups are wired (shared nets between them), and the order power flows "
+    "through them. Going straight to coordinates is how a layout ends up compliant "
+    "and ugly: the partition and the flow are the constraints that make placement "
+    "small enough to judge. Writes nothing.",
+    {"type": "object",
+     "properties": dict({
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _topology(b), derived=True),
+)
+
 _tool(
     "board_intent",
     "Check a DESIGN INTENT against a board before anything is routed. The intent "
@@ -5006,6 +5143,7 @@ def _capabilities(_args):
             "part_export",
             "schematic_pcb_diff", "schematic_pcb_sync", "schematic_export",
             "board_blockers", "board_run_ledger", "board_fanout", "board_intent",
+            "board_layout_metrics", "board_topology",
             "lceda_pcb_write",
             "experience_recall", "experience_check", "experience_candidate",
             "experience_promote", "experience_outcome", "experience_export",
@@ -11371,7 +11509,10 @@ _tool(
                                   "applies_to; recipe: procedure[>=2 steps], "
                                   "parameters{name:{value,unit,source}}; layout: "
                                   "class, elements[{role,dx_mm,dy_mm,rotation_deg,"
-                                  "side,anchor,must,notes}], constraints{min_gap_mm}"},
+                                  "side,anchor,must,notes}], constraints{min_gap_mm}; "
+                                  "pitfall: symptom, cause, fix, optional metric "
+                                  "(a board_layout_metrics key) and "
+                                  "below_percentile"},
      },
      "required": ["kind", "entry"]},
     lambda a: _guarded(lambda: _pattern_add(a)),

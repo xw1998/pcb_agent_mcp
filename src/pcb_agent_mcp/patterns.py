@@ -1,5 +1,5 @@
-"""Two kinds of knowledge that are not rules about a board: a verified recipe and
-a reusable layout.
+"""Three kinds of knowledge that are not rules about a board: a verified recipe, a
+reusable layout, and a pitfall (a symptom, its cause and the fix).
 
 `experience.py` stores *claims* that a measurement can contradict ("no via ring
 under 0.10 mm"). This module stores *artefacts* that a person can apply again:
@@ -39,7 +39,7 @@ import time
 
 FILENAME = "patterns.json"
 SCHEMA = 1
-KINDS = ("recipe", "layout")
+KINDS = ("recipe", "layout", "pitfall")
 STATUSES = ("candidate", "verified", "retired")
 SIDES = ("top", "bottom")
 OUTCOMES = ("worked", "failed")
@@ -63,16 +63,21 @@ def path():
 
 
 # ------------------------------------------------------------------ storage
+STORES = {"recipe": "recipes", "layout": "layouts", "pitfall": "pitfalls"}
+
+
 def _read():
+    empty = {"recipes": [], "layouts": [], "pitfalls": []}
     try:
         with open(path(), encoding="utf-8") as fh:
             blob = json.load(fh)
     except (OSError, ValueError):
-        return {"recipes": [], "layouts": []}
+        return empty
     if not isinstance(blob, dict):
-        return {"recipes": [], "layouts": []}
-    out = {"recipes": [], "layouts": []}
-    for key, ident in (("recipes", "recipe"), ("layouts", "layout")):
+        return empty
+    out = {"recipes": [], "layouts": [], "pitfalls": []}
+    for key, ident in (("recipes", "recipe"), ("layouts", "layout"),
+                       ("pitfalls", "pitfall")):
         for entry in blob.get(key) or []:
             if isinstance(entry, dict):
                 item = dict(entry)
@@ -89,7 +94,8 @@ def _write(store):
     tmp = target + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump({"schema": SCHEMA, "recipes": store["recipes"],
-                   "layouts": store["layouts"]}, fh, ensure_ascii=False,
+                   "layouts": store["layouts"],
+                   "pitfalls": store.get("pitfalls") or []}, fh, ensure_ascii=False,
                   indent=1, sort_keys=True)
         fh.write("\n")
     os.replace(tmp, target)
@@ -99,7 +105,7 @@ def library(kind=None, status=None):
     """Every entry, newest first. `kind` and `status` filter, both optional."""
     store = _read()
     rows = []
-    for key in ("recipes", "layouts"):
+    for key in ("recipes", "layouts", "pitfalls"):
         rows.extend(store[key])
     rows.sort(key=lambda item: (item.get("updated_at") or "", item.get("id") or ""),
               reverse=True)
@@ -210,6 +216,7 @@ def normalise(payload, kind):
         "kind": kind,
         "title": title,
         "problem": payload.get("problem"),
+        "summary": payload.get("summary"),
         "applies_to": payload.get("applies_to") or {},
         "status": "candidate",
         "created_at": _now(),
@@ -220,7 +227,33 @@ def normalise(payload, kind):
                  "notes": []},
         "origin": payload.get("origin") or "local",
     }
-    if kind == "recipe":
+    if kind == "pitfall":
+        symptom = (payload.get("symptom") or "").strip()
+        cause = (payload.get("cause") or "").strip()
+        fix = (payload.get("fix") or "").strip()
+        for name, value in (("symptom", symptom), ("cause", cause), ("fix", fix)):
+            if len(value) < 8:
+                raise ValueError(
+                    "a pitfall needs %s in at least 8 characters: 'looks wrong' is "
+                    "what this record exists to replace" % name)
+        entry["symptom"] = symptom
+        entry["cause"] = cause
+        entry["fix"] = fix
+        metric = payload.get("metric")
+        if metric:
+            from . import layout_quality as _lq
+            if metric not in _lq.PERCENTILE_KEYS:
+                raise ValueError(
+                    "metric %r is not one board_layout_metrics reports (known: %s): a "
+                    "pitfall tied to a reading nobody can take again is a story"
+                    % (metric, ", ".join(_lq.PERCENTILE_KEYS)))
+            entry["metric"] = metric
+            threshold = payload.get("below_percentile")
+            if threshold is not None and not _is_number(threshold):
+                raise ValueError("below_percentile must be a number 0-100")
+            entry["below_percentile"] = threshold
+        entry["saw_on"] = payload.get("saw_on")
+    elif kind == "recipe":
         procedure = payload.get("procedure") or []
         if not isinstance(procedure, list) or len(procedure) < 2:
             raise ValueError("a recipe needs a procedure of at least two steps; a "
@@ -282,7 +315,7 @@ def normalise(payload, kind):
 
 
 def _find(store, ident):
-    for key in ("recipes", "layouts"):
+    for key in ("recipes", "layouts", "pitfalls"):
         for entry in store[key]:
             if entry.get("id") == ident:
                 return key, entry
@@ -300,7 +333,7 @@ def add(payload, kind):
         raise ValueError("%s already exists with status %r; add a new id instead of "
                          "overwriting a record of something that was verified"
                          % (entry["id"], existing.get("status")))
-    store["recipes" if kind == "recipe" else "layouts"].append(entry)
+    store[STORES[kind]].append(entry)
     _write(store)
     return entry
 
@@ -540,7 +573,7 @@ def status():
     """Is this library actually alive: how many entries, how many verified, how
     many were ever applied, and which verified ones never were."""
     store = _read()
-    rows = store["recipes"] + store["layouts"]
+    rows = store["recipes"] + store["layouts"] + store.get("pitfalls", [])
     by_status = {name: 0 for name in STATUSES}
     by_kind = {name: 0 for name in KINDS}
     uses = worked = failed = 0
