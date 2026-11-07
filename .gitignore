@@ -18,3 +18,18 @@ _scratch/
 /_*.py
 /_*.log
 /_*.json
+
+# examples/sky_star 的当场取证产物（对比方案的板子/报告/探针脚本）：结论已写进
+# docs/130，文件本身不留库。可重放的流水线脚本不在此列。
+/examples/sky_star/_exp_*
+/examples/sky_star/_stg*
+/examples/sky_star/_fin.*
+/examples/sky_star/_dbg*
+/examples/sky_star/_chk_*
+/examples/sky_star/_chk_exp.py
+/examples/sky_star/_chk_hand.py
+/examples/sky_star/_chk_pt.py
+/examples/sky_star/_chk_zone.py
+/examples/sky_star/_gaps.py
+/examples/sky_star/_near.py
+/examples/sky_star/_probe_edge.py
