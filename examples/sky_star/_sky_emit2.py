@@ -77,33 +77,24 @@ def emit(m, origin, out):
     # pours.  Only the OUTLINE is mine; the copper itself is poured by KiCad's
     # ZONE_FILLER - no hand-drawn copper anywhere.
     #   B.Cu : one GND plane, corners bevelled 45 deg.
-    #   F.Cu : +3V3 as shaped rails (MCU top/bottom combs, side rails, the
-    #          decoupling row, and the pull-up row with a riser to the socket),
-    #          +5V as the stepped band along the input-protection row, then GND
-    #          fills what is left.
+    #   F.Cu : +3V3 as ONE shaped plate (x +-21.5, y +-35.5) at a priority above
+    #          GND, because +3V3 feeds 45 pads spread over the whole board and the
+    #          old rail version left 38 endpoints stranded; +5V keeps its own
+    #          higher-priority band along the input-protection row; GND then fills
+    #          every gap that is left (and is stitched to B.Cu afterwards).
+    #   Priorities are written out explicitly: two pours of the SAME net that
+    #   overlap at the SAME priority is a `zones_intersect` error.
     import uuid
     ZONES = [
         ('GND', 'B.Cu', 0, [(-17.8, -34.8), (17.8, -34.8), (20.8, -31.8), (20.8, 31.8),
                             (17.8, 34.8), (-17.8, 34.8), (-20.8, 31.8), (-20.8, -31.8)]),
-        ('+3V3', 'F.Cu', 2, [(-8.55, 7.85), (7.20, 7.85), (7.20, 8.55), (-8.30, 8.55),
-                             (-8.55, 8.30)]),
-        ('+3V3', 'F.Cu', 2, [(-8.30, -7.85), (7.20, -7.85), (7.20, -8.55), (-8.55, -8.30)]),
-        ('+3V3', 'F.Cu', 2, [(-8.55, -8.30), (-8.00, -8.30), (-8.00, 5.40),
-                             (-8.55, 5.40)]),
-        ('+3V3', 'F.Cu', 2, [(8.00, 5.40), (8.55, 5.40), (8.55, 6.60), (8.00, 6.60)]),
-        ('+3V3', 'F.Cu', 2, [(-7.70, -12.00), (8.20, -12.00), (8.20, -10.00),
-                             (7.90, -9.70), (-7.40, -9.70), (-7.70, -10.00)]),
-        ('+3V3', 'F.Cu', 2, [(0.70, 19.15), (1.40, 19.15), (1.40, 23.50), (0.70, 23.50)]),
-        ('+3V3', 'F.Cu', 2, [(-4.40, 18.85), (0.70, 18.85), (0.70, 19.15), (-4.40, 19.15)]),
-        ('+3V3', 'F.Cu', 2, [(1.40, 18.85), (10.00, 18.85), (10.00, 19.15),
-                             (1.40, 19.15)]),
-        ('+5V', 'F.Cu', 3, [(-11.90, -25.60), (9.20, -25.60), (9.20, -24.90),
-                            (-5.65, -24.90), (-5.65, -24.20), (-6.60, -24.20),
-                            (-6.60, -24.90), (-11.90, -24.90)]),
+        ('+3V3', 'F.Cu', 6, [(-21.5, -35.5), (21.5, -35.5), (21.5, 35.5), (-21.5, 35.5)]),
+        ('+5V', 'F.Cu', 11, [(-11.90, -25.60), (9.20, -25.60), (9.20, -24.90),
+                             (-5.65, -24.90), (-5.65, -24.20), (-6.60, -24.20),
+                             (-6.60, -24.90), (-11.90, -24.90)]),
         ('GND', 'F.Cu', 0, [(-20.8, -34.8), (20.8, -34.8), (20.8, 34.8), (-20.8, 34.8)]),
     ]
     for k, (net, layer, prio, pts) in enumerate(ZONES):
-        prio = prio + (k if prio else 0)
         if net not in idx:
             continue
         A('  (zone (net %d) (net_name "%s") (layer "%s") (uuid "%s") (priority %d)'
