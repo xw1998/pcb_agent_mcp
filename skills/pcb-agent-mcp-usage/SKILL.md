@@ -1,6 +1,6 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——223 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——226 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
@@ -14,12 +14,12 @@ description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路—�
 
 ## 三件必须先知道的事
 
-1. **它注册了 191 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
+1. **它注册了 226 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
    这是故意的：把 301 KB 的工具清单塞进上下文会直接把对话撑爆。
    ⇒ 想用的工具不在清单里，就先 `tool_search`（按**任务**搜，支持中文任务名词，
    例如「阻抗」「回流」「铺铜」），再 `tool_call` 执行。**不要臆造工具名，也不要因为
    「清单里没有」就断言「这个服务做不到」。**
-2. **工具数与环境变量会变。** 本文写的 190 是 `0.0.111` 的数；任何判断以
+2. **工具数与环境变量会变。** 本文写的 226 是当前数；任何判断以
    `calc_capabilities` / `tools/list` 的当前返回为准。`PCB_AGENT_TOOLSET=all` 可广告全部。
 3. **它不替你设计。** 它给事实、给度量、给规则判定；摆哪里、走哪条，是人（或按
    `pcb-layout-methodology` 技能）决定的。`board_route` / `board_fanout` 已**退休**，
@@ -62,10 +62,24 @@ footprints、pads、tracks、vias、zones（含填充多边形）、Edge.Cuts、
 |---|---|---|
 | 新器件还能放哪 | `board_free_space` | 「板子有多密」 |
 | 每个焊盘能不能出线、每层拥挤度 | `board_routability` | 「哪条路最优」 |
+| **0.4 的电源线到底能不能出这个焊盘**（最宽能出去多少） | `board_routability` 加 `width_scan_mm=[0.6,0.5,0.4,0.3,0.25,0.15]` | 指出该在哪一段加宽 |
 | 某个焊盘/某点八向射线里谁挡路、能不能挪 | `board_blockers` | 全局布线可行性 |
+| **一条线切下去有几条通道、有几个网必须跨过去** | `board_cut_capacity` | 哪条网走哪条通道 |
+| **这附近有没有合法过孔、余量多少** | `board_via_sites` | 这个孔有没有用、该不该放 |
 
 判读要点：**「焊盘出不去」是摆放级硬阻断，任何路由器都修不了**；
 「需要 dogleg 才能出」对人没问题，对直线扇出就不行。
+
+三条最容易误读的读数：
+
+- **「焊盘出不去」和「线上没位置」是两件事。** `board_cut_capacity` 报的是通道数；
+  如果通道几百条而 `width_scan_mm` 报 0.3，堵点在焊盘逃逸宽度，不在线上。
+  反例留在 `docs/125`：12 个网穿排针行曾被解释成「通道不够」，实测差两个数量级。
+- **`board_via_sites` 的 `room_mm` 是「最紧那条约束的余量」**，`limited_by` 指名是哪条。
+  铺铜默认不挡（灌铜会绕开新孔重切），`inside_pours` 说明这个孔会咬掉哪块平面；
+  要严格口径用 `pours_block=true`。
+- **`board_routability` 不给线宽就是旧答案**：`width_scan_mm` 不传，`widest_escape`
+  这个字段根本不出现——不是返回 0。
 
 ### 阶段 3：定意图（在布任何线之前，把约束写成 JSON）
 `board_intent`：一个 version 1 的对象，含 `nets.route` / `nets.layers`，
