@@ -28,8 +28,11 @@ sys.path.insert(0, os.path.join('..', '..', 'src'))
 
 from pcb_agent_mcp import tools, geometry as G, oracle as _orc
 
-VIA_SIZE = 0.45
-VIA_DRILL = 0.25
+# Only sizes the project netclass accepts (via 0.45-0.25; board min drill 0.20,
+# min annular 0.10).  A 0.30-0.15 fallback used to sit here and DRC rejected it
+# three times (via_diameter / drill_out_of_range / annular_width) at one point;
+# an island too thin for 0.45 is now left to a hand stub instead.
+VIA_SIZES = [(0.45, 0.25)]
 RIM = 0.50            # want the hole at least this far inside the island
 
 VIA = ('\t(via\r\n\t\t(at %s %s)\r\n\t\t(size %s)\r\n\t\t(drill %s)\r\n'
@@ -96,6 +99,15 @@ def _rim(poly, p):
 
 
 def pick(board, poly):
+    for d, dr in VIA_SIZES:
+        s, why = _pick(board, poly, d, dr)
+        if s is not None:
+            s['size'] = d
+            s['drill'] = dr
+            return s, None
+    return None, why
+
+def _pick(board, poly, VIA_SIZE, VIA_DRILL):
     bb = G.bbox_of(poly)
     big = max(bb[2] - bb[0], bb[3] - bb[1]) >= 6
     step = 1.0 if big else 0.1
@@ -139,7 +151,7 @@ def main(src, dst):
     text = open(src, encoding='utf-8', newline='').read()
     blob = ''
     for k, (x, y, s, j, area) in enumerate(picks):
-        blob += VIA % ('%.3f' % x, '%.3f' % -y, VIA_SIZE, VIA_DRILL,
+        blob += VIA % ('%.3f' % x, '%.3f' % -y, s['size'], s['drill'],
                        uuid.UUID(int=0x6000 + k))
     at = text.rfind('\t(gr_rect')
     if at < 0:
@@ -152,8 +164,9 @@ def main(src, dst):
     for j, area, why in skipped:
         print('   skipped island %-2d area %6.2f mm2  %s' % (j, area, why))
     for x, y, s, j, area in picks:
-        print('   via (%8.3f, %9.3f)  island %-2d room %.3f touch %.3f  %s'
-              % (x, y, j, s['room_mm'], s['touch_mm'], s['limited_by']))
+        print('   via (%8.3f, %9.3f) %s/%s island %-2d room %.3f touch %.3f  %s'
+              % (x, y, s['size'], s['drill'], j, s['room_mm'], s['touch_mm'],
+                 s['limited_by']))
 
 
 if __name__ == '__main__':
