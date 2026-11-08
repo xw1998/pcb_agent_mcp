@@ -9,13 +9,15 @@ up through a via at (-3.00, 5.90) and finish with a short F.Cu spur into
 U1.21 from the south.  A dead-end spur cannot enclose pour, so no new +3V3
 island is created.
 
+The spur turns north at x=-4.00 at y=5.90 (NOT at y=6.35): the y=6.40 lane
+under the top pin row is reserved for AGND U1.20 -> TP4.1 (part 20).
+
 Measured free runs (0.15 track, clearance 0.225):
   B col x=-1.00 : -5.20..5.20   (full)
   B row y=5.10  : -3.70..-0.80
   B col x=-3.00 :  4.80..6.20
-  F col x=-3.00 :  5.80..6.52
-  F row y=6.35  : -4.20..-2.80
-  F col x=-4.00 :  5.30..9.00
+  F row y=5.90  : -4.20..-2.60
+  F col x=-4.00 :  5.70..7.70
 Via (-3.00,5.90): F 0.825 / B 0.868  (>= 0.45)
 """
 
@@ -27,9 +29,8 @@ SEGS = [
                                  (-1.200, 5.100), (-2.800, 5.100),
                                  (-3.000, 5.300), (-3.000, 5.900)]),
     # F.Cu: short spur into U1.21 from the south (never crosses VDDA)
-    ('$1I8749/$2N1188', 'F.Cu', [(-3.000, 5.900), (-3.000, 6.150),
-                                 (-3.200, 6.350), (-3.800, 6.350),
-                                 (-4.000, 6.550), (-4.000, 7.550)]),
+    ('$1I8749/$2N1188', 'F.Cu', [(-3.000, 5.900), (-3.800, 5.900),
+                                 (-4.000, 6.100), (-4.000, 7.550)]),
 ]
 
 VIAS = [
