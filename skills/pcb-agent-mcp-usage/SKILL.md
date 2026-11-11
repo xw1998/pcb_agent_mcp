@@ -1,6 +1,6 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——244 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——246 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
@@ -14,12 +14,12 @@ description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路—�
 
 ## 三件必须先知道的事
 
-1. **它注册了 244 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
+1. **它注册了 246 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
    这是故意的：把 301 KB 的工具清单塞进上下文会直接把对话撑爆。
    ⇒ 想用的工具不在清单里，就先 `tool_search`（按**任务**搜，支持中文任务名词，
    例如「阻抗」「回流」「铺铜」），再 `tool_call` 执行。**不要臆造工具名，也不要因为
    「清单里没有」就断言「这个服务做不到」。**
-2. **工具数与环境变量会变。** 本文写的 244 是当前数；任何判断以
+2. **工具数与环境变量会变。** 本文写的 246 是当前数；任何判断以
    `calc_capabilities` / `tools/list` 的当前返回为准。`PCB_AGENT_TOOLSET=all` 可广告全部。
 3. **它不替你设计。** 它给事实、给度量、给规则判定；摆哪里、走哪条，是人（或按
    `pcb-layout-methodology` 技能）决定的。`board_route` / `board_fanout` 已**退休**，
@@ -56,6 +56,8 @@ description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路—�
 | 走线的间距、直角/锐角、线对焊盘侵入 | `board_geometry_check` |
 | 某块区域还有没有合法落点 | `board_pad_obstacle_map` |
 | 这组配对能不能零交叉扇出（画之前判） | `board_fanout_order_check` |
+| 某段线还能加多宽（逐段，只读） | `board_width_ladder` | 按到异网铜/焊盘/过孔的真实距离逐段算 `max_width_mm`，输出 `set_track_width` 的 `uuids` 分组；**它不写**，写要走 propose/apply |
+| 某个孔还能放多大（逐孔，只读） | `board_via_ladder` | 逐孔算 `max_size_mm`/`max_drill_mm` 与 `bound_by`（异网铜 / 孔壁间距 / 焊盘），输出 `set_via_size` 分组；环宽 `size - drill >= 2*min_ann` 是硬约束，钻比尺寸先裁 |
 | 权威 DRC + 未连通项 | `board_drc` |
 
 **判据类工具只判不画。** 本服务**没有**自动布线/自动布局（`board_route`/`board_fanout`

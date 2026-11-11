@@ -1708,23 +1708,56 @@ op("delete_via", {"copper"},
     "allow_fixed": "bool: also move copper the file marks (locked)"},
    _run_delete_via, _verify_delete_via)
 
+def _track_nodes(ed):
+    """Every copper track on the board: `segment` AND `arc`.
+
+    KiCad 10 writes a curved track as `(arc (start) (mid) (end) (width) (layer)
+    (net) (uuid))`. It is the same copper, carries the same width attribute and
+    is selected by the same net - a width rule that only walks `segment` leaves
+    157 of this repository's example board's 862 tracks at the signal width and
+    says nothing about it. Both kinds are tracks; they are iterated together.
+    """
+    return ed.items("segment") + ed.items("arc")
+
+def _uuid_set(o):
+    """The `uuids` selector, or None when the call does not use it."""
+    raw = o.get("uuids")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise OpError("'uuids' must be a non-empty list of segment ids; an empty list "
+                      "matches nothing and an empty match is not an edit",
+                      "ARG_INVALID")
+    return {str(u) for u in raw}
+
 def _run_set_track_width(ed, o, seed):
     width = _num(o, "width", positive=True)
     net = o.get("net")
     layer = o.get("layer")
-    if not net and not layer:
-        raise OpError("set_track_width needs 'net' or 'layer' (or both) so it cannot "
+    uuids = _uuid_set(o)
+    if not net and not layer and not uuids:
+        raise OpError("set_track_width needs 'net' or 'layer' or 'uuids' so it cannot "
                       "accidentally retarget the whole board", "ARG_MISSING")
     code = ed.net_by_name.get(net) if net else None
     if net and code is None:
         raise OpError("net %r does not exist" % net, "NET_NOT_FOUND")
     matched = []
-    for node in ed.items("segment"):
+    for node in _track_nodes(ed):
+        if uuids is not None and ed.sp.id_of(node) not in uuids:
+            continue
         if code is not None and S.arg_text(S.child(node, "net"), 1) != code:
             continue
         if layer and S.arg_text(S.child(node, "layer"), 1) != layer:
             continue
         matched.append(node)
+    if uuids is not None:
+        found = {ed.sp.id_of(n) for n in matched}
+        missing = sorted(uuids - found)
+        if missing:
+            raise OpError("%d of %d requested segment id(s) are not on this board "
+                          "(net/layer filters do not explain it): %s"
+                          % (len(missing), len(uuids), ", ".join(missing[:6])),
+                          "SEGMENT_NOT_FOUND")
     _refuse_fixed(ed, "matching segment(s)", _fixed_nodes(matched),
                   len(matched), o)
     changed = 0
@@ -1742,10 +1775,13 @@ def _verify_set_track_width(ed, o):
     width = _num(o, "width")
     net = o.get("net")
     layer = o.get("layer")
+    uuids = _uuid_set(o)
     code = ed.net_by_name.get(net) if net else None
     bad = 0
     checked = 0
-    for node in ed.items("segment"):
+    for node in _track_nodes(ed):
+        if uuids is not None and ed.sp.id_of(node) not in uuids:
+            continue
         if code is not None and S.arg_text(S.child(node, "net"), 1) != code:
             continue
         if layer and S.arg_text(S.child(node, "layer"), 1) != layer:
@@ -1757,9 +1793,12 @@ def _verify_set_track_width(ed, o):
     return {"ok": bad == 0 and checked > 0, "checked": checked, "wrong_width": bad}
 
 op("set_track_width", {"copper"},
-   "Set the width of every track of one net and/or one layer. Refuses a bare call "
-   "with neither filter.",
+   "Set the width of the tracks matched by net, layer and/or a list of segment "
+   "ids. Refuses a bare call with none of the three filters, and refuses ids that "
+   "are not on the board - a width applied to nothing is not an edit.",
    {"width": "mm > 0", "net": "net name", "layer": "copper layer",
+    "uuids": "[segment id, ...] - one width per segment is how a net is widened "
+             "as far as its neighbours allow",
     "allow_fixed": "bool: also resize copper the file marks (locked)"},
    _run_set_track_width, _verify_set_track_width)
 
@@ -1796,6 +1835,84 @@ op("add_via", {"copper"},
    {"x": "mm", "y": "mm", "size": "mm", "drill": "mm", "net": "net name",
     "layers": "[layer, layer]"},
    _run_add_via, _verify_add_via)
+
+def _run_set_via_size(ed, o, seed):
+    size = _num(o, "size", required=False)
+    drill = _num(o, "drill", required=False)
+    net = o.get("net")
+    uuids = _uuid_set(o)
+    if size is None and drill is None:
+        raise OpError("set_via_size needs 'size' and/or 'drill'; naming neither "
+                      "changes nothing", "ARG_MISSING")
+    if not net and not uuids:
+        raise OpError("set_via_size needs 'net' or 'uuids' so it cannot retarget "
+                      "every via on the board", "ARG_MISSING")
+    code = ed.net_by_name.get(net) if net else None
+    if net and code is None:
+        raise OpError("net %r does not exist" % net, "NET_NOT_FOUND")
+    matched = []
+    for node in ed.items("via"):
+        if uuids is not None and ed.sp.id_of(node) not in uuids:
+            continue
+        if code is not None and S.arg_text(S.child(node, "net"), 1) != code:
+            continue
+        matched.append(node)
+    if not matched:
+        raise OpError("no via matched the selector", "NOTHING_MATCHED")
+    _refuse_fixed(ed, "matching via(s)", _fixed_nodes(matched), len(matched), o)
+    for node in matched:
+        cur_size = S.arg_num(S.child(node, "size"), 1)
+        cur_drill = S.arg_num(S.child(node, "drill"), 1)
+        new_size = size if size is not None else cur_size
+        new_drill = drill if drill is not None else cur_drill
+        if new_size is None or new_drill is None:
+            raise OpError("via %r carries no size/drill to keep; name both"
+                          % ed.sp.id_of(node), "ARG_MISSING")
+        if new_drill >= new_size:
+            raise OpError("drill (%r) must stay smaller than the pad (%r) or the "
+                          "via has no copper left" % (new_drill, new_size),
+                          "ARG_INVALID")
+        for key, val in (("size", new_size), ("drill", new_drill)):
+            child = S.child(node, key)
+            for i, item in enumerate(node.items):
+                if item is child:
+                    node.items[i] = B.L(B.A(key), B.A(B.num(val)))
+                    break
+    return {"vias_changed": len(matched), "size": size, "drill": drill}
+
+def _verify_set_via_size(ed, o):
+    size = _num(o, "size", required=False)
+    drill = _num(o, "drill", required=False)
+    net = o.get("net")
+    uuids = _uuid_set(o)
+    code = ed.net_by_name.get(net) if net else None
+    bad = 0
+    checked = 0
+    for node in ed.items("via"):
+        if uuids is not None and ed.sp.id_of(node) not in uuids:
+            continue
+        if code is not None and S.arg_text(S.child(node, "net"), 1) != code:
+            continue
+        checked += 1
+        if size is not None:
+            w = S.arg_num(S.child(node, "size"), 1)
+            if w is None or abs(w - size) > 1e-6:
+                bad += 1
+                continue
+        if drill is not None:
+            d = S.arg_num(S.child(node, "drill"), 1)
+            if d is None or abs(d - drill) > 1e-6:
+                bad += 1
+    return {"ok": bad == 0 and checked > 0, "checked": checked, "wrong_size": bad}
+
+op("set_via_size", {"copper"},
+   "Set a via family: the pad diameter and/or the drill, for one net or a list "
+   "of via ids. Refuses a drill that is not smaller than the pad, and refuses a "
+   "call that names neither size nor drill.",
+   {"size": "mm - pad diameter", "drill": "mm - finished hole",
+    "net": "net name", "uuids": "[via id, ...]",
+    "allow_fixed": "bool: also resize copper the file marks (locked)"},
+   _run_set_via_size, _verify_set_via_size)
 
 # --- zones ------------------------------------------------------------
 def _zone_points(o):

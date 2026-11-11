@@ -1,4 +1,4 @@
-# 工具全表（0.0.125 实测 205 个；下表「规则与基线」为 0.0.134 追加）
+# 工具全表（下表按加入的版本分批；总数以 `server.py` 的断言为准，0.0.135 是 246 个）
 
 用途：查名字。语义以 `tool_search` / `tools/list` 的当前返回为准，本表只给一句话索引。
 
@@ -328,8 +328,10 @@
 - `ac_self_heating` — Temperature of a conductor carrying AC current, solved self-consistently - the loop electrothermal_trace and e
 - `fullwave_solver` — Is a full-wave electromagnetic solver installed on this machine, which version, and what does the handoff look
 
-## 规则与基线（3，0.0.134）
+## 规则与基线（5，0.0.135）
 
 - `pcb_rule_catalog` — The whole rule set: 22 catalogue rules, 29 fab limits (each with a verbatim quote from a published source), 20 SMT rules, each with its priority P0-P4 and what it grades.
 - `board_rule_audit` — Can this board be built, in priority order: P0 manufacturability (vendor limits, needs a declared process), P1 electrical integrity, P2 assembly, P3 signal quality, P4 looks. Blocking only at P0/P1/P2; below that everything is flagged, and anything unmeasurable stays `undetermined` instead of being scored.
 - `board_design_baseline` — What finished boards look like, as numbers: p10/p50/p90 of track width, spacing, via, drill, collar, copper-to-edge and board size over the demo corpus, plus where this board sits (below/inside/above). Blocks nothing and passes nothing; `only_buildable` keeps only boards that pass P0 under their own layer count.
+- `board_width_ladder` — Per-segment room: the widest this track can be before it violates the 0.2 mm gate on the board it is on, one neighbour per layer, reported with `bound_by`. Read only, it writes nothing; the `uuids` selector of `set_track_width` is what turns it into a write.
+- `board_via_ladder` — Per-via room: the largest diameter and drill each via can take, from copper-to-neighbour plus hole-to-hole plus the annular rule. The drill is clipped first against the size that survived, and a via never shrinks.

@@ -2857,6 +2857,103 @@ def _house_style_with_rules(board, args):
                         "clearance the wider copper needs")
     return out
 
+def _width_ladder(board, args):
+    """Per segment width targets, capped by what the neighbours allow.
+
+    A net-level width rule cannot be applied to a board whose real segments sit
+    in fan-outs of different pitch: the net either all fits or all does not. The
+    measured case is this repository's own sky_star board - 61 power segments
+    between 0.15 and 0.60, and a whole-net widening produced 5 new sub-0.2 mm
+    pairs and was refused by the state gate. Doing it per segment keeps the
+    widening the board can take and names the ones it cannot.
+    """
+    from . import house_style as _hs
+
+    targets = args.get("targets")
+    if not isinstance(targets, list) or not targets:
+        return err("targets must be a non-empty list of {net, width_mm}",
+                   "ARG_MISSING",
+                   hint='e.g. targets=[{"net": "+5V", "width_mm": 0.5}]')
+    nets = {}
+    for t in targets:
+        if not isinstance(t, dict) or not t.get("net"):
+            return err("every target needs a 'net' name", "ARG_INVALID")
+        width = t.get("width_mm")
+        if width is None:
+            return err("target for net %r has no width_mm" % t.get("net"),
+                       "ARG_INVALID")
+        if float(width) <= 0:
+            return err("width for net %r must be > 0" % t.get("net"), "ARG_INVALID")
+        nets[str(t["net"])] = float(width)
+    width_by_net = {t.get("net"): float(t.get("width") or t.get("width_mm"))
+                    for t in getattr(board, "tracks", []) or []
+                    if t.get("net") and (t.get("width") or t.get("width_mm"))}
+    missing = sorted(n for n in nets if n not in width_by_net)
+    if missing:
+        return err("no track on net(s) %s" % ", ".join(missing), "NO_GEOMETRY",
+                   hint="nets with tracks: %s" % ", ".join(sorted(width_by_net)[:12]),
+                   extra={"nets_missing": missing})
+    room = _hs.segment_room(board, clearance_mm=args.get("clearance_mm"),
+                            planned_widths=nets)
+    by_uuid = room["by_uuid"]
+    planned, rows, skipped_locked = {}, [], 0
+    for uid, row in by_uuid.items():
+        if row["net"] not in nets:
+            continue
+        asked = nets[row["net"]]
+        current = float(row["current_mm"])
+        if asked <= current + 1e-9:
+            continue
+        allowed = row["max_width_mm"]
+        final = asked if allowed is None else min(asked, float(allowed))
+        if final <= current + 1e-9:
+            skipped_locked += 1
+            continue
+        planned[uid] = round(final, 4)
+        rows.append({"uuid": uid, "net": row["net"], "layer": row["layer"],
+                     "current_mm": round(current, 4),
+                     "allowed_mm": allowed,
+                     "planned_mm": round(final, 4),
+                     "capped": final < asked - 1e-9,
+                     "bound_by": row["bound_by"]})
+    groups = {}
+    for uid, w in planned.items():
+        groups.setdefault(w, []).append(uid)
+    operations = [{"op": "set_track_width", "uuids": sorted(uids), "width": w}
+                  for w, uids in sorted(groups.items(), key=lambda kv: -len(kv[1]))]
+    per_net = {}
+    for r in rows:
+        e = per_net.setdefault(r["net"], {"asked_mm": nets[r["net"]], "segments": 0,
+                                          "capped": 0, "min_planned_mm": None,
+                                          "max_planned_mm": None})
+        e["segments"] += 1
+        e["capped"] += 1 if r["capped"] else 0
+        e["min_planned_mm"] = r["planned_mm"] if e["min_planned_mm"] is None \
+            else min(e["min_planned_mm"], r["planned_mm"])
+        e["max_planned_mm"] = r["planned_mm"] if e["max_planned_mm"] is None \
+            else max(e["max_planned_mm"], r["planned_mm"])
+    for net in sorted(nets):
+        per_net.setdefault(net, {"asked_mm": nets[net], "segments": 0, "capped": 0,
+                                 "min_planned_mm": None, "max_planned_mm": None})
+    blocked = [n for n, e in per_net.items() if e["segments"] == 0]
+    return ok({"clearance_mm": room["clearance_mm"],
+               "nets": [dict(net=n, **per_net[n]) for n in sorted(per_net)],
+               "rows": rows,
+               "operations": operations,
+               "segments_left_alone": skipped_locked,
+               "nets_that_could_not_take_any_mm": blocked,
+               "caveat": room["caveat"]},
+              "each segment gets the width its own neighbours allow, grouped into "
+              "set_track_width calls by resulting width",
+              model="per-segment clearance bound (house_style.segment_room), the "
+                    "same geometry clearance_room uses",
+              basis="segment-to-segment, segment-to-pad-box and segment-to-via "
+                    "distances on the same layer",
+              precision="widths to 1e-4 mm, grouped at 1e-4",
+              assumptions={"routes_nothing": True, "writes_nothing": True,
+                           "applies_nothing": True},
+              extra={"routes_nothing": True, "writes_nothing": True})
+
 def _routing_violations(board, args):
     from . import routing_profile as _rp
     limits = {}
@@ -2939,6 +3036,197 @@ _tool(
      }, **_COMMON),
      "required": ["path"]},
     _board_tool(lambda b, a: _house_style_with_rules(b, a), derived=True),
+)
+
+_tool(
+    "board_width_ladder",
+    "A width rule for a net is not one number on a real board: the sky_star power "
+    "nets run 61 segments from 0.15 to 0.60 mm, and eleven of them sit in a 0.5 mm "
+    "fan-out that cannot take 0.50 mm while the other fifty can. Applying the rule "
+    "net-wide either widens the fan-out into a DRC violation or refuses the whole "
+    "rail. This answers PER SEGMENT: how wide each one could get before the nearest "
+    "different-net copper on its own layer goes below the clearance, then the width "
+    "to actually use, grouped into `set_track_width` calls ready for board_propose. "
+    "Naming a width above what fits is not an error - the row says `capped` and "
+    "`bound_by` names the pad, via or track that stopped it. Routes nothing, writes "
+    "nothing.",
+    {"type": "object",
+     "properties": dict({
+         "targets": _arr("one {net, width_mm} per net, e.g. "
+                         '[{"net": "+5V", "width_mm": 0.5}]'),
+         "clearance_mm": _num("edge-to-edge clearance to keep (default: the board's "
+                              "own rule, else 0.15)", None),
+     }, **_COMMON),
+     "required": ["path", "targets"]},
+    _board_tool(lambda b, a: _width_ladder(b, a), derived=True),
+)
+
+def _via_ladder(board, args):
+    """Per via size targets, capped by the neighbours the board actually has.
+
+    The same argument as :func:`_width_ladder`, on the other half of the copper.
+    sky_star has 201 vias all at 0.45/0.25 while the per-via ceiling measures
+    0.45 to 1.90; eight of them are pinned at 0.45 by a 0.60 mm fan-out whose
+    copper gap is already exactly the clearance. So the rule is applied per via
+    and the ones that cannot grow are named with the neighbour that stopped them.
+    """
+    from . import house_style as _hs
+
+    targets = args.get("targets")
+    if not isinstance(targets, list) or not targets:
+        return err("targets must be a non-empty list of {net, size_mm, drill_mm}; "
+                   "use net '*' for every net", "ARG_MISSING",
+                   hint='e.g. targets=[{"net": "*", "size_mm": 0.5, '
+                        '"drill_mm": 0.3}]')
+    asked = {}
+    for t in targets:
+        if not isinstance(t, dict) or not t.get("net"):
+            return err("every target needs a net name ('*' for all)", "ARG_INVALID")
+        size = t.get("size_mm")
+        drill = t.get("drill_mm")
+        if size is None or drill is None:
+            return err("target %r needs both size_mm and drill_mm" % t.get("net"),
+                       "ARG_INVALID")
+        size, drill = float(size), float(drill)
+        if size <= 0 or drill <= 0:
+            return err("size and drill must both be > 0", "ARG_INVALID")
+        if drill >= size:
+            return err("target %r asks for drill %g >= size %g: a via with no "
+                       "annular ring is a hole" % (t.get("net"), drill, size),
+                       "ARG_INVALID")
+        asked[str(t["net"])] = (size, drill)
+    if "*" not in asked and not asked:
+        return err("no target given", "ARG_MISSING")
+
+    room = _hs.via_room(board, clearance_mm=args.get("clearance_mm"))
+    min_ann = float(room.get("min_via_annular_width_mm") or 0.0)
+    by_uuid = room["by_uuid"]
+    vias_with_net = {v.get("net") for v in (getattr(board, "vias", None) or [])}
+    named = sorted(n for n in asked if n != "*" and n not in vias_with_net)
+    if named:
+        return err("no via on net(s) %s" % ", ".join(named), "NO_GEOMETRY",
+                   hint="nets with vias: %s" % ", ".join(sorted(vias_with_net)[:12]),
+                   extra={"nets_missing": named})
+
+    rows, planned, untouched = [], {}, 0
+    for uid, row in by_uuid.items():
+        net = row.get("net")
+        want = asked.get(net) or asked.get("*")
+        if want is None:
+            continue
+        want_size, want_drill = want
+        size_cap = row.get("max_size_mm")
+        hole_cap = row.get("max_drill_mm")
+        # equality counts as clipped: a ceiling of exactly 0.5000 leaves the
+        # measured pair at exactly 0.2000 mm, which the gate reads as a new
+        # violation in floating point. Measured on sky_star: one such via.
+        capped_size = size_cap is not None and want_size >= float(size_cap) - 1e-9
+        final_size = float(size_cap) if capped_size else want_size
+        final_drill = want_drill if hole_cap is None else min(want_drill, float(hole_cap))
+        capped_drill = hole_cap is not None and want_drill >= float(hole_cap) - 1e-9
+        # the annular rule couples the two: (size - drill)/2 >= min_annular
+        # Floor, not round: a ceiling that comes out at 0.4999 and is rounded to
+        # 0.5000 lands the pair it was measured against at 0.1999 mm, which the
+        # clearance gate then reads as a NEW sub-0.2 mm pair. Measured on
+        # sky_star: 68 -> 69 pairs from exactly one via two ten-thousandths over.
+        # The 1e-6 is not noise: a ceiling that comes out at exactly 0.4900 leaves
+        # the pair it was measured against at exactly 0.2000 mm, and the clearance
+        # gate compares with a bare `<` in floating point. Measured on sky_star:
+        # 68 -> 69 pairs from one pair sitting on the boundary. Dropping one 0.01
+        # step when the ceiling lands ON a step is cheaper than arguing with it.
+        def _floor(x, ask, clipped):
+            """A ceiling is clipped down one 0.01 step; the ask itself is kept."""
+            if not clipped:
+                return round(ask, 4)
+            return math.floor(x * 100.0 - 1e-6) / 100.0
+        # the size is clipped FIRST, because the annular room is a function of
+        # the size that will actually be written: 0.49 / 0.30 leaves a 0.095 mm
+        # ring and DRC refuses it (measured: annular_width at (156.09, 92.53)).
+        final_size = _floor(final_size, want_size, capped_size)
+        ann_room = final_size - 2.0 * min_ann
+        # the annular rule is `>=`, so landing exactly on it is legal and is
+        # not clipped: 0.50 / 0.30 is a standard via, 0.50 / 0.29 is an oddity.
+        capped_drill = capped_drill or final_drill > ann_room + 1e-9
+        final_drill = _floor(min(final_drill, ann_room), want_drill, capped_drill)
+        if final_size <= 0 or final_drill <= 0:
+            untouched += 1
+            continue
+        if (final_size <= float(row["current_size_mm"]) + 1e-9
+                and final_drill <= float(row["current_drill_mm"]) + 1e-9):
+            untouched += 1
+            continue
+        planned[uid] = (final_size, final_drill)
+        rows.append({"uuid": uid, "net": net, "at": row.get("at"),
+                     "current_size_mm": row["current_size_mm"],
+                     "current_drill_mm": row["current_drill_mm"],
+                     "asked_size_mm": want_size, "asked_drill_mm": want_drill,
+                     "planned_size_mm": final_size,
+                     "planned_drill_mm": final_drill,
+                     "capped_size": final_size < want_size - 1e-9,
+                     "capped_drill": final_drill < want_drill - 1e-9,
+                     "bound_by": row.get("bound_by"),
+                     "drill_bound_by": row.get("drill_bound_by")})
+    groups = {}
+    for uid, pair in planned.items():
+        groups.setdefault(pair, []).append(uid)
+    operations = [{"op": "set_via_size", "uuids": sorted(uids),
+                   "size": pair[0], "drill": pair[1]}
+                  for pair, uids in sorted(groups.items(), key=lambda kv: -len(kv[1]))]
+    per_net = {}
+    for r in rows:
+        e = per_net.setdefault(r["net"], {"vias": 0, "capped": 0,
+                                          "min_planned_size_mm": None,
+                                          "max_planned_size_mm": None})
+        e["vias"] += 1
+        e["capped"] += 1 if (r["capped_size"] or r["capped_drill"]) else 0
+        e["min_planned_size_mm"] = r["planned_size_mm"] if e["min_planned_size_mm"] is None \
+            else min(e["min_planned_size_mm"], r["planned_size_mm"])
+        e["max_planned_size_mm"] = r["planned_size_mm"] if e["max_planned_size_mm"] is None \
+            else max(e["max_planned_size_mm"], r["planned_size_mm"])
+    pinned = [r for r in rows if r["capped_size"]]
+    return ok({"clearance_mm": room["clearance_mm"],
+               "min_via_annular_width_mm": min_ann,
+               "min_hole_to_hole_mm": room.get("min_hole_to_hole_mm"),
+               "nets": [dict(net=n, **per_net[n]) for n in sorted(per_net)],
+               "rows": rows,
+               "operations": operations,
+               "vias_planned": len(planned),
+               "vias_left_alone": untouched,
+               "vias_pinned_by_a_neighbour": len(pinned),
+               "nets_that_could_not_take_any_mm": sorted(
+                   n for n in asked if n != "*" and n not in per_net),
+               "caveat": room["caveat"]},
+              "each via gets the size its own neighbours allow, grouped into "
+              "set_via_size calls by resulting (size, drill)",
+              model="per-via copper and hole-to-hole bound (house_style.via_room), "
+                    "with the annular rule applied last",
+              basis="via-to-via copper, via-to-via hole-to-hole, via-to-track and "
+                    "via-to-pad; zones are left to the filler",
+              precision="sizes and drills to 1e-4 mm, grouped at 1e-4",
+              assumptions={"routes_nothing": True, "writes_nothing": True,
+                           "applies_nothing": True},
+              extra={"routes_nothing": True, "writes_nothing": True})
+
+_tool(
+    "board_via_ladder",
+    "A via size is not one number on a real board either. sky_star has 201 vias at "
+    "0.45/0.25 while the per-via ceiling measures 0.45 to 1.90: eight of them sit in "
+    "a 0.60 mm fan-out whose copper gap at 0.45 mm is already exactly the clearance, "
+    "and one is 0.10 mm from pad U1.28. Asking for 0.50/0.30 net-wide would either "
+    "be refused or, worse, be written and shipped. This answers PER VIA how large "
+    "each one could get, then the size actually to use, grouped into `set_via_size` "
+    "calls ready for board_propose. The annular rule is applied last because it "
+    "couples the two numbers: (size - drill)/2 >= min_via_annular_width. A capped "
+    "row names the pad, via or track that stopped it. Routes nothing, writes nothing.",
+    {"type": "object",
+     "properties": dict({
+         "targets": _arr("one {net, size_mm, drill_mm} per net; net '*' for all, "
+                         'e.g. [{"net": "*", "size_mm": 0.5, "drill_mm": 0.3}]'),
+         "clearance_mm": _num("edge-to-edge clearance to keep (default: the board's "
+                              "own rule, else 0.15)", None),
+     }, **_COMMON),
+     "required": ["path", "targets"]},
+    _board_tool(lambda b, a: _via_ladder(b, a), derived=True),
 )
 
 _tool(

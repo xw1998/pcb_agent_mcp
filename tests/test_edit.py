@@ -175,8 +175,10 @@ class TestChecks(EditTestBase):
 
 class TestSlotAndHoles(EditTestBase):
     def test_slot_is_two_lines_and_two_arcs_with_the_right_chord(self):
+        # a slot IS an edge change, so the gate has to be told that on purpose
         prop = E.propose(self.board, [{"op": "add_slot", "x1": 8, "y1": 14,
-                                       "x2": 26, "y2": 14, "slot_width": 3.2}])
+                                       "x2": 26, "y2": 14, "slot_width": 3.2}],
+                         options={"allow_edge_changes": True})
         self.assertFalse(prop["blocking"])
         doc = K.KiCadDocument.from_text(P.PLANS[prop["plan_id"]]["new_text"],
                                         self.board)

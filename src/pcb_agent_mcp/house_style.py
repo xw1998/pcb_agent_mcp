@@ -263,6 +263,315 @@ def clearance_room(board, clearance_mm=None, rows=None, planned_widths=None):
                        "neighbour on one layer, no drill-to-drill, no board edge, "
                        "pads read as their axis-aligned box")}
 
+def segment_room(board, clearance_mm=None, rows=None, planned_widths=None):
+    """Per SEGMENT version of :func:`clearance_room`: how wide each one could get.
+
+    A net is not one copper object. The F412 core board's +3V3 runs 65 segments;
+    eleven of them sit in a 0.5 mm-pitch fan-out and cannot take 0.50 mm, while the
+    other fifty-four can. Answering at the net level therefore loses the widening
+    that IS possible: the net gets blocked as a whole and the rail stays at the
+    signal width. This answers per segment so the rule can be applied to the copper
+    that can take it.
+
+    Same geometry, same bound, same caveat as :func:`clearance_room` - it is the
+    first neighbour on one layer, it does not model drill-to-drill or the board
+    edge, and pads are read as their axis-aligned box. Nothing here routes.
+    """
+    from . import routing_profile as rp
+
+    rows = rows if rows is not None else rp._segment_table(board)
+    rules = getattr(board, "rules", None) or {}
+    if clearance_mm is None:
+        clearance_mm = ((rules.get("clearance") or {}).get("min_clearance")
+                        or rules.get("min_clearance") or 0.15)
+    clearance_mm = float(clearance_mm)
+    planned = {k: float(v) for k, v in (planned_widths or {}).items()}
+
+    widths = {}
+    for row in rows:
+        if row.get("width_mm") is not None:
+            widths.setdefault(row["net"], float(row["width_mm"]))
+
+    def keep(i, allowed, binding):
+        best = limits.get(i)
+        if best is None or allowed < best[0]:
+            limits[i] = (allowed, binding)
+
+    limits = {}
+    # --- segment against segment, both directions -------------------------
+    for i, row in enumerate(rows):
+        if row.get("width_mm") is None:
+            continue
+        for j, other in enumerate(rows):
+            if j <= i or other["net"] == row["net"] or other["layer"] != row["layer"]:
+                continue
+            if other.get("width_mm") is None:
+                continue
+            distance = _segment_distance(row["start"], row["end"],
+                                         other["start"], other["end"])
+            if distance > 3.0:
+                continue
+            if row["net"] in planned and other["net"] in planned:
+                allowed = distance - clearance_mm
+            else:
+                other_w = planned.get(other["net"], widths.get(other["net"], 0.0))
+                allowed = 2.0 * (distance - clearance_mm) - other_w
+            keep(i, allowed, ("track", other["net"], distance))
+            # the neighbour may grow too; its own bound is its own to work out
+            if other["net"] in planned:
+                row_w = planned.get(row["net"], widths.get(row["net"], 0.0))
+                keep(j, 2.0 * (distance - clearance_mm) - row_w,
+                     ("track", row["net"], distance))
+    # --- segment against pads and vias ------------------------------------
+    for fp in getattr(board, "footprints", []) or []:
+        for pad in fp.get("pads") or []:
+            if pad.get("net") is None or pad.get("x") is None:
+                continue
+            layers = [l for l in (pad.get("layers") or []) if l.endswith(".Cu")]
+            hw = float(pad.get("w") or 0.0) / 2.0
+            hh = float(pad.get("h") or 0.0) / 2.0
+            deg = pad.get("rotation")
+            if deg is None:
+                deg = fp.get("rotation") or 0.0
+            tag = "%s.%s" % (fp.get("ref"), pad.get("number"))
+            for i, row in enumerate(rows):
+                if row["net"] == pad["net"] or row.get("width_mm") is None:
+                    continue
+                if layers and row["layer"] not in layers and "*.Cu" not in layers:
+                    continue
+                distance = _segment_obox_distance(row["start"], row["end"],
+                                                  float(pad["x"]), float(pad["y"]),
+                                                  hw, hh, deg)
+                if distance > 2.0:
+                    continue
+                keep(i, 2.0 * (distance - clearance_mm), ("pad", tag, distance))
+    for via in getattr(board, "vias", []) or []:
+        if via.get("net") is None or via.get("x") is None:
+            continue
+        radius = float(via.get("diameter") or 0.0) / 2.0
+        layers = via.get("layers") or ["F.Cu", "B.Cu"]
+        for i, row in enumerate(rows):
+            if row["net"] == via["net"] or row.get("width_mm") is None:
+                continue
+            if layers and row["layer"] not in layers and "*.Cu" not in layers:
+                continue
+            distance = (_point_segment_distance((float(via["x"]), float(via["y"])),
+                                                row["start"], row["end"]) ** 0.5
+                        - radius)
+            if distance > 1.5:
+                continue
+            keep(i, 2.0 * (distance - clearance_mm),
+                 ("via", "%s at (%.2f, %.2f)" % (via.get("net"), float(via["x"]),
+                                                float(via["y"])), distance))
+
+    out = {}
+    for i, row in enumerate(rows):
+        if row.get("width_mm") is None or not row.get("uuid"):
+            continue
+        current = float(row["width_mm"])
+        if i in limits:
+            allowed, binding = limits[i]
+            out[row["uuid"]] = {
+                "net": row["net"], "layer": row["layer"], "current_mm": current,
+                "max_width_mm": max(current, round(allowed, 4)),
+                "bound_by": {"kind": binding[0], "neighbour": binding[1],
+                             "centre_distance_mm": round(binding[2], 4),
+                             "allows_mm": round(allowed, 4)},
+            }
+        else:
+            out[row["uuid"]] = {"net": row["net"], "layer": row["layer"],
+                                "current_mm": current, "max_width_mm": None,
+                                "bound_by": None}
+    return {"clearance_mm": clearance_mm,
+            "segments": len(out),
+            "by_uuid": out,
+            "method": ("identical distances to clearance_room, kept per segment "
+                       "instead of collapsed per net"),
+            "caveat": ("a lower bound on what fits: first neighbour on one layer, "
+                       "no drill-to-drill, no board edge, pads as axis-aligned boxes")}
+
+def _track_points(track):
+    """A track's copper centreline as a polyline.
+
+    KiCad 10 writes a rounded corner or a tuned bump as `(arc)`, and 862 of the
+    sky_star board's copper objects are 157 arcs. Read as the chord (start to end
+    only) an arc's distance to a neighbour is wrong in both directions, so the
+    per-it geometry below walks the sampled points the adapter already keeps.
+    """
+    pts = track.get("_points")
+    if pts and len(pts) >= 2:
+        return [(float(p[0]), float(p[1])) for p in pts]
+    return [(float(track["start"][0]), float(track["start"][1])),
+            (float(track["end"][0]), float(track["end"][1]))]
+
+def _clearance_of(board, net):
+    """The clearance the project itself assigns to this net, else the board floor."""
+    rules = getattr(board, "rules", None) or {}
+    classes = rules.get("net_classes") or {}
+    assign = rules.get("netclass_assignments") or {}
+    for name in assign.get(net) or []:
+        value = (classes.get(name) or {}).get("clearance")
+        if value is not None:
+            return float(value)
+    return float((rules.get("clearance") or {}).get("min_clearance") or 0.15)
+
+def via_room(board, clearance_mm=None):
+    """Per VIA version of :func:`segment_room`: how large each one could get.
+
+    Why it is not a single board-wide number: this repository's own sky_star
+    board has 201 vias, all 0.45/0.25. Eight of them sit in a 0.60 mm fan-out
+    where the copper gap at 0.45 mm is already exactly the 0.15 mm the project
+    asks for, so 0.50 mm is not available there while it is everywhere else.
+    A board-wide "vias are 0.60" rule would either be refused by DRC or, worse,
+    written and shipped. The annular rule couples the two numbers - KiCad asks
+    `(size - drill) / 2 >= min_via_annular_width`, so a larger drill needs a
+    larger size - while the hole-to-hole rule caps the drill on its own and
+    does not care about nets at all.
+
+    Nothing here writes; it answers "how big could this one be and what
+    stopped it". Zones are deliberately not a constraint: the filler rebuilds
+    them around foreign copper, which is why widening a track only collides
+    with a pour until `--refill-zones` runs.
+    """
+    rules = getattr(board, "rules", None) or {}
+    via_rules = rules.get("via") or {}
+    if clearance_mm is None:
+        clearance_mm = (rules.get("clearance") or {}).get("min_clearance") or 0.15
+    clearance_mm = float(clearance_mm)
+    min_annular = float(via_rules.get("min_via_annular_width") or 0.0)
+    min_hole_gap = float(via_rules.get("min_hole_to_hole") or 0.0)
+    min_size = float(via_rules.get("min_via_diameter") or 0.0)
+
+    vias = [v for v in (getattr(board, "vias", None) or [])
+            if v.get("x") is not None and v.get("diameter")]
+    size_limits, drill_limits = {}, {}
+
+    def keep(table, v, allowed, binding):
+        best = table.get(id(v))
+        if best is None or allowed < best[0]:
+            table[id(v)] = (allowed, binding)
+
+    def label(other):
+        return ("%s at (%.2f, %.2f)" % (other.get("net"), float(other["x"]),
+                                        float(other["y"])))
+
+    # --- via against via: copper gap, and hole-to-hole (net-independent) ---
+    for i, a in enumerate(vias):
+        for b in vias[i + 1:]:
+            d = math.hypot(float(a["x"]) - float(b["x"]),
+                           float(a["y"]) - float(b["y"]))
+            if d > 3.0:
+                continue
+            if a.get("net") != b.get("net"):
+                clearance = max(clearance_mm, _clearance_of(board, a.get("net")),
+                                _clearance_of(board, b.get("net")))
+                for me, other in ((a, b), (b, a)):
+                    allowed = 2.0 * (d - float(other["diameter"]) / 2.0 - clearance)
+                    keep(size_limits, me, allowed,
+                         ("via", label(other), round(d, 4)))
+            for me, other in ((a, b), (b, a)):
+                allowed = 2.0 * (d - float(other["drill"]) / 2.0 - min_hole_gap)
+                keep(drill_limits, me, allowed,
+                     ("via_hole", label(other), round(d, 4)))
+
+    # --- via against foreign tracks ---------------------------------------
+    for v in vias:
+        net = v.get("net")
+        layers = v.get("layers") or ["F.Cu", "B.Cu"]
+        for t in getattr(board, "tracks", None) or []:
+            if t.get("net") == net or t.get("layer") not in layers:
+                continue
+            pts = _track_points(t)
+            d = min(_point_segment_distance((float(v["x"]), float(v["y"]),),
+                                            p, q) ** 0.5
+                    for p, q in zip(pts, pts[1:]))
+            if d > 3.0:
+                continue
+            clearance = max(clearance_mm, _clearance_of(board, net),
+                            _clearance_of(board, t.get("net")))
+            allowed = 2.0 * (d - float(t.get("width") or 0.0) / 2.0 - clearance)
+            keep(size_limits, v, allowed,
+                 ("track", t.get("net"),
+                  round(d - float(t.get("width") or 0.0) / 2.0, 4)))
+
+    # --- via against foreign pads -----------------------------------------
+    for fp in getattr(board, "footprints", None) or []:
+        for pad in fp.get("pads") or []:
+            if pad.get("net") is None or pad.get("x") is None:
+                continue
+            layers = [l for l in (pad.get("layers") or []) if l.endswith(".Cu")]
+            hw = float(pad.get("w") or 0.0) / 2.0
+            hh = float(pad.get("h") or 0.0) / 2.0
+            deg = pad.get("rotation")
+            if deg is None:
+                deg = fp.get("rotation") or 0.0
+            tag = "%s.%s" % (fp.get("ref"), pad.get("number"))
+            for v in vias:
+                if v.get("net") == pad.get("net"):
+                    continue
+                vlayers = v.get("layers") or ["F.Cu", "B.Cu"]
+                if layers and not set(layers) & set(vlayers) and "*.Cu" not in layers:
+                    continue
+                here = (float(v["x"]), float(v["y"]))
+                d = _segment_obox_distance(here, here, float(pad["x"]),
+                                           float(pad["y"]), hw, hh, deg)
+                if d > 3.0:
+                    continue
+                clearance = max(clearance_mm, _clearance_of(board, v.get("net")),
+                                _clearance_of(board, pad.get("net")))
+                keep(size_limits, v, 2.0 * (d - clearance),
+                     ("pad", tag, round(d, 4)))
+                if pad.get("hole_mm"):
+                    centre = math.hypot(float(v["x"]) - float(pad["x"]),
+                                        float(v["y"]) - float(pad["y"]))
+                    allowed = 2.0 * (centre - float(pad["hole_mm"]) / 2.0
+                                     - min_hole_gap)
+                    if allowed < float(v["drill"]):
+                        keep(drill_limits, v, allowed,
+                             ("pad_hole", tag,
+                              round(centre - float(pad["hole_mm"]) / 2.0, 4)))
+
+    out = {}
+    for idx, v in enumerate(vias):
+        current_size = float(v["diameter"])
+        current_drill = float(v["drill"])
+        entry = {"net": v.get("net"),
+                 "at": [round(float(v["x"]), 3), round(float(v["y"]), 3)],
+                 "current_size_mm": current_size,
+                 "current_drill_mm": current_drill,
+                 "max_size_mm": None, "max_drill_mm": None,
+                 "bound_by": None, "drill_bound_by": None}
+        copper = size_limits.get(id(v))
+        hole = drill_limits.get(id(v))
+        if copper is not None:
+            allowed, binding = copper
+            # a via never shrinks: what fits is a ceiling, and the current size
+            # is already on the board. Never report a smaller number than the
+            # copper that exists, or `max < current` reads as "must shrink".
+            entry["max_size_mm"] = max(current_size, min_size, round(allowed, 4))
+            entry["bound_by"] = {"kind": binding[0], "neighbour": binding[1],
+                                 "allows_mm": round(allowed, 4)}
+        if hole is not None:
+            allowed, binding = hole
+            entry["max_drill_mm"] = max(current_drill, round(allowed, 4))
+            entry["drill_bound_by"] = {"kind": binding[0], "neighbour": binding[1],
+                                       "allows_mm": round(allowed, 4)}
+        # the annular rule is the one bound that depends on both numbers, so
+        # it is reported as its own field rather than folded into either.
+        size_for = entry["max_size_mm"] if entry["max_size_mm"] is not None \
+            else current_size
+        entry["drill_ceiling_from_annular_mm"] = round(size_for - 2.0 * min_annular, 4)
+        out[v.get("uuid") or "index-%d" % idx] = entry
+    return {"clearance_mm": clearance_mm,
+            "min_via_annular_width_mm": min_annular,
+            "min_hole_to_hole_mm": min_hole_gap,
+            "vias": len(out),
+            "by_uuid": out,
+            "method": ("nearest foreign copper on a shared layer, plus the "
+                       "hole-to-hole rule that does not care about nets"),
+            "caveat": ("a lower bound: first neighbour only, no board edge, no "
+                       "mask/paste, pads as rotated boxes, zones left to the filler")}
+
 def role_of(net):
     """Power, differential or signal - read off the net name, nothing else.
 
