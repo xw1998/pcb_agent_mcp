@@ -9,6 +9,48 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.139] - 2026-11-11
+
+P1 里剩下两条从"没有测量"变成"量出来了，但一条只量不判、一条把限值留给调用方"。
+
+新增（`ruleset/measure.py`）：
+
+- **`_pour_nets(board)`**：这块板**用铺铜承载**的网——非 keepout 且带 `filled_polygons`
+  的 zone 的 net。不是网名猜测（测试里故意起名 `VRAIL`，证明代码里没有 `GND`）。
+- **`_return_vias(board)` → `layer_changes_without_return_via`**：每个"所在网没有铺铜"的
+  过孔，到最近"铺铜网过孔"的距离。换层处回流电流必须跳板对，跳不回去的环路既反射又辐射。
+  1.0 mm 阈值只决定**计数哪些**，每一条距离都留在 `examples` 里（前 8 条，按距离降序）。
+- **`_power_traces(board)` → `power_trace_width_mm`**：铺铜网里**最窄**的一段走线。
+  电源余量受最窄处约束，不受平均宽度约束——一条 2 mm 的轨在 router 让开一个焊盘留下的
+  0.2 mm 脖子上照样是保险丝。
+- `CAP_FACTS` 增 `layer_changes_without_return_via`（cap 文案含 `where`）；
+  `catalog_facts` 增这两项的 `take`，`audit` 侧不需要新代码。
+
+读数（`examples/sky_star`）：
+
+| 项 | 值 |
+|---|---|
+| 换层无回流过孔 | **146 / 147**（1.0 mm 门槛），最坏 `$1N4905` at (131.57, -88.49)，距最近回流过孔 **13.255 mm** |
+| 铺铜网 | `{+3V3, +5V, GND}`；回流网上 54 个过孔，信号网上 147 个 |
+| 电源线宽 | **0.15 mm**（GND @ (141.47, -116.00)；18 条走线 / 2 个有走线的铺铜网） |
+| 只由铺铜承载、无走线可量 | `+3V3`，进 `note`，不进数字 |
+
+判词路径（三种 `facts` 组合都实测过）：不传电流 ⇒ `undetermined`、`reason` 含 `current_a`；
+`{"current_a":0.3,"current_standard":"ipc2221","copper_oz":1.0}` ⇒ **pass**（limit 0.0574）；
+`current_a=2.0` ⇒ **fail**，`margin` 0.6359。
+
+为什么不把 146/147 判 fail：规则问的是 RF 与快速信号，**板文件不说哪些网是"快"的**。
+在一块已量产的 GPIO 开发板上把每一次换层都判成缺陷，是把未知洗成决定。同一套 cap 机制：
+`facts={"layer_changes_without_return_via": 0}` 一给就判 pass。同理线宽 0.15 mm 只是
+**下界**，限值必须由调用方的 `current_a` + `current_standard` 给出（IPC-2221 与 IPC-2152
+差 3 倍以上，已有 `_limit_width_for_current` 会拒答）。
+
+测试：`tests/test_return_vias.py` 新增 10 条（近距不计数 / 5 mm 要计数且距离对 /
+`VRAIL` 证明不硬编码 GND / 无回流过孔要拒 / 无铺铜要拒 / 最窄段才是数字 / 同板 0.1 mm
+的信号线不参与 / pour-only 进 `note` / 全铺铜承载要拒 / pass-fail 三条 `facts` 路径）。
+
+`--selftest` 363/366（3 项恒为 ngspice-47 环境干扰）；相关子集 147 + 26 passed。
+
 ## [0.0.138] - 2026-11-11
 
 `layout.reference_plane_continuous`（P1）从"没有测量"变成"有测量、有判词、判词带证据"。

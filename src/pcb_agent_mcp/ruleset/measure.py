@@ -577,6 +577,9 @@ def measure(board, window_mm=WINDOW_MM):
     m.update(_decoupling(board))
     # -------------------------------------------------- reference plane
     m.update(_reference_plane(board))
+    # ------------------------------------------------ return vias, ampacity
+    m.update(_return_vias(board))
+    m.update(_power_traces(board))
 
     return m
 
@@ -1116,6 +1119,122 @@ def _reference_plane(board):
         out["note"] = (out.get("note", "") + "; " + "; ".join(unmeasured)).strip("; ")
     return {"signal_crosses_plane_split": out}
 
+_RETURN_VIA_MM = 1.0
+
+def _pour_nets(board):
+    """Nets the board itself carries by pouring copper.
+
+    Not a name heuristic: a rail that has a filled pour IS the rail the board
+    returns current on, whatever it is called.
+    """
+    nets = set()
+    for z in board.zones:
+        if z.get("is_keepout"):
+            continue
+        if not (z.get("filled_polygons") or []):
+            continue
+        if z.get("net"):
+            nets.add(z.get("net"))
+    return nets
+
+def _return_vias(board):
+    """How far each signal via is from the nearest via into the return copper.
+
+    A layer change is where the return current has to jump the plane pair. If it
+    has no via to do that within a fraction of a millimetre it jumps wherever it
+    likes, and that loop both reflects and radiates.
+
+    The number is bounded, the POPULATION is not: the rule speaks about RF and
+    fast signals, and no board file says which nets those are. Counting every
+    signal via condemns a GPIO-only dev board that has been manufactured and
+    works, so the count is measured and the grading is left to
+    ``grade_caps`` - a caller who knows the net set passes the count in.
+    """
+    pours = _pour_nets(board)
+    if not pours:
+        return {"layer_changes_without_return_via": _na(
+            "no net is carried by a filled pour on this board, so there is no "
+            "return copper for a layer change to return into")}
+    ret = [v for v in board.vias if v.get("net") in pours]
+    sig = [v for v in board.vias if v.get("net") not in pours]
+    if not ret:
+        return {"layer_changes_without_return_via": _na(
+            "%d via(s) on the board, none of them on a poured net (%s): there is "
+            "no return via anywhere, so a distance to the nearest one is not a "
+            "measurement" % (len(board.vias), ", ".join(sorted(map(str, pours)))))}
+    if not sig:
+        return {"layer_changes_without_return_via": _rec(
+            0, "no via outside the poured nets", "count of signal vias with no "
+            "return via within %.1f mm" % _RETURN_VIA_MM)}
+    worst, rows = None, []
+    for v in sig:
+        d = min(math.hypot(v["x"] - r["x"], v["y"] - r["y"]) for r in ret)
+        rows.append((d, v.get("net"), v["x"], v["y"]))
+        if worst is None or d > worst[0]:
+            worst = (d, v.get("net"), v["x"], v["y"])
+    rows.sort(key=lambda r: -r[0])
+    far = [r for r in rows if r[0] > _RETURN_VIA_MM]
+    out = _rec(len(far),
+               "%d of %d signal via(s) have no via into the poured copper (%s) "
+               "within %.1f mm; the worst is %s at %.2f, %.2f, %.2f mm away"
+               % (len(far), len(sig), "/".join(sorted(map(str, pours))),
+                  _RETURN_VIA_MM, worst[1], worst[0], worst[2], worst[3]),
+               "distance from each via on a net with no pour to the nearest via on "
+               "a poured net, counted when it exceeds %.1f mm (the rule asks for "
+               "ground vias 'within a few tenths of a mm'; the threshold only picks "
+               "which of the measured distances to count, every distance is in "
+               "`examples`)" % _RETURN_VIA_MM)
+    out["examples"] = [{"net": r[1], "x": round(r[2], 3), "y": round(r[3], 3),
+                        "nearest_return_via_mm": round(r[0], 3)} for r in rows[:8]]
+    return {"layer_changes_without_return_via": out}
+
+def _power_traces(board):
+    """The narrowest piece of copper on a rail the board pours.
+
+    Ampacity is per trace, and the binding number is the NARROWEST segment: a
+    rail can be 2 mm wide for 30 mm and still be a fuse at the one 0.2 mm neck
+    the router left by a pad. Which current a rail carries is not in the file,
+    so the width is measured here and the limit comes from the caller
+    (`current_a` + `current_standard`, see ``_limit_width_for_current``).
+    """
+    pours = _pour_nets(board)
+    if not pours:
+        return {"power_trace_width_mm": _na(
+            "no net is carried by a filled pour, so which nets are rails cannot be "
+            "read from the board")}
+    rows, seen, poured_only = [], set(), []
+    for t in board.tracks:
+        net = t.get("net")
+        if net not in pours:
+            continue
+        w = t.get("width")
+        if w is None:
+            continue
+        seen.add(net)
+        start = t.get("start") or (0.0, 0.0)
+        rows.append((float(w), net, float(start[0]), float(start[1])))
+    for net in pours:
+        if net not in seen:
+            poured_only.append(str(net))
+    if not rows:
+        return {"power_trace_width_mm": _na(
+            "every poured net (%s) is carried by copper pour alone, so there is no "
+            "power TRACK to measure" % "/".join(sorted(map(str, pours))))}
+    rows.sort()
+    narrow = rows[0]
+    out = _rec(narrow[0],
+               "narrowest copper on a poured net: %s at %.2f, %.2f (%.3f mm, %d "
+               "track(s) on %d poured net(s))"
+               % (narrow[1], narrow[2], narrow[3], narrow[0], len(rows),
+                  len(seen)),
+               "the narrowest track width among the nets this board carries by "
+               "pouring; it is a lower bound on the ampacity of the rail because a "
+               "rail is only as wide as its neck")
+    if poured_only:
+        out["note"] = ("%s carried by pour alone, no track to measure"
+                       % "/".join(poured_only))
+    return {"power_trace_width_mm": out}
+
 def grade_caps(m):
     """Facts this module measured but refuses to GRADE, and why.
 
@@ -1141,6 +1260,15 @@ def grade_caps(m):
             "measured, not graded: same population caveat as "
             "decoupling_max_distance_to_pin_mm (%s)"
             % (row.get("where") or "?"))
+    row = m.get("layer_changes_without_return_via") or {}
+    if "value" in row:
+        caps["layer_changes_without_return_via"] = (
+            "measured, not graded: the population is every via that is not on a "
+            "poured net, and the rule asks about RF / fast-signal layer changes "
+            "only - no board file says which nets are fast, and counting a GPIO "
+            "dev board's vias condemns a design that works (%s). Name the nets you "
+            "meant and this fact is graded from them."
+            % (row.get("where") or "?"))
     return caps
 
 
@@ -1158,6 +1286,8 @@ def catalog_facts(m):
     take("diffpair_length_skew_mm", "diffpair_length_skew_mm")
     take("trace_under_crystal", "trace_under_crystal")
     take("decoupling_max_distance_to_pin_mm", "decoupling_max_distance_to_pin_mm")
+    take("layer_changes_without_return_via", "layer_changes_without_return_via")
+    take("power_trace_width_mm", "power_trace_width_mm")
     row = m.get("signal_crosses_plane_split") or {}
     if isinstance(row.get("value"), bool):
         facts["signal_crosses_plane_split"] = row["value"]
@@ -1171,7 +1301,8 @@ def catalog_facts(m):
 
 # Facts whose measurement this module can make but whose POPULATION it cannot
 # bound, so they are reported and not graded (see `grade_caps`).
-CAP_FACTS = ("decoupling_max_distance_to_pin_mm", "decoupling_via_in_path")
+CAP_FACTS = ("decoupling_max_distance_to_pin_mm", "decoupling_via_in_path",
+             "layer_changes_without_return_via")
 
 
 def failing_examples(m, key, limit):

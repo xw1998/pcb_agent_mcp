@@ -175,6 +175,12 @@ clearance，所以板上有 zone 时 `new_blocking_total == 0` 是构造性成�
 - **`evidence` / `examples` 字段**：`board_rule_audit` 里判 pass/fail 的检查项会带上测量自己的
   `where`（一条能读懂的话）与 `examples`（最多 8 条明细）。看到 fail 先读 `evidence`——
   「119 条走线跨分割，最宽 6.98 mm」和「有一条没过」是两种完全不同的事故。
+- **`undetermined` + `measured` 是「量出来了、判不了」，不是「没量」**：这类检查项会把
+  实测值放进 `measured`，并把 `margin` **去掉**——没有分母就没有余量。典型两例：
+  `layer_change_return_via`（不知道哪些网是 RF/快速的，于是不知道分母里该有几次换层）、
+  `power_trace_width`（线宽量到了，但电流不在板文件里，限值要 `current_a` +
+  `current_standard` 才给得出）。调用方知道的东西用 `facts=` 传进去，判词立刻从
+  `undetermined` 变成 pass/fail。
 - **单点读数失败不否证被测对象**：某个网布不通，可能只是这一版摆放不行。
 
 ### 改服务自己的代码时：每条后置条件必须有能失败的反向对照
