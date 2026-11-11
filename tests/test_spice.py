@@ -50,10 +50,17 @@ class TestDC(unittest.TestCase):
             self.assertIn("power_w", e)
 
     def test_current_source_into_a_resistor(self):
-        # SPICE convention: `I n+ n- value` pushes current from n+ THROUGH the
-        # source to n-, so `I1 1 0 1m` injects 1 mA into node 1. Getting this
-        # backwards turns 10 V into -10 V and nothing else here would notice.
+        # SPICE convention: `I n+ n- value` carries current from n+ to n- INSIDE
+        # the source, so the external circuit receives it at n-: `I1 1 0 1m`
+        # across 10k makes node 1 MINUS 10 V. This test used to assert +10 V and
+        # called it "the SPICE convention"; ngspice-47 answers -10.0 V for the
+        # same deck, so the test was defending a sign the builtin solver had
+        # backwards. Getting this wrong turns a supply rail into a sink.
         v = _op("* isrc\nI1 1 0 1m\nR1 1 0 10k\n.end\n")
+        self.assertAlmostEqual(v["nodes_v"]["1"], -10.0, places=6)
+
+    def test_the_other_way_round_is_the_other_sign(self):
+        v = _op("* isrc\nI1 0 1 1m\nR1 1 0 10k\n.end\n")
         self.assertAlmostEqual(v["nodes_v"]["1"], 10.0, places=6)
 
     def test_vcvs_and_vccs(self):

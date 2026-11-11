@@ -40,6 +40,8 @@ from .calc import dfm as _dfm
 from .calc import matching as _matching
 from .calc import power as _power
 from .calc import spice as _spice
+from .sim import board as _simboard
+from .sim import run as _simrun
 from .calc import thermal as _thermal
 from .calc import vibration as _vib
 from .calc import vibration_poly as _vib_poly
@@ -6081,7 +6083,7 @@ def _capabilities(_args):
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_spreading",
             "thermal_convection",
-            "board_ir_drop",
+            "board_ir_drop", "board_netlist", "board_sim",
             "dfm_capability", "dfm_check",
             "vibration_plate_modes", "vibration_plate_outline",
             "vibration_plate_stress",
@@ -6542,10 +6544,11 @@ def _capabilities(_args):
             "crowding along a wide strip and no phase - so this 2-D THERMAL "
             "plate is still excited at DC and there is no AC heat map - "
             "device self-heating inside sim_spice, "
-            "reading the conductors or the zones straight off a board "
-            "file - board_electrothermal takes geometry, it does not open the "
-            ".kicad_pcb for "
-            "you",
+            "a board file read straight into the THERMAL plate: since 0.0.142 "
+            "board_netlist/board_sim do extract a .kicad_pcb's copper into R/L/C "
+            "and a SPICE deck (and board_ir_drop reads it too), but the plate "
+            "still takes geometry, and the deck does not yet hand it per-element "
+            "power, so there is no heat map from a board file",
             "Surge and fusing: fusing_current answers the single-pulse "
             "adiabatic question (Onderdonk 1928) and states its one-sided "
             "assumptions (no cooling, equal-area rectangle, no skin effect); its "
@@ -8093,6 +8096,142 @@ _tool(
                               max_points=int(a.get("max_points") or 200),
                               engine=a.get("engine") or "builtin",
                               cross_check=bool(a.get("cross_check"))),
+)
+
+# ------------------------------------------------------- whole-board circuit
+_SIM_DRIVE = {
+    "type": "object",
+    "description": "one source attached to a real pad",
+    "properties": {
+        "at": _str("pad name (U1.1) or deck node to drive"),
+        "kind": _str("dc | current | pulse | sin",
+                     enum=["dc", "current", "pulse", "sin"], default="dc"),
+        "voltage_v": _num("DC value for kind=dc (this also grounds the node)"),
+        "current_a": _num("current pushed INTO the node for kind=current"),
+        "v1": _num("pulse start"), "v2": _num("pulse end"),
+        "td": _num("pulse delay s"), "tr": _num("pulse rise s"),
+        "tf": _num("pulse fall s"), "pw": _num("pulse width s"),
+        "per": _num("pulse period s"),
+        "vo": _num("sin offset"), "va": _num("sin amplitude"),
+        "freq": _num("sin frequency Hz"),
+        "ref": _str("the node this source returns to: a pad (U2.1) or \"0\" for the "
+                    "engine's own 0 V. Default is the ground tie, which closes the "
+                    "loop inside the source and makes the tie carry nothing - give a "
+                    "ref on the other net when you want a real return current"),
+    },
+    "required": ["at"],
+}
+_SIM_LOAD = {
+    "type": "object",
+    "properties": {
+        "at": _str("pad name (U2.8) or deck node"),
+        "r_ohm": _num("resistive load"), "i_a": _num("current sunk from the node"),
+        "c_f": _num("capacitance to the reference node"),
+        "ref": _str("the node this load returns to (pad name, or \"0\" for the "
+                    "engine's own 0 V when the load is not on the board at all)"),
+    },
+    "required": ["at"],
+}
+
+_tool(
+    "board_netlist",
+    "The BOARD as one SPICE deck: every net, every track segment, every via, every pad "
+    "node, with R from the copper the file carries and L and C from the transmission "
+    "line each segment forms over its reference plane. Read-only, and the thing that "
+    "makes a simulation a BOARD simulation - sim_spice solves a netlist you typed, and "
+    "until this existed nothing here produced one from a .kicad_pcb. R is not "
+    "re-implemented: it comes from the same graph board_ir_drop solves, so a deck and "
+    "an IR-drop report on this board cannot disagree. Pads are named nodes (U1.1), so "
+    "a source or a load attaches to real copper. What is NOT in it is stated in "
+    "value.not_modelled, and a net that could not be extracted is named in "
+    "value.skipped with its reason rather than dropped. One net is not always one "
+    "piece of copper: the pieces are measured (value.islands) and the pads that no "
+    "track reaches are named (value.copperless_pads), because a deck with floating "
+    "pieces does not solve and a deck quietly made connected would not be this board.",
+    {"type": "object", "properties": dict(
+        _COMMON,
+        nets={"type": "array", "items": {"type": "string"},
+              "description": "nets to extract (default: every net with a track)"},
+        plating_um=_num("via barrel plating thickness; required for any net with vias "
+                        "(25 is a common fab number, and this server will not assume it)"),
+        copper_um=_num("override the stackup copper thickness"),
+        quantize_mm=_num("node merge pitch (default 0.01)", 0.01),
+        temp_c=_num("copper temperature for rho (default 20)", 20),
+        model_zones=_bool("grid copper pours on the simulated nets as 2-D sheets "
+                          "(changes the network; off by default)", False),
+        include_lc=_bool("compute segment L and C from the stackup (default true)", True),
+        max_nodes=_num("refuse past this many nodes (default 60000)", 60000),
+    ), "required": ["path"]},
+    _board_tool(lambda b, a: _simboard.build(
+        b, nets=a.get("nets"), plating_um=a.get("plating_um"),
+        copper_um=a.get("copper_um"),
+        quantize_mm=(a["quantize_mm"] if a.get("quantize_mm") is not None else 0.01),
+        temp_c=(a["temp_c"] if a.get("temp_c") is not None else 20.0),
+        model_zones=bool(a.get("model_zones")),
+        include_lc=(a.get("include_lc") if a.get("include_lc") is not None else True),
+        max_nodes=int(a.get("max_nodes") or 60000)), derived=True),
+)
+
+_tool(
+    "board_sim",
+    "Simulate the BOARD: extract its copper into a circuit (board_netlist), attach the "
+    "sources and loads YOU name to real pads, and solve it with a SPICE engine. op / "
+    "tran / ac. This is the difference between 'a netlist I typed' and 'this layout': "
+    "a 6 mm power escape and a 0.15 mm signal stub are not the same circuit, and only "
+    "the board knows which is which. The R values are board_ir_drop's own graph, so an "
+    "IR-drop answer and a .op here agree digit for digit - measured on ten finished "
+    "boards (max |difference| 2.9e-14 mV over 10-336 mV answers). The deck is returned "
+    "in value.board.deck so the run can be reproduced or edited. It adds no component "
+    "that is not on the board: a capacitor here is the copper's own shunt capacitance, "
+    "and a load is yours - with no load the answer is zero, accurately. A node is tied "
+    "to 0 V because you named it (ground=), and that tie is a 0 V source written into "
+    "the deck, so the return current comes back as a number (ground_current_a). A "
+    "drive or a load may name its own ref, which is how current is made to return "
+    "through another net's copper. Islands of copper that no wired pad touches are "
+    "left out and named in board.skipped instead of making the matrix singular, and a "
+    "wired pad whose net has no copper reaching it is refused as NOT_CONNECTED rather "
+    "than solved into numbers.",
+    {"type": "object", "properties": dict(
+        _COMMON,
+        nets={"type": "array", "items": {"type": "string"},
+              "description": "nets to simulate (default: every net with a track)"},
+        drives={"type": "array", "items": _SIM_DRIVE,
+                "description": "sources, each attached to a pad"},
+        loads={"type": "array", "items": _SIM_LOAD,
+               "description": "loads, each attached to a pad"},
+        analysis={"type": "object", "description":
+                  "kind=op | tran (tstep_s, tstop_s) | ac (fstart_hz, fstop_hz, "
+                  "points, sweep=dec|oct|lin)",
+                  "properties": {"kind": {"type": "string"},
+                                 "tstep_s": {"type": "number"},
+                                 "tstop_s": {"type": "number"},
+                                 "fstart_hz": {"type": "number"},
+                                 "fstop_hz": {"type": "number"},
+                                 "points": {"type": "number"},
+                                 "sweep": {"type": "string"}}},
+        ground=_str("pad or node tied to 0 V (a 0 V source in the deck)"),
+        outputs={"type": "array", "items": {"type": "string"},
+                 "description": "pads/nodes whose waveforms are returned "
+                                "(default: the driven and loaded ones)"},
+        engine=_str("builtin | ngspice | auto (auto = ngspice when installed)",
+                    enum=["builtin", "ngspice", "auto"], default="auto"),
+        plating_um=_num("via barrel plating thickness (required for nets with vias)"),
+        copper_um=_num("override the stackup copper thickness"),
+        temp_c=_num("copper temperature for rho (default 20)", 20),
+        model_zones=_bool("grid copper pours on the simulated nets", False),
+        include_lc=_bool("model segment L and C (default true; false = resistive only, "
+                         "i.e. DC only)", True),
+        max_nodes=_num("refuse past this many nodes (default 60000)", 60000),
+    ), "required": ["path"]},
+    _board_tool(lambda b, a: _simrun.simulate(
+        b, nets=a.get("nets"), drives=a.get("drives"), loads=a.get("loads"),
+        analysis=a.get("analysis"), ground=a.get("ground"),
+        outputs=a.get("outputs"), engine=(a.get("engine") or "auto"),
+        plating_um=a.get("plating_um"), copper_um=a.get("copper_um"),
+        temp_c=(a["temp_c"] if a.get("temp_c") is not None else 20.0),
+        model_zones=bool(a.get("model_zones")),
+        include_lc=(a.get("include_lc") if a.get("include_lc") is not None else True),
+        max_nodes=int(a.get("max_nodes") or 60000)), derived=True),
 )
 
 _tool(
@@ -13036,6 +13175,9 @@ CORE_TOOLS = (
     # the 25 KiB tools/list budget (46 tools / 23 976 B before this release), so any
     # addition pushes a tool off the single page. They stay in the registry, are
     # listed by calc_capabilities, and tool_search / tool_call reach them.
+    # board_netlist / board_sim are in the same position (0.0.142): they are the
+    # whole-board deck and solve, they are listed in calc_capabilities, and the
+    # page has no room for them.
 )
 
 

@@ -148,12 +148,17 @@ class TestRefusals(unittest.TestCase):
     def test_a_disconnected_sink_is_not_a_zero_drop(self):
         # This is the failure mode that matters: the sink exists on the net but
         # no copper reaches it, so the honest answer is "not connected", not
-        # "0 mV, all good"
+        # "0 mV, all good". This test used to pin NOT_APPLICABLE, because the only
+        # thing the solve could say was "singular at column N" - which names
+        # neither the pad nor the reason and reads like a modelling gap. The dense
+        # path now makes the same reachability cut the pour path always did, so
+        # the answer is NOT_CONNECTED and the pad is in the message.
         body = '  (segment (start 10 10) (end 15 10) (width 0.5) (layer "F.Cu") (net 1))'
         r = oracle.board_ir_drop(board(body, "F.Cu"), "VCC", "U1.1", ["U2.1"],
                                  current_a=1.0)
         self.assertEqual(r["status"], "error")
-        self.assertEqual(r["reason_code"], "NOT_APPLICABLE")
+        self.assertEqual(r["reason_code"], "NOT_CONNECTED")
+        self.assertIn("U2.1", r["message"])
 
     def test_a_pad_that_is_not_on_the_net_is_refused(self):
         r = oracle.board_ir_drop(board(ONE_TRACK, "F.Cu"), "VCC", "U1.9", ["U2.1"],

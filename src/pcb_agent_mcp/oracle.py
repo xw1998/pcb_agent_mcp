@@ -3783,7 +3783,7 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                   max_nodes=1200, model_zones=False, zone_grid_mm=None,
                   max_zone_nodes=8000, zone_link_mm=0.5, frequency_hz=None,
                   faces="one", mu_r=1.0, roughness_rq_um=None,
-                  thermal_relief=None):
+                  thermal_relief=None, return_network=False):
     """DC voltage drop across ONE net, out of the copper the board actually carries.
 
     This is "will 2 A make it from the regulator to the MCU without browning it
@@ -4575,6 +4575,54 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                     "- it is the single crudest number in this answer" %
                     (len(zone_bridged), float(zone_link_mm)))
 
+    # ---- the graph WITHOUT solving it (0.0.142)
+    # Where the current ENTERS is a property of the analysis, not of the board.
+    # A caller that wants the board as a CIRCUIT (board_netlist / board_sim) needs
+    # this graph and nothing else, so the question is not asked. Both answers come
+    # out of the SAME builder, so the deck a simulation runs and the IR drop a
+    # report quotes cannot drift apart - a second extractor would have been the
+    # obvious way to write this and the certain way to end up with two answers.
+    if return_network:
+        terms = []
+        for fp, pad in pads:
+            px, py = _pad_xy(fp, pad)
+            lays = [str(l) for l in (_item_layers(board, pad.get("layers")) or [])
+                    if l]
+            if not lays:
+                continue
+            terms.append({"pad": "%s.%s" % (fp.get("ref"), pad.get("number")),
+                          "node": node(px, py, lays[0]),
+                          "x_mm": px, "y_mm": py, "layers": lays})
+        return ok(value={"net": net,
+                         "nodes": [dict(n) for n in names],
+                         "edges": [dict(e) for e in edges],
+                         "terminals": terms,
+                         "node_count": len(names),
+                         "edge_count": len(edges),
+                         "quantize_mm": q,
+                         "copper_um": explicit,
+                         "copper_um_source": ("explicit" if explicit is not None
+                                              else ("stackup" if cu else None)),
+                         "board_thickness_mm": board_th,
+                         "zone_summary": zone_summary},
+                  unit="ohm",
+                  model="track_via_pad_resistor_graph",
+                  basis=("the same graph board_ir_drop solves: every track segment "
+                         "is rho*L/(w*t), every via a plated barrel, every plated "
+                         "pad joins its layers"
+                         + (", and every pour on this net is a 2-D sheet gridded and "
+                            "four-connected" if zone_summary else "")
+                         + ". Returned unsolved, with each pad's node id, so a "
+                           "circuit can be built on top of it"),
+                  precision=("the resistance values are the ones board_ir_drop "
+                             "publishes, unchanged; what this answer does NOT do is "
+                             "decide where current enters, so it carries no drop and "
+                             "no current density"),
+                  assumptions={"quantize_mm": q, "temp_c": float(temp_c), "net": net,
+                               "copper_um": explicit, "plating_um": plating_um,
+                               "model_zones": bool(model_zones)},
+                  extra={"warnings": warnings})
+
     # ---- terminals
     src_hits = [h for h in _pad_lookup(board, source) if h[1].get("net") == net]
     if not src_hits:
@@ -4711,6 +4759,41 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
                            hint="coarsen the pour with zone_grid_mm; a reported "
                                 "drop out of an unconverged solve is noise")
     else:
+        # The same cut the pour path makes, and for the same reason: a net's pads
+        # are NOT always one piece of copper. A pad that no track touches, or two
+        # islands that only a pour would have joined, leave the dense Laplacian
+        # singular - and "singular at 181" names neither the pad nor the reason,
+        # so the caller cannot tell a modelling gap from a layout fault. Measured
+        # on the corpus: every finished board reported NOT_APPLICABLE "singular at
+        # N" where the truth was "this pad is on the net but nothing conducts to
+        # it".
+        adj = {}
+        for e in edges:
+            adj.setdefault(e["a"], []).append(e["b"])
+            adj.setdefault(e["b"], []).append(e["a"])
+        seen = {src_node}
+        stack = [src_node]
+        while stack:
+            k = stack.pop()
+            for nb in adj.get(k, ()):
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        stranded = [s["pad"] for s in sink_list if s["node"] not in seen]
+        if stranded:
+            return err("sink(s) %s are not connected to %s on net %r by any track"
+                       % (", ".join(stranded), source, net), "NOT_CONNECTED",
+                       hint="either this net has islands in the layout, or the "
+                            "copper that joins them is a pour: model_zones=true "
+                            "puts the pours in the network")
+        dropped = len(names) - len(seen)
+        if dropped:
+            keep = seen
+            names = [n for n in names if n["id"] in keep]
+            edges = [e for e in edges if e["a"] in keep and e["b"] in keep]
+            warnings.append("%d node(s) of net %r are not connected to %s by any "
+                            "track and were dropped: they carry no current"
+                            % (dropped, net, source))
         sol, why = PW.resistive_network([n["id"] for n in names], edges,
                                         injections, src_node)
     if sol is None:

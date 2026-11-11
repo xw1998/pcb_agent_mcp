@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.0.142] - 2026-11-11
+
+「仿真」以前只吃一份手写的网表。这一版让 `.kicad_pcb` 自己变成网表：叠层、参考面、
+走线电阻、走线电感与对参考面的电容、过孔、孤岛，全部从板文件里量出来，交给同一个
+求解器。判决口径只有一条——**同一块板，两条独立路径必须给出同一个数**。
+
+新增（`sim/board.py`、`sim/run.py`、`board_netlist`、`board_sim`）：
+
+- **R 不重写。** `oracle.board_ir_drop` 新增 `return_network=True`，只出图不求解，
+  deck 与 IR-drop 报告共用同一个图构建器。自证=10 块成品板逐位对照，差
+  **0 ~ 2.8e-14 mV**（答案从 10.2 mV 到 336.8 mV）。
+- **L 与 C 同一条传输线**：`L'C'·1e6 == εr/c₀²` 是判据本身，不是注释。有 L 才写
+  `R a mid` + `L mid b`；**没有 L 就直接 `R a b`**（`include_lc=false` 曾因此在远端悬空）。
+- **一个网的焊盘不总是一块铜。** 先按 R 边算连通块，`islands` / `copperless_pads`
+  逐块点名；`keep_pads` 剪掉不含被接线焊盘的块，并在 `notes` 里说清剪了几块、为什么。
+
+the three wrong answers that look right（三个「看起来合理的错答案」，都写成测试防回退）：
+
+- **0.000000 mV**：R 与 L 并排画时，IR-drop 报 0——它量的是被 `mid` 节点分掉的那一半。
+- **+10 V**：内置 `engine="builtin"` 的 I 源与 ngspice 符号相反，测试曾经防守**错**的那一侧。
+  `calc/spice.py` 改正（DC 与 AC 两处）。
+- **1000.000000 mV**：给一个**没有铜**的焊盘接地，ngspice 用 gmin 解出浮空网络，`status: ok`。
+  修法是前置拒答：`copperless_pads` 直接 `NOT_CONNECTED`，再对 `R/L/V` 做并查集，
+  每个节点必须与 `"0"` 同根（C 在直流开路、I 源不定电位，都不算连通）。
+
+同一类还修了一处不是板子的话：稠密路径上的 `singular at column 181`。现在它先做
+"从源可达"剪枝（与铺铜路径同构），孤岛 sink 判 `NOT_CONNECTED` 并点名 pad，
+`board_ir_drop` 不再把线性代数的列号当成结论。
+
+12 块官方成品板实测（`docs/133` 有全表）：video 12836 节点、cm5_minima 4249 边是最大的
+两块；**microwave 板里 0 根走线**（纯铜皮图形板）、**multichannel 无叠层**（要先给
+`copper_um`，否则 L/C 无从算起）、**royalblue54L 54 个网 `ARG_RANGE`**（文件里过孔
+`drill 0.00001 mm`，25 µm 镀铜把它堵死）——三类跳过原因都点名，不返回空图。
+
+`not_modelled` 六条写在返回里（焊盘/过孔的接触电阻、铜箔粗糙度、介质损耗、
+温升、铺铜只在 `model_zones=true` 时算导体、器件模型仍要调用方给），
+`board_electrothermal` 仍吃几何不吃板文件、`board_sim` 还不输出每元件功耗——这两件
+登记未做，没有假装做了。
+
+`board_netlist` / `board_sim` 不进 `CORE_TOOLS`：46 个工具已经把 25 KiB 的 `tools/list`
+预算顶到 23 976 B。
+
+测试：`tests/test_board_sim.py` 新增 22 条（串联 R/L、传输线恒等式、跨网节点、
+孤岛剪枝、浮空拒答、deck 与 IR-drop 逐位一致），`tests/test_board_ir_drop.py` 的
+孤岛期望从 `NOT_APPLICABLE` 改成 `NOT_CONNECTED`。
+
 ## [0.0.141] - 2026-11-11
 
 八条规则一直回答「no measurement supplied for 'X'」——那不是关于板子的话。这一版

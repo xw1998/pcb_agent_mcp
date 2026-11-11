@@ -2992,12 +2992,19 @@ class _Circuit(object):
                 else:
                     self._rhs(b, row, _source_value(el, t if t is not None else 0.0))
             elif T == "I":
+                # SPICE's own direction: `I n+ n- value` carries the current from
+                # n+ to n- INSIDE the source, so the external circuit receives it
+                # at n- and `I1 1 0 1m` across 10k gives -10 V, not +10 V. This
+                # was stamped with the opposite sign, and a test had been
+                # written to defend that: measured against ngspice-47 the same
+                # deck answered -10.0 V here and +10.0 V there. A sign is not a
+                # matter of taste when the answer is a voltage.
                 if mode == "ac":
                     # see the V branch: no AC keyword means no excitation
                     mag, phase = el.get("ac") or (0.0, 0.0)
-                    self._current(b, na, nb, -cmath.rect(mag, math.radians(phase)))
+                    self._current(b, na, nb, cmath.rect(mag, math.radians(phase)))
                 else:
-                    self._current(b, na, nb, -_source_value(el, t if t is not None else 0.0))
+                    self._current(b, na, nb, _source_value(el, t if t is not None else 0.0))
             elif T == "E":
                 row = self.branch_idx[el["name"]]
                 a, bb = self.i(na), self.i(nb)
