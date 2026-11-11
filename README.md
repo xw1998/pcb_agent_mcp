@@ -233,7 +233,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（241 个）
+## 工具（243 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` / `magnetics_dc_bias` /
 `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor` / `ac_self_heating` / `experience_recall` / `experience_check` / `experience_candidate` / `experience_promote` / `experience_outcome` / `experience_export` / `experience_import`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
@@ -356,6 +356,8 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `rf_chain` | 级联增益、Friis 噪声（含各级占比）、级联 IIP3/OIP3、kTB 底噪与灵敏度 | 缺任一级 `nf_db` ⇒ NF 是 `None` 不是部分和；IP3 公式是 worst case；级间失配不在里面 |
 | `design_rules` | 规则目录：id、需要哪个事实、单位、怎么测、证据等级、出处 | —— |
 | `layout_review` | 用你测到的事实判 22 条布局规则（参考面连续性 / 去耦距离与同层 / λ_g/20 / 3W / 弯曲半径 / 板边 / 天线净空 / 换层地孔 / 差分等长 / 载流线宽 / 散热孔 / 晶振 / 丝印 / 测试点 / 最小孔与线宽） | **不替你读板**；没测到的规则一律 `undetermined` 并给出怎么测，空事实集直接拒答 |
+| `board_rule_audit` | **一次量完、按五级优先级判整块板**（`0.0.130`）：P0 可制造性（只认带逐字 quote 的厂商能力库，未声明 `process` 就一律 `undetermined`，不猜）/ P1 电气完整性 / P2 装配机械 / P3 信号质量 / P4 印字可读；**只有 P0–P2 能阻塞**，阻塞层之下全部 `deferred` 并保留自己的分数，`first_action` 只从阻塞层按 margin 升序取；测不到的行是 `undetermined`，永不当 `pass` | 只读：不布线、不移动、不铺铜、不落盘；P0 判的是「按声明的那道工艺」，每条 fail 都带 `process` 与 `source`；`facts=` 只接受调用方已有的事实，不自己从网表猜 |
+| `pcb_rule_catalog` | 这套规则的全表：id、所在优先级、限值、出处、怎么量——先看它再跑 `board_rule_audit` 就知道会检查什么、按什么顺序 | 不需要板子；规则数与时不变的目录同步维护 |
 | `schematic_review` | 用事实判 14 条原理图规则（逐脚去耦 / 每路 bulk / 复位与使能悬空 / LED 限流 / 栅极电阻 / 连接器 ESD / 防反接 / 保险丝 / 补偿 / 放电 / 悬空输入 / 测试点 / 射频匹配 / PA 旁路梯 / IEC 60664 隔离间距） | 不把网表解析成“这颗 IC 的电源脚”，事实要调用方给；隔离间距因表未验证而永远 fail-closed |
 | `link_friis` | 链路预算：Prx / 路损 / EIRP / ERP | `FSPL_CONST = -27.5522`（写错 60 dB 的坑） |
 | `link_max_range` | 给定灵敏度与额外损耗 → 最大距离 | 额外损耗要显式给，默认 0 就说 0 dB |

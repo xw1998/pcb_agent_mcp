@@ -1,0 +1,298 @@
+"""ruleset: five priorities, and the resolution between them.
+
+Every test here has a control that can fail. The point of the package is not
+"collect rules" - it is that a low-priority finding can never be reported as the
+next step while a high-priority one fails, and that a rule with no evidence is
+`undetermined` instead of a pass.
+
+Two of the boards are real KiCad demos: `pic_programmer` carries an NPTH
+mounting hole (the case that used to be graded as a zero annular ring) and
+`multichannel_mixer-unrouted` is a positive control for connectivity - it MUST
+be caught at P1. Both are skipped, not faked, when KiCad's demos are absent.
+"""
+import os
+import sys
+import unittest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "src"))
+
+from pcb_agent_mcp.adapters import open_board                       # noqa: E402
+from pcb_agent_mcp.ruleset import audit, catalog, LEVELS, LEVEL_NAMES  # noqa: E402
+from pcb_agent_mcp.ruleset import measure as M                     # noqa: E402
+import importlib                                                # noqa: E402
+_audit_mod = importlib.import_module("pcb_agent_mcp.ruleset.audit")
+from pcb_agent_mcp.ruleset.levels import (BLOCKING_LEVELS,         # noqa: E402
+                                          resolve)
+
+SAMPLE = os.path.join(_HERE, "data", "sample.kicad_pcb")
+PROC = {"layers": 2, "copper_oz": 1}
+
+
+def _demo(name, folder=None, fname=None):
+    """Path of a KiCad demo board, or None when this machine has no demos."""
+    try:
+        from pcb_agent_mcp.fidelity import engine
+        cli = engine.find_kicad_cli()
+    except Exception:                                          # noqa: BLE001
+        return None
+    if not cli:
+        return None
+    root = os.path.dirname(os.path.dirname(cli))
+    p = os.path.join(root, "share", "kicad", "demos", folder or name,
+                     fname or (name + ".kicad_pcb"))
+    return p if os.path.isfile(p) else None
+
+
+def _check(level, state, cid=None):
+    return {"id": cid or ("x." + level), "level": level, "state": state}
+
+
+class TestPriorityOrder(unittest.TestCase):
+
+    def test_five_levels_and_three_blocking(self):
+        self.assertEqual(LEVELS, ("P0", "P1", "P2", "P3", "P4"))
+        self.assertEqual(BLOCKING_LEVELS, ("P0", "P1", "P2"))
+        for lvl in LEVELS:
+            self.assertIn(lvl, LEVEL_NAMES)
+
+    def test_a_lower_level_is_never_the_next_step(self):
+        res = resolve([_check("P0", "fail", "p0.a"), _check("P1", "fail", "p1.a"),
+                       _check("P2", "fail", "p2.a"), _check("P3", "fail", "p3.a")])
+        self.assertEqual(res["blocking_level"], "P0")
+        self.assertEqual(res["first_action"]["rule"], "p0.a")
+        # Anything below the blocker is deferred, and its own grade is kept.
+        for lvl in ("P1", "P2", "P3", "P4"):
+            for c in res["levels"][lvl]["checks"]:
+                self.assertEqual(c["state"], "deferred")
+                self.assertEqual(c["graded_state"], "fail")
+        self.assertEqual(res["deferred"], 3)
+        # Nothing below a blocker is offered as advice either.
+        self.assertEqual(res["flagged"], [])
+
+    def test_p3_cannot_block_a_buildable_board(self):
+        res = resolve([_check("P0", "pass"), _check("P3", "fail", "p3.corner")])
+        self.assertIsNone(res["blocking_level"])
+        self.assertEqual(res["levels"]["P3"]["status"], "flagged")
+        self.assertEqual([f["rule"] for f in res["flagged"]], ["p3.corner"])
+        self.assertIsNone(res["first_action"])
+
+    def test_failing_state_is_required_by_the_validator(self):
+        with self.assertRaises(ValueError):
+            resolve([{"id": "x", "level": "P1", "state": "maybe"}])
+        with self.assertRaises(ValueError):
+            resolve([{"id": "x", "level": "P9", "state": "fail"}])
+
+
+class TestAudit(unittest.TestCase):
+
+    def test_no_process_means_p0_is_not_guessed(self):
+        r = audit(open_board(SAMPLE))
+        self.assertIsNone(r["process"])
+        p0 = r["levels"]["P0"]["checks"]
+        self.assertTrue(any(c["id"] == "P0.process_declared" and
+                            c["state"] == "undetermined" for c in p0))
+        # The catalogue's own P0 rules must be undetermined too, not passed.
+        for c in p0:
+            if c["id"].startswith("layout."):
+                self.assertEqual(c["state"], "undetermined", c["id"])
+        # ... and a P0 blocker must never be invented from the missing process.
+        self.assertNotEqual(r["verdict"], "blocked_at_P0_unbuildable")
+
+    def test_declared_process_evaluates_p0(self):
+        r = audit(open_board(SAMPLE), process=PROC)
+        p0 = r["levels"]["P0"]["checks"]
+        graded = [c for c in p0 if c["state"] in ("pass", "fail",
+                                                  "pass_with_warning")]
+        self.assertTrue(graded, "nothing at P0 was graded with a process declared")
+        self.assertNotIn("P0.process_declared", [c["id"] for c in p0])
+        self.assertEqual(r["measured"]["min_track_width"]["value"] > 0, True)
+
+    def test_thickness_comes_from_the_board_not_from_the_caller(self):
+        r = audit(open_board(SAMPLE), process=PROC)
+        self.assertIn("thickness_mm", r["process_filled_from_board"])
+        self.assertIsInstance(r["process"]["thickness_mm"], float)
+
+    def test_unrouted_board_is_caught_at_p1(self):
+        """Positive control: an unrouted demo board must fail connectivity."""
+        p = _demo("multichannel_mixer-unrouted", "multichannel")
+        if not p:
+            self.skipTest("KiCad demos are not installed here")
+        # No declared process: P0 is not evaluated, so the first thing this
+        # board can fail is P1 - which is exactly what an unrouted board is.
+        r = audit(open_board(p), window_mm=5.0)
+        failed = [c["id"] for c in r["levels"]["P1"]["checks"]
+                  if c["state"] == "fail"]
+        self.assertIn("layout.connectivity_complete", failed)
+        self.assertEqual(r["priority"]["blocking_level"], "P1")
+
+    def test_verdict_names_follow_the_evidence(self):
+        r = audit(open_board(SAMPLE), process=PROC)
+        self.assertRegex(r["verdict"],
+                         r"^(blocked_at_P[0-2]|buildable_flag_at_P[34]|"
+                         r"nothing_failed_but_\d+_rules_undetermined|measured_clean)")
+
+    def test_every_rule_carries_a_source(self):
+        for lvl in LEVELS:
+            for c in r_checks(lvl):
+                self.assertTrue(c.get("source"), "%s has no source" % c["id"])
+
+
+def r_checks(level):
+    return [c for c in audit(open_board(SAMPLE), process=PROC)["levels"][level]["checks"]]
+
+
+class TestNpth(unittest.TestCase):
+    """An NPTH mounting hole has no copper collar; it must not be graded as one."""
+
+    def test_mounting_hole_is_not_a_zero_annular_ring(self):
+        p = _demo("pic_programmer")
+        if not p:
+            self.skipTest("KiCad demos are not installed here")
+        m = M.measure(open_board(p))
+        self.assertIn("value", m["min_th_annular"])
+        self.assertGreater(m["min_th_annular"]["value"], 0.0)
+        self.assertIn("value", m["min_npth_drill"])
+        self.assertGreater(m["min_npth_drill"]["value"], 0.0)
+
+    def test_board_with_only_an_npth_hole_passes_p0_annular(self):
+        """The control: pic_programmer used to be unbuildable at P0 for this."""
+        p = _demo("pic_programmer")
+        if not p:
+            self.skipTest("KiCad demos are not installed here")
+        r = audit(open_board(p), process=PROC, window_mm=5.0)
+        p0 = {c["id"]: c for c in r["levels"]["P0"]["checks"]}
+        self.assertNotEqual(p0["PCB.TH.ANNULAR_MIN"]["state"], "fail")
+        self.assertNotEqual(r["verdict"], "blocked_at_P0_unbuildable")
+
+
+class TestLowerBoundIsEvidence(unittest.TestCase):
+
+    def test_a_proven_bound_settles_a_one_sided_rule(self):
+        m = {"min_via_hole_edge_gap": {"lower_bound": 5.0, "where": "far apart"}}
+        checks, _, _ = _audit_mod._fab_checks(dict(PROC), m)
+        row = [c for c in checks if c["id"] == "PCB.VIA.HOLE_EDGE_GAP"][0]
+        self.assertEqual(row["state"], "pass")
+        self.assertEqual(row.get("measured_from"), "lower_bound")
+
+    def test_a_bound_below_the_limit_stays_undetermined(self):
+        m = {"min_via_hole_edge_gap": {"lower_bound": 0.1, "where": "close"}}
+        checks, _, _ = _audit_mod._fab_checks(dict(PROC), m)
+        row = [c for c in checks if c["id"] == "PCB.VIA.HOLE_EDGE_GAP"][0]
+        self.assertEqual(row["state"], "undetermined")
+        self.assertNotIn("measured_from", row)
+
+
+class TestMeasureHygiene(unittest.TestCase):
+
+    def test_bbox_normalises_both_spellings(self):
+        d = {"x_min": 1.0, "y_min": 2.0, "x_max": 3.0, "y_max": 4.0}
+        self.assertEqual(M._bbox4(d), (1.0, 2.0, 3.0, 4.0))
+        self.assertEqual(M._bbox4([1.0, 2.0, 3.0, 4.0]), (1.0, 2.0, 3.0, 4.0))
+
+    def test_pruning_does_not_change_the_answer(self):
+        b = open_board(SAMPLE)
+        fast = M.measure(b)
+        old = M._PRUNE
+        try:
+            M._PRUNE = False
+            slow = M.measure(b)
+        finally:
+            M._PRUNE = old
+        self.assertEqual(fast["min_track_space"]["value"],
+                         slow["min_track_space"]["value"])
+
+    def test_oracle_spelling_is_lifted_to_value(self):
+        """oracle says `measured`; a ruleset row must say `value` or rules go blind."""
+        r = audit(open_board(SAMPLE), process=PROC)
+        for key in ("min_via_hole_edge_gap", "min_copper_to_edge"):
+            row = r["measured"].get(key) or r["unmeasured"].get(key)
+            self.assertIsNotNone(row, key)
+        # On this board copper is far from the edge, so it is a bound that passes.
+        p0 = {c["id"]: c for c in r["levels"]["P0"]["checks"]}
+        self.assertIn(p0["PCB.EDGE.ROUTED"]["state"],
+                      ("pass", "fail", "undetermined"))
+
+
+class TestThreeAdapterFixes(unittest.TestCase):
+    """Three reader defects that each invented a violation on a finished board.
+
+    None of them was a rule problem: every one of them was this server measuring
+    a shape it had misread. All three are pinned here because they are silent -
+    a wrong polygon still produces a number, and a number still produces a
+    verdict.
+    """
+
+    def test_rotated_custom_pad_turns_once_not_twice(self):
+        """vme-wren L1: footprint 180, both pads 180. Turning the outline here AND
+        in `pad_points` put the two pads of one inductor on top of each other and
+        reported a 0.0 mm short between `Net-(IC32-SW)` and `5VREG`."""
+        p = _demo("vme-wren")
+        if not p:
+            self.skipTest("KiCad demos not installed")
+        from pcb_agent_mcp.adapters.canonical import pad_points
+        from pcb_agent_mcp import geometry as G
+        b = open_board(p)
+        fp = [f for f in b.footprints if f.get("ref") == "L1"][0]
+        self.assertEqual(round(float(fp.get("rotation") or 0), 3), 180.0)
+        pads = {p["number"]: pad_points(p) for p in fp["pads"]}
+        d = G.dist_polygon_polygon(pads["1"], pads["2"])
+        # The control that can fail: before the fix this was 0.0.
+        self.assertGreater(d, 1.0, "the two pads of L1 overlap: the outline was "
+                                   "turned twice")
+
+    def test_a_through_via_has_no_copper_where_it_does_not_connect(self):
+        """`(remove_unused_layers yes)` on 4370 vme-wren vias. Treating the whole
+        F.Cu..B.Cu span as copper made an In4.Cu track passing 0.4 mm from one
+        read as a 0.0 mm clearance, while `kicad-cli pcb drc` reports no clearance
+        violation at all on that board."""
+        p = _demo("vme-wren")
+        if not p:
+            self.skipTest("KiCad demos not installed")
+        b = open_board(p)
+        v = [v for v in b.vias
+             if abs(v["x"] - 96.326125) < 1e-3 and abs(v["y"] + 240.302175) < 1e-3][0]
+        self.assertTrue(v["unused_layers_removed"])
+        self.assertEqual(len(v["layers_span"]), 12)
+        self.assertNotIn("In4.Cu", v["layers"])
+        self.assertIn("F.Cu", v["layers"])
+        # ... and the copper it does have is kept: 3 of 12 layers here.
+        self.assertGreaterEqual(len(v["layers"]), 2)
+
+    def test_a_connector_pad_is_not_a_short(self):
+        """StickHub JP1 is `(pad "1" connect custom ...)`: two interlocking comb
+        outlines on two different nets. `kicad-cli pcb drc` on that file reports
+        ZERO violations, so this must not be a spacing pair."""
+        p = _demo("stickhub", folder="stickhub", fname="StickHub.kicad_pcb")
+        if not p:
+            self.skipTest("KiCad demos not installed")
+        b = open_board(p)
+        m = M.measure(b)
+        row = m.get("min_track_space") or {}
+        where = str(row.get("where") or "")
+        self.assertNotIn("JP1", where, "a `connect` pad was used as a spacing pair")
+        val = row.get("value")
+        if val is not None:
+            self.assertGreater(float(val), 0.0)
+
+class TestCatalog(unittest.TestCase):
+
+    def test_catalog_lists_every_gradable_rule_with_a_level(self):
+        cat = catalog()
+        rules = cat["rules"] if isinstance(cat, dict) else cat
+        self.assertGreaterEqual(len(rules), 20)
+        for r in rules:
+            self.assertIn(r["level"], LEVELS, r["id"])
+            self.assertTrue(r.get("title"))
+            self.assertTrue(r.get("source"), r["id"])
+        ids = [r["id"] for r in rules]
+        for own in ("layout.connectivity_complete", "layout.segment_angle_45",
+                    "layout.courtyard_clear", "layout.parts_on_board"):
+            self.assertIn(own, ids)
+        for fab in ("layout.min_trace_width", "layout.min_via_hole"):
+            row = [r for r in rules if r["id"] == fab][0]
+            self.assertEqual(row["level"], "P0")
+
+
+if __name__ == "__main__":
+    unittest.main()

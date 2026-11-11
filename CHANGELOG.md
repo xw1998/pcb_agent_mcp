@@ -9,6 +9,81 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.130] - 2026-11-11
+
+这一版做**规则**：把散落在 `layout_review` / `design_rules` / `jlc_spec_check` 里的判据收成一套
+带优先级的规则集（`pcb_agent_mcp.ruleset`），再用 **18 块 KiCad 官方 demo 成品板**去问它：
+`if 规则说这些板做不出来，那是规则错了`。
+
+### 规则从三个地方来，55 条
+
+| 来源 | 条数 | 落到哪层 |
+|---|---|---|
+| 厂商能力库 `jlc/data/jlc-pcb-capabilities.json`（每条带 `src`/`tier`/`url`/逐字 `quote`） | 29 PCB（+20 SMT，仅 `process.smt` 时加载） | P0（丝印 3 条降 P4） |
+| 设计目录 `calc/rules.py` | 22 | P1/P2/P3/P4 |
+| 本包自己量的几何（连通性 / 45° /  courtyard / 出框） | 4 | P1×1 P2×2 P3×1 |
+
+### 五级优先级，和三条硬规矩
+
+P0 可制造性 / P1 电气完整性 / P2 装配机械 / P3 信号质量 / P4 印字可读。
+
+1. **只有 P0–P2 能阻塞**：P3/P4 的 fail 只进 `flagged`，且只在没有阻塞项时才出现。
+2. **阻塞层之下全部 `deferred`**，保留自己的 `graded_state`；`first_action` 只从阻塞层按
+   margin 升序取——低层的 fail 永远不许当「下一步」。
+3. **severity ≠ priority**：`min_trace_width` 目录 severity 是 `Low` 但 P0（板厂真拒单）；
+   `rf_z0_tolerance` 是 `High` 却 P3（阻抗偏 5% 的板照样装、照样连通）。
+
+### 18 块官方 demo 校准（含两块未布线正对照）
+
+| 结果 | 板数 |
+|---|---|
+| 不声明工艺 → P0 `undetermined`，只报 P1 及以下 | 18/18 |
+| 声明工艺（2 层 1 oz）后 **P0 全 pass** | **11/18**（6 块 P3 flagged + 4 块 20+ 条 undetermined + StickHub 转 P1） |
+| 声明工艺后被 P0 拦（每条都指到具体焊盘/过孔坐标） | **7/18** |
+| 未布线正对照被 P1 `layout.connectivity_complete` 拦住 | 2/2 ✓ |
+| 不声明工艺时被 P1 拦（含两块正对照） | 4/18 |
+
+### 第一轮 6 块量产板被误判 unbuildable、vme-wren 被误判 P2：八类假阳性全是自己的错
+
+| # | 假阳性 | 根因 | 修法 | 权威对照 |
+|---|---|---|---|---|
+| 1 | NPTH 安装孔当镀通孔 | `_hole_list` 不带 `pad_type`，无铜孔被算进 `min_th_annular` ⇒ 焊环 0 | oracle 带 `pad_type`；measure 分流镀通/非镀通，新增 `min_npth_drill`/`min_npth_ring` | 该板重判 P3 通过 |
+| 2 | 丝印填充图形当线宽 | `fp_poly` 的 `width` 是填充轮廓，不是笔画 | 排除 `_SILK_AREA_KINDS`；`PCB.SILK.*` 三条整体降 P4 | KiCad DRC 不报丝印细 |
+| 3 | 无网络铜造出 0 间距 | `net=None` 焊盘的 bbox 覆盖整颗器件，与别人的铜算出「重叠」 | 无网络铜退出异网间距扫描，另报 `copper_items_without_net` 计数 | 真最近间距是 0.091 mm，不是 0 |
+| 4 | oracle 拼写导致盲判 | oracle 返 `measured`，ruleset 只认 `value` ⇒ 三条规则永远 `undetermined` | `_norm()` 归一；`unmeasurable` 以 `no ` 开头视为 `NONE_PRESENT` | — |
+| 5 | 板框断链 → 碎成内槽 | `_chain_segments(tol=1e-6)` 把 1e-3 级折线断开，碎片被当板框/cutout | `_CHAIN_TOL = 1e-3`，未闭合链记 `board.outline_open` | 修后板框 160.1×233.5 mm 单条闭合、1338 个出框器件归零 |
+| 6 | custom 焊盘被旋转两次 | `pad["rotation"]` 是**绝对角**，adapter 又按 fp 角转了一次 ⇒ 两盘相交成 0.0 mm 假短路 | adapter **不再旋转** `polygon`，旋转只在 `canonical.pad_points` 做一次 | `kicad-cli pcb drc` 对该板 **610 条违规、0 条 clearance** |
+| 7 | through via 内层凭空多出焊环 | 文件带 `(remove_unused_layers yes)`，该 via 在内层本无铜 | 新增 `_resolve_via_copper()`：首末层 ∪ zone 连接层 ∪ 同网 zone 层 ∪ 邻近同网 track 端点层 | 该 via 解析为 `['F.Cu','In5.Cu','B.Cu']`（span 12）；4370/4374 个解析；audit 225 s→87 s |
+| 8 | `connect` 焊盘被当间距对 | `(pad "1" connect ...)` 是焊锡桥，KiCad DRC 刻意不查其间距 | oracle 打 `pad_connect` 标记，measure 跳过任一侧带标记的对（只标记不删） | `kicad-cli pcb drc` 对 StickHub = **0 条违规**（该板真因未连通转 P1） |
+
+另两处口径：**板厚吸附**（`cm5_minima` 叠层总量 1.5296 mm 吸附到 1.6，容差 0.1 mm，记 `process_snapped`）；
+**同一数字只许一个 owner**（`min_trace_width`/`min_via_hole` 交厂商库判，目录只留可发现性说明 `graded_by`）。
+
+### 修完假阳性之后剩下的 P0 fail——全部是文件里真实的几何
+
+细焊环 0.150/0.18（`SW501.4`）、铜到板边 0.191/0.2 与 0.0/0.2（`J1.16`、`JP1.2`、`J2.1#3`）、
+钻孔存成 0.00001 mm、两个过孔同一坐标 (136.960,−80.660)、`J2.1` 三个焊盘共用编号 1 其中两个同坐标、
+异网铜真重叠（`U5.1` vs `U5.2`）。**这是「官方 demo ≠ 官方可量产」，不是规则错。**
+
+### 新增
+
+- `pcb_agent_mcp.ruleset`：`levels.py`（五级 / 阻塞判定 / `resolve()`）、`measure.py`（40 条事实，
+  一次量完）、`audit.py`（合并两个库 + 下界即证据 + 厚度吸附）。
+- 工具 `board_rule_audit`（整块板按优先级判，只读）与 `pcb_rule_catalog`（规则全表），
+  工具数 241 → **243**。
+- `tools/calibrate_rules.py`：语料校准台，逐板落盘、可 `--only` / `--markdown`，重跑跳过已完成的。
+- `tests/test_ruleset.py` 18 条，每条都有能反向失败的控制（未布线正对照必须 P1 拦、NPTH 不许
+  算出零焊环、下界满足限值必须判 pass、非法 state 必须抛错…）。
+- `docs/132-规则优先级与官方成品板校准.md`：逐板结果、四类假阳性的取证、剩余 fail 的坐标，
+  以及 **20 条恒定 `undetermined` 的规则缺哪个 fact、由谁补** 的欠账表。
+
+### 口径写死
+
+- **下界即证据**：`lower_bound` 已满足 `>=` 限值 ⇒ pass 并标 `measured_from: lower_bound`；
+  已超 `<=` 限值 ⇒ fail。证据是「至少这么小」，不是「大概这么小」。
+- **P0 判的是「按声明的这道工艺」**，每条 fail 带 `process` 与逐字 `quote`，不写成判决书。
+- `undetermined` 永不计入 pass，也不冒充「通过」。
+
 ## [0.0.129] - 2026-11-11
 
 这一版做一件事：**把 `jackwang988/jlceda-pcb-ai-workflow`（MIT）整套制板门禁吸收进来**，

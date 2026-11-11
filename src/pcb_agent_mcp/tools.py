@@ -4329,6 +4329,115 @@ _tool(
     _pro_rules_write,
 )
 
+def _rule_audit(board, args):
+    """Run the prioritized audit and hand back the levels, the verdict, the numbers."""
+    from .ruleset import audit as _audit
+    from .ruleset.levels import LEVELS
+
+    process = args.get("process")
+    if isinstance(process, str):
+        if not process.strip():
+            process = None
+        else:
+            try:
+                process = json.loads(process)
+            except ValueError as exc:
+                return err("process is not valid JSON: %s" % exc, "BAD_ARG",
+                           hint='pass {"layers": 2, "copper_oz": 1}')
+    if process is not None and not isinstance(process, dict):
+        return err("process must be an object such as {layers: 2, copper_oz: 1}",
+                   "BAD_ARG")
+    facts = args.get("facts")
+    if isinstance(facts, str) and facts.strip():
+        try:
+            facts = json.loads(facts)
+        except ValueError as exc:
+            return err("facts is not valid JSON: %s" % exc, "BAD_ARG")
+    if facts is not None and not isinstance(facts, dict):
+        return err("facts must be an object of fact name -> value", "BAD_ARG")
+    levels = args.get("levels")
+    if isinstance(levels, str):
+        levels = [x.strip() for x in levels.split(",") if x.strip()]
+    if levels:
+        bad = [x for x in levels if x not in LEVELS]
+        if bad:
+            return err("unknown priority level(s): %s" % ", ".join(map(str, bad)),
+                       "BAD_ARG", hint="levels are P0..P4")
+    window = args.get("window_mm")
+    try:
+        out = _audit(board, process=process, facts=facts, levels=levels,
+                     window_mm=float(window) if window else 2.0)
+    except ValueError as exc:
+        return err(str(exc), "BAD_ARG")
+    return ok(
+        value=out,
+        unit="verdict",
+        model="prioritized_rule_audit",
+        basis="measured from the file's own geometry (pads, tracks, vias, zones, "
+              "silk and courtyard boxes) plus the published JLCPCB capability "
+              "library for P0 and the design catalogue for P1..P4",
+        precision="exact for counts and widths read from the file; minimum "
+                  "clearances are edge-to-edge on stored copper; a rule whose "
+                  "measurement this server does not have is reported as "
+                  "undetermined and never as a pass",
+        assumptions={"nothing_is_written": True,
+                     "p0_needs_declared_process": True,
+                     "blocking_levels": ["P0", "P1", "P2"]},
+        extra=({"how_to_read": "priority.blocking_level is the highest level that "
+                               "fails; every level below it is deferred, not passed; "
+                               "priority.flagged lists P3/P4 findings that do not "
+                               "block a build"}),
+    )
+
+
+def _rule_catalog(args):
+    from .ruleset import catalog as _catalog
+    return ok(
+        value=_catalog(),
+        unit="rule list",
+        model="prioritized_rule_catalog",
+        basis="the design catalogue (calc/rules.py) plus the geometric rules the "
+              "audit measures itself; the P0 fab rules live in the capability "
+              "library and are listed by jlc_capabilities",
+        precision="exact: this is the rule set itself, not a measurement",
+        assumptions={"priority_is_not_severity": True},
+    )
+
+_tool(
+    "board_rule_audit",
+    "The prioritized audit: measure the board once, grade every rule, and return the "
+    "five priority levels P0..P4 with a strict order - P0 manufacturability, P1 "
+    "electrical integrity, P2 assembly/mechanical, P3 signal quality, P4 readability. "
+    "Only P0..P2 can block a board; everything below the first failing blocking level "
+    "is reported as `deferred` (its own grade kept), never as done. P0 limits come "
+    "from the quoted JLCPCB capability library and are graded only when `process` is "
+    "declared - without it P0 stays undetermined rather than guessing a limit. Rows "
+    "this server cannot measure are `undetermined`, never `pass`. Read-only: nothing "
+    "is routed, moved, poured or written.",
+    {"type": "object",
+     "properties": dict({
+         "process": {"type": "object", "description":
+             "the fab process the P0 limits depend on, e.g. {layers: 2, copper_oz: 1, "
+             "thickness_mm: 1.6, surface: 'HASL_LEADFREE'}; leave it out and P0 is "
+             "reported as undetermined"},
+         "facts": {"type": "object", "description":
+             "extra facts the caller already knows (schematic-side counts, currents), "
+             "as {fact_name: value}; they are merged over the measured ones"},
+         "levels": _arr("only these priority levels, e.g. ['P0','P1']"),
+         "window_mm": _num("pair-search window for clearances (default 2.0)", 2.0),
+     }, **_COMMON), "required": ["path"]},
+    _board_tool(_rule_audit, derived=True),
+)
+
+_tool(
+    "pcb_rule_catalog",
+    "List the rules this server audits, each with the priority level it sits at, its "
+    "limit, its source and how it is measured. Use it to see what board_rule_audit "
+    "will check and in what order, before running it. Read-only, no board needed.",
+    {"type": "object", "properties": {}},
+    _rule_catalog,
+)
+
 def _parse_object_list(val, what):
     """A list of dicts, or a JSON string that decodes to one. Anything else fails."""
     if val is None or val == "":

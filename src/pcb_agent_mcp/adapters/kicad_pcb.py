@@ -167,16 +167,33 @@ def _arc_points(start, mid, end):
     return G.arc_to_points((ux, uy), r, a0, sweep, chord_tol_mm=_ARC_CHORD_TOL)
 
 
-def _chain_segments(segments, tol=1e-6):
-    """Chain unordered segments into closed contours [(x,y), ...]."""
+_CHAIN_TOL = 1e-3   # 1 um: a drawing gap, never a manufacturable one
+
+
+def _chain_segments(segments, tol=_CHAIN_TOL):
+    """Chain unordered segments into contours, closed ones kept apart from open ones.
+
+    Returns ``(closed, open)``. Two things used to be wrong here and both were
+    silent on a board with arcs on Edge.Cuts (vme-wren):
+
+    * ``tol=1e-6`` mm. KiCad stores an arc's endpoints rounded, so a line and the
+      arc it should meet can differ by ~1e-4 mm; at 1e-6 the chain breaks, and
+      the leftover pieces were then chained into sliver "cut-outs" with throats
+      of 0.005 mm. 1 um is far below any board feature and far above the noise.
+    * an unclosed chain was returned as if it were a contour. The caller then took
+      the largest fragment as the board outline (`outline bbox` spanned 67 mm of a
+      160 mm board) and every part outside the fragment "was off the board":
+      1338 of them on a finished VME board. An open chain is now returned as
+      open, so the rules that need a closed outline say `undetermined`.
+    """
     segs = [(a, b) for a, b in segments if a != b]
     if not segs:
-        return []
+        return [], []
 
     def close(p, q):
         return abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
 
-    contours = []
+    contours, open_chains = [], []
     used = [False] * len(segs)
     for i, (a, b) in enumerate(segs):
         if used[i]:
@@ -204,9 +221,10 @@ def _chain_segments(segments, tol=1e-6):
                 break
         if len(poly) >= 3:
             if close(poly[0], poly[-1]):
-                poly = poly[:-1]
-            contours.append(poly)
-    return contours
+                contours.append(poly[:-1])
+            else:
+                open_chains.append(poly)
+    return contours, open_chains
 
 
 def _edge_polygons(board_node):
@@ -252,8 +270,8 @@ def _edge_polygons(board_node):
                 del pts
             elif kind == "gr_curve":
                 segments.extend(_bezier_segments(node))
-    contours = _chain_segments(segments)
-    return polys, contours
+    closed, open_chains = _chain_segments(segments)
+    return polys, closed, open_chains
 
 
 def _bezier_segments(node, steps=16):
@@ -734,11 +752,14 @@ def _footprint(node, mask_expansion=0.0):
         px, py = pad["x"], pad["y"]
         pad["x"] = x + px * ca - py * sa
         pad["y"] = y + px * sa + py * ca
-        if pad.get("polygon"):
-            # A custom pad's outline is stored relative to its anchor, so it has to
-            # turn with the footprint as well.
-            pad["polygon"] = [(qx * ca - qy * sa, qx * sa + qy * ca)
-                              for qx, qy in pad["polygon"]]
+        # A custom pad's outline stays UNROTATED and untranslated: `polygon` is in the
+        # pad's own frame relative to its anchor, and `canonical.pad_points` turns it
+        # by `pad["rotation"]`, which the file stores as an ABSOLUTE angle. Turning it
+        # here as well meant the pad's primitive was rotated twice - by the footprint
+        # angle once (and, in an earlier attempt, once more by the pad angle). On
+        # vme-wren L1 (VLCF5020, footprint 180, both pads 180) the double turn left the
+        # two pads INTERSECTING and invented a 0.0 mm short between `Net-(IC32-SW)` and
+        # `5VREG` on a finished 1508-part VME board.
         # pad["rotation"] stays as written: it is already absolute.
         pad["ref"] = ref
     # Copper drawn as a footprint graphic is real copper (microwave draws its whole
@@ -948,6 +969,105 @@ def _zone(node):
         "thermal_bridge_width_mm": (thermal_bridge
                                     if thermal_bridge not in (None, "") else None),
     }
+
+
+# --------------------------------------------------- via copper bookkeeping
+_VIA_CONNECT_TOL = 5e-3     # mm; a track end and the via it lands on are written
+                            # with the same coordinates, but an arc's end is rounded
+
+
+def _resolve_via_copper(board):
+    """Give every through via the copper layers it really HAS, not the ones it spans.
+
+    A `(via ... (layers "F.Cu" "B.Cu"))` is a through via: geometrically it passes
+    through every copper layer, but KiCad only leaves copper on the layers it uses.
+    `(remove_unused_layers yes)` drops the annular ring on a layer where nothing of
+    the same net connects, and `(keep_end_layers yes)` keeps the two end layers
+    regardless. Both are on 4370 of vme-wren's vias; ignoring them gave every one of
+    those vias a full 0.6 mm ring on EVERY inner layer, so an unrelated `In4.Cu`
+    track passing 0.4 mm from one came out as a 0.0 mm clearance
+    (`PCB.TRACE.SPACE_MIN 0.0 / 0.1`). KiCad's own DRC on that finished VME board
+    reports 610 violations and not one of them is a clearance.
+
+    The connection test is deliberately the narrow one: a same-net track END within
+    `_VIA_CONNECT_TOL`, or a same-net zone that covers the layer at all. The zone
+    rule keeps a ring KiCad may have removed, which can only over-report a
+    clearance - the safe direction for a DRC surrogate - never hide a short.
+    """
+    cu = [str(s.get("name")) for s in (board.stackup or [])
+          if str(s.get("name") or "").endswith(".Cu")]
+    if not cu:
+        cu = ["F.Cu", "B.Cu"]
+    order = {n: i for i, n in enumerate(cu)}
+
+    # Same-net track ends on a 1 mm grid: a via then looks at nine cells instead of
+    # every track on the board (vme-wren: 4370 vias, tens of thousands of tracks).
+    cells = {}
+    for tr in board.tracks:
+        net, layer = tr.get("net"), tr.get("layer")
+        if not net or not layer:
+            continue
+        for pt in (tr.get("start"), tr.get("end")):
+            if not pt:
+                continue
+            cells.setdefault((net, int(pt[0]), int(pt[1])), []).append(
+                (layer, pt[0], pt[1]))
+    zone_layers = {}
+    for z in board.zones:
+        if z.get("is_keepout"):
+            continue          # a keep-out is not copper
+        net = z.get("net")
+        if not net:
+            continue
+        for name in z.get("layers") or []:
+            if name in order:
+                zone_layers.setdefault(str(net), set()).add(name)
+
+    removed_total = 0
+    for v in board.vias:
+        frm, to = v.get("from"), v.get("to")
+        if frm in order and to in order:
+            i, j = order[frm], order[to]
+            span = list(cu[min(i, j):max(i, j) + 1])
+        else:
+            span = list(cu)
+        if not v.get("unused_layers_removed"):
+            v["layers"] = span
+            v["layers_source"] = "a_via_has_copper_on_every_layer_it_spans"
+            continue
+        keep = set()
+        if v.get("keep_end_layers"):
+            keep.update(n for n in (frm, to) if n in order)
+        for name in v.get("zone_layer_connections") or []:
+            if name in order:
+                keep.add(name)
+        net = v.get("net")
+        if net:
+            keep |= zone_layers.get(str(net), set())
+            cx, cy = v["x"], v["y"]
+            ix, iy = int(cx), int(cy)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for layer, px, py in cells.get((net, ix + dx, iy + dy), ()):
+                        if (abs(px - cx) <= _VIA_CONNECT_TOL
+                                and abs(py - cy) <= _VIA_CONNECT_TOL):
+                            keep.add(layer)
+        layers = [n for n in span if n in keep]
+        if not layers:
+            # Nothing of this net reaches the via: KiCad would have deleted it, so
+            # the file says something this reader cannot resolve. Keep the ends -
+            # the smallest set that still leaves a via a via - and say so.
+            layers = [n for n in (span[0], span[-1])]
+            v["layers_source"] = ("remove_unused_layers_but_no_connection_was_found: "
+                                  "end layers kept")
+        else:
+            v["layers_source"] = ("remove_unused_layers: only layers a same-net track "
+                                  "end or a same-net zone reaches")
+        if len(layers) != len(span):
+            removed_total += 1
+        v["layers"] = layers
+        v["layers_span"] = span
+    board.via_copper_resolved = removed_total
 
 
 # ---------------------------------------------- side files: rules / stackup
@@ -1216,6 +1336,18 @@ def parse_board_text(text, path="<memory>", project_path=None):
             "to": lname[-1] if len(lname) > 1 else (lname[0] if lname else None),
             "kind": vtype if vtype in ("blind", "micro") else "through",
             "locked": child(via, "locked") is not None,
+            # KiCad does not give a through via copper on every layer it spans:
+            # `(remove_unused_layers yes)` drops the annular ring wherever the via
+            # connects to nothing, and `(keep_end_layers yes)` keeps the two ends.
+            # Both flags are read here and RESOLVED after the stackup is known -
+            # see `_resolve_via_copper`. 4370 of vme-wren's vias carry the first
+            # flag, and ignoring it invented a 0.0 mm clearance on a board whose
+            # own DRC reports none.
+            "unused_layers_removed": child(via, "remove_unused_layers") is not None,
+            "keep_end_layers": child(via, "keep_end_layers") is not None,
+            "zone_layer_connections": [
+                v for v in (child(via, "zone_layer_connections") or [])[1:]
+                if not isinstance(v, list)],
         })
 
     for gnode in tree:
@@ -1248,7 +1380,12 @@ def parse_board_text(text, path="<memory>", project_path=None):
     for znode in children(tree, "zone"):
         board.zones.append(_zone(znode))
 
-    polys, contours = _edge_polygons(tree)
+    polys, contours, open_chains = _edge_polygons(tree)
+    if open_chains:
+        # Kept, not dropped: `board.outline_open` is what tells the rules that the
+        # board edge could not be closed, so edge-distance and off-board checks
+        # are undetermined instead of judged against a fragment.
+        board.outline_open = list(open_chains)
     if polys:
         # gr_rect / gr_circle / gr_poly: the FIRST is the outer contour, and every
         # later one is a cut-out. Putting them all in `outline` (what this did
@@ -1266,6 +1403,7 @@ def parse_board_text(text, path="<memory>", project_path=None):
             board.cutouts.extend(contours)
 
     board.stackup = _stackup(tree, thickness)
+    _resolve_via_copper(board)
     rules = load_project_rules(project_path or path)
     if not rules.get("net_classes"):
         # the project file is absent (or has no classes): the board file's own

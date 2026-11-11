@@ -117,7 +117,16 @@ def _items(board, layer=None, nets=None):
                 # comparing it here invented 0.0 mm "violations" between the paste
                 # geometry of neighbouring pads (royalblue54L_feather, openair-max).
                 continue
+            # `(pad "1" connect ...)` is a CONNECTOR pad: KiCad documents it as the
+            # pad a solder bridge or mating contact lands on, and its clearance
+            # checker skips it. StickHub's JP1 is exactly that - two interlocking
+            # comb outlines on `Net-(J1-Pin_1)` and `VIN` - and the hulled outline
+            # of the two teeth came out 0.000 mm apart while `kicad-cli pcb drc`
+            # on the same file reports ZERO violations. Tagged (not dropped) so the
+            # spacing sweep can skip it while connectivity still sees the copper.
+            connect_pad = (pad.get("type") == "connect")
             items.append({"kind": "pad", "net": pad.get("net"),
+                          "pad_connect": connect_pad,
                           "uuid": pad.get("uuid"),
                           # A local clearance on the pad/footprint replaces the net
                           # class value for anything measured against it.
@@ -166,7 +175,13 @@ def _items(board, layer=None, nets=None):
         dia = via.get("diameter") or via.get("drill") or 0.4
         items.append({"kind": "via", "net": via.get("net"),
                       "uuid": via.get("uuid"), "layer": None,
-                      "layers": _layer_span(board, via.get("from"), via.get("to")),
+                      # `layers` is resolved by the adapter (`_resolve_via_copper`):
+                      # a through via with `(remove_unused_layers yes)` has copper
+                      # only where something of its net reaches it, and calling
+                      # its whole span copper invents 0.0 mm clearances (vme-wren).
+                      "layers": (via.get("layers")
+                                 or _layer_span(board, via.get("from"),
+                                                via.get("to"))),
                       "poly": G.circle_points(via["x"], via["y"], dia / 2.0, 16),
                       "ref": "via@(%.3f,%.3f)" % (via["x"], via["y"])})
     return items
@@ -2754,7 +2769,7 @@ def _poly_holds(poly, bands, band, px, py):
     return inside
 
 
-def _net_copper(board, net, pours_connect=True):
+def _net_copper(board, net, pours_connect=True, all_items=None):
     """One net's copper as distance-comparable items, filled pours included.
 
     `_items` covers pads, tracks and vias but not the filled copper of a zone, and
@@ -2763,7 +2778,11 @@ def _net_copper(board, net, pours_connect=True):
     Each filled_polygon of a same-net zone becomes one item of kind "zone",
     tagged with the zone's index and its piece number so a report can name it.
     """
-    items = [dict(it) for it in _items(board) if it.get("net") == net]
+    # `all_items` lets a caller that walks every net build the item list once
+    # instead of once per net (on a 112-part board that is 220 rebuilds).
+    if all_items is None:
+        all_items = _items(board)
+    items = [dict(it) for it in all_items if it.get("net") == net]
     pours = 0
     if pours_connect:
         for zi, z in enumerate(board.zones or []):
@@ -2832,6 +2851,14 @@ def _copper_groups(items, prims, grid, cell=1.0, tol=1e-6):
     """
     n = len(items)
     par = list(range(n))
+    # Each segment's own inflated bbox. Two segments can only be within
+    # (hw_a + hw_b) of each other when those boxes touch, so a box test throws
+    # away most same-cell pairs (a 1 mm cell at a pour corner holds hundreds of
+    # unrelated segments) before any exact distance is computed.
+    boxes = []
+    for (_idx, a, b, hw) in prims:
+        boxes.append((min(a[0], b[0]) - hw, min(a[1], b[1]) - hw,
+                      max(a[0], b[0]) + hw, max(a[1], b[1]) + hw))
 
     def find(x):
         while par[x] != x:
@@ -2845,11 +2872,29 @@ def _copper_groups(items, prims, grid, cell=1.0, tol=1e-6):
             par[rb] = ra
 
     for bucket in grid.values():
-        for i in range(len(bucket)):
-            for j in range(i + 1, len(bucket)):
-                pa, pb = prims[bucket[i]], prims[bucket[j]]
-                ia, ib = pa[0], pb[0]
-                if ia == ib or find(ia) == find(ib):
+        m = len(bucket)
+        # Sorting by item id puts one item's own segments in a contiguous run.
+        # They can never join anything to each other, and a pour corner can put
+        # fifty of them in one cell - that run used to cost 1 225 wasted pairs.
+        bucket.sort(key=lambda k: prims[k][0])
+        for i in range(m):
+            ka = bucket[i]
+            pa = prims[ka]
+            ia = pa[0]
+            j = i + 1
+            while j < m and prims[bucket[j]][0] == ia:
+                j += 1
+            if j >= m:
+                continue
+            ax0, ay0, ax1, ay1 = boxes[ka]
+            for jj in range(j, m):
+                kb = bucket[jj]
+                bx0, by0, bx1, by1 = boxes[kb]
+                if ax0 > bx1 or bx0 > ax1 or ay0 > by1 or by0 > ay1:
+                    continue
+                pb = prims[kb]
+                ib = pb[0]
+                if find(ia) == find(ib):
                     continue
                 if not set(items[ia]["layers"]) & set(items[ib]["layers"]):
                     continue
@@ -2920,7 +2965,7 @@ def _piece_gap(prims_a, prims_b, grid_b, cell, limit_mm):
 
 
 def net_gaps(board, net=None, pours_connect=True, gap_limit_mm=5.0, limit=12,
-             cell_mm=1.0):
+             cell_mm=1.0, max_prims_per_net=None):
     """Which pieces of one net's copper are still separate, and how far apart.
 
     DRC says 115 unconnected on the reference board and stops there: it counts
@@ -2951,9 +2996,10 @@ def net_gaps(board, net=None, pours_connect=True, gap_limit_mm=5.0, limit=12,
     cell = float(cell_mm)
 
     nets = []
+    all_items = _items(board)
     if net is None:
         seen = set()
-        for it in _items(board):
+        for it in all_items:
             if it.get("net") and it["net"] not in seen:
                 seen.add(it["net"].__str__())
                 nets.append(it["net"])
@@ -2964,13 +3010,23 @@ def net_gaps(board, net=None, pours_connect=True, gap_limit_mm=5.0, limit=12,
     else:
         nets = [net]
 
-    summary, keep, pours_total = [], {}, 0
+    summary, keep, pours_total, skipped = [], {}, 0, []
     for name in nets:
-        items, pours = _net_copper(board, name, pours_connect=pours_connect)
+        items, pours = _net_copper(board, name, pours_connect=pours_connect,
+                                  all_items=all_items)
         pours_total += pours
         if not items:
             continue
         prims = _copper_edges(items)
+        # A ground pour is one net with 1.4 M boundary edges on a large board,
+        # and the walk is quadratic in a cell's edge count (GND alone asked for
+        # 456 M candidate pairs).  Rather than spend minutes, the caller may set
+        # a budget: a net over it is SKIPPED and named, never guessed at - the
+        # total then stops being a count and becomes a lower bound.
+        if max_prims_per_net and len(prims) > int(max_prims_per_net):
+            skipped.append({"net": name, "edges": len(prims),
+                            "budget": int(max_prims_per_net)})
+            continue
         grid = _edge_grid(prims, cell)
         groups, find = _copper_groups(items, prims, grid, cell)
         summary.append({"net": name, "pieces": len(groups),
@@ -2980,12 +3036,23 @@ def net_gaps(board, net=None, pours_connect=True, gap_limit_mm=5.0, limit=12,
             keep[name] = (items, prims, groups, find)
 
     if net is not None and not summary:
+        if skipped:
+            return err("%s was skipped: %d edges exceed the %d budget"
+                       % (net, skipped[0]["edges"], skipped[0]["budget"]),
+                       "SKIPPED_BY_BUDGET",
+                       hint="raise max_prims_per_net, or use board_drc for this net")
         return err("no copper of that net on this board", "NO_GEOMETRY",
                    hint="net names are the board's own; use board_nets to see them")
 
     value = {"nets": sorted(summary, key=lambda s: (-s["edges_needed"], str(s["net"]))),
              "edges_needed_total": sum(s["edges_needed"] for s in summary),
-             "pours_counted_as_copper": int(pours_total)}
+             "pours_counted_as_copper": int(pours_total),
+             "complete": not skipped}
+    if skipped:
+        value["skipped_nets"] = sorted(skipped, key=lambda s: -s["edges"])
+        value["edges_needed_total_is"] = (
+            "a LOWER BOUND: %d net(s) were skipped by the edge budget, so the "
+            "count covers only the nets actually walked" % len(skipped))
     assumptions = {"pours_connect": bool(pours_connect),
                    "cell_mm": cell,
                    "gap_limit_mm": None if net is None else float(gap_limit_mm),
@@ -4896,6 +4963,9 @@ def _hole_list(board):
                           "diameter_mm": min(float(pad.get("w") or 0.0),
                                              float(pad.get("h") or 0.0)),
                           "net": pad.get("net"), "uuid": pad.get("uuid"),
+                          # Plating matters: a 4.3 mm mounting hole is an NPTH with
+                          # no copper collar, so an annular-ring rule must not see it.
+                          "pad_type": pad.get("type"),
                           # The pad that OWNS the hole is the annular ring, which is
                           # a different rule; kept here so the copper-to-hole sweep
                           # can leave it out without relying on net matching.
