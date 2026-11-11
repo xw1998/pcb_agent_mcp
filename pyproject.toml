@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcb-agent-mcp"
-version = "0.0.128"
+version = "0.0.129"
 description = "AI-native PCB design MCP server - Calc layer: current, impedance, lambda/20 and safety spacing with a strict evidence envelope"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,3 +32,9 @@ pcb-agent-mcp = "pcb_agent_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The JLCPCB capability library ships inside the package: every limit must travel
+# with its src/quote/tier, so a wheel without these JSON files would be a wheel whose
+# gates have no numbers to compare against.
+[tool.setuptools.package-data]
+"pcb_agent_mcp.jlc" = ["data/*.json", "data/rule-presets/*.json"]

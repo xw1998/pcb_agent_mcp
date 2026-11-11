@@ -5655,6 +5655,10 @@ def _capabilities(_args):
             "filter_coupled_microstrip", "filter_coupled_resonator",
             "filter_waveguide_cavity", "filter_coupling_matrix",
             "fullwave_solver",
+            "jlc_library_validate", "jlc_capabilities", "jlc_process",
+            "jlc_spec_check", "jlc_gerber_guard", "jlc_bom_cpl", "jlc_rules_check",
+            "jlc_gate", "jlc_release", "jlc_geometry_audit", "jlc_schematic_spec",
+            "jlc_pitfalls",
             "board_fab_package", "board_export_graphics", "board_export_3d",
             "part_export",
             "schematic_pcb_diff", "schematic_pcb_sync", "schematic_export",
@@ -12342,12 +12346,26 @@ def _board_fab_package(args):
     if isinstance(formats, str):
         formats = [f.strip() for f in formats.split(",") if f.strip()]
     try:
-        return _fab.package(path, out_dir=args.get("out_dir"),
-                            formats=formats or ("gerbers", "drill", "pos"),
-                            allow_beside_source=bool(args.get("allow_beside_source")),
-                            zip_it=args.get("zip") is not False)
+        out = _fab.package(path, out_dir=args.get("out_dir"),
+                           formats=formats or ("gerbers", "drill", "pos"),
+                           allow_beside_source=bool(args.get("allow_beside_source")),
+                           zip_it=args.get("zip") is not False)
     except Exception as exc:                       # noqa: BLE001
         return _fab_fail(exc)
+    if args.get("jlc_guard"):
+        # The package's own checks only look for M02* / a tool table / one row.
+        # The JLC guard parses the files and grades them against the published
+        # capability library. A guard that cannot run is reported, never dropped.
+        from .jlc import api as _jlc
+        process = args.get("jlc_process")
+        target = out.get("zip") or out.get("out_dir")
+        try:
+            out["jlc"] = _jlc.gerber_guard(target, process,
+                                           structure_only=not process)
+        except Exception as exc:                   # noqa: BLE001
+            out["jlc"] = {"status": "error", "reason_code": "JLC_GUARD_FAILED",
+                          "message": "%s: %s" % (type(exc).__name__, exc)}
+    return out
 
 def _board_export_graphics(args):
     from . import fab as _fab
@@ -12416,6 +12434,12 @@ _tool(
                         "the source directory is refused"),
         "allow_beside_source": _bool("really write inside the design's directory", False),
         "zip": _bool("also write fab.zip (default true)", True),
+        "jlc_guard": _bool("also parse the produced files and grade them against the "
+                           "bundled JLCPCB capability library (result under `jlc`)", False),
+        "jlc_process": {"type": "object", "description":
+                        "the JLCPCB process declaration (layers / copper_oz required, see "
+                        "jlc_process); without it the guard runs structure checks only, "
+                        "because a guessed copper weight picks the wrong limit row"},
     }, "required": ["path"]},
     _board_fab_package,
 )
@@ -12526,6 +12550,10 @@ CORE_TOOLS = (
     "sim_spice", "thermal_via_array",
     # parts
     "part_search", "part_get",
+    # JLCPCB fabrication gates are NOT here on purpose: the core page is packed to
+    # the 25 KiB tools/list budget (46 tools / 23 976 B before this release), so any
+    # addition pushes a tool off the single page. They stay in the registry, are
+    # listed by calc_capabilities, and tool_search / tool_call reach them.
 )
 
 
@@ -14215,3 +14243,12 @@ RETIRED_TOOLS = {
 
 for _gone in RETIRED_TOOLS:
     TOOLS.pop(_gone, None)
+
+
+# ------------------------------------------------ JLCPCB fabrication gates (0.0.129)
+# Absorbed from jackwang988/jlceda-pcb-ai-workflow (MIT). The thresholds live in
+# jlc/data/*.json with src + quote + tier per row, the logic in jlc/api.py, and the
+# envelope shaping in jlc/mcp.py. Nothing here places an order or uploads a file.
+from .jlc import mcp as _jlc_mcp
+
+_jlc_mcp.register(_tool, _str, _num, _bool, _arr)

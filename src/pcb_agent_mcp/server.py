@@ -5448,11 +5448,12 @@ def selftest(verbose=False):
                      .get("value") or {}).get("P_v_w_m3") or 0.0)
     _cap = _tools.TOOLS["calc_capabilities"]["handler"]({})
     check("fringing is reachable from the capability list as well as the tool "
-          "table (200 tools now: 192 until 0.0.107 removed the autorouter and the "
+          "table (241 tools now: 192 until 0.0.107 removed the autorouter and the "
           "auto-fanout, 0.0.114 added board_journal, 0.0.118 added five geometry "
-          "judges and no writer, 0.0.119 added the pour-border writer), so an agent that asks what can be "
+          "judges and no writer, 0.0.119 added the pour-border writer, 0.0.129 "
+          "added the twelve JLCPCB fabrication gates), so an agent that asks what can be "
           "computed is told about it",
-          len(_tools.TOOLS) == 200
+          len(_tools.TOOLS) == 241
           and "magnetics_fringing_loss" in (_cap.get("available") or [])
           and "fringing" in (_tools.TOOLS["magnetics_fringing_loss"]
                              ["description"].lower()),
@@ -5627,10 +5628,11 @@ def selftest(verbose=False):
           "%d warnings" % len(_lf_wide.get("warnings") or []))
 
     check("the vendor fit is reachable from the capability list as well as the tool "
-          "table (200 tools now: 192 until 0.0.107 removed the autorouter and the "
+          "table (241 tools now: 192 until 0.0.107 removed the autorouter and the "
           "auto-fanout, 0.0.114 added board_journal, 0.0.118 added five geometry "
-          "judges and no writer, 0.0.119 added the pour-border writer)",
-          len(_tools.TOOLS) == 200
+          "judges and no writer, 0.0.119 added the pour-border writer, 0.0.129 "
+          "added the twelve JLCPCB fabrication gates)",
+          len(_tools.TOOLS) == 241
           and "magnetics_material_core_loss" in (_cap.get("available") or [])
           and "vendor" in (_tools.TOOLS["magnetics_material_core_loss"]
                            ["description"].lower()),
@@ -5894,7 +5896,7 @@ def selftest(verbose=False):
           "never a quiet guess: a bias with only solid cores ARG_INVALID, a bias "
           "above the peak current ARG_RANGE, a zero bias ARG_RANGE whose hint "
           "points at the unchanged 0.0.77 answer, a non-numeric bias ARG_INVALID, "
-          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 200, "
+          "and a missing fit table DATA_UNAVAILABLE - and the tool count is 241, "
           "because 0.0.78 added arguments and no tool, 0.0.79 added exactly one "
           "(magnetics_toroid_mlt), 0.0.80 adds exactly one "
           "(magnetics_powder_curve), 0.0.81 exactly one "
@@ -5919,7 +5921,10 @@ def selftest(verbose=False):
           "exactly one (board_journal, the progress journal a broken session resumes "
           "from), and 0.0.119 exactly one (lceda_pour: it writes, lists and "
           "deletes pour BORDERS and reads the fill the editor made; the fill "
-          "itself has no API entry, so Shift+B stays a human step), so it is 200",
+          "itself has no API entry, so Shift+B stays a human step), and 0.0.129 "
+          "exactly twelve (the JLCPCB fabrication gates: library self-check, "
+          "capabilities, process, spec, gerber, bom-cpl, rules, gate, release, "
+          "geometry, schematic, pitfalls), so it is 241",
           _dcb_r1.get("reason_code") == "ARG_INVALID"
           and "include_powder_cores" in json.dumps(_dcb_r1, ensure_ascii=False)
           and _dcb_r2.get("reason_code") == "ARG_RANGE"
@@ -5927,7 +5932,7 @@ def selftest(verbose=False):
           and "0.0.77" in json.dumps(_dcb_r3, ensure_ascii=False)
           and _dcb_r4.get("reason_code") == "ARG_INVALID"
           and _dcb_r5.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 200,
+          and len(_tools.TOOLS) == 241,
           "powder %s, above-peak %s, zero %s, string %s, missing %s, tools %d"
           % (_dcb_r1.get("reason_code"), _dcb_r2.get("reason_code"),
              _dcb_r3.get("reason_code"), _dcb_r4.get("reason_code"),
@@ -6069,7 +6074,7 @@ def selftest(verbose=False):
           and _tm_row_on.get("part") == _tm_row_off.get("part")
           and _tm_row_on.get("turns") == _tm_row_off.get("turns")
           and _tm_bad.get("reason_code") == "ARG_INVALID"
-          and len(_tools.TOOLS) == 200,
+          and len(_tools.TOOLS) == 241,
           "off/omitted identical %s, off copper %s, on mlt %s, part %s/%s, tools %d"
           % (json.dumps(_tm_off, sort_keys=True) == json.dumps(_tm_omitted,
                                                               sort_keys=True),
@@ -6351,7 +6356,7 @@ def selftest(verbose=False):
           and _au_temp.get("temperatures_printed") == [100.0]
           and _au_kneg.get("reason_code") == "ARG_RANGE"
           and _au_tab.get("reason_code") == "DATA_UNAVAILABLE"
-          and len(_tools.TOOLS) == 200,
+          and len(_tools.TOOLS) == 241,
           "3B7 %s/%s, N27 %s, mat %s, unit %s, temp %s, k0 %s, tab %s, tools %d"
           % (_au_3b7.get("reason_code"), _au_3b7.get("points_printed"),
              _au_n27.get("reason_code"), _au_mat.get("reason_code"),
@@ -7436,7 +7441,7 @@ def selftest(verbose=False):
             _cur2 = _p.get("nextCursor")
             if not _cur2 or _pages2 > 40:
                 break
-        check("the `all` profile (200 tools, %d B raw) still reaches every tool "
+        check("the `all` profile (241 tools, %d B raw) still reaches every tool "
               "through the cursor while no page exceeds the cap: the profile most "
               "likely to kill a session is now the one with a measured way out"
               % _tsize(_raw_all),

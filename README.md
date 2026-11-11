@@ -233,7 +233,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（199 个）
+## 工具（241 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` / `magnetics_dc_bias` /
 `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor` / `ac_self_heating` / `experience_recall` / `experience_check` / `experience_candidate` / `experience_promote` / `experience_outcome` / `experience_export` / `experience_import`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
@@ -412,6 +412,37 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 `via_current_allowed` 实算 0.3mm 孔 / 25µm 镀铜 → 1.795 A，高于工程经验值 1A；
 返回里同时给出 `rule_of_thumb_gap`，请按保守者取用。
+
+## JLCPCB 制板门禁（0.0.129 吸收）
+
+能力与规范数值移植自 [jackwang988/jlceda-pcb-ai-workflow](https://github.com/jackwang988/jlceda-pcb-ai-workflow)（MIT），
+改造三处：判定字段 `status`→`verdict`（不撞信封）、层识别改为**按角色**（三套命名都认，否则自家
+kicad-cli 导出包必然误报）、包里的 `.txt` 说明与 `.GDD` 图纸不再被当 Excellon 解析。
+
+阈值只存在于 `src/pcb_agent_mcp/jlc/data/*.json`，每条带 `src` / `quote` / `tier`(T0/T1/T2) / `url` /
+`fetched_at`；`T3`（第三方）禁止入库，缺 `quote` 的规则由 `jlc_library_validate` 直接判不合格。
+三档判定：`BLOCK`（低于官方极限）/ `WARN`（极限与建议之间）/ `PASS`（达建议），另有
+`NEEDS_EVIDENCE`（适用但缺实测值，exit 2，**绝不写 PASS**）与 `N/A`（板上无此对象，用 `NONE_PRESENT`）。
+
+| tool | 作用 | 关键约束 |
+|---|---|---|
+| `jlc_library_validate` | 规范库自检（29 PCB + 20 SMT + 24 BOM/CPL 条） | 缺 `quote`/`tier`/`src` 即不合格；引用任何数字前先跑它 |
+| `jlc_capabilities` | 读规范行（按 `layers`/`copper_oz` 解析 limit 与 recommended） | 只读查表，不判板 |
+| `jlc_process` | 工艺声明模板 / 校验 | `layers` 与 `copper_oz` **必填且永不默认**——猜错就选到错的极限行 |
+| `jlc_spec_check` | 实测值 × 规范库三档判定 | exit 2 = 缺证据即 BLOCKED；`partial=true` 也不把未覆盖项读成通过 |
+| `jlc_gerber_guard` | 自己解析 Gerber/Excellon 复核导出包 | 量得出线宽/孔径/槽宽/钻孔/丝印/板框闭合；线距、焊盘到线、阻焊桥、丝印高度的**读不出**都列在 `uncovered`，永不计为 PASS |
+| `jlc_bom_cpl` | BOM/CPL 复核 + UTF-16→UTF-8 规范化 | EDA 原生编码是 WARN 不是静默乱码；BOM↔CPL 位号集合必须一致；件号对不对、极性对不对**判不了** |
+| `jlc_rules_check` | DRC 预设/规则文件 vs 官方极限 | 判的是**规则**松不松，不是板子 |
+| `jlc_gate` | G1 原理图→G2 库→G3 布局→G4 PCB→G5 导出 | `confirm` 必须带用户原话 + `bind`(sha256)；改文件即 `STALE`，前序失效后续也失效 |
+| `jlc_release` | 封存 `release/<version>/` + `manifest.json` | 门禁没全 confirmed 直接拒；**封存时重跑复核**；不上传、不下单 |
+| `jlc_geometry_audit` | 布局只读几何审计（重叠/越框/keepout 被压/位号碰撞） | 只吃 EDA 真实回读 JSON（`capture_source=eda_readback`）；**不给布局** |
+| `jlc_schematic_spec` | 原理图项目规格审计 | 对照声明规格，不是 ERC |
+| `jlc_pitfalls` | 19 条已知踩坑 | 清单，不是判词 |
+
+`board_fab_package` 增加可选 `jlc_guard` / `jlc_process`（默认关，关时逐字节不变）：打开后在
+导出包上跑 `gerber_guard`，结果放在返回的 `jlc` 段；不给工艺声明就只做结构复核。
+
+**红线**：本层永不调用下单/付款接口，永不上传文件，永不猜工艺、猜铜重、猜实测值。
 
 ## 用法
 

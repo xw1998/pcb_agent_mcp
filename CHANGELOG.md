@@ -9,6 +9,49 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.129] - 2026-11-11
+
+这一版做一件事：**把 `jackwang988/jlceda-pcb-ai-workflow`（MIT）整套制板门禁吸收进来**，
+变成 `pcb_agent_mcp.jlc` 子包 + 12 个工具，并接进制板包主流程。
+
+### 吸收了什么（原来的缺口）
+
+| 缺口 | 现在 |
+|---|---|
+| 没有任何工艺规范库（`dfm.py` 刻意不内置厂商数字） | `jlc/data/*.json`：29 条 PCB + 20 条 SMT + 24 条 BOM/CPL，每条带 `src`/`quote`/`tier`(T0/T1/T2)/`url`/`fetched_at`，T3 第三方禁止入库 |
+| 只有"是否合格"，没有三档 | `jlc_spec_check`：`BLOCK`(低于官方极限)/`WARN`(极限与建议之间)/`PASS`，`NEEDS_EVIDENCE`(适用但没实测值，exit 2，绝不写 PASS)、`N/A`(板上无此对象，用 `NONE_PRESENT` 表示) |
+| Gerber 只有 M02\* 级浅检查 | `jlc_gerber_guard`：自己解析 RS274X/Excellon，量板框闭合与 BBox、最小线宽/孔径/槽宽/各档钻孔、丝印宽度、单位与坐标格式一致性，并按**角色**认层（`-F_Cu.gbr`、`.GTL`、`%TF.FileFunction%` 三套都认） |
+| BOM/CPL 只读 CSV 行 | `jlc_bom_cpl`：真实编码（EDA 原生 UTF-16 TAB 是 WARN + 规范化建议，不是静默乱码）、必需列、位号文法、数量、LCSC 号、坐标单位、旋转位数、BOM↔CPL 位号集合交叉核对、坐标是否落在板内 |
+| 没有对话门禁 | `jlc_gate`：G1 原理图→G2 库/封装→G3 布局→G4 PCB→G5 导出；`confirm` 必须带用户原话 + `bind`(sha256)，改了被绑文件即 `STALE`，前序失效后续也失效 |
+| 封存只到 manifest | `jlc_release`：G1–G5 全 confirmed 才允许，封存时**重跑**复核（不信旧报告），写 `release/<version>/manifest.json` + 报告快照 + 门禁留痕；**不上传、不下单** |
+| 没有规则文件自己的对照 | `jlc_rules_check`：6 个官方 DRC 预设抽最小允许值，回判是否比官方极限更松 |
+| 没有几何/原理图只读审计 | `jlc_geometry_audit` / `jlc_schematic_spec`：重叠、越框、keepout 被压、位号碰撞、标注缺失；**只判不给布局** |
+| 没有踩坑清单 | `jlc_pitfalls`：19 条（导出、钻孔、BOM/CPL、层命名、阻焊、拼板、版本漂移） |
+
+### 接进主流程
+
+- `board_fab_package` 新增 `jlc_guard` / `jlc_process`（默认关）：打开后在导出包上跑
+  `gerber_guard`，结果放在返回的 `jlc` 段；不给 `jlc_process` 就只做结构复核，
+  **因为铜重猜错会选到错的极限行**。
+- 默认 `core` 工具集加 4 个：`jlc_gerber_guard` / `jlc_bom_cpl` / `jlc_gate` / `jlc_release`
+  （其余 8 个一个 `tool_search` 就到；core 列表实测裁剪后 46 670 B，仍在 48 KiB 一页内）。
+
+### 移植时改的三处（不是照抄）
+
+1. 判定字段 `status` → `verdict`，避免和信封的 `status: ok|error` 撞名；
+2. 层识别从"固定文件名"改成"**角色**"，否则对我们自己 kicad-cli 导出的包必然误报 BLOCK；
+3. 包里的 `.txt` 导出说明和 `.GDD` 钻孔图**不再被当 Excellon 解析**（移植时实测出的假 BLOCK）。
+
+### 测试
+
+`tests/test_jlc_gates.py` 15 条，每条都有能反向失败的控制：库自检对缺 `quote` 的规则必须报错、
+0.05/0.11/0.30 必须落三档、删掉顶层铜文件必须 `GB.FILE.REQUIRED`、导出说明不得被当钻孔、
+BOM↔CPL 位号集合错一个必须 BLOCK、门禁 PENDING→CONFIRMED→STALE 与"没原话/没绑定/跳序"必须拒、
+门禁没全过时封存必须拒。
+
+来源与归属：能力与规范数值移植自 [jackwang988/jlceda-pcb-ai-workflow](https://github.com/jackwang988/jlceda-pcb-ai-workflow)（MIT），
+原项目作者保留其著作权；本仓库只做上述三处改造并接入自己的信封。
+
 ## [0.0.128] - 2026-11-07
 
 这一版没有新工具，只有一件事：**把「下通道总线画不出」从前面的算术推断变成真画一遍的实测**，
