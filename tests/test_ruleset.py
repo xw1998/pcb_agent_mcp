@@ -445,5 +445,65 @@ class TestPrecondition(unittest.TestCase):
         self.assertNotIn("precondition.clearance_no_worse",
                          [x.get("gate") for x in off.get("blocking")])
 
+class TestDesignBaseline(unittest.TestCase):
+    """The corpus bands are a target, not a verdict - and the code has to say so.
+
+    Every test here uses a two-board corpus so the bands are known by hand; the
+    eighteen-board run costs minutes and belongs to a tool call, not to a suite.
+    """
+
+    def setUp(self):
+        import importlib
+        self.b = importlib.import_module("pcb_agent_mcp.ruleset.baseline")
+
+    def test_a_missing_corpus_errors_instead_of_inventing_bands(self):
+        row = self.b.bands(directory=os.path.join(_HERE, "no_such_dir"))
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["reason_code"], "CORPUS_NOT_FOUND")
+        # control: a real corpus is ok, and its board count is the count it read.
+        real = self.b.bands(paths=[SAMPLE, SAMPLE])
+        self.assertEqual(real["status"], "ok")
+        self.assertEqual(real["boards"], 2)
+
+    def test_bands_are_measured_not_assumed(self):
+        row = self.b.bands(paths=[SAMPLE, SAMPLE])
+        width = row["bands"]["min_track_width"]
+        self.assertEqual(width["n"], 2)
+        # the sample board's narrowest stored track is 0.25 mm; a band that does
+        # not contain the value it was computed from is not a band.
+        self.assertAlmostEqual(width["p50"], 0.25, places=6)
+        self.assertLessEqual(width["p10"], width["p50"])
+        self.assertLessEqual(width["p50"], width["p90"])
+        self.assertIn("target, not a limit", row["reads_as"])
+
+    def test_a_board_inside_the_corpus_is_inside(self):
+        from pcb_agent_mcp.adapters import open_board
+        row = self.b.compare(open_board(SAMPLE), paths=[SAMPLE, SAMPLE])
+        self.assertEqual(row["status"], "ok")
+        self.assertTrue(row["blocks_nothing"])
+        pos = dict((r["metric"], r["position"]) for r in row["rows"])
+        self.assertEqual(pos["min_track_width"], "inside")
+        # control: a corpus that does NOT contain this board puts it outside, and
+        # the answer still carries no verdict - only the word.
+        other = _demo("pic_programmer")
+        if not other:
+            self.skipTest("KiCad demos not installed")
+        far = self.b.compare(open_board(SAMPLE), paths=[other])
+        self.assertIn(dict((r["metric"], r["position"])
+                           for r in far["rows"])["min_board_dim"], ("below", "above"))
+        self.assertNotIn("verdict", far)
+
+    def test_a_metric_the_board_cannot_answer_is_unknown_not_zero(self):
+        from pcb_agent_mcp.adapters import open_board
+        row = self.b.compare(open_board(SAMPLE), paths=[SAMPLE])
+        rows = dict((r["metric"], r) for r in row["rows"])
+        # the sample has no plated through-hole pad, so that metric cannot exist
+        # there at all; a 0 would read as "drilled at zero", which is wrong.
+        self.assertIn(rows["min_plated_drill"]["position"], ("unknown", "inside"))
+        for r in row["rows"]:
+            if r["position"] == "unknown":
+                self.assertIsNone(r["this"])
+                self.assertTrue(r["why"])
+
 if __name__ == "__main__":
     unittest.main()

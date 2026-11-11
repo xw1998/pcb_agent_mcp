@@ -4403,6 +4403,47 @@ def _rule_catalog(args):
         assumptions={"priority_is_not_severity": True},
     )
 
+def _design_baseline(board, args):
+    """This board against the middle 80% of finished boards. Blocks nothing."""
+    from .ruleset import baseline as _baseline
+    directory = args.get("corpus_dir") or None
+    res = _baseline.compare(board, directory=directory)
+    if res.get("status") != "ok":
+        return err(res.get("message") or "the corpus could not be measured",
+                   res.get("reason_code") or "CORPUS_NOT_FOUND",
+                   extra={"tried": res.get("tried")})
+    out = dict(res)
+    out["blocks_nothing"] = True
+    return ok(value=out, unit="design band comparison",
+              model="corpus_percentiles",
+              basis="the distribution of measured values across the finished demo "
+                    "boards installed with KiCad (%d boards here); it is a target, "
+                    "not a vendor limit - every limit that matters for manufacture "
+                    "is a P0 rule with a published quote and lives in board_rule_audit"
+                    % res.get("boards_in_corpus", 0),
+              precision="percentiles by nearest rank, no interpolation",
+              assumptions={"authoritative": False,
+                           "blocks_writes": False,
+                           "outside_the_band_is_not_wrong": True})
+
+_tool(
+    "board_design_baseline",
+    "What good boards look like, as numbers: measure a corpus of finished demo boards "
+    "and report the 10th / 50th / 90th percentile of track width, different-net copper "
+    "spacing, via diameter, plated drill, via collar, copper-to-edge and board size, "
+    "then place THIS board in each band (below / inside / above). It exists because a "
+    "rule set can only say no - a designer needs a target. Deliberately not a verdict: "
+    "nothing here blocks, nothing here passes, and being outside the middle 80% of "
+    "eighteen boards does NOT mean the value is wrong (0.15 mm is a legitimate track on "
+    "1 oz with room to spare). Read-only.",
+    {"type": "object",
+     "properties": dict({
+         "corpus_dir": _str("directory of .kicad_pcb files to measure; default is the "
+                            "demos installed with KiCad"),
+     }, **_COMMON), "required": ["path"]},
+    _board_tool(_design_baseline, derived=True),
+)
+
 _tool(
     "board_rule_audit",
     "The prioritized audit: measure the board once, grade every rule, and return the "
