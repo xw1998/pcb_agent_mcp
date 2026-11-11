@@ -172,6 +172,9 @@ clearance，所以板上有 zone 时 `new_blocking_total == 0` 是构造性成�
 - **拒答优于错答**：`board_cross_split`、`board_loop_area`、`decoupling_check`、
   `ir_drop` 类都会在缺参数时拒答或给 `INDETERMINATE`。**不要为了要一个数而补一个猜的参数。**
 - **`authoritative` 字段**：同一件事有权威与非权威两个读数时，报告里必须写明用的是哪个。
+- **`evidence` / `examples` 字段**：`board_rule_audit` 里判 pass/fail 的检查项会带上测量自己的
+  `where`（一条能读懂的话）与 `examples`（最多 8 条明细）。看到 fail 先读 `evidence`——
+  「119 条走线跨分割，最宽 6.98 mm」和「有一条没过」是两种完全不同的事故。
 - **单点读数失败不否证被测对象**：某个网布不通，可能只是这一版摆放不行。
 
 ### 改服务自己的代码时：每条后置条件必须有能失败的反向对照

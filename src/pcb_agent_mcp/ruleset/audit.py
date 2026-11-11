@@ -295,6 +295,15 @@ def _catalog_checks(process, m, facts_in):
             c["margin"] = (c["measured"] - c["limit"]
                            if rule["kind"] in ("max", "count_max")
                            else c["limit"] - c["measured"])
+        # A verdict without the reading behind it is not worth much on a board
+        # the caller cannot see: carry the measurement's own "where" (and, when
+        # it has them, its examples) into the check.
+        row = m.get(rule["fact"]) or {}
+        if state in ("pass", "fail") and isinstance(row, dict):
+            if row.get("where"):
+                c["evidence"] = row["where"]
+            if state == "fail" and row.get("examples"):
+                c["examples"] = row["examples"]
         if state in ("pass", "fail") and rule["fact"] in caps \
                 and rule["fact"] not in given:
             c["measured_state"] = state

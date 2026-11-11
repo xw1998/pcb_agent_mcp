@@ -575,6 +575,8 @@ def measure(board, window_mm=WINDOW_MM):
 
     # ------------------------------------------------- decoupling capacitors
     m.update(_decoupling(board))
+    # -------------------------------------------------- reference plane
+    m.update(_reference_plane(board))
 
     return m
 
@@ -847,6 +849,273 @@ def _npth_ring(npth_holes, cu_items, window_mm=5.0):
     return _rec(gap, "%s vs %s" % (h["ref"], it.get("ref")),
                 "hole edge to nearest copper of any net (NPTH keep-out)")
 
+_PLANE_STEP_MM = 0.2
+
+
+def _raster(rings, step=_PLANE_STEP_MM):
+    """Even-odd raster of a set of rings on a ``step`` grid.
+
+    A scanline per grid row, crossing lists collected from every ring at once, so
+    a hole (or an island inside a hole) comes out right without knowing which
+    ring is which. Filled by spans, so the cost is the EDGE count and not the
+    vertex-by-vertex point-in-polygon a naive test would pay: the reference pour
+    on a real board is a 19 766-vertex polygon, and testing 35 000 sample points
+    against it directly took 138 s on sky_star.
+    """
+    if not rings:
+        return None
+    xs = [p[0] for r in rings for p in r]
+    ys = [p[1] for r in rings for p in r]
+    x0, y0 = min(xs) - step, min(ys) - step
+    nx = int((max(xs) - x0) / step) + 2
+    ny = int((max(ys) - y0) / step) + 2
+    bits = bytearray(nx * ny)
+    rows = {}
+    for r in rings:
+        n = len(r)
+        for i in range(n):
+            ax, ay = r[i]
+            bx, by = r[(i + 1) % n]
+            if ay == by:
+                continue
+            ylo, yhi = (ay, by) if ay < by else (by, ay)
+            # The scanline of row j sits at the CENTRE of the band that row j
+            # stands for, so a query point and the crossings that decide it are
+            # never more than half a cell apart. Placing the scans on the lattice
+            # itself is what made this disagree with a point-in-polygon test: the
+            # sky_star pours sit on a 0.05 mm lattice, so vertices landed exactly
+            # on the rows, ties doubled the crossing count and the parity invented
+            # 24 "holes" in a solid plane.
+            j0 = int(math.ceil((ylo - y0) / step - 0.5))
+            j1 = int(math.floor((yhi - y0) / step - 0.5))
+            for j in range(max(j0, 0), min(j1, ny - 1) + 1):
+                y = y0 + (j + 0.5) * step
+                # Half-open [ylo, yhi): a vertex that lands exactly on a scanline
+                # then counts once (on the edge that starts there), never twice.
+                if not (ylo <= y < yhi):
+                    continue
+                rows.setdefault(j, []).append(ax + (bx - ax) * (y - ay) / (by - ay))
+    for j, xcross in rows.items():
+        xcross.sort()
+        base = j * nx
+        for k in range(0, len(xcross) - 1, 2):
+            # Fill the cells whose CENTRE lies inside the span, i.e. the same
+            # convention ``covered`` reads back with.
+            ia = int(math.ceil((xcross[k] - x0) / step - 0.5))
+            ib = int(math.floor((xcross[k + 1] - x0) / step - 0.5))
+            for i in range(max(ia, 0), min(ib, nx - 1) + 1):
+                bits[base + i] = 1
+
+    def covered(x, y):
+        i = int(math.floor((x - x0) / step))
+        j = int(math.floor((y - y0) / step))
+        if i < 0 or j < 0 or i >= nx or j >= ny:
+            return False
+        return bits[j * nx + i] == 1
+
+    return covered, (nx, ny, step)
+
+
+def _copper_order(board):
+    """The copper layers in stack order, or None when the file does not say."""
+    names = [l.get("name") for l in (board.stackup or []) if l.get("name")]
+    names = [n for n in names if str(n).endswith(".Cu")]
+    if len(names) >= 2:
+        return names
+    seen = set()
+    for t in board.tracks:
+        if t.get("layer"):
+            seen.add(str(t["layer"]))
+    for z in board.zones:
+        for l in (z.get("layers") or []):
+            seen.add(str(l))
+    if seen == {"F.Cu", "B.Cu"}:
+        return ["F.Cu", "B.Cu"]
+    return None
+
+
+_FINE_MM = 0.02
+_BAND_MM = 0.25
+
+class _Scan(object):
+    """Exact even-odd coverage of a set of rings, edges bucketed by y band.
+
+    This exists to CONFIRM what the coarse raster flagged, because the raster is
+    half a cell coarse by construction: on sky_star it calls a track uncovered
+    whenever the track runs within 0.1 mm of a pour boundary, and two of its
+    twenty-seven candidates were exactly that (re-read at 0.02 mm, they are over
+    solid copper end to end). Nothing here is reported without this re-read.
+    """
+
+    def __init__(self, rings):
+        self.ymin = min(p[1] for r in rings for p in r)
+        self.bands = {}
+        for r in rings:
+            n = len(r)
+            for i in range(n):
+                ax, ay = r[i]
+                bx, by = r[(i + 1) % n]
+                if ay == by:
+                    continue
+                lo, hi = (ay, by) if ay < by else (by, ay)
+                b0 = int(math.floor((lo - self.ymin) / _BAND_MM))
+                b1 = int(math.floor((hi - self.ymin) / _BAND_MM))
+                for b in range(b0, b1 + 1):
+                    self.bands.setdefault(b, []).append((ax, ay, bx, by))
+
+    def covered(self, x, y):
+        n = 0
+        for ax, ay, bx, by in self.bands.get(
+                int(math.floor((y - self.ymin) / _BAND_MM)), ()):
+            if (ay > y) != (by > y):
+                if x < (bx - ax) * (y - ay) / (by - ay) + ax:
+                    n += 1
+        return n % 2 == 1
+
+
+def _track_seq(t):
+    """Sample points along a track's centreline, arcs included, or None."""
+    if t.get("_arc") and t.get("_points"):
+        return [(float(x), float(y)) for x, y in t["_points"]]
+    a, b = t.get("start"), t.get("end")
+    if not (a and b):
+        return None
+    return [(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))]
+
+
+def _walk(seq, step, cap=20000):
+    """Points every ``step`` mm along a polyline, ends included."""
+    length = sum(math.hypot(seq[i + 1][0] - seq[i][0], seq[i + 1][1] - seq[i][1])
+                 for i in range(len(seq) - 1))
+    if length / step > cap:
+        step = length / float(cap)
+    out = []
+    for i in range(len(seq) - 1):
+        x0, y0 = seq[i]
+        x1, y1 = seq[i + 1]
+        steps = max(2, int(math.hypot(x1 - x0, y1 - y0) / step) + 1)
+        for k in range(steps):
+            f = k / float(steps - 1)
+            out.append((x0 + (x1 - x0) * f, y0 + (y1 - y0) * f))
+    return out
+
+
+def _reference_plane(board):
+    """Does a signal run over a place where its reference layer has no copper?
+
+    For each pair of ADJACENT copper layers the copper on the other one is taken
+    as the return path, and every track on the near layer is walked along its
+    centreline. A **split crossing** is a run of uncovered samples with covered
+    samples on BOTH sides: the track enters a hole in the return copper and
+    leaves it again. A run that reaches one end of the track is counted
+    separately as ``off_plane`` - the track runs off the plane's edge, which is a
+    different and usually deliberate thing.
+
+    Two passes, because neither alone is honest. A raster at
+    ``_PLANE_STEP_MM`` decides which tracks are worth a close look (the exact
+    even-odd ray cast costs O(vertices) per sample and 34 000 vertices per real
+    board would cost a minute); every track it flags is then re-read at
+    ``_FINE_MM`` by ``_Scan``, and only what the re-read agrees with is reported.
+    The one thing the coarse pass can still do is MISS: a gap narrower than
+    ``_PLANE_STEP_MM`` under a track that is otherwise covered reads as copper.
+    """
+    order = _copper_order(board)
+    if not order:
+        why = ("the copper layers cannot be ordered from the file (no stackup, and "
+               "not a two-layer board), so which layer is the reference is unknown")
+        return {"signal_crosses_plane_split": _na(why)}
+    pours = {}
+    for z in board.zones:
+        if z.get("is_keepout"):
+            continue
+        for l in (z.get("layers") or []):
+            for poly in (z.get("filled_polygons") or []):
+                if len(poly) >= 3:
+                    pours.setdefault(str(l), []).append(
+                        [(float(x), float(y)) for x, y in poly])
+    crossings, off_plane, unmeasured = [], [], []
+    for idx, layer in enumerate(order):
+        refs = [order[j] for j in (idx - 1, idx + 1) if 0 <= j < len(order)]
+        if not refs:
+            continue
+        rings = []
+        for r in refs:
+            rings.extend(pours.get(r) or [])
+        if not rings:
+            unmeasured.append("no filled pour on %s" % "/".join(refs))
+            continue
+        cov = _raster(rings)[0]
+        scan = None
+        for t in board.tracks:
+            if str(t.get("layer")) != layer:
+                continue
+            seq = _track_seq(t)
+            if not seq:
+                continue
+            if all(cov(x, y) for x, y in _walk(seq, _PLANE_STEP_MM)):
+                continue                      # nothing the coarse pass doubts
+            if scan is None:
+                scan = _Scan(rings)
+            flags = [scan.covered(x, y) for x, y in _walk(seq, _FINE_MM)]
+            inside, edge = 0.0, False
+            i, n = 0, len(flags)
+            while i < n:
+                if flags[i]:
+                    i += 1
+                    continue
+                k = i
+                while k < n and not flags[k]:
+                    k += 1
+                run = (k - i) * _FINE_MM
+                if i == 0 or k == n:
+                    edge = True
+                else:
+                    inside = max(inside, run)
+                i = k
+            row = {"net": t.get("net"), "layer": layer,
+                   "reference": "/".join(refs),
+                   "uncovered_mm": round(inside, 3),
+                   "where": "%.3f, %.3f" % (seq[0][0], seq[0][1])}
+            if inside > 0:
+                crossings.append(row)
+            if edge:
+                off_plane.append(row)
+    if not pours:
+        return {"signal_crosses_plane_split": _na(
+            "the board has no filled pour, so there is no reference plane to cross")}
+    if not crossings and len(unmeasured) == len(order):
+        return {"signal_crosses_plane_split": _na(
+            "; ".join(unmeasured) or "no reference copper to test against")}
+    widest = max(crossings, key=lambda c: c["uncovered_mm"]) if crossings else None
+    counts = {}
+    for c in crossings:
+        key = "%s over %s" % (c["layer"], c["reference"])
+        counts[key] = counts.get(key, 0) + 1
+    out = {
+        "value": bool(crossings),
+        "where": ("%d track(s) run over a gap in the reference copper and come back "
+                  "onto it%s"
+                  % (len(crossings),
+                     ("; the widest is %s on %s over %s, uncovered for %.2f mm"
+                      % (widest["net"], widest["layer"], widest["reference"],
+                         widest["uncovered_mm"])) if widest else "")),
+        "method": "the copper on the adjacent layer is taken as the return path; a "
+                  "raster at %.1f mm picks the tracks that are not covered end to "
+                  "end, and each of those is re-read at %.2f mm by an exact even-odd "
+                  "ray cast over every filled polygon of every pour, so a hole reads "
+                  "as a hole and a boundary artefact does not read as one"
+                  % (_PLANE_STEP_MM, _FINE_MM),
+        "examples": sorted(crossings, key=lambda c: -c["uncovered_mm"])[:8],
+        "counts": counts,
+    }
+    if off_plane:
+        out["note"] = ("%d track(s) run over the edge of the reference copper (the "
+                       "uncovered run reaches one end) - a different thing and not "
+                       "counted as a split crossing" % len(off_plane))
+    if unmeasured:
+        out["note"] = (out.get("note", "") + "; " + "; ".join(unmeasured)).strip("; ")
+    return {"signal_crosses_plane_split": out}
+
 def grade_caps(m):
     """Facts this module measured but refuses to GRADE, and why.
 
@@ -889,6 +1158,9 @@ def catalog_facts(m):
     take("diffpair_length_skew_mm", "diffpair_length_skew_mm")
     take("trace_under_crystal", "trace_under_crystal")
     take("decoupling_max_distance_to_pin_mm", "decoupling_max_distance_to_pin_mm")
+    row = m.get("signal_crosses_plane_split") or {}
+    if isinstance(row.get("value"), bool):
+        facts["signal_crosses_plane_split"] = row["value"]
     # A bool must stay a bool: `take` multiplies by 1.0 and would hand the
     # grader the float 1.0, which it rejects as "must be true/false".
     row = m.get("decoupling_via_in_path") or {}
