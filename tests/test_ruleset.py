@@ -520,5 +520,41 @@ class TestDesignBaseline(unittest.TestCase):
         caveat = sug["caveats"].get("min_copper_to_edge") or ""
         self.assertIn("lower bounds", caveat)
 
+    def test_only_buildable_drops_a_board_and_names_the_rule(self):
+        """The corpus for "what good boards look like" should be boards that could
+        be made. When one is dropped the rule that dropped it is named with its own
+        measured/limit pair, so a too-strict rule is visible instead of silent."""
+        r = self.b.bands(paths=[SAMPLE], only_buildable=True)
+        self.assertEqual(r["status"], "ok")
+        self.assertTrue(r["filter"]["only_buildable"])
+        self.assertIn(os.path.basename(SAMPLE), r["filter"]["kept"])
+        self.assertEqual(r["filter"]["dropped"], [])
+        # control: a board that fails P0 leaves the corpus AND the band stops
+        # counting it - a dropped board must not shape the percentile.
+        import importlib as _i
+        real = self.b.p0_verdict
+        fake = lambda _b: {"passes": False, "layers": 2,
+                           "failures": [{"rule": "PCB.TH.ANNULAR_MIN",
+                                         "measured": 0.15, "limit": 0.18}],
+                           "verdict": "blocked_at_P0_unbuildable"}
+        # a fresh path: the first call's answer is cached by (path, mtime), so
+        # reusing SAMPLE would answer from the cache and test nothing.
+        self.b.p0_verdict = fake
+        try:
+            import shutil
+            import tempfile
+            tmp = tempfile.mkdtemp(prefix="pcb_base_")
+            self.addCleanup(shutil.rmtree, tmp, True)
+            copy = os.path.join(tmp, "copy.kicad_pcb")
+            shutil.copy(SAMPLE, copy)
+            dropped = self.b.bands(paths=[copy], only_buildable=True)
+        finally:
+            self.b.p0_verdict = real
+        self.assertEqual(dropped["boards"], 0)
+        self.assertEqual(dropped["bands"]["min_track_width"]["n"], 0)
+        self.assertEqual(dropped["filter"]["dropped"][0]["board"], "copy.kicad_pcb")
+        self.assertEqual(dropped["filter"]["dropped"][0]["failures"][0]["rule"],
+                         "PCB.TH.ANNULAR_MIN")
+
 if __name__ == "__main__":
     unittest.main()

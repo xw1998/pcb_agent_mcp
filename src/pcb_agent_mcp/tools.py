@@ -4407,7 +4407,8 @@ def _design_baseline(board, args):
     """This board against the middle 80% of finished boards. Blocks nothing."""
     from .ruleset import baseline as _baseline
     directory = args.get("corpus_dir") or None
-    res = _baseline.compare(board, directory=directory)
+    res = _baseline.compare(board, directory=directory,
+                            only_buildable=args.get("only_buildable") is True)
     if res.get("status") != "ok":
         return err(res.get("message") or "the corpus could not be measured",
                    res.get("reason_code") or "CORPUS_NOT_FOUND",
@@ -4440,6 +4441,11 @@ _tool(
      "properties": dict({
          "corpus_dir": _str("directory of .kicad_pcb files to measure; default is the "
                             "demos installed with KiCad"),
+         "only_buildable": _bool(
+             "measure only the boards that pass P0 when each declares its OWN layer "
+             "count at 1 oz - the ones that could actually be made. Default false: "
+             "all boards, and the answer says which were kept and which were dropped "
+             "with the rule, measured value and limit that dropped them", False),
      }, **_COMMON), "required": ["path"]},
     _board_tool(_design_baseline, derived=True),
 )
