@@ -45,6 +45,7 @@ from ..fidelity import sexpr as S
 from . import build as B
 from . import checks as _checks
 from . import drc_policy as _drcp
+from ..ruleset import precondition as _precondition
 from . import ops as _ops
 from .fsutil import atomic_write as _atomic_write
 from .fsutil import home, sha256 as _sha256
@@ -258,6 +259,46 @@ def propose(path, operations, options=None):
         warnings.append({"gate": "geometry_outside_outline",
                          "message": outside["message"]})
 
+    # ---- state before copper (default on; `preconditions: false` skips it whole)
+    # The rule is "state wrong, no write", not "no write without a human": every
+    # value below is computed here from this file and this plan, and re-checked at
+    # apply time against the same stored numbers. The before-clearance costs one
+    # more sweep of the same window, and only when the plan lands copper.
+    pre_options = options.get("preconditions", True) is not False
+    pre = None
+    clearance_before = None
+    # A uniform move of the whole board touches Edge.Cuts but does not change the
+    # board's shape: every point, the outline included, moves by the same delta. So
+    # a plan made only of `translate_board` is not a mechanical change and must not
+    # be asked to declare itself as one - the gate would otherwise refuse the very
+    # repair it exists to make possible (a design parked off the plot page).
+    pure_move = bool(operations) and all(
+        (o.get("op") or "") == "translate_board" for o in operations)
+    # Removing copper cannot create a spacing pair or land anything near a board
+    # edge, so "copper" in `touched` is too coarse a question to ask of a cut. An
+    # op that puts copper down is any copper-affecting op that is not a delete.
+    copper_adds = any("copper" in (r.get("affects") or ())
+                      and not (r.get("op") or "").startswith("delete_")
+                      for r in records)
+    if pre_options:
+        if "copper" in touched:
+            clearance_before = _checks.copper_clearance(
+                src, region=region, threshold_mm=clearance["threshold_mm"])
+        pre = _precondition.assess(
+            path, affected=touched, outline=after["outline"],
+            clearance_after=clearance, clearance_before=clearance_before,
+            process=options.get("process"),
+            engine_on=options.get("engine", True) is not False,
+            allow_edge_changes=(pure_move or
+                                bool(options.get("allow_edge_changes"))),
+            allow_open_outline=bool(options.get("allow_open_outline")),
+            copper_adds=copper_adds)
+        for c in pre["checks"]:
+            if c["ok"] is False and c["severity"] == "block":
+                blocking.append({"gate": "precondition." + c["check"],
+                                 "message": c["why"],
+                                 "how_to_clear": c.get("how_to_clear")})
+
     plan_id = "plan-" + _uuid.uuid4().hex[:12]
     plan = {
         "plan_id": plan_id, "path": os.path.abspath(path),
@@ -270,12 +311,19 @@ def propose(path, operations, options=None):
         "options": {"precheck_region": region,
                     "precheck_clearance_mm": clearance["threshold_mm"],
                     "mode": options.get("mode") or "in_place",
-                    "out_path": options.get("out_path")},
+                    "out_path": options.get("out_path"),
+                    "process": options.get("process"),
+                    "preconditions": pre_options,
+                    "allow_edge_changes": bool(options.get("allow_edge_changes")),
+                    "allow_open_outline": bool(options.get("allow_open_outline"))},
+        "preconditions_input": {
+            "outline": after["outline"], "clearance_after": clearance,
+            "clearance_before": clearance_before, "copper_adds": copper_adds},
     }
     PLANS[plan_id] = plan
     _trim_plans()
 
-    return {
+    out = {
         "status": "ok",
         "plan_id": plan_id,
         "path": plan["path"],
@@ -292,11 +340,15 @@ def propose(path, operations, options=None):
         "blocking": blocking,
         "warnings": warnings,
         "plan_conflicts": _plan_conflicts(operations),
-        "expires_in_seconds": PLAN_TTL,
         "next": ("board_apply(plan_id=%r, confirm=true) - that call takes a "
                  "checkpoint, writes atomically, then has KiCad and the file's own "
                  "re-read check the result" % plan_id),
     }
+    if pre is not None:
+        # Only present when the gate ran: `preconditions: false` has to leave the
+        # reply exactly as it was, or "off" is not off.
+        out["preconditions"] = pre
+    return out
 
 def _verify_all(ops_module, doc, operations, records):
     """Postconditions, with the run records when the module understands them.
@@ -495,6 +547,40 @@ def apply_plan(plan_id, confirm=False, options=None):
     if mode == "new_file" and os.path.exists(target):
         raise EditError("refusing to overwrite an existing file: %s" % target,
                         "TARGET_EXISTS")
+
+    # ---- the state gate, before a single byte is written
+    # Everything here was already computed by the proposal and is re-asked against
+    # the same stored numbers, so this cannot be a different opinion than the one
+    # the digest showed. What CAN change between propose and apply is the rule set
+    # on disk and the engine, and both are cheap to re-read - that is why they are
+    # re-read rather than trusted.
+    gate_on = options.get("preconditions", plan["options"].get("preconditions", True))
+    pre = None
+    if gate_on is not False:
+        pin = plan.get("preconditions_input") or {}
+        pre = _precondition.assess(
+            path, affected=plan["affected"], outline=pin.get("outline"),
+            clearance_after=pin.get("clearance_after"),
+            clearance_before=pin.get("clearance_before"),
+            process=options.get("process") or plan["options"].get("process"),
+            engine_on=options.get("engine", True) is not False,
+            allow_edge_changes=(
+                (bool(plan["operations"]) and all(
+                    (r.get("op") or "") == "translate_board"
+                    for r in plan["operations"])) or
+                bool(options.get("allow_edge_changes",
+                                 plan["options"].get("allow_edge_changes")))),
+            allow_open_outline=bool(options.get("allow_open_outline",
+                                                plan["options"].get("allow_open_outline"))),
+            copper_adds=pin.get("copper_adds"))
+        if not pre["ok"]:
+            raise EditError(
+                "refusing to write: the board is not in a state where this edit is "
+                "judgeable - " + _precondition.message(pre) +
+                ". (Nothing was written. Each entry in `preconditions.checks` says "
+                "which state is wrong and how it is cleared; this is not a "
+                "confirmation prompt, it is a state the tool can read.)",
+                "PRECONDITION_NOT_MET", preconditions=pre)
 
     checkpoint = save_checkpoint(path, current,
                                  "before apply %s (%s)" % (plan_id, ", ".join(

@@ -294,5 +294,156 @@ class TestCatalog(unittest.TestCase):
             self.assertEqual(row["level"], "P0")
 
 
+class TestPrecondition(unittest.TestCase):
+    """`state wrong, no write` - and every check here has a control that fails.
+
+    The gate is not a confirmation box: each line below is decidable from the
+    board file and the plan. A check that cannot be decided is None, never True.
+    """
+
+    def setUp(self):
+        import importlib
+        self.pre = importlib.import_module("pcb_agent_mcp.ruleset.precondition")
+
+    # 1 ---------------------------------------------------------------
+    def test_a_missing_engine_blocks_and_a_switched_off_one_does_not(self):
+        """`options.engine=false` is a switch the caller owns (and the API
+        documents), so the gate reports undecided instead of overruling it. A
+        kicad-cli that cannot be found is a different fact: the caller asked for a
+        check that cannot happen, so that one blocks."""
+        off = self.pre.drc_engine(engine_on=False)
+        self.assertIs(off["ok"], None, "a switched-off engine was reported as a pass")
+        self.assertEqual(off["severity"], "report")
+        self.assertIn("NOT a pass", off["why"])
+        # control 1: the engine on, with kicad-cli present, is a genuine pass.
+        from unittest import mock
+        engine = importlib.import_module("pcb_agent_mcp.fidelity.engine")
+        with mock.patch.object(engine, "find_kicad_cli", lambda: "/fake/kicad-cli"):
+            row = self.pre.drc_engine(engine_on=True)
+        self.assertIs(row["ok"], True)
+        self.assertIn("DRC diff will run", row["why"])
+        # control 2: no kicad-cli at all blocks, and says which binary is missing.
+        with mock.patch.object(engine, "find_kicad_cli", lambda: None):
+            gone = self.pre.drc_engine(engine_on=True)
+        self.assertIs(gone["ok"], False)
+        self.assertIn("kicad-cli was not found", gone["why"])
+
+    # 2 ---------------------------------------------------------------
+    def test_rules_baseline_fails_when_a_quote_is_missing(self):
+        self.assertIs(self.pre.rules_baseline()["ok"], True)
+        import importlib
+        from unittest import mock
+        api = importlib.import_module("pcb_agent_mcp.jlc.api")
+        real = api.capabilities("pcb")
+        stripped = dict(real)
+        stripped["rules"] = [dict(r) for r in real["rules"]]
+        for r in stripped["rules"]:
+            if r.get("limit"):
+                r["limit"] = dict(r["limit"])
+                r["limit"].pop("quote", None)
+            if r.get("recommended"):
+                r["recommended"] = dict(r["recommended"])
+                r["recommended"].pop("quote", None)
+        with mock.patch.object(api, "capabilities", lambda *a, **k: stripped):
+            row = self.pre.rules_baseline()
+        self.assertIs(row["ok"], False, "an unsourced fab limit was allowed to pass")
+        self.assertIn("no verbatim quote", row["why"])
+
+    # 3 ---------------------------------------------------------------
+    def test_an_unknown_outline_blocks_copper_but_not_silk(self):
+        empty = {}
+        self.assertIs(self.pre.outline_known(empty, copper_write=True)["ok"], False)
+        # control: the same missing outline is *not* a pass, but it is not a block
+        # either when the plan lands no copper - it degrades to None (=undecided).
+        self.assertIs(self.pre.outline_known(empty, copper_write=False)["ok"], None)
+        closed = {"present": True, "closed": True, "primitives": 4, "loops": 1}
+        self.assertIs(self.pre.outline_known(closed)["ok"], True)
+        # control: a plan that only TAKES copper away lands nothing, so an unknown
+        # shape cannot stop it - "copper" in `affected` would have been too coarse.
+        cut = self.pre.assess(affected=("copper",), outline={}, copper_adds=False)
+        self.assertTrue(cut["ok"], "a copper cut was blocked by a missing outline")
+        add = self.pre.assess(affected=("copper",), outline={}, copper_adds=True)
+        self.assertEqual(add["verdict"], "refused_at_outline_known")
+
+    # 4 ---------------------------------------------------------------
+    def test_touching_the_board_shape_is_a_block_unless_declared(self):
+        bad = self.pre.mech_unchanged(["outline"])
+        self.assertIs(bad["ok"], False)
+        self.assertEqual(bad["severity"], "block")
+        # control: the same plan passes when it says the shape is the subject.
+        self.assertIs(self.pre.mech_unchanged(["outline"],
+                                             allow_edge_changes=True)["ok"], True)
+        self.assertIs(self.pre.mech_unchanged(["copper", "silkscreen"])["ok"], True)
+
+    # 5 ---------------------------------------------------------------
+    def test_clearance_gate_is_a_delta_not_an_absolute(self):
+        """A board that already has a tight pair may still be edited; a plan that
+        CREATES one may not. Both arms use the same numbers."""
+        after = {"threshold_mm": 0.2, "violations": 3,
+                 "worst": [{"gap_mm": 0.0, "at": [1.0, 2.0]}]}
+        created = self.pre.clearance_no_worse(after, {"violations": 0})
+        self.assertIs(created["ok"], False)
+        self.assertIn("from 0 to 3", created["why"])
+        inherited = self.pre.clearance_no_worse(after, {"violations": 3})
+        self.assertIs(inherited["ok"], True, "an inherited pair was blamed on this plan")
+        self.assertIn("created none", inherited["why"])
+        # and a plan that lands no copper is undecided, not clean
+        self.assertIs(self.pre.clearance_no_worse(after, None,
+                                                  copper_write=False)["ok"], None)
+
+    # 6 ---------------------------------------------------------------
+    def test_assess_names_the_check_that_refused(self):
+        r = self.pre.assess(affected=("copper",),
+                            outline={"present": True, "closed": True},
+                            clearance_after={"violations": 2, "threshold_mm": 0.2},
+                            clearance_before={"violations": 0})
+        self.assertIs(r["ok"], False)
+        self.assertEqual(r["verdict"], "refused_at_clearance_no_worse")
+        self.assertEqual(r["blocking"], ["clearance_no_worse"])
+        self.assertIn("state wrong, no write", r["rule"])
+        # control: the same numbers with the inherited count pass the clearance
+        # line, and allow_open_outline turns an open shape into undecided rather
+        # than into either a pass or a refusal.
+        ok = self.pre.assess(affected=("copper",),
+                             outline={"present": True, "closed": True},
+                             clearance_after={"violations": 2, "threshold_mm": 0.2},
+                             clearance_before={"violations": 2})
+        self.assertIs(ok["ok"], True)
+        self.assertEqual(ok["verdict"], "writable_with_1_undecided")
+        opened = self.pre.assess(affected=("copper",), outline={"present": True,
+                                                               "closed": False},
+                                 allow_open_outline=True)
+        self.assertIs(opened["ok"], True)
+        self.assertIn("allow_open_outline", opened["verdict"] + str(opened["checks"]))
+
+    # 7 ---------------------------------------------------------------
+    def test_the_gate_is_wired_into_propose_and_has_an_off_switch(self):
+        import shutil
+        import tempfile
+        import importlib
+        plan = importlib.import_module("pcb_agent_mcp.edit.plan")
+        tmp = tempfile.mkdtemp(prefix="pcb_pre_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        a = os.path.join(tmp, "a.kicad_pcb")
+        b = os.path.join(tmp, "b.kicad_pcb")
+        shutil.copy(SAMPLE, a)
+        shutil.copy(SAMPLE, b)
+        # two different nets, 0.05 mm of copper gap: this plan creates a pair.
+        bad = [{"op": "add_track", "layer": "F.Cu", "net": "GND",
+                "x1": 120.0, "y1": -110.0, "x2": 120.0, "y2": -112.0, "width": 0.25},
+               {"op": "add_track", "layer": "F.Cu", "net": "VCC",
+                "x1": 120.3, "y1": -110.0, "x2": 120.3, "y2": -112.0, "width": 0.25}]
+        r = plan.propose(a, bad, options={})
+        self.assertIn("precondition.clearance_no_worse",
+                      [x.get("gate") for x in r.get("blocking")])
+        self.assertEqual(r["preconditions"]["verdict"],
+                         "refused_at_clearance_no_worse")
+        # control: the off switch removes the key entirely - a reply from a gate
+        # that did not run must not look like a reply from one that passed.
+        off = plan.propose(b, bad, options={"preconditions": False})
+        self.assertNotIn("preconditions", off)
+        self.assertNotIn("precondition.clearance_no_worse",
+                         [x.get("gate") for x in off.get("blocking")])
+
 if __name__ == "__main__":
     unittest.main()

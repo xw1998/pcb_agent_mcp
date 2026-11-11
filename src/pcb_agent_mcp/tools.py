@@ -12461,6 +12461,39 @@ def _board_fab_package(args):
                            zip_it=args.get("zip") is not False)
     except Exception as exc:                       # noqa: BLE001
         return _fab_fail(exc)
+    # ---- nothing leaves here with a known blocking violation in it
+    # A package is the last thing you do to a board; after this the next stop is a
+    # board house. So the DRC runs on THIS file, right now, and an error-severity
+    # violation or an unconnected item stops the package. `drc_gate: false` skips
+    # the check outright - it does not turn a dirty result into a clean one.
+    if args.get("drc_gate") is not False:
+        from .fidelity import engine as _engine
+        drc = _engine.drc(path, refill=True)
+        errors = int((drc.get("by_severity") or {}).get("error") or 0)
+        warns = int((drc.get("by_severity") or {}).get("warning") or 0)
+        unconnected = int(drc.get("unconnected_total") or 0)
+        block = {"errors": errors, "warnings": warns, "unconnected": unconnected,
+                 "violations_total": drc.get("violations_total"),
+                 "by_type": drc.get("by_type"),
+                 "zones_refilled_for_check": drc.get("zones_refilled_for_check"),
+                 "first": (drc.get("violations") or [])[:5],
+                 "verdict_source": drc.get("verdict_source")}
+        if drc.get("status") != "ok":
+            block["message"] = ("the DRC could not run, so this package cannot be "
+                                "said to be clean: %s" % drc.get("message"))
+            block["reason_code"] = drc.get("reason_code")
+            return err("refusing to package: the DRC gate could not run (%s)"
+                       % drc.get("reason_code"), "FAB_GATE_UNRUNNABLE",
+                       extra={"drc": block})
+        if errors or unconnected:
+            return err(
+                "refusing to package: %d DRC error(s) and %d unconnected item(s) are "
+                "on this board right now - fix them, or pass drc_gate=false if you "
+                "know what they are and are packaging anyway. Nothing was written."
+                % (errors, unconnected),
+                "FAB_REFUSED_UNCLEAN", extra={"drc": block})
+        out["drc"] = dict(block, note=("checked on the packaged file, zones refilled; "
+                                       "%d warning(s) do not block" % warns))
     if args.get("jlc_guard"):
         # The package's own checks only look for M02* / a tool table / one row.
         # The JLC guard parses the files and grades them against the published
@@ -12533,8 +12566,10 @@ _tool(
     "rows, a STEP that is not ISO-10303-21 comes back under `problems` instead of being "
     "counted as success. Writes a manifest.json (source sha256, kicad-cli version, every "
     "file with its own sha256) and a fab.zip. Refuses to write inside the source "
-    "directory tree unless allow_beside_source=true. Not included: panelisation, V-cut, "
-    "stencil, impedance report.",
+    "directory tree unless allow_beside_source=true. The DRC runs on the packaged file "
+    "first and an error-severity violation or an unconnected item refuses the package "
+    "(drc_gate=false skips the check; it does not make a dirty board clean). Not "
+    "included: panelisation, V-cut, stencil, impedance report.",
     {"type": "object", "properties": {
         "path": _str("the .kicad_pcb file (never modified)"),
         "formats": _arr("gerbers / drill / pos / step / ipc2581 / odb / ipcd356 / gencad"
@@ -12549,6 +12584,9 @@ _tool(
                         "the JLCPCB process declaration (layers / copper_oz required, see "
                         "jlc_process); without it the guard runs structure checks only, "
                         "because a guessed copper weight picks the wrong limit row"},
+        "drc_gate": _bool("run the DRC on this file first and refuse to package when it "
+                          "has error-severity violations or unconnected items (default "
+                          "true; false skips the check, it does not clean anything)", True),
     }, "required": ["path"]},
     _board_fab_package,
 )

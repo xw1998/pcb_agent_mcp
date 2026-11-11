@@ -265,7 +265,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `diff_width` | Zdiff → 线宽（间距固定，二分） | 不可达 → `UNREACHABLE` + 可达带宽 |
 | `schematic_pcb_diff` | 原理图网表 ↔ 板：**逐脚**差集（哪个封装的哪个脚换了网 / 板上没网） | 两侧都用权威（KiCad 自己的网表器 + 板文件里的 pad net）；缺封装只报 `needs_placement`，**不发明位置** |
 | `schematic_pcb_sync` | 把差集变成 op，走正常的 propose/apply 闸门 | 一个字节都不写；位置必须调用方给 |
-| `board_fab_package` | 制造包：Gerber/Excellon/位置/gbrjob + `manifest.json` + 可选 `fab.zip` | **只外包给 `kicad-cli` 不重算**；产物重新读一遍验终止符/工具表/行数，不合格判 failed；`out_dir` 落在源目录里直接拒（`OUT_DIR_BESIDE_SOURCE`） |
+| `board_fab_package` | 制造包：Gerber/Excellon/位置/gbrjob + `manifest.json` + 可选 `fab.zip` | **只外包给 `kicad-cli` 不重算**；产物重新读一遍验终止符/工具表/行数，不合格判 failed；`out_dir` 落在源目录里直接拒（`OUT_DIR_BESIDE_SOURCE`）；**出包前对这个文件跑一次 DRC：有 error 或未连通项就 `FAB_REFUSED_UNCLEAN` 拒绝出包，warning 只记录；`drc_gate=false` 只跳过检查，不会让脏板变干净** |
 | `board_export` / `board_graphics` | Gerber / STEP / PDF / 图形 | 同上；`kicad-cli` 缺失即 `KICAD_CLI_NOT_FOUND`，不回退自研 writer |
 | `board_blockers` | 布不通时**挡路的是谁**：八扇区哪些开着 + 每个对象的可变性标注 | 标注是**结构事实**（pad movable / 铜 reroutable / 铺铜·keepout·板框 fixed），不是替你做的决定 |
 | `board_fanout` | BGA 扇出：每个球朝外短桩 + 四次旋转，用布线器同一套精确几何判 | 不做 via-in-pad、不回拆已接受的出口、**不声称完整扇出**（`skipped` 就是埋着的球） |
@@ -290,6 +290,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 | `board_create` | 造一块新的空板（叠层/规则/闭合板框），写完再问 KiCad：板框闭合吗、DRC 干净吗 | 任一为否就删掉文件而不是留个“看着像板”的东西 |
 | `board_propose` | 只算不写：plan_id、改前/改后 digest、每条 op 将被检查的后置条件、blocking | 按**内容**判格式（`PK` = `.epro`） |
 | `board_apply` | 落盘：checkpoint → 原子写 → 五道闸门 → 不过就回滚回原字节 | 必须 `confirm=true`；plan 单次使用 |
+| *(状态门)* | `propose` / `apply` 落笔前先跑 `ruleset/precondition.py` 六条：规则基线有据、DRC 引擎在且没被关掉、板框已知、机械层没被动过、本次计划没新造 <0.2 mm 跨网间距、工艺是否已声明 | 不是「未确认不得布线」，是「状态不对不得布线」；不满足抛 `PRECONDITION_NOT_MET`；`options.preconditions=false` 时回复里连 `preconditions` 键都不出现 |
 | `board_checkpoints` | 某个文件的所有检查点（时间、sha256、原因） | — |
 | `board_restore` | 回到某个检查点（默认把当前态先再存一份） | 必须 `confirm=true` |
 | `app_detect` | EDA 装在哪（显式路径→运行中镜像→盘符→注册表） | 永远回带 `tried` 证据 |

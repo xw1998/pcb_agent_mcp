@@ -9,6 +9,51 @@
 早期用 `0.1.0`…`0.7.0` 递增标注过内部阶段，已按要求收敛；那些标签只留在 git 历史里
 （见文末对照表），不再作为版本号使用。
 
+## [0.0.131] - 2026-11-11
+
+这一版做**门**：规则能判板子能不能造，`ruleset/precondition.py` 判它**现在能不能动**。
+写工具（`edit/plan.py` 的 `propose` 与 `apply_plan`）在写任何字节之前先过六条机器可裁决的检查。
+
+**不是"未确认不得布线"，是"状态不对不得布线"**——门是一份状态，不是一个人工确认框。
+
+### 六条检查（全部不需要人、不需要网络、不猜）
+
+| 检查 | 判什么 | 结果 |
+|---|---|---|
+| `rules_baseline` | 规则集能加载；15 条阻塞规则全有来源，29 条 fab 限值全有逐字引文 | `ok:false` → 拒绝 |
+| `drc_engine` | kicad-cli 在不在 | 不在 → 拒绝；`options.engine=false` 只记未定（那是调用方的开关，门不覆写契约） |
+| `outline_known` | 板框存在且闭合（否则"离板边太近"不是事实） | 落铜时拒绝 / 非铜降为未定 |
+| `mech_unchanged` | 计划没有偷偷改 Edge.Cuts | 拒绝，除非 `allow_edge_changes=true` |
+| `clearance_no_worse` | 计划没有把不同网络铜拉到 0.2 mm 以内 | 拒绝（**增量判据**） |
+| `process_declared` | 有没有可对照的工艺声明 | 只报不判，且不算 pass |
+
+三条设计口径：
+
+- **增量而非绝对**：`clearance_no_worse` 只拒"这次新造出来的"贴近对。真板本来就可能有
+  0.1 mm 的既有对，要求先修好历史才能编辑，会让门在最需要编辑的板上失效。
+- **propose 与 apply 用同一份数**：propose 把 `outline` / `clearance_after` /
+  `clearance_before` 存进 `preconditions_input`，apply 复判用它；只有 `rules_baseline`
+  与 `drc_engine` 在 apply 时重读。门与它守的提案不会给出两个说法。
+- **关闭开关 = 回复逐字节不变**：`options.preconditions=false` 时连 `preconditions` 键都不出现。
+
+拒绝抛 `PRECONDITION_NOT_MET`，`extra.preconditions` 带六条完整读数。
+
+### `board_fab_package` 加 DRC 门（默认开）
+
+出包前对**这个文件**跑一次 `kicad-cli pcb drc --refill-zones`：有 error 或未连通项 →
+`FAB_REFUSED_UNCLEAN` 拒绝出包；engine 跑不起来 → `FAB_GATE_UNRUNNABLE`；
+warning 不拦，写进 `out["drc"]`。`drc_gate=false` 只跳过检查，不会把脏板变干净。
+
+### 实测
+
+- 两态对照（`_t/pp2.kicad_pcb`，4 error + 1 未连通）：`drc_gate=true` → `FAB_REFUSED_UNCLEAN`；
+  `drc_gate=false` → 正常出包（9 个文件、244+246 flash、两套钻孔）。
+- 端到端（`pic_programmer`）：(100,-120)→(112,-120) 加铜被 `refused_at_clearance_no_worse`
+  拒（0→3 对）；(200,-130)→(210,-130) 五门全过写入成功。
+- `tests/test_ruleset.py` 21 → **28 passed**（新增 7 条，每条都有反向对照：
+  找不到引擎必须 fail、显式关引擎必须只剩未定、删一条引文必须 fail、无板框落铜必须 fail、碰 Edge.Cuts 必须 fail、
+  `0→3` 必须 fail 而 `3→3` 必须 pass、`preconditions:false` 必须不出现该键）。
+
 ## [0.0.130] - 2026-11-11
 
 这一版做**规则**：把散落在 `layout_review` / `design_rules` / `jlc_spec_check` 里的判据收成一套
