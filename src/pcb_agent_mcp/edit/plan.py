@@ -39,6 +39,8 @@ import tempfile
 import time
 import uuid as _uuid
 
+from .. import geometry as _geom
+from ..adapters import open_board as _open_board
 from ..fidelity import engine as _engine
 from ..fidelity import kicad_doc as _kdoc
 from ..fidelity import sexpr as S
@@ -466,6 +468,103 @@ def _drc_keys(result):
                      round(pos["y"], 2) if pos else None))
     return keys
 
+def _pour_rows(board):
+    """Filled copper per zone, as numbers that survive being compared.
+
+    `signed_mm2` is the shoelace sum over the zone's `filled_polygon` rings, taken
+    as an absolute value: KiCad writes a copper ring clockwise and a hole
+    counter-clockwise, so the sum is copper-minus-holes and only its SIGN says
+    which way round the file happens to wind them. Measured on sky_star: all four
+    zones sum negative, so the magnitude is taken and the orientation is not a
+    guess.
+
+    What is still an assumption is that holes are wound OPPOSITE to copper. If
+    they were not, holes would add instead of subtract and the pour would measure
+    larger than the outline it sits in - which is exactly the check every row
+    carries. A row that fails it (`sign_convention_ok: False`) has its area left
+    out of the total rather than reported as a number that might be wrong.
+    """
+    rows = []
+    for zone in board.zones or []:
+        if zone.get("is_keepout") or zone.get("fill_mode") in (None, "none"):
+            continue
+        rings = zone.get("filled_polygons") or []
+        signed = abs(sum(_geom.polygon_area(ring) for ring in rings))
+        outline = abs(_geom.polygon_area(zone.get("outline") or []))
+        ok = True
+        if outline > 1e-9 and signed > outline * 1.001 + 1e-9:
+            ok = False
+        elif outline <= 1e-9 and signed > 1e-9:
+            ok = False
+        rows.append({"net": zone.get("net"), "layers": list(zone.get("layers") or []),
+                     "rings": len(rings),
+                     "vertices": sum(len(r) for r in rings),
+                     "signed_mm2": round(signed, 4),
+                     "outline_mm2": round(outline, 4),
+                     "sign_convention_ok": ok})
+    return rows
+
+
+def _pour_delta(before_path, after_path):
+    """What the pour gave up so this edit could exist.
+
+    Measured on the REFILLED copies of both halves, which `engine.drc(save_to=)`
+    leaves behind, because the `filled_polygon` in the file on disk is a snapshot:
+    a track added since the last fill is not cut out of it, so the on-disk
+    polygons are the same before and after and would report a delta of zero for
+    every edit ever made.
+
+    This is the number the DRC gate structurally cannot produce. A refilled pour
+    never violates clearance against a track or a via - the filler carves itself
+    back around them - so `new_blocking_total == 0` is true by construction
+    whenever a zone is in play. What actually happens to a wider track that
+    lands inside a pour is that the pour loses area (and, if that was the island's
+    only copper, a connection). The first half of that is measured here.
+    """
+    try:
+        before = _pour_rows(_open_board(before_path))
+        after = _pour_rows(_open_board(after_path))
+    except Exception as exc:                       # noqa: BLE001 - reported
+        return {"comparable": False,
+                "reason": "the refilled copies could not be re-read: %s" % (exc,)}
+    if len(before) != len(after):
+        return {"comparable": False,
+                "reason": ("the refilled copies do not carry the same zones "
+                           "(%d before, %d after), so no per-zone pair exists"
+                           % (len(before), len(after)))}
+    out = {"comparable": True, "zones": [], "note": (
+        "filled area of the pour, from the refilled copies of both halves; a "
+        "refilled pour cannot violate clearance against tracks or vias, it only "
+        "gives copper up, and this is that copper")}
+    total_before = total_after = 0.0
+    for i, (b, a) in enumerate(zip(before, after)):
+        row = dict(a)
+        row["index"] = i
+        row["before_mm2"] = b["signed_mm2"]
+        row["delta_mm2"] = round(a["signed_mm2"] - b["signed_mm2"], 4)
+        row["usable"] = bool(b["sign_convention_ok"] and a["sign_convention_ok"])
+        if row["usable"]:
+            total_before += b["signed_mm2"]
+            total_after += a["signed_mm2"]
+        out["zones"].append(row)
+    if not all(r["usable"] for r in out["zones"]):
+        out["comparable"] = False
+        out["reason"] = ("at least one zone fails the outline check that the "
+                         "hole-winding assumption rests on; no area is reported "
+                         "rather than an area that might be wrong")
+        out["zones_unusable"] = [r["index"] for r in out["zones"] if not r["usable"]]
+        return out
+    out["before_mm2"] = round(total_before, 4)
+    out["after_mm2"] = round(total_after, 4)
+    out["delta_mm2"] = round(total_after - total_before, 4)
+    out["pour_gave_up_mm2"] = round(max(0.0, total_before - total_after), 4)
+    out["pour_gained_mm2"] = round(max(0.0, total_after - total_before), 4)
+    # 0.01 mm2 is a tenth of a 0.1 x 0.1 mm square: below that it is the filler's
+    # own vertex rounding, not a decision the edit forced.
+    out["pour_changed"] = abs(out["delta_mm2"]) > 0.01
+    return out
+
+
 def _drc_diff(before, after, limit=10, strict=False):
     """What the edit newly broke, split into blocking and advisory.
 
@@ -640,11 +739,35 @@ def apply_plan(plan_id, confirm=False, options=None):
             # tracks that are too close are still too close - it only removes the
             # phantom ones. Measured on the STM32F412 core board: 502 violations
             # stale vs 52 refilled, same bytes (kicad-cli 10.0.7).
-            drc_before = _engine.drc(before_file, project=pro_beside, refill=True)
-            drc_after = _engine.drc(target, project=pro_beside, refill=True)
-            gates["drc"] = _drc_diff(drc_before, drc_after,
-                                     strict=bool(options.get("strict_drc")))
-            gates["drc"]["zones_refilled_for_check"] = True
+            pour_dir = tempfile.mkdtemp(prefix="pcb_agent_pour_")
+            try:
+                before_refilled = os.path.join(pour_dir, "before.kicad_pcb")
+                after_refilled = os.path.join(pour_dir, "after.kicad_pcb")
+                drc_before = _engine.drc(before_file, project=pro_beside, refill=True,
+                                         save_to=before_refilled)
+                drc_after = _engine.drc(target, project=pro_beside, refill=True,
+                                        save_to=after_refilled)
+                gates["drc"] = _drc_diff(drc_before, drc_after,
+                                         strict=bool(options.get("strict_drc")))
+                gates["drc"]["zones_refilled_for_check"] = True
+                # The one thing a refilled verdict cannot say: a refilled pour
+                # meets clearance by carving itself back, so it pays in copper.
+                gates["drc"]["pour"] = _pour_delta(before_refilled, after_refilled)
+            finally:
+                shutil.rmtree(pour_dir, ignore_errors=True)
+            gates["drc"]["unconnected"] = {
+                "before": drc_before.get("unconnected_total"),
+                "after": drc_after.get("unconnected_total"),
+                "delta": (None if drc_before.get("unconnected_total") is None
+                          or drc_after.get("unconnected_total") is None else
+                          int(drc_after["unconnected_total"])
+                          - int(drc_before["unconnected_total"])),
+                "not_a_verdict": (
+                    "these are COUNTED, not judged: two refills of the SAME file "
+                    "do not agree on which pairs are missing (2 zone-to-zone "
+                    "pairs one run, 13 the next, 49 either way), so a count that "
+                    "moves is not proof of a new break and one that holds still "
+                    "is not proof there is none")}
             if gates["drc"].get("comparable"):
                 gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")
             # The pour happens AFTER this DRC, so its errors have to be compared
@@ -814,6 +937,15 @@ def apply_plan(plan_id, confirm=False, options=None):
                 "plan_still_open": True,
             }
         PLANS.pop(plan_id, None)
+        pour = (gates.get("drc") or {}).get("pour") or {}
+        pour_note = ""
+        if pour.get("comparable") and pour.get("pour_changed"):
+            moved = ", ".join("%s@%s %+.2f" % (z["net"], "/".join(z["layers"]), z["delta_mm2"])
+                              for z in pour["zones"] if abs(z["delta_mm2"]) > 0.01)
+            pour_note = ("; the pour was reshaped so this could exist: %+.2f mm2 of "
+                         "filled copper overall (%s), and a refilled pour meets "
+                         "clearance by carving itself back - which is why the "
+                         "violation count cannot see this" % (pour["delta_mm2"], moved))
         return {
             "status": "ok",
             "plan_id": plan_id,
@@ -827,7 +959,7 @@ def apply_plan(plan_id, confirm=False, options=None):
             "decision": ("every gate passed: the bytes on disk are the planned bytes, "
                          "re-parsing reproduces the planned tree, each operation's "
                          "postcondition was re-read from the file, KiCad re-read both "
-                         "files, and its DRC reports no new violation"),
+                         "files, and its DRC reports no new violation" + pour_note),
             "how_to_undo": "board_restore(checkpoint_id=%r, confirm=true)"
                            % checkpoint["checkpoint_id"],
         }
@@ -1004,11 +1136,29 @@ def _final_gates_board(plan, target, session, options):
                          and (comparable or eng.get("status") == "skipped"))
         gates["engine"] = eng
         pro_beside = _project_beside(target)
-        gates["drc"] = _drc_diff(_engine.drc(before_file, project=pro_beside,
-                                             refill=True),
-                                 _engine.drc(target, project=pro_beside,
-                                             refill=True),
-                                 strict=bool(options.get("strict_drc")))
+        pour_dir = tempfile.mkdtemp(prefix="pcb_agent_pour_")
+        try:
+            before_refilled = os.path.join(pour_dir, "before.kicad_pcb")
+            after_refilled = os.path.join(pour_dir, "after.kicad_pcb")
+            drc_before = _engine.drc(before_file, project=pro_beside, refill=True,
+                                     save_to=before_refilled)
+            drc_after = _engine.drc(target, project=pro_beside, refill=True,
+                                    save_to=after_refilled)
+            gates["drc"] = _drc_diff(drc_before, drc_after,
+                                     strict=bool(options.get("strict_drc")))
+            gates["drc"]["zones_refilled_for_check"] = True
+            gates["drc"]["pour"] = _pour_delta(before_refilled, after_refilled)
+        finally:
+            shutil.rmtree(pour_dir, ignore_errors=True)
+        gates["drc"]["unconnected"] = {
+            "before": drc_before.get("unconnected_total"),
+            "after": drc_after.get("unconnected_total"),
+            "delta": (None if drc_before.get("unconnected_total") is None
+                      or drc_after.get("unconnected_total") is None else
+                      int(drc_after["unconnected_total"])
+                      - int(drc_before["unconnected_total"])),
+            "not_a_verdict": ("counted, not judged: two refills of the same file "
+                              "disagree about WHICH pairs are missing")}
         if gates["drc"].get("comparable"):
             gates["drc"]["ok"] = not gates["drc"].get("new_blocking_total")
         drc = gates["drc"]

@@ -141,6 +141,11 @@ DRC 引擎在、板框已知（只对新增铜要求）、机械层没被动过�
 …）。checkpoint 在 `$PCB_AGENT_HOME`（默认 `~/.pcb_agent_mcp`），不在工程目录边上。
 回滚用 `board_checkpoints` 列表 + `board_restore`。
 
+回包里 `gates.drc.pour` 是**只有这里能给出**的读数：重填后的铺铜永远靠"把自己挖掉"来满足
+clearance，所以板上有 zone 时 `new_blocking_total == 0` 是构造性成立的。铺铜到底被动了多少，
+看 `pour.delta_mm2` / `pour_gave_up_mm2`（逐 zone 也有），`decision` 句里会直接写出来。
+`gates.drc.unconnected` 只给计数，**不构成判词**：同一文件两次重填对"哪几对断"并不一致。
+
 状态不对时 `apply` 抛 `PRECONDITION_NOT_MET`，`extra.preconditions` 带六条完整读数；
 它复判用的是 `propose` 存下的同一份数（只有规则文件与引擎会重读），所以门和提案不会给出两个说法。
 

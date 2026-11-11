@@ -121,7 +121,8 @@ def _run(args, cwd, timeout=180):
 # because the right answer to a slow call is an id, not a longer wait.
 DRC_TIMEOUT_S = 900
 
-def drc(path, severity="all", timeout=None, project=None, refill=False):
+def drc(path, severity="all", timeout=None, project=None, refill=False,
+        save_to=None):
     """Authoritative DRC. Reports only; never writes beside the input.
 
     `project` is the `.kicad_pro` the verdict has to be read against. It is not
@@ -158,6 +159,15 @@ def drc(path, severity="all", timeout=None, project=None, refill=False):
     without the refill 502 violations / 324 of them clearance; with it 52 / 0
     clearance. The 450 difference was entirely the stale snapshot - which is to
     say the no-refill verdict was not a stricter answer, it was a wrong one.
+
+    `save_to` asks for the refilled board itself, not just the verdict. It needs
+    `refill=True`, and it is the only way to answer a question the violation
+    list structurally cannot: a refilled pour NEVER violates clearance against a
+    track or a via, because the filler carves itself back around them. So "no
+    new clearance violation" is true by construction whenever a zone is in play,
+    and the price the pour paid - the filled area it gave up - is only visible in
+    the refilled polygons. Nothing is written beside the input: the scratch copy
+    is what gets copied out.
     """
     timeout = DRC_TIMEOUT_S if timeout is None else timeout
     exe = find_kicad_cli()
@@ -194,6 +204,11 @@ def drc(path, severity="all", timeout=None, project=None, refill=False):
         args.append("--severity-all" if severity == "all" else "--severity-error")
         if refill:
             args.append("--refill-zones")
+            if save_to:
+                # the refilled polygons are written into the SCRATCH copy; the
+                # caller's path is only ever read, and `save_to` is copied out
+                # below, before the scratch directory is removed
+                args.append("--save-board")
         args.append(target_path)
         res = _run(args, cwd=tmp, timeout=timeout)
         if not os.path.isfile(report):
@@ -203,6 +218,11 @@ def drc(path, severity="all", timeout=None, project=None, refill=False):
                     "engine_output": res}
         with open(report, "r", encoding="utf-8") as fh:
             data = json.load(fh)
+        saved = None
+        if save_to and refill:
+            if os.path.isfile(target_path) and os.path.getsize(target_path) > 0:
+                shutil.copyfile(target_path, save_to)
+                saved = save_to
         return {
             "status": "ok",
             "authoritative": True,
@@ -219,6 +239,7 @@ def drc(path, severity="all", timeout=None, project=None, refill=False):
             "schematic_parity": data.get("schematic_parity"),
             "project_file_used": project_used,
             "zones_refilled_for_check": bool(refill),
+            "refilled_board_saved_to": saved,
             "zone_refill_note": (
                 "zones were refilled in a scratch copy before the check, so the "
                 "verdict is about the pour as it would be after a fill - the "
