@@ -42,6 +42,7 @@ from .calc import power as _power
 from .calc import spice as _spice
 from .sim import board as _simboard
 from .sim import run as _simrun
+from .sim import power as _simpower
 from .calc import thermal as _thermal
 from .calc import vibration as _vib
 from .calc import vibration_poly as _vib_poly
@@ -6083,7 +6084,7 @@ def _capabilities(_args):
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_spreading",
             "thermal_convection",
-            "board_ir_drop", "board_netlist", "board_sim",
+            "board_ir_drop", "board_netlist", "board_sim", "board_thermal",
             "dfm_capability", "dfm_check",
             "vibration_plate_modes", "vibration_plate_outline",
             "vibration_plate_stress",
@@ -8232,6 +8233,64 @@ _tool(
         model_zones=bool(a.get("model_zones")),
         include_lc=(a.get("include_lc") if a.get("include_lc") is not None else True),
         max_nodes=int(a.get("max_nodes") or 60000)), derived=True),
+)
+
+_tool(
+    "board_thermal",
+    "Whole-board electro-thermal from the FILE: the currents you give per pad are solved "
+    "on board_ir_drop's own copper graph, every track segment's I^2R becomes a heat "
+    "source, and the 2-D plate is board_electrothermal - the plate is the outline's "
+    "bounding box, the thickness is the stackup's, and every filled pour on a copper "
+    "layer spreads heat as a rectangle. This is the board answer to 'where does it get "
+    "hot', and it is a closed loop: rho(T) feeds back into the I^2R that made the heat. "
+    "Two things are REFUSED rather than guessed, because a .kicad_pcb states neither: a "
+    "current (that is why currents are yours to give) and a convection coefficient "
+    "(h_w_m2k). A net whose currents do not add up to zero is refused - with no "
+    "component models in the file, half a circuit is not a hot trace. A net whose "
+    "copper is split is solved on the piece the driven pads reach, and the rest is "
+    "counted as islands that carry nothing; if the driven pads themselves sit on two "
+    "pieces, nothing can flow and that is refused too. Vias dissipate "
+    "and are reported, but a vertical barrel is not placed as a source in a 2-D "
+    "in-plane field, so their power is named separately instead of being folded in.",
+    {"type": "object", "properties": dict(
+        _COMMON,
+        currents={"type": "array", "items": {
+            "type": "object",
+            "description": "one current at a real pad",
+            "properties": {
+                "at": _str("pad name (U1.1, J2.3)"),
+                "a": _num("amps INTO the copper at that pad; each net's values must "
+                          "add up to zero"),
+            }, "required": ["at", "a"]},
+            "description": "the currents the board actually carries - the one thing "
+                           "a board file cannot state"},
+        h_w_m2k=_num("convection coefficient per exposed face (required); still air "
+                     "on a horizontal board is about 5-10"),
+        k_w_mk=_num("in-plane laminate conductivity (FR4 ~0.3)", 0.3),
+        thickness_mm=_num("board thickness; defaults to the stackup's"),
+        copper_um=_num("override the stackup copper thickness"),
+        copper_from_board=_bool("pass the file's filled pours as spreading copper "
+                                "(default true)", True),
+        model_zones=_bool("grid pours on the simulated nets as conductors too "
+                          "(slower; the plate already spreads through them)", False),
+        plating_um=_num("via barrel plating thickness (required for nets with vias)"),
+        quantize_mm=_num("node quantisation of the copper graph", 0.01),
+        t_ambient_c=_num("ambient temperature", 25),
+        cell_mm=_num("plate grid pitch; default min(W,H)/40"),
+        edge_temp_c=_num("hold the four plate edges at this temperature"),
+        emissivity=_num("0..1 grey-body emissivity of both faces (optional)"),
+        thermal_vias={"type": "array", "items": {"type": "object"},
+                      "description": "board_electrothermal's thermal_vias, unchanged"},
+        layer_stack={"type": "object",
+                     "description": "board_electrothermal's layer_stack, unchanged; "
+                                    "mutually exclusive with copper_from_board"},
+        k_copper_w_mk=_num("copper conductivity used by the pours", 400),
+        max_cells=_num("plate cell cap", 20000),
+        max_nodes=_num("copper graph node cap", 60000),
+        transient={"type": "object",
+                   "description": "board_electrothermal's transient block, unchanged"},
+    ), "required": ["path", "currents", "h_w_m2k"]},
+    _board_tool(lambda b, a: _simpower.board_thermal(b, a), derived=True),
 )
 
 _tool(
