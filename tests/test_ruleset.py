@@ -505,5 +505,20 @@ class TestDesignBaseline(unittest.TestCase):
                 self.assertIsNone(r["this"])
                 self.assertTrue(r["why"])
 
+    def test_a_starting_point_never_outranks_a_rule(self):
+        """The suggested sizes are corpus medians of each board's MINIMUM. They are
+        a place to start, and the answer has to say what outranks them."""
+        from pcb_agent_mcp.adapters import open_board
+        row = self.b.compare(open_board(SAMPLE), paths=[SAMPLE, SAMPLE])
+        sug = row["suggested"]
+        self.assertAlmostEqual(sug["narrowest_track_mm"], 0.25, places=6)
+        self.assertIn("starting_point", sug["reads_as"])
+        self.assertIn("board_rule_audit (P0 limits, quoted)", sug["outranked_by"])
+        # control: a band made entirely of "nothing closer than the window" values
+        # is a floor, and the suggestion must flag it instead of quoting it as a
+        # measured spacing.
+        caveat = sug["caveats"].get("min_copper_to_edge") or ""
+        self.assertIn("lower bounds", caveat)
+
 if __name__ == "__main__":
     unittest.main()
