@@ -16,8 +16,10 @@ exist in this server:
   (``non_45_segments``, ``unconnected_pairs``, ``courtyard_overlaps``, ...).
 """
 import math
+import re
 
 from .. import geometry as G
+from ..adapters.canonical import pad_points as _pad_points
 from ..oracle import (_items, _dist, _bucketize, _item_bbox, _hole_list,
                       _hole_web, _min_copper_to_edge, _edge_segments,
                       _silk_facts, _silk_items, _polygon_throat,
@@ -571,7 +573,251 @@ def measure(board, window_mm=WINDOW_MM):
     else:
         m["footprints_off_board"] = _na("no closed outline to test against")
 
+    # ------------------------------------------------- decoupling capacitors
+    m.update(_decoupling(board))
+
     return m
+
+_CAP_REF = re.compile(r"^C\d")
+# A decoupling cap is a capacitor by reference designator (the file states C1,
+# C12; nothing is inferred from the value), and the pin it serves is a pad of a
+# part with three or more pads - a two-pin part is a passive, and "the cap serves
+# the resistor next to it" would make every board pass.
+_MULTI_PIN = 3
+
+
+def _q(v):
+    return int(round(float(v) * 10000.0))
+
+
+def _copper_graph(board, net):
+    """Layer-aware copper graph of ONE net: tracks, arcs, vias, pads.
+
+    Nodes are ``(layer, x*1e4, y*1e4)`` so two spellings of the same coordinate
+    (-95.10000000000198 and -95.1) are one node. Pad anchors become their own
+    node, joined to any track endpoint or via that lands inside the pad polygon.
+
+    This is the only honest way to answer either decoupling rule: pad-to-pad
+    distance is a straight line through the laminate, and the rule is about the
+    current's path. A pour-connected pair has NO track path at all, which the
+    caller reports instead of pretending the straight line is the trace.
+    """
+    adj = {}
+
+    def link(a, b, w, via):
+        adj.setdefault(a, []).append((b, w, via))
+        adj.setdefault(b, []).append((a, w, via))
+
+    for t in board.tracks:
+        if t.get("net") != net:
+            continue
+        lay = t.get("layer")
+        pts = t.get("_points") if t.get("_arc") else None
+        if pts:
+            seq = [(float(x), float(y)) for x, y in pts]
+        else:
+            a, b = t.get("start"), t.get("end")
+            if not (a and b):
+                continue
+            seq = [(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))]
+        for i in range(len(seq) - 1):
+            x0, y0 = seq[i]
+            x1, y1 = seq[i + 1]
+            link((lay, _q(x0), _q(y0)), (lay, _q(x1), _q(y1)),
+                 math.hypot(x1 - x0, y1 - y0), False)
+    for v in board.vias:
+        if v.get("net") != net:
+            continue
+        x, y = float(v["x"]), float(v["y"])
+        layers = [l for l in (v.get("layers") or [v.get("from"), v.get("to")]) if l]
+        for i in range(len(layers) - 1):
+            link((layers[i], _q(x), _q(y)), (layers[i + 1], _q(x), _q(y)), 0.0, True)
+
+    pads = []
+    keys = list(adj)
+    for f in board.footprints:
+        for pad in (f.get("pads") or []):
+            if pad.get("net") != net:
+                continue
+            poly = _pad_points(pad)
+            if not poly:
+                continue
+            idx = len(pads)
+            pads.append({"idx": idx, "ref": f.get("ref"),
+                         "number": pad.get("number"), "net": net,
+                         "node": ("PAD", idx), "poly": poly,
+                         "layers": set(pad.get("layers") or [])})
+            x0, y0, x1, y1 = G.bbox_of(poly)
+            node = ("PAD", idx)
+            adj.setdefault(node, [])
+            for k in keys:
+                if k[0] not in pads[idx]["layers"]:
+                    continue
+                px, py = k[1] / 10000.0, k[2] / 10000.0
+                if not (x0 - 1e-6 <= px <= x1 + 1e-6
+                        and y0 - 1e-6 <= py <= y1 + 1e-6):
+                    continue
+                if not G.point_in_polygon((px, py), poly):
+                    continue
+                link(node, k, 0.0, False)
+    return adj, pads
+
+
+def _shortest(adj, src, skip_vias):
+    """Dijkstra from ``src``. ``skip_vias`` leaves the via edges out.
+
+    No via edge has a length, so the distance is the copper length of the route.
+    With ``skip_vias`` the answer is "can these two pads be joined without
+    changing layer at all" - the question the same-layer rule actually asks.
+    """
+    import heapq
+    best = {src: 0.0}
+    pq = [(0.0, 0, src)]
+    tick = 1
+    while pq:
+        d, _, u = heapq.heappop(pq)
+        if d > best.get(u, float("inf")) + 1e-12:
+            continue
+        for v, w, via in adj.get(u) or ():
+            if via and skip_vias:
+                continue
+            nd = d + w
+            if nd < best.get(v, float("inf")) - 1e-12:
+                best[v] = nd
+                heapq.heappush(pq, (nd, tick, v))
+                tick += 1
+    return best
+
+
+def _decoupling(board):
+    """How far a decoupling capacitor's copper has to travel to reach its pin.
+
+    Two numbers the P1 catalogue asks for, measured on the ROUTED COPPER rather
+    than on pad centres:
+
+    ``decoupling_max_distance_to_pin_mm``
+        the worst capacitor on the board: the shortest copper path from one of its
+        own pads to any same-net pad of a multi-pin part, taking the most
+        favourable pad (that is the lower bound of "the pin it serves").
+    ``decoupling_via_in_path``
+        whether that path has no via-free alternative - i.e. the connection
+        cannot exist without changing layer.
+
+    What this is NOT: it does not know which pin the capacitor was *bought* to
+    serve, and it cannot answer for a capacitor whose net is carried by a pour
+    (there is no track path in the file to measure). Both residues are counted
+    and named instead of being folded into the number.
+    """
+    out = {}
+    caps, targets = [], []
+    for f in board.footprints:
+        ref = str(f.get("ref") or "")
+        pads = [p for p in (f.get("pads") or []) if p.get("net") is not None]
+        if not pads:
+            continue
+        (caps if _CAP_REF.match(ref) else targets).append((ref, pads))
+    targets = [(r, p) for r, p in targets if len(p) >= _MULTI_PIN]
+    if not caps:
+        why = "no footprint whose reference designator starts with C (capacitor)"
+        out["decoupling_max_distance_to_pin_mm"] = _na(why)
+        out["decoupling_via_in_path"] = _na(why)
+        return out
+    if not targets:
+        why = ("no multi-pin part (3+ pads) to decouple: the denominator of this "
+               "rule is absent, so there is no distance to quote")
+        out["decoupling_max_distance_to_pin_mm"] = _na(why)
+        out["decoupling_via_in_path"] = _na(why)
+        return out
+
+    tf = {}
+    for ref, pads in targets:
+        for p in pads:
+            tf.setdefault(p.get("net"), []).append((ref, p))
+    graphs = {}
+
+    def graph(net):
+        if net not in graphs:
+            graphs[net] = _copper_graph(board, net)
+        return graphs[net]
+
+    served, unserved = [], []
+    for ref, pads in caps:
+        best = None
+        for p in pads:
+            net = p.get("net")
+            if not tf.get(net):
+                continue
+            adj, gnodes = graph(net)
+            src = None
+            for g in gnodes:
+                if g["ref"] == ref and str(g["number"]) == str(p.get("number")):
+                    src = g["node"]
+                    break
+            if src is None:
+                continue
+            dist = _shortest(adj, src, skip_vias=False)
+            for tref, q in tf[net]:
+                tgt = None
+                for g in gnodes:
+                    if g["ref"] == tref and str(g["number"]) == str(q.get("number")) \
+                            and g["net"] == net:
+                        tgt = g["node"]
+                        break
+                if tgt is None or tgt not in dist:
+                    continue
+                if best is None or dist[tgt] < best[0]:
+                    best = (dist[tgt], p, q, tref, adj, src, tgt)
+        if best is None:
+            unserved.append(ref)
+        else:
+            served.append((ref, best))
+
+    if not served:
+        why = ("no capacitor reaches a multi-pin part through routed copper: %s "
+               "(a pour-carried net has no track path to measure)"
+               % ", ".join(unserved[:6]))
+        out["decoupling_max_distance_to_pin_mm"] = _na(why)
+        out["decoupling_via_in_path"] = _na(why)
+        return out
+
+    served.sort(key=lambda s: -s[1][0])
+    d, p, q, tref, adj, src, tgt = served[0][1]
+    out["decoupling_max_distance_to_pin_mm"] = {
+        "value": float(d),
+        "where": "%s.%s to %s.%s on %s" % (served[0][0], p.get("number"), tref,
+                                           q.get("number"), p.get("net")),
+        "method": "shortest path over the routed copper of the net (tracks, arcs, "
+                  "vias, pads; pad anchors joined to any track landing inside the "
+                  "pad), from the capacitor pad to the nearest same-net pad of a "
+                  "multi-pin part - the most favourable reading of 'the pin it "
+                  "serves', so this is a lower bound; %d capacitor(s) measured, "
+                  "%d have no track path at all" % (len(served), len(unserved)),
+        "examples": [{"cap": r, "part": b[3], "net": b[1].get("net"),
+                      "path_mm": round(b[0], 4)} for r, b in served[:6]],
+    }
+    forced = []
+    for ref, b in served:
+        free = _shortest(b[4], b[5], skip_vias=True)
+        if b[6] not in free:
+            forced.append((ref, b))
+    out["decoupling_via_in_path"] = {
+        "value": bool(forced),
+        "where": ("%d of %d measured capacitor(s) have no via-free copper path to "
+                  "the pin they reach%s"
+                  % (len(forced), len(served),
+                     (": " + ", ".join(x[0] for x in forced[:6])) if forced else "")),
+        "method": "the same shortest-path graph is walked again with the via edges "
+                  "removed: a pad pair that drops out of the reachable set cannot be "
+                  "joined without changing layer",
+    }
+    residues = []
+    if unserved:
+        residues.append("%d capacitor(s) have no track path (pour-carried net): %s"
+                        % (len(unserved), ", ".join(unserved[:8])))
+    if residues:
+        out["decoupling_max_distance_to_pin_mm"]["note"] = "; ".join(residues)
+        out["decoupling_via_in_path"]["note"] = "; ".join(residues)
+    return out
 
 
 def _npth_ring(npth_holes, cu_items, window_mm=5.0):
@@ -601,6 +847,34 @@ def _npth_ring(npth_holes, cu_items, window_mm=5.0):
     return _rec(gap, "%s vs %s" % (h["ref"], it.get("ref")),
                 "hole edge to nearest copper of any net (NPTH keep-out)")
 
+def grade_caps(m):
+    """Facts this module measured but refuses to GRADE, and why.
+
+    The measurement is real; the population is not the rule's. Feeding it to the
+    grader would turn "I measured every capacitor on a routed net" into a verdict
+    about decoupling capacitors, which is the exact laundering this package
+    exists to prevent. The number stays visible as a diagnostic, and the rule
+    stays undetermined until the caller names the cap-to-pin pairs.
+    """
+    caps = {}
+    row = m.get("decoupling_max_distance_to_pin_mm") or {}
+    if "value" in row:
+        caps["decoupling_max_distance_to_pin_mm"] = (
+            "measured, not graded: the population is every capacitor whose net is "
+            "carried by a track to a multi-pin part, and that set contains "
+            "debounce and filter capacitors that are not decoupling capacitors "
+            "(worst: %s). Name the pairs you meant - the capacitor pad and the pin "
+            "it serves - and this fact is graded from them."
+            % (row.get("where") or "?"))
+    row = m.get("decoupling_via_in_path") or {}
+    if isinstance(row.get("value"), bool):
+        caps["decoupling_via_in_path"] = (
+            "measured, not graded: same population caveat as "
+            "decoupling_max_distance_to_pin_mm (%s)"
+            % (row.get("where") or "?"))
+    return caps
+
+
 def catalog_facts(m):
     """Map the measurements onto the fact names ``calc/rules.py`` grades."""
     facts = {}
@@ -614,7 +888,18 @@ def catalog_facts(m):
     take("min_plated_drill", "min_via_hole_mm")
     take("diffpair_length_skew_mm", "diffpair_length_skew_mm")
     take("trace_under_crystal", "trace_under_crystal")
+    take("decoupling_max_distance_to_pin_mm", "decoupling_max_distance_to_pin_mm")
+    # A bool must stay a bool: `take` multiplies by 1.0 and would hand the
+    # grader the float 1.0, which it rejects as "must be true/false".
+    row = m.get("decoupling_via_in_path") or {}
+    if isinstance(row.get("value"), bool):
+        facts["decoupling_via_in_path"] = row["value"]
     return facts
+
+
+# Facts whose measurement this module can make but whose POPULATION it cannot
+# bound, so they are reported and not graded (see `grade_caps`).
+CAP_FACTS = ("decoupling_max_distance_to_pin_mm", "decoupling_via_in_path")
 
 
 def failing_examples(m, key, limit):

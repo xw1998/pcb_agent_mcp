@@ -243,8 +243,14 @@ def _fab_checks(process, m):
 
 
 def _catalog_checks(process, m, facts_in):
-    facts = dict(_measure.catalog_facts(m))
+    auto = _measure.catalog_facts(m)
+    facts = dict(auto)
     facts.update(facts_in or {})
+    # A fact this module measured but cannot bound the POPULATION of is shown and
+    # not graded. A number supplied by the caller replaces it, because the caller
+    # is the one who knows which capacitor serves which pin.
+    caps = _measure.grade_caps(m)
+    given = set(facts_in or ())
     checks = []
     for rule in _rules.LAYOUT_RULES:
         lvl = _CATALOG_LEVEL.get(rule["id"])
@@ -282,11 +288,20 @@ def _catalog_checks(process, m, facts_in):
              "evidence_level": graded.get("evidence_level")}
         if state == "undetermined":
             c["reason"] = graded.get("reason") or graded.get("next_check")
-        if state == "fail" and isinstance(c["measured"], (int, float)) \
-                and isinstance(c["limit"], (int, float)):
+        numeric = (rule["kind"] not in ("bool_false", "bool_true")
+                   and isinstance(c["measured"], (int, float))
+                   and isinstance(c["limit"], (int, float)))
+        if state == "fail" and numeric:
             c["margin"] = (c["measured"] - c["limit"]
                            if rule["kind"] in ("max", "count_max")
                            else c["limit"] - c["measured"])
+        if state in ("pass", "fail") and rule["fact"] in caps \
+                and rule["fact"] not in given:
+            c["measured_state"] = state
+            c["state"] = "undetermined"
+            c["reason"] = caps[rule["fact"]]
+            # The margin belongs to a verdict this check does not make.
+            c.pop("margin", None)
         checks.append(c)
     return checks
 
