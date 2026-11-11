@@ -43,6 +43,7 @@ from .calc import spice as _spice
 from .sim import board as _simboard
 from .sim import run as _simrun
 from .sim import power as _simpower
+from .sim import field as _simfield
 from .calc import thermal as _thermal
 from .calc import vibration as _vib
 from .calc import vibration_poly as _vib_poly
@@ -6084,7 +6085,8 @@ def _capabilities(_args):
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_spreading",
             "thermal_convection",
-            "board_ir_drop", "board_netlist", "board_sim", "board_thermal",
+            "board_current_field", "board_ir_drop", "board_netlist", "board_sim",
+            "board_thermal",
             "dfm_capability", "dfm_check",
             "vibration_plate_modes", "vibration_plate_outline",
             "vibration_plate_stress",
@@ -8291,6 +8293,37 @@ _tool(
                    "description": "board_electrothermal's transient block, unchanged"},
     ), "required": ["path", "currents", "h_w_m2k"]},
     _board_tool(lambda b, a: _simpower.board_thermal(b, a), derived=True),
+)
+
+_tool(
+    "board_current_field",
+    "2-D current density on the board's OWN copper: one net, one layer, driven between two "
+    "pads you name. The region is the file's tracks of that net as board_ir_drop's graph "
+    "publishes them, plus the pads as rectangles and the stackup's copper thickness - so "
+    "the peak J is where a board actually fails (a bend, a width step, the funnel into a "
+    "pad), which a 1-D J=I/(w*t) cannot see. The 1-D answer on the same pair is printed "
+    "beside it with the relative difference: they are different measurements, and a large "
+    "gap means the 1-D number is optimistic at the contact. One layer per answer (a net "
+    "that hops through a via is two fields); vias, pours and the net's other layers are "
+    "named as not in the region rather than merged in.",
+    {"type": "object", "properties": dict(
+        _COMMON,
+        net=_str("the net to solve, as board_nets spells it"),
+        source_pad=_str("pad the current enters (REF.number)"),
+        sink_pad=_str("pad the current leaves (REF.number)"),
+        current_a=_num("amps between the two contacts; the field is linear in it", 1.0),
+        layer=_str("copper layer to solve on; defaults to the one with the most track"),
+        copper_um=_num("override the stackup copper thickness"),
+        plating_um=_num("via barrel plating thickness"),
+        quantize_mm=_num("node quantisation of the copper graph", 0.01),
+        temp_c=_num("copper temperature for rho(T)", 20),
+        h_mm=_num("finest field grid pitch; default from max_unknowns"),
+        max_unknowns=_num("field unknown budget", 40000),
+        levels=_num("multigrid levels", 4),
+        frequency_hz=_num("AC field: reduce the sheet to the skin-effective thickness"),
+        max_nodes=_num("copper graph node cap", 60000),
+    ), "required": ["path", "net", "source_pad", "sink_pad"]},
+    _board_tool(lambda b, a: _simfield.board_current_field(b, a), derived=True),
 )
 
 _tool(
