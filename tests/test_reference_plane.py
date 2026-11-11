@@ -32,8 +32,9 @@ def _pour(layer, rings, net="GND"):
             "filled_polygons": [[(float(x), float(y)) for x, y in r] for r in rings]}
 
 
-def _board(tracks=(), zones=()):
+def _board(tracks=(), zones=(), stackup=()):
     b = Board("test", "memory")
+    b.stackup = [{"name": n} for n in stackup]
     b.footprints = []
     b.tracks = list(tracks)
     b.vias = []
@@ -68,12 +69,49 @@ class TestTheSplit(unittest.TestCase):
         self.assertEqual(row["examples"][0]["net"], "SIG")
         self.assertIn("widest", row["where"])
 
-    def test_a_gap_narrower_than_the_raster_still_counts(self):
-        """0.4 mm is two cells of the coarse pass; it must survive the re-read."""
+    def test_a_narrow_gap_is_counted_but_not_graded(self):
+        """0.4 mm is a via clearance, not a split: it lands in `bands`, ungraded.
+
+        A hole this size sits around every via and every pad of another net on a
+        real plane. The re-read must still find it (it is two cells of the coarse
+        pass, so the coarse pass can miss it) - it just may not be called a break.
+        """
         b = _board([_track("SIG", (1, 0), (19, 0))],
                    [_pour("B.Cu", [_rect(0, -5, 20, 5), _rect(9, -2, 9.4, 2)])])
-        m = M.measure(b)
-        self.assertIs(m["signal_crosses_plane_split"]["value"], True)
+        row = M.measure(b)["signal_crosses_plane_split"]
+        self.assertIs(row["value"], False)
+        self.assertEqual(sum(row["bands"].values()), 1)
+        self.assertIn("under 1.0 mm", row["bands"])
+        self.assertIn("not graded", row["where"])
+        self.assertIn("not graded", row["note"])
+
+    def test_a_gap_wider_than_one_millimetre_is_graded(self):
+        """1.2 mm is a plane cut, and the verdict says so."""
+        b = _board([_track("SIG", (1, 0), (19, 0))],
+                   [_pour("B.Cu", [_rect(0, -5, 20, 5), _rect(9, -2, 10.2, 2)])])
+        row = M.measure(b)["signal_crosses_plane_split"]
+        self.assertIs(row["value"], True)
+        self.assertAlmostEqual(row["examples"][0]["uncovered_mm"], 1.2, places=1)
+        self.assertIn("1.0-2.0 mm", row["bands"])
+
+    def test_a_power_plane_is_not_a_reference_plane(self):
+        """The video case: GND is the biggest flood, +5V is the adjacent copper.
+
+        A track on F.Cu whose other side is the +5V plane returns on GND, which
+        is two layers away. Testing it against +5V reported 297 crossings on a
+        finished board; the rule must say it cannot test, not that it broke.
+        """
+        b = _board([_track("SIG", (1, 0), (19, 0), layer="F.Cu")],
+                   [_pour("B.Cu", [_rect(0, -5, 40, 5)], net="GND"),
+                    _pour("B.Cu", [_rect(20, -5, 40, 5)], net="GND"),
+                    _pour("In1.Cu", [_rect(0, -5, 20, 5), _rect(9, -2, 15, 2)],
+                          net="+5V")],
+                   stackup=("F.Cu", "In1.Cu", "B.Cu"))
+        row = M.measure(b)["signal_crosses_plane_split"]
+        self.assertEqual(row["reference_net"], "GND")
+        self.assertIs(row["value"], False)
+        self.assertIn("In1.Cu carries +5V, which is not the return net",
+                      row["note"])
 
     def test_a_track_hugging_the_pour_edge_is_not_a_split(self):
         """The sky_star false positive: 0.05 mm inside the edge, coarse says no."""
@@ -111,6 +149,33 @@ class TestWhenItRefuses(unittest.TestCase):
         self.assertIn("unmeasurable", row)
         self.assertIn("no filled pour", row["unmeasurable"])
 
+
+class TestTheCorpusRefutedTheVerdict(unittest.TestCase):
+    """The rule was a Critical P1 bool. Every finished board failed it.
+
+    Eleven of the twelve measurable KiCad demo boards cross at least one gap
+    wider than 1 mm in their return copper, including boards that shipped. A gap
+    only breaks a FAST signal, and no board file says which nets are fast, so
+    the crossing is measured and the verdict is left to the caller: the check
+    reports `undetermined` with the measurement as evidence instead of failing
+    the board.
+    """
+
+    def test_a_crossing_is_shown_and_not_graded(self):
+        import importlib
+        audit_mod = importlib.import_module("pcb_agent_mcp.ruleset.audit")
+        b = _board([_track("SIG", (1, 0), (19, 0))],
+                   [_pour("B.Cu", [_rect(0, -5, 20, 5), _rect(9, -2, 15, 2)])],
+                   stackup=("F.Cu", "B.Cu"))
+        b.net_resolve = None
+        rep = audit_mod.audit(b, levels=["P1"])
+        hit = [c for c in rep["levels"]["P1"]["checks"]
+               if c["id"] == "layout.reference_plane_continuous"]
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["state"], "undetermined")
+        self.assertIs(hit[0]["measured"], True)
+        self.assertIn("not graded", hit[0]["reason"])
+        self.assertIn("gap wider than 1.0 mm", hit[0]["evidence"])
 
 if __name__ == "__main__":
     unittest.main()

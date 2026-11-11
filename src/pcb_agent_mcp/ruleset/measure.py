@@ -105,6 +105,118 @@ def _bbox4(obj):
     return None
 
 
+def _interiors_meet(pa, pb):
+    """Do two closed outlines OVERLAP (share area), as opposed to merely touch?
+
+    ``dist_polygon_polygon`` answers 0 for both, and the difference decides a
+    verdict: royalblue54L_feather and stickhub place parts with their courtyards
+    exactly flush (R5's bottom edge IS R7's top edge, 27 pairs on royalblue,
+    64 on stickhub), which is how those libraries draw them and how KiCad's
+    courtyard rule with a 0.0 mm clearance lets them through. Real overlap - one
+    part's clearance area inside another's - is a different thing and is what the
+    rule is about. Two tests, both needed: an edge that crosses transversally
+    (not at an endpoint), or a vertex strictly inside the other outline.
+    """
+    def _inside(p, poly):
+        if not G.point_in_polygon(p, poly):
+            return False
+        n = len(poly)
+        return min(G.dist_point_segment(p, poly[k], poly[(k + 1) % n])
+                   for k in range(n)) > 1e-6
+
+    def _midpoints(poly):
+        n = len(poly)
+        return [((poly[k][0] + poly[(k + 1) % n][0]) / 2.0,
+                 (poly[k][1] + poly[(k + 1) % n][1]) / 2.0) for k in range(n)]
+
+    def _side(p, q, r):
+        """Orientation with a tolerance, because the coordinates are floats.
+
+        An exact flush pair reads as collinear only up to rounding: U2 ends at
+        x = 150.68 and its neighbour starts at 150.67999999999998, and the raw
+        cross product then comes out 1.8e-13 instead of 0, which the strict
+        ``< 0`` test below reads as "both ends on opposite sides" - a crossing
+        that is not there. KiCad works in integer nanometres, where those two
+        numbers are the same integer. The tolerance is scaled by the squared
+        edge length, since a cross product of lengths has units of mm^2.
+        """
+        v = G._orient(p, q, r)
+        span = max(abs(q[0] - p[0]), abs(q[1] - p[1]), 1e-3)
+        return 0.0 if abs(v) <= 1e-9 * span * span else v
+
+    na, nb = len(pa), len(pb)
+    for i in range(na):
+        a1, a2 = pa[i], pa[(i + 1) % na]
+        for j in range(nb):
+            b1, b2 = pb[j], pb[(j + 1) % nb]
+            if (_side(a1, a2, b1) * _side(a1, a2, b2) < 0
+                    and _side(b1, b2, a1) * _side(b1, b2, a2) < 0):
+                return True
+    for p in pa:
+        if _inside(p, pb):
+            return True
+    for p in pb:
+        if _inside(p, pa):
+            return True
+    # Third test, for the case the other two cannot see: two rectangles that share
+    # a pair of edge LINES exactly. U1 [8,12]x[9,11] and U2 [11,13]x[9,11] share
+    # area [11,12]x[9,11], yet every corner sits ON the other's boundary and every
+    # edge crossing is at an endpoint - so a corner test and a transversal test
+    # both say "touch". The midpoint of an edge that runs THROUGH the other
+    # outline is strictly interior in exactly that case, and still ON the boundary
+    # for a flush pair (their shared edge is the boundary itself). A false
+    # negative here would only mean "not reported", which is the safe direction.
+    for p in _midpoints(pa):
+        if _inside(p, pb):
+            return True
+    for p in _midpoints(pb):
+        if _inside(p, pa):
+            return True
+    return False
+
+def _castellated(holes, segs, window_mm=2.0):
+    """Pad holes whose centre sits inside the board outline: half-holes.
+
+    A pad placed ON the edge is cut in half by the router. It is not a clearance
+    violation and it is not a hole-to-hole violation against the through-hole
+    1.27 mm away - it is a castellation, a process option the fab prices
+    separately. royalblue54L_feather (Adafruit Feather) builds every header pin
+    that way: read literally, its castellations were a 0.0 mm copper-to-edge and
+    a 0.27 mm hole gap, i.e. "unbuildable", on a board that ships.
+
+    A hole is a half-hole when its centre is closer to an edge than its own
+    radius: then the router removes part of it. The edge segments are bucketed
+    exactly as `_min_copper_to_edge` buckets them, so this stays a lookup.
+    """
+    if not segs:
+        return set(), []
+    cell = float(window_mm)
+    grid = {}
+    for idx, (a, b, _kind) in enumerate(segs):
+        for gx in range(int(math.floor(min(a[0], b[0]) / cell)),
+                        int(math.floor(max(a[0], b[0]) / cell)) + 1):
+            for gy in range(int(math.floor(min(a[1], b[1]) / cell)),
+                            int(math.floor(max(a[1], b[1]) / cell)) + 1):
+                grid.setdefault((gx, gy), []).append(idx)
+    uuids, refs = set(), []
+    for h in holes:
+        if h.get("kind") != "pad":
+            continue
+        reach = h["drill_mm"] / 2.0 + 0.01
+        cand = grid.get((int(math.floor(h["x"] / cell)),
+                         int(math.floor(h["y"] / cell)))) or ()
+        best = None
+        for idx in cand:
+            a, b, _kind = segs[idx]
+            d = G.dist_point_segment((h["x"], h["y"]), a, b)
+            if best is None or d < best:
+                best = d
+        if best is not None and best <= reach:
+            if h.get("uuid"):
+                uuids.add(h["uuid"])
+            refs.append(h["ref"])
+    return uuids, refs
+
 def measure(board, window_mm=WINDOW_MM):
     """Return ``{fact_key: {"value"/"unmeasurable", "where", "method"}}``."""
     m = {}
@@ -116,13 +228,25 @@ def measure(board, window_mm=WINDOW_MM):
     # how openair-max came out at 0.000 mm. Name them, count them, and leave
     # them out of the spacing sweep instead of reporting a short that may not
     # exist - the count is the honest residue.
-    cu_items = [it for it in cu_all if it.get("net")]
+    def _named(it):
+        """A net name is a statement about intent; KiCad's auto label is not.
+
+        `unconnected-(J18-Pad1)` is what KiCad writes on a pad that connects to
+        nothing. tiny_tapeout puts one 0.2 mm placeholder pad exactly on the end
+        of a GND track, and treating the label as a net reported a 0.0 mm short
+        between copper that is deliberately the same node.
+        """
+        net = it.get("net")
+        return bool(net) and not str(net).startswith("unconnected-(")
+
+    cu_items = [it for it in cu_all if _named(it)]
     m["copper_items_without_net"] = {
         "value": float(len(cu_all) - len(cu_items)),
         "where": ", ".join(str(it.get("ref")) for it in cu_all
                            if not it.get("net"))[:200],
-        "method": "copper items (pads/tracks/vias/graphics) that state no net and "
-                  "are therefore excluded from every different-net spacing rule",
+        "method": "copper items (pads/tracks/vias/graphics) that state no net - or "
+                  "only KiCad's `unconnected-(...)` auto label - and are therefore "
+                  "excluded from every different-net spacing rule",
         "examples": [it.get("ref") for it in cu_all if not it.get("net")][:8],
     }
 
@@ -233,16 +357,31 @@ def measure(board, window_mm=WINDOW_MM):
 
     # ------------------------------------------------------------------ holes
     holes = _hole_list(board)
+    segs = _edge_segments(board)
+    cast_uuids, cast_refs = _castellated(holes, segs)
+    m["castellated_pads"] = (
+        {"value": float(len(cast_refs)),
+         "where": ", ".join(cast_refs[:8]),
+         "method": "pad holes whose centre is closer to the board outline than "
+                   "their own radius: the router cuts them in half, so their "
+                   "copper-to-edge and hole-to-hole readings are properties of "
+                   "the half-hole process, not of the layout",
+         "examples": cast_refs[:8]}
+        if cast_refs else
+        {"value": 0.0, "where": "no pad sits on the board outline",
+         "method": "pad holes whose centre is closer to the board outline than "
+                   "their own radius"})
     via_holes = [h for h in holes if h["kind"] == "via"]
     pad_holes = [h for h in holes if h["kind"] == "pad"]
+    solid_pad_holes = [h for h in pad_holes if h.get("uuid") not in cast_uuids]
     # Plated vs non-plated is not cosmetic: an NPTH mounting hole has no copper
     # collar, so an annular-ring or plated-hole rule that counted it would report
     # ring = 0 and condemn a perfectly buildable board (pic_programmer P101).
     def _plated(h):
         return (h.get("pad_type") in (None, "thru_hole")
                 and h["diameter_mm"] > h["drill_mm"] + 1e-9)
-    plated_holes = [h for h in pad_holes if _plated(h)]
-    npth_holes = [h for h in pad_holes if not _plated(h)]
+    plated_holes = [h for h in solid_pad_holes if _plated(h)]
+    npth_holes = [h for h in solid_pad_holes if not _plated(h)]
     plated_all = via_holes + plated_holes
     if plated_all:
         h = min(plated_all, key=lambda x: x["drill_mm"])
@@ -302,10 +441,11 @@ def measure(board, window_mm=WINDOW_MM):
             m[k] = _na("no drilled hole on this board")
 
     # ------------------------------------------------------- copper to edge
+    cu_solid = [it for it in cu_items if it.get("uuid") not in cast_uuids]
     m["min_copper_to_edge"] = _norm(
-        _min_copper_to_edge(board, cu_items, _edge_segments(board),
-                            window_mm=window_mm),
-        "edge-to-edge distance from copper to the board outline / cut-out")
+        _min_copper_to_edge(board, cu_solid, segs, window_mm=window_mm),
+        "edge-to-edge distance from copper to the board outline / cut-out "
+        "(half-hole pads excluded: they are castellations)")
 
     # ---------------------------------------------------------- board shape
     outline = [p for c in (board.outline or []) for p in c]
@@ -527,33 +667,84 @@ def measure(board, window_mm=WINDOW_MM):
         bb = _bbox4(f.get("bbox"))
         if bb is not None:
             fps.append((f, bb))
-    overlaps = []
+    overlaps, suspects, no_courtyard, gaps, touching = [], [], [], [], []
     for i in range(len(fps)):
         for j in range(i + 1, len(fps)):
             a, abb = fps[i]
             b, bbb = fps[j]
             if (a.get("layer") or "") != (b.get("layer") or ""):
                 continue
-            ax0, ay0, ax1, ay1 = abb
-            bx0, by0, bx1, by1 = bbb
+            ca, cb = a.get("courtyard") or {}, b.get("courtyard") or {}
+            ra, rb = ca.get("contours") or [], cb.get("contours") or []
+            exact = bool(ra and rb and not ca.get("open_pieces")
+                         and not cb.get("open_pieces"))
+            if exact:
+                pair = [(qa, qb) for qa in ra for qb in rb]
+                gap = min(G.dist_polygon_polygon(qa, qb) for qa, qb in pair)
+                if gap > 1e-6:
+                    gaps.append(gap)
+                elif any(_interiors_meet(qa, qb) for qa, qb in pair):
+                    overlaps.append({"a": a.get("ref"), "b": b.get("ref"),
+                                     "gap_mm": 0.0,
+                                     "where": "drawn courtyards overlap"})
+                else:
+                    touching.append({"a": a.get("ref"), "b": b.get("ref")})
+                continue
+            # No closed outline on at least one side. The courtyard's own bbox is
+            # still better than the pad hull (an open outline is a real area, just
+            # not a provable one), and a bbox is bigger than the body at every
+            # corner - so this is a candidate, never a verdict.
+            ax0, ay0, ax1, ay1 = _bbox4(ca.get("bbox")) or abb
+            bx0, by0, bx1, by1 = _bbox4(cb.get("bbox")) or bbb
             ox = min(ax1, bx1) - max(ax0, bx0)
             oy = min(ay1, by1) - max(ay0, by0)
             if ox > 1e-6 and oy > 1e-6:
-                overlaps.append({"a": a.get("ref"), "b": b.get("ref"),
-                                 "overlap_mm": [round(ox, 3), round(oy, 3)]})
-    m["courtyard_overlaps"] = {
-        "value": float(len(overlaps)),
-        "where": "footprint bbox overlap on the same side, %d pairs" % len(overlaps),
-        "method": "footprint bbox intersection (bbox, not courtyard layer: a part "
-                  "whose courtyard layer was never drawn has none to read)",
-        "supports": "undetermined",
-        "why_that_cap": "a body-shaped courtyard (a D-sub shell, a switch with a "
-                         "notch) is wider in nothing but its bbox corner, so an "
-                         "bbox overlap is a candidate and never a verdict; this "
-                         "adapter keeps the courtyard as a bbox only, so the "
-                         "audit reports the pair and stops there",
-        "examples": overlaps[:5],
+                suspects.append({"a": a.get("ref"), "b": b.get("ref"),
+                                 "bbox_overlap_mm": [round(ox, 3), round(oy, 3)]})
+                for f in (a, b):
+                    cy = f.get("courtyard") or {}
+                    if f.get("ref") in no_courtyard:
+                        continue
+                    if not (cy.get("contours") or cy.get("open_pieces")):
+                        no_courtyard.append(f.get("ref") or "?")
+    where = "%d pair(s) of drawn courtyards intersect on the same side" % len(overlaps)
+    if gaps:
+        where += "; the closest pair of drawn courtyards clears by %.2f mm" % min(gaps)
+    if suspects:
+        where += "; %d more pair(s) only have a bbox overlap" % len(suspects)
+    if touching:
+        where += ("; %d pair(s) touch edge to edge with no shared area (flush "
+                  "placement, not a collision)" % len(touching))
+    out = {
+        "value": float(len(overlaps) + len(suspects)),
+        "where": where,
+        "method": "the courtyard outline the footprint DRAWS (rect/poly/circle, or "
+                  "line/arc pieces chained end to end) in board space, tested with "
+                  "an exact polygon-to-polygon distance; only a footprint with no "
+                  "closed outline falls back to its bbox",
+        "examples": (overlaps + suspects)[:5],
     }
+    if suspects:
+        out["supports"] = "undetermined"
+        out["why_that_cap"] = (
+            "%d pair(s) collide only as bounding boxes, and %s draws no closed "
+            "courtyard, so a bbox corner is the whole case - a candidate, never a "
+            "verdict" % (len(suspects),
+                         "at least one of those parts" if no_courtyard
+                         else "at least one of them"))
+    if touching:
+        out["touching"] = touching[:8]
+        out["note"] = ((out.get("note") + "; ") if out.get("note") else "") + (
+            "%d pair(s) touch exactly (gap 0.000 mm) without sharing area and are "
+            "not counted: a library that draws the courtyard as the body outline "
+            "gives a flush placement a 0.000 mm gap, and the 0.0 mm courtyard "
+            "clearance lets it through" % len(touching))
+    if not suspects and no_courtyard:
+        out["note"] = ((out.get("note") + "; ") if out.get("note") else "") + (
+            "%d part(s) draw no courtyard and are not in any pair: an absent "
+            "courtyard cannot collide, and pretending it is a pad-sized box would "
+            "invent both fixes and failures" % len(no_courtyard))
+    m["courtyard_overlaps"] = out
 
     # ------------------------------------------------------ off-board parts
     if outline:
@@ -1003,39 +1194,85 @@ def _walk(seq, step, cap=20000):
     return out
 
 
+def _pour_area_by_net(board):
+    """Filled copper area per pour net, over every layer.
+
+    The largest flood is the board's return net: it is the one the designer built
+    a plane out of. Asking "which net is ground" by NAME fails on a board whose
+    ground is `PGND`, `0V` or `AGND`, and on a board whose power is poured too
+    (sky_star pours +3V3 and +5V).
+    """
+    areas = {}
+    for z in board.zones:
+        if z.get("is_keepout"):
+            continue
+        net = z.get("net")
+        if not net:
+            continue
+        a = 0.0
+        for poly in (z.get("filled_polygons") or []):
+            if len(poly) >= 3:
+                a += abs(G.polygon_area(poly))
+        if a > 0:
+            areas[net] = areas.get(net, 0.0) + a
+    return areas
+
 def _reference_plane(board):
-    """Does a signal run over a place where its reference layer has no copper?
+    """Does a signal run over a place where its return plane has no copper?
 
-    For each pair of ADJACENT copper layers the copper on the other one is taken
-    as the return path, and every track on the near layer is walked along its
-    centreline. A **split crossing** is a run of uncovered samples with covered
-    samples on BOTH sides: the track enters a hole in the return copper and
-    leaves it again. A run that reaches one end of the track is counted
-    separately as ``off_plane`` - the track runs off the plane's edge, which is a
-    different and usually deliberate thing.
+    For each pair of ADJACENT copper layers, the return net's copper on the other
+    layer is taken as the reference, and every track on the near layer is walked
+    along its centreline. A **split crossing** is a run of uncovered samples with
+    covered samples on BOTH sides: the track enters a hole in the return copper
+    and leaves it again. A run that reaches one end of the track is counted
+    separately as ``off_plane``.
 
-    Two passes, because neither alone is honest. A raster at
-    ``_PLANE_STEP_MM`` decides which tracks are worth a close look (the exact
-    even-odd ray cast costs O(vertices) per sample and 34 000 vertices per real
-    board would cost a minute); every track it flags is then re-read at
-    ``_FINE_MM`` by ``_Scan``, and only what the re-read agrees with is reported.
-    The one thing the coarse pass can still do is MISS: a gap narrower than
-    ``_PLANE_STEP_MM`` under a track that is otherwise covered reads as copper.
+    The reference is the net the board pours the MOST copper of, not "whatever is
+    on the adjacent layer". On a 4-layer board whose inner layers are GND and +5V,
+    pairing every outer track with the +5V plane reported 297 crossings on a
+    finished, routed board - a +5V plane is not what a signal returns on, and the
+    rule was measuring the wrong copper. Other pours on the adjacent layer are
+    named in `note` and not tested.
+
+    Two passes, because neither alone is honest. A raster at ``_PLANE_STEP_MM``
+    decides which tracks are worth a close look; every track it flags is re-read
+    at ``_FINE_MM`` by ``_Scan``, and only what the re-read agrees with is
+    reported. The one thing the coarse pass can still do is MISS: a gap narrower
+    than ``_PLANE_STEP_MM`` under a track that is otherwise covered reads as
+    copper.
+
+    A void in a plane is not always a split: the clearance around a via or a pad
+    of another net is a hole the return current simply flows around, and every
+    board has thousands of them. Widths are therefore bucketed, and only a gap
+    wider than ``_SPLIT_MIN_MM`` is graded - the narrow ones are counted in
+    `bands` and named in `note`, because a rule that reports an antipad ring as a
+    return-path break is a rule nobody can act on.
     """
     order = _copper_order(board)
     if not order:
         why = ("the copper layers cannot be ordered from the file (no stackup, and "
                "not a two-layer board), so which layer is the reference is unknown")
         return {"signal_crosses_plane_split": _na(why)}
-    pours = {}
+    areas = _pour_area_by_net(board)
+    if not areas:
+        return {"signal_crosses_plane_split": _na(
+            "the board has no filled pour, so there is no reference plane to cross")}
+    ret = max(areas, key=lambda k: areas[k])
+    pours, others = {}, {}
     for z in board.zones:
-        if z.get("is_keepout"):
+        if z.get("is_keepout") or z.get("net") != ret:
             continue
         for l in (z.get("layers") or []):
             for poly in (z.get("filled_polygons") or []):
                 if len(poly) >= 3:
                     pours.setdefault(str(l), []).append(
                         [(float(x), float(y)) for x, y in poly])
+    for z in board.zones:
+        if z.get("is_keepout") or z.get("net") == ret:
+            continue
+        for l in (z.get("layers") or []):
+            if z.get("filled_polygons"):
+                others.setdefault(str(l), set()).add(z.get("net"))
     crossings, off_plane, unmeasured = [], [], []
     for idx, layer in enumerate(order):
         refs = [order[j] for j in (idx - 1, idx + 1) if 0 <= j < len(order)]
@@ -1045,7 +1282,13 @@ def _reference_plane(board):
         for r in refs:
             rings.extend(pours.get(r) or [])
         if not rings:
-            unmeasured.append("no filled pour on %s" % "/".join(refs))
+            alt = "; ".join("%s carries %s" % (r, "/".join(sorted(map(str, others[r]))))
+                            for r in refs if others.get(r))
+            why = ("no %s pour on %s" % (ret, "/".join(refs))
+                   + ((" (the adjacent copper is %s, which is not the return net)"
+                       % alt) if alt else ""))
+            if why not in unmeasured:
+                unmeasured.append(why)
             continue
         cov = _raster(rings)[0]
         scan = None
@@ -1076,49 +1319,77 @@ def _reference_plane(board):
                     inside = max(inside, run)
                 i = k
             row = {"net": t.get("net"), "layer": layer,
-                   "reference": "/".join(refs),
+                   "reference": "%s on %s" % (ret, "/".join(refs)),
                    "uncovered_mm": round(inside, 3),
                    "where": "%.3f, %.3f" % (seq[0][0], seq[0][1])}
             if inside > 0:
                 crossings.append(row)
             if edge:
                 off_plane.append(row)
-    if not pours:
-        return {"signal_crosses_plane_split": _na(
-            "the board has no filled pour, so there is no reference plane to cross")}
     if not crossings and len(unmeasured) == len(order):
         return {"signal_crosses_plane_split": _na(
             "; ".join(unmeasured) or "no reference copper to test against")}
     widest = max(crossings, key=lambda c: c["uncovered_mm"]) if crossings else None
-    counts = {}
+    counts, bands = {}, {}
+    graded = []
     for c in crossings:
         key = "%s over %s" % (c["layer"], c["reference"])
         counts[key] = counts.get(key, 0) + 1
+        w = c["uncovered_mm"]
+        b = ("under %.1f mm" % _SPLIT_MIN_MM if w < _SPLIT_MIN_MM else
+             "%.1f-%.1f mm" % (_SPLIT_MIN_MM, 2 * _SPLIT_MIN_MM) if w < 2 * _SPLIT_MIN_MM
+             else "%.1f-%.1f mm" % (2 * _SPLIT_MIN_MM, 5 * _SPLIT_MIN_MM)
+             if w < 5 * _SPLIT_MIN_MM else "over %.1f mm" % (5 * _SPLIT_MIN_MM))
+        bands[b] = bands.get(b, 0) + 1
+        if w >= _SPLIT_MIN_MM:
+            graded.append(c)
+    width_hist = {}
+    for c in crossings:
+        width_hist[round(c["uncovered_mm"], 1)] = width_hist.get(
+            round(c["uncovered_mm"], 1), 0) + 1
     out = {
-        "value": bool(crossings),
-        "where": ("%d track(s) run over a gap in the reference copper and come back "
-                  "onto it%s"
-                  % (len(crossings),
+        "value": bool(graded),
+        "where": ("%d track(s) run over a gap wider than %.1f mm in the %s copper "
+                  "and come back onto it%s"
+                  % (len(graded), _SPLIT_MIN_MM, ret,
                      ("; the widest is %s on %s over %s, uncovered for %.2f mm"
                       % (widest["net"], widest["layer"], widest["reference"],
-                         widest["uncovered_mm"])) if widest else "")),
-        "method": "the copper on the adjacent layer is taken as the return path; a "
-                  "raster at %.1f mm picks the tracks that are not covered end to "
-                  "end, and each of those is re-read at %.2f mm by an exact even-odd "
-                  "ray cast over every filled polygon of every pour, so a hole reads "
-                  "as a hole and a boundary artefact does not read as one"
-                  % (_PLANE_STEP_MM, _FINE_MM),
-        "examples": sorted(crossings, key=lambda c: -c["uncovered_mm"])[:8],
+                         widest["uncovered_mm"])) if widest else ""))
+                 if graded else
+                 ("no track runs over a %s gap wider than %.1f mm (%d narrower "
+                  "one(s) are counted in `bands`, not graded)"
+                  % (ret, _SPLIT_MIN_MM, len(crossings) - len(graded))),
+        "method": "the largest copper flood on the board is taken as the return "
+                  "net, and its pour on the layer adjacent to each routed layer is "
+                  "the reference; a raster at %.1f mm picks the tracks that are "
+                  "not covered end to end, each is re-read at %.2f mm by an exact "
+                  "even-odd ray cast over every filled polygon, and a gap is graded "
+                  "only above %.1f mm because a via or pad clearance is a hole the "
+                  "current flows around, not a break"
+                  % (_PLANE_STEP_MM, _FINE_MM, _SPLIT_MIN_MM),
+        "reference_net": ret,
         "counts": counts,
+        "bands": bands,
+        "examples": sorted(graded, key=lambda c: -c["uncovered_mm"])[:8],
     }
+    if not graded:
+        out["examples"] = []
+    if len(graded) != len(crossings):
+        out["note"] = ("%d uncovered run(s) under %.1f mm are counted in `bands` "
+                       "and not graded: at that width they are the clearance around "
+                       "a via or a pad, which the return current flows around"
+                       % (len(crossings) - len(graded), _SPLIT_MIN_MM))
     if off_plane:
-        out["note"] = ("%d track(s) run over the edge of the reference copper (the "
-                       "uncovered run reaches one end) - a different thing and not "
-                       "counted as a split crossing" % len(off_plane))
+        out["note"] = ((out.get("note", "") + "; ") if out.get("note") else "") + (
+            "%d track(s) run over the edge of the reference copper (the uncovered "
+            "run reaches one end) - a different thing and not counted as a split "
+            "crossing" % len(off_plane))
     if unmeasured:
-        out["note"] = (out.get("note", "") + "; " + "; ".join(unmeasured)).strip("; ")
+        out["note"] = ((out.get("note", "") + "; ") if out.get("note") else "") + \
+            "; ".join(unmeasured)
     return {"signal_crosses_plane_split": out}
 
+_SPLIT_MIN_MM = 1.0
 _RETURN_VIA_MM = 1.0
 
 def _pour_nets(board):
@@ -1260,6 +1531,15 @@ def grade_caps(m):
             "measured, not graded: same population caveat as "
             "decoupling_max_distance_to_pin_mm (%s)"
             % (row.get("where") or "?"))
+    row = m.get("signal_crosses_plane_split") or {}
+    if isinstance(row.get("value"), bool):
+        caps["signal_crosses_plane_split"] = (
+            "measured, not graded: the crossing is real, but a gap in the return "
+            "copper only breaks a fast signal, and no board file says which nets "
+            "are fast. Every finished board in the KiCad demo corpus crosses at "
+            "least one %s gap, so a blanket verdict condemns designs that work "
+            "(%s). Name the nets you meant and this fact is graded from them."
+            % ("1.0 mm", row.get("where") or "?"))
     row = m.get("layer_changes_without_return_via") or {}
     if "value" in row:
         caps["layer_changes_without_return_via"] = (
@@ -1302,7 +1582,7 @@ def catalog_facts(m):
 # Facts whose measurement this module can make but whose POPULATION it cannot
 # bound, so they are reported and not graded (see `grade_caps`).
 CAP_FACTS = ("decoupling_max_distance_to_pin_mm", "decoupling_via_in_path",
-             "layer_changes_without_return_via")
+             "layer_changes_without_return_via", "signal_crosses_plane_split")
 
 
 def failing_examples(m, key, limit):

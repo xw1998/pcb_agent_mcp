@@ -664,6 +664,119 @@ def _silk_item(kind, node, place=None):
     return item
 
 
+def _chain(pieces, tol=1e-3):
+    """Join open polylines end to end; return the closed rings and the leftovers.
+
+    A courtyard is usually drawn as four `fp_line`s. Without this, "does this part
+    collide" can only be answered from a bbox - and a bbox is exactly what the
+    audit used to cap at `undetermined`.
+    """
+    left = [list(p) for p in pieces if len(p) >= 2]
+    rings, rest = [], []
+    while left:
+        cur = left.pop()
+        grew = True
+        while grew:
+            grew = False
+            for i, other in enumerate(left):
+                if G.dist_point_point(cur[-1], other[0]) <= tol:
+                    cur = cur + other[1:]
+                elif G.dist_point_point(cur[-1], other[-1]) <= tol:
+                    cur = cur + list(reversed(other))[1:]
+                elif G.dist_point_point(cur[0], other[-1]) <= tol:
+                    cur = other[:-1] + cur
+                elif G.dist_point_point(cur[0], other[0]) <= tol:
+                    cur = list(reversed(other))[:-1] + cur
+                else:
+                    continue
+                left.pop(i)
+                grew = True
+                break
+        if len(cur) >= 4 and G.dist_point_point(cur[0], cur[-1]) <= tol:
+            rings.append(cur[:-1])
+        else:
+            rest.append(cur)
+    return rings, rest
+
+def _courtyard(node, place):
+    """The courtyard as CLOSED CONTOURS in board space, not only a bbox.
+
+    A bbox cannot answer "do these two bodies collide": it is bigger than the
+    courtyard in every corner, so on a real board (pic_programmer, 2-layer,
+    manufactured) it reported a 0.295 mm x 6.6 mm overlap between P3 and C7 that
+    the drawn outlines do not have. The contours let the audit answer exactly;
+    the bbox stays for callers that only need a box.
+    """
+    x, y, ca, sa = place
+    layer = None
+    pts_all, closed, open_pieces = [], [], []
+    for g in node:
+        if not (isinstance(g, list) and g and g[0] in _GRAPHIC_KINDS):
+            continue
+        glayer = atom(child(g, "layer"), 1, "")
+        if not str(glayer or "").endswith(".CrtYd"):
+            continue
+        lpts = _graphic_points(g)
+        if not lpts:
+            continue
+        kind = g[0]
+        half = (_stroke_width(g) or 0.0) / 2.0
+        # grow the bbox by the stroke: the pen has width, the centreline does not
+        lx = [p[0] for p in lpts]
+        ly = [p[1] for p in lpts]
+        box_local = [(min(lx) - half, min(ly) - half), (max(lx) + half, min(ly) - half),
+                     (max(lx) + half, max(ly) + half), (min(lx) - half, max(ly) + half)]
+        pts_all.extend(box_local)
+        ring_local = None
+        # The contour is the CENTRELINE of the pen, not the ink. KiCad's courtyard
+        # test uses the closed polygon and ignores the line width (which is a
+        # display property), and that matters: every library draws the courtyard
+        # with width 0.05, so inflating by half a width makes two flush parts
+        # overlap by 0.05 mm everywhere. royalblue54L_feather and stickhub each
+        # place 27 and 64 pairs exactly flush - they would all read as collisions.
+        if kind in ("fp_rect", "gr_rect"):
+            (ax_, ay_), (bx_, by_) = lpts[0], lpts[1]
+            ring_local = [(ax_, ay_), (bx_, ay_), (bx_, by_), (ax_, by_)]
+        elif kind in ("fp_poly", "gr_poly"):
+            if len(lpts) >= 3:
+                ring_local = list(lpts)
+        elif kind in ("fp_circle", "gr_circle"):
+            # `_graphic_points` returns the BBOX CORNER PAIR for a circle, not
+            # centre-plus-rim, so the radius has to come from the raw nodes. Read
+            # as centre/rim it comes out sqrt(2) too big in the wrong place, and
+            # a mounting hole then "collides" with everything around it.
+            c_, e_ = xy(child(g, "center")), xy(child(g, "end"))
+            if not (c_ and e_):
+                continue
+            r = G.dist_point_point(c_, e_)
+            ring_local = G.circle_points(c_[0], c_[1], r, segments=64)
+        if ring_local:
+            closed.append([(x + qx * ca - qy * sa, y + qx * sa + qy * ca)
+                           for qx, qy in ring_local])
+        else:
+            open_pieces.append([(x + qx * ca - qy * sa, y + qx * sa + qy * ca)
+                                for qx, qy in lpts])
+        layer = glayer if layer in (None, glayer) else layer + "+" + glayer
+    if not pts_all:
+        return {"layer": None, "bbox": None, "contours": [],
+                "source": "absent - this footprint draws no courtyard"}
+    rings, rest = _chain(open_pieces)
+    rb = [(min(p[0] for p in q), min(p[1] for p in q),
+           max(p[0] for p in q), max(p[1] for p in q)) for q in rings + rest]
+    for q in closed:
+        rb.append((min(p[0] for p in q), min(p[1] for p in q),
+                   max(p[0] for p in q), max(p[1] for p in q)))
+    bbox = (min(b[0] for b in rb), min(b[1] for b in rb),
+            max(b[2] for b in rb), max(b[3] for b in rb))
+    out = {"layer": layer, "bbox": _bbox_dict(bbox), "contours": closed + rings,
+           "source": "F.CrtYd/B.CrtYd graphics in the file"}
+    if rest:
+        out["open_pieces"] = rest
+        out["note"] = ("%d courtyard polyline(s) do not close, so they are kept as "
+                       "line pieces and their owner cannot be tested for overlap "
+                       "exactly" % len(rest))
+    return out
+
 def _footprint(node, mask_expansion=0.0):
     """One placed footprint. `mask_expansion` is the board's
     `(setup (pad_to_mask_clearance ...))`, used when neither the pad nor the
@@ -816,40 +929,7 @@ def _footprint(node, mask_expansion=0.0):
     # board, that guess was 0.4-1.9 mm too small per side and turned into three
     # phantom courtyard overlaps plus a real short. The bbox below is the hull of
     # the real F.CrtYd/B.CrtYd graphics, rotated with the footprint.
-    courtyard = None
-    for g in node:
-        if not (isinstance(g, list) and g and g[0] in _GRAPHIC_KINDS):
-            continue
-        glayer = atom(child(g, "layer"), 1, "")
-        if not str(glayer or "").endswith(".CrtYd"):
-            continue
-        lpts = _graphic_points(g)
-        if not lpts:
-            continue
-        half = (_stroke_width(g) or 0.0) / 2.0
-        lx = [p[0] for p in lpts]
-        ly = [p[1] for p in lpts]
-        corners = [(min(lx) - half, min(ly) - half), (max(lx) + half, min(ly) - half),
-                   (max(lx) + half, max(ly) + half), (min(lx) - half, max(ly) + half)]
-        rp = [(x + qx * ca - qy * sa, y + qx * sa + qy * ca) for qx, qy in corners]
-        rx = [p[0] for p in rp]
-        ry = [p[1] for p in rp]
-        box = (min(rx), min(ry), max(rx), max(ry))
-        if courtyard is None:
-            courtyard = {"layer": glayer, "bbox": box}
-        else:
-            old = courtyard["bbox"]
-            courtyard["bbox"] = (min(old[0], box[0]), min(old[1], box[1]),
-                                 max(old[2], box[2]), max(old[3], box[3]))
-            if courtyard["layer"] != glayer:
-                courtyard["layer"] = courtyard["layer"] + "+" + glayer
-    if courtyard is not None:
-        courtyard = {"layer": courtyard["layer"],
-                     "bbox": _bbox_dict(courtyard["bbox"]),
-                     "source": "F.CrtYd/B.CrtYd graphics in the file"}
-    else:
-        courtyard = {"layer": None, "bbox": None,
-                     "source": "absent - this footprint draws no courtyard"}
+    courtyard = _courtyard(node, (x, y, ca, sa))
     bbox = None
     if pads:
         xs, ys = [], []

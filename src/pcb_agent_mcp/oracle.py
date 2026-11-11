@@ -4934,6 +4934,12 @@ def board_ir_drop(board, net, source, sinks, current_a=None, copper_um=None,
 # half of the job is only "what does the board actually carry".
 
 
+# A drill below this is not a hole. royalblue54L_feather ships a `(via blind
+# ... (drill 0.00001))` on the board edge - KiCad writes that for a via whose
+# drill was never set - and read literally it became the board's smallest plated
+# drill (1e-05 mm), i.e. a P0 "unbuildable" verdict on a finished design.
+DEGENERATE_DRILL_MM = 0.02
+
 def _hole_list(board):
     """Every drilled hole on the board, vias and pads together.
 
@@ -4945,6 +4951,8 @@ def _hole_list(board):
         drill = via.get("drill")
         if drill is None:
             continue
+        if float(drill) < DEGENERATE_DRILL_MM:
+            continue
         dia = via.get("diameter") or drill
         holes.append({"kind": "via",
                       "ref": "via@(%.3f,%.3f)" % (via["x"], via["y"]),
@@ -4954,7 +4962,7 @@ def _hole_list(board):
     for fp in board.footprints:
         for pad in fp.get("pads") or []:
             hole = pad.get("hole_mm")
-            if hole is None:
+            if hole is None or float(hole) < DEGENERATE_DRILL_MM:
                 continue
             ref = "%s.%s" % (fp.get("ref") or "?", pad.get("number") or "?")
             holes.append({"kind": "pad", "ref": ref,
@@ -5006,6 +5014,16 @@ def _hole_web(holes, window_mm=5.0):
                             continue
                         seen.add(pair)
                         a, b = holes[i], holes[j]
+                        # Two records for ONE hole: royalblue54L_feather's J2
+                        # carries pad `1` three times (two of them at the same
+                        # point), so the closest pair on that board was
+                        # "J2.1 and J2.1" at 0.000 mm. Co-location is required
+                        # as well as the same owner, so two real holes of one
+                        # pad that ARE 0.5 mm apart still get reported.
+                        if (a.get("owner_ref") == b.get("owner_ref")
+                                and math.hypot(a["x"] - b["x"],
+                                               a["y"] - b["y"]) < 1e-3):
+                            continue
                         gap = (math.hypot(a["x"] - b["x"], a["y"] - b["y"])
                                - a["drill_mm"] / 2.0 - b["drill_mm"] / 2.0)
                         if gap <= window_mm and (best is None or gap < best[0]):
