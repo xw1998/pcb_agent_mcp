@@ -244,6 +244,7 @@ def _fab_checks(process, m):
 
 def _catalog_checks(process, m, facts_in):
     auto = _measure.catalog_facts(m)
+    refusals = _measure.fact_refusals(m)
     facts = dict(auto)
     facts.update(facts_in or {})
     # A fact this module measured but cannot bound the POPULATION of is shown and
@@ -287,7 +288,12 @@ def _catalog_checks(process, m, facts_in):
              "how_to_measure": graded.get("how_to_measure"),
              "evidence_level": graded.get("evidence_level")}
         if state == "undetermined":
-            c["reason"] = graded.get("reason") or graded.get("next_check")
+            # When this module could not measure the fact, say why in its own
+            # words ("no crystal on this board") instead of "no measurement
+            # supplied for 'trace_under_crystal'", which reads as a gap in the
+            # tool and hides the fact that the board settles it.
+            c["reason"] = (refusals.get(rule["fact"])
+                           or graded.get("reason") or graded.get("next_check"))
         numeric = (rule["kind"] not in ("bool_false", "bool_true")
                    and isinstance(c["measured"], (int, float))
                    and isinstance(c["limit"], (int, float)))

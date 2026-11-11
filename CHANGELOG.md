@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.0.141] - 2026-11-11
+
+八条规则一直回答「no measurement supplied for 'X'」——那不是关于板子的话。这一版
+把测量补上，每条都先在 12 块官方成品板上跑，**三次口径被成品板推翻**（下面标了
+"推翻"），推不翻的那一版才是留在这里的。
+
+新增测量（`ruleset/measure.py`）：
+
+- **`silkscreen_over_pad`**：每条丝印按自身宽度当胶囊，量它到焊盘铜皮的距离。
+  推翻：`fp_rect` 只给两个对角点，被当折线画出**对角线**——pic_programmer 的 4 个
+  插座因此判成压焊盘；adapter 把矩形展开成闭合 5 点环之后归零。剩 4 块板仍为真，
+  逐条手验：cm5_minima 竖线穿 SW501.4、openair-max 横线穿 PWR_SW1.5、
+  tiny_tapeout 三条。
+- **`power_pad_has_thermal_vias`**：只判**库名自己声明**有裸露焊盘的器件
+  （`_EP` / `ThermalVias` / `exposed`）。推翻两次：面积 ≥1 mm² 抓到 royalblue 23 个
+  （1206 电容、USB-C 外壳 MP 焊盘）；"footprint 最大焊盘"抓到 J4 外壳。热通路三选一
+  计数（同号组内镀铜孔 / 同网落在焊盘下的过孔 / 其它器件同网落在焊盘下的镀铜孔）。
+  焊盘中心落在自身铺铜内的（cm5_minima U702）**不判级**。
+- **`stitching_via_pitch_mm`**：铺铜网上过孔的最坏近邻间距。近邻搜索按环扩张——
+  固定 ±1 格窗口曾把相距 5 mm 的两颗过孔判成"没有邻居"。
+- **`diffpair_gap_varies`**：判定改占比口径（偏离主间隙 >0.05 mm 的耦合长度占比
+  >20%），采样前先剔除扇出（端点落在自身焊盘/过孔上）、不平行（>15°）、垂足落在
+  对侧线段之外的样本。推翻：极值口径在 royalblue 读 0.23..2.14 mm，全是扇出；
+  12 块干净板最高 11%、真正改间隙的落在 21–27%。
+- **`ics_without_bulk_cap`**、**`min_mask_expansion`**：字面测量，见 docstring。
+- **`test_points_on_rails_and_connectors`**：rail 必须是**铺铜且名字像电源**的网
+  （royalblue 铺了 70 个网，含全部连接器信号）。**不判级**——pogo 治具要焊盘、手测
+  要排针，板文件不说用哪种。
+- **`crystal_has_guard_ring`**：晶振 courtyard 外扩 0.75 mm 取 8 点，落在最大铺铜网
+  内 ≥6 判"被包"。**不判级**：interf_u 与 video 的晶振周围一点铜都没有，它们是成品。
+
+改写：
+
+- **`trace_under_crystal` 返回 bool**（原来返回 count，grader 判
+  `must be true/false, got 2.0`）；只判晶振**同侧**层（royalblue 的 In4 走线不再算）；
+  判定区域从 courtyard 换成 **courtyard 裁到 pad hull**——HC18-U 库画了 13.1×17.3 mm
+  的 courtyard 围着 4.9 mm 的引脚间距，interf_u / video 会把 2.5 mm 外的走线判成
+  "在晶振下面"；再除掉 bounding box 的角（royalblue 的 45° 走线在 0.65 mm 外）。
+- **`fact_refusals`**：`undetermined` 的 `reason` 改成测量自己的原句，不再是一句
+  通用的 `no measurement supplied`。
+
+新增 `tests/test_layout_facts.py`（30 条）：八条测量每一条都有**反向失败对照**——
+同一个板只改被测的那一件事，结论必须翻面。
+
 **版本口径**：从 `0.0.1` 起，第三位数字随每次提交递增（`0.0.2`、`0.0.3`…），
 只有真正对外、有不兼容变化的里程碑才动第二位。不为了"看起来成熟"把版本号往上跳。
 

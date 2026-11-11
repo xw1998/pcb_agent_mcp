@@ -68,6 +68,11 @@ def _norm(row, method):
 _SILK_AREA_KINDS = ("fp_poly", "gr_poly", "fp_rect", "gr_rect")
 
 _PAIR_SUFFIXES = (("+", "-"), ("_P", "_N"), ("_DP", "_DN"), ("-P", "-N"))
+_PAIR_PARALLEL = math.sin(math.radians(15.0))  # "runs alongside"
+_PAIR_COUPLED_MM = 0.60    # beyond this the two are not coupled
+_PAIR_GAP_TOL = 0.05        # a gap that moves by less is the same gap
+_PAIR_OFF_SHARE = 0.20      # share of the length allowed to move
+_PAIR_MIN_SAMPLES = 6       # below this the share is not a share
 
 def _split_pair(name, fam):
     """Return (base, suffix) when `name` ends in one of `fam`'s suffixes."""
@@ -104,6 +109,90 @@ def _bbox4(obj):
             return None
     return None
 
+
+def _pad_hull(pads, grow=0.0):
+    """Axis-aligned box around a part's pads, grown by ``grow``; None if no pad.
+
+    A footprint with no pad position cannot be located, and callers must then
+    skip the part instead of guessing a body.
+    """
+    xs, ys = [], []
+    for q in pads or ():
+        if q.get("x") is None or q.get("y") is None:
+            continue
+        w = float(q.get("w") or 0.0) / 2.0
+        h = float(q.get("h") or 0.0) / 2.0
+        xs.extend((float(q["x"]) - w, float(q["x"]) + w))
+        ys.extend((float(q["y"]) - h, float(q["y"]) + h))
+    if not xs:
+        return None
+    return (min(xs) - grow, min(ys) - grow, max(xs) + grow, max(ys) + grow)
+
+
+def _clip_polygon_to_rect(points, x0, y0, x1, y1):
+    """Sutherland-Hodgman clip of a closed outline against an axis-aligned box.
+
+    Returns a (possibly empty) list of points.  Used to answer "which part of
+    the courtyard is actually the crystal": the legacy HC18-U library draws a
+    13.1 x 17.3 mm courtyard around a 4.9 mm lead pitch, and a track 5 mm from
+    the can is inside that courtyard without being under the part.
+    """
+    poly = [(float(q[0]), float(q[1])) for q in points]
+    edges = (
+        (lambda q: q[0] >= x0, lambda p, q: (x0, p[1] + (q[1] - p[1]) *
+                                            (x0 - p[0]) / (q[0] - p[0]))),
+        (lambda q: q[0] <= x1, lambda p, q: (x1, p[1] + (q[1] - p[1]) *
+                                            (x1 - p[0]) / (q[0] - p[0]))),
+        (lambda q: q[1] >= y0, lambda p, q: (p[0] + (q[0] - p[0]) *
+                                            (y0 - p[1]) / (q[1] - p[1]), y0)),
+        (lambda q: q[1] <= y1, lambda p, q: (p[0] + (q[0] - p[0]) *
+                                            (y1 - p[1]) / (q[1] - p[1]), y1)),
+    )
+    for keep, cut in edges:
+        if len(poly) < 3:
+            return []
+        out = []
+        for i in range(len(poly)):
+            cur, prev = poly[i], poly[i - 1]
+            if keep(cur):
+                if not keep(prev):
+                    out.append(cut(prev, cur))
+                out.append(cur)
+            elif keep(prev):
+                out.append(cut(prev, cur))
+        poly = out
+    return poly if len(poly) > 2 else []
+
+
+def _segment_meets_polygons(a, b, polygons, grow=0.0):
+    """Does segment ``a``-``b`` come within ``grow`` of any of these outlines?
+
+    Used for keep-out questions ("does a track run under the crystal"). A box
+    test answers a different question: a 45 degree track that clips the corner
+    of the bounding box can be a full millimetre clear of the part, and that is
+    exactly how royalblue54L_feather's Net-(U5-DEC3) got called a violation.
+    Here the segment is measured against the drawn edges, and a segment end
+    inside the outline counts as meeting it.
+    """
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    for poly in polygons or ():
+        pts = [(float(q[0]), float(q[1])) for q in poly]
+        if len(pts) < 3:
+            continue
+        if G.point_in_polygon((ax, ay), pts) or G.point_in_polygon((bx, by), pts):
+            return True
+        if grow <= 0.0:
+            if any(G.segments_intersect((ax, ay), (bx, by),
+                                        pts[i], pts[(i + 1) % len(pts)])
+                   for i in range(len(pts))):
+                return True
+            continue
+        for i in range(len(pts)):
+            if G.dist_segment_segment((ax, ay), (bx, by),
+                                      pts[i], pts[(i + 1) % len(pts)]) <= grow:
+                return True
+    return False
 
 def _interiors_meet(pa, pb):
     """Do two closed outlines OVERLAP (share area), as opposed to merely touch?
@@ -601,21 +690,8 @@ def measure(board, window_mm=WINDOW_MM):
             continue
         lens[t["net"]] = lens.get(t["net"], 0.0) + math.hypot(
             float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
-    candidates = {}
-    for fam in _PAIR_SUFFIXES:
-        for name in lens:
-            base, suf = _split_pair(name, fam)
-            if base is not None:
-                candidates.setdefault((fam, base), set()).add(name)
-    pairs, done = [], set()
-    for (fam, base), members in candidates.items():
-        if len(members) != 2:
-            continue
-        n1, n2 = sorted(members)
-        if (n1, n2) in done:
-            continue
-        done.add((n1, n2))
-        pairs.append({"a": n1, "b": n2, "skew_mm": abs(lens[n1] - lens[n2])})
+    pairs = [{"a": n1, "b": n2, "skew_mm": abs(lens[n1] - lens[n2])}
+             for n1, n2 in _diffpairs(board)]
     if pairs:
         worst = max(pairs, key=lambda r: r["skew_mm"])
         m["diffpair_length_skew_mm"] = _rec(
@@ -635,29 +711,64 @@ def measure(board, window_mm=WINDOW_MM):
     else:
         hits = []
         for f in xtals:
-            box = _bbox4((f.get("courtyard") or {}).get("bbox")) or _bbox4(f.get("bbox"))
+            cy = f.get("courtyard") or {}
+            shape = [list(c) for c in (cy.get("contours") or []) if len(c) > 2]
+            box = _bbox4(cy.get("bbox")) or _bbox4(f.get("bbox"))
             if box is None:
                 continue
-            own = {p.get("net") for p in (f.get("pads") or []) if p.get("net")}
-            x0, y0, x1, y1 = box
+            if not shape:
+                x0, y0, x1, y1 = box
+                shape = [[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]]
+            # The part is between its pads.  What counts as "under the
+            # crystal" is the courtyard CLIPPED to the pad hull grown by
+            # _CRY_BODY_PAD: the legacy Crystal_HC18-U_Horizontal library draws
+            # a 13.1 x 17.3 mm courtyard (226.63 mm2) around a 4.9 mm lead
+            # pitch, and interf_u / video then read a track 5 mm from the can as
+            # a keep-out violation.
+            hull = _pad_hull(f.get("pads") or [], _CRY_BODY_PAD)
+            if hull is not None:
+                clipped = [_clip_polygon_to_rect(c, *hull) for c in shape]
+                shape = [c for c in clipped if c]
+                if not shape:
+                    continue
+            own = {q.get("net") for q in (f.get("pads") or []) if q.get("net")}
+            side = "F.Cu" if str(f.get("layer") or "F").upper().startswith("F") \
+                else "B.Cu"
             for t in board.tracks:
                 if not t.get("net") or t["net"] in own:
+                    continue
+                # The crystal is a part on ONE side. A track on an inner layer
+                # below it is in another plane of the stackup, not "under the
+                # crystal" - royalblue has one on In4 four layers down and the
+                # rule called it a keep-out violation.
+                if t.get("layer") != side:
                     continue
                 a, b = t.get("start"), t.get("end")
                 if not (a and b):
                     continue
                 hw = float(t.get("width") or 0.0) / 2.0
-                sx0, sx1 = min(a[0], b[0]) - hw, max(a[0], b[0]) + hw
-                sy0, sy1 = min(a[1], b[1]) - hw, max(a[1], b[1]) + hw
-                if sx0 <= x1 and sx1 >= x0 and sy0 <= y1 and sy1 >= y0:
+                # The courtyard's bounding BOX is not the courtyard.  A 45
+                # degree track that clips the box's corner is nowhere near the
+                # part: royalblue's Net-(U5-DEC3) leaves the 45 degree corner at
+                # (132.99, -108.8) 0.65 mm clear and the box test still called it
+                # a keep-out violation.  Ask the drawn outline instead.
+                if _segment_meets_polygons((a[0], a[1]), (b[0], b[1]), shape, hw):
                     hits.append({"ref": f.get("ref"), "net": t["net"],
                                  "layer": t.get("layer")})
                     break
         m["trace_under_crystal"] = {
-            "value": float(len(hits)),
-            "where": ", ".join("%s under %s" % (h["net"], h["ref"]) for h in hits[:5]),
+            # The rule is "a trace runs under the crystal", which is yes or no.
+            # Handing the grader a COUNT made it answer "must be true/false,
+            # got 2.0" on every board that had two such traces.
+            "value": bool(hits),
+            "count": len(hits),
+            "where": (", ".join("%s under %s" % (h["net"], h["ref"])
+                                for h in hits[:5]) if hits
+                      else "no other-net track enters the body of %s (the "
+                           "courtyard clipped to the part's own pads)"
+                           % ", ".join(str(f.get("ref")) for f in xtals[:3])),
             "method": "other-net tracks whose centreline (grown by half its width) "
-                      "meets the crystal's courtyard box",
+                      "meets the crystal's drawn courtyard outline",
             "examples": hits[:5],
         }
 
@@ -771,8 +882,763 @@ def measure(board, window_mm=WINDOW_MM):
     # ------------------------------------------------ return vias, ampacity
     m.update(_return_vias(board))
     m.update(_power_traces(board))
+    # ------------------------------------------- assembly, rails and the RF gap
+    m.update(_assembly_facts(board))
 
     return m
+
+# ---------------------------------------------------- assembly and rail facts
+# Everything below answers a rule that the catalogue states and this module did
+# not measure at all. The line through all of them: measure what the geometry
+# says, and when the rule needs something the file does not carry (which nets are
+# RF, how much capacitance a capacitor is), say so in a sentence a reader can act
+# on instead of leaving the rule with no reading at all.
+
+_BULK_FARADS = 1e-6
+_CAP_VALUE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([pnuµmkK]?)\s*[fF]?\s*$")
+_CAP_MULT = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "m": 1e-3, "k": 1e3, "": 1.0}
+_SILK_COPPER = (("F.SilkS", "F.Cu"), ("B.SilkS", "B.Cu"))
+_THERMAL_PAD_MM2 = 1.0     # a pad this big on a poured net is a heat path, not a join
+_EP_DECL = re.compile(r"(?:^|[_\-])1?EP(?:[_\-]|\d|$)|ThermalVias|exposed", re.I)
+# Crystal body = the pad hull, clipped into the courtyard.  Growing the hull
+# was measured and rejected: 2.0 mm turns interf_u's /PC-A7 (a track 2.5 mm
+# from a pad centre) red, 0.5 mm turns video's /GREEN_IN red, and neither
+# runs under the part.
+_CRY_BODY_PAD = 0.0
+
+
+def _farads(text):
+    """'100n' / '0.1uF' / '4u7' -> farads, or None when the string is not one.
+
+    The value field of a footprint is the only place a board file states a
+    capacitance, and it is free text ('100nF 50V' parses, 'DNP' does not). A
+    value that does not parse is counted, never defaulted - guessing 100 nF is
+    how every board ends up "having" a bulk capacitor.
+    """
+    raw = str(text or "")
+    m = _CAP_VALUE.match(raw)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)) * _CAP_MULT.get(m.group(2).lower(), 1.0)
+    except ValueError:
+        return None
+
+
+def _pad_poly(pad):
+    """Pad copper as ('poly', points) or ('circle', (centre, radius)).
+
+    Shapes that are not a plain rect or circle are reduced to their INSCRIBED
+    rectangle (roundrect loses its corner radius, oval loses its caps). A silk
+    line that crosses only a rounded corner is then missed rather than reported,
+    which is the safe direction for a rule whose verdict is "a defect". A custom
+    or wedge pad returns None and is counted as untested.
+    """
+    try:
+        x, y = float(pad["x"]), float(pad["y"])
+        w, h = float(pad.get("w") or 0.0), float(pad.get("h") or 0.0)
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    if w <= 0 or h <= 0:
+        return None, None
+    shape = str(pad.get("shape") or "rect").lower()
+    rot = math.radians(float(pad.get("rotation") or 0.0))
+    ca, sa = math.cos(rot), math.sin(rot)
+
+    def place(pts):
+        return [(x + qx * ca - qy * sa, y + qx * sa + qy * ca) for qx, qy in pts]
+
+    if shape == "circle":
+        return "circle", ((x, y), min(w, h) / 2.0)
+    if shape == "roundrect":
+        r = min(w, h) * float(pad.get("rratio") or 0.25)
+        w, h = max(w - 2.0 * r, 0.1 * w), max(h - 2.0 * r, 0.1 * h)
+    elif shape == "oval":
+        d = min(w, h)
+        w, h = (max(w - d, 0.1 * w), h) if w > h else (w, max(h - d, 0.1 * h))
+    elif shape != "rect":
+        return None, None
+    hw, hh = w / 2.0, h / 2.0
+    return "poly", place([(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)])
+
+
+def _silk_strokes(item):
+    """(a, b, half_width) for every piece of a silk polyline, in board space."""
+    pts = item.get("pts") or []
+    if len(pts) < 2:
+        return []
+    half = float(item.get("width_mm") or 0.0) / 2.0
+    return [(pts[i], pts[i + 1], half) for i in range(len(pts) - 1)]
+
+
+def _capsule_gap(a, b, half, kind, geom):
+    """Distance from a silk stroke (a capsule) to a pad, 0.0 when they touch."""
+    if kind == "circle":
+        centre, r = geom
+        return max(0.0, G.dist_point_segment(centre, a, b) - r - half)
+    if G.point_in_polygon(a, geom) or G.point_in_polygon(b, geom):
+        return 0.0
+    n = len(geom)
+    d = min(G.dist_segment_segment(a, b, geom[k], geom[(k + 1) % n])
+            for k in range(n))
+    return max(0.0, d - half)
+
+
+def _silk_over_pad(board):
+    """Does any silkscreen line print on top of a solder pad?
+
+    Only stroked silk with a polyline is tested: a text's bbox is an advance box,
+    not ink, and reporting a text whose box covers a pad would flag perfectly
+    good reference designators. Skipped items are counted and said out loud.
+    """
+    by_side = {}
+    untested_pads = 0
+    for f in board.footprints:
+        for pad in (f.get("pads") or []):
+            layers = pad.get("layers") or []
+            for _side, cu in _SILK_COPPER:
+                if not (cu in layers or "*.Cu" in layers):
+                    continue
+                kind, geom = _pad_poly(pad)
+                if kind is None:
+                    untested_pads += 1
+                    continue
+                w, h = float(pad.get("w") or 0.0), float(pad.get("h") or 0.0)
+                r = max(w, h) / 2.0
+                by_side.setdefault(cu, []).append(
+                    {"pad": pad, "kind": kind, "geom": geom,
+                     "cx": float(pad["x"]), "cy": float(pad["y"]), "r": r})
+    if not by_side:
+        return _na("no pad copper on a side that carries silkscreen")
+
+    hits, tested, skipped = [], 0, {}
+    for it in _silk_items(board):
+        side = dict(_SILK_COPPER).get(it.get("layer"))
+        if side is None:
+            continue
+        strokes = _silk_strokes(it)
+        if not strokes:
+            key = it.get("kind") or "?"
+            skipped[key] = skipped.get(key, 0) + 1
+            continue
+        bb = _bbox_of_item(it)
+        tested += 1        # an item examined against the pads on its side
+        for p in by_side.get(side, ()):
+            if bb is not None:
+                # Cheap rejection with room for the stroke: the pad's own circle
+                # plus the widest stroke on the item.
+                reach = p["r"] + max(h for _a, _b, h in strokes) + 0.01
+                if bb[0] > p["cx"] + reach or bb[2] < p["cx"] - reach \
+                        or bb[1] > p["cy"] + reach or bb[3] < p["cy"] - reach:
+                    continue
+            gap = min(_capsule_gap(a, b, half, p["kind"], p["geom"])
+                      for a, b, half in strokes)
+            if gap <= 1e-9:
+                hits.append({"silk": it.get("ref") or "board-level",
+                             "kind": it.get("kind"),
+                             "pad": "%s.%s" % (p["pad"].get("ref"),
+                                               p["pad"].get("number")),
+                             "net": p["pad"].get("net"),
+                             "layer": it.get("layer")})
+                break
+    if not tested and not hits:
+        return _na("no silkscreen polyline on this board to test against a pad")
+    out = {
+        "value": bool(hits),
+        "where": (", ".join("%s %s over %s" % (h["silk"], h["kind"], h["pad"])
+                            for h in hits[:5])
+                  if hits else "%d silk line(s) tested against the pads on their "
+                               "side, none touches a pad" % tested),
+        "method": "each silkscreen stroke treated as a capsule of its own width, "
+                  "tested against the pad's copper outline (roundrect and oval "
+                  "reduced to their inscribed rectangle, custom pads not tested)",
+        "examples": hits[:8],
+    }
+    if skipped:
+        out["note"] = ("%d silk item(s) not tested (%s): a text box is an advance "
+                       "box, not ink, and a circle or arc is not carried as a "
+                       "polyline" % (sum(skipped.values()),
+                                     ", ".join("%s x%d" % kv for kv in sorted(skipped.items()))))
+    if untested_pads:
+        out["note"] = ((out.get("note") + "; ") if out.get("note") else "") + (
+            "%d pad(s) have a shape this module cannot outline (custom/wedge) and "
+            "were not tested" % untested_pads)
+    return out
+
+
+def _bbox_of_item(it):
+    bb = it.get("bbox") or {}
+    try:
+        return (float(bb["x_min"]), float(bb["y_min"]),
+                float(bb["x_max"]), float(bb["y_max"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _sits_in_pour(board, net, layers, x, y):
+    """Is the point already inside filled copper of `net` on one of `layers`?
+
+    An exposed pad standing in its own pour is not fed only by vias: the copper it
+    sits in carries heat away sideways, into the same net that is stitched
+    elsewhere. Whether such a pad still wants a via field under it is a thermal
+    survey, not something a board file settles - cm5_minima's 2x2 mm DFN pad sits
+    in the ground pour with no via under it, on a board with four ground planes.
+    """
+    for z in board.zones:
+        if z.get("is_keepout") or z.get("net") != net:
+            continue
+        if not any(str(l) in layers for l in (z.get("layers") or [])):
+            continue
+        for poly in (z.get("filled_polygons") or []):
+            if len(poly) >= 3 and G.point_in_polygon((x, y), poly):
+                return True
+    return False
+
+def _thermal_vias(board, pours):
+    """Does the exposed pad of every part that declares one reach the plane?
+
+    Which pad is a heat path is a decision the board file does not carry, and two
+    attempts at guessing it from geometry were wrong on finished boards: an area
+    threshold picks up every 1206 land and every USB-C shell tab (royalblue alone
+    had 23 of them), and "the biggest pad of the footprint" picks up the shell tab
+    of any four-pin connector. So the rule asks the one place that does name it:
+    the footprint, whose library id says `_EP3.2x3.2mm` or `_ThermalVias` when
+    the part has an exposed pad. A part made without that convention is not
+    graded here at all - it is counted and said out loud.
+
+    The heat path itself is measured three ways, because a via pad is drawn as a
+    via in some boards and as a plated pad in others: a plated hole in the pad's
+    own pad-number group, a via on the same net under the pad, or a plated pad of
+    another part on that net under the pad.
+    """
+    vias = {}
+    for v in board.vias:
+        if v.get("net"):
+            vias.setdefault(v["net"], []).append(v)
+    tested, bad, where, ungraded, undeclared = 0, [], [], [], 0
+    for f in board.footprints:
+        groups = {}
+        for pad in (f.get("pads") or []):
+            groups.setdefault(pad.get("number"), []).append(pad)
+        if not _EP_DECL.search(str(f.get("lib_id") or "")):
+            for ps in groups.values():
+                for pad in ps:
+                    if (pad.get("smd") and not pad.get("hole_mm")
+                            and pad.get("net") in pours
+                            and float(pad.get("w") or 0) * float(pad.get("h") or 0)
+                            >= _THERMAL_PAD_MM2):
+                        undeclared += 1
+            continue
+        for number, ps in groups.items():
+            smd = [p for p in ps if p.get("smd") and not p.get("hole_mm")]
+            if not smd:
+                continue
+            area = sum(float(p.get("w") or 0) * float(p.get("h") or 0) for p in smd)
+            net = ps[0].get("net")
+            if area < _THERMAL_PAD_MM2 or not net or net not in pours:
+                continue
+            try:
+                x = float(smd[0]["x"])
+                y = float(smd[0]["y"])
+                reach = max(max(float(p.get("w") or 0), float(p.get("h") or 0))
+                            for p in ps) / 2.0 + 0.5
+            except (KeyError, TypeError, ValueError):
+                continue
+            tested += 1
+            near = len([p for p in ps if p.get("hole_mm")])
+            near += sum(1 for v in vias.get(net, ())
+                        if (float(v["x"]) - x) ** 2 + (float(v["y"]) - y) ** 2
+                        <= reach * reach)
+            for f2 in board.footprints:
+                for q in (f2.get("pads") or []):
+                    if q.get("net") != net or not q.get("hole_mm") or q in ps:
+                        continue
+                    try:
+                        if abs(float(q["x"]) - x) <= reach \
+                                and abs(float(q["y"]) - y) <= reach:
+                            near += 1
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            ref = "%s.%s" % (f.get("ref"), number)
+            if near:
+                where.append("%s: %d" % (ref, near))
+            elif _sits_in_pour(board, net,
+                               set(pad.get("layers") or [])
+                               | set(smd[0].get("layers") or []), x, y):
+                ungraded.append(ref)
+            else:
+                bad.append(ref)
+    if not tested:
+        tail = ("; %d large pad(s) on a poured net sit on a part whose library id "
+                "does not declare an exposed pad, so they are not graded" % undeclared
+                if undeclared else "")
+        return _na("no footprint on this board declares an exposed pad in its "
+                   "library id, so there is no thermal pad to feed" + tail)
+    out = {
+        "value": not bad,
+        "where": ("no heat path into the plane under %s" % ", ".join(bad[:5]))
+                 if bad else ("%d exposed pad(s), each fed: %s"
+                              % (tested, ", ".join(where[:5]))),
+        "method": "the exposed pad of a part whose library id says _EP/ThermalVias, "
+                  "counted against plated holes in the pad itself, vias on that net "
+                  "under it, and plated pads of other parts on that net under it, "
+                  "within half the pad plus 0.5 mm",
+        "examples": bad[:8],
+    }
+    notes = []
+    if ungraded:
+        notes.append("%d exposed pad(s) with no via field stand inside their own "
+                     "pour, which carries the heat sideways; whether they still need "
+                     "vias is a thermal survey, so they are not graded (%s)"
+                     % (len(ungraded), ", ".join(ungraded[:5])))
+        if not bad:
+            out["value"] = None
+            out["unmeasurable"] = notes[-1]
+    if undeclared:
+        notes.append("%d large pad(s) of parts that do not declare an exposed pad "
+                     "were not graded" % undeclared)
+    if notes:
+        out["note"] = "; ".join(notes)
+    return out
+
+def _nn_gaps(pts, cell=2.0):
+    """Nearest-neighbour distance for every point, by a grid, not n squared.
+
+    The search widens ring by ring and stops at the first ring that finds
+    anything, because a fixed +-1 cell window silently loses every neighbour more
+    than two cells away: the first version put two vias 5 mm apart in cells 2 apart
+    and reported "the poured-net vias do not have neighbours" - on a board whose
+    fence is 4 mm pitch.
+    """
+    grid = {}
+    for i, (x, y) in enumerate(pts):
+        grid.setdefault((int(math.floor(x / cell)), int(math.floor(y / cell))),
+                        []).append(i)
+    out = []
+    for i, (x, y) in enumerate(pts):
+        gx, gy = int(math.floor(x / cell)), int(math.floor(y / cell))
+        best = None
+        for r in range(1, 16):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r:
+                        continue
+                    for j in grid.get((gx + dx, gy + dy), ()):
+                        if j == i:
+                            continue
+                        d = math.hypot(pts[j][0] - x, pts[j][1] - y)
+                        best = d if best is None else min(best, d)
+            if best is not None:
+                break
+        if best is None:
+            # Nothing inside thirty millimetres: the neighbour is a far one, and
+            # dropping the point would hide exactly the isolated via that makes a
+            # fence bad. Pay the O(n) for the few points that get here.
+            for j, (xj, yj) in enumerate(pts):
+                if j == i:
+                    continue
+                d = math.hypot(xj - x, yj - y)
+                best = d if best is None else min(best, d)
+        if best is not None:
+            out.append(best)
+    return out
+
+
+def _stitching(board, pours):
+    """Pitch of the via fence in the poured copper: the worst nearest-neighbour gap."""
+    pts = [(float(v["x"]), float(v["y"])) for v in board.vias
+           if v.get("net") in pours]
+    if len(pts) < 2:
+        return _na("fewer than two vias on a poured net: there is no fence to "
+                   "measure a pitch on")
+    gaps = _nn_gaps(pts)
+    if not gaps:
+        return _na("the poured-net vias do not have neighbours to measure against")
+    gaps.sort()
+    med = gaps[len(gaps) // 2]
+    return {
+        "value": float(gaps[-1]),
+        "where": ("%d via(s) on poured nets; nearest-neighbour pitch %.2f mm at the "
+                  "median, %.2f mm at the tightest, %.2f mm at the widest"
+                  % (len(pts), med, gaps[0], gaps[-1])),
+        "method": "nearest-neighbour distance among vias whose net the board pours; "
+                  "the reading is the WIDEST of those, because a fence is only as "
+                  "good as its coarsest gap and an isolated via is also a gap",
+    }
+
+
+def _diffpairs(board):
+    """Nets that form a differential pair by their own names, exactly two each."""
+    seen, done = {}, set()
+    for t in board.tracks:
+        if t.get("net"):
+            seen.setdefault(t["net"], 0)
+    candidates = {}
+    for fam in _PAIR_SUFFIXES:
+        for name in seen:
+            base, _suf = _split_pair(name, fam)
+            if base is not None:
+                candidates.setdefault((fam, base), set()).add(name)
+    out = []
+    for members in candidates.values():
+        if len(members) != 2:
+            continue
+        n1, n2 = sorted(members)
+        if (n1, n2) in done:
+            continue
+        done.add((n1, n2))
+        out.append((n1, n2))
+    return out
+
+
+def _pair_terminals(board):
+    """Pad and via centres per net: a segment that ends on one is an escape."""
+    pts = {}
+    for f in board.footprints:
+        for pad in (f.get("pads") or []):
+            if pad.get("net"):
+                pts.setdefault(pad["net"], []).append(
+                    (float(pad["x"]), float(pad["y"])))
+    for v in board.vias:
+        if v.get("net"):
+            pts.setdefault(v["net"], []).append((float(v["x"]), float(v["y"])))
+    return pts
+
+def _pair_gap_samples(board, a, b, terminals):
+    """Edge-to-edge gap where the two nets run alongside each other, and nowhere else.
+
+    Three things are excluded, each because including it reports an escape as a
+    routing mistake - and each was caught by a finished board, not guessed:
+      * a segment that ends on a pad or a via is the fanout, where the pair splays
+        apart to reach its own pins (royalblue's USB pair reads 0.23..2.14 mm on
+        the fanout alone, while its routed length is a flat 0.23),
+      * a segment that is not parallel to its counterpart within 15 degrees,
+      * a sample whose perpendicular foot lands past either end of the other
+        segment, where the "gap" is really a distance to a corner.
+    A pair that changes layer has no gap on either side of the via, so only same-
+    layer segments are compared.
+    """
+    segs = {}
+    for t in board.tracks:
+        if t.get("net") in (a, b) and t.get("start") and t.get("end"):
+            segs.setdefault(t["net"], []).append(t)
+    if len(segs.get(a) or []) < 2 or len(segs.get(b) or []) < 2:
+        return []
+
+    def terminal(t):
+        for q in (t["start"], t["end"]):
+            for px, py in terminals.get(t["net"], ()):
+                if (float(q[0]) - px) ** 2 + (float(q[1]) - py) ** 2 < 0.04:
+                    return True
+        return False
+
+    def unit(t):
+        (ax, ay), (bx, by) = t["start"], t["end"]
+        dx, dy = float(bx) - float(ax), float(by) - float(ay)
+        n = math.hypot(dx, dy)
+        return None if n <= 1e-9 else (dx / n, dy / n)
+
+    gaps = []
+    for me, other in ((a, b), (b, a)):
+        for t in segs[me]:
+            if terminal(t):
+                continue
+            d_t = unit(t)
+            if d_t is None:
+                continue
+            p, q = t["start"], t["end"]
+            mid = ((float(p[0]) + float(q[0])) / 2.0,
+                   (float(p[1]) + float(q[1])) / 2.0)
+            wi = float(t.get("width") or 0.0) / 2.0
+            best = None
+            for u in segs[other]:
+                if u.get("layer") != t.get("layer") or terminal(u):
+                    continue
+                d_u = unit(u)
+                if d_u is None or abs(d_t[0] * d_u[1] - d_t[1] * d_u[0]) \
+                        > _PAIR_PARALLEL:
+                    continue
+                (ux, uy), (vx, vy) = u["start"], u["end"]
+                ex, ey = float(vx) - float(ux), float(vy) - float(uy)
+                ln2 = ex * ex + ey * ey
+                if ln2 <= 1e-12:
+                    continue
+                s_ = ((mid[0] - float(ux)) * ex + (mid[1] - float(uy)) * ey) / ln2
+                if s_ <= 0.0 or s_ >= 1.0:
+                    continue
+                d = G.dist_point_segment(mid, u["start"], u["end"])
+                d -= wi + float(u.get("width") or 0.0) / 2.0
+                if d > _PAIR_COUPLED_MM:
+                    continue
+                best = d if best is None else min(best, d)
+            if best is not None:
+                gaps.append(best)
+    return gaps
+
+def _pair_gap_varies(board, a, b, terminals):
+    """(median gap, the widest deviation from it, share of length off it) or None."""
+    gaps = _pair_gap_samples(board, a, b, terminals)
+    if len(gaps) < _PAIR_MIN_SAMPLES:
+        return None
+    gaps.sort()
+    med = gaps[len(gaps) // 2] if len(gaps) % 2 else \
+        0.5 * (gaps[len(gaps) // 2 - 1] + gaps[len(gaps) // 2])
+    dev = max(abs(g - med) for g in gaps)
+    off = sum(1 for g in gaps if abs(g - med) > _PAIR_GAP_TOL) / float(len(gaps))
+    return med, dev, off, len(gaps)
+
+def _diffpair_gap(board):
+    """Does any pair run at one gap, or does a share of its length run at another?
+
+    A pair whose gap changes along its coupled length is a pair whose impedance
+    changes with it, and no single number describes it. The reading is therefore
+    "how much of the coupled length runs at a gap other than the dominant one",
+    not "min and max differ": measured on 12 finished boards, every pair shifts
+    its gap SOMEWHERE near a pad or a via, and the share of length that does is
+    what separates them - clean pairs top out at 11%, the pairs that change gap
+    for a stretch sit at 21-27%.
+    """
+    pairs = _diffpairs(board)
+    if not pairs:
+        return _na("no net name on this board forms a recognisable pair with a "
+                   "suffix (+/-, _P/_N), so there is no gap to compare")
+    terminals = _pair_terminals(board)
+    worst, seen = None, 0
+    for a, b in pairs:
+        got = _pair_gap_varies(board, a, b, terminals)
+        if got is None:
+            continue
+        seen += 1
+        med, dev, off, n = got
+        if worst is None or off > worst[2]:
+            worst = (a, b, off, med, dev, n)
+    if worst is None:
+        return _na("the pair(s) on this board never run alongside each other away "
+                   "from a pad or a via for long enough to sample a gap")
+    varies = worst[2] > _PAIR_OFF_SHARE
+    return {
+        "value": bool(varies),
+        "where": ("%s vs %s: %.0f%% of %d coupled sample(s) sit at a gap other than "
+                  "the dominant %.2f mm, the widest by %.2f mm%s"
+                  % (worst[0], worst[1], 100.0 * worst[2], worst[5], worst[3],
+                     worst[4], "" if seen < 2 else "; %d pair(s) sampled" % seen)),
+        "method": "edge-to-edge gap at the midpoint of every segment that runs "
+                  "parallel (15 degrees) to the other net's segment on the same "
+                  "layer, away from pads and vias, within %.1f mm; a pair counts as "
+                  "varying when more than %.0f%% of those samples miss the dominant "
+                  "gap by more than %.2f mm"
+                  % (_PAIR_COUPLED_MM, 100.0 * _PAIR_OFF_SHARE, _PAIR_GAP_TOL),
+    }
+
+def _bulk_caps(board, pours):
+    """ICs on a poured rail with no capacitor of 1 uF or more on the same rail."""
+    caps, unparsed = [], 0
+    for f in board.footprints:
+        ref = str(f.get("ref") or "")
+        if not _CAP_REF.match(ref):
+            continue
+        far = _farads(f.get("value"))
+        if far is None:
+            unparsed += 1
+            continue
+        nets = {p.get("net") for p in (f.get("pads") or []) if p.get("net")}
+        caps.append((ref, nets, far))
+    if not caps:
+        return _na("no capacitor on this board states a value that parses as a "
+                   "capacitance (%d capacitor(s), none readable: the value field is "
+                   "free text)" % unparsed)
+    ics = []
+    for f in board.footprints:
+        pads = f.get("pads") or []
+        if len(pads) < 6:
+            continue
+        nets = {p.get("net") for p in pads if p.get("net")}
+        if not (nets & pours):
+            continue
+        ics.append((str(f.get("ref") or "?"), nets))
+    if not ics:
+        return _na("no part with six or more pads sits on a poured rail, so there "
+                   "is no IC to hold a bulk capacitor for")
+    bad = []
+    for ref, nets in ics:
+        if not any(far >= _BULK_FARADS and (nets & cnets)
+                   for _c, cnets, far in caps):
+            bad.append(ref)
+    out = {
+        "value": float(len(bad)),
+        "where": ("%d of %d IC(s) on a poured rail have no capacitor of 1 uF or "
+                  "more on the same rail: %s"
+                  % (len(bad), len(ics), ", ".join(bad[:6]))) if bad
+                 else ("all %d IC(s) on a poured rail have a 1 uF or larger "
+                       "capacitor on it" % len(ics)),
+        "method": "capacitance parsed from each capacitor's value field (100n, "
+                  "0.1uF, 4u7); 1 uF separates bulk from the 100 nF edge part; "
+                  "an IC is a part with six or more pads on a poured net",
+        "examples": bad[:8],
+    }
+    if unparsed:
+        out["note"] = ("%d capacitor(s) state a value that does not parse as a "
+                       "capacitance and are not counted either way" % unparsed)
+    return out
+
+
+def _crystal_guard(board, pours):
+    """Is each crystal enclosed by copper of the board's own return net?
+
+    A guard ring is drawn as a loop or as a pour; this module can tell the second
+    from nothing at all, and says which. The enclosure is sampled at eight points
+    on the ring of the crystal's courtyard grown by 0.75 mm: when one net covers at
+    least six of them, the crystal sits inside that net's copper. "Grounded" is the
+    pour with the largest filled area, the same reading the return-path rule uses,
+    because a board that calls its ground `0V` or `PGND` is not unusual.
+    """
+    xtals = [f for f in board.footprints if _is_crystal(f)]
+    if not xtals:
+        return _na("no crystal or resonator on this board, so there is no guard "
+                   "ring to look for")
+    areas = _pour_area_by_net(board)
+    if not areas:
+        return _na("this board has no filled pour, so there is no ground for a "
+                   "guard ring to be connected to")
+    ret = max(areas, key=lambda k: areas[k])
+    polys = {}
+    for z in board.zones:
+        if z.get("is_keepout") or z.get("net") != ret:
+            continue
+        good = [p for p in (z.get("filled_polygons") or []) if len(p) >= 3]
+        for l in (z.get("layers") or []):
+            polys.setdefault(str(l), []).extend(good)
+    guarded, bare = [], []
+    for f in xtals:
+        box = _bbox4((f.get("courtyard") or {}).get("bbox")) or _bbox4(f.get("bbox"))
+        if box is None:
+            continue
+        side = "F.Cu" if str(f.get("layer") or "F").upper().startswith("F") else "B.Cu"
+        x0, y0, x1, y1 = box
+        d = 0.75
+        ring = [((x0 + x1) / 2.0, y0 - d), ((x0 + x1) / 2.0, y1 + d),
+                (x0 - d, (y0 + y1) / 2.0), (x1 + d, (y0 + y1) / 2.0),
+                (x0 - d, y0 - d), (x1 + d, y0 - d),
+                (x0 - d, y1 + d), (x1 + d, y1 + d)]
+        covered = sum(1 for pt in ring
+                      if any(G.point_in_polygon(pt, poly)
+                             for poly in polys.get(side, ())))
+        (guarded if covered >= 6 else bare).append(
+            "%s (%d of 8)" % (f.get("ref"), covered))
+    if not guarded and not bare:
+        return _na("the crystal(s) on this board have no courtyard or bbox to "
+                   "sample a ring around")
+    return {
+        "value": not bare,
+        "where": (("no %s copper around %s" % (ret, ", ".join(bare[:4]))) if bare
+                  else ("crystal(s) inside %s copper: %s"
+                        % (ret, ", ".join(guarded[:4])))),
+        "method": "eight points on the crystal's courtyard grown by 0.75 mm, "
+                  "counted against the filled copper of the board's largest pour on "
+                  "the crystal's own side; six of eight is 'enclosed'",
+        "examples": bare[:4],
+    }
+
+_RAIL = re.compile(r"(?:^|[+_/\-])(?:[0-9]+V[0-9]*|V(?:CC|DD|SS|EE|BUS|BAT|SYS|IN|OUT)"
+                   r"|[AP]?GND|PGND|0V)(?:$|[+_/\-])", re.I)
+
+def _test_points(board, pours):
+    """Which rails and connector signals have somewhere a probe can touch?
+
+    A rail is a POURED net whose NAME says power (GND, +3V3, VBUS, VDD...). Using
+    every poured net was wrong: royalblue pours 70 nets, most of them signals, and
+    the rule then read "no test point on /Connectors/ANALOG.A0", which is a
+    connector pin, not a rail.
+
+    A probe point is a TP footprint, the only pad of a footprint, or a plated
+    through hole - you can clip a header pin. This module still does not GRADE the
+    result: a board tested on a pogo fixture needs pads, a board tested by hand
+    needs headers, and no board file says which (see grade_caps).
+    """
+    rails = sorted(n for n in pours if _RAIL.search(str(n)))
+    if not rails:
+        return _na("no poured net on this board is named like a power rail, so "
+                   "there is no rail to put a test point on")
+    have = {}
+    for f in board.footprints:
+        pads = f.get("pads") or []
+        ref = str(f.get("ref") or "")
+        dedicated = len(pads) == 1 or ref.upper().startswith("TP")
+        for pad in pads:
+            net = pad.get("net")
+            if not net:
+                continue
+            if dedicated:
+                have.setdefault(net, []).append("%s (test point)" % (ref or "?"))
+            elif pad.get("hole_mm"):
+                have.setdefault(net, []).append("%s.%s (through hole)"
+                                                % (ref or "?", pad.get("number")))
+    missing = [n for n in rails if n not in have]
+    return {
+        "value": not missing,
+        "where": ("%d of %d rail(s) have a probe point; none on %s"
+                  % (len(rails) - len(missing), len(rails), ", ".join(missing[:6])))
+                 if missing else
+                 ("all %d rail(s) have a probe point" % len(rails)),
+        "method": "rails are poured nets whose names say power; a probe point is a "
+                  "TP footprint, the only pad of a footprint, or a plated through "
+                  "hole on that net",
+        "examples": missing[:8],
+    }
+
+def _mask_expansion(board):
+    """The narrowest solder-mask expansion the file states, per side."""
+    rows = []
+    for f in board.footprints:
+        for pad in (f.get("pads") or []):
+            if not pad.get("mask_layers"):
+                continue
+            v = pad.get("mask_margin")
+            if v is None:
+                continue
+            rows.append((float(v), "%s.%s" % (f.get("ref"), pad.get("number")),
+                         pad.get("mask_margin_source")))
+    if not rows:
+        return _na("no pad states a solder-mask aperture, so no expansion is "
+                   "recorded in the file")
+    v, ref, src = min(rows, key=lambda r: r[0])
+    out = _rec(v, "narrowest of %d pad(s): %s" % (len(rows), ref),
+               "each pad's solder_mask_margin, which is the per-side expansion; a "
+               "pad that states none is 0 mm, which is what KiCad plots")
+    absent = [r for r in rows if r[2] == "absent_treated_as_zero"]
+    if absent:
+        out["note"] = ("%d of %d pads state no margin and read as 0 mm by the "
+                       "plotter's own default" % (len(absent), len(rows)))
+    return out
+
+
+def _assembly_facts(board):
+    """The facts the catalogue asks for that this module measured nowhere until now."""
+    pours = _pour_nets(board)
+    out = {
+        "silkscreen_over_pad": _silk_over_pad(board),
+        "power_pad_has_thermal_vias": _thermal_vias(board, pours),
+        "stitching_via_pitch_mm": _stitching(board, pours),
+        "diffpair_gap_varies": _diffpair_gap(board),
+        "ics_without_bulk_cap": _bulk_caps(board, pours),
+        "test_points_on_rails_and_connectors": _test_points(board, pours),
+        "min_mask_expansion": _mask_expansion(board),
+        "crystal_has_guard_ring": _crystal_guard(board, pours),
+    }
+    # The RF family needs a population the file does not carry. Saying which
+    # number is missing beats leaving the rule with no reading at all: the caller
+    # can hand each one over through `facts`.
+    for key, what in (
+            ("rf_line_z0_error_pct", "the impedance the line was routed to"),
+            ("has_right_angle_bend_on_rf", "which nets are RF"),
+            ("rf_min_bend_radius_mm", "which nets are RF"),
+            ("rf_min_spacing_to_other_trace_mm", "which nets are RF"),
+            ("rf_min_distance_to_edge_mm", "which nets are RF"),
+            ("antenna_min_distance_to_other_rf_mm", "which net is the antenna feed")):
+        out[key] = _na("this rule needs %s, and no board file states it; pass the "
+                       "number through `facts` (or name the nets) and the rule is "
+                       "graded from your input" % what)
+    return out
 
 _CAP_REF = re.compile(r"^C\d")
 # A decoupling cap is a capacitor by reference designator (the file states C1,
@@ -1516,6 +2382,22 @@ def grade_caps(m):
     stays undetermined until the caller names the cap-to-pin pairs.
     """
     caps = {}
+    row = m.get("test_points_on_rails_and_connectors") or {}
+    if isinstance(row.get("value"), bool):
+        caps["test_points_on_rails_and_connectors"] = (
+            "measured, not graded: whether a header pin counts as a test point "
+            "depends on the fixture the product is tested on - a pogo bed needs "
+            "pads, a hand probe needs headers - and no board file says which "
+            "(%s)" % (row.get("where") or "?"))
+    row = m.get("crystal_has_guard_ring") or {}
+    if isinstance(row.get("value"), bool):
+        caps["crystal_has_guard_ring"] = (
+            "measured, not graded: copper around a crystal is a practice for a "
+            "clock that has to be quiet, and no board file says how quiet this "
+            "clock has to be - two finished boards in the corpus (interf_u, video) "
+            "put their crystal in no copper at all and they shipped (%s). Name the "
+            "crystal whose clock matters and this fact is graded from it."
+            % (row.get("where") or "?"))
     row = m.get("decoupling_max_distance_to_pin_mm") or {}
     if "value" in row:
         caps["decoupling_max_distance_to_pin_mm"] = (
@@ -1553,13 +2435,19 @@ def grade_caps(m):
 
 
 def catalog_facts(m):
-    """Map the measurements onto the fact names ``calc/rules.py`` grades."""
+    """Map the measurements onto the fact names ``calc/rules.py`` grades.
+
+    A bool stays a bool: the grader rejects anything else as "must be true/false",
+    and multiplying by 1.0 (which is what a blind scale would do) turned every
+    boolean rule into a false undetermined.
+    """
     facts = {}
 
-    def take(key, fact, scale=1.0):
+    def take(key, fact):
         row = m.get(key) or {}
-        if "value" in row:
-            facts[fact] = row["value"] * scale
+        val = row.get("value")
+        if isinstance(val, bool) or isinstance(val, (int, float)):
+            facts[fact] = val
 
     take("min_track_width", "min_trace_width_mm")
     take("min_plated_drill", "min_via_hole_mm")
@@ -1568,21 +2456,35 @@ def catalog_facts(m):
     take("decoupling_max_distance_to_pin_mm", "decoupling_max_distance_to_pin_mm")
     take("layer_changes_without_return_via", "layer_changes_without_return_via")
     take("power_trace_width_mm", "power_trace_width_mm")
-    row = m.get("signal_crosses_plane_split") or {}
-    if isinstance(row.get("value"), bool):
-        facts["signal_crosses_plane_split"] = row["value"]
-    # A bool must stay a bool: `take` multiplies by 1.0 and would hand the
-    # grader the float 1.0, which it rejects as "must be true/false".
-    row = m.get("decoupling_via_in_path") or {}
-    if isinstance(row.get("value"), bool):
-        facts["decoupling_via_in_path"] = row["value"]
+    take("signal_crosses_plane_split", "signal_crosses_plane_split")
+    take("decoupling_via_in_path", "decoupling_via_in_path")
+    # The assembly and rail facts: every one of these rules used to answer with
+    # "no measurement supplied", which is true of this module and says nothing
+    # about the board.
+    take("silkscreen_over_pad", "silkscreen_over_pad")
+    take("power_pad_has_thermal_vias", "power_pad_has_thermal_vias")
+    take("stitching_via_pitch_mm", "stitching_via_pitch_mm")
+    take("diffpair_gap_varies", "diffpair_gap_varies")
+    take("ics_without_bulk_cap", "ics_without_bulk_cap")
+    take("test_points_on_rails_and_connectors", "test_points_on_rails_and_connectors")
+    take("min_mask_expansion", "min_mask_expansion")
+    take("crystal_has_guard_ring", "crystal_has_guard_ring")
     return facts
 
+
+def fact_refusals(m):
+    """The reason a fact has no value, in the measurement's own words."""
+    out = {}
+    for key, row in m.items():
+        if isinstance(row, dict) and row.get("unmeasurable"):
+            out[key] = row["unmeasurable"]
+    return out
 
 # Facts whose measurement this module can make but whose POPULATION it cannot
 # bound, so they are reported and not graded (see `grade_caps`).
 CAP_FACTS = ("decoupling_max_distance_to_pin_mm", "decoupling_via_in_path",
-             "layer_changes_without_return_via", "signal_crosses_plane_split")
+             "layer_changes_without_return_via", "signal_crosses_plane_split",
+             "test_points_on_rails_and_connectors")
 
 
 def failing_examples(m, key, limit):

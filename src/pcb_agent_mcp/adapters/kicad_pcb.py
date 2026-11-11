@@ -651,6 +651,26 @@ def _silk_item(kind, node, place=None):
         lpts = _graphic_points(node)
         if not lpts:
             return item
+        # The polyline itself, in board space, for the one rule that needs the
+        # ink and not the box around it: "does this silk line sit on a pad". A
+        # bbox answers that with a false positive every time a diagonal line
+        # passes a pad at 45 degrees - the box corners are not ink. Two kinds
+        # cannot be handed over as a polyline and say so instead of carrying a
+        # wrong one: `_graphic_points` returns a circle as its bbox corners, and
+        # an arc as its end points.
+        if kind.endswith("_circle") or kind.endswith("_arc"):
+            item["pts_unavailable"] = ("_graphic_points gives a %s as its bounding "
+                                       "points, not its ink" % kind.split("_")[-1])
+        else:
+            # A rectangle arrives as two OPPOSITE CORNERS, not as its outline.
+            # Walking those two points as a polyline draws the diagonal, and the
+            # diagonal is not ink: pic_programmer's four socket outlines read as
+            # "silk over pad" on the strength of that one wrong segment.
+            if kind.endswith("_rect") and len(lpts) == 2:
+                (ax_, ay_), (bx_, by_) = lpts
+                lpts = [(ax_, ay_), (bx_, ay_), (bx_, by_), (ax_, by_), (ax_, ay_)]
+            item["pts"] = [(x + qx * ca - qy * sa, y + qx * sa + qy * ca)
+                           for qx, qy in lpts]
         half = (_stroke_width(node) or 0.0) / 2.0
         lx = min(p[0] for p in lpts) - half
         ly = min(p[1] for p in lpts) - half
