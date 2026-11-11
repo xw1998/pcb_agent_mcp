@@ -1,6 +1,6 @@
 ---
 name: pcb-agent-mcp-usage
-description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——229 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
+description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路——244 个工具怎么发现（默认只广告 core 子集，其余走 tool_search + tool_call）、读板/写板的六阶段工作流（量事实 → 找空间 → 定意图 → propose → apply → 验）、哪些读数权威（board_drc）哪些不是（board_pour_connectivity 只是中心点在多边形内）、body 体积与 48 KiB 对话预算（saved_to 落盘、大板文件要切片读）、已退休的 board_route / board_fanout、经验库 experience_* 的写入门槛、以及一批真实踩过的坑（.kicad_pcb 全在一行、层名是 "F.Cu" 不是 "F"、过孔压焊盘不算连通、无网焊盘仍是障碍）。适用于任何要调用 pcb_agent_mcp 或排查它「为什么没读到/为什么写坏了/为什么答案不对」的场合。用户说「用这个 mcp」「工具怎么调」「为什么布不通」「读数对不对」时触发。
 ---
 
 # pcb_agent_mcp 使用手册
@@ -14,18 +14,34 @@ description: 正确使用 pcb_agent_mcp 这个 MCP 服务画板与算电路—�
 
 ## 三件必须先知道的事
 
-1. **它注册了 229 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
+1. **它注册了 244 个工具，但默认只广告 `core` 子集（约 45 个）+ 两个元工具。**
    这是故意的：把 301 KB 的工具清单塞进上下文会直接把对话撑爆。
    ⇒ 想用的工具不在清单里，就先 `tool_search`（按**任务**搜，支持中文任务名词，
    例如「阻抗」「回流」「铺铜」），再 `tool_call` 执行。**不要臆造工具名，也不要因为
    「清单里没有」就断言「这个服务做不到」。**
-2. **工具数与环境变量会变。** 本文写的 229 是当前数；任何判断以
+2. **工具数与环境变量会变。** 本文写的 244 是当前数；任何判断以
    `calc_capabilities` / `tools/list` 的当前返回为准。`PCB_AGENT_TOOLSET=all` 可广告全部。
 3. **它不替你设计。** 它给事实、给度量、给规则判定；摆哪里、走哪条，是人（或按
    `pcb-layout-methodology` 技能）决定的。`board_route` / `board_fanout` 已**退休**，
    按名调用回 `TOOL_RETIRED`——这是刻意的，不要再去找替代的自动布线。
 
 ## 六阶段工作流
+
+### 阶段 0：先把判据装上（只在要「画一块好板」时）
+| 想知道 | 工具 |
+|---|---|
+| 这套规则都有哪些、怎么分级 | `pcb_rule_catalog`（22 条目录 / 29 条 fab 限值 / 20 条 SMT，每条带原文引文） |
+| 这块板**能不能造** | `board_rule_audit`（P0 工艺 / P1 电气 / P2 装配 / P3 信号质量 / P4 美观） |
+| 好板子长什么样、我该画多宽 | `board_design_baseline`（13 块 P0 合格成品板的 p10/p50/p90 + 起点值） |
+
+三条纪律：
+
+1. **优先级不是建议，是顺序**。P0 不合格其余一律不用看；`verdict` 里 `blocked_at_P0_*`
+   表示「造不出来」，不是「还能改进」。P0/P1/P2 阻塞写，P3/P4 只标 `flagged`。
+2. **P0 必须声明工艺**，否则全列 `undetermined`——不许猜。声明要**按板子自己的层数**
+   （层数从 stackup 数），拿 2 层去声明白一块 6 层板，得到的 unbuildable 说的是声明，不是板。
+3. **`board_design_baseline` 不是判据**：`blocks_nothing`，落在 p10-p90 之外不说明错。
+   它给的是起点值，被三样东西压过——P0 限值、铜要过的电流、实际工艺。
 
 ### 阶段 1：量事实（只读，先别动）
 | 想知道 | 工具 |
@@ -111,11 +127,20 @@ footprints、pads、tracks、vias、zones（含填充多边形）、Edge.Cuts、
 postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、走线出框）。
 磁盘上什么都没发生。**看 postcondition 列表，就是在看这份提案会被怎么验。**
 
+`propose` 的回包还带 `preconditions`：六条**机器可裁决**的前置状态——规则基线有据、
+DRC 引擎在、板框已知（只对新增铜要求）、机械层没被动过（纯 `translate_board` 平移不算）、
+本次计划没新造 <0.2 mm 跨网间距（**增量判据**，板子上原有的贴近对不算你的）、工艺是否已声明。
+不是「没确认不许布线」，是「状态不对不许布线」：`verdict=refused_at_<check>` 时先修状态；
+`options.preconditions=false` 可以关（关掉后回包里连 `preconditions` 键都没有）。
+
 ### 阶段 5：apply（写入，并自证）
 `board_apply` 会：先取 checkpoint → 原子写入 → 过四道不信任写入代码的闸门
 （磁盘字节 == 计划字节；重新解析得到计划树；每条 postcondition 从文件里重读；
 …）。checkpoint 在 `$PCB_AGENT_HOME`（默认 `~/.pcb_agent_mcp`），不在工程目录边上。
 回滚用 `board_checkpoints` 列表 + `board_restore`。
+
+状态不对时 `apply` 抛 `PRECONDITION_NOT_MET`，`extra.preconditions` 带六条完整读数；
+它复判用的是 `propose` 存下的同一份数（只有规则文件与引擎会重读），所以门和提案不会给出两个说法。
 
 ### 阶段 6：验（分权威与不权威）
 | 结论 | 权威工具 | 说明 |
@@ -126,8 +151,10 @@ postcondition**、以及阻断原因（板框没闭合、会新增 DRC 违约、
 | 信号有没有跨分割 | `board_cross_split` | **没有平面铺铜时拒答**——因为「没找到分割」会让坏层叠变绿 |
 | 环路面积 | `board_loop_area` | **没有层叠时拒答**，猜介质厚度就是猜 EMC |
 | 按规则目录打分 | `layout_review`（先 `design_rules` 拿目录） | 事实缺失一律 `undetermined`，不给你一份全绿的假报告 |
-| 工艺能力 | `dfm_check`（拿真实能力表）+ `dfm_capability` | |
-| 出图/交付 | `board_fab_package`、`board_export_graphics`、`board_export_3d` | Gerber/钻孔/坐标/STEP，逐件报来源与设置 |
+| 工艺能力 | `dfm_check`（拿真实能力表）+ `dfm_capability` |
+| 按优先级判「能不能造」 | `board_rule_audit` | P0 只认厂商能力库的引文；工艺未声明就不判，「全 pass」与「全未定」是两种答案 |
+| 离好板子有多远 | `board_design_baseline` | **不判**：`blocks_nothing`，只给「在 p10-p90 之内/外」 | |
+| 出图/交付 | `board_fab_package`、`board_export_graphics`、`board_export_3d` | Gerber/钻孔/坐标/STEP，逐件报来源与设置；**出包前跑一次 DRC，有 error 或未连通就 `FAB_REFUSED_UNCLEAN` 拒包**（`drc_gate=false` 只跳过检查，不会让脏板变干净） |
 
 ## 读数的纪律（这个服务的设计意图）
 
