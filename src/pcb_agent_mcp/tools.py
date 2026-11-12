@@ -8386,8 +8386,16 @@ _tool(
     "overlapping along the run by at least min_overlap_mm - tens of tracks per net is "
     "why 'the nearest two' would be an answer about traces that never run together. "
     "Every candidate is returned ranked with its own gap and overlap; the field solve is "
-    "run on the worst one only, because a full solution per candidate would be a minute "
-    "each - on a 0.15 mm pair this one solve took 285.8 s, so budget 30 s to 5 min. "
+    "run on the nearest of them, and max_runs says how many of the ranked candidates get "
+    "their own full solve - each one is a whole 2-D field solution (a 0.15 mm pair has "
+    "taken 285.8 s at the default mesh, so one solve is 30 s to 5 min and the clock is the "
+    "honest cost of asking for five). Those solves share nothing, so jobs runs that many "
+    "of them at once in spawned processes - off by default, because a library that "
+    "starts processes unasked can re-run an unguarded caller's __main__ once per "
+    "worker; ask with jobs=\"auto\" for min(runs, cores, 8) or with a number - and the "
+    "numbers are the same as solving them one after another and only the wall clock "
+    "moves, value.parallel records which of the two happened, and a pool that could not "
+    "start falls back to serial and says so instead of passing for a speed-up. "
     "The reference plane, its dielectric thickness and er come from the stackup nearest "
     "that layer (nearest, not outermost: a track has two neighbours). A net on no shared "
     "copper layer, a net against itself, and two tracks of different widths are refused "
@@ -8411,6 +8419,10 @@ _tool(
         mesh_div=_num("field mesh divisions", 12),
         samples_per_delay=_num("time samples per delay", 60),
         waveform_points=_num("points returned per waveform", 101),
+        max_runs=_num("solve this many of the ranked runs, each a whole field solve "
+                      "(default 1, cap 8)", 1),
+        jobs=_num("solve this many runs at once in spawned processes; off by "
+                  "default, 'auto' = min(runs, cores, 8), cap 8"),
     ), "required": ["path", "net_a", "net_b", "rise_time_ns"]},
     _board_tool(lambda b, a: _simcouple.board_crosstalk(b, a), derived=True),
 )

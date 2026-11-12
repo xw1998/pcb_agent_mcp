@@ -176,8 +176,11 @@ class TestHowManyRunsGetSolved(unittest.TestCase):
     def _patched(self, calls, result=None):
         import unittest.mock as mock
 
-        def fake(kind, width, gap, *a, **kw):
-            calls.append({"width": width, "gap": gap})
+        def fake(kind, width_mm, spacing_mm, *a, **kw):
+            # keyword names, because that is how a run's parameters travel now
+            # (a dict handed to _solve_one_run, so the same call works in a
+            # spawned worker); it used to be positional
+            calls.append({"width": width_mm, "gap": spacing_mm})
             if result is not None:
                 return dict(result)
             return {"status": "ok", "value": {"next": len(calls) * 1.0,
@@ -237,6 +240,157 @@ class TestHowManyRunsGetSolved(unittest.TestCase):
         self.assertEqual(out["reason_code"], "MESH_TOO_FINE", out)
         self.assertEqual(out["run_rank"], 1)
 
+
+class TestHowManyRunsAtOnce(unittest.TestCase):
+    """`jobs`: solving several runs at the same time, and what is said when not.
+
+    Nothing here measures a speed-up. A spawned pool cannot be exercised from
+    inside pytest - spawn re-imports `__main__`, and under pytest that is the
+    test runner, so the pool refuses to start and falls back to serial. What is
+    pinned here is the decision (how many, capped by what), the refusals, the
+    fallback being *reported*, and - in a subprocess with a real `__main__` -
+    that a parallel answer is the same answer.
+    """
+
+    def _patched(self, calls):
+        import unittest.mock as mock
+
+        def fake(kind, width_mm, spacing_mm, *a, **kw):
+            calls.append(spacing_mm)
+            return {"status": "ok",
+                    "value": {"next": spacing_mm, "fext": spacing_mm * 2.0}}
+
+        return mock.patch.object(C._X, "coupled_lines", side_effect=fake)
+
+    def test_the_default_is_one_run_at_a_time(self):
+        calls = []
+        with self._patched(calls):
+            out = C.board_crosstalk(_board(THREE), {"net_a": "A", "net_b": "B",
+                                                    "rise_time_ns": 0.5,
+                                                    "max_runs": 3})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertEqual(len(calls), 2)
+        how = out["value"]["parallel"]
+        self.assertIs(how["used"], False)
+        self.assertEqual(how["jobs"], 1)
+        self.assertIn("default", how["asked"])
+        self.assertIn("one after another", how["why"])
+        self.assertIn("wall_s", how)
+        # the answer is still the serial one, in rank order: gap 0.3 then 0.4
+        self.assertEqual([round(r["next"], 6) for r in out["value"]["runs_solved"]],
+                         [0.3, 0.4])
+
+    def test_auto_is_capped_by_the_runs_the_cores_and_eight(self):
+        self.assertEqual(C._jobs_asked({"jobs": "auto"}, 3)[0], min(3, C.MAX_JOBS,
+                         os.cpu_count() or 1))
+        self.assertEqual(C._jobs_asked({"jobs": "auto"}, 40)[0], C.MAX_JOBS)
+        self.assertEqual(C._jobs_asked({"jobs": 99}, 2)[0], 2)
+        self.assertEqual(C._jobs_asked({"jobs": "4"}, 8)[0], 4)
+        self.assertEqual(C._jobs_asked({"jobs": "auto"}, 1)[0], 1)
+
+    def test_the_machine_env_can_ask_and_a_number_wins_over_it(self):
+        import unittest.mock as mock
+        with mock.patch.dict(os.environ, {C.JOBS_ENV: "3"}):
+            self.assertEqual(C._jobs_asked({}, 8)[0], 3)
+            self.assertEqual(C._jobs_asked({"jobs": 2}, 8)[0], 2)
+        with mock.patch.dict(os.environ, {C.JOBS_ENV: "auto"}):
+            self.assertEqual(C._jobs_asked({}, 2)[0], min(2, C.MAX_JOBS,
+                             os.cpu_count() or 1))
+
+    def test_jobs_zero_and_a_non_number_are_refused_by_name(self):
+        out = C.board_crosstalk(_board(THREE), {"net_a": "A", "net_b": "B",
+                                                "rise_time_ns": 0.5,
+                                                "max_runs": 3, "jobs": 0})
+        self.assertEqual(out["reason_code"], "ARG_RANGE", out)
+        out = C.board_crosstalk(_board(THREE), {"net_a": "A", "net_b": "B",
+                                                "rise_time_ns": 0.5,
+                                                "max_runs": 3, "jobs": "twice"})
+        self.assertEqual(out["reason_code"], "ARG_INVALID", out)
+
+    def test_a_pool_that_cannot_start_says_so_and_still_answers(self):
+        import unittest.mock as mock
+        calls = []
+        with self._patched(calls), \
+                mock.patch("multiprocessing.get_context",
+                           side_effect=OSError("no semaphores here")):
+            out = C.board_crosstalk(_board(THREE), {"net_a": "A", "net_b": "B",
+                                                    "rise_time_ns": 0.5,
+                                                    "max_runs": 3, "jobs": 2})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertEqual(len(calls), 2)
+        how = out["value"]["parallel"]
+        self.assertIs(how["used"], False)
+        self.assertIn("OSError", how["why"])
+        self.assertIn("one after another", how["why"])
+
+    def test_a_parallel_answer_is_the_same_answer(self):
+        """Run from a real script file, where spawn is allowed to work.
+
+        `python -c` would not do: a spawned worker re-imports the main *file*,
+        so the stub below has to live at module level of something on disk or
+        the workers would solve the real field and never finish in a test.
+        """
+        import json
+        import subprocess
+        import textwrap
+
+        script = textwrap.dedent('''
+            import json, os, sys
+            sys.path.insert(0, "src"); sys.path.insert(0, "tests")
+            import unittest.mock as mock
+            from test_board_coupling import _board, THREE
+            from pcb_agent_mcp.sim import couple as C
+
+            # at module level, so a spawned worker sees it too: what is being
+            # pinned is the plumbing (pickling, order, equality), not physics
+            mock.patch.object(
+                C._X, "coupled_lines",
+                side_effect=lambda kind, width_mm, spacing_mm, *a, **k: {
+                    "status": "ok",
+                    "value": {"next": round(spacing_mm, 9),
+                              "fext": round(spacing_mm * 2.0, 9)}}).start()
+
+            def run(jobs):
+                a = {"net_a": "A", "net_b": "B", "rise_time_ns": 0.5,
+                     "max_runs": 3, "mesh_div": 4}
+                if jobs is not None:
+                    a["jobs"] = jobs
+                out = C.board_crosstalk(_board(THREE), a)
+                assert out["status"] == "ok", out
+                return out
+
+            if __name__ == "__main__":
+                one = run(1)
+                two = run(2)
+                print(json.dumps({
+                    "one": [r["next"] for r in one["value"]["runs_solved"]],
+                    "two": [r["next"] for r in two["value"]["runs_solved"]],
+                    "used": two["value"]["parallel"]["used"],
+                    "jobs": two["value"]["parallel"]["jobs"],
+                    "serial_used": one["value"]["parallel"]["used"]}))
+        ''')
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(tempfile.gettempdir(), "couple_par_%d.py" % os.getpid())
+        with open(path, "w", newline="") as fh:
+            fh.write(script)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = "src;tests;."
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        try:
+            got = subprocess.run([sys.executable, path], capture_output=True,
+                                 text=True, cwd=root, env=env, timeout=300)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self.assertEqual(got.returncode, 0, got.stderr[-3000:])
+        data = json.loads(got.stdout.strip().splitlines()[-1])
+        self.assertIs(data["serial_used"], False)
+        self.assertIs(data["used"], True, data)
+        self.assertEqual(data["jobs"], 2)
+        self.assertEqual(data["one"], data["two"])
+        self.assertEqual([round(v, 9) for v in data["two"]], [0.3, 0.4])
 
 class TestOneRealSolve(unittest.TestCase):
     """Slow: the field engine costs 30 s to 5 min, so this is ONE coarse run."""

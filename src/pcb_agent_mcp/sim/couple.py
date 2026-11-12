@@ -24,6 +24,7 @@ that was and how many others there were.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 from ..calc import crosstalk as _X
@@ -179,6 +180,86 @@ def _tracks(board, net, layer):
     return out
 
 
+JOBS_ENV = "PCB_AGENT_JOBS"
+MAX_JOBS = 8          # the same cap max_runs has: beyond it the answer is the same
+
+def _solve_one_run(kw):
+    """One coupled run: its own full 2-D field solution.
+
+    Module level, and taking a plain dict, so a spawned worker can find it. The
+    solve is pure arithmetic on floats - no board object, no globals - which is
+    the whole reason the runs can be handed to separate processes at all.
+    """
+    started = time.time()
+    one = _X.coupled_lines(**kw)
+    one["elapsed_s"] = round(time.time() - started, 2)
+    return one
+
+def _jobs_asked(args, n_specs):
+    """How many runs to solve at once, and the reason if it is one.
+
+    `jobs` is the caller's, `PCB_AGENT_JOBS` is the machine's; 1 means "one after
+    another" and is BOTH the default and the fallback whenever a pool cannot be
+    started, because a wrong pool is worse than a slow answer - a library that
+    spawns processes unasked is a library that can re-run a caller's unguarded
+    `__main__` once per worker. Returns (jobs, why) or (None, error).
+    """
+    raw = args.get("jobs")
+    if raw is None or raw == "":
+        raw = os.environ.get(JOBS_ENV)
+    if raw is None or raw == "":
+        return 1, ("default: one after another - starting processes behind the "
+                   'caller\'s back is not something a library does; ask with '
+                   'jobs="auto" (or %s=auto)' % JOBS_ENV)
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        return (max(1, min(n_specs, MAX_JOBS, os.cpu_count() or 1)),
+                "auto: min(%d runs, %d cores, %d)" % (
+                    n_specs, os.cpu_count() or 1, MAX_JOBS))
+    n = _num(raw)
+    if n is None:
+        return None, _err("jobs must be a number: it is how many runs are solved at "
+                          "once", "ARG_INVALID")
+    n = int(n)
+    if n < 1:
+        return None, _err("jobs must be >= 1: jobs=0 would be a request to solve "
+                          "nothing, and a run that is not solved contributes "
+                          "nothing", "ARG_RANGE")
+    return min(n, MAX_JOBS, n_specs), "jobs=%d capped at min(%d runs, %d)" % (
+        n, n_specs, MAX_JOBS)
+
+def _solve_runs(specs, jobs):
+    """Solve every (rank, run, kwargs) spec, in parallel when asked and able.
+
+    Returns (list of (rank, run, one) in rank order, how) where `how` says what
+    actually happened. Order is preserved by `Pool.map`, so a parallel answer is
+    the same answer; only the wall clock and `how` differ.
+    """
+    kws = [kw for _rank, _run, kw in specs]
+    if jobs <= 1 or len(kws) <= 1:
+        return [(specs[i][0], specs[i][1], _solve_one_run(kw))
+                for i, kw in enumerate(kws)], {
+                    "used": False, "jobs": 1,
+                    "why": ("one run to solve: there is nothing to overlap"
+                            if len(kws) <= 1 else "jobs=1: runs were solved one "
+                            "after another")}
+    try:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=jobs) as pool:
+            outs = pool.map(_solve_one_run, kws)
+    except Exception as exc:                     # pragma: no cover - see the test
+        return [(specs[i][0], specs[i][1], _solve_one_run(kw))
+                for i, kw in enumerate(kws)], {
+                    "used": False, "jobs": 1,
+                    "why": "the worker pool could not be started (%s: %s), so the "
+                           "runs were solved one after another - the numbers are "
+                           "the same and only the wall clock pays"
+                           % (type(exc).__name__, exc)}
+    return [(specs[i][0], specs[i][1], outs[i]) for i in range(len(kws))], {
+        "used": True, "jobs": jobs,
+        "why": "%d runs solved in %d spawned process(es): each run is its own "
+               "field solution and they do not share anything" % (len(kws), jobs)}
+
 def board_crosstalk(board, args):
     """NEXT/FEXT between two nets, on the run where they actually couple."""
     net_a = str(args.get("net_a") or "")
@@ -289,7 +370,7 @@ def board_crosstalk(board, args):
     # one width for a symmetric pair, so that run is not the pair on the board,
     # and "the second-closest run was skipped and nobody said why" is how a tool
     # reports crosstalk for a pair that does not exist.
-    solved, refused = [], []
+    specs, refused = [], []
     for rank, run in enumerate(runs[:want_runs], 1):
         wa, wb = run["width_a_mm"], run["width_b_mm"]
         if abs(wa - wb) / max(wa, wb) > 0.10:
@@ -301,25 +382,34 @@ def board_crosstalk(board, args):
                        "has ONE width for a symmetric pair, so this run is not the "
                        "pair on the board" % (wa, wb)})
             continue
-        started = time.time()
-        one = _X.coupled_lines(
-            kind, wa, run["gap_mm"], dielectric_mm, run["overlap_mm"], rise,
-            copper_um=float(copper_um), er=float(er),
-            amplitude_v=float(args.get("amplitude_v") or 1.0),
-            termination_ohm=(None if args.get("termination_ohm") is None
-                             else float(args["termination_ohm"])),
-            mesh_div=int(args.get("mesh_div") or 12),
-            samples_per_delay=int(args.get("samples_per_delay") or 60),
-            waveform_points=int(args.get("waveform_points") or 101))
-        one["elapsed_s"] = round(time.time() - started, 2)
+        specs.append((rank, run, {
+            "kind": kind, "width_mm": wa, "spacing_mm": run["gap_mm"],
+            "dielectric_mm": dielectric_mm, "length_mm": run["overlap_mm"],
+            "rise_time_ns": rise,
+            "copper_um": float(copper_um), "er": float(er),
+            "amplitude_v": float(args.get("amplitude_v") or 1.0),
+            "termination_ohm": (None if args.get("termination_ohm") is None
+                                else float(args["termination_ohm"])),
+            "mesh_div": int(args.get("mesh_div") or 12),
+            "samples_per_delay": int(args.get("samples_per_delay") or 60),
+            "waveform_points": int(args.get("waveform_points") or 101)}))
+
+    jobs, jobs_why = _jobs_asked(args, len(specs))
+    if jobs is None:
+        return jobs_why                      # already an error envelope
+    started_all = time.time()
+    solved, how = _solve_runs(specs, jobs)
+    how["wall_s"] = round(time.time() - started_all, 2)
+    how["asked"] = jobs_why
+    for rank, run, one in solved:
         if one.get("status") != "ok":
             # A solver failure is about the stackup or the arguments, not about
             # which run it was: say which run, then hand the error up unchanged.
             one["run_rank"] = rank
             one["run_at_mm"] = list(run["at_mm"])
             return one
-        solved.append({"rank": rank, "run": run, "solve": one})
 
+    solved = [{"rank": r, "run": run, "solve": one} for r, run, one in solved]
     if not solved:
         first = refused[0]
         return _err("the closest run has %s at %.4g mm wide and %s at %.4g mm: the "
@@ -366,7 +456,8 @@ def board_crosstalk(board, args):
     rows = [_brief(s) for s in solved]
     value = out.get("value")
     out["value"] = {"crosstalk": value, "board": info,
-                    "runs_solved": rows, "runs_refused": refused}
+                    "runs_solved": rows, "runs_refused": refused,
+                    "parallel": how}
     for key in ("not_modelled", "authoritative", "where_the_rest_is"):
         if key in out:
             out["value"][key] = out.pop(key)
@@ -384,6 +475,19 @@ def board_crosstalk(board, args):
            worst["angle_deg"], worst["gap_mm"], worst["overlap_mm"],
            worst["at_mm"][0], worst["at_mm"][1],
            best["solve"].get("elapsed_s") or 0.0))
+    if len(solved) > 1:
+        # The cost of a second run is the whole point of `max_runs`, so the answer
+        # says what the runs actually cost together and whether they overlapped.
+        # A pool that could not start is reported here rather than swallowed: the
+        # caller asked for a speed-up and did not get one.
+        notes.append(
+            "%d runs cost %.1f s of field solving in %.1f s of wall clock (%s); "
+            "raise max_runs to solve more of them and `jobs` to solve more at "
+            "once, and note that each extra run is a full solution of its own pair"
+            % (len(solved), sum((r.get("elapsed_s") or 0.0) for r in rows),
+               how.get("wall_s") or 0.0,
+               "in %d processes" % how["jobs"] if how.get("used")
+               else "one after another, because %s" % how.get("why")))
     if len(solved) < len(runs):
         notes.append(
             "%d of the %d coupled run(s) are not solved here: max_runs=%d covers "

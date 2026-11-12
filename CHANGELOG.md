@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.0.149] - 2026-11-12
+
+`docs/139` 第 8 节四条欠账里唯一能真修的第三条：**串扰一次只解一段，而段与段之间本来毫无关系**。
+
+- **`sim/couple.py::max_runs` 之后加 `jobs`**：多段串扰求解现在可以并行。每个 run 是一整套独立的 2-D 场解（只吃 float，没有 board 对象、没有全局），天然可发给独立进程；`Pool.map` 保序，所以并行答案与串行逐位相同。
+- **默认是串行，不是 auto**（改过一次）。库在背后起进程，等于把调用方没写 `if __name__ == "__main__":` 的脚本在每个 worker 里重跑一遍；`jobs` 要显式给（数字或 `"auto"` = min(runs, cores, 8)），或经 `PCB_AGENT_JOBS` 在机器上打开。
+- **实测（`_par_probe.py`，3 段平行、`mesh_div=4`）**：串行 wall **324.1 s**（三段分别 75.33 / 102.50 / 146.24 s，合计 324.07 s）；`jobs=3` wall **144.0 s**，即 **2.25×**，上限就是最长那一段 —— 并行不是"除以 3"，是"取最大值"，这一点写进了 `value.parallel`。
+- **实解上也逐字符相同**（`_par_probe2.py`，2 段、`mesh_div=4`）：串行 wall 318.2 s 对 `jobs=2` 168.9 s（1.88×），两次 `runs_solved` 的 `next`/`fext` 整段 JSON 逐字符一致（670 / 808 字符，含完整 `waveform_ns_v`）。
+- **回退不吞**：池起不来（Windows spawn 没有 main guard 就是这条）时退回串行，并在 `value.parallel.why` 里带异常类型与消息，notes 里也照实说"one after another, because …"，不让"要了加速却没拿到"变成静默。
+- **`jobs=0` 报 `ARG_RANGE`、非数字报 `ARG_INVALID`**；`jobs` 被 `min(jobs, 8, 越段数)` 夹住，理由同 `MAX_JOBS`。
+- **`tools.py` 补齐广告**：`board_crosstalk` 的 schema 里上一轮漏了 `max_runs`（实现有、schema 没有 = 调用方看不见），这轮把 `max_runs` 与 `jobs` 一起写进 `properties`，描述里删掉"只解最严重的一段"与"这一次求解花了 285.8 s"这两句已经过期的话。
+- **一处连带**：run 的参数改成以 dict 关键字进 `coupled_lines(**kw)`（worker 只认这一种形态），旧测试桩写的是位置参数，全量回归照出 3 例红，桩跟着改成 `(kind, width_mm, spacing_mm)`；被测代码没错。
+- 新增 `tests/test_board_coupling.py::TestHowManyRunsAtOnce` 六例：默认串行、`auto` 的三重夹取、env 与显式值的优先级、`jobs=0`/非数字的具名拒绝、池起不来时回退且说明、以及在**真的脚本文件里**（spawn 需要真 `__main__`）跑一遍"并行答案 == 串行答案"。
+
 ## [0.0.148] - 2026-11-12
 
 `0.0.147` 之后收的八件事，落点全在「规则到底量了什么」和「仿真到底算了什么」（`docs/139`）：
