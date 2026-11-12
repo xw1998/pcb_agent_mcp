@@ -173,6 +173,26 @@ class TestWhatIsRefused(unittest.TestCase):
         name = P.board_plane_resonance(b, {"layer_a": "F.Cu", "layer_b": "In3.Cu"})
         self.assertEqual(name["reason_code"], "NOT_FOUND")
 
+    def test_a_layer_that_is_two_permille_copper_is_not_a_plate(self):
+        # measured on a real demo board (complex_hierarchy): the second poured
+        # layer carries one small pour, so scoring alone would name a 0.2 %
+        # copper layer as the other side of a cavity
+        tiny = _pour("F.Cu", 2, "GND", [(0, 0), (0.4, 0), (0.4, 10), (0, 10)])
+        b = _board(pours=[tiny, _pour("B.Cu", 2, "GND", RING)])
+        out = P.board_plane_resonance(b, {})
+        self.assertEqual(out["reason_code"], "NOT_APPLICABLE")
+        self.assertIn("not a plate", out["message"])
+        # the escape hatch: naming the pair is the caller's assumption, and it wins
+        named = P.board_plane_resonance(b, {"layer_a": "B.Cu", "layer_b": "F.Cu"})
+        self.assertEqual(named["status"], "ok", named)
+        self.assertFalse(named["value"]["board"]["pair_from_file"])
+
+    def test_a_file_with_no_stackup_says_that_rather_than_no_pours(self):
+        out = P.board_plane_resonance(_board("", pours=BOTH), {})
+        self.assertEqual(out["reason_code"], "NOT_APPLICABLE")
+        self.assertIn("states no stackup", out["message"])
+        self.assertEqual((out.get("extra") or {}).get("copper_layers"), [])
+
     def test_no_outline_means_no_cavity(self):
         out = P.board_plane_resonance(_board(pours=BOTH, outline=False), {})
         self.assertEqual(out["reason_code"], "NOT_APPLICABLE")

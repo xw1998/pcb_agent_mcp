@@ -195,14 +195,34 @@ def _pick_pair(board, box, args):
         if cov:
             scored.append((cov["coverage_of_box"], name, cov))
     scored.sort(reverse=True)
+    found = [{"layer": n, "coverage": c["coverage_of_box"]} for _, n, c in scored]
+    if not cu:
+        # Nothing in the stackup at all: this is a different failure from "poured
+        # on one layer only", and the message has to say which one it is.
+        return None, _err(
+            "this file states no stackup, so it names neither the copper layers "
+            "nor the dielectric between them; a plane pair and an er are both "
+            "missing, and neither is something to invent", "NOT_APPLICABLE",
+            hint="give layer_a/layer_b and er explicitly if you know the stack"
+                 "the board was built on",
+            extra={"copper_layers": [], "pours_found": found})
     if len(scored) < 2:
         return None, _err(
             "this board does not name two copper layers with pours on them, so "
             "there is no plane pair to find; name layer_a/layer_b if the plates "
             "are your assumption rather than the file's", "NOT_APPLICABLE",
-            extra={"copper_layers": cu,
-                   "pours_found": [{"layer": n, "coverage": c["coverage_of_box"]}
-                                   for _, n, c in scored]})
+            extra={"copper_layers": cu, "pours_found": found})
+    # A plate with a hole in it is one thing; a layer that is 0.2 % copper is not
+    # a plate at all, and a mode computed over it is a mode of some other
+    # resonator. Measured on a real demo board (complex_hierarchy): the second
+    # best layer carries a single small pour, and scoring alone would happily
+    # name it as the other side of a cavity.
+    if scored[1][0] < 0.5:
+        return None, _err(
+            "the second best poured layer (%r) covers only %.1f %% of the box, "
+            "which is not a plate; name layer_a/layer_b if you mean it anyway"
+            % (scored[1][1], 100.0 * scored[1][0]), "NOT_APPLICABLE",
+            extra={"copper_layers": cu, "pours_found": found})
     return (scored[0][1], scored[1][1], True), None
 
 
