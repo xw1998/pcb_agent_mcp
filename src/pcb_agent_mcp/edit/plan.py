@@ -1566,9 +1566,20 @@ def _build_board_text(spec):
            "F.Mask": 39, "Dwgs.User": 40, "Cmts.User": 41, "Eco1.User": 42,
            "Eco2.User": 43, "Edge.Cuts": 44, "Margin": 45, "B.CrtYd": 46,
            "F.CrtYd": 47, "B.Fab": 48, "F.Fab": 49}
+    # Inner-layer KINDS are a design fact, not a default: a ground plane is a
+    # `power` layer in KiCad's layer table and reads as one in the layer manager,
+    # its zone behaviour and every later "which layer is this" summary. Writing
+    # them all as `signal` (the old behaviour) meant a plane layer existed but
+    # nothing said it was a plane.
+    kinds = spec.get("inner_kinds") or []
+    allowed = ("signal", "power", "mixed", "jumper", "user")
     for i in range(1, max(1, copper_layers - 1)):
+        kind = str(kinds[i - 1]) if i - 1 < len(kinds) else "signal"
+        if kind not in allowed:
+            raise EditError("inner_kinds[%d] must be one of %s, got %r"
+                            % (i - 1, "/".join(allowed), kind), "ARG_INVALID")
         ids["In%d.Cu" % i] = i
-        standard.append(("In%d.Cu" % i, "signal"))
+        standard.append(("In%d.Cu" % i, kind))
     layers = [B.L(B.A(str(ids[name])), B.A(name, True), B.A(kind))
               for name, kind in standard]
 
@@ -1643,7 +1654,17 @@ def _build_board_text(spec):
     items.append(B.L(B.A("net"), B.A("0"), B.A("", True)))
     items.append(netclass)
     x1, y1 = x0 + width, y0 + height
-    items.extend(B.rect_as_lines(x0, y0, x1, y1, "Edge.Cuts", edge, sp, "create:edge"))
+    radius = float(spec.get("corner_radius_mm") or 0.0)
+    if radius > 0:
+        if radius >= min(width, height) / 2.0:
+            raise EditError("corner_radius_mm (%g) must be smaller than half the "
+                            "short side (%g)" % (radius, min(width, height) / 2.0),
+                            "ARG_INVALID")
+        items.extend(B.rounded_rect(x0, y0, x1, y1, radius, "Edge.Cuts", edge, sp,
+                                    "create:edge"))
+    else:
+        items.extend(B.rect_as_lines(x0, y0, x1, y1, "Edge.Cuts", edge, sp,
+                                     "create:edge"))
     # The board must be ONE seq. Joining top-level nodes would emit a bare
     # `kicad_pcb` atom followed by siblings - which parses fine as S-expression
     # and is not a board (KiCad reports no (kicad_pcb ...) at top level).

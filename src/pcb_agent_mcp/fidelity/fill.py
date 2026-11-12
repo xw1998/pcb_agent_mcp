@@ -33,6 +33,7 @@ Honesty notes that must survive into the tool surface:
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -635,12 +636,63 @@ def _err(code, message):
 
 # ------------------------------------------------------- shaped pour outlines
 _COPPER_LAYERS = ("F.Cu", "B.Cu")
+_COPPER_NAME = re.compile(r"^(F\.Cu|B\.Cu|In(\d{1,2})\.Cu)$")   # 1..30
+
+
+def is_copper_name(name, limit=30):
+    """Is this spelled like a copper layer? The board still has to HAVE it."""
+    m = _COPPER_NAME.match(str(name or ""))
+    if not m:
+        return False
+    return m.group(2) is None or 1 <= int(m.group(2)) <= limit
+
+
+def board_copper_layers(board):
+    """Copper layers this board really declares, in layer-table order."""
+    node = S.child(board, "layers")
+    if node is None:
+        return []
+    out = []
+    for child in (node.items or []):
+        name = S.arg_text(child, 1) if S.head(child) is not None else None
+        if name and is_copper_name(name):
+            out.append(name)
+    return out
 
 
 def _fmt_mm(value):
     """KiCad writes millimetres; keep 3 decimals and never an exponent."""
     text = ("%.3f" % float(value)).rstrip("0").rstrip(".")
     return "0" if text in ("-0", "") else text
+
+
+def y_flip(board):
+    """-1.0 when this file stores geometry with negative Y (KiCad's own writing).
+
+    `add_zone` takes points in BOARD millimetres (Y up, the way a human reads a
+    drawing). A file that writes Y down needs the sign flipped, and the honest
+    way to know is to read the outline this board already has rather than to
+    guess from a setting. Getting this wrong does not fail loudly in KiCad: the
+    zone outline lands mirrored outside the board and ZONE_FILLER aborts with an
+    integer overflow in kimathLogOverflow (seen: "Overflow converting value
+    -2147493567.024006 to int").
+    """
+    ys = []
+    for _path, item in S.walk(board):
+        if S.head(item) in ("gr_line", "gr_rect", "gr_arc"):
+            if S.arg_text(S.child(item, "layer") or S.Atom(""), 0) is None:
+                pass
+            layer = S.child(item, "layer")
+            if layer is not None and (S.arg_text(layer, 1) or "") == "Edge.Cuts":
+                for sub in ("start", "end", "mid"):
+                    node = S.child(item, sub)
+                    if node is not None:
+                        v = S.arg_text(node, 2)
+                        if v is not None:
+                            ys.append(float(v))
+    if not ys:
+        return 1.0
+    return -1.0 if (sum(ys) / len(ys)) < 0 else 1.0
 
 
 def _available_nets(board):
@@ -654,7 +706,11 @@ def _available_nets(board):
         if S.head(item) in ("pad", "zone", "segment", "via", "arc", "gr_line"):
             node = S.child(item, "net")
             if node is not None:
-                text = S.arg_text(node, 1)
+                # KiCad writes `(net <code> "<name>")` on pads/zones and a bare
+                # name only in old or hand-written files. Reading arg 1 alone
+                # therefore returned "1", "10", "11"... for a real board and
+                # every net lookup failed with NET_NOT_FOUND.
+                text = S.arg_text(node, 2) or S.arg_text(node, 1)
                 if text:
                     names.add(str(text))
     return sorted(names)
@@ -691,10 +747,10 @@ def add_zone(path, net, layer, points, holes=None, priority=9,
     if not os.path.isfile(path):
         return _err("PROJECT_NOT_FOUND", "no such board: %s" % path)
     layer = str(layer or "")
-    if layer not in _COPPER_LAYERS:
+    if not is_copper_name(layer):
         return _err("BAD_LAYER",
-                    "a pour needs a copper layer (%s), got %r"
-                    % (" / ".join(_COPPER_LAYERS), layer))
+                    "a pour needs a copper layer (F.Cu / B.Cu / In1.Cu .. In30.Cu), "
+                    "got %r" % (layer,))
     pts = []
     for p in (points or []):
         try:
@@ -721,6 +777,12 @@ def add_zone(path, net, layer, points, holes=None, priority=9,
 
     doc = _kdoc.KiCadDocument.from_path(path)
     board = doc.board()
+    have = board_copper_layers(board)
+    if layer not in have:
+        return _err("LAYER_NOT_ON_BOARD",
+                    "this board has no copper layer %r; it has %s. A pour on a "
+                    "layer the file does not declare disappears without a word."
+                    % (layer, ", ".join(have) or "none"))
     nets = _available_nets(board)
     if net not in nets:
         return _err("NET_NOT_FOUND",
@@ -733,8 +795,10 @@ def add_zone(path, net, layer, points, holes=None, priority=9,
         return _err("BAD_ARGS", "connect must be solid / thermal / none / "
                                 "thru_hole_only")
 
+    flip = y_flip(board)
+
     def _pts_block(points_mm):
-        return " ".join("(xy %s %s)" % (_fmt_mm(x), _fmt_mm(y))
+        return " ".join("(xy %s %s)" % (_fmt_mm(x), _fmt_mm(y * flip))
                         for x, y in points_mm)
 
     text = ("(zone (net %s) (layer %s) (uuid %s) (hatch edge 0.5) (priority %d) "

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.9] - 2026-11-13
+
+RK3506 核心板第九步：**从图纸走到板子**——45 mm 方板 / 6 层 / R2 圆角 / 140 邮票孔落地，并把第一块 GND 平面交给 KiCad 官方 `ZONE_FILLER` 铺。
+板上一根走线都没有，没有调用任何自动布局/自动布线（`tools/gen_som_board.py` docstring 首句即 `Nothing here is a route; it is a space survey.`）。
+
+- **`create_board` 两个新 spec**：`inner_kinds`（`signal/power/mixed/jumper/user`，非法值 `EditError(ARG_INVALID)`；原来所有内层一律 `signal`）与 `corner_radius_mm`（`>= min(w,h)/2` 报错，`<=0` 退回 `rect_as_lines`）。新增 `build.rounded_rect()`：4 `gr_line` + 4 `gr_arc`（mid 落在 45° 对角线上）。**圆角板框是 Edge.Cuts 机械几何，不属禁弧**（禁弧约束铜层走线），这句话写进 docstring，防止后来者把板角当违规删掉。
+- **`--create` 实测**：`45.0000×45.0000 mm / 6 layers / R2 / outline closed / thickness 声 1.6 测 1.6 / engine_drc 0`；存在即拒跑。
+- **`--castellation` 实测**：J1 140 半孔（0.85/0.55、1.000 节距、中心落在 `±22.5` 即板边线上）走 `propose`+`apply_plan`，四道门全过；`stamp_pad_nets()` 从 `netmap_terminals.csv` 取 `device=STAMP`，不是 140 行即退出。
+- **`plane_outline()`**：内缩 0.5、圆角 1.5、弧采样 15°，实测 **28 点 / 1933.988 mm²**（解析 1934.069）。自交伏笔已修：`range(1,n)` 漏切点再补 append 会跨接，面积一度 1964.738 > 外接盒 1936。
+- **`fill.add_zone` 三处修复，每处都留失败原文**：① 内层被 `_COPPER_LAYERS=("F.Cu","B.Cu")` 硬拒 ⇒ `is_copper_name()` 正则 + 解析后 `board_copper_layers()` 精确校验（`LAYER_NOT_ON_BOARD`）；② `_available_nets` 读 arg1 拿到净编号 ⇒ `arg_text(node,2) or arg_text(node,1)`（原报错 `NET_NOT_FOUND: … no net GND; 98 nets exist, e.g. 1, 10, 11`）；③ 新增 `y_flip(board)`——按板已有 `Edge.Cuts` 的 y 符号判定翻转，因为 `create_board` 写 Y 向下而老板是 Y 向上，**判定法而非新参数**（强行翻转会打坏 `sky_star` 的正 Y zone）。写错方向的症状是 `kimathLogOverflow(): Overflow converting value -2147493567.024006 to int`。
+- **`--planes` 四层逐层实跑（同文件/同多边形/同网/各次先剥净既有 zone）**：`In1.Cu` **ok（fill 1922.987 mm²，1 个填充多边形）**；`In3.Cu`、`In4.Cu` 都 `ENGINE_FAILED` 于同一个 `-2147493567.024006`；`F.Cu` `TIMEOUT`（300 s 不返回）。判别式只剩层本身——「带既有填充」「多边形形状」「6 层堆叠」「模板缺字段」逐一被排除。故 `PLANE_LAYERS_NOW = [In1.Cu]`，`GND_PLANE_LAYERS` 三层仍是设计目标；`planes()` 失败记进 `out[layer]` 后 `continue`，一层的失败不掩盖另一层的读数。
+- **铺完的 DRC 如实照抄**：`not_clean / errors 637 / unconnected 42 / by_type clearance 499 + copper_edge_clearance 138 + isolated_copper 1 + lib_footprint_issues 1`，`top_errors` 全是相邻 J1 PTH 焊盘的 `间距 0.2000 实际 0.1500`（节距 1.000、盘 0.85 ⇒ 边距 0.15）。这些**不是铺铜造成**（板上无走线），邮票孔本就骑边，要按板厂工艺口径裁定，**不当缺陷清掉**。
+- 没做完：In4/B.Cu 平面（下一步拿 KiCad GUI 在同一块板上复现同层 zone，分清「缺参数」还是「我们写错层 id」）、45 器件手工单面布局、In3 按轨分块、手工 45° 布线
+
 ## [0.1.8] - 2026-11-13
 
 RK3506 核心板第八步：**把 `docs/145` 冻结的网表画成原理图**，并让 KiCad 自己的网表器 / ERC / PDF 当裁判。
