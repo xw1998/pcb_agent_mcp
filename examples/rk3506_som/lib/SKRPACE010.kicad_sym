@@ -3,11 +3,11 @@
   (generator "pcb_agent_mcp")
   (generator_version "0.0.13")
   (symbol "SKRPACE010"
-    (property "Reference" "SW" (at 0 5.08 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Value" "SKRPACE010" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Footprint" "RK3506:Package_Switch_SMD_4.2x3.2-4P-P2.20_SKRPACE010" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Description" "Tact switch 4-pad reset key (LCSC C139797) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Reference" "SW" (at 0 11.43 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Value" "SKRPACE010" (at 0 8.89 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Footprint" "RK3506:Package_Switch_SMD_4.2x3.2-4P-P2.20_SKRPACE010" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "Tact switch 4-pad reset key (LCSC C139797) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (symbol "SKRPACE010_0_1"
       (polyline (pts (xy -2.54 1.27) (xy 2.54 1.27))
         (stroke (width 0.254) (type solid)) (fill (type none)))

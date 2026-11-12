@@ -3,11 +3,11 @@
   (generator "pcb_agent_mcp")
   (generator_version "0.0.13")
   (symbol "SY8113BADC"
-    (property "Reference" "U" (at 0 5.08 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Value" "SY8113BADC" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Footprint" "Package_TSOT-23-6_L2.9-W1.6-P0.95-LS2.8_SY8113BADC" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Description" "3 A synchronous step-down converter, TSOT-23-6, LCSC C78989 | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Reference" "U" (at 0 12.7 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Value" "SY8113BADC" (at 0 10.16 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Footprint" "RK3506:Package_TSOT-23-6_L2.9-W1.6-P0.95-LS2.8_SY8113BADC" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "3 A synchronous step-down converter, TSOT-23-6, LCSC C78989 | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (symbol "SY8113BADC_0_1"
       (rectangle (start -7.62 6.35) (end 7.62 -6.096)
         (stroke (width 0.254) (type solid)) (fill (type background)))

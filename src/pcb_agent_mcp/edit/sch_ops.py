@@ -794,13 +794,22 @@ def _definition_properties(definition):
     return out
 
 def _rotate(dx, dy, rot):
+    """Rotate an offset that is still in the LIBRARY frame (Y is UP there).
+
+    The caller turns the result into the sheet frame, where Y runs DOWN, by
+    subtracting the rotated y. Doing that the other way round -- keeping the
+    library's sign and only rotating -- mirrored every field about the symbol
+    origin: U8's Value printed 5.08 mm *under* the body instead of above it, on
+    top of its own GND pin name. Rotation 0 is what exposes it, so nothing here
+    was ever caught by a rotation test.
+    """
     r = int(round(rot)) % 360
     if r == 90:
-        return dy, -dx
+        return -dy, dx
     if r == 180:
         return -dx, -dy
     if r == 270:
-        return -dy, dx
+        return dy, -dx
     return dx, dy
 
 def _load_definition(ed, o):
@@ -955,8 +964,8 @@ def _run_add_symbol(ed, o, seed):
         seen.add(p["name"])
         value = overrides.get(p["name"], p["value"] or "")
         dx, dy = _rotate(p["x"], p["y"], rot)
-        fx, fy, frot = _placed(p["name"], (x + dx, y + dy,
-                                           (p["rotation"] + rot) % 360 if p["rotation"] else 0))
+        fx, fy, frot = _placed(p["name"], (x + dx, y - dy,
+                                           (p["rotation"] - rot) % 360 if p["rotation"] else 0))
         written.append(prop(p["name"], value, fx, fy, frot, hide=p["hide"]))
     for name, value in overrides.items():
         if name in seen:

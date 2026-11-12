@@ -67,7 +67,8 @@ def pad_numbers_of(footprint_path):
             out.add(m.group(1))
     return out
 
-def build(doc_text, name, reference, footprint, datasheet, description, pad_numbers):
+def build(doc_text, name, reference, footprint, datasheet, description, pad_numbers,
+          hide_pin_names=False):
     description = lceda_fp.with_source(description)
     doc = parts.parse_symbol_doc(doc_text)
     errs = audit(doc, pad_numbers)
@@ -75,7 +76,8 @@ def build(doc_text, name, reference, footprint, datasheet, description, pad_numb
         raise SystemExit("audit failed:\n  " + "\n  ".join(errs))
     text, report = parts.symbol_to_kicad(doc_text, name=name, reference=reference,
                                          footprint=footprint, datasheet=datasheet,
-                                         description=description)
+                                         description=description,
+                                         hide_pin_names=hide_pin_names)
     out = {
         "symbol": name,
         "reference": reference,
@@ -85,6 +87,7 @@ def build(doc_text, name, reference, footprint, datasheet, description, pad_numb
         "pin_numbers": sorted(p["number"] for p in doc["pins"]),
         "cross_check": "pad set == pin set" if pad_numbers is not None else "not run",
         "audits": "S1-S2 passed",
+        "stacked_separated": report.get("stacked_separated", []),
     }
     return text, out
 
@@ -97,6 +100,9 @@ def main(argv=None):
     ap.add_argument("--footprint", default="")
     ap.add_argument("--datasheet", default="")
     ap.add_argument("--description", default="")
+    ap.add_argument("--hide-pin-names", action="store_true",
+                    help="pin names are datasheet-length strings; hide them so "
+                         "they cannot land on the net labels")
     ap.add_argument("--footprint-pads", default=None,
                     help=".kicad_mod whose pad numbers must equal the pin numbers")
     a = ap.parse_args(argv)
@@ -104,7 +110,8 @@ def main(argv=None):
         doc_text = f.read()
     pads = pad_numbers_of(a.footprint_pads) if a.footprint_pads else None
     text, report = build(doc_text, a.name, a.reference, a.footprint,
-                         a.datasheet, a.description, pads)
+                         a.datasheet, a.description, pads,
+                         hide_pin_names=a.hide_pin_names)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)

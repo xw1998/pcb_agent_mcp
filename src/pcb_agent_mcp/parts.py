@@ -895,7 +895,7 @@ PIN_TYPE = {
 
 
 def symbol_to_kicad(data, name=None, reference="U", footprint="",
-                    datasheet="", description=""):
+                    datasheet="", description="", hide_pin_names=False):
     """EasyEDA Pro symbol document -> .kicad_sym text (one symbol)."""
     doc = parse_symbol_doc(data)
     if not doc["pins"]:
@@ -910,35 +910,65 @@ def symbol_to_kicad(data, name=None, reference="U", footprint="",
              '  (generator "pcb_agent_mcp")',
              '  (generator_version "0.0.13")',
              '  (symbol "%s"' % _kq(name)]
-    lines.append('    (property "Reference" "%s" (at 0 %s 0) (effects (font (size 1.27 1.27)) (justify left)))'
-                 % (_kq(reference), _fmt(2.54 * 2)))
-    lines.append('    (property "Value" "%s" (at 0 %s 0) (effects (font (size 1.27 1.27)) (justify left)))'
-                 % (_kq(name), _fmt(0)))
-    lines.append('    (property "Footprint" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))'
+    top = _extent_top(doc, s)      # above the drawing, never on the pins
+    for label, text, k in (("Reference", reference, 6.35), ("Value", name, 3.81)):
+        lines.append('    (property "%s" "%s" (at 0 %s 0) (effects (font (size 1.27 1.27)) (justify left)))'
+                     % (_kq(label), _kq(text), _fmt(top + k)))
+    lines.append('    (property "Footprint" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))'
                  % _kq(footprint))
-    lines.append('    (property "Datasheet" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))'
+    lines.append('    (property "Datasheet" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))'
                  % _kq(datasheet))
     if description:
-        lines.append('    (property "Description" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))'
+        lines.append('    (property "Description" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))'
                      % _kq(description))
     for a in doc["attrs"]:
         if a["key"] in ("Symbol", "Designator"):
             continue
-        lines.append('    (property "%s" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))'
+        lines.append('    (property "%s" "%s" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))'
                      % (_kq(a["key"]), _kq(a["text"])))
+    if hide_pin_names:
+        # A BGA ball name is a four-function datasheet string ("ETH_RMII0_MDC/
+        # DSM_AUD_LN_M1/SAI3_SDI/GPIO2_B6_d", 53 mm wide at 1.27 mm text). It is
+        # wider than the space between any two pin columns, so it lands on the
+        # net labels. The name stays in the library and in the frozen CSV; what
+        # the sheet shows per pin is the ball number and the net.
+        lines.append('    (pin_names (offset 0.508) (hide yes))')
     lines.append('    (symbol "%s_0_1"' % _kq(name))
     for shape in doc["shapes"]:
         block = _kicad_symbol_shape(shape, s, report)
         if block:
             lines.extend(block)
+    stacked = separate_stacked_pins(doc["pins"])
     for pin in doc["pins"]:
         lines.extend(_kicad_symbol_pin(pin, s, report))
     lines.append("    )")
     lines.append("  )")
     lines.append(")")
     report["dropped"] = sorted(set(report["dropped"]))
+    report["stacked_separated"] = stacked
     return "\n".join(lines) + "\n", report
 
+
+def _extent_top(doc, s):
+    """Symbol-space y of the highest drawn thing, so fields go above it.
+
+    Measured on the RK3506 sheet: the two fields defaulted to (0, 5.08) and
+    (0, 0) -- the middle of the body -- and printed the part name on top of its
+    own ``GND``/``VSS`` pins. Seven parts were doing it.
+    """
+    ys = [2.54 * 2]               # a symbol with no shapes still needs a row
+    for shape in doc["shapes"]:
+        row, kind = shape["row"], shape["kind"]
+        if kind == "RECT" and len(row) >= 6:
+            ys.append(max(_num(row[3], s), _num(row[5], s)))
+        elif kind in ("POLY", "POLYLINE"):
+            raw = row[2] if kind == "POLY" else (row[5] if len(row) > 5 else [])
+            ys.extend(_num(v, s) for v in _flat_points(raw)[1::2])
+        elif kind == "CIRCLE" and len(row) >= 5:
+            ys.append(_num(row[3], s) + _num(row[4], s))
+    for pin in doc["pins"]:
+        ys.append(_num(pin["y"], s) + 2.54)
+    return max(ys)
 
 def _kicad_symbol_shape(shape, s, report):
     row = shape["row"]
@@ -1000,6 +1030,52 @@ def _kicad_symbol_pin(pin, s, report):
                rot, _fmt(length or s * 10)),
             '        (name "%s" (effects (font (size 1.27 1.27))))' % _kq(name),
             '        (number "%s" (effects (font (size 1.27 1.27)))))' % _kq(number)]
+
+
+# ------------------------------------------------ stacked (colinear) pins
+_PIN_OUTWARD = {0: (-1, 0), 180: (1, 0), 90: (0, 1), 270: (0, -1)}
+
+
+def separate_stacked_pins(pins, step_raw=40):
+    """Split pins that sit on the *same* point, outward, and say which moved.
+
+    EasyEDA symbols stack pins to save space -- here 32 ``VSS`` balls are drawn
+    on top of a power ball each. Two pins on one point cannot carry two nets:
+    a label on that point shorts ``GND`` to ``+0V9_LOGIC`` (or similar).  So
+    the duplicates are pushed outward along their own pin direction, one step
+    (``step_raw`` * ``SYMBOL_UNIT_MM``) at a time, until the point is free.
+
+    The step defaults to four grids (10.16 mm). The two pins keep the same row,
+    so what travels between them is text: the inner pin's net label (``GND`` is
+    3.05 mm) and the outer pin's ball number (~3.5 mm). Measured on the RK3506
+    sheet, one grid (2.54 mm) put the labels on top of each other, two grids
+    (5.08 mm) put the number on top of the label; four grids clears both.  The first pin of each group keeps its place, so the ball
+    order in ``number`` is reproduced deterministically.
+
+    Returns ``[{"number", "net_name", "from", "to"}]`` -- never a silent edit.
+    """
+    groups = {}
+    for p in pins:
+        groups.setdefault((p["x"], p["y"]), []).append(p)
+    occupied = set(groups)
+    moved = []
+    for (x, y), group in groups.items():
+        if len(group) < 2:
+            continue
+        for p in group[1:]:
+            dx, dy = _PIN_OUTWARD.get(int(p["rot"] or 0) % 360, (1, 0))
+            k = 1
+            while True:
+                nx = x + dx * k * step_raw
+                ny = y + dy * k * step_raw
+                if (nx, ny) not in occupied:
+                    break
+                k += 1
+            occupied.add((nx, ny))
+            moved.append({"number": p["number"], "name": p.get("name", ""),
+                          "from": [x, y], "to": [nx, ny]})
+            p["x"], p["y"] = nx, ny
+    return moved
 
 
 # ------------------------------------------------------------- disk cache

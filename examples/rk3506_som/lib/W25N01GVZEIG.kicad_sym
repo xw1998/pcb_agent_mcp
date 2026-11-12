@@ -3,11 +3,11 @@
   (generator "pcb_agent_mcp")
   (generator_version "0.0.13")
   (symbol "W25N01GVZEIG"
-    (property "Reference" "U" (at 0 5.08 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Value" "W25N01GVZEIG" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Footprint" "RK3506:Package_WSON-8_L8.0-W6.1-P1.27_W25N01GVZEIG" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Description" "Winbond SPI-NAND 1Gb, WSON-8 EP (LCSC C907680) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Reference" "U" (at 0 17.78 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Value" "W25N01GVZEIG" (at 0 15.24 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Footprint" "RK3506:Package_WSON-8_L8.0-W6.1-P1.27_W25N01GVZEIG" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "Winbond SPI-NAND 1Gb, WSON-8 EP (LCSC C907680) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (symbol "W25N01GVZEIG_0_1"
       (rectangle (start -17.78 6.35) (end 17.78 -6.35)
         (stroke (width 0.254) (type solid)) (fill (type background)))

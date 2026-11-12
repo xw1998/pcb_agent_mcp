@@ -1,7 +1,53 @@
 # Changelog
 
-## [0.1.7] - 2026-11-12
+## [0.1.8] - 2026-11-13
 
+RK3506 核心板第八步：**把 `docs/145` 冻结的网表画成原理图**，并让 KiCad 自己的网表器 / ERC / PDF 当裁判。
+零板改动、零封装改动、零布线（生成器 docstring 首句即 `Nothing here is a route …`）。
+
+- **新增 `tools/gen_som_sch.py` + `examples/rk3506_som/rk3506_som.kicad_sch`（A1 / 45 符号 / 682 标签）**：实跑
+  **`components 45, nets 187, pins_expected 585, pins_found 682, pins_wrong_or_absent 0, rails_missing []`**。
+  画法是**把 local label 贴在引脚尖端**而不是拉线——333 球 BGA 的符号按 EasyEDA 三泳道出脚，拉线必穿脚；
+  "标签落在连接点即同网"由 KiCad 网表器证明，不是本文件的意见。
+- **四条独立交叉断言 + 一条渲染门，全部带反向对照**：C1 表侧引脚数、C2 库侧引脚数（682−585=97）、
+  C3 表外引脚扣掉 `no_connect`、C4 ERC 类型只能是 `isolated_pin_label`、
+  C5 **ERC violation 坐标集合 == plan 单标签坐标集合**（11 点，比坐标不比文字，避开中文 locale）、
+  C6 表侧单端网必须"孤立或被表外引脚终结"；T1 `TEXT_OVERLAP_MM = 1.5`（两轴都超才判）——
+  实测 `pairs_on_each_other 0`、最坏 `1M11` vs `DDR_CSN` 1.14×1.43 mm。
+  plan 侧**只读库与冻结 CSV，绝不读自己生成的文件**；KiCad 侧只跑网表器/ERC。
+- **电源补成真电路**：`netmap_terminals.csv` 把稳压器建模成"一个以轨名命名的端点"，原理图不允许
+  （源脚不存在 ⇒ ERC 无从检查），故补电感/输入输出电容/反馈分压/自举电容，值由 `docs/144` 的
+  `Vref 0.6 V ±1.5 %`、`fsw 500 kHz` 算出，其余明写为设计值。四路实算：
+  `+0V9_CPU 4.32 µH / 4.7 / 10.0 µF / 5.9k`、`+0V9_LOGIC 6.19 / 4.7 / 10.0 / 4.99k`、
+  `+1V35_DDR 8.25 / 4.7 / 4.7 / 12.4k`、`+3V3 4.64 / 10.0 / 4.7 / 45.3k`。
+  `+0V9_PMU`/`+0V9_ANA` 走磁珠（`Device:L` + `L_0603_1608Metric` 代位封装，真料号未定）。
+- **J1 邮票孔 140 自生成**（不是采购件，任何库都没有）：`lib/SOM_CASTELLATION_140.kicad_sym` 由
+  `som_pinout_140.csv` 按 0.1.2 的 R8 边序写，**边序是封装侧事实，符号只镜像它**（
+  `tools/gen_som_footprint.py` 的 F1–F8 断言）。其余 8 颗器件全部取库出处（立创 EasyEDA → 本仓库转换）。
+- **三处"静默错答案"修在生成器里**：① KiCad 10 属性隐藏必须写 `(hide yes)`，裸 `hide` 被静默忽略 ⇒
+  Footprint/Datasheet/Description 真被印到 PDF 上（改后文本 span 2595→1931，−664 正是这三个字段）；
+  ② 符号→图纸字段坐标必须 Y 翻转（`_rotate()` 在库帧 Y 向上做 CCW，调用处写 `x+dx, y−dy`，
+  写成 `y+dy` 会关于原点镜像，U8 的 Value 压住自己的 `GND` 引脚名 3.87×1.94 mm）；
+  ③ `_extent_top()` 必须按 shape kind 各取 y（对 `row[2:6]` 取 max 会把 x 当 y，RK3506 算出 109.22）。
+- **排版两件**：32 对叠压引脚分离步长定 **4 格 = 10.16 mm**（1 格标签叠标签、2 格球号压标签、4 格都清空）；
+  RK3506 **隐藏引脚名**（球名是四功能手册串最长 53 mm，比任何列距都宽），图上每脚显示"球号 + 网络名"，
+  名字仍在库与 `netmap_terminals.csv` 里。
+- **两条环境口径**：① `KICAD_CONFIG_HOME` 不能跟着 HOME 一起重定向——只重定向 HOME 时全局库失效，
+  同一张图 ERC 从 11 条涨到 79 条（34 个无源器件变 `lib_symbol_issues`+`footprint_link_issues`），
+  补 `KICAD_CONFIG_HOME=%APPDATA%\kicad` 后回到 11 条；② ERC 必须在 `.kicad_pro` 所在目录跑
+  （`kicad-cli` 按 cwd 解析 `sym-lib-table`/`fp-lib-table`）。另记：`_run()` 已自带 `kicad-cli` 前缀，
+  传 exe 路径会得到 `kicad-cli kicad-cli …`（rc=1 + 打印 help，极易误判为路径问题）。
+- **一条测试基建修复**：`tests/test_step_apply.py` 原写 `from tests.test_sch_edit import …`，而本机
+  `site-packages` 另有一个名为 `tests` 的包（常规包优先于命名空间包）⇒ 收集阶段必炸、整轮回归被打断；
+  改成裸名 `from test_sch_edit import …`（与其余 11 个文件的 `import _toolcount` 同一套 prepend 约定）。
+  **加 `tests/__init__.py` 是错的方向**：它会让 `tests/` 不再是 sys.path 项，反而打坏 11 个裸导入。
+- 验证：`python tools/gen_som_sch.py --check` rc=0 且 `cross_checks_failed []`；九个 `.kicad_sym`
+  `sym upgrade --force` 全部 rc=0；反向对照四条全触发（plan 掉一个孤立标签 / `table_pins` +1 /
+  `outside_table` +3 / 渲染门阈值降到 1.0 mm ⇒ 报 48 对）。全量回归见提交说明。
+- 没修完：**31 个电源球每引脚去耦**（下一批）、`DDR_ZQ` 缺 240 Ω、磁珠料号、SY8113 `ILIM`；
+  `parts.footprint_to_kicad()` 仍采信 CANVAS 声明单位（连续第五批）。
+
+## [0.1.7] - 2026-11-12
 RK3506 核心板第七步：**把四张冻结的球/焊盘表合成唯一一张网表**，让"哪个脚在哪条网上"变成可审计的数据。
 零板改动、零封装改动、零布线（本工具 docstring 首句即 `Nothing here is a route, a placement, or a copper decision.`）。
 

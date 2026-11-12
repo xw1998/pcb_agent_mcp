@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "filename": "rk3506_som.kicad_pro",
+    "version": 1
+  },
+  "sheets": [],
+  "board": {},
+  "schematic": {},
+  "libraries": {
+    "pinned_footprint_libs": [],
+    "pinned_symbol_libs": []
+  },
+  "text_variables": {},
+  "erc": {
+    "rule_severities": {
+      "pin_to_pin": "ignore"
+    }
+  }
+}

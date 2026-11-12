@@ -3,11 +3,11 @@
   (generator "pcb_agent_mcp")
   (generator_version "0.0.13")
   (symbol "AMS1117-1.8"
-    (property "Reference" "U" (at 0 5.08 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Value" "AMS1117-1.8" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Footprint" "Package_SOT-223-4_L6.5-W3.5-P2.30-LS7.0_AMS1117-1.8" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Description" "1.8 V 1 A LDO, SOT-223-4 (tab = pin 2), LCSC C351432 | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Reference" "U" (at 0 11.43 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Value" "AMS1117-1.8" (at 0 8.89 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Footprint" "RK3506:Package_SOT-223-4_L6.5-W3.5-P2.30-LS7.0_AMS1117-1.8" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "1.8 V 1 A LDO, SOT-223-4 (tab = pin 2), LCSC C351432 | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (symbol "AMS1117-1.8_0_1"
       (rectangle (start -7.62 5.08) (end 7.62 -5.08)
         (stroke (width 0.254) (type solid)) (fill (type background)))

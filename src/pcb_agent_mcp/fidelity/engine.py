@@ -98,16 +98,37 @@ def _user_env(scratch):
     env = dict(os.environ)
     env["HOME"] = alt
     env["USERPROFILE"] = alt
+    # KiCad reads its *own settings directory* through HOME, so the redirect
+    # above also hid the user's global library tables and every symbol from the
+    # official libraries turned into a `lib_symbol_issues` violation. Measured
+    # on the RK3506 core board, kicad-cli 10.0.7:
+    #     HOME redirected only                        79 violations
+    #     same, plus KICAD_CONFIG_HOME pointing back  11 (all isolated_pin_label)
+    # The 68 that vanished were lib_symbol_issues + footprint_link_issues on the
+    # 34 passive parts: not the design, just the tables going unread.
+    cfg = _kicad_config_home()
+    if cfg:
+        env["KICAD_CONFIG_HOME"] = cfg
     return env
 
-def _run(args, cwd, timeout=180):
+def _kicad_config_home():
+    """The real KiCad settings directory of the user this process runs as."""
+    if os.name == "nt":
+        root = os.environ.get("APPDATA")
+        cand = os.path.join(root, "kicad") if root else ""
+    else:
+        cand = os.path.join(os.path.expanduser("~"), ".config", "kicad")
+    return cand if cand and os.path.isdir(cand) else ""
+
+def _run(args, cwd, timeout=180, env_dir=None):
+    """`env_dir` keeps the redirected HOME out of the directory being read."""
     exe = find_kicad_cli()
     if not exe:
         return {"ok": False, "error": "KICAD_CLI_NOT_FOUND"}
     try:
         proc = subprocess.run([exe] + args, cwd=cwd, capture_output=True,
                               text=True, timeout=timeout,
-                              env=_user_env(cwd))
+                              env=_user_env(env_dir or cwd))
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "TIMEOUT", "timeout_s": timeout}
     return {"ok": proc.returncode == 0, "returncode": proc.returncode,
@@ -319,15 +340,28 @@ def _slim_unconnected(items):
     return out
 
 # --------------------------------------------------------------- ERC (schematic)
-def sch_erc(path, severity="all", timeout=300):
+def sch_erc(path, severity="all", timeout=300, project_dir=None):
     """Authoritative ERC: KiCad's own electrical-rule engine on a .kicad_sch.
 
     The report is the verdict for a schematic edit. It is *not* "this server
     thinks two pins are unconnected": KiCad computed it, and the tool reports
     what KiCad said, with the sheet path of every violation.
 
-    Read-only: the JSON report is written into a temp directory, and no
-    `--save-*`/rewrite flag is ever passed, so the project is untouched.
+    `project_dir` is the directory holding the `.kicad_pro` and the project's
+    `sym-lib-table` / `fp-lib-table`. It is not decoration: kicad-cli resolves
+    those tables **relative to the working directory it runs in**, so a
+    schematic checked from anywhere else loses every project-local library and
+    reports violations that are not about the design. Measured on the RK3506
+    core board, same 272,751 bytes, kicad-cli 10.0.7:
+
+        run from a scratch dir      79 violations, 68 of them
+                                    lib_symbol_issues + footprint_link_issues
+        run beside its .kicad_pro   11 violations, all isolated_pin_label
+                                    (the 11 nets the table gives one terminal)
+
+    So the tool runs where the tables are, and only the *report* goes to the
+    temp directory. Read-only either way: no `--save-*`/rewrite flag is ever
+    passed, so no file beside the input is created or modified.
     """
     exe = find_kicad_cli()
     if not exe:
@@ -342,7 +376,12 @@ def sch_erc(path, severity="all", timeout=300):
         args = ["sch", "erc", "-o", report, "--format", "json"]
         args.append("--severity-all" if severity == "all" else "--severity-error")
         args.append(os.path.abspath(path))
-        res = _run(args, cwd=tmp, timeout=timeout)
+        here = os.path.dirname(os.path.abspath(path))
+        run_dir = project_dir or here
+        if not os.path.isdir(run_dir):
+            return {"status": "error", "reason_code": "PROJECT_NOT_FOUND",
+                    "message": "project_dir is not a directory: %s" % run_dir}
+        res = _run(args, cwd=run_dir, timeout=timeout, env_dir=tmp)
         if not os.path.isfile(report):
             return {"status": "error", "reason_code": "ENGINE_FAILED",
                     "message": "kicad-cli produced no ERC report",
@@ -381,6 +420,27 @@ def sch_erc(path, severity="all", timeout=300):
         shutil.rmtree(tmp, ignore_errors=True)
 
 # --------------------------------------------------------------- netlist
+def sch_pdf(path, out, timeout=300):
+    """Plot the schematic to PDF with KiCad's own plotter.
+
+    Used as an instrument, not as a deliverable: the PDF's text boxes are the
+    only place where "did two labels land on each other" can be answered by
+    measurement instead of by eye. Runs beside the sheet for the same reason
+    `sch_erc` does -- a project-local library that fails to resolve is drawn
+    differently, so the plot would not be the sheet that will be read.
+    """
+    if not find_kicad_cli():
+        return {"status": "error", "reason_code": "KICAD_CLI_NOT_FOUND"}
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    here = os.path.dirname(os.path.abspath(path))
+    res = _run(["sch", "export", "pdf", "-o", os.path.abspath(out),
+                os.path.abspath(path)], cwd=here, timeout=timeout,
+               env_dir=os.path.dirname(os.path.abspath(out)))
+    if res["returncode"] or not os.path.isfile(out):
+        return {"status": "error", "reason_code": "PLOT_FAILED",
+                "message": (res["stderr"] or res["stdout"] or "").strip()[-300:]}
+    return {"status": "ok", "pdf": out, "bytes": os.path.getsize(out)}
+
 def sch_netlist(path, timeout=300):
     """KiCad's own connectivity answer for a schematic, as a comparable list.
 

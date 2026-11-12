@@ -26,7 +26,7 @@ from pcb_agent_mcp.edit import sch_plan as SP
 from pcb_agent_mcp.fidelity import kicad_doc as KD
 from pcb_agent_mcp.fidelity import kicad_sch as KS
 
-from tests.test_sch_edit import schematic_text
+from test_sch_edit import schematic_text  # bare name: tests/ is sys.path[0] under pytest prepend mode
 
 SPEC = {"width_mm": 60, "height_mm": 40, "copper_layers": 2, "engine": False,
         "title": "stepped write"}

@@ -3,12 +3,12 @@
   (generator "pcb_agent_mcp")
   (generator_version "0.0.13")
   (symbol "MT41K256M16"
-    (property "Reference" "U" (at 0 5.08 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Value" "MT41K256M16" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Footprint" "RK3506:Package_FBGA-96_L14.0-W9.0_MT41K256M16" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "https://item.szlcsc.com/datasheet/MT41K256M16HA-125%253AE/245013.html" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Description" "Micron DDR3L x16 4Gb, FBGA-96 (LCSC C82488) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Name" "MT41K256M16HA-125:E" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Reference" "U" (at 0 69.85 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Value" "MT41K256M16" (at 0 67.31 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Footprint" "RK3506:Package_FBGA-96_L14.0-W9.0_MT41K256M16" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "https://item.szlcsc.com/datasheet/MT41K256M16HA-125%253AE/245013.html" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "Micron DDR3L x16 4Gb, FBGA-96 (LCSC C82488) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Name" "MT41K256M16HA-125:E" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (symbol "MT41K256M16_0_1"
       (rectangle (start -12.7 63.5) (end 12.7 -60.96)
         (stroke (width 0.254) (type solid)) (fill (type background)))

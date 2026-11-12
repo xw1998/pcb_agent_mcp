@@ -3,11 +3,11 @@
   (generator "pcb_agent_mcp")
   (generator_version "0.0.13")
   (symbol "X322524MSB4SI"
-    (property "Reference" "Y" (at 0 5.08 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Value" "X322524MSB4SI" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-    (property "Footprint" "RK3506:Package_Crystal_SMD_3225-4P_L3.2-W2.5_X322524MSB4SI" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Description" "24 MHz crystal 3225 4-pad (LCSC C15643) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Reference" "Y" (at 0 11.43 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Value" "X322524MSB4SI" (at 0 8.89 0) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Footprint" "RK3506:Package_Crystal_SMD_3225-4P_L3.2-W2.5_X322524MSB4SI" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "24 MHz crystal 3225 4-pad (LCSC C15643) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (symbol "X322524MSB4SI_0_1"
       (polyline (pts (xy -1.27 -1.016) (xy -1.27 1.016))
         (stroke (width 0.254) (type solid)) (fill (type none)))
