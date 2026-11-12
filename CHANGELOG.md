@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.1.7] - 2026-11-12
+
+RK3506 核心板第七步：**把四张冻结的球/焊盘表合成唯一一张网表**，让"哪个脚在哪条网上"变成可审计的数据。
+零板改动、零封装改动、零布线（本工具 docstring 首句即 `Nothing here is a route, a placement, or a copper decision.`）。
+
+- **新增 `tools/gen_netmap.py` + `tests/test_netmap.py`（38 用例）+ 两个产物 CSV**：实跑
+  **`balls 332, nets 174, terminals 593`**（地 1 / 无连接 11 / 电源 9 / 信号 153）。八个规则 R1–R8 逐条在生成时断言，
+  任一不过 ⇒ 退出码 2 且**不写字节**；R8 抽成 `audit_net_ends(nets, terminals)` 以便用玩具网表直接测。
+- **DDR3L 逐对同网 50 条**：两侧词表不同（`DQS1P→UDQS`、`CASN→CAS#`、`A10→A10/AP`、`RZQ→ZQ`），靠**声明表**
+  `DDR_SOC_TO_CHIP` 翻译 + "芯片信号脚必须全被表覆盖" 审计；模糊匹配必然漏串。
+- **32.768 kHz 晶振丢弃并具名**：手册 p8 只有内部 LF RC 与 GPIO 复用的 `CLK_32K`（`RM_IO14`），该脚落在球 N3
+  且 N3 已外引为 `SPI1_CSN0`（邮票孔 123）⇒ RK3506J 无 32 K 宿主脚；器件/封装留 `lib/`，本设计不连。
+- **A15 落 `NC_Y17`**：MT41K256M16（4 Gb x16）96 个脚名里只有 A0–A14，SoC 侧 A15 球 Y17 必须悬空；
+  映射表删掉 `A15` 并用 `DDR_SOC_NO_CHIP_PIN` 反向看住（把它加回映射表即报错）。
+- **VREF 归到 `+0V675_REF` 一条轨**（5 端：SoC 2 + DDR 2 + 分压 1），并把"正好一半"升为 R7 硬门禁
+  （0.675 对 1.35/2 差 ≤ 5 mV），不是两条独立网；`RZQ` 侧为信号网 `DDR_ZQ`，电阻值仍留空。
+- **邮票孔 140 端 / 98 条网**（95 信号 + GND + `+5V_IN` + `+3V3`）；`RAIL_ALIASES` 是唯一做
+  `5V_IN`/`3V3_OUT`/`GND`→轨名归一的地方，信号名不做别名（孔上名字就是板级契约）。
+- **一条自纠错**：初版"孔说网 X 但球在网 Y"拿 `stamp_nets[ball]` 比 `row["net"]`——两侧同源、永远为真；
+  改为"先用球/引脚名规则定出该球的网，再要求孔行与它一致"，并又补了"一个球不许占两个孔""孔上的球必须在球表里"。
+- **SY8113BADC 外部取证补两条**：Vref **0.6 V ±1.5 %**、fsw **500 kHz**（四处分销页一致）；**ILIM 仍缺**
+  （`datasheet.eeworld.com.cn`/`hqew` 的 PDF 页 fetch 均失败）⇒ FB 分压与电感可算，限流校验继续留空并具名。
+- 验证：`python tools/gen_netmap.py` 退出码 0；`python -m unittest discover -s tests -p "test_netmap.py"` **38/38**；
+  `--selftest` 与全量回归见提交说明。
+- 没修完：`parts.footprint_to_kicad()` 仍采信 CANVAS 声明单位（连续第四批）；网表**空间可实现性**一概未看。
+
 ## [0.1.6] - 2026-11-12
 
 RK3506 核心板第六步：**把电源从「20 个电源组」落成一棵可算的树**，并把树上出现的两颗稳压器做成真封装与真符号。
