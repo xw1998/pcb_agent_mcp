@@ -17,9 +17,23 @@ forms over its reference plane, and the via barrel's inductance.
 same graph, and each track segment's I^2R becomes a source in the 2-D plate
 (board_electrothermal). A board file states no current, so that is the one
 thing the caller has to bring.
+
+`field` is the same graph asked a different question: not "how much drop" but
+"how dense does the current get" - a 2-D sheet solve on the net's own copper,
+because the peak J lives at a bend or the funnel into a pad, where no 1-D
+J=I/(w*t) can see it.
+
+`planes` and `couple` are the two questions a board answers as geometry rather
+than as a netlist: where its plane pair rings (cavity modes of the two pours,
+with the outline's bounding box stated as such), and how much two nets that
+really do run side by side talk to each other (the field solver's input is
+found in the file; the rise time is not, so that one is asked for).
 """
 
 from . import board  # noqa: F401
+from . import couple  # noqa: F401
+from . import field  # noqa: F401
+from . import planes  # noqa: F401
 from . import power  # noqa: F401
 
-__all__ = ["board", "power"]
+__all__ = ["board", "couple", "field", "planes", "power"]

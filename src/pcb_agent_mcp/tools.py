@@ -44,6 +44,8 @@ from .sim import board as _simboard
 from .sim import run as _simrun
 from .sim import power as _simpower
 from .sim import field as _simfield
+from .sim import planes as _simplanes
+from .sim import couple as _simcouple
 from .calc import thermal as _thermal
 from .calc import vibration as _vib
 from .calc import vibration_poly as _vib_poly
@@ -6085,7 +6087,8 @@ def _capabilities(_args):
             "thermal_stack", "thermal_via_array", "thermal_plate",
             "thermal_transient", "thermal_heatsink", "thermal_spreading",
             "thermal_convection",
-            "board_current_field", "board_ir_drop", "board_netlist", "board_sim",
+            "board_current_field", "board_crosstalk", "board_ir_drop",
+            "board_netlist", "board_plane_resonance", "board_sim",
             "board_thermal",
             "dfm_capability", "dfm_check",
             "vibration_plate_modes", "vibration_plate_outline",
@@ -8324,6 +8327,76 @@ _tool(
         max_nodes=_num("copper graph node cap", 60000),
     ), "required": ["path", "net", "source_pad", "sink_pad"]},
     _board_tool(lambda b, a: _simfield.board_current_field(b, a), derived=True),
+)
+
+_tool(
+    "board_plane_resonance",
+    "Where does THIS board ring: the cavity modes of a plane pair read out of the file. "
+    "board_plane_resonance asks for a_mm x b_mm x er as three typed numbers; here the two "
+    "plates are two copper layers, the dielectric thickness and er are the stackup's "
+    "between them, and the resonator is the board outline. Three things are stated "
+    "rather than hidden: the cavity is the OUTLINE'S BOUNDING BOX (the mode formula is "
+    "for a rectangle), so the box area is printed beside the outline's area and a board "
+    "that is 30 % empty in its corner rings like the box, not like its copper; when the "
+    "stackup has no er the answer is a REFUSAL (substituting 4.3 would silently set every "
+    "mode); and a mode list is not a verdict - a mode is not a problem without an "
+    "excitation and a coupling, and neither is in a board file, so via_fence and plane_q "
+    "stay separate questions. Which layers are the plates: pass layer_a/layer_b, or let "
+    "it take the two pours that cover the most of the box. A board with fewer than two "
+    "poured layers is refused, with the pours it did find named.",
+    {"type": "object", "properties": dict(
+        _COMMON,
+        layer_a=_str("one plate (e.g. In1.Cu); default = biggest pour"),
+        layer_b=_str("the other plate; default = second biggest pour"),
+        er=_num("override the stackup's dielectric constant for this pair"),
+        m_max=_num("modes along the box's x axis to enumerate", 2),
+        n_max=_num("modes along the box's y axis to enumerate", 2),
+        f_operate_hz=_num("your clock/edge frequency; the answer says f/f_mode"),
+        top=_num("how many modes to list", 12),
+    ), "required": ["path"]},
+    _board_tool(lambda b, a: _simplanes.board_plane_resonance(b, a), derived=True),
+)
+
+_tool(
+    "board_crosstalk",
+    "Crosstalk between two nets that actually run side by side on THIS board. "
+    "crosstalk_coupled_lines is a full 2-D field solution and wants width, gap, height "
+    "to the reference plane, coupled length and er - all of which are geometry the file "
+    "already holds - plus a RISE TIME, which no .kicad_pcb states, so that one is "
+    "required from you (FEXT is proportional to 1/rise_time; without it the answer would "
+    "be a made-up edge). The part that is not arithmetic is FINDING the run: the tool "
+    "walks both nets' tracks and keeps only pairs that are parallel within angle_tol_deg "
+    "(measured on the segment directions), at most max_gap_mm edge-to-edge, and "
+    "overlapping along the run by at least min_overlap_mm - tens of tracks per net is "
+    "why 'the nearest two' would be an answer about traces that never run together. "
+    "Every candidate is returned ranked with its own gap and overlap; the field solve is "
+    "run on the worst one only, because a full solution per candidate would be a minute "
+    "each - on a 0.15 mm pair this one solve took 285.8 s, so budget 30 s to 5 min. "
+    "The reference plane, its dielectric thickness and er come from the stackup nearest "
+    "that layer (nearest, not outermost: a track has two neighbours). A net on no shared "
+    "copper layer, a net against itself, and two tracks of different widths are refused "
+    "rather than averaged - a coupling number belongs to ONE width.",
+    {"type": "object", "properties": dict(
+        _COMMON,
+        net_a=_str("one net, as board_nets spells it"),
+        net_b=_str("the other net"),
+        rise_time_ns=_num("10-90 % edge of the aggressor (required: the file has no edge)"),
+        layer=_str("solve on this copper layer; default = the one both nets share with "
+                    "the most track"),
+        kind=_str("microstrip or stripline; default from whether the layer is outer"),
+        max_gap_mm=_num("widest edge-to-edge gap that still counts as coupled", 1.0),
+        min_overlap_mm=_num("shortest longitudinal overlap that still counts", 2.0),
+        angle_tol_deg=_num("parallel within this angle", 10),
+        dielectric_mm=_num("override the height to the reference plane"),
+        er=_num("override the dielectric constant"),
+        copper_um=_num("override the stackup copper thickness"),
+        amplitude_v=_num("aggressor swing", 1.0),
+        termination_ohm=_num("termination (optional)"),
+        mesh_div=_num("field mesh divisions", 12),
+        samples_per_delay=_num("time samples per delay", 60),
+        waveform_points=_num("points returned per waveform", 101),
+    ), "required": ["path", "net_a", "net_b", "rise_time_ns"]},
+    _board_tool(lambda b, a: _simcouple.board_crosstalk(b, a), derived=True),
 )
 
 _tool(
