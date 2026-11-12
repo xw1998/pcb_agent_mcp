@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.4] - 2026-11-12
+
+RK3506 核心板第四步：把「取几何」从一次性脚本变成**仓库工具**，并用它取了 **DDR3L 颗粒**（x16 4Gb）的封装与符号。零板改动。
+
+- **新增 `tools/fetch_lceda_part.py`**：立创官方库取件工具（search / fetch）。fetch 产出 `<stem>.efp`（解密文档）+ `<stem>_source.json`（uuid/key/iv/title/version/字节数/`doc_sha256`/版权声明）+ `<stem>_meta.json`（原始组件记录）；已存在 `.efp` 不覆盖（需 `--force`）。失败分支全部具名：key≠32B、iv≠12B、GCM 拒绝、明文非 gzip、明文不像文档。**实测坑：目录检索返回的 uuid 是器件记录，直接喂 components/ 会得到 `component not found (code=1111113)`；要用 `attributes.Footprint`/`attributes.Symbol` 里的 component uuid。**
+- **新增 `tools/lceda_fp.py`**：通用转写模块。`solve_scale()` 把单位当**方程**解（两个候选、唯一命中，零/双命中即报错）；`layer_bbox()` 按层取几何，兼容 `POLY` 扁平点列与 `CIRCLE`（`FILL` 的几何在 `row[7]` 而不是 `row[6]`）；`emit_footprint()` 出 KiCad 10 原生 `.kicad_mod`。
+- **新增 `tools/gen_ddr3l_footprint.py` + 产物**：DDR3L **MT41K256M16HA-125:E**（LCSC C248057，**FBGA-96 9×14**）→ `Package_FBGA-96_L14.0-W9.0_MT41K256M16.kicad_mod`（96 盘）与 `MT41K256M16.kicad_sym`（96 pin）。八条审计 A1–A8（96 盘/编号唯一、单位解出且最近邻谱只有 0.8、盘径单一且与 0.45 球径差 ≤0.03、本体 9×14、行字母 A..T 16 行 / 列 {1,2,3,7,8,9}、坐标不重、质心 (0,0)、盘不出本体），任一不过非零退出、不写字节。
+- **单位陷阱第二次复现**：该文档 `CANVAS` 也写 `"mm"`，但本体 ±177.165/±275.595 raw → **9.0000×14.0002 mm**、X 跨 251.96 → **6.3998**（8×0.8）、Y 跨 472.44 → **12.0000**（15×0.8）、盘 18 → **0.4572 mm**。⇒ CANVAS 单位在本库不可信是**两次实测**，不是一次性事故。
+- **新增 `tests/test_ddr3l_footprint.py`（19 用例 = 6 正向 + 11 反向 + 2 交叉）**：反向逐条打掉一个审计通道（声明 mm 仍须解成 mil、双候选都不命中、少焊盘、重号、挪中心焊盘 E2 半 pitch、盘径错、本体错、无本体、行字母写成 O、列写成 6、坐标重、质心偏）。两条**交叉判据**查两侧能不能对接：符号的 96 个 pin number 与封装的 96 个焊盘号**集合相等**；符号里 DQ0–DQ15 与 LDQS/UDQS/LDM/UDM/RAS#/CAS#/WE#/CK/CS#/ZQ 全在。
+- **KiCad 10 又三个语法坑**：`(size 1.27)` 单值字体尺寸非法（必须 `(size 1.27 1.27)`）、`(justify center)` 非法（居中=不写 justify）、`(generator pcb_agent_mcp)` 必须带引号。三者报错都是同一句「无法加载库」⇒ 只能二分定位（本轮手法：删整块 property 能过 ⇒ 逐条加回 ⇒ 先抓 justify ⇒ 再抓单值 size）。
+- **验证**：`python -m unittest discover -s tests -p test_ddr3l_footprint.py` **19/19 OK**；`python -m unittest discover -s tests -p test_bga333_footprint.py` **14/14 OK**；`kicad-cli fp upgrade` 输出「封装库未更新」、`fp export svg` 出图、`sym upgrade` 输出「用更新的格式保存符号库」。
+- **没修完（如实）**：焊盘 0.4572 是库值（Micron land pattern 未核到）；DDR 符号形状仍是库的 25.4×124.46 大矩形（是否按功能分块重画未决定）；SPI-NAND / 晶振 / 复位 / 电源树器件、原理图、布局、布线、内层平面均未开工。
+
 ## [0.1.3] - 2026-11-12
 
 RK3506 核心板第三步：把 0.1.2 记的「⛔ 333 球坐标缺失」这条硬阻塞自己解开——不再向用户要资料，改走立创 EDA 官方库在线接口取到 333 球真实几何，解密后落成 KiCad 封装与符号。零板改动（天空星板不动，`rk3506_som.kicad_pcb` 不动）。

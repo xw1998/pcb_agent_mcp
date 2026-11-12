@@ -1,0 +1,19 @@
+{
+  "component_uuid": "3cba6f1855a54f9b86422721c15414e5",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "fbga-96_l14.0-w9.0-r16-c6-p0.80-tl",
+  "doc_doctype": 4,
+  "doc_version": 1736302256666,
+  "dataStrId": "https://modules.lceda.cn/datastr/c0/c0/d7/d4/96f9ef0d50a376dfdeefdca3",
+  "aes_key_hex": "c2f3fa621fef39e4436b54abae17570402679ed3bac4ca183150af06c82e0715",
+  "aes_iv_hex": "22884a79d09b7e62b81a359b",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 3774,
+  "doc_bytes": 20093,
+  "doc_sha256": "4f3cd1b8bfa34a80751ddbc3ef39196d267b4b9c4430782a82773f228f7a3472",
+  "copyright": "[\"HEAD\",{\"editorVersion\":\"2.2.C\",\"importFlag\":0,\"uuid\":\"6a2c6b89e6394ee9981d833b2d5d0c4d\",\"title\":\"FBGA-96_L14.0-W9.0-R16-C6-P0.80-TL\",\"source\":\"\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

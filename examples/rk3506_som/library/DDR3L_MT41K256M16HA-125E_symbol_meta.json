@@ -1,0 +1,51 @@
+{
+  "createTime": 1620741540,
+  "created_at": "2021-05-11T13:59:00.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/77/db/b2/64/c604fd856812ed388c4b093c",
+  "description": "",
+  "display_title": "MT41K256M16HA-125:E",
+  "docType": 2,
+  "has_device": true,
+  "iv": "95b118deff68ec5c1bb05383",
+  "key": "4ddf5d75c7ce4db0827e46d53a75758945168f1728fd7455c8ea0d38e2d56ac7",
+  "modifier": {
+    "nickname": "",
+    "username": "",
+    "uuid": ""
+  },
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "9b5303d7372c467e877524f83f47a70d",
+  "tags": {
+    "child_tag": {
+      "name": "DDR SDRAM",
+      "name_cn": "DDR SDRAM",
+      "uuid": "4114791f29094a98abc8959a89c743df"
+    },
+    "parent_tag": {
+      "name": "Memory",
+      "name_cn": "存储器",
+      "uuid": "672970ba5a66473fb91519efaa81af95"
+    }
+  },
+  "ticket": 4,
+  "title": "mt41k256m16ha-125:e",
+  "type": 3,
+  "updateTime": 1789066122,
+  "updated_at": "2026-11-11T19:29:55.000Z",
+  "uuid": "fc705e9d5f354414adb1adfde99c4ae4",
+  "version": 1789066202177
+}
