@@ -157,6 +157,87 @@ class TestWhatIsRefused(unittest.TestCase):
         self.assertIn("ONE width", out["message"])
 
 
+THREE = [_seg(2, 2, 8, 2, 0.3, 1),
+         _seg(2, 5, 8, 5, 0.3, 1),
+         _seg(2, 8, 8, 8, 0.3, 1),
+         _seg(2, 2.6, 8, 2.6, 0.3, 2),      # 0.6 c-c, 0.3 gap, same width -> solves
+         _seg(2, 8.7, 8, 8.7, 0.3, 2),      # 0.7 c-c, 0.4 gap, same width -> solves
+         _seg(2, 5.9, 8, 5.9, 0.6, 2)]      # 0.9 c-c, 0.45 gap, 0.6 vs 0.3 -> refused
+
+
+class TestHowManyRunsGetSolved(unittest.TestCase):
+    """The orchestration around the field solve, with the solve stubbed out.
+
+    A real solve is minutes (see TestOneRealSolve), so what is pinned here is
+    which runs are handed to the solver and what the report says about the ones
+    that are not - not the physics, which is the solver's own test.
+    """
+
+    def _patched(self, calls, result=None):
+        import unittest.mock as mock
+
+        def fake(kind, width, gap, *a, **kw):
+            calls.append({"width": width, "gap": gap})
+            if result is not None:
+                return dict(result)
+            return {"status": "ok", "value": {"next": len(calls) * 1.0,
+                                              "fext": len(calls) * 2.0}}
+
+        return mock.patch.object(C._X, "coupled_lines", side_effect=fake)
+
+    def test_the_default_solves_one_run_and_says_how_many_were_left(self):
+        calls = []
+        with self._patched(calls):
+            out = C.board_crosstalk(_board(THREE),
+                                    {"net_a": "A", "net_b": "B",
+                                     "rise_time_ns": 0.5})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertEqual(len(calls), 1)
+        v = out["value"]
+        self.assertEqual([r["rank"] for r in v["runs_solved"]], [1])
+        self.assertEqual(v["board"]["candidate_runs"], 3)
+        self.assertEqual(len(v["runs_refused"]), 0)
+        self.assertTrue(any("solved 1 of 3" in n for n in out["notes"]), out["notes"])
+
+    def test_max_runs_solves_that_many_and_a_width_mismatch_is_refused_by_name(self):
+        calls = []
+        with self._patched(calls):
+            out = C.board_crosstalk(_board(THREE),
+                                    {"net_a": "A", "net_b": "B",
+                                     "rise_time_ns": 0.5, "max_runs": 3})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertAlmostEqual(calls[0]["width"], 0.3, places=9)
+        self.assertAlmostEqual(calls[0]["gap"], 0.3, places=6)
+        self.assertAlmostEqual(calls[1]["gap"], 0.4, places=6)
+        v = out["value"]
+        self.assertEqual([r["rank"] for r in v["runs_solved"]], [1, 2])
+        self.assertEqual([r["next"] for r in v["runs_solved"]], [1.0, 2.0])
+        self.assertEqual(len(v["runs_refused"]), 1)
+        bad = v["runs_refused"][0]
+        self.assertEqual(bad["rank"], 3)
+        self.assertAlmostEqual(bad["width_b_mm"], 0.6, places=9)
+        self.assertIn("ONE width", bad["why"])
+        self.assertTrue(any("not solved here" in n for n in out["notes"]),
+                        out["notes"])
+
+    def test_zero_runs_is_refused_rather_than_solved_silently(self):
+        out = C.board_crosstalk(_board(THREE),
+                                {"net_a": "A", "net_b": "B",
+                                 "rise_time_ns": 0.5, "max_runs": 0})
+        self.assertEqual(out["reason_code"], "ARG_RANGE", out)
+
+    def test_a_solver_failure_says_which_run_it_was(self):
+        calls = []
+        with self._patched(calls, result={"status": "error",
+                                          "reason_code": "MESH_TOO_FINE",
+                                          "message": "grid too fine"}):
+            out = C.board_crosstalk(_board(THREE),
+                                    {"net_a": "A", "net_b": "B",
+                                     "rise_time_ns": 0.5})
+        self.assertEqual(out["reason_code"], "MESH_TOO_FINE", out)
+        self.assertEqual(out["run_rank"], 1)
+
+
 class TestOneRealSolve(unittest.TestCase):
     """Slow: the field engine costs 30 s to 5 min, so this is ONE coarse run."""
 

@@ -26,6 +26,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from pcb_agent_mcp.adapters import kicad_pcb as K  # noqa: E402
+from pcb_agent_mcp.calc import cavity as CAV  # noqa: E402
 from pcb_agent_mcp.sim import planes as P  # noqa: E402
 
 C_LIGHT = 299792458.0
@@ -38,6 +39,23 @@ STACKUP_2 = """  (setup (stackup
 STACKUP_NO_ER = """  (setup (stackup
       (layer "F.Cu" (type "copper") (thickness 0.035))
       (layer "dielectric 1" (type "core") (thickness 1.51))
+      (layer "B.Cu" (type "copper") (thickness 0.035))))"""
+
+STACKUP_TD = """  (setup (stackup
+      (layer "F.Cu" (type "copper") (thickness 0.035))
+      (layer "dielectric 1" (type "core") (thickness 1.51) (epsilon_r 4.5)
+             (loss_tangent 0.02))
+      (layer "B.Cu" (type "copper") (thickness 0.035))))"""
+
+STACKUP_TD_MIX = """  (setup (stackup
+      (layer "F.Cu" (type "copper") (thickness 0.035))
+      (layer "dielectric 1" (type "prepreg") (thickness 0.1) (epsilon_r 4.2)
+             (loss_tangent 0.01))
+      (layer "In1.Cu" (type "copper") (thickness 0.035))
+      (layer "dielectric 2" (type "core") (thickness 1.2) (epsilon_r 4.6)
+             (loss_tangent 0.022))
+      (layer "dielectric 3" (type "prepreg") (thickness 0.1) (epsilon_r 4.2)
+             (loss_tangent 0.01))
       (layer "B.Cu" (type "copper") (thickness 0.035))))"""
 
 STACKUP_4 = """  (setup (stackup
@@ -196,6 +214,89 @@ class TestWhatIsRefused(unittest.TestCase):
     def test_no_outline_means_no_cavity(self):
         out = P.board_plane_resonance(_board(pours=BOTH, outline=False), {})
         self.assertEqual(out["reason_code"], "NOT_APPLICABLE")
+
+class TestTheModesAreDamped(unittest.TestCase):
+    """A mode location is not a ringing level: Q is a second question.
+
+    Three mechanisms, three numbers, and 1/Q = 1/Qc + 1/Qd + 1/Qrad because they
+    all see the same stored energy. What is NOT in it is what is soldered across
+    the planes, which is usually the dominant loss of a real PDN resonance.
+    """
+
+    def test_each_mode_carries_its_three_losses_and_their_reciprocal_sum(self):
+        out = P.board_plane_resonance(_board(STACKUP_TD, pours=BOTH), {})
+        self.assertEqual(out["status"], "ok", out)
+        rows = out["value"]["modes"]
+        self.assertTrue(rows)
+        for r in rows:
+            d = r["damping"]
+            self.assertGreater(d["q_conductor"], 0.0)
+            self.assertGreater(d["q_radiation"], 0.0)
+            self.assertAlmostEqual(d["q_dielectric"], 50.0, places=9)  # 1/0.02
+            want = 1.0 / (1.0 / d["q_conductor"] + 1.0 / d["q_dielectric"]
+                          + 1.0 / d["q_radiation"])
+            self.assertAlmostEqual(d["q_total"], want, places=9)
+            self.assertEqual(d["losses_in_q_total"],
+                             ["q_conductor", "q_dielectric", "q_radiation"])
+            self.assertAlmostEqual(d["h_mm"], 1.51, places=9)
+        b = out["value"]["board"]
+        self.assertAlmostEqual(b["tan_delta"], 0.02, places=9)
+        self.assertEqual(b["tan_delta_missing_in"], [])
+        # the q_conductor in the answer IS cavity.plane_q's, not a second formula
+        want = CAV.plane_q(rows[0]["f_hz"], 1.51, tan_delta=0.02)["value"]
+        self.assertAlmostEqual(rows[0]["damping"]["q_conductor"],
+                               want["q_conductor"], places=9)
+        # Qc = h/delta_s moves with FREQUENCY only (delta ~ 1/sqrt(f)), never with
+        # the mode numbers: 1358.15 at 3.533 GHz against 2872.14 at 15.80 GHz is
+        # 2.1146, and sqrt(15.80/3.533) is 2.1147
+        self.assertAlmostEqual(
+            rows[-1]["damping"]["q_conductor"] / rows[0]["damping"]["q_conductor"],
+            math.sqrt(rows[-1]["f_hz"] / rows[0]["f_hz"]), places=3)
+        self.assertGreater(len({round(r["damping"]["q_radiation"], 6)
+                                for r in rows}), 1)
+
+    def test_the_total_is_lower_than_every_part_and_radiation_can_win(self):
+        # Measured on this box (20 x 10 mm, 1.51 mm of er 4.5): the (1,0) mode is
+        # 3.533 GHz with Qc 1358.15, Qd 50 and Qrad 7.45033, so 1/Q adds up to
+        # 6.45 and RADIATION is what damps it - a small board on a thick gap
+        # radiates, which is why the split is printed instead of one number.
+        # Written as "the total is below every part" so it stays true whichever
+        # mechanism wins, and the parts are asserted separately.
+        out = P.board_plane_resonance(_board(STACKUP_TD, pours=BOTH), {})
+        d = out["value"]["modes"][0]["damping"]
+        self.assertAlmostEqual(d["q_radiation"], 7.45033, places=4)
+        self.assertAlmostEqual(d["q_dielectric"], 50.0, places=9)
+        self.assertGreater(d["q_conductor"], 1300.0)
+        self.assertAlmostEqual(d["q_total"], 6.453339142, places=5)
+        for k in ("q_conductor", "q_dielectric", "q_radiation"):
+            self.assertLess(d["q_total"], d[k])
+
+    def test_sublayers_are_weighted_by_capacitance(self):
+        # t/er weights: 0.1/4.2 at 0.01, 1.2/4.6 at 0.022, 0.1/4.2 at 0.01
+        w = [0.1 / 4.2, 1.2 / 4.6, 0.1 / 4.2]
+        want = (w[0] * 0.01 + w[1] * 0.022 + w[2] * 0.01) / sum(w)
+        out = P.board_plane_resonance(_board(STACKUP_TD_MIX, four=True, pours=[
+            _pour("F.Cu", 2, "GND", RING), _pour("B.Cu", 2, "GND", RING)]),
+            {"layer_a": "F.Cu", "layer_b": "B.Cu"})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertAlmostEqual(out["value"]["board"]["tan_delta"], want, places=9)
+        # measured 0.020147651006711: NOT the thickness-weighted 0.0202857 and
+        # not the plain 0.014 - the energy that sets the loss is in the
+        # capacitance, so t/er is the weight
+        self.assertAlmostEqual(want, 0.020147651006711, places=9)
+        thick_weighted = (0.1 * 0.01 + 1.2 * 0.022 + 0.1 * 0.01) / 1.4
+        self.assertNotAlmostEqual(want, thick_weighted, places=4)
+        self.assertNotAlmostEqual(want, (0.01 + 0.022 + 0.01) / 3.0, places=3)
+
+    def test_a_stackup_with_no_loss_tangent_says_the_q_is_optimistic(self):
+        out = P.board_plane_resonance(_board(pours=BOTH), {})   # STACKUP_2: no td
+        d = out["value"]["modes"][0]["damping"]
+        self.assertIsNone(d["q_dielectric"])
+        self.assertEqual(d["losses_in_q_total"], ["q_conductor", "q_radiation"])
+        self.assertEqual(out["value"]["board"]["tan_delta_missing_in"],
+                         ["dielectric 1"])
+        self.assertTrue(any("counted as lossless" in n
+                            for n in (out.get("notes") or [])))
 
 class TestOneRealAnswer(unittest.TestCase):
     def test_the_lowest_mode_is_the_box_and_the_stackup(self):

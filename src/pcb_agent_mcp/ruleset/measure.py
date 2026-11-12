@@ -42,7 +42,11 @@ _PRUNE = True        # pair search window: every fab limit here is below 0.5 mm
 
 
 def _rec(value, where, method):
-    return {"value": float(value), "where": where, "method": method}
+    # A bool must STAY a bool: `calc/rules.py` rejects a number for a
+    # true/false rule ("must be true/false"), so `float(True)` turned
+    # every flag this module measured into an undetermined rule.
+    kept = value if isinstance(value, bool) else float(value)
+    return {"value": kept, "where": where, "method": method}
 
 
 def _na(reason):
@@ -1625,19 +1629,330 @@ def _assembly_facts(board):
         "min_mask_expansion": _mask_expansion(board),
         "crystal_has_guard_ring": _crystal_guard(board, pours),
     }
-    # The RF family needs a population the file does not carry. Saying which
-    # number is missing beats leaving the rule with no reading at all: the caller
-    # can hand each one over through `facts`.
-    for key, what in (
-            ("rf_line_z0_error_pct", "the impedance the line was routed to"),
-            ("has_right_angle_bend_on_rf", "which nets are RF"),
-            ("rf_min_bend_radius_mm", "which nets are RF"),
-            ("rf_min_spacing_to_other_trace_mm", "which nets are RF"),
-            ("rf_min_distance_to_edge_mm", "which nets are RF"),
-            ("antenna_min_distance_to_other_rf_mm", "which net is the antenna feed")):
-        out[key] = _na("this rule needs %s, and no board file states it; pass the "
-                       "number through `facts` (or name the nets) and the rule is "
-                       "graded from your input" % what)
+    out.update(_rf_facts(board))
+    return out
+
+# ------------------------------------------------------------- the RF family
+# Five of the six RF rules used to be answered with "which nets are RF is not in
+# the file", which is true and useless: a board whose net is called RF_IN has
+# said it. So the population is read off the NET NAMES, by whole tokens (a
+# substring match would put `BT` inside `BAT+`), and the reading says which names
+# it took. A board whose RF net is called `Net-(U1-Pad3)` still gets
+# `undetermined` - that is the honest answer, and the caller can name the nets
+# through `facts`.
+_RF_NET_TOKENS = frozenset((
+    "RF", "ANT", "ANTENNA", "AERIAL", "FEED", "FEEDLINE", "LNA", "HIRF",
+    "MICROSTRIP", "CPW", "CPWG", "WIFI", "WLAN", "BLE", "GNSS", "GPS",
+    "LTE", "GSM", "LORA", "NBIOT", "RADAR", "UWB", "ZIGBEE",
+))
+# Band spellings are tokens of their own: 2G4 / 5G8 / 2.4G / 5.8G / 433M / 868M /
+# 915M. `TX`/`RX` are deliberately NOT tokens: on a dev board they are the UART.
+_RF_BAND_TOKEN = re.compile(r"^(2[._]?4|5[._]?8)(g|ghz)?$|^(433|868|915)(m|mhz)?$",
+                            re.I)
+_ANT_TOKEN = frozenset(("ANT", "ANTENNA", "AERIAL"))
+_NET_TOKEN_SPLIT = re.compile(r"[^0-9A-Za-z]+")
+
+
+def _net_tokens(name):
+    return [t for t in _NET_TOKEN_SPLIT.split(str(name or "")) if t]
+
+
+def _rf_population(board):
+    """Which nets the file's own names say are RF, and which of those is the feed."""
+    names = set()
+    for t in board.tracks:
+        if t.get("net"):
+            names.add(str(t["net"]))
+    for v in board.vias:
+        if v.get("net"):
+            names.add(str(v["net"]))
+    for f in board.footprints:
+        for pad in (f.get("pads") or []):
+            if pad.get("net"):
+                names.add(str(pad["net"]))
+    rf, ant = [], []
+    for n in sorted(names):
+        # `unconnected-(U5-ANT-Pad24)` is KiCad's own label for a pad that
+        # connects to nothing; it happens to contain the word ANT and is not
+        # a net at all (same exclusion the spacing sweep makes).
+        if n.startswith("unconnected-("):
+            continue
+        up = [t.upper() for t in _net_tokens(n)]
+        if not any(t in _RF_NET_TOKENS or _RF_BAND_TOKEN.match(t) for t in up):
+            continue
+        rf.append(n)
+        if any(t in _ANT_TOKEN for t in up):
+            ant.append(n)
+    return {"nets": rf, "antenna": ant,
+            "how": "net names matched as WHOLE tokens (RF, ANT, FEED, LNA, GPS, "
+                   "WIFI, ...) or band spellings such as 2G4 / 5G8 / 433M; TX and "
+                   "RX are not tokens because on a dev board they are the UART"}
+
+
+def _rf_segments_by_layer(board, nets):
+    """Every RF track flattened to segments, grouped by (net, layer)."""
+    out = {}
+    for t in board.tracks:
+        if str(t.get("net") or "") not in nets:
+            continue
+        pts = t.get("_points") or ([t["start"], t["end"]]
+                                   if t.get("start") and t.get("end") else [])
+        pts = [(float(p[0]), float(p[1])) for p in pts]
+        for i in range(len(pts) - 1):
+            if pts[i] == pts[i + 1]:
+                continue
+            out.setdefault((str(t.get("net")), str(t.get("layer") or "")),
+                           []).append((pts[i], pts[i + 1],
+                                       float(t.get("width") or 0.0)))
+    return out
+
+
+def _rf_right_angles(board, nets, tol_deg=89.0):
+    """Corners on an RF line whose direction turns by 90 degrees or more."""
+    groups = _rf_segments_by_layer(board, nets)
+    if not groups:
+        return None
+    hits, worst, corners = [], None, 0
+    for (net, layer), segs in groups.items():
+        ends = {}
+        for a, b, _w in segs:
+            for p, q in ((a, b), (b, a)):
+                key = (round(p[0], 3), round(p[1], 3))
+                ends.setdefault(key, []).append((q[0] - p[0], q[1] - p[1]))
+        for key, dirs in ends.items():
+            if len(dirs) != 2:
+                continue                    # stub, crossing or a redundant point
+            corners += 1
+            (ax, ay), (bx, by) = dirs
+            na, nb = math.hypot(ax, ay), math.hypot(bx, by)
+            if na <= 0 or nb <= 0:
+                continue
+            cos = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
+            # Both vectors point AWAY from the vertex, so a straight
+            # continuation reads as 180 deg and a right-angled corner reads as
+            # 90. What the rule is about is how far the line TURNS, i.e. the
+            # supplement of that angle: straight = 0, right angle = 90,
+            # 45 deg miter = 45. Reporting the angle itself counted every
+            # collinear vertex (a track split in two) as a right angle.
+            turn = 180.0 - math.degrees(math.acos(cos))
+            if worst is None or turn > worst[0]:
+                worst = (turn, net, layer, key[0], key[1])
+            if turn >= tol_deg:
+                hits.append({"net": net, "layer": layer,
+                             "x_mm": round(key[0], 3), "y_mm": round(key[1], 3),
+                             "turn_deg": round(turn, 2)})
+    hits.sort(key=lambda h: -h["turn_deg"])
+    if not hits:
+        return _rec(False, "%d corner(s) on the RF nets, the sharpest turning %.1f deg"
+                    % (corners, worst[0] if worst else 0.0),
+                    "turn of the direction vector at every vertex where exactly two "
+                    "RF track ends meet; a right angle is 90 deg of turn, a 45 deg "
+                    "miter is 45, and anything at or above %g deg is counted"
+                    % tol_deg)
+    out = _rec(True, "%d corner(s) turn by >= %g deg; the sharpest is %s on %s at "
+               "(%.3f, %.3f) mm turning %.1f deg"
+               % (len(hits), tol_deg, hits[0]["net"], hits[0]["layer"],
+                  hits[0]["x_mm"], hits[0]["y_mm"], hits[0]["turn_deg"]),
+               "turn of the direction vector at every vertex where exactly two RF "
+               "track ends meet; 90 deg of turn is a right angle and counts, a "
+               "45 deg miter does not")
+    out["examples"] = hits[:8]
+    return out
+
+
+def _circumradius(p0, p1, p2):
+    ax, ay = p1[0] - p0[0], p1[1] - p0[1]
+    bx, by = p2[0] - p0[0], p2[1] - p0[1]
+    cross = ax * by - ay * bx
+    if abs(cross) < 1e-12:
+        return None
+    la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+    lc = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    return (la * lb * lc) / (2.0 * abs(cross))
+
+
+def _rf_bend_radius(board, nets):
+    """The tightest radius an RF line actually bends on, from its arc tracks."""
+    radii, straight = [], 0
+    for t in board.tracks:
+        if str(t.get("net") or "") not in nets:
+            continue
+        if t.get("_arc") and t.get("_points") and len(t["_points"]) >= 3:
+            pts = [(float(p[0]), float(p[1])) for p in t["_points"]]
+            r = _circumradius(pts[0], pts[len(pts) // 2], pts[-1])
+            w = float(t.get("width") or 0.0)
+            if r and r > 1e-3:
+                radii.append((r, w, str(t.get("net")), str(t.get("layer") or "")))
+        else:
+            straight += 1
+    if radii:
+        r, w, net, layer = min(radii, key=lambda x: x[0])
+        out = _rec(r, "%s on %s: radius %.4g mm on a %.4g mm line (%.2f widths)"
+                   % (net, layer, r, w, (r / w) if w else 0.0),
+                   "circumradius of each arc track's own three-point geometry; the "
+                   "rule wants radius >= 3 line widths")
+        out["arc_tracks"] = len(radii)
+        return out
+    return _na("no arc track on the RF nets, so the bend radius is a number this "
+               "board does not have: %d straight segment(s) bend as MITERS, and a "
+               "miter's radius is zero by construction. The 3w rule asks about a "
+               "curve; grade the miter with layout.rf_right_angle_bend instead"
+               % straight)
+
+
+def _bbox_apart(a, b, best):
+    """True when the two boxes are certainly farther apart than the best so far.
+
+    Skipping a pair on its bounding boxes is only allowed to make this faster, so
+    the test compares against the CURRENT best: a pair that could beat it is
+    always measured exactly.
+    """
+    if best is None:
+        return False
+    ax0, ay0, ax1, ay1 = _item_bbox(a)
+    bx0, by0, bx1, by1 = _item_bbox(b)
+    dx = max(0.0, max(ax0, bx0) - min(ax1, bx1))
+    dy = max(0.0, max(ay0, by0) - min(ay1, by1))
+    return math.hypot(dx, dy) > best[0]
+
+
+def _min_gap_between(items_a, items_b, max_gap_mm):
+    """Closest edge-to-edge distance between two item sets, up to a window."""
+    cell = float(max_gap_mm)
+    grid = {}
+    for idx, it in enumerate(items_b):
+        x0, y0, x1, y1 = _item_bbox(it)
+        for gx in range(int(math.floor((x0 - cell) / cell)),
+                        int(math.floor((x1 + cell) / cell)) + 1):
+            for gy in range(int(math.floor((y0 - cell) / cell)),
+                            int(math.floor((y1 + cell) / cell)) + 1):
+                grid.setdefault((gx, gy), []).append(idx)
+    best = None
+    for a in items_a:
+        x0, y0, x1, y1 = _item_bbox(a)
+        seen = set()
+        for gx in range(int(math.floor(x0 / cell)), int(math.floor(x1 / cell)) + 1):
+            for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
+                for idx in grid.get((gx, gy), ()):
+                    if idx in seen:
+                        continue
+                    seen.add(idx)
+                    b = items_b[idx]
+                    if _bbox_apart(a, b, best):
+                        continue
+                    d = _dist(a, b)
+                    if best is None or d < best[0]:
+                        best = (d, a, b)
+                        if d == 0.0:
+                            return best
+    return best
+
+
+def _rf_min_width(rf_items):
+    ws = [float(it["seg"][2]) for it in rf_items if it.get("seg")]
+    return min(ws) if ws else 0.0
+
+
+def _rf_facts(board):
+    """The RF rules, measured on the nets the file's names call RF."""
+    pop = _rf_population(board)
+    nets = set(pop["nets"])
+    out = {}
+    if not nets:
+        return {key: _na("no net name on this board reads as an RF, antenna, feed "
+                         "or band net, so there is no population to measure; name "
+                         "the feed in the schematic (RF_IN, ANT_2G4, ...) or pass "
+                         "the number through `facts`")
+                for key in ("rf_line_z0_error_pct", "has_right_angle_bend_on_rf",
+                            "rf_min_bend_radius_mm", "rf_min_width_mm",
+                            "rf_min_spacing_to_other_trace_mm",
+                            "rf_min_distance_to_edge_mm",
+                            "antenna_min_distance_to_other_rf_mm")}
+
+    ra = _rf_right_angles(board, nets)
+    out["has_right_angle_bend_on_rf"] = ra if ra is not None else _na(
+        "the RF net(s) %s carry no track, so there is no corner to measure"
+        % ", ".join(sorted(nets)))
+    out["rf_min_bend_radius_mm"] = _rf_bend_radius(board, nets)
+
+    items = [it for it in _items(board)
+             if it.get("kind") in ("pad", "track", "via") and it.get("net")]
+    rf_items = [it for it in items if str(it["net"]) in nets]
+    other = [it for it in items if str(it["net"]) not in nets]
+    if not rf_items:
+        for key in ("rf_min_width_mm", "rf_min_spacing_to_other_trace_mm",
+                    "rf_min_distance_to_edge_mm"):
+            out[key] = _na("the RF net(s) %s have no copper item that states a net"
+                           % ", ".join(sorted(nets)))
+    else:
+        # The narrowest RF line's own width, on its own: the 3W rules
+        # (spacing, bend radius) are three times THE LINE's width, so the
+        # catalogue cannot compute their limits without it.
+        w_all = _rf_min_width(rf_items)
+        out["rf_min_width_mm"] = _rec(
+            w_all, "the narrowest RF track on the board",
+            "min width over every track on a net the file's names call RF") \
+            if w_all > 0 else _na("no RF track states a width")
+        rf_layers = set(l for r in rf_items for l in (r.get("layers") or []))
+        same_layer = [it for it in other
+                      if set(it.get("layers") or []) & rf_layers]
+        best = _min_gap_between(rf_items, same_layer, 5.0) if same_layer else None
+        if best is None:
+            out["rf_min_spacing_to_other_trace_mm"] = {
+                "lower_bound": 5.0,
+                "where": "no copper of a different net is within 5 mm of an RF item",
+                "method": "edge-to-edge distance from every RF copper item to every "
+                          "other-net copper item on a shared layer, bucketed at 5 mm",
+            }
+        else:
+            d, a, b = best
+            out["rf_min_spacing_to_other_trace_mm"] = _rec(
+                d, "%s to %s" % (a.get("ref"), b.get("ref")),
+                "edge-to-edge distance from every RF copper item to every other-net "
+                "copper item on a layer both use; the rule wants 3 line widths")
+            w = _rf_min_width(rf_items)
+            if w > 0:
+                out["rf_min_spacing_to_other_trace_mm"]["in_line_widths"] = d / w
+                out["rf_min_spacing_to_other_trace_mm"]["rf_min_width_mm"] = w
+        out["rf_min_distance_to_edge_mm"] = _norm(
+            _min_copper_to_edge(board, rf_items, _edge_segments(board),
+                                window_mm=5.0),
+            "edge-to-edge distance from RF copper to the board outline")
+
+    ant = set(pop["antenna"])
+    if not ant:
+        out["antenna_min_distance_to_other_rf_mm"] = _na(
+            "no net name on this board says which net is the antenna feed (the "
+            "names read %s), so the keep-out has nothing to be measured around"
+            % (", ".join(sorted(nets)) or "none"))
+    else:
+        ant_items = [it for it in items if str(it["net"]) in ant]
+        rest = [it for it in items if str(it["net"]) not in ant]
+        best = _min_gap_between(ant_items, rest, 20.0) if ant_items and rest else None
+        if best is None:
+            out["antenna_min_distance_to_other_rf_mm"] = {
+                "lower_bound": 20.0,
+                "where": "nothing of another net is within 20 mm of %s"
+                         % ", ".join(sorted(ant)),
+                "method": "edge-to-edge distance from the antenna net's copper to "
+                          "every other net's copper, bucketed at 20 mm",
+            }
+        else:
+            d, a, b = best
+            out["antenna_min_distance_to_other_rf_mm"] = _rec(
+                d, "%s to %s" % (a.get("ref"), b.get("ref")),
+                "edge-to-edge distance from the antenna net's copper to every other "
+                "net's copper, whatever the layer; the rule wants 10 mm")
+
+    # Z0 is NOT measured: the width and the stackup are here, but the impedance the
+    # line was DESIGNED to is a decision, and `feedline_impedance` is the tool that
+    # says what a given width really is. Assuming 50 ohm would turn a decision into
+    # a measurement.
+    out["rf_line_z0_error_pct"] = _na(
+        "the target impedance is a design decision, not a property of the file: "
+        "this board routes a %.4g mm line as RF, and what that width really is on "
+        "this stackup is what feedline_impedance answers; pass the target through "
+        "`facts` to grade the error" % _rf_min_width(rf_items))
     return out
 
 _CAP_REF = re.compile(r"^C\d")
@@ -2449,6 +2764,29 @@ def catalog_facts(m):
         if isinstance(val, bool) or isinstance(val, (int, float)):
             facts[fact] = val
 
+    def take_lb(key, fact):
+        """A measured distance, else a BOUND that can only say "at least this far".
+
+        The measured value is always taken. A minimum-distance rule whose scan
+        found nothing inside its window has a lower bound, not a value: every
+        gap is >= that bound. Handing the bound over as the measurement can only
+        be wrong in the direction of a pass, so it is only done where the window
+        is wider than the rule's own limit - the three RF keep-outs (5 mm and
+        20 mm windows against a 3 mm and a 10 mm limit). Everywhere else a bound
+        stays a bound and the rule stays undetermined.
+
+        Supplying only the bound (the first version of this function) dropped
+        the measured value on the floor and left the rule undetermined on every
+        board that DID have close copper - the exact opposite of the point.
+        """
+        row = m.get(key) or {}
+        val = row.get("value")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            facts[fact] = float(val)
+            return
+        if "lower_bound" in row and "value" not in row:
+            facts[fact] = float(row["lower_bound"])
+
     take("min_track_width", "min_trace_width_mm")
     take("min_plated_drill", "min_via_hole_mm")
     take("diffpair_length_skew_mm", "diffpair_length_skew_mm")
@@ -2469,6 +2807,15 @@ def catalog_facts(m):
     take("test_points_on_rails_and_connectors", "test_points_on_rails_and_connectors")
     take("min_mask_expansion", "min_mask_expansion")
     take("crystal_has_guard_ring", "crystal_has_guard_ring")
+    # The RF family, measured on the nets the file's names call RF.
+    take("has_right_angle_bend_on_rf", "has_right_angle_bend_on_rf")
+    take("rf_min_bend_radius_mm", "rf_min_bend_radius_mm")
+    take("rf_min_width_mm", "rf_line_width_mm")
+    take_lb("rf_min_spacing_to_other_trace_mm",
+            "rf_min_spacing_to_other_trace_mm")
+    take_lb("rf_min_distance_to_edge_mm", "rf_min_distance_to_edge_mm")
+    take_lb("antenna_min_distance_to_other_rf_mm",
+            "antenna_min_distance_to_other_rf_mm")
     return facts
 
 

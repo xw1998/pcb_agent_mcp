@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 
 from ..calc import cavity as _C
+from ..calc import planar as _PL
 
 
 def _err(message, code, hint=None, extra=None):
@@ -138,6 +139,49 @@ def layer_dielectric(board, layer_a, layer_b):
     return {"thickness_mm": total_mm, "er": (total_mm / series) if series else None,
             "missing_er_in": missing, "layers_between": j - i - 1}
 
+
+def layer_tan_delta(board, layer_a, layer_b):
+    """Loss tangent between two plates: the capacitance-weighted sublayer average.
+
+    Laminated loss is not additive in tan_delta across a stack of sublayers - the
+    stored energy is proportional to C, so the tangent that reproduces the same
+    loss is weighted by t/er. One core is just its own number; prepreg + core is
+    the weighted mix, and that is what a mode at that gap actually sees.
+
+    A sublayer with no `loss_tangent` in the file is named in `missing_tand_in`
+    and counted as LOSSLESS, which can only make the answer optimistic. It is not
+    replaced with an FR4 default: that would put a number in the answer that no
+    file states.
+    """
+    stack = board.stackup or []
+    names = [l.get("name") for l in stack]
+    if layer_a not in names or layer_b not in names:
+        return None
+    i, j = names.index(layer_a), names.index(layer_b)
+    if i > j:
+        i, j = j, i
+    num = den = 0.0
+    missing = []
+    for l in stack[i + 1:j]:
+        if l.get("type") == "copper":
+            continue
+        t = _num(l.get("thickness_mm"))
+        if not t or t <= 0:
+            continue
+        er = _num(l.get("er"))
+        weight = (t / er) if er and er > 0 else t
+        den += weight
+        td = _num(l.get("tand"))
+        if td is None:
+            missing.append(l.get("name"))
+        else:
+            num += weight * td
+    if den <= 0:
+        return None
+    return {"tan_delta": (num / den) if num > 0 else None,
+            "missing_tand_in": missing,
+            "weighting": "capacitance (t/er) weighted over the sublayers between "
+                         "the plates"}
 
 def plane_coverage(board, layer, box):
     """How much of the outline's box a layer's pours cover, and the biggest net.
@@ -288,6 +332,92 @@ def board_plane_resonance(board, args):
         "pour_a": cov_a, "pour_b": cov_b,
         "cavity_is_the_box": True,
     }
+    # --- Q of every mode, split into what each loss mechanism does -----------
+    # A mode LOCATION is what plane_resonance answers; "and how much does it
+    # ring" is a separate question with three separate answers, and the board
+    # file supplies the two numbers that set them: the gap h (copper Q = h/delta_s,
+    # independent of size and mode) and the laminate's tan_delta (Qd = 1/tan_delta
+    # - which on FR4 is the one that usually wins). Radiation Q comes from the
+    # open edges, i.e. from the mode shape and the gap, and is the only one of the
+    # three that knows the board is not a closed box.
+    #
+    # 1/Q = 1/Qc + 1/Qd + 1/Qrad: the three see the same stored energy, so the
+    # reciprocals add. No verdict is drawn from the result - a high-Q mode is not
+    # a problem, it is a mode that needs an excitation AND a coupling to be one.
+    damp = layer_tan_delta(board, layer_a, layer_b) or {}
+    tan_d = damp.get("tan_delta")
+    h_mm = stack["thickness_mm"]
+    damp_notes = []
+    for row in rows:
+        f = _num(row.get("f_hz"))
+        d = {"tan_delta": tan_d, "h_mm": h_mm, "q_conductor": None,
+             "q_dielectric": None, "q_radiation": None, "q_total": None,
+             "losses_in_q_total": [], "radiation_open_edges": ["x0", "x1",
+                                                              "y0", "y1"]}
+        if f:
+            q = _C.plane_q(f, h_mm, tan_delta=tan_d)
+            if q.get("status") == "ok":
+                qv = q.get("value") or {}
+                d["q_conductor"] = qv.get("q_conductor")
+                d["q_dielectric"] = qv.get("q_dielectric")
+                d["skin_depth_um"] = qv.get("skin_depth_um")
+            else:
+                d["plane_q_refused"] = {"reason_code": q.get("reason_code"),
+                                        "message": q.get("message")}
+            rad = _PL.plane_radiation_q(box[2], box[3], h_mm, er=er,
+                                        m=int(row.get("m") or 0),
+                                        n=int(row.get("n") or 0),
+                                        tan_delta=tan_d)
+            if rad.get("status") == "ok":
+                rv = rad.get("value") or {}
+                d["q_radiation"] = rv.get("q_radiation")
+                d["k0_h"] = rv.get("k0_h")
+                if rv.get("warning"):
+                    d["radiation_warning"] = rv["warning"]
+            else:
+                # Every edge open is the right default for a bare rectangle, and
+                # k0*h >= 1 is the model's own scope gate - refused rather than
+                # clamped, so the total Q below is the two loss terms only and
+                # says so.
+                d["radiation_refused"] = {"reason_code": rad.get("reason_code"),
+                                          "message": rad.get("message")}
+            parts = {}
+            for name in ("q_conductor", "q_dielectric", "q_radiation"):
+                v = d.get(name)
+                if isinstance(v, (int, float)) and v > 0:
+                    parts[name] = float(v)
+            if parts:
+                d["q_total"] = 1.0 / sum(1.0 / v for v in parts.values())
+                d["losses_in_q_total"] = sorted(parts)
+        row["damping"] = d
+
+    if damp.get("missing_tand_in"):
+        damp_notes.append(
+            "the stackup states no loss_tangent for %s, so those sublayers were "
+            "counted as lossless: the dielectric Q below is optimistic"
+            % ", ".join(damp["missing_tand_in"]))
+    if tan_d is None and not damp.get("missing_tand_in"):
+        damp_notes.append("no dielectric between %r and %r states a loss tangent, "
+                          "so only the copper loss is in each mode's Q"
+                          % (layer_a, layer_b))
+    if any(r["damping"].get("radiation_refused") for r in rows):
+        damp_notes.append(
+            "radiation Q was refused for at least one mode (see that mode's "
+            "damping.radiation_refused; k0*h >= 1 is the model's own scope gate, "
+            "and it happens at high modes on a thick gap): those q_total values "
+            "hold only the losses that could be computed, and "
+            "damping.losses_in_q_total lists which")
+    info["tan_delta"] = tan_d
+    info["tan_delta_from_stackup"] = damp.get("tan_delta")
+    info["tan_delta_missing_in"] = damp.get("missing_tand_in")
+    info["dielectric_damping_mm"] = h_mm
+    info["damping_note"] = (
+        "Q per mode: 1/Q = 1/Qc + 1/Qd + 1/Qrad, with Qc = h/delta_s "
+        "(independent of mode and size), Qd = 1/tan_delta and Qrad from the "
+        "narrow-slot open-edge model over all four edges. What is NOT in it: "
+        "whatever is mounted across the planes (decoupling capacitors, packages), "
+        "which is usually the dominant loss of a real PDN resonance")
+
     # `plane_resonance` flattens its extras to the top of the envelope, so the
     # mode list is moved under `value` and the rest goes with the board block:
     # one place to read a mode, one place to read where the plates came from.
@@ -322,15 +452,18 @@ def board_plane_resonance(board, args):
                          "plate has holes where the mode assumes copper"
                          % (name, 100.0 * cov["coverage_of_box"],
                             cov["biggest_net"]))
+    notes.extend(damp_notes)
     notes.append("this is a mode LOCATION, not a problem: a resonance needs an "
                  "excitation and a coupling, and neither is in the file. Via pitch "
-                 "is cavity_via_fence, damping is cavity_plane_q")
+                 "is cavity_via_fence; the damping of each mode is in "
+                 "value.modes[].damping, and it is a damping, not a verdict")
     out["basis"] = (out.get("basis") or "") + (
         "; the plates, the gap and er come from the .kicad_pcb (two copper layers, "
         "the stackup between them, the pours on each), the extent is the outline box")
     out.setdefault("assumptions", {})
     out["assumptions"]["board_plane_resonance"] = (
         "rectangular cavity over the outline's bounding box; er is the "
-        "capacitance-equivalent average of the stackup between the plates; the "
-        "side walls are PMC as in plane_resonance")
+        "capacitance-equivalent average of the stackup between the plates and "
+        "tan_delta is its capacitance-weighted mix; the side walls are PMC as in "
+        "plane_resonance, so all four edges are taken as radiating for Qrad")
     return out

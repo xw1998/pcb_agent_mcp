@@ -19,8 +19,11 @@ one of them is wrong - which is why both are printed with their difference.
 """
 from __future__ import annotations
 
+import math
+
 from .. import oracle as _O
 from ..calc import currentfield as _CF
+from ..calc import zonefield as _ZF
 
 # Copper at 20 C, ohm*mm; the field solver's own default, restated here because
 # the temperature argument has to move it.
@@ -74,6 +77,34 @@ def _pad_shapes(board, net, layer):
     return out, approx
 
 
+def _pours_by_layer(board, net):
+    """The fill (or outline) of every zone this net owns, per copper layer.
+
+    A pour IS copper on the net, and on a plane-heavy board it is often the only
+    copper joining the two contacts - which is why refusing a pour-only net with
+    "no 2-D region here" was wrong. `zonefield` already knows how to read a zone
+    (`filled_polygons` when the file carries it, else the outline), so the same
+    reading is used here and the geometry stays in one place.
+    """
+    out, notes = {}, []
+    for z in (board.zones or []):
+        if str(z.get("net") or "") != net:
+            continue
+        if z.get("keepout") or z.get("is_keepout"):
+            continue
+        polys, used_fill = _ZF._polys_of(z)
+        if not polys:
+            continue
+        for lay in _ZF.zone_layer_list(z):
+            for poly in polys:
+                out.setdefault(lay, []).append(poly)
+            if not used_fill:
+                notes.append("zone %r has no filled_polygons, so its OUTLINE is "
+                             "used as copper: an unfilled zone on this layer is "
+                             "less copper than the file will actually have"
+                             % (z.get("name") or z.get("id") or "?"))
+    return out, notes
+
 def board_current_field(board, args):
     """J and R on one net's copper, driven between two named pads."""
     net = str(args.get("net") or "")
@@ -94,6 +125,15 @@ def board_current_field(board, args):
                     "field", "ARG_INVALID")
 
     temp_c = float(args.get("temp_c") if args.get("temp_c") is not None else 20.0)
+    want_pours = args.get("model_pours")
+    want_pours = True if want_pours is None else bool(want_pours)
+    pours_by_layer, pour_notes = ({}, [])
+    if want_pours:
+        pours_by_layer, pour_notes = _pours_by_layer(board, net)
+    # The graph is asked for the pouches too when there are any: a net whose pads
+    # are joined by a pour has no track path between them, and with the pour off
+    # the IR-drop graph answers `singular` before this function ever sees it.
+    has_pour = bool(pours_by_layer)
     g = _O.board_ir_drop(board, net, None, None,
                          copper_um=args.get("copper_um"),
                          plating_um=args.get("plating_um"),
@@ -102,7 +142,7 @@ def board_current_field(board, args):
                                       else 0.01),
                          temp_c=temp_c,
                          max_nodes=int(args.get("max_nodes") or 60000),
-                         return_network=True)
+                         model_zones=has_pour, return_network=True)
     if g.get("status") != "ok":
         return g
     val = g["value"]
@@ -124,15 +164,17 @@ def board_current_field(board, args):
         lay = str(e.get("layer") or "")
         by_layer.setdefault(lay, []).append(e)
     layers = [l for l in sorted(by_layer, key=lambda l: -len(by_layer[l])) if l]
+    for lay in sorted(pours_by_layer):
+        if lay not in layers:
+            layers.append(lay)
     if not layers:
-        return _err("net %r has no track on any layer, so there is no region to "
-                    "solve" % net, "NOT_APPLICABLE",
-                    hint="a net made only of a pour has no 2-D region here; "
-                         "board_ir_drop(model_zones=true) or board_pour_audit "
-                         "answers about pours")
+        return _err("net %r has no track and no pour on any layer, so there is no "
+                    "copper to solve" % net, "NOT_APPLICABLE",
+                    hint="board_nets lists what each net actually has; "
+                         "board_current_field needs copper on one layer")
     layer = str(args.get("layer") or layers[0])
-    if layer not in by_layer:
-        return _err("net %r has no track on %r; it has copper on %s"
+    if layer not in by_layer and layer not in pours_by_layer:
+        return _err("net %r has no copper on %r; it has copper on %s"
                     % (net, layer, ", ".join(layers)), "NOT_APPLICABLE")
     for name in (src, snk):
         if layer not in (term[name].get("layers") or []) and "*.Cu" not in (
@@ -154,20 +196,27 @@ def board_current_field(board, args):
                               "radius_mm": 0.2}
 
     paths = []
-    for e in by_layer[layer]:
+    for e in (by_layer.get(layer) or []):
         a, b = nodes.get(e["a"]), nodes.get(e["b"])
         if a is None or b is None:
             continue
         paths.append({"points": [[float(a["x_mm"]), float(a["y_mm"])],
                                  [float(b["x_mm"]), float(b["y_mm"])]],
                       "width_mm": float(e.get("width_mm") or 0.0)})
+    pours = [list(p) for p in (pours_by_layer.get(layer) or [])]
     paths = [p for p in paths if p["width_mm"] > 0]
-    if not paths:
+    if not paths and not pours:
         return _err("the tracks on %r carry no width, so the region is degenerate"
                     % layer, "NOT_APPLICABLE")
 
-    cu_um = float(args.get("copper_um") or val.get("copper_um")
-                  or (by_layer[layer][0].get("copper_um") or 0.0))
+    on_layer = by_layer.get(layer) or []
+    cu_um = float(args.get("copper_um") or val.get("copper_um") or 0.0)
+    if not cu_um and on_layer:
+        cu_um = float(on_layer[0].get("copper_um") or 0.0)
+    if not cu_um:
+        # A pour-only net has no track edge to carry the stackup number, so the
+        # stackup is read directly; that is the same reading `board_ir_drop` uses.
+        cu_um = float((_O._cu_um_by_layer(board) or {}).get(layer) or 0.0)
     if not cu_um:
         return _err("neither the stackup nor the call states the copper thickness "
                     "of %r" % layer, "ARG_MISSING",
@@ -194,9 +243,29 @@ def board_current_field(board, args):
         area_mm2 += p["width_mm"] * ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
     for p in pads:
         area_mm2 += p["w_mm"] * p["h_mm"]
+    pour_area = sum(_ZF._poly_area(poly) for poly in pours)
+    area_mm2 += pour_area
     h_mm = args.get("h_mm")
     h_mm = float(h_mm) if h_mm is not None else w_min / 6.0
     need = area_mm2 / (h_mm * h_mm)
+    if need > budget and pours and args.get("h_mm") is None:
+        # A pour is tens of square millimetres of copper and the pitch that
+        # resolves a 0.3 mm track would be millions of unknowns. Coarsen to what
+        # the budget affords and SAY SO: R is an integral and is not biased by
+        # the pitch (a square is a square), but a grid coarser than the narrowest
+        # track can lose that track, and the halved-grid check below is the guard
+        # that decides whether the number may be published as a resistance.
+        h_mm = math.sqrt(area_mm2 / float(budget))
+        need = area_mm2 / (h_mm * h_mm)
+        pour_notes.append(
+            "the pour is %.3g mm^2 of copper and the pitch that resolves the "
+            "narrowest copper (%.3g mm) would be %.3g cells, so the grid was set "
+            "by the %.0f-cell budget to %.4g mm%s"
+            % (pour_area, w_min, area_mm2 / ((w_min / 6.0) ** 2), budget, h_mm,
+               "" if h_mm <= w_min / 4.0 else
+               "; that is coarser than %.3g mm, so a thin track on this layer can "
+               "be dropped from the mask and the resistance read HIGH"
+               % (w_min / 4.0)))
     if need > budget:
         return _err("this net cannot be resolved on %d unknowns: the narrowest "
                     "copper is %.3g mm, which needs a %.3g mm grid, and %.6g mm^2 "
@@ -209,7 +278,7 @@ def board_current_field(board, args):
     def _solve(pitch):
         return _CF.current_density_field(
             paths=paths,
-            polygons=[p["polygon"] for p in pads],
+            polygons=[p["polygon"] for p in pads] + pours,
             thickness_mm=cu_um / 1000.0,
             rho_ohm_mm=_RHO_MM_20 * (1.0 + _ALPHA * (temp_c - 20.0)),
             source=contacts[src], sink=contacts[snk],
@@ -226,10 +295,24 @@ def board_current_field(board, args):
     # The finer grid is the answer; the coarse one is the check on it. When the
     # fine grid cannot be afforded or cannot solve, the coarse number is
     # published with is_grid_convergent false rather than as if it were confirmed.
+    coarse = out.get("value") or {}
     conv = {"h_mm": h_mm, "h_fine_mm": None,
-            "resistance_ohm": (out.get("value") or {}).get("resistance_ohm"),
+            "resistance_ohm": coarse.get("resistance_ohm"),
             "resistance_fine_ohm": None, "relative_change": None,
-            "is_grid_convergent": False}
+            "is_grid_convergent": False,
+            # The peak is a SEPARATE question from the resistance: R is an
+            # integral over the whole region and converges on any grid that
+            # connects it, while the peak sits wherever the geometry is sharpest.
+            # A reentrant corner gives J ~ r^(-1/3), so halving the grid grows
+            # the peak by 2^(1/3) = 1.2599 and never settles; that is a property
+            # of the shape, not of the grid, and quoting it as a physical
+            # current density is how a tool invents a hot spot on a straight run.
+            "peak_j_a_per_mm2": coarse.get("peak_j_a_per_mm2"),
+            "peak_j_fine_a_per_mm2": None,
+            "peak_growth": None,
+            "peak_growth_if_270deg_corner": _CF.REENTRANT_GROWTH_PER_HALVING,
+            "peak_is_grid_convergent": False,
+            "peak_convergence_threshold": _CF.PEAK_GROWTH_WARN}
     fine = None
     if 4.0 * need <= 4.0 * budget:
         fine = _solve(h_mm / 2.0)
@@ -242,6 +325,13 @@ def board_current_field(board, args):
         if r0 > 0.0:
             conv["relative_change"] = (r1 - r0) / r0
             conv["is_grid_convergent"] = abs(conv["relative_change"]) < 0.03
+        p1 = fv.get("peak_j_a_per_mm2")
+        conv["peak_j_fine_a_per_mm2"] = p1
+        p0 = conv["peak_j_a_per_mm2"]
+        if p0 and p1 is not None and float(p0) > 0.0:
+            conv["peak_growth"] = float(p1) / float(p0)
+            conv["peak_is_grid_convergent"] = (
+                conv["peak_growth"] <= _CF.PEAK_GROWTH_WARN)
         out = fine
     elif fine is not None:
         conv["fine_refused"] = {"reason_code": fine.get("reason_code"),
@@ -286,6 +376,7 @@ def board_current_field(board, args):
         "source_pad": src, "sink_pad": snk,
         "current_a": current_a, "copper_um": cu_um, "temp_c": temp_c,
         "paths": len(paths), "pad_polygons": len(pads),
+        "pour_polygons": len(pours), "pour_area_mm2": pour_area,
         "nodes": val.get("node_count"), "edges": val.get("edge_count"),
         "contacts": contacts,
     }
@@ -299,9 +390,19 @@ def board_current_field(board, args):
                 "net %r also has tracks on %s; those are a separate field and are "
                 "not in this one (a 2-D solve is one layer)"
                 % (net, ", ".join([l for l in layers if l != layer])))
-        out["notes"].append("the region is the file's copper on one layer plus its "
-                            "pads; vias, pours and the other layers of the same net "
-                            "are not in it")
+        out["notes"].extend(pour_notes)
+        if pours:
+            out["notes"].append(
+                "the region is the file's copper on %r: %d track(s), %d pad(s) and "
+                "%d pour polygon(s) (%.3g mm^2 of fill); vias and the other layers "
+                "of the same net are not in it, and the pour is taken as SOLID - a "
+                "real thermal relief between a pad and the pour is a resistance "
+                "this model does not have, so it is optimistic there"
+                % (layer, len(paths), len(pads), len(pours), pour_area))
+        else:
+            out["notes"].append("the region is the file's copper on one layer plus "
+                                "its pads; vias, pours and the other layers of the "
+                                "same net are not in it")
         if conv["is_grid_convergent"]:
             out["notes"].append(
                 "the resistance is confirmed on a grid twice as fine: %.6g ohm at "
@@ -314,6 +415,31 @@ def board_current_field(board, args):
                 "the resistance is NOT confirmed: the grid was not halved or the "
                 "two grids disagree by more than 3 % (see value.grid_convergence). "
                 "Treat the number as a shape, not a resistance")
+        if conv["peak_growth"] is None:
+            out["notes"].append(
+                "the PEAK current density has no refinement to check it against, "
+                "so it is published as a shape: at a contact edge the density is "
+                "singular by construction (the contact is an equipotential island "
+                "with a hard edge), and it must not be read as a failure point")
+        elif conv["peak_is_grid_convergent"]:
+            out["notes"].append(
+                "the PEAK current density is confirmed on the finer grid: %.4g "
+                "A/mm^2 at %.3g mm against %.4g at %.3g mm (x%.4f, threshold "
+                "x%.4f), so the hot spot is resolved geometry and not a "
+                "singularity"
+                % (conv["peak_j_a_per_mm2"], conv["h_mm"],
+                   conv["peak_j_fine_a_per_mm2"], conv["h_fine_mm"],
+                   conv["peak_growth"], conv["peak_convergence_threshold"]))
+        else:
+            out["notes"].append(
+                "the PEAK current density is NOT confirmed: halving the grid grew "
+                "it by x%.4f (%.4g -> %.4g A/mm^2) against x%.4f for a 270 degree "
+                "corner, where J ~ r^(-1/3) and the peak never settles. The hot "
+                "spot sits on a geometric or contact singularity, so read the "
+                "region's resistance and the ring values, not this peak"
+                % (conv["peak_growth"], conv["peak_j_a_per_mm2"],
+                   conv["peak_j_fine_a_per_mm2"],
+                   conv["peak_growth_if_270deg_corner"]))
     out["basis"] = (out.get("basis") or "") + (
         "; the region and the contacts come from the .kicad_pcb: tracks of one net "
         "on one layer as the graph publishes them, pads as rectangles, thickness "

@@ -56,6 +56,20 @@ def _limit_three_w(facts):
     return 3.0 * w, "3 x trace_width_mm"
 
 
+def _limit_three_w_rf(facts):
+    """3W on the RF LINE's own width, which the measurement already knows.
+
+    `trace_width_mm` is the generic input a caller supplies; an RF rule graded
+    against it would be graded against whichever trace the caller happened to
+    have in mind. The ruleset measures the narrowest RF track on the board
+    (`rf_line_width_mm`) and that is the width 3W is three times.
+    """
+    w = _n(facts.get("rf_line_width_mm"))
+    if w is not None:
+        return 3.0 * w, "3 x rf_line_width_mm (the narrowest RF track measured)"
+    return _limit_three_w(facts)
+
+
 def _limit_lambda20(facts):
     f = _n(facts.get("freq_ghz"))
     if f is None:
@@ -186,7 +200,7 @@ LAYOUT_RULES = [
        "measure the inner radius of the tightest bend on the RF net",
        "L1", "rf-circuit-design 3.4 (最小弯曲半径 3w)",
        "below 3w the corner behaves as a shunt capacitance and the local width "
-       "no longer matches the impedance", limit_fn=_limit_three_w),
+       "no longer matches the impedance", limit_fn=_limit_three_w_rf),
     _r("layout.rf_spacing_3w",
        "adjacent same-layer traces keep 3 line widths of edge-to-edge gap",
        "isolation", "High", "rf_min_spacing_to_other_trace_mm", "mm", "min", None,
@@ -194,7 +208,7 @@ LAYOUT_RULES = [
        "L1", "kicad-free (3W 规则); rf-circuit-design 3.4",
        "3W is the point where coupling to a neighbour stops moving the impedance; "
        "below it the neighbour is part of your matching network",
-       limit_fn=_limit_three_w),
+       limit_fn=_limit_three_w_rf),
     _r("layout.rf_to_board_edge",
        "RF lines stay at least 3 mm from the board edge",
        "isolation", "Medium", "rf_min_distance_to_edge_mm", "mm", "min", 3.0,
@@ -439,7 +453,8 @@ def design_rules(kind="layout", ids=None, severity=None):
             row["limit"] = r["limit"]
         rows.append(row)
     facts = sorted(set(r["fact"] for r in rules) |
-                   set(("trace_width_mm", "freq_ghz", "er", "current_a",
+                   set(("trace_width_mm", "rf_line_width_mm", "freq_ghz",
+                        "er", "current_a",
                         "current_standard", "allowed_delta_t_c", "copper_oz",
                         "layer", "voltage_v", "pollution_degree",
                         "material_group", "pcb_material", "transient_v")))
@@ -543,7 +558,8 @@ def review(kind, facts):
     rules = CATALOGUES[k]
     checks = [_grade(r, facts) for r in rules]
     known_facts = set(r["fact"] for r in rules) | {
-        "trace_width_mm", "freq_ghz", "er", "current_a", "current_standard",
+        "trace_width_mm", "rf_line_width_mm", "freq_ghz", "er", "current_a",
+        "current_standard",
         "allowed_delta_t_c", "copper_oz", "layer", "voltage_v",
         "pollution_degree", "material_group", "pcb_material", "transient_v"}
     unknown = sorted(set(facts) - known_facts)

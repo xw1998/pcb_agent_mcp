@@ -24,6 +24,7 @@ that was and how many others there were.
 from __future__ import annotations
 
 import math
+import time
 
 from ..calc import crosstalk as _X
 
@@ -250,14 +251,22 @@ def board_crosstalk(board, args):
                     extra={"closest_parallel": near,
                            "layers_with_both": common})
 
-    worst = runs[0]
-    wa, wb = worst["width_a_mm"], worst["width_b_mm"]
-    if abs(wa - wb) / max(wa, wb) > 0.10:
-        return _err("the closest run has %s at %.4g mm wide and %s at %.4g mm: the "
-                    "solver has ONE width and the pair is symmetric, so solving "
-                    "this would be solving a pair that is not on the board"
-                    % (net_a, wa, net_b, wb), "ARG_INVALID",
-                    extra={"runs": runs[:5]})
+    # `args.get("max_runs") or 1` turns 0 into 1, which silently solves a run the
+    # caller asked NOT to solve - so 0 has to survive to the range check.
+    raw_runs = args.get("max_runs")
+    if raw_runs is None or raw_runs == "":
+        want_runs = 1
+    else:
+        n_runs = _num(raw_runs)
+        if n_runs is None:
+            return _err("max_runs must be a number: it is how many coupled runs "
+                        "get their own field solve", "ARG_INVALID")
+        want_runs = int(n_runs)
+    if want_runs < 1:
+        return _err("max_runs must be >= 1: a run that is not solved contributes "
+                    "nothing, so asking for zero solves is not a request",
+                    "ARG_RANGE")
+    want_runs = min(want_runs, 8)
 
     ref = reference_plane(board, layer)
     if not ref:
@@ -272,28 +281,67 @@ def board_crosstalk(board, args):
     if copper_um is None:
         copper_um = next((_num(l.get("copper_um")) for l in (board.stackup or [])
                           if l.get("name") == layer), None) or 0.0
-
     dielectric_mm = _num(args.get("dielectric_mm")) or ref["dielectric_mm"]
-    out = _X.coupled_lines(
-        str(args.get("kind") or ("microstrip" if ref["outer"] else "stripline")),
-        wa, worst["gap_mm"], dielectric_mm, worst["overlap_mm"], rise,
-        copper_um=float(copper_um), er=float(er),
-        amplitude_v=float(args.get("amplitude_v") or 1.0),
-        termination_ohm=(None if args.get("termination_ohm") is None
-                         else float(args["termination_ohm"])),
-        mesh_div=int(args.get("mesh_div") or 12),
-        samples_per_delay=int(args.get("samples_per_delay") or 60),
-        waveform_points=int(args.get("waveform_points") or 101))
-    if out.get("status") != "ok":
-        return out
+    kind = str(args.get("kind") or ("microstrip" if ref["outer"] else "stripline"))
+
+    # Solve the runs in rank order, up to max_runs of them. A run whose two lines
+    # are different widths is REFUSED BY NAME rather than dropped: the solver has
+    # one width for a symmetric pair, so that run is not the pair on the board,
+    # and "the second-closest run was skipped and nobody said why" is how a tool
+    # reports crosstalk for a pair that does not exist.
+    solved, refused = [], []
+    for rank, run in enumerate(runs[:want_runs], 1):
+        wa, wb = run["width_a_mm"], run["width_b_mm"]
+        if abs(wa - wb) / max(wa, wb) > 0.10:
+            refused.append({
+                "rank": rank, "width_a_mm": wa, "width_b_mm": wb,
+                "gap_mm": run["gap_mm"], "overlap_mm": run["overlap_mm"],
+                "at_mm": list(run["at_mm"]),
+                "why": "the two lines are %.4g mm and %.4g mm wide and the solver "
+                       "has ONE width for a symmetric pair, so this run is not the "
+                       "pair on the board" % (wa, wb)})
+            continue
+        started = time.time()
+        one = _X.coupled_lines(
+            kind, wa, run["gap_mm"], dielectric_mm, run["overlap_mm"], rise,
+            copper_um=float(copper_um), er=float(er),
+            amplitude_v=float(args.get("amplitude_v") or 1.0),
+            termination_ohm=(None if args.get("termination_ohm") is None
+                             else float(args["termination_ohm"])),
+            mesh_div=int(args.get("mesh_div") or 12),
+            samples_per_delay=int(args.get("samples_per_delay") or 60),
+            waveform_points=int(args.get("waveform_points") or 101))
+        one["elapsed_s"] = round(time.time() - started, 2)
+        if one.get("status") != "ok":
+            # A solver failure is about the stackup or the arguments, not about
+            # which run it was: say which run, then hand the error up unchanged.
+            one["run_rank"] = rank
+            one["run_at_mm"] = list(run["at_mm"])
+            return one
+        solved.append({"rank": rank, "run": run, "solve": one})
+
+    if not solved:
+        first = refused[0]
+        return _err("the closest run has %s at %.4g mm wide and %s at %.4g mm: the "
+                    "solver has ONE width and the pair is symmetric, so solving "
+                    "this would be solving a pair that is not on the board"
+                    % (net_a, first["width_a_mm"], net_b, first["width_b_mm"]),
+                    "ARG_INVALID",
+                    extra={"runs": runs[:5], "refused_runs": refused})
+
+    best = solved[0]
+    worst = best["run"]
+    wa = worst["width_a_mm"]
+    out = best["solve"]
 
     info = {
         "net_a": net_a, "net_b": net_b, "layer": layer,
-        "kind": str(args.get("kind") or ("microstrip" if ref["outer"] else "stripline")),
+        "kind": kind,
         "width_mm": wa, "spacing_mm": worst["gap_mm"],
         "length_mm": worst["overlap_mm"], "dielectric_mm": dielectric_mm,
         "er": float(er), "rise_time_ns": rise, "copper_um": float(copper_um),
         "run_at_mm": worst["at_mm"], "run_angle_deg": worst["angle_deg"],
+        "run_rank": best["rank"],
         "candidate_runs": len(runs),
         "runs": [{k: r[k] for k in ("gap_mm", "overlap_mm", "width_a_mm",
                                     "width_b_mm", "angle_deg", "at_mm")}
@@ -302,8 +350,23 @@ def board_crosstalk(board, args):
                                           "nearest", "outer")},
         "er_from_stackup": ref["er"],
     }
+
+    def _brief(s):
+        v = s["solve"].get("value") or {}
+        return {"rank": s["rank"],
+                "gap_mm": s["run"]["gap_mm"],
+                "overlap_mm": s["run"]["overlap_mm"],
+                "angle_deg": s["run"]["angle_deg"],
+                "at_mm": list(s["run"]["at_mm"]),
+                "width_a_mm": s["run"]["width_a_mm"],
+                "width_b_mm": s["run"]["width_b_mm"],
+                "elapsed_s": s["solve"].get("elapsed_s"),
+                "next": v.get("next"), "fext": v.get("fext")}
+
+    rows = [_brief(s) for s in solved]
     value = out.get("value")
-    out["value"] = {"crosstalk": value, "board": info}
+    out["value"] = {"crosstalk": value, "board": info,
+                    "runs_solved": rows, "runs_refused": refused}
     for key in ("not_modelled", "authoritative", "where_the_rest_is"):
         if key in out:
             out["value"][key] = out.pop(key)
@@ -312,11 +375,23 @@ def board_crosstalk(board, args):
     notes = notes if isinstance(notes, list) else []
     out["notes"] = notes
     notes.append(
-        "solved on the closest of %d coupled run(s): %s and %s are parallel to "
-        "%.1f deg, %.4g mm apart edge to edge, for %.4g mm around (%.4g, %.4g) mm. "
-        "The other runs are listed but not solved - each is a full field solution"
-        % (len(runs), net_a, net_b, worst["angle_deg"], worst["gap_mm"],
-           worst["overlap_mm"], worst["at_mm"][0], worst["at_mm"][1]))
+        "solved %d of %d coupled run(s) (max_runs=%d): run #%d is %s and %s, "
+        "parallel to %.1f deg, %.4g mm apart edge to edge, for %.4g mm around "
+        "(%.4g, %.4g) mm, computed in %.1f s. Every run is its own full 2-D field "
+        "solution of its own pair, which is why the NUMBER solved is the caller's "
+        "choice - pass max_runs to solve more of them (up to 8)"
+        % (len(solved), len(runs), want_runs, best["rank"], net_a, net_b,
+           worst["angle_deg"], worst["gap_mm"], worst["overlap_mm"],
+           worst["at_mm"][0], worst["at_mm"][1],
+           best["solve"].get("elapsed_s") or 0.0))
+    if len(solved) < len(runs):
+        notes.append(
+            "%d of the %d coupled run(s) are not solved here: max_runs=%d covers "
+            "the %d closest and %d of those could not be solved as a symmetric "
+            "pair; the rest are listed in board.runs with their own gap and "
+            "overlap so a tighter run can be picked by hand"
+            % (len(runs) - len(solved), len(runs), want_runs, len(runs[:want_runs]),
+               len(refused)))
     if ref["both_sides"] and len(ref["both_sides"]) == 2:
         notes.append(
             "the trace has copper on both sides (%.4g mm %s / %.4g mm %s); the "
@@ -333,6 +408,7 @@ def board_crosstalk(board, args):
         "the rise time is the caller's because no board file has one")
     out.setdefault("assumptions", {})
     out["assumptions"]["board_crosstalk"] = (
-        "one straight parallel run, single reference plane, same termination at "
-        "all four ports as crosstalk_coupled_lines documents")
+        "each solved run is one straight parallel pair over a single reference "
+        "plane with the same termination at all four ports as crosstalk_coupled_"
+        "lines documents; runs are solved independently of each other")
     return out

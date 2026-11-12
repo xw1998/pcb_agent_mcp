@@ -8302,13 +8302,19 @@ _tool(
     "board_current_field",
     "2-D current density on the board's OWN copper: one net, one layer, driven between two "
     "pads you name. The region is the file's tracks of that net as board_ir_drop's graph "
-    "publishes them, plus the pads as rectangles and the stackup's copper thickness - so "
+    "publishes them, plus the pads as rectangles, the pours of that net on that layer "
+    "and the stackup's copper thickness - so "
     "the peak J is where a board actually fails (a bend, a width step, the funnel into a "
     "pad), which a 1-D J=I/(w*t) cannot see. The 1-D answer on the same pair is printed "
     "beside it with the relative difference: they are different measurements, and a large "
     "gap means the 1-D number is optimistic at the contact. One layer per answer (a net "
-    "that hops through a via is two fields); vias, pours and the net's other layers are "
-    "named as not in the region rather than merged in.",
+    "that hops through a via is two fields); vias and the net's other layers are named as "
+    "not in the region rather than merged in. A pour IS copper, so a plane-heavy net is "
+    "solved on its fill (the pour is taken as solid - a thermal relief is a resistance "
+    "this model does not have, so it is optimistic there); a pour is large, so when the "
+    "pitch the narrowest track needs would be unaffordable the grid is set by the cell "
+    "budget and said out loud, and the halved-grid check decides whether the resistance "
+    "may be published as a resistance.",
     {"type": "object", "properties": dict(
         _COMMON,
         net=_str("the net to solve, as board_nets spells it"),
@@ -8325,6 +8331,9 @@ _tool(
         levels=_num("multigrid levels", 4),
         frequency_hz=_num("AC field: reduce the sheet to the skin-effective thickness"),
         max_nodes=_num("copper graph node cap", 60000),
+        model_pours={"type": "boolean",
+                     "description": "solve the net's pours as copper too (default "
+                                    "true); false is the track-only answer"},
     ), "required": ["path", "net", "source_pad", "sink_pad"]},
     _board_tool(lambda b, a: _simfield.board_current_field(b, a), derived=True),
 )
@@ -8340,8 +8349,15 @@ _tool(
     "that is 30 % empty in its corner rings like the box, not like its copper; when the "
     "stackup has no er the answer is a REFUSAL (substituting 4.3 would silently set every "
     "mode); and a mode list is not a verdict - a mode is not a problem without an "
-    "excitation and a coupling, and neither is in a board file, so via_fence and plane_q "
-    "stay separate questions. Which layers are the plates: pass layer_a/layer_b, or let "
+    "excitation and a coupling, and neither is in a board file. Each mode does carry "
+    "its damping: 1/Q = 1/Qc + 1/Qd + 1/Qrad with Qc = h/delta_s (copper, moves with "
+    "sqrt(f) only), Qd = 1/tan_delta from the stackup's loss_tangent (capacitance-"
+    "weighted across the sublayers) and Qrad from the narrow-slot open-edge model over "
+    "all four edges; which losses went into a mode's q_total is listed per mode, and a "
+    "loss_tangent the file does not state is named as lossless rather than guessed. "
+    "What is NOT in it is whatever is soldered across the planes - usually the dominant "
+    "loss of a real PDN resonance. Via_fence stays a separate question, as does "
+    "plane_q on its own. Which layers are the plates: pass layer_a/layer_b, or let "
     "it take the two pours that cover the most of the box. A board with fewer than two "
     "poured layers is refused, with the pours it did find named.",
     {"type": "object", "properties": dict(

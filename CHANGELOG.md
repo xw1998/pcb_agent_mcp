@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.0.148] - 2026-11-12
+
+`0.0.147` 之后收的八件事，落点全在「规则到底量了什么」和「仿真到底算了什么」（`docs/139`）：
+
+- **RF 六条规则从「文件里没写」变成真测量**（`ruleset/measure.py::_rf_facts`）。哪些网是 RF，从**网名按整词**读（`RF/ANT/FEED/LNA/GPS/WIFI` 与 `2G4/5G8/433M` 这类频段拼写；`TX/RX` 故意不算——开发板上那是 UART；`BT` 不能子串命中 `BAT+`；KiCad 的 `unconnected-(U5-ANT-Pad24)` 是标签不是网）。读数里写明取了哪几个网名，取不到才回 `undetermined`，调用方仍可经 `facts` 指定。
+- **直角判据数错了量**（真缺陷）：原实现读的是两条边之间的夹角，于是一条被切成两段的**直线**（180° 共线）会被算成直角。改成读**方向转过的角度**（共线 0°、直角 90°、45° 斜切 45°），阈值 `>= 89°`，命中项带坐标与转角。
+- **`_rec` 把 bool 变成 float**（真缺陷）：`float(True)` 让 `calc/rules.py` 的 `bool_true/bool_false` 一律落到「must be true/false」，本模块量出来的每个布尔事实判分时都降级成 undetermined。现在 bool 原样保留。
+- **两处口径**：`take_lb` 只搬了限值、丢掉实测值（`measured` 为空）；`3W` 改吃 `rf_line_width_mm`（板上最细的 RF 走线）而不是调用方心里那条线的 `trace_width_mm`，该事实进 `known_facts`/`facts_a_rule_may_need`；`rf_line_z0_error_pct` 永远 `_na`——目标阻抗是设计决定，只有 `feedline_impedance` 有权回答。
+- **串扰默认只解最严重的一段**（`sim/couple.py::max_runs`）：一次整板求解实测 **285.8 s**，默认 `max_runs=1`、上限 8，被拒的段逐一具名进 `runs_refused`，`max_runs=0` 报 `ARG_RANGE`（原来 `or 1` 把 0 吃掉了）。
+- **峰值 J 单独做网格收敛**（`sim/field.py`）：R 0.013992→0.013986（0.043 %）确认收敛，而 **J 29.7096→30.8407（×1.0381）不确认**；阈值用既有 `PEAK_GROWTH_WARN=1.02`、270° 内角参考 `2**(1/3)=1.2599`，不确认时 notes 明确「读这一区的电阻与 ring 值，不要引这个峰值」。
+- **`board_current_field` 把铺铜当铜**：铺铜检测提到 `board_ir_drop` 之前（只靠铺铜连的网否则是 `singular`），`model_pours` 默认 true、false 才退成纯走线；铜厚走 `_cu_um_by_layer` 兜底；网格预算冲突时**粗化并说出代价**（`pour_notes`）。实测 `paths=0 / pour_area_mm2=144 / R=0.0035974` 的板子给出读数，同一次里峰值仍不收敛（×1.1861）。
+- **腔模带三项阻尼**（`sim/planes.py`）：每个模给 `1/Q = 1/Qc + 1/Qd + 1/Qrad` 与逐项值，`tan_delta` 按**电容权重 t/er** 跨层混合（实测 0.0201477，既非厚度加权 0.0202857 也非算术平均 0.014）；缺 `loss_tangent` 的层**计为无损耗并在 `missing_tand_in` 具名**，不猜 FR4 默认值。stickhub 真板 (0,1) 1.7665 GHz：Qc 960.4 / Qd 50 / Qrad 13.47 ⇒ **Q 10.50**，这块小板上辐射是主项。不写判词——高 Q 不等于坏。
+- **自检里那三条红是守卫写错了**（`server.py`）：`--selftest` 长期 363/366，三条都断言 `find_ngspice(allow_bundled=True) == bundle`，而代码与 docstring 写的是「`PCB_AGENT_NGSPICE` 与 PATH 排在 bundle 之前」（`0.0.112` 改过文、行为没动）——本机 `ngspice-47` 在 PATH 上，断言恒红。改成断言真正承诺的两半：默认回答永远不含 bundle，`allow_bundled` 只在没安装时补位；另两条把 A 卡读数改用优先级最高的入口（`PCB_AGENT_NGSPICE`）显式路由到 bundle 再测，测完还原环境变量。修后 **366/366 passed in 92.8 s**，单元侧补一例覆盖「补位而不覆盖」。
+
 ## [0.0.147] - 2026-11-12
 
 `0.0.146` 之后跑了一次全量回归：**4108 passed / 48 failed**，修完再跑就是

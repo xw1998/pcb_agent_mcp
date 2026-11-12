@@ -1830,27 +1830,66 @@ def selftest(verbose=False):
         _default = _spice_mod.find_ngspice()
         _asked = _spice_mod.find_ngspice(allow_bundled=True)
         if _bundled:
-            check("the bundled engine is found only when asked for: find_ngspice() "
-                  "still reports the machine's own copy (%s), "
-                  "find_ngspice(allow_bundled=True) reports the bundle"
+            # 0.0.148: the old form of this check asserted `asked == bundled`,
+            # which contradicts the ranking the code and `find_ngspice`'s own
+            # docstring state: PCB_AGENT_NGSPICE and PATH outrank a vendored
+            # binary, and the bundle is the FALLBACK. So on a machine that has
+            # ngspice installed, `asked` is the installed copy and the old
+            # assertion was red for the right reason - the guard was wrong, not
+            # the ranking. What is actually promised: the bundle never appears
+            # in the default answer, and allow_bundled never overrides an
+            # explicit one.
+            check("the bundled engine cannot change the meaning of a lookup: "
+                  "find_ngspice() reports the machine's own copy (%s) and never "
+                  "the bundle, and allow_bundled=True only fills a gap - it "
+                  "returns the bundle when nothing is installed and the "
+                  "installed copy otherwise, because PATH and PCB_AGENT_NGSPICE "
+                  "are statements about this machine"
                   % (_default[0] if _default else "none"),
                   _bundled[0] not in (_default or [])
-                  and _asked == _bundled
+                  and (_asked == _default if _default else _asked == _bundled)
                   and _bundled[0].endswith("ngspice_con.exe"),
-                  str(_asked))
+                  "%r / %r" % (_default, _asked))
         else:
             check("no bundle in this checkout, so allow_bundled changes nothing",
                   _asked == _default, str(_asked))
+
+        def _sim_with_bundle(netlist, rid):
+            """Run a deck on `engine='ngspice'` pointed AT the bundle.
+
+            The claim below is about the bundled binary, not about whatever
+            `engine='ngspice'` happens to resolve to here, so the deck is routed
+            through the one input that outranks everything (`PCB_AGENT_NGSPICE`).
+            Testing the resolution and testing the binary are two questions and
+            the check above is the one about resolution.
+            """
+            import os as _os
+            key = _spice_mod.NGSPICE_ENV
+            prev = _os.environ.get(key)
+            _os.environ[key] = _bundled[0]
+            try:
+                _r = handle({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                             "params": {"name": "sim_spice", "arguments": {
+                                 "netlist": netlist, "engine": "ngspice"}}})
+            finally:
+                if prev is None:
+                    _os.environ.pop(key, None)
+                else:
+                    _os.environ[key] = prev
+            return json.loads(_r["result"]["content"][0]["text"])
 
         # 0.0.37: the A card is the whole reason for the bundle. This is an
         # XSPICE `gain` block: 1 V in, gain=2, so node 10 must read exactly 2 V -
         # and the envelope must admit that the deck was NOT parsed here.
         _GAIN = ("* xspice\nV1 1 0 1\nA1 1 10 g1\n.model g1 gain(gain=2.0)\n"
                  "R1 10 0 1k\n.op\n")
-        r = handle({"jsonrpc": "2.0", "id": 155, "method": "tools/call",
-                    "params": {"name": "sim_spice", "arguments": {
-                        "netlist": _GAIN, "engine": "ngspice"}}})
-        payload = json.loads(r["result"]["content"][0]["text"])
+        if _bundled:
+            payload = _sim_with_bundle(_GAIN, 155)
+        else:
+            r = handle({"jsonrpc": "2.0", "id": 155, "method": "tools/call",
+                        "params": {"name": "sim_spice", "arguments": {
+                            "netlist": _GAIN, "engine": "ngspice"}}})
+            payload = json.loads(r["result"]["content"][0]["text"])
         if _bundled:
             _n = (payload.get("value") or {}).get("nodes_v") or {}
             check("the bundled engine RUNS an XSPICE A card: gain(gain=2) on 1 V "
@@ -1872,10 +1911,13 @@ def selftest(verbose=False):
         _LIMIT = ("* lim\nV1 1 0 5\nA1 1 2 lim1\n"
                   ".model lim1 limit(in_offset=0 gain=1 out_lower_limit=-1 "
                   "out_upper_limit=1)\nR1 2 0 1k\n.op\n")
-        r = handle({"jsonrpc": "2.0", "id": 156, "method": "tools/call",
-                    "params": {"name": "sim_spice", "arguments": {
-                        "netlist": _LIMIT, "engine": "ngspice"}}})
-        payload = json.loads(r["result"]["content"][0]["text"])
+        if _bundled:
+            payload = _sim_with_bundle(_LIMIT, 156)
+        else:
+            r = handle({"jsonrpc": "2.0", "id": 156, "method": "tools/call",
+                        "params": {"name": "sim_spice", "arguments": {
+                            "netlist": _LIMIT, "engine": "ngspice"}}})
+            payload = json.loads(r["result"]["content"][0]["text"])
         if _bundled:
             _n = (payload.get("value") or {}).get("nodes_v") or {}
             check("a second code model behaves: limit(out_upper_limit=1) on 5 V "

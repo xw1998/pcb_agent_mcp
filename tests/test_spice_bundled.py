@@ -102,6 +102,26 @@ class TestLookupRules(unittest.TestCase):
             self.assertNotIn(BUNDLED[0], default or [])
         self.assertIsInstance(asked, (list, type(None)))
 
+    def test_allow_bundled_fills_a_gap_and_never_overrides_an_install(self):
+        # 0.0.148: the ranking is "PCB_AGENT_NGSPICE and PATH first, the bundle
+        # as the fallback". Both halves are asserted here on a machine with
+        # nothing installed, because the other half (an install wins) is what
+        # the selftest used to get wrong: it asserted `asked == bundled` and went
+        # red on every machine that already had ngspice on PATH.
+        from unittest import mock
+        old = spice.NGSPICE_CMD
+        try:
+            spice.NGSPICE_CMD = None
+            with mock.patch.dict(os.environ, {spice.NGSPICE_ENV: ""}, clear=False), \
+                    mock.patch("shutil.which", return_value=None), \
+                    mock.patch("glob.glob", return_value=[]):
+                default = spice.find_ngspice()
+                asked = spice.find_ngspice(allow_bundled=True)
+        finally:
+            spice.NGSPICE_CMD = old
+        self.assertIsNone(default)          # the default answer stays "nothing"
+        self.assertEqual(asked, BUNDLED)    # allow_bundled is exactly the gap
+
     def test_a_fake_engine_command_still_wins(self):
         # PCB_AGENT_NGSPICE (and the test stand-in) must outrank everything.
         old = spice.NGSPICE_CMD

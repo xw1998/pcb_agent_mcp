@@ -61,6 +61,29 @@ def _board(width_mm=1.0, extra=""):
     return K.parse_board(path)
 
 
+POUR = """  (zone (net 1) (net_name "VCC") (layer "F.Cu") (hatch edge 0.5)
+    (connect_pads yes (clearance 0.2)) (min_thickness 0.2)
+    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))
+    (polygon (pts (xy 2 8) (xy 38 8) (xy 38 12) (xy 2 12)))
+    (filled_polygon (layer "F.Cu") (pts (xy 2 8) (xy 38 8) (xy 38 12) (xy 2 12))))"""
+
+def _pour_board():
+    """VCC between U1.1 and U2.1 with NO track at all: the pour is the copper."""
+    text = ['(kicad_pcb (version 20221018) (generator pcbnew)',
+            '  (general (thickness 1.6))',
+            '  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))',
+            STACKUP,
+            '  (net 0 "") (net 1 "VCC") (net 2 "GND")',
+            '  (gr_rect (start 0 0) (end 40 20) (layer "Edge.Cuts") (width 0.1))',
+            PADS,
+            POUR,
+            ')']
+    path = os.path.join(tempfile.gettempdir(),
+                        "board_field_pour_%d.kicad_pcb" % os.getpid())
+    with open(path, "w", newline="") as fh:
+        fh.write("\n".join(text) + "\n")
+    return K.parse_board(path)
+
 ONE_A = {"net": "VCC", "source_pad": "U2.1", "sink_pad": "U1.1"}
 
 
@@ -111,11 +134,75 @@ class TestTheRegionIsTheBoard(unittest.TestCase):
                             cmp["peak_j_1d_a_per_mm2"])
         self.assertIsNotNone(cmp["relative_difference"])
 
+    def test_the_resistance_is_confirmed_but_the_peak_is_not(self):
+        # These are two different questions and the answer must not let one
+        # vouch for the other. Measured on this board: R 0.013992 against
+        # 0.013986 (0.043 % apart, confirmed) while the peak went 29.7096 ->
+        # 30.8407 A/mm^2 when the grid was halved - x1.0381, far inside the
+        # x1.2599 a 270 degree corner would give, but well over the x1.02 a
+        # resolved peak has to be under. The peak sits on the contact edge,
+        # which is an equipotential island with a hard edge and is singular by
+        # construction, so it is published as a shape.
+        out = _field(_board())
+        c = out["value"]["grid_convergence"]
+        self.assertTrue(c["is_grid_convergent"], c)
+        self.assertIsNotNone(c["h_fine_mm"], c)
+        self.assertIsNotNone(c["peak_j_fine_a_per_mm2"], c)
+        self.assertIsInstance(c["peak_is_grid_convergent"], bool)
+        self.assertFalse(c["peak_is_grid_convergent"], c)
+        self.assertGreater(c["peak_growth"], 1.0)
+        self.assertLess(c["peak_growth"], c["peak_growth_if_270deg_corner"])
+        self.assertAlmostEqual(c["peak_growth_if_270deg_corner"],
+                               2.0 ** (1.0 / 3.0), places=12)
+        self.assertAlmostEqual(c["peak_convergence_threshold"], 1.02, places=12)
+        self.assertAlmostEqual(
+            c["peak_j_fine_a_per_mm2"] / c["peak_j_a_per_mm2"],
+            c["peak_growth"], places=12)
+        peak_note = [n for n in out["notes"] if "PEAK" in n]
+        self.assertEqual(len(peak_note), 1, peak_note)
+        self.assertIn("NOT confirmed", peak_note[0])
+        self.assertIn("not this peak", peak_note[0])
+        self.assertIn("x%.4f" % c["peak_growth"], peak_note[0])
+
     def test_the_same_question_twice_is_the_same_number(self):
         a = _field(_board())["value"]["resistance_ohm"]
         b = _field(_board())["value"]["resistance_ohm"]
         self.assertEqual(a, b)
 
+
+class TestThePourIsCopper(unittest.TestCase):
+    """A plane-heavy net has no track between its pads: the pour IS the path.
+
+    This used to be refused ("a net made only of a pour has no 2-D region here"),
+    which is the wrong answer from a field tool - the pour is copper on the net,
+    it is usually the only thing joining the two halves, and refusing it means
+    the answer is missing exactly on the boards where the question matters.
+    """
+
+    def test_a_pour_carries_the_current_when_there_is_no_track(self):
+        out = _field(_pour_board())
+        self.assertEqual(out["status"], "ok", out)
+        v = out["value"]
+        self.assertEqual(v["board"]["paths"], 0)
+        self.assertEqual(v["board"]["pour_polygons"], 1)
+        self.assertEqual(v["board"]["layer"], "F.Cu")
+        # 36 x 4 mm of 35 um copper between contacts 30 mm apart: the sheet is
+        # ~0.4926 ohm/sq, so a 30/4 = 7.5 square run is ~0.0037 ohm and the fill
+        # either side of the contacts makes it lower still
+        r = v["resistance_ohm"]
+        self.assertGreater(r, 0.0)
+        self.assertLess(r, 0.005)
+        self.assertIsNotNone(v["board"]["pour_area_mm2"])
+        self.assertAlmostEqual(v["board"]["pour_area_mm2"], 144.0, places=6)
+        self.assertTrue(any("pour" in n for n in out["notes"]), out["notes"])
+        self.assertFalse(any("are not in it" in n and "pours" in n
+                             for n in out["notes"]), out["notes"])
+
+    def test_asking_for_no_pour_refuses_a_pour_only_net(self):
+        out = _field(_pour_board(), model_pours=False)
+        self.assertEqual(out["status"], "error", out)
+        self.assertIn(out["reason_code"],
+                      ("NOT_APPLICABLE", "NO_GEOMETRY", "NOT_CONNECTED"), out)
 
 class TestWhatIsRefused(unittest.TestCase):
     def test_a_pad_on_another_net_is_refused(self):
