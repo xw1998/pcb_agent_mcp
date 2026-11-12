@@ -594,6 +594,202 @@ class PadsAndFields(EditBase):
                         "field": "Value"})
         self.assertEqual(ctx.exception.code, "ARG_MISSING")
 
+class DrilledPads(EditBase):
+    """Turning an SMD pad into a drilled pad.
+
+    An SMD pad is on the layers it names - usually one. A header pin has to join
+    copper on both sides, and the only pad type that does that is a drilled one.
+    A board where every pad says `smd` looks complete in the editor and is
+    electically one-sided underneath, which is exactly the failure this op is
+    for. So the tests below check the three things that make a pad drilled: the
+    type atom, the `(drill ...)` node, and `*.Cu` in the layers - plus the gate
+    re-reading them.
+    """
+
+    def test_a_round_hole_makes_the_pad_thru_hole_on_every_layer(self):
+        plan, _ = self.apply({"op": "set_pad_drill", "ref": "R1", "pad": "1",
+                              "drill": 0.4})
+        detail = plan["operations"][0]["detail"]
+        self.assertEqual(detail["pads"][0]["type"], "thru_hole")
+        self.assertAlmostEqual(detail["pads"][0]["annular_ring_mm"], 0.4,
+                               places=6)
+        pad = S.children(self.footprint("R1"), "pad")[0]
+        self.assertEqual(S.arg_text(pad, 2), "thru_hole")
+        drill = S.child(pad, "drill")
+        self.assertIsNotNone(drill, "a thru_hole pad with no (drill ...) is not drilled")
+        self.assertAlmostEqual(S.arg_num(drill, 1), 0.4, places=9)
+        self.assertTrue(S.child(drill, "oval") is None, "0.4 is round, not a slot")
+        layers = S.child(pad, "layers")
+        have = [S.arg_text(layers, i) for i in range(1, 4)]
+        self.assertEqual([x for x in have if x], ["*.Cu", "*.Mask"])
+        size = S.child(pad, "size")
+        self.assertAlmostEqual(S.arg_num(size, 1), 1.2, places=9)
+        self.assertAlmostEqual(S.arg_num(size, 2), 1.4, places=9)
+        attr = S.child(self.footprint("R1"), "attr")
+        words = [S.arg_text(attr, i) for i in range(1, 8)]
+        self.assertIn("through_hole", words)
+        self.assertNotIn("smd", words)
+
+    def test_a_hole_as_big_as_the_pad_is_refused_with_both_numbers(self):
+        before = open(self.board, "rb").read()
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_pad_drill", "ref": "R1", "pad": "1",
+                        "drill": 1.2})
+        self.assertEqual(ctx.exception.code, "DRILL_TOO_LARGE")
+        message = str(ctx.exception)
+        self.assertIn("1.2", message)
+        self.assertIn("1.4", message)
+        self.assertIn("set_pad_size", message)
+        self.assertEqual(open(self.board, "rb").read(), before,
+                         "a refused op must not have touched the file")
+
+    def test_a_mounting_hole_gets_no_copper_ring(self):
+        plan, _ = self.apply({"op": "set_pad_drill", "ref": "R1", "pad": "1",
+                              "drill": 0.6, "kind": "np_thru_hole"})
+        pad = S.children(self.footprint("R1"), "pad")[0]
+        self.assertEqual(S.arg_text(pad, 2), "np_thru_hole")
+        size = S.child(pad, "size")
+        self.assertAlmostEqual(S.arg_num(size, 1), 0.6, places=9)
+        self.assertAlmostEqual(S.arg_num(size, 2), 0.6, places=9)
+        attr = S.child(self.footprint("R1"), "attr")
+        words = [S.arg_text(attr, i) for i in range(1, 8)]
+        self.assertNotIn("through_hole", words,
+                         "a mounting hole is not a through-hole part")
+        self.assertIn("smd", words)
+
+    def test_several_pads_at_once_and_a_missing_one_is_named(self):
+        plan, _ = self.apply({"op": "set_pad_drill", "ref": "R1",
+                              "pad": ["1", "2"], "drill": 0.4})
+        self.assertEqual([p["pad"] for p in
+                          plan["operations"][0]["detail"]["pads"]], ["1", "2"])
+        self.assertEqual([S.arg_text(p, 2) for p in
+                          S.children(self.footprint("R1"), "pad")],
+                         ["thru_hole", "thru_hole"])
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_pad_drill", "ref": "R1", "pad": "9",
+                        "drill": 0.4})
+        self.assertEqual(ctx.exception.code, "PAD_NOT_FOUND")
+        self.assertIn("1", str(ctx.exception))
+        self.assertIn("2", str(ctx.exception))
+
+    def test_paste_is_kept_only_when_asked_for(self):
+        self.apply({"op": "set_pad_drill", "ref": "R1", "pad": "1",
+                    "drill": 0.4, "paste": True})
+        layers = S.child(S.children(self.footprint("R1"), "pad")[0], "layers")
+        have = [S.arg_text(layers, i) for i in range(1, 5)]
+        self.assertEqual([x for x in have if x],
+                         ["*.Cu", "*.Mask", "*.Paste"])
+
+    def test_an_oval_slot_is_written_as_an_oval_drill(self):
+        plan, _ = self.apply({"op": "set_pad_drill", "ref": "R1", "pad": "2",
+                              "drill": [0.3, 0.9]})
+        self.assertEqual(plan["operations"][0]["detail"]["pads"][0]["drill"],
+                         [0.3, 0.9])
+        drill = S.child(S.children(self.footprint("R1"), "pad")[1], "drill")
+        self.assertEqual(S.arg_text(drill, 1), "oval")
+        self.assertAlmostEqual(S.arg_num(drill, 2), 0.3, places=9)
+        self.assertAlmostEqual(S.arg_num(drill, 3), 0.9, places=9)
+
+    def test_a_pad_number_that_repeats_is_refused_until_you_say_which(self):
+        self.add_star_footprint()
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_pad_drill", "ref": "H1", "pad": "1",
+                        "drill": 0.5})
+        self.assertEqual(ctx.exception.code, "PAD_AMBIGUOUS")
+        message = str(ctx.exception)
+        self.assertIn("3 times", message)
+        self.assertIn("occurrence", message)
+
+    def test_the_nth_pad_of_a_repeated_number_can_be_picked(self):
+        self.add_star_footprint()
+        plan, _ = self.apply({"op": "set_pad_drill", "ref": "H1", "pad": "1",
+                              "occurrence": 2, "drill": 0.5})
+        rows = plan["operations"][0]["detail"]["pads"]
+        self.assertEqual([r["occurrence"] for r in rows], [2])
+        pads = [p for p in S.children(self.footprint("H1"), "pad")
+                if S.arg_text(p, 1) == "1"]
+        self.assertEqual([S.arg_text(p, 2) for p in pads],
+                         ["smd", "thru_hole", "smd"],
+                         "only the second pad numbered 1 is drilled")
+        self.assertIsNone(S.child(pads[0], "drill"))
+        self.assertIsNone(S.child(pads[2], "drill"))
+
+    def test_all_of_a_repeated_number_at_once(self):
+        self.add_star_footprint()
+        plan, _ = self.apply({"op": "set_pad_drill", "ref": "H1", "pad": "1",
+                              "occurrence": "all", "drill": 0.5})
+        self.assertEqual(len(plan["operations"][0]["detail"]["pads"]), 3)
+        pads = [p for p in S.children(self.footprint("H1"), "pad")
+                if S.arg_text(p, 1) == "1"]
+        self.assertEqual([S.arg_text(p, 2) for p in pads], ["thru_hole"] * 3)
+
+    def test_a_named_occurrence_that_is_not_there_names_the_count(self):
+        self.add_star_footprint()
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_pad_drill", "ref": "H1", "pad": "1",
+                        "occurrence": 4, "drill": 0.5})
+        self.assertEqual(ctx.exception.code, "PAD_NOT_FOUND")
+        self.assertIn("3 occurrence", str(ctx.exception))
+
+    def test_a_slot_wider_than_the_pad_keeps_the_pad_when_asked(self):
+        # A USB-C shell slot is 1.7 mm long across a 1.0 mm pad: the slot does
+        # not fit "inside" the pad, but it is not supposed to - the pad is the
+        # plated strip along the slot. np_thru_hole + keep_size says exactly
+        # that instead of silently stamping a 1.7 mm square over the pad.
+        self.add_star_footprint()
+        self.apply({"op": "set_pad_drill", "ref": "H1", "pad": "5",
+                    "drill": [1.7, 0.6], "kind": "np_thru_hole",
+                    "keep_size": True})
+        pad = [p for p in S.children(self.footprint("H1"), "pad")
+               if S.arg_text(p, 1) == "5"][0]
+        size = S.child(pad, "size")
+        self.assertAlmostEqual(S.arg_num(size, 1), 1.0, places=9)
+        self.assertAlmostEqual(S.arg_num(size, 2), 2.0, places=9)
+        drill = S.child(pad, "drill")
+        self.assertEqual(S.arg_text(drill, 1), "oval")
+        self.assertAlmostEqual(S.arg_num(drill, 2), 1.7, places=9)
+        self.assertAlmostEqual(S.arg_num(drill, 3), 0.6, places=9)
+
+    def test_a_slot_poking_out_of_both_sides_is_refused(self):
+        self.add_star_footprint()
+        with self.assertRaises(O.OpError) as ctx:
+            self.apply({"op": "set_pad_drill", "ref": "H1", "pad": "5",
+                        "drill": [2.2, 0.6]})
+        self.assertEqual(ctx.exception.code, "DRILL_TOO_LARGE")
+        self.assertIn("2.2", str(ctx.exception))
+
+    def add_star_footprint(self):
+        """Append a footprint whose pads 1,1,1 repeat, plus a 1.0 x 2.0 pad 5."""
+        extra = '''  (footprint "Test:STAR" (layer "F.Cu") (at 30 25) (tstamp 00000000-0000-0000-0000-000000000050)
+    (attr smd)
+    (fp_text reference "H1" (at 0 -4) (layer "F.SilkS") (tstamp 00000000-0000-0000-0000-000000000051))
+    (fp_text value "STAR" (at 0 4) (layer "F.Fab") (tstamp 00000000-0000-0000-0000-000000000052))
+    (pad "1" smd circle (at -2.5 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "GND") (tstamp 00000000-0000-0000-0000-000000000053))
+    (pad "1" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "GND") (tstamp 00000000-0000-0000-0000-000000000054))
+    (pad "1" smd circle (at 2.5 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "GND") (tstamp 00000000-0000-0000-0000-000000000055))
+    (pad "5" smd oval (at 0 3) (size 1 2) (layers "F.Cu" "F.Mask") (net 2 "VCC") (tstamp 00000000-0000-0000-0000-000000000056))
+  )
+'''
+        text = open(self.board, "r", encoding="utf-8").read()
+        at = text.rstrip().rfind(")")
+        text = text[:at] + extra + text[at:]
+        with open(self.board, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+
+    def test_the_board_parser_reads_the_pad_back_as_thru_hole(self):
+        # The file text agreeing with itself proves nothing about the reader a
+        # clearance check uses. Go through the same parser the rest of the tool
+        # trusts and ask it what kind of pad that is.
+        from pcb_agent_mcp.adapters import kicad_pcb
+        self.apply({"op": "set_pad_drill", "ref": "R1", "pad": "1",
+                    "drill": 0.45})
+        board = kicad_pcb.parse_board(self.board)
+        fp = [f for f in board.footprints if f["ref"] == "R1"][0]
+        pad = [p for p in fp["pads"] if p.get("number") == "1"][0]
+        self.assertEqual(pad["type"], "thru_hole")
+        self.assertNotIn("smd", fp["attr"])
+
+
 class FieldGeometry(EditBase):
     """The optional layer / position / size arguments added in 0.0.98.
 

@@ -3523,6 +3523,269 @@ op("set_pad_net", {"copper", "nets"},
                    "(default false)"},
    _run_set_pad_net, _verify_set_pad_net)
 
+# --- drilled pads -----------------------------------------------------
+def _pad_widgets(ed, ref, numbers, occurrences=None):
+    """The pad nodes of one footprint, in the order asked for.
+
+    Missing pads are named rather than skipped: a plan that says "drill pad 3 of
+    P1" and silently drills nothing because P1 has 1..2 is the kind of quiet
+    no-op that reads as success.
+
+    Duplicate pad numbers are real - a thermal via star, a shield, a jumper are
+    all one number many times (the file even carries
+    `duplicate_pad_numbers_are_jumpers`). So a number that matches more than one
+    pad is refused unless the caller says which one (`occurrence=3`) or that it
+    means all of them (`occurrence="all"`). Drilling "the" pad 1 of a nine-pad
+    star without saying which is a guess, and a guess here writes copper.
+    """
+    fp = ed.footprint(ref)
+    have = {}
+    for pad in S.children(fp, "pad"):
+        n = S.arg_text(pad, 1)
+        if n is not None:
+            have.setdefault(n, []).append(pad)
+    missing = [n for n in numbers if n not in have]
+    if missing:
+        raise OpError("footprint %r has no pad %s (it has: %s)"
+                      % (ref, ", ".join(repr(m) for m in missing),
+                         ", ".join(sorted(have))), "PAD_NOT_FOUND")
+    occ = occurrences if occurrences is not None else [None] * len(numbers)
+    if not isinstance(occ, (list, tuple)):
+        occ = [occ] * len(numbers)
+    if len(occ) != len(numbers):
+        raise OpError("'occurrence' must be one value or one per pad (%d pads, "
+                      "%d occurrences)" % (len(numbers), len(occ)), "ARG_INVALID")
+    out = []
+    for number, which in zip(numbers, occ):
+        pads = have[number]
+        if which in (None, ""):
+            if len(pads) > 1:
+                raise OpError(
+                    "pad %r of %r appears %d times, so 'which one' is missing: "
+                    "pass occurrence=<n> (1-based) or occurrence=\"all\""
+                    % (number, ref, len(pads)), "PAD_AMBIGUOUS")
+            out.append((number, 1, pads[0]))
+            continue
+        if isinstance(which, str) and which.strip().lower() == "all":
+            out.extend((number, i + 1, pad) for i, pad in enumerate(pads))
+            continue
+        try:
+            k = int(which)
+        except (TypeError, ValueError):
+            raise OpError("occurrence must be an integer or \"all\" (got %r)"
+                          % (which,), "ARG_INVALID")
+        if not 1 <= k <= len(pads):
+            raise OpError("pad %r of %r has %d occurrence(s), so no %d"
+                          % (number, ref, len(pads), k), "PAD_NOT_FOUND")
+        out.append((number, k, pads[k - 1]))
+    return fp, out
+
+def _pad_type(pad):
+    return (S.arg_text(pad, 2) or "").strip()
+
+def _set_pad_seq(pad, head, node):
+    """Replace the (head ...) child of a pad, or put it after (size ...)."""
+    items = list(pad.items)
+    old = S.child(pad, head)
+    if old is not None:
+        items[items.index(old)] = node
+    else:
+        size = S.child(pad, "size")
+        at = items.index(size) + 1 if size is not None else len(items)
+        items.insert(at, node)
+    pad.items = items
+
+def _drill_shape(raw):
+    """(width, height) of the finished hole in mm, or a loud refusal."""
+    if raw is None:
+        raise OpError("'drill' is required: the finished hole diameter in mm "
+                      "(or [w, h] for an oval slot)", "ARG_MISSING")
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 2:
+            raise OpError("an oval drill is [width, height] in mm", "ARG_INVALID")
+        dw, dh = float(raw[0]), float(raw[1])
+    else:
+        dw = dh = float(raw)
+    if min(dw, dh) <= 0:
+        raise OpError("a drill must be > 0 mm (got %r)" % (raw,), "ARG_INVALID")
+    return dw, dh
+
+def _fit_drill(ref, number, w, h, dw, dh):
+    """Check the hole fits the pad, and say how much copper is left around it.
+
+    Round drill: it has to fit inside the pad with copper left on every side, so
+    `d < min(w, h)` - equal is a hole with no ring, which is an NPTH hole.
+
+    Oval drill: a slot's long axis is allowed to cross the pad's narrow axis,
+    because that is what a slot is for (a USB-C shell slot in a 1.0 x 2.0 pad).
+    What is not allowed is a slot that pokes out of the pad in both directions.
+    The ring reported is the one measured across the slot's narrow side, which
+    is the only side that has one.
+    """
+    if abs(dw - dh) < 1e-9:
+        if min(w, h) <= dw + 1e-9:
+            raise OpError(
+                "pad %s.%s is %s x %s mm and the drill is %s x %s mm: there "
+                "would be no annular ring left. Grow the pad first "
+                "(set_pad_size), ask for a smaller hole, or make it np_thru_hole "
+                "(a bare hole has no ring by definition)."
+                % (ref, number, B.num(w), B.num(h), B.num(dw), B.num(dh)),
+                "DRILL_TOO_LARGE")
+        return round((min(w, h) - dw) / 2.0, 4)
+    lo_p, hi_p = min(w, h), max(w, h)
+    lo_d, hi_d = min(dw, dh), max(dw, dh)
+    if hi_d > hi_p + 1e-9 or lo_d >= lo_p - 1e-9:
+        raise OpError(
+            "pad %s.%s is %s x %s mm and the slot is %s x %s mm: the slot does "
+            "not fit inside the pad. Grow the pad first (set_pad_size) or make "
+            "it np_thru_hole."
+            % (ref, number, B.num(lo_p), B.num(hi_p), B.num(lo_d), B.num(hi_d)),
+            "DRILL_TOO_LARGE")
+    return round((lo_p - lo_d) / 2.0, 4)
+
+def _run_set_pad_drill(ed, o, seed):
+    ref = _str(o, "ref")
+    asked = o.get("pad")
+    numbers = [asked] if isinstance(asked, str) else list(asked or [])
+    if not numbers:
+        raise OpError("'pad' is required: which pad(s) of %r get a hole" % ref,
+                      "ARG_MISSING")
+    numbers = [str(n) for n in numbers]
+    kind = (o.get("kind") or "thru_hole")
+    if kind not in ("thru_hole", "np_thru_hole"):
+        raise OpError("kind must be thru_hole or np_thru_hole (got %r)" % kind,
+                      "ARG_INVALID")
+    dw, dh = _drill_shape(o.get("drill"))
+    paste = _bool(o, "paste", False)
+    keep_size = _bool(o, "keep_size", False)
+    fp, pads = _pad_widgets(ed, ref, numbers, o.get("occurrence"))
+    done = []
+    for number, occ, pad in pads:
+        size = S.child(pad, "size")
+        w = S.arg_num(size, 1, None) if size is not None else None
+        h = S.arg_num(size, 2, None) if size is not None else None
+        if w is None or h is None:
+            raise OpError("pad %s.%s has no (size ...) node, so there is nothing "
+                          "to put a hole through" % (ref, number),
+                          "PAD_UNSUPPORTED")
+        before = _pad_type(pad)
+        ring = None
+        if kind == "np_thru_hole":
+            # NPTH is a bare hole: copper around a mounting hole is a decision,
+            # not a default, so the pad is set to the drill size - unless the
+            # caller wants the drawn pad shape kept (a slot that is wider than
+            # the pad it belongs to).
+            if not keep_size:
+                w = h = max(dw, dh)
+                items = list(pad.items)
+                items[items.index(size)] = B.size(w, h)
+                pad.items = items
+        else:
+            ring = _fit_drill(ref, number, w, h, dw, dh)
+        # the pad type is argument 2 of the node: `(pad "1" smd rect ...)`
+        items = list(pad.items)
+        for i, item in enumerate(items):
+            if isinstance(item, S.Atom) and item.text in ("smd", "thru_hole",
+                                                          "np_thru_hole",
+                                                          "connect"):
+                items[i] = B.A(kind)
+                break
+        else:                                       # no type atom at all
+            raise OpError("pad %s.%s has no pad-type atom, so the file is not a "
+                          "board file this op understands" % (ref, number),
+                          "PAD_UNSUPPORTED")
+        pad.items = items
+        drill_node = (B.L(B.A("drill"), B.A(B.num(dw)))
+                      if abs(dw - dh) < 1e-9 else
+                      B.L(B.A("drill"), B.A("oval"), B.A(B.num(dw)),
+                          B.A(B.num(dh))))
+        _set_pad_seq(pad, "drill", drill_node)
+        layers = [B.A("*.Cu", True), B.A("*.Mask", True)]
+        if paste:
+            layers.append(B.A("*.Paste", True))
+        _set_pad_seq(pad, "layers", B.L(B.A("layers"), *layers))
+        done.append({"pad": number, "occurrence": occ, "before": before,
+                     "type": kind, "size": [w, h],
+                     "drill": [dw, dh] if dw != dh else dw,
+                     "annular_ring_mm": ring})
+    if _bool(o, "footprint_attr", True) and kind == "thru_hole":
+        attr = S.child(fp, "attr")
+        words = [S.arg_text(attr, i) for i in range(1, 8)] if attr is not None else []
+        words = [x for x in words if x]
+        if "through_hole" not in words:
+            words = [x for x in words if x != "smd"] + ["through_hole"]
+            node = B.L(B.A("attr"), *[B.A(x) for x in words])
+            items = list(fp.items)
+            if attr is not None:
+                items[items.index(attr)] = node
+            else:
+                items.insert(1, node)
+            fp.items = items
+    return {"reference": ref, "pads": done,
+            "why_drilled": ("a drilled pad is on every copper layer at once - "
+                            "it is the only pad type that can join a track on "
+                            "one side to a track or pour on the other")}
+
+def _verify_set_pad_drill(ed, o):
+    ref = _str(o, "ref")
+    asked = o.get("pad")
+    numbers = [asked] if isinstance(asked, str) else list(asked or [])
+    numbers = [str(n) for n in numbers]
+    kind = (o.get("kind") or "thru_hole")
+    dw, dh = _drill_shape(o.get("drill"))
+    paste = _bool(o, "paste", False)
+    _fp, pads = _pad_widgets(ed, ref, numbers, o.get("occurrence"))
+    rows = []
+    ok = True
+    for number, occ, pad in pads:
+        drill = S.child(pad, "drill")
+        got = None
+        if drill is not None:
+            if (S.arg_text(drill, 1) or "") == "oval":
+                got = (S.arg_num(drill, 2, None), S.arg_num(drill, 3, None))
+            else:
+                got = (S.arg_num(drill, 1, None),)
+        layers = S.child(pad, "layers")
+        have = [S.arg_text(layers, i) for i in range(1, 5)] if layers else []
+        have = [x for x in have if x]
+        want = ["*.Cu", "*.Mask"] + (["*.Paste"] if paste else [])
+        # oval reads back as (w, h); round as (d,) - compare like with like
+        same_drill = (got == (dw, dh) if abs(dw - dh) > 1e-9
+                      else got == (dw,))
+        good = (_pad_type(pad) == kind and same_drill and have == want)
+        ok = ok and good
+        rows.append({"pad": number, "occurrence": occ, "type": _pad_type(pad),
+                     "drill": got, "layers": have, "ok": good})
+    attr = S.child(_fp, "attr")
+    words = [S.arg_text(attr, i) for i in range(1, 8)] if attr is not None else []
+    return {"ok": ok, "reference": ref, "pads": rows,
+            "footprint_attr": [x for x in words if x]}
+
+op("set_pad_drill", {"copper", "mech"},
+   "Turn pad(s) of a placed footprint into drilled pads: say how big the finished "
+   "hole is (a number for a round drill, [w, h] for an oval slot) and the pad "
+   "goes on every copper layer at once with a mask opening on both sides, which "
+   "is the only way a pad can join copper on the far side. This is what a "
+   "through-hole part needs and what an SMD pad cannot do: an SMD pad that was "
+   "meant to be a header pin looks right in the editor and leaves the bottom "
+   "side unreachable. The hole must fit the pad: a round drill needs copper "
+   "left all round it, an oval slot may cross the pad's narrow axis but not "
+   "poke out of both, and a pad with no ring at all is refused unless it is "
+   "asked for as np_thru_hole. np_thru_hole is a bare hole (mounting), so the "
+   "pad is set to the drill size - copper around a mounting hole is a decision, "
+   "not a default.",
+   {"ref": "reference designator", "pad": "pad number, or a list of them",
+    "drill": "mm, or [w, h] for an oval slot",
+    "kind": "thru_hole (default) | np_thru_hole",
+    "occurrence": "when one pad number appears more than once (thermal via "
+                  "star, shield, jumper): the 1-based one, or \"all\"; one "
+                  "value or one per pad (default: only allowed if unique)",
+    "paste": "bool - keep a paste opening on the drilled pad (default false)",
+    "keep_size": "bool - np_thru_hole only: keep the drawn pad size instead of "
+                 "shrinking it to the hole (a slot wider than its pad)",
+    "footprint_attr": "bool - also mark the footprint through_hole (default true)"},
+   _run_set_pad_drill, _verify_set_pad_drill)
+
 # --- via in pad -------------------------------------------------------
 def _pad_abs(ed, ref, number):
     """Absolute position of one pad in the FILE frame, plus its net name.
