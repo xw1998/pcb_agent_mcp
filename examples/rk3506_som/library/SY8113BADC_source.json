@@ -1,0 +1,19 @@
+{
+  "component_uuid": "5579e636f863400792d24e68c08750e6",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "tsot-23-6_l2.9-w1.6-p0.95-ls2.8-br",
+  "doc_doctype": 4,
+  "doc_version": 1736302657276,
+  "dataStrId": "https://modules.lceda.cn/datastr/f8/1d/98/14/a435a1d9db77c1787e79b880",
+  "aes_key_hex": "c47763d865f6edba684a4a7ce3a07db6909e75cc8ebb9d1f93d72120b47c07ed",
+  "aes_iv_hex": "050bc6ec15ec5e46bdbcf799",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 2563,
+  "doc_bytes": 5981,
+  "doc_sha256": "07df679fc20e2df7742d5c2671f46589f9c7d5e32fa9bbdbcf14476edc7f1033",
+  "copyright": "[\"HEAD\",{\"editorVersion\":\"2.2.C\",\"importFlag\":0,\"uuid\":\"c5533f37e54f4bd0a361fb90c38aa932\",\"title\":\"TSOT-23-6_L2.9-W1.6-P0.95-LS2.8-BR\",\"source\":\"\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

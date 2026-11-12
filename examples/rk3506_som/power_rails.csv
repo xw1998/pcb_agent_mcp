@@ -1,0 +1,11 @@
+rail,kind,typ_v,min_v,max_v,source,device,lcsc,rating_ma,load_ma,balls,basis
++5V_IN,input,5.0000,4.7500,5.2500,,stamp holes 42-45,,,,0,"5.0 V input, ±5 % design window; 4 stamp pads (pinout 42-45)"
++0V9_CPU,regulator,0.9500,0.8550,1.1030,+5V_IN,SY8113BADC,C78989,3000,1200,3,Table 3-2 CPU_DVDD 0.855/0.95/1.103; fixed 0.95 V (no DVFS on a core board); load is a design value (datasheet gives no per-rail current)
++0V9_LOGIC,regulator,0.9000,0.8550,0.9980,+5V_IN,SY8113BADC,C78989,3000,800,7,Table 3-2 LOGIC_DVDD 0.855/0.90/0.998; load is a design value
++0V9_PMU,bead,0.9000,0.8100,0.9900,+0V9_LOGIC,ferrite bead + 2x10 uF,,,100,1,"Table 3-2 PMU_LOGIC_DVDD0V9 0.81/0.90/0.99 equals the LOGIC band, so one 0.9 V converter feeds both through a bead; datasheet p.8 says the PMU has three separate voltage domains, it does not require separate regulators"
++0V9_ANA,bead,0.9000,0.8100,0.9900,+0V9_LOGIC,ferrite bead + 10 uF,,,150,2,"Table 3-2 AVDD_0V9 0.81/0.90/0.99; USB/MIPI PHY only, fed through a bead from the logic 0.9 V"
++1V35_DDR,regulator,1.3500,1.2830,1.4180,+5V_IN,SY8113BADC,C78989,3000,800,5,Table 3-2 DDR3L IO power 1.283/1.35/1.418; load is a design value
++0V675_REF,divider,0.6750,0.6415,0.7090,+1V35_DDR,1 % divider 1k/1k + 100 nF,,,2,2,"DDR3L defines VREF = VDDQ/2 = 0.675 V, so the band is exactly the DDR_VDDQ band halved (0.6415/0.675/0.709)"
++3V3,regulator,3.3000,3.0000,3.6300,+5V_IN,SY8113BADC,C78989,3000,1600,7,Table 3-2 PMUIO_VCC3V3 / USB20_OTG_AVDD3V3 / VCCIO* at 3.3 V 3.00/3.30/3.63; load covers SoC IO + NAND + the 1V8 LDO input current + 3V3_OUT (design value)
++1V8_ANA,regulator,1.8000,1.6200,1.9800,+3V3,AMS1117-1.8,C351432,1000,250,6,Table 3-2 AVDD_1V8 / PLL / ADC 1.62/1.80/1.98; LDO from 3V3 keeps the PLL and ADC rails linear (load is a design value)
+GND,ground,0.0000,0.0000,0.0000,,,,,,141,VSS 140 balls + ACODEC_ADC_AVSS (Table 2-2)

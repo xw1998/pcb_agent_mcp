@@ -23,6 +23,8 @@ PRETTY = os.path.join(LIB, "RK3506.pretty")
 DOC24 = os.path.join(REPO, "examples", "rk3506_som", "library", "XTAL_24M_X322524MSB4SI_3225.efp")
 DOC32 = os.path.join(REPO, "examples", "rk3506_som", "library", "XTAL_32K_NX2012SA_2012.efp")
 DOCSW = os.path.join(REPO, "examples", "rk3506_som", "library", "SW_SKRPACE010_4.2x3.2.efp")
+DOC8113 = os.path.join(REPO, "examples", "rk3506_som", "library", "SY8113BADC.efp")
+DOC1117 = os.path.join(REPO, "examples", "rk3506_som", "library", "AMS1117-1.8.efp")
 
 FP24 = "Package_Crystal_SMD_3225-4P_L3.2-W2.5_X322524MSB4SI"
 FP32 = "Package_Crystal_SMD_2012-2P_L2.05-W1.2_NX2012SA"
@@ -112,14 +114,17 @@ class _Base(unittest.TestCase):
     def rows(self, path):
         return self.L.read_rows(path)
 
-    def build(self, path, body, pads, grid=None, tol=0.03, name="X", descr="d", tags="t"):
-        return self.g.build(self.rows(path), name, body, pads, descr, tags, grid, tol)
+    def build(self, path, body, pads, grid=None, tol=0.03, name="X", descr="d", tags="t",
+              lead_span=None, overrides=None):
+        return self.g.build(self.rows(path), name, body, pads, descr, tags, grid, tol,
+                            lead_span, overrides)
 
-    def fails(self, text, expect, body, pads, grid=None, tol=0.03):
+    def fails(self, text, expect, body, pads, grid=None, tol=0.03, lead_span=None):
         """build 必须以 ``expect`` 这条审计号失败。"""
         with _TmpDoc(text) as path:
             with self.assertRaises(SystemExit) as ctx:
-                self.g.build(self.rows(path), "X", body, pads, "d", "t", grid, tol)
+                self.g.build(self.rows(path), "X", body, pads, "d", "t", grid, tol,
+                             lead_span)
             self.assertIn(expect, str(ctx.exception))
 
     def geom_error(self, text, fn):
@@ -217,7 +222,58 @@ class AuditTest(_Base):
 
     def test_reverse_off_centre(self):
         text = _patch_pad(_doc_text(DOC24), "1", i6=-80)
-        self.fails(text, "G4 pad centroid", (3.2, 2.5), 4)
+        self.fails(text, "G4 pad union is not centred", (3.2, 2.5), 4)
+
+    def test_pad_union_not_centroid_is_what_is_audited(self):
+        """SOT-223 has 1 pad on one side and 3 on the other: centroid 1.42 mm off,
+        drawing perfectly centred -- the centroid rule would refuse a good part."""
+        text, report, _s = self.build(DOC1117, (3.5, 6.5), 4, grid=2.3,
+                                      lead_span=7.0, overrides={"4": (2.47, 3.6)})
+        self.assertEqual(report["audits"], "G1-G8 passed")
+        self.assertEqual(report["pitch_axis"], "y")
+
+    def test_land_envelope_uses_lead_span_from_title(self):
+        """G6 的包络是 max(本体, 引脚跨距)/2 + 0.75；只给本体时 TSOT 的 1.60 mm
+        焊盘外缘会被误拒（本体半宽 0.80 + 0.75 = 1.55 < 1.60）。"""
+        self.fails(_doc_text(DOC8113), "G6 pad", (1.6, 2.9), 6, grid=0.95, tol=0.01)
+        text, report, _s = self.build(DOC8113, (1.6, 2.9), 6, grid=0.95, tol=0.01,
+                                      lead_span=2.8)
+        self.assertEqual(report["lead_span_mm"], 2.8)
+        self.assertEqual(report["pad_boxes_mm"], [(0.8, 0.532)])
+
+    def test_pitch_axis_is_measured_not_assumed(self):
+        """两列三行的 TSOT 的节距在 y 上：沿 x 看盘宽 0.800 mm 恰好卡在 0.15 mm
+        间隙线上（原实现就是在这里判死的），沿真实节距轴看盘高 0.532 mm 间隙 0.418。
+        """
+        rows = self.rows(DOC8113)
+        pads = self.L.pad_rows(rows)
+        info = self.g.solve_scale(rows, pads)
+        self.assertEqual(info["pitch_axis"], "y")
+        s = info["scale"]
+        exact = self.L.min_grid_gap(pads) * s        # 0.94996，不是标题舍入的 0.95
+        pad = [p for p in pads if p["num"] == "1"][0]
+        with self.assertRaises(self.L.GeometryError) as ctx:
+            self.L.resolve_pad_box(pad, s, exact, pitch_axis="x")
+        self.assertIn("along x", str(ctx.exception))
+        box = self.L.resolve_pad_box(pad, s, exact, pitch_axis="y")
+        self.assertAlmostEqual(box["w_mm"], 0.8, places=3)
+        self.assertAlmostEqual(box["h_mm"], 0.532, places=3)
+        self.assertLessEqual(exact - box["h_mm"], 0.42)
+        self.assertGreater(exact - box["h_mm"], 0.41)
+
+    def test_reverse_pad_box_without_pitch_neighbour_is_not_guessed(self):
+        """AMBA SOT-223 的散热盘没有同行的邻居 ⇒ rot=90 不许猜，必须显式给盘。"""
+        self.fails(_doc_text(DOC1117), "G5 pad 4 has no pitch neighbour", (3.5, 6.5), 4,
+                   grid=2.3, lead_span=7.0)
+
+    def test_reverse_land_envelope_refuses_a_flying_pad(self):
+        """把 TSOT 的盘整体外移 1 mm：外缘 2.60 mm 越 2.15 mm 包络 ⇒ G6。"""
+        def fn(row):
+            if isinstance(row, list) and row and row[0] == "PAD":
+                row[6] = row[6] + (1.0 / 0.0254) * (1 if row[6] > 0 else -1)
+            return row
+        text = _rewrite(_doc_text(DOC8113), fn)
+        self.fails(text, "G6 pad", (1.6, 2.9), 6, grid=0.95, tol=0.01, lead_span=2.8)
 
     def test_reverse_pad_leaves_courtyard(self):
         text = _patch_pad(_doc_text(DOC24), "3", i6=200)
@@ -284,6 +340,41 @@ class OfficialLibraryCrossCheck(unittest.TestCase):
         xs = sorted({round(abs(x), 3) for (_n, x, _y, _w, _h, _s) in specs})
         self.assertEqual(xs, [2.1])
         self.assertAlmostEqual(abs(self.KICAD_ALPS_SKRK[0][1]), 2.1, places=4)
+
+class SotRulerTest(unittest.TestCase):
+    """外部尺子：KiCad 10.0 自带 ``Package_TO_SOT_SMD.pretty``（2026-11-12 逐行读）。
+
+    ``TSOT-23-6.kicad_mod``：6 盘 1.325 x 0.6 @ x=+-1.1375, y=+-0.95/0 →
+    焊盘外缘 1.80 mm，而本体 1.6 mm 宽、半宽 0.80 mm ⇒ 旧规则
+    ``本体/2 + 0.75 = 1.55`` 会拒掉 KiCad 自己的封装，所以 G6 的包络必须以
+    标题里的引脚跨距 LS 为准（1.4 + 0.75 = 2.15）。
+    ``SOT-223-3_TabPin2.kicad_mod``：三盘 2.0 x 1.5 @ x=-3.15, y=-2.3/0/2.3；
+    散热盘 2.0 x 3.8 @ x=+3.15 ⇒ 散热盘的长轴在 **y** 上。
+    """
+
+    def setUp(self):
+        self.g = _gen()
+        self.L = self.g.lceda_fp
+
+    def test_tsot_body_based_envelope_would_refuse_kicads_own_land(self):
+        kicad_tsot_outer = 1.1375 + 1.325 / 2.0
+        self.assertGreater(kicad_tsot_outer, 1.6 / 2.0 + self.g.PROTRUDE_ALLOW_MM)
+        self.assertLessEqual(kicad_tsot_outer, 2.8 / 2.0 + self.g.PROTRUDE_ALLOW_MM)
+
+    def test_sot223_tab_land_is_long_along_y_like_kicad(self):
+        _text, report, _specs = self.g.build(
+            self.L.read_rows(DOC1117), "X", (3.5, 6.5), 4, "d", "t", 2.3, 0.01, 7.0,
+            {"4": (2.47, 3.6)})
+        tab = [b for b in report["pad_boxes_mm"] if b not in ((2.47, 0.98),)]
+        self.assertEqual(tab, [(2.47, 3.6)])
+        self.assertGreater(tab[0][1], tab[0][0])       # 3.6 > 2.47：长轴在 y
+
+    def test_reverse_swapped_tab_box_is_refused_by_the_centring_audit(self):
+        """把散热盘反向摆（3.6 x 2.47）：盘并集 bbox 中心 x=-0.28 ⇒ G4 拒。"""
+        with self.assertRaises(SystemExit) as ctx:
+            self.g.build(self.L.read_rows(DOC1117), "X", (3.5, 6.5), 4, "d", "t", 2.3,
+                         0.01, 7.0, {"4": (3.6, 2.47)})
+        self.assertIn("G4 pad union is not centred", str(ctx.exception))
 
 class SourceNoteTest(unittest.TestCase):
     """立创官方库 HEAD 里的许可要求出处声明：所有产物都必须带上，且只能带一次。"""

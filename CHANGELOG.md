@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.1.6] - 2026-11-12
+
+RK3506 核心板第六步：**把电源从「20 个电源组」落成一棵可算的树**，并把树上出现的两颗稳压器做成真封装与真符号。
+三条审计（G4/G5/G6）原来会**拒掉 KiCad 官方自己的封装**——这轮不是让产物通过审计，是审计错了，而错误由仓库之外
+的官方库证伪。零板改动（`rk3506_som.kicad_pcb` 不动）。
+
+- **新增 `tools/power_tree.py` + `tests/test_power_tree.py`（35 用例）**：docstring 写死
+  `Nothing here is a route, a placement, or a copper decision.`。`read_groups` / `check_rail_bands` /
+  `check_internal` / `check_cover` / `check_unique` / `check_vref` / `check_sources` / `check_load` / `build` / `write_csv`，
+  每条判据都有一条反向失败对照；任一条不过⇒退出码 **2**、不写字节。实跑 `rails 10, balls 176`。
+- **10 条轨（`examples/rk3506_som/power_rails.csv`）**：`+5V_IN`（邮票孔 42–45）/ `+0V9_CPU`(SY8113,1200 mA) /
+  `+0V9_LOGIC`(SY8113,800) / `+0V9_PMU`(磁珠,100) / `+0V9_ANA`(磁珠,150) / `+1V35_DDR`(SY8113,800) /
+  `+0V675_REF`(1 %/1k 分压,2) / `+3V3`(SY8113,1600) / `+1V8_ANA`(AMS1117-1.8,250) / `GND`(141 球)。
+- **176 球逐球归档（`power_balls.csv`）**：`GND 141 / +0V9_LOGIC 7 / +3V3 7 / +1V8_ANA 6 / +1V35_DDR 5 /
+  +0V9_CPU 3 / +0V9_ANA 2 / +0V675_REF 2 / INTERNAL 2 / +0V9_PMU 1`，合计 176。
+- **三条来自手册的「没有」，不编数**：全文检索 `sequence` 与 `DCDC` **各 0 命中** ⇒ 手册无上电时序表、
+  无 DCDC 设计指引；Table 2-2/3-2 不给每轨电流 ⇒ `load_ma` 一律标注 `design value` 并在 `basis` 列写依据。
+  `1A13` 在源表出现两次（`VSS` 与 `ACODEC_ADC_AVSS`）= 手册自身缺陷 ⇒ 登记不去重，唯一性下沉到 rail 级，双列点名。
+- **p39 Interface 表把 `ACODEC_ADC_VCM`(1B11) 与 `ACODEC_ADC_AVDD1V6`(1B12) 标 O=内部输出** ⇒ 它们是 SoC 自出，
+  **不接稳压器**（接了两电源对接），轨名记 `INTERNAL`，只去耦。
+- **四项取值理由**：CPU 轨固定 0.95 V 不做 DVFS（核心板不是整机）；`PMU`/`ANA` 用磁珠不分设稳压器
+  （`PMU_LOGIC_DVDD0V9` 与 `LOGIC_DVDD` 的带 **0.81/0.90/0.99 与 0.855/0.90/0.998** 逐值相等，独立性是去耦要求不是稳压器要求）；
+  VCCIO 全 3.3 V 且 SDMMC 不切 1.8 V（**限制**，要跑 UHS-I 须加负载开关）；DDR3L 单 x16 **无 VTT**、
+  VREF=0.675 V 由 1 %/1k 分压且 `check_vref` 硬门禁「必须正好 VDDQ/2」（查定义不查电阻）。
+- **`8.220 W` 的口径写死**：只累加 `src == +5V_IN` 且 `kind == regulator` 的轨，项是 `typ_v × load_ma / 1000`
+  （0.95×1200 + 0.90×800 + 1.35×800 + 3.30×1600）⇒ 这是**四条 5 V 轨的输出和（下界）**，**不含任何效率系数**；
+  AMS1117（src=+3V3）、两条磁珠轨、分压轨**故意不进**（重复计数 / 不产功率 / 拿自己设的数证明自己）。
+- **G6 包络改用标题 LS（`--lead-span`）**：旧规则 `body/2 + 0.75` 会拒掉 KiCad 官方 `TSOT-23-6`
+  （6 盘 1.325×0.6 @ x=±1.1375 ⇒ 外缘 **1.80** > 0.80+0.75）⇒ 改 `max(body/2, LS/2) + 0.75`。
+- **G5 节距轴必须测（`min_grid_gap_info` 返回 `axis`）**：两列三行的 SOT-23/TSOT-23 节距在 **y** 上，
+  拿 x 判会把 0.800 mm 盘判死而沿 y 的真实间隙是 0.418 mm。无节距邻居的盘（SOT-223 散热盘）**不许猜**：
+  单候选接受、双候选抛 `GeometryError`（"state the box explicitly"）。
+- **G4 改焊盘并集 bbox 居中**：SOT-223 是 1+3 非对称盘组，质心偏 **1.42 mm** 而图形完全居中 ⇒ 质心判据会误拒。
+  `--pad-box NUM:WxH`（可重复）作显式 override 且写进报告，由居中审计**反向确认**。
+- **courtyard 必须包住焊盘**（`emit_generic`：`max(hw, pw_max) + margin`）：焊盘合法越出本体
+  （SOT-223 4.07 对 1.75、TSOT 1.60 对 0.80），只增不减 ⇒ 三份既有封装**仅 courtyard 行变化**
+  （1.85/1.50→2.0501/1.70、1.275→1.5001、2.35→2.8751），`diff` 过滤 `descr`/`tags` 后零几何差。
+- **两颗稳压器的取件与产物**：**SY8113BADC**（LCSC C78989）→ `Package_TSOT-23-6_L2.9-W1.6-P0.95-LS2.8`
+  （6 盘 0.8×0.532 @ x=±1.2, y=±0.95/0）+ `.kicad_sym`（6 pin）；**AMS1117-1.8**（C351432）→
+  `Package_SOT-223-4_L6.5-W3.5-P2.30-LS7.0`（3 信号盘 2.47×0.98 @ x=+2.835 + 散热盘 **(2.47, 3.6)** @ x=−2.835）+ `.kicad_sym`（4 pin）。
+  `library/` 各 6 件（`.efp`/`_meta.json`/`_source.json`/`_symbol.efp`/`_symbol_meta.json`/`_symbol_source.json`），
+  全部 `copyright: true`。
+- **外部尺子（逐行读自本机官方库，作用是证伪我自己的规则）**：`Package_TO_SOT_SMD.pretty/TSOT-23-6.kicad_mod`
+  与 `SOT-223-3_TabPin2.kicad_mod` — 后者散热盘 **2.0×3.8 @ x=+3.15（长轴在 y）** ⇒ 立创文档的原样读法同向，
+  交换读法 (3.6, 2.47) 会把 bbox 中心推到 x=−0.28 被 G4 拒（已写成用例）。
+- **KiCad 版本口径（必须写死）**：本仓库封装是 **KiCad 10 原生格式**（`(version 20260206)` +
+  `(duplicate_pad_numbers_are_jumpers no)`），**KiCad 8 一律拒收**（去掉 jumpers token 仍失败 ⇒ 是 version 号本身被拒）；
+  验证一律用 `/d/KiCad/10.0/bin/kicad-cli.exe`（10.0.7）。且两关输出目录口径**相反**：
+  `fp upgrade -o` 目标须**不存在**、`fp export svg -o` 目标须**先存在**。
+- **验证**：`test_power_tree` **35/35 OK**、`test_smd_footprint` **34/34 OK**（新增 5 例 + `SotRulerTest` 3 例外部尺子）；
+  未回归 `test_spinand_footprint` 22/22、`test_bga333_footprint` 14/14、`test_ddr3l_footprint` 19/19、`test_som_pinout` 18/18；
+  KiCad 三关全过（`fp upgrade`「封装库未更新」/`fp export svg` **8 张**含两颗新件/两符号 `sym upgrade --force` 真重写），
+  两颗封装栅格化后视觉复核（盘组、本体、丝印、1 脚圆点、courtyard 均无误）。
+- **没修完（如实）**：**SY8113 的 Vref / fsw / ILIM 不在本仓库** ⇒ 反馈分压、电感、输出电容**全部留空不编**
+  （`fb_divider` 空，下一批第一件事是取厂商手册再算）；`parts.footprint_to_kicad()` 仍直接采信 CANVAS 声明的单位
+  （照样会产出 486 mm 宽封装，**连续第四批**）；符号形状仍是库的原形状转写（未按功能分块重画）；
+  原理图、布局、布线、内层平面未开工。
+
 ## [0.1.5] - 2026-11-12
 
 RK3506 核心板第五步：再取四颗器件（SPI-NAND、24 MHz、32.768 kHz、复位按键），并把转写从「一器件一脚本」抽出**通用 SMD 工具**；同一轮发现并修掉一个**许可级缺陷**：此前所有产物都没有写立创官方库要求的出处声明。零板改动。

@@ -1,0 +1,51 @@
+{
+  "createTime": 1644549303,
+  "created_at": "2022-02-11T03:15:04.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/8d/6e/50/85/020bacb3af48a4032877f734",
+  "description": "",
+  "display_title": "AMS1117-1.8_C351432",
+  "docType": 2,
+  "has_device": true,
+  "iv": "0d763dffecd12b813311d445",
+  "key": "d2091ca5876cb1afb3bfb9c75bd911a6f6e284a3ce28ef434658644e7173c2c5",
+  "modifier": {
+    "nickname": "",
+    "username": "",
+    "uuid": ""
+  },
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "f9e37bf7b24249cd92ed5e60949bae83",
+  "tags": {
+    "child_tag": {
+      "name": "Voltage Regulators - Linear, Low Drop Out (LDO) Regulators",
+      "name_cn": "线性稳压器(LDO)",
+      "uuid": "697e62ab0f7649d9b2b4cb40f4f14c65"
+    },
+    "parent_tag": {
+      "name": "Power Management (PMIC)",
+      "name_cn": "电源管理",
+      "uuid": "3f924163e2f249a7b0568b63013871cd"
+    }
+  },
+  "ticket": 3,
+  "title": "ams1117-1.8_c351432",
+  "type": 3,
+  "updateTime": 1740987923,
+  "updated_at": "2026-11-11T18:43:30.000Z",
+  "uuid": "20c708882c724d6c942500aa0eedc4b9",
+  "version": 1740988222121
+}

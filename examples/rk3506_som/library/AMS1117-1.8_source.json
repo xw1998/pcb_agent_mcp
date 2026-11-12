@@ -1,0 +1,19 @@
+{
+  "component_uuid": "ad4d89affdbe4c3ea53e7a6c4c6ed088",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "sot-223-4_l6.5-w3.5-p2.30-ls7.0-br",
+  "doc_doctype": 4,
+  "doc_version": 1736302668250,
+  "dataStrId": "https://modules.lceda.cn/datastr/f4/53/ab/1d/8e980ed7c8dbae18eecc4f12",
+  "aes_key_hex": "59cae6aabf3d0838e17eb43f84d6bb36ce7aa661f6251a0580583e08ec0f8c2e",
+  "aes_iv_hex": "8cfe48dc502baa71228ce907",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 2455,
+  "doc_bytes": 5433,
+  "doc_sha256": "d49440e8872a212fb262c89faf8e7b3e6707a871a87e970bc1ca25e9f7ff222d",
+  "copyright": "[\"HEAD\",{\"editorVersion\":\"2.2.C\",\"importFlag\":0,\"uuid\":\"09952c2799c54b76904e264324ada8f3\",\"title\":\"SOT-223-4_L6.5-W3.5-P2.30-LS7.0-BR\",\"source\":\"\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

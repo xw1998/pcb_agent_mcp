@@ -170,14 +170,26 @@ def circle_marks_mm(rows, scale, layers=(LAYER_MARKING, LAYER_DOCUMENT)):
             out.append((cx * scale, -cy * scale, r * scale))
     return out
 
-def min_grid_gap(pad_rows):
+def min_grid_gap_info(pad_rows):
     """Smallest positive pad-to-pad gap sharing a row or a column (raw units).
 
     This is the grid step the land pattern was drawn on. It is reported, not
     used as a ruler: with rounding in the library title (P2.20 drawn as 2.15)
     a strict equality test would be a false alarm generator.
+
+    The **axis** is returned with it because a land pattern's pitch axis is not
+    always x: a two-terminal chip part is drawn in one row (pitch along x, as
+    in the 2012 crystal), while an SOT-23/TSOT-23 is drawn in two columns and
+    three rows (pitch along **y**, as in SY8113BADC). Checking a pad's width
+    against a y pitch is the bug that made this necessary: 0.800 mm of land on
+    a 0.950 mm pitch was refused even though the along-pitch extent was 0.532 mm
+    and the real clearance 0.418 mm.
+
+    Returns ``{"gap", "axis", "spans"}`` (``spans`` = the gap measured on each
+    axis, ``None`` where an axis has no neighbour pair); ``gap`` and ``axis`` are
+    ``None`` when no pair shares a row or a column.
     """
-    best = None
+    spans = {"x": None, "y": None}
     for i, a in enumerate(pad_rows):
         for b in pad_rows[i + 1:]:
             for axis in ("x", "y"):
@@ -186,8 +198,16 @@ def min_grid_gap(pad_rows):
                     continue
                 d = abs(a[axis] - b[axis])
                 if d > 1e-9:
-                    best = d if best is None else min(best, d)
-    return best
+                    spans[axis] = d if spans[axis] is None else min(spans[axis], d)
+    hits = [(v, k) for k, v in spans.items() if v is not None]
+    if not hits:
+        return {"gap": None, "axis": None, "spans": spans}
+    gap, axis = min(hits)
+    return {"gap": gap, "axis": axis, "spans": spans}
+
+def min_grid_gap(pad_rows):
+    """Backwards-compatible wrapper: the gap only, see ``min_grid_gap_info``."""
+    return min_grid_gap_info(pad_rows)["gap"]
 
 def pad_rows(rows):
     """Full PAD records, shape-agnostic; see ``resolve_pad_box`` for rotation.
@@ -211,20 +231,40 @@ def pad_rows(rows):
                     "h": float(shape[2]), "rot": float(rot)})
     return out
 
-def resolve_pad_box(pad, scale, pitch_mm, gap_min=0.15):
+def resolve_pad_box(pad, scale, pitch_mm, gap_min=0.15, pitch_axis="x"):
     """Resolve ``(w_x, h_y)`` in mm for one pad on a pitch row.
 
     A 90/270 flag is the only ambiguity that can change the result: it swaps the
-    two axes. The document is not trusted -- the assignment whose pitch-axis
-    width would leave less than ``gap_min`` to a neighbour at ``pitch_mm`` is
-    rejected; if both survive, the smaller along-pitch extent wins (see the
-    KiCad library precedent in the body). Nothing is guessed: zero survivors is
-    a ``GeometryError``.
+    two axes. The document is not trusted -- the assignment whose extent along
+    the **pitch axis** would leave less than ``gap_min`` to a neighbour at
+    ``pitch_mm`` is rejected; if both survive, the smaller along-pitch extent
+    wins (see the KiCad library precedent in the body). Nothing is guessed:
+    zero survivors is a ``GeometryError``.
+
+    ``pitch_axis`` must be the axis the measured pitch runs on (see
+    ``min_grid_gap_info``). Defaults to ``"x"``, the chip-part convention that
+    every earlier call site was written against.
     """
+    if pitch_axis not in ("x", "y"):
+        raise GeometryError("pitch_axis must be 'x' or 'y', got %r" % (pitch_axis,))
+    key = 0 if pitch_axis == "x" else 1
     cands = [(pad["w"] * scale, pad["h"] * scale)]
     if abs(pad["rot"]) % 180 == 90:
         cands.append((pad["h"] * scale, pad["w"] * scale))
-    ok = [c for c in cands if c[0] <= pitch_mm - gap_min + 1e-9]
+    if pitch_mm is None:
+        # No neighbour on this axis, so no clearance rule can decide. One
+        # candidate means the rot flag does not matter; two means it does, and
+        # guessing which one the library meant is exactly what this tool does
+        # not do -- the caller must state the box explicitly.
+        if len(cands) != 1:
+            raise GeometryError(
+                "pad %s has no pitch neighbour and its rot flag swaps %.4f x %.4f "
+                "into %.4f x %.4f: neither assignment is decidable here, state the "
+                "box explicitly" % (pad["num"], cands[0][0], cands[0][1],
+                                    cands[1][0], cands[1][1]))
+        ok = cands
+    else:
+        ok = [c for c in cands if c[key] <= pitch_mm - gap_min + 1e-9]
     if len(ok) > 1:
         # Tie-break, measured against a ruler outside this repository: KiCad's
         # own ``Crystal_SMD_2012-2Pin_2.0x1.2mm`` puts a 0.6 x 1.1 mm land on a
@@ -232,12 +272,12 @@ def resolve_pad_box(pad, scale, pitch_mm, gap_min=0.15):
         # across the body. Two-terminal chip parts are authored that way, so the
         # assignment with the smaller along-pitch extent wins; a true tie means
         # both boxes are identical and either is the same geometry.
-        ok = [min(ok, key=lambda c: (c[0], -c[1]))]
+        ok = [min(ok, key=lambda c: (c[key], -c[1 - key]))]
     if len(ok) != 1:
         raise GeometryError(
-            "pad %s box is not resolvable at pitch %.3f mm: %d of %d axis "
-            "assignments fit (candidates %s)"
-            % (pad["num"], pitch_mm, len(ok), len(cands),
+            "pad %s box is not resolvable at pitch %.3f mm along %s: %d of %d "
+            "axis assignments fit (candidates %s)"
+            % (pad["num"], pitch_mm, pitch_axis, len(ok), len(cands),
                ["%.4f x %.4f" % c for c in cands]))
     out = {"w_mm": ok[0][0], "h_mm": ok[0][1],
            "rejected": [c for c in cands if c != ok[0]]}
@@ -428,7 +468,16 @@ def emit_generic(name, pad_specs, body_mm, silk_segments, pin1_marks,
     for (x1, y1, x2, y2) in silk_segments:
         L.append("  (fp_line\n    (start %s)\n    (end %s)\n    (stroke (width %s) (type solid))\n"
                  "    (layer \"%s\")\n  )" % (_pair(x1, y1), _pair(x2, y2), _f(silk_width), silk_layer))
-    cw, ch = hw + courtyard_margin, hh + courtyard_margin
+    # courtyard = the larger of body and pad extents, plus margin. A land pattern
+    # legitimately puts pads outside the package outline (SOT-223 tab land 4.07 mm
+    # from centre on a 3.5 mm wide body, TSOT-23 side land 1.60 mm on a 1.6 mm
+    # body), and a courtyard that clips its own pads cannot report a real
+    # placement overlap. It only ever grows, so a footprint whose pads sit inside
+    # the body keeps its bytes.
+    pw_max = max([abs(x) + pw / 2.0 for (_, x, _, pw, _, _) in pad_specs] or [0.0])
+    ph_max = max([abs(y) + ph / 2.0 for (_, _, y, _, ph, _) in pad_specs] or [0.0])
+    cw = max(hw, pw_max) + courtyard_margin
+    ch = max(hh, ph_max) + courtyard_margin
     for (x1, y1, x2, y2) in ((-cw, -ch, cw, -ch), (cw, -ch, cw, ch),
                              (cw, ch, -cw, ch), (-cw, ch, -cw, -ch)):
         L.append("  (fp_line\n    (start %s)\n    (end %s)\n    (stroke (width %s) (type solid))\n"

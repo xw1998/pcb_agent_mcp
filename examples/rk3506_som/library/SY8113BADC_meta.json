@@ -1,0 +1,54 @@
+{
+  "createTime": 1620741503,
+  "created_at": "2021-05-11T13:58:23.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/f8/1d/98/14/a435a1d9db77c1787e79b880",
+  "description": ";TSOT-23-6;SOT-23-6;TSOT-6;SOT-6;-;DFN-6;TSOT-23-6L;TSOT-23_6;TSOT-26;TSOT-26-6;SOT-23-THN;TSOT23-6;SOT-23-THIN-6;SOT-23-6-THIN;SOT-23-Thin-6;TSOT-23-6(FC);SOT-23-THIN;SO-6T;SOT-23;FCTSOT23-6;TSOP-6;SOT23-6L;TSOT-23;SOT23-6;TSOT23-6L",
+  "display_title": "TSOT-23-6_L2.9-W1.6-P0.95-LS2.8-BR",
+  "docType": 4,
+  "has_device": true,
+  "iv": "050bc6ec15ec5e46bdbcf799",
+  "key": "c47763d865f6edba684a4a7ce3a07db6909e75cc8ebb9d1f93d72120b47c07ed",
+  "model_3d": {
+    "title": "TSOT-23-6_L2.9-W1.6-H1.1-LS2.8-P0.95",
+    "transform": "110.45568,114.173,0,180,0,0,-0.005,-0.0005,0",
+    "uri": "2c4039b5b88644c1bda4b4ba9e971667"
+  },
+  "modifier": {
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "need_sync_easyeda_pro": true,
+  "need_sync_pro": true,
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "c5533f37e54f4bd0a361fb90c38aa932",
+  "tags": {
+    "child_tag": [],
+    "parent_tag": {
+      "name": "TSOT-23-6",
+      "name_cn": "",
+      "uuid": "06ef6a245f3d4743a6745d1d0f637222"
+    }
+  },
+  "ticket": 3,
+  "title": "tsot-23-6_l2.9-w1.6-p0.95-ls2.8-br",
+  "type": 3,
+  "updateTime": 1649423253,
+  "updated_at": "2025-01-08T02:17:37.000Z",
+  "uuid": "5579e636f863400792d24e68c08750e6",
+  "version": 1736302657276
+}

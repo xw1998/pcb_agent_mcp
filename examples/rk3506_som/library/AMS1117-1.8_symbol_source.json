@@ -1,0 +1,19 @@
+{
+  "component_uuid": "20c708882c724d6c942500aa0eedc4b9",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "ams1117-1.8_c351432",
+  "doc_doctype": 2,
+  "doc_version": 1740988222121,
+  "dataStrId": "https://modules.lceda.cn/datastr/8d/6e/50/85/020bacb3af48a4032877f734",
+  "aes_key_hex": "d2091ca5876cb1afb3bfb9c75bd911a6f6e284a3ce28ef434658644e7173c2c5",
+  "aes_iv_hex": "0d763dffecd12b813311d445",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 1689,
+  "doc_bytes": 3360,
+  "doc_sha256": "f5240fffba1787208db764a62135c162093c94dab6bcab22f639df075a0f2d9b",
+  "copyright": "[\"HEAD\",{\"symbolType\":2,\"originX\":0,\"originY\":0,\"version\":\"0.13.0\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints, 3D models, modules and related data, belong to JLCEDA/EasyEDA. 【适用对象/Scope】任何A",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

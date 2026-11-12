@@ -1,0 +1,51 @@
+{
+  "createTime": 1620739698,
+  "created_at": "2021-05-11T13:28:18.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/d0/b6/2d/b5/53517066aa5b0806f69d147f",
+  "description": "SY8113BADC",
+  "display_title": "SY8113BADC",
+  "docType": 2,
+  "has_device": true,
+  "iv": "d043bd6ecae6bc4bd8c233f3",
+  "key": "8b43eff3b3e07a4ae073d9d882bbde8d2738129aa202e775d74daa770ca0ba31",
+  "modifier": {
+    "nickname": "",
+    "username": "",
+    "uuid": ""
+  },
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "d0fb8368064082990b85ca8fa1eb1c6b",
+  "tags": {
+    "child_tag": {
+      "name": "DC-DC Converters",
+      "name_cn": "DC-DC电源芯片",
+      "uuid": "c06d63cd70f142ff9e0fa61bdda6819c"
+    },
+    "parent_tag": {
+      "name": "Power Management (PMIC)",
+      "name_cn": "电源管理",
+      "uuid": "3f924163e2f249a7b0568b63013871cd"
+    }
+  },
+  "ticket": 10,
+  "title": "sy8113badc",
+  "type": 3,
+  "updateTime": 1752488406,
+  "updated_at": "2026-11-11T19:23:50.000Z",
+  "uuid": "9117144c67424a10baa2f63ec372a8a3",
+  "version": 1752488703835
+}
