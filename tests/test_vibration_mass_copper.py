@@ -25,6 +25,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
+import _toolcount  # noqa: E402
 from pcb_agent_mcp.calc import vibration as V  # noqa: E402
 
 # ---- fixture: the same 100 x 80 x 1.6 mm FR-4 board as the 0.0.53 hand
@@ -640,7 +641,7 @@ class TestThroughTheToolSurface(unittest.TestCase):
         # islands, and to LOOK at the copper are three separate questions,
         # each of which the previous 200 tools could not answer.
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 229)
+        self.assertEqual(len(tools.TOOLS), _toolcount.EXPECTED_TOOL_COUNT)
 
     def test_capabilities_states_the_boundaries_0_0_57_moved(self):
         """The honesty list must move WITH the code: 0.0.53 claimed symmetric-only

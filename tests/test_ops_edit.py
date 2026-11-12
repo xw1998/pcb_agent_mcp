@@ -829,12 +829,26 @@ class ViaInPad(EditBase):
         self.assertEqual(len(new), 1, "no via at the pad centre: %r" % (after,))
         self.assertEqual(new[0]["net"], "1")
 
-    def test_the_via_takes_the_pad_net_and_can_be_told_another(self):
-        plan, _ = self.apply({"op": "add_via_in_pad", "ref": "R1", "pad": "2",
-                              "net": "GND"})
+    def test_the_via_takes_the_pad_net_without_being_told(self):
+        plan, _ = self.apply({"op": "add_via_in_pad", "ref": "R1", "pad": "2"})
         detail = plan["operations"][0]["detail"]
-        self.assertEqual(detail["net"], "GND")
+        self.assertEqual(detail["net"], "VCC")
         self.assertEqual(detail["pad_size"], [1.2, 1.4])
+
+    def test_a_net_the_pad_does_not_have_is_refused_as_a_short_not_written(self):
+        """This case used to assert that naming another net worked. It does not,
+        and that is the correct answer: R1 pad 2 carries VCC, so a GND via at its
+        centre is 0 mm from VCC copper - a short, not a routing choice. The
+        clearance gate stops it at propose time, before a byte is written; naming
+        a net is still the way out for a pad that has none (see the netless-pad
+        case below)."""
+        before = open(self.board, "rb").read()
+        plan = E.propose(self.board, [{"op": "add_via_in_pad", "ref": "R1",
+                                       "pad": "2", "net": "GND"}])
+        gates = [b.get("gate") for b in plan["blocking"] if isinstance(b, dict)]
+        self.assertEqual(gates, ["precondition.clearance_no_worse"], plan["blocking"])
+        with open(self.board, "rb") as fh:
+            self.assertEqual(fh.read(), before)
 
     def test_a_pad_with_no_net_is_refused_unless_a_net_is_named(self):
         self.apply({"op": "set_pad_net", "ref": "R1", "pad": "1", "net": ""})
@@ -1338,6 +1352,17 @@ class SetBoardOutlinePolygon(EditBase):
     not cosmetic: two outlines on one board are two boards to every rule that
     reads Edge.Cuts.
     """
+
+    def apply(self, *ops):
+        """`mech_unchanged` refuses a plan that touches Edge.Cuts unless it is
+        told the shape is the subject of the edit. In this class it always is."""
+        plan = E.propose(self.board, list(ops), {"allow_edge_changes": True})
+        self.assertEqual(plan["blocking"], [], plan["blocking"])
+        report = E.apply_plan(plan["plan_id"], confirm=True,
+                              options=dict(engine=False, allow_edge_changes=True))
+        self.assertTrue(report["gates"]["postconditions"]["all_verified"],
+                        report["gates"]["postconditions"])
+        return plan, report
 
     def test_replaces_the_edge_with_one_closed_polygon(self):
         shape = [[2, 2], [18, 2], [18, 17], [2, 17], [10, 9]]

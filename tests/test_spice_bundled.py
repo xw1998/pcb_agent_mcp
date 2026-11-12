@@ -366,7 +366,44 @@ class TestLicenceHygiene(unittest.TestCase):
 
 @unittest.skipUnless(BUNDLED, "vendor/ngspice is not present in this checkout")
 class TestBundledEngineRuns(unittest.TestCase):
-    """The decks that no engine-less machine could run before 0.0.37."""
+    """The decks that no engine-less machine could run before 0.0.37.
+
+    These goldens are about the SHIPPED copy, so they name it instead of letting
+    `engine="ngspice"` resolve through PATH. That resolution is documented to
+    prefer what the machine has installed, and on this machine that is
+    `%LOCALAPPDATA%\ngspice-47`, which ships `lib/ngspice/*.cm` but no
+    `share/ngspice/scripts/spinit`: every `A` card in this file then comes back
+    "can't find the initialization file spinit / unable to find definition of
+    model gain1", from the engine the suite was not trying to test. The bundle
+    has the init file, so the goldens run it - and
+    `test_the_machines_own_engine_is_told_apart_from_the_bundle` keeps that
+    difference visible instead of hidden by the pin.
+    """
+
+    def setUp(self):
+        self._cmd = spice.NGSPICE_CMD
+        spice.NGSPICE_CMD = list(BUNDLED)
+
+    def tearDown(self):
+        spice.NGSPICE_CMD = self._cmd
+
+    def test_the_machines_own_engine_is_told_apart_from_the_bundle(self):
+        """A negative control for the pin above: what the resolution DOES answer
+        and what this class runs have to be two different things on a machine
+        whose own install cannot load code models - otherwise the pin is doing
+        nothing and this whole file is testing PATH."""
+        pinned = spice.NGSPICE_CMD
+        try:
+            spice.NGSPICE_CMD = []          # ask the resolution, not the pin
+            machine = spice.find_ngspice()
+        finally:
+            spice.NGSPICE_CMD = pinned
+        if not machine or os.path.normcase(machine[0]) == os.path.normcase(BUNDLED[0]):
+            self.skipTest("this machine has no separate ngspice on PATH")
+        raw, problem = spice._run_ngspice(machine, GAIN_OP, "op")
+        self.assertIsNotNone(problem, "the machine's own engine ran an A card "
+                                      "here, so this control says nothing")
+        self.assertIn("gain1", str(problem.get("log_tail")) + str(problem))
 
     def _ok(self, deck, analysis=None, **kw):
         r = spice.simulate(deck, analysis=analysis, engine="ngspice", **kw)

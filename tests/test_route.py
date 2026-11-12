@@ -114,8 +114,19 @@ class RouteBase(unittest.TestCase):
         return router.plan(board, **kw)
 
     def call(self, **args):
+        """Ask the router, not the retired tool.
+
+        0.0.107 removed the TOOL `board_route` (autorouting is not part of this
+        server any more) but not the router: `tools._board_route` is still the
+        function that reads the board, resolves the rules, plans, and - with
+        `apply` - writes through board_propose/board_apply. Every claim below is
+        about THAT behaviour, so it is asked of the function directly. The
+        retirement itself is pinned once, in
+        `TestTheToolIsRetiredNotTheRouter`, instead of being re-asserted in
+        eighteen cases that used to describe a reachable tool.
+        """
         args.setdefault("path", self.board)
-        return tools.call_tool("board_route", args)
+        return tools._board_route(args)
 
 class TestRulesAreResolvedNotInvented(RouteBase):
     """The router may not draw copper to a rule it made up."""
@@ -1597,3 +1608,33 @@ class TestBlindAndBuriedVias(unittest.TestCase):
         em = self.emitter(_StubGrid(self.STACK), blind=True)
         self.assertTrue(em.via("A", 1.0, 1.0, list(self.STACK)))
         self.assertNotIn("layers", self.op(em))
+
+class TestTheToolIsRetiredNotTheRouter(RouteBase):
+    """0.0.107 removed the TOOL, and this is the one place that says so.
+
+    Eighteen cases above ask the router - `tools._board_route` - because that is
+    where the behaviour they describe still lives. This case pins the other half:
+    the NAME is not reachable from a caller, and calling it is not a typo. Two
+    different answers ("unknown tool" vs "that tool is gone on purpose") are what
+    keep the removal from reading like a bug in this server.
+    """
+
+    def test_calling_the_name_is_tool_retired_and_not_tool_not_found(self):
+        out = tools.call_tool("board_route", {"path": self.board})
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "TOOL_RETIRED")
+        self.assertNotEqual(out["reason_code"], "TOOL_NOT_FOUND")
+        # the refusal has to name what was removed, or a caller reads "gone" as
+        # "this server cannot do that today" and tries again tomorrow
+        self.assertIn("autorout", out["message"])
+
+    def test_the_name_is_not_advertised_under_any_profile(self):
+        for profile in ("core", "all", "default"):
+            names = tools.list_tools(profile)
+            self.assertNotIn("board_route", names if isinstance(names, dict)
+                             else json.loads(json.dumps(names)))
+
+    def test_the_board_is_not_touched_by_the_refusal(self):
+        before = read_bytes(self.board)
+        tools.call_tool("board_route", {"path": self.board, "apply": True})
+        self.assertEqual(read_bytes(self.board), before)

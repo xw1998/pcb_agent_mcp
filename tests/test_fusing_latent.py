@@ -38,6 +38,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from pcb_agent_mcp.calc import current  # noqa: E402
+import _toolcount  # noqa: E402
 from pcb_agent_mcp import tools  # noqa: E402
 
 CP = current.COPPER_CP_J_PER_KGK
@@ -333,7 +334,7 @@ class TestToolLayer(unittest.TestCase):
 
     def test_tool_count_did_not_change(self):
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 229)
+        self.assertEqual(len(tools.TOOLS), _toolcount.EXPECTED_TOOL_COUNT)
 
     def test_gap_is_registered(self):
         # 0.0.88 closed the "melting, by name" gap on all three tools, so that entry

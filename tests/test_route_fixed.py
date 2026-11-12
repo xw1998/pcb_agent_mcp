@@ -253,8 +253,10 @@ class FixedNetsOnTheRouter(LockedBase):
 
     def test_the_tool_carries_the_flag_and_the_plan_still_refuses_a_partial_board(self):
         from pcb_agent_mcp import tools
-        out = tools.call_tool("board_route",
-                              {"path": self.board, "fixed_nets": "GND"})
+        # 0.0.107 retired the TOOL `board_route`, not this function: the flag
+        # still has to survive the argument unpacking, so ask the implementation
+        # (the retirement itself is pinned in test_route.py).
+        out = tools._board_route({"path": self.board, "fixed_nets": "GND"})
         self.assertEqual(out["status"], "ok", out.get("message"))
         self.assertEqual(out["value"]["nets_fixed"], 1)
 

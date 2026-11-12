@@ -234,7 +234,13 @@ class TestOneOpenSideIsADifferentDiagnosis(BlockerBase):
         out = self.call(ref="U1", pad="1", radius_mm=2.0)
         self.assertEqual(out["status"], "ok", out)
         self.assertIn("NOT boxed in", out["message"])
-        self.assertIn("further along the net", out["hint"])
+        # 0.0.107 removed the router, so the hint can no longer be "the router
+        # will go further along the net". What it says instead has to name a tool
+        # that exists (board_dangling / board_routability) and the one move that
+        # is possible in this exact spot (a via in the pad), or it is a next step
+        # the caller cannot take.
+        self.assertIn("walk the net yourself", out["hint"])
+        self.assertIn("via-in-pad", out["hint"])
 
 class TestViaInPadIsReportedNotAssumed(BlockerBase):
     """A via needs 0.6 mm of copper; a 0.25 mm track needs a quarter of that."""

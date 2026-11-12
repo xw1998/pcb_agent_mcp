@@ -199,6 +199,22 @@ def drc(path, severity="all", timeout=None, project=None, refill=False,
             shutil.copyfile(os.path.splitext(os.path.abspath(path))[0] + ".kicad_pro",
                             os.path.splitext(staged)[0] + ".kicad_pro")
             target_path = staged
+        if save_to and refill and target_path == os.path.abspath(path):
+            # `--save-board` makes kicad-cli WRITE the board it was given, and
+            # until this branch existed the board it was given was the caller's
+            # own file whenever the board had no .kicad_pro beside it. So a
+            # "reports only" call re-saved the caller's board with KiCad's own
+            # writer - which drops what KiCad 10 treats as legacy, `(net_class
+            # "Default" ... (clearance 0.2) (trace_width 0.25) ...)`, i.e. the
+            # board's clearance. Measured: one apply on a 60x40 synthetic board
+            # (engine=True, so the DRC gate runs with save_to) left the file with
+            # net_class count 0, and the next board_route on it refused with
+            # RULES_ABSENT. A read must not edit the thing it reads, so the
+            # scratch copy is made here even when there is no project to bring
+            # along.
+            staged = os.path.join(tmp, os.path.basename(path))
+            shutil.copyfile(path, staged)
+            target_path = staged
         report = os.path.join(tmp, "drc.json")
         args = ["pcb", "drc", "-o", report, "--format", "json"]
         args.append("--severity-all" if severity == "all" else "--severity-error")

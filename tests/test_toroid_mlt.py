@@ -28,6 +28,7 @@ import os
 import unittest
 
 from pcb_agent_mcp.calc import magnetics as mag
+import _toolcount  # noqa: E402
 from pcb_agent_mcp import tools
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -393,7 +394,7 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
         caps = tools._capabilities({})
         self.assertIn("magnetics_toroid_mlt", caps["available"])
         # 174 = 173 + thermal_spreading in 0.0.85
-        self.assertEqual(len(caps["available"]), 204)
+        self.assertEqual(len(caps["available"]), _toolcount.EXPECTED_AVAILABLE_COUNT)
         joined = json.dumps(caps)
         self.assertIn("toroid_mlt", joined)
         self.assertNotIn("(so no toroid copper estimate)", joined)
@@ -408,7 +409,7 @@ class TestTheToolSurfaceMovedOnce(unittest.TestCase):
         # islands, and to LOOK at the copper are three separate questions,
         # each of which the previous 200 tools could not answer.
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 229)
+        self.assertEqual(len(tools.TOOLS), _toolcount.EXPECTED_TOOL_COUNT)
 
 if __name__ == "__main__":
     unittest.main()

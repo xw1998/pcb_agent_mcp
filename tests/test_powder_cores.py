@@ -51,6 +51,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from pcb_agent_mcp.calc import magnetics as mg  # noqa: E402
+import _toolcount  # noqa: E402
 from pcb_agent_mcp import tools  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -456,7 +457,7 @@ class TestTheFilledSaturationValues(unittest.TestCase):
         # 180 = 179 + thermal_spreading in 0.0.85 (a rectangular heat source's
         # spreading resistance is its own question; thermal_stack stays strictly 1-D)
         # 223 = 220 + the three routing-discipline tools in 0.0.122
-        self.assertEqual(len(tools.TOOLS), 229)
+        self.assertEqual(len(tools.TOOLS), _toolcount.EXPECTED_TOOL_COUNT)
         props = tools.TOOLS["magnetics_select_core"]["inputSchema"]["properties"]
         self.assertIn("include_powder_cores", props)
         self.assertIn("permeability", props)

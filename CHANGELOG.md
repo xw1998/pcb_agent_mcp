@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.0.147] - 2026-11-12
+
+`0.0.146` 之后跑了一次全量回归：**4108 passed / 48 failed**，修完再跑就是
+**4165 passed, 9 skipped, 53 subtests passed in 644.20s**（`-n 6`，8 核）。48 个红逐类查下来
+只有一个是真缺陷，其余五类是「陈旧期望」，但都不是可以放着不管的那种红（`docs/138`）：
+
+- **`engine.drc(save_to=...)` 会改它读的板子**（真缺陷）。`kicad-cli pcb drc --refill-zones
+  --save-board` 会**写**它拿到的那个 `.kicad_pcb`；当板子旁边没有 `.kicad_pro` 时落点会落回
+  调用方自己的文件，KiCad 10 重存时把 `(net_class "Default" ...)` 当 legacy 丢掉，板子的
+  `clearance 0.2` 就没了——表现是「一次 apply 之后 `board_route` 报 `RULES_ABSENT`」。修：
+  refill 且目标就是原件时先复制到 scratch 再交给 kicad-cli。实测修前 `engine=False → net_class=1`、
+  `engine=True → 0`，修后两次都是 1；新增 `tests/test_drc_reads_only.py`（4 例）钉住
+  「DRC 不得改动它读的板子」。
+- **棘轮漂移**：十二处 `assertEqual(len(tools.TOOLS), 229)` 早在 surface 走到 250/252 之后就永远红，
+  红数字等于没有守卫。收口到 `tests/_toolcount.py`（252 / 222），另三处 `available == 204` 同样接上。
+- **19 个用例在断言已退役的 `board_route` 返回 ok**：单测改走库函数 `tools._board_route()`
+  （planner 没坏，坏的是它被当工具广告），退役本身用一个类钉住（`TOOL_RETIRED` ≠ `TOOL_NOT_FOUND`、
+  四个 profile 都不广告、拒绝不写盘）。
+- **夹具开框**：`test_sync` 的板子只有一条 `gr_line`，新闸门 `precondition.outline_known` 如实拒绝；
+  补成闭合矩形。
+- **新闸门 vs 旧期望**：`test_ops_edit` 拆成「过孔跟随焊盘网络」与「指定他网被当短路拒绝且文件不变」；
+  改板形的类显式传 `allow_edge_changes=True`；`test_crosscheck` 故意造 0.15 mm 间距 ⇒ 该类传
+  `preconditions=False`（只在违规就是被测对象时开闸）。
+- **本机 ngspice-47 没有 spinit**：`engine="ngspice"` 先走 PATH，落到没有 XSPICE 的本机引擎，
+  `gain1` 找不到定义。golden 钉到 `vendor/ngspice`，并加反向对照记录「本机引擎确实跑不了这张卡」。
+
+工具数仍 **252**、`available` **222**，selftest 363/366。
+
 ## [0.0.146] - 2026-11-12
 
 拿 KiCad 自带的 12 块 demo 板把两个「不需要调用方给数」的入口全扫了一遍（`docs/137`），

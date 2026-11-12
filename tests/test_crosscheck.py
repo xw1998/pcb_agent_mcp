@@ -68,8 +68,17 @@ class TestOnABuiltBoard(_Tmp):
     """A board built by this server, with one clearance violation put in on purpose."""
 
     def build(self, gap_mm):
+        """A board with one clearance violation on purpose.
+
+        `preconditions` is off for this build because the violation IS the
+        subject: the `clearance_no_worse` gate exists to stop an edit from
+        quietly making a board worse, and here the edit is supposed to. Passing
+        the flag keeps the gate alive everywhere else instead of teaching it to
+        tolerate edits that this file happens to want.
+        """
         path = os.path.join(self.tmp, "cc.kicad_pcb")
         E.create_board(path, {"width_mm": 30, "height_mm": 20, "engine": False})
+        opts = {"engine": False, "preconditions": False}
         plan = E.propose(path, [
             {"op": "add_net", "name": "N1"},
             {"op": "add_net", "name": "N2"},
@@ -77,8 +86,8 @@ class TestOnABuiltBoard(_Tmp):
              "width": 0.25, "layer": "F.Cu", "net": "N1"},
             {"op": "add_track", "x1": 5, "y1": 10 + gap_mm, "x2": 15,
              "y2": 10 + gap_mm, "width": 0.25, "layer": "F.Cu", "net": "N2"},
-        ], {"engine": False})
-        E.apply_plan(plan["plan_id"], confirm=True, options={"engine": False})
+        ], dict(opts))
+        E.apply_plan(plan["plan_id"], confirm=True, options=dict(opts))
         return path
 
     def test_one_violation_is_found_by_both_sides(self):

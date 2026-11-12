@@ -297,6 +297,92 @@ class TestViewsReadStoredValues(unittest.TestCase):
         # from `raw` alone.
         self.assertEqual(got[("J9", "6")][0] - 2.54, 12.7)
 
+    def test_a_rotated_footprint_puts_its_pads_where_kicad_does(self):
+        """The pinned numbers are pcbnew 10.0.7's, not ours: see
+        tests/test_kicad_pad_placement.py, which measures the same cases against
+        the installed KiCad. This view reports Y up, so y_mm == -pcbnew_y.
+
+        Rotation 0 is the case that hides a wrong rotation sign, so every case
+        here is rotated: a negated angle used to mirror the pads about the
+        footprint origin (a 90 deg header pad 25.4 mm out) while every other
+        answer stayed self-consistent.
+        """
+        text = """(kicad_pcb (version 20221018)
+  (net 0 "") (net 1 "A")
+  (footprint "T:Q" (layer "F.Cu") (at 10 10 90)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 2 0) (size 1 1) (layers "F.Cu") (net 1 "A"))
+  )
+  (footprint "T:F" (layer "F.Cu") (at 10 10 45)
+    (property "Reference" "U2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 2 0) (size 1 2) (layers "F.Cu") (net 1 "A"))
+    (pad "2" smd rect (at 0 2) (size 1 2) (layers "F.Cu") (net 1 "A"))
+  )
+  (footprint "T:HDR" (layer "F.Cu") (at 2.54 -3.81 90)
+    (property "Reference" "J9" (at 0 0 0) (layer "F.SilkS"))
+    (pad "6" thru_hole circle (at 0 12.7 90) (size 1.7 1.7) (drill 1)
+      (layers "*.Cu" "*.Mask") (net 1 "A"))
+  )
+)"""
+        pads = BoardView(KiCadDocument.from_text(text)).pads()
+        got = dict(((p["footprint"], p["number"]), (p["x_mm"], p["y_mm"]))
+                   for p in pads)
+        want = {
+            ("U1", "1"): (10.0, -8.0),
+            ("U2", "1"): (11.414214, -8.585786),
+            ("U2", "2"): (11.414214, -11.414214),
+            ("J9", "6"): (15.24, 3.81),
+        }
+        for key, xy in want.items():
+            self.assertAlmostEqual(got[key][0], xy[0], places=5, msg=key)
+            self.assertAlmostEqual(got[key][1], xy[1], places=5, msg=key)
+        # The local offsets stay as written (Y up), so the answer is reproducible
+        # from `raw` alone.
+        self.assertEqual(got[("J9", "6")][0] - 2.54, 12.7)
+
+    def test_a_rotated_footprint_puts_its_pads_where_kicad_does(self):
+        """The pinned numbers are pcbnew 10.0.7's, not ours: see
+        tests/test_kicad_pad_placement.py, which measures the same cases against
+        the installed KiCad. This view reports Y up, so y_mm == -pcbnew_y.
+
+        Rotation 0 is the case that hides a wrong rotation sign, so every case
+        here is rotated: a negated angle used to mirror the pads about the
+        footprint origin (a 90 deg header pad 25.4 mm out) while every other
+        answer stayed self-consistent.
+        """
+        text = """(kicad_pcb (version 20221018)
+  (net 0 "") (net 1 "A")
+  (footprint "T:Q" (layer "F.Cu") (at 10 10 90)
+    (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 2 0) (size 1 1) (layers "F.Cu") (net 1 "A"))
+  )
+  (footprint "T:F" (layer "F.Cu") (at 10 10 45)
+    (property "Reference" "U2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 2 0) (size 1 2) (layers "F.Cu") (net 1 "A"))
+    (pad "2" smd rect (at 0 2) (size 1 2) (layers "F.Cu") (net 1 "A"))
+  )
+  (footprint "T:HDR" (layer "F.Cu") (at 2.54 -3.81 90)
+    (property "Reference" "J9" (at 0 0 0) (layer "F.SilkS"))
+    (pad "6" thru_hole circle (at 0 12.7 90) (size 1.7 1.7) (drill 1)
+      (layers "*.Cu" "*.Mask") (net 1 "A"))
+  )
+)"""
+        pads = BoardView(KiCadDocument.from_text(text)).pads()
+        got = dict(((p["footprint"], p["number"]), (p["x_mm"], p["y_mm"]))
+                   for p in pads)
+        want = {
+            ("U1", "1"): (10.0, -8.0),
+            ("U2", "1"): (11.414214, -8.585786),
+            ("U2", "2"): (11.414214, -11.414214),
+            ("J9", "6"): (15.24, 3.81),
+        }
+        for key, xy in want.items():
+            self.assertAlmostEqual(got[key][0], xy[0], places=5, msg=key)
+            self.assertAlmostEqual(got[key][1], xy[1], places=5, msg=key)
+        # The local offsets stay as written (Y up), so the answer is reproducible
+        # from `raw` alone.
+        self.assertEqual(got[("J9", "6")][0] - 2.54, 12.7)
+
     def test_stackup_rows_come_from_the_file(self):
         rows = {r["name"]: r for r in self.view.stackup()}
         self.assertEqual(rows["dielectric 1"]["thickness"], 1.53)
