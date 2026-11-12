@@ -1,0 +1,21 @@
+{
+  "what": "JLCEDA/EasyEDA official footprint document for LCSC C48642327 (RK3506J, FBGA-333L)",
+  "how": "GET https://pro.lceda.cn/api/v5/components/<footprint_uuid> -> dataStrId/key/iv -> AES-256-GCM -> gzip -> EasyEDA doc text",
+  "device_uuid": "128603d95e744add8ee01d5f70f34383",
+  "footprint_uuid": "d190bd3d49d2453ebaeb5200af6bd2ad",
+  "symbol_uuid": "0afac4e6936a4bec9702ed842676ae84",
+  "symbol_uuid_monolithic": "d190bd3d49d2453ebaeb5200af6bd2ad",
+  "lcsc": "C48642327",
+  "mpn": "RK3506J",
+  "manufacturer": "Rockchip(瑞芯微)",
+  "package": "FBGA-333L",
+  "datasheet": "https://item.szlcsc.com/datasheet/RK3506J/50920590.html",
+  "dataStrId": "https://modules.lceda.cn/datastr/3c/ae/e3/c5/bfc8e9bf1987e4161806094b",
+  "aes_key_hex": "ae38296126a1edb877c8b8d525b0772b335dd70374a4eba57e8236ed7fc6afe8",
+  "aes_iv_hex": "68f8567b25a9313800d6fdd5",
+  "doc_title": "BGA-333_L13.3-W11.3_RK3506B",
+  "doc_doctype": 4,
+  "doc_version": 1749694807946,
+  "fetched": "2026-11-12",
+  "copyright": "footprint data copyright JLCEDA/EasyEDA official library (see HEAD line in the .efp file); used here as geometry source for a local layout, not redistributed as a library."
+}

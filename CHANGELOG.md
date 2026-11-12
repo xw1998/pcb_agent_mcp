@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.3] - 2026-11-12
+
+RK3506 核心板第三步：把 0.1.2 记的「⛔ 333 球坐标缺失」这条硬阻塞自己解开——不再向用户要资料，改走立创 EDA 官方库在线接口取到 333 球真实几何，解密后落成 KiCad 封装与符号。零板改动（天空星板不动，`rk3506_som.kicad_pcb` 不动）。
+
+- **取几何链路（可复用的四个步骤）**：① `POST https://pro.lceda.cn/api/v5/devices/search`（`{"wd":"RK3506","page":1,"pageSize":10}`，匿名可用）→ 命中 RK3506J **LCSC C48642327 / FBGA-333L**，`device_uuid 128603d95e744add8ee01d5f70f34383`、`footprint_uuid d190bd3d49d2453ebaeb5200af6bd2ad`、`symbol_uuid 0afac4e6936a4bec9702ed842676ae84`；② `GET /api/v5/components/<uuid>` 返回 `dataStrId` + `key`(32B) + `iv`(**12B**)；③ 下载密文 → **AES-256-GCM**（`AESGCM(key).decrypt(iv, raw, None)`，tag 在尾部）→ 拿到 **gzip** 流 → `gzip.decompress` → EasyEDA 文档文本；④ `HEAD` 行自带版权声明（**嘉立创EDA/EasyEDA 官方库**），故 `.efp` 原文档随库留在 `examples/rk3506_som/library/`，来源凭证全量落 `lceda_source.json`（含 key/iv），并写明**只作几何来源、不作为库再分发**。旧 `easyeda.com/api/products/...` 一律 **403**，不要再走。
+- **比例不“读”而是“解”**（本轮最贵的一条）：该封装 `CANVAS` 行写 `["CANVAS",0,0,"mm",1,1,0.3937,0.3937]`，但坐标真值是 **mil**。按 mm 解释会得到 486 mm 宽的器件（不可能）；用手册当尺子才能证明——pad 直径 9.843→**0.250 mm**、X 跨 486.78→**12.364 mm = 手册 E1**、Y 跨 420.40→**10.678 mm = 手册 D1**、本体 ±261.8105/±222.4405→**13.300 × 11.300 mm = 手册 E × D**。于是 `solve_scale()` 在 `("mil",0.0254)` 与 `("mm",1.0)` 两候选中**用 D1/E1 当尺子解唯一命中**，命中数 ≠ 1 即 `SystemExit`，不写任何字节。
+- **几何结论**：**333 焊盘**（手册具名 332 + 库多出 `1G2`），两组阵列双间距——外圈稀疏阵 163 球（`<行A..Y><列1..23>`，20 行）行/列距 **22.13 mil = 0.562 mm = 手册 e**，bbox 12.364×10.678；内密阵 170 球（`1<行A..N><列1..14>`，13 行 14 列共 182 槽位实装 170）间距 **25.59 mil = 0.650 mm = 手册 e1**，bbox 8.45×7.80；两族行字母 20+13=**33**，与手册「33 行字母」吻合。焊盘取库的 **0.250 mm**（手册 **b=0.30 是球径不是焊盘**；已 grep 证实手册**无 land pattern**）。
+- **新增 `tools/gen_bga333_footprint.py`**（docstring 首行 `Nothing here is a route; it is a package geometry transcription.`）：读官方文档 → 解比例 → **八条审计 A1–A8**（pad 数/编号唯一、比例由 E1/D1 解出、间距谱只允许 0.562/0.65、焊盘直径单一、本体 13.30×11.30、球名与手册 332 逐一致且多出只能是 `1G2`、坐标无重复、球阵中心在原点）→ 生成 `.kicad_mod` 与球表 CSV。**任一审计不过即非零退出、一个字节都不写**。
+- **新增 `tests/test_bga333_footprint.py`（14 用例，11 条反向失败对照）**：正向证「比例是解出来的不是读出来的」「真实文档审计通过」「产物 333 pad / 括号平衡 / size 0.25 / 含 1G2 / 跨度 ≤12.3645·10.6785」；反向逐条打掉审计一个通道——声明 mil 实为 mm、两候选都不命中、少焊盘、重号、挪中心焊盘 `1G7` 半拍（跨度不变但最近邻多出第三间距）、焊盘直径错、本体尺寸错、找不到本体、多出非 `1G2` 的球、坐标重复、球阵不居中。
+- **新增产物**：`examples/rk3506_som/lib/RK3506.pretty/Package_WBBGA-333L_RK3506J.kicad_mod`（36,418 B，KiCad 10 原生，`kicad-cli fp upgrade` = 「封装库未更新」、`fp export svg` 成功）、`examples/rk3506_som/lib/RK3506.kicad_sym`（64,457 B，**333 pin**，pin 名取手册功能名、number 为球号，`sym upgrade` 通过）、`examples/rk3506_som/bga333_balls.csv`（334 行，`1G2` 标 `named_in_datasheet=no`）。
+- **KiCad 10 语法三坑**（写错就整库加载失败）：封装头必须 `(version 20260206)`（`20240108` 报 Unable to convert library）、元件属性用 `(property "Reference" …)`（不是 `fp_text`）、`(tags …)` **只接受一个字符串**。另：括号必须平衡、`-0.0` 要归零。
+- **两条明确不声称**：courtyard（本体 +0.25 mm）与 1 脚标记描边（库给的是半径 0.05 mm 的 circle，只加 0.15 描边使其可见）都是**工程默认值**，报告里以 `courtyard_rule` / `pin1_marker_rule` 字段明示，不当手册事实；`1G2` 手册未具名，保留但标 NC 待定。
+- **验证**：`python -m unittest discover -s tests -p test_bga333_footprint.py` **14/14 OK**；`python run_server.py --selftest` **366/366**。
+- **没修完（如实）**：`src/pcb_agent_mcp/parts.py` 的 `footprint_pads_mm`/`footprint_to_kicad` 仍**直接采信 CANVAS 声明的单位**，对这份文档会产出 486 mm 的错误封装（本轮用自写生成器绕开，缺陷留着）；DDR3L 颗粒、SPI-NAND、电源器件尚未取库、未选型；原理图、布局、布线、内层平面未开工。
+
 ## [0.1.2] - 2026-11-12
 
 RK3506 核心板（SOM）第二步：把「邮票孔引哪些脚」变成可复现的规则表演算，并修掉上一版写错的半孔几何。零板改动（天空星板不动）。
