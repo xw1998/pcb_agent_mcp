@@ -1,0 +1,51 @@
+{
+  "createTime": 1620741474,
+  "created_at": "2021-05-11T13:57:54.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/75/8b/cb/c8/755bee03100fef15cb277e75",
+  "description": "",
+  "display_title": "W25N01GVZEIG_C907680",
+  "docType": 2,
+  "has_device": true,
+  "iv": "8952696d54d9c3738697d167",
+  "key": "a4fccfa9ba60e8fab47a2f51a5b8ae805dc2cacddfd311edd07d3526c0eb077d",
+  "modifier": {
+    "nickname": "",
+    "username": "",
+    "uuid": ""
+  },
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "3ab30dcf114641f7b048830783cf2972",
+  "tags": {
+    "child_tag": {
+      "name": "NAND FLASH",
+      "name_cn": "NAND FLASH",
+      "uuid": "8366aa1685ae4d48bb258c0172ab3d43"
+    },
+    "parent_tag": {
+      "name": "Memory",
+      "name_cn": "存储器",
+      "uuid": "672970ba5a66473fb91519efaa81af95"
+    }
+  },
+  "ticket": 6,
+  "title": "w25n01gvzeig_c907680",
+  "type": 3,
+  "updateTime": 1752487839,
+  "updated_at": "2026-11-11T19:30:10.000Z",
+  "uuid": "8ab6380f66304895b75e188e38fa7106",
+  "version": 1752488136453
+}

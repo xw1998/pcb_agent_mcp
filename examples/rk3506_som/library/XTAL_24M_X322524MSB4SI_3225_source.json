@@ -1,0 +1,19 @@
+{
+  "component_uuid": "7ad2c95bfc5a4739a91ef8a01dcb9dc1",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "crystal-smd_4p-l3.2-w2.5-bl",
+  "doc_doctype": 4,
+  "doc_version": 1766627403350,
+  "dataStrId": "https://modules.lceda.cn/datastr/0b/d7/6e/10/ca99aa42c1170e389100201d",
+  "aes_key_hex": "d849fe980fd2f80e8d53efa6a4502cea29d86d7b50aefa5a3fa36aefe7864350",
+  "aes_iv_hex": "3e5c8a97f1de5cc8eb69ed3a",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 2344,
+  "doc_bytes": 5059,
+  "doc_sha256": "df2ded1727854c2b3591819eade4fa6a6905b629bd7638e62519d538fd4e03b9",
+  "copyright": "[\"HEAD\",{\"editorVersion\":\"2.2.C\",\"importFlag\":0,\"uuid\":\"9e297fbdb6c24ee39419d7ac96617dbf\",\"title\":\"CRYSTAL-SMD_4P-L3.2-W2.5-BL\",\"source\":\"\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints, 3D mo",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

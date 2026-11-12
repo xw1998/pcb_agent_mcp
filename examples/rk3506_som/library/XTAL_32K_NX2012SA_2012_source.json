@@ -1,0 +1,19 @@
+{
+  "component_uuid": "008b03bb3158456cb0348c46d0cb8ea3",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "osc-smd-2p_-l2.1-w1.2",
+  "doc_doctype": 4,
+  "doc_version": 1736302955391,
+  "dataStrId": "https://modules.lceda.cn/datastr/21/41/73/18/80843aba7c8c37c8da05c78b",
+  "aes_key_hex": "2d60fa14769b0fc72e773812d20602bc3d23635fddeee04abdfd459f322b2e2a",
+  "aes_iv_hex": "9e2fb7f0a977c7874ca75d1e",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 2508,
+  "doc_bytes": 5352,
+  "doc_sha256": "9992f56ba196b01e56277b384ae4fadcdff5cb86fcdf8ad6bc3d279aaf42b2d4",
+  "copyright": "[\"HEAD\",{\"editorVersion\":\"2.2.C\",\"importFlag\":0,\"uuid\":\"d12c981021184949a6e742a7722e0510\",\"title\":\"OSC-SMD-2P_-L2.1-W1.2\",\"source\":\"\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints, 3D models, ",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

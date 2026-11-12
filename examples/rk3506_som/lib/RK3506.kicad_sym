@@ -7,7 +7,7 @@
     (property "Value" "RK3506J" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
     (property "Footprint" "RK3506:Package_WBBGA-333L_RK3506J" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
     (property "Datasheet" "https://mail.rockchip.fr/RK3506J%20datasheet%20V1.3.pdf" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Description" "RK3506J (Cortex-A7 x3 + MCU) WBBGA-333L. Symbol geometry from JLCEDA official library LCSC C48642327." (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Description" "RK3506J triple-core Cortex-A7 + MCU, FBGA-333L (LCSC C48642327) | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
     (symbol "RK3506J_0_1"
       (rectangle (start -81.28 63.5) (end 81.28 -63.5)
         (stroke (width 0.254) (type solid)) (fill (type background)))

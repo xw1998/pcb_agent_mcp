@@ -1,0 +1,19 @@
+{
+  "component_uuid": "a583434a75024da7969702748eac2f50",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "wson-8_l8.0-w6.10-p1.27-bl-ep",
+  "doc_doctype": 4,
+  "doc_version": 1736302686582,
+  "dataStrId": "https://modules.lceda.cn/datastr/8b/f9/aa/7d/a8b57130cc3d73e845b4c484",
+  "aes_key_hex": "dd7e2ab97fbba09b040a4f090d2e942dc87a900c52df53bee04065b9bcd07a65",
+  "aes_iv_hex": "8b9f3b3cdc1d9b1c559500a8",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 2617,
+  "doc_bytes": 6447,
+  "doc_sha256": "a809dd2bd68248483f1ec2f970d77d0396c2703c825e2ef7b1171de5204fb570",
+  "copyright": "[\"HEAD\",{\"editorVersion\":\"2.2.C\",\"importFlag\":0,\"uuid\":\"329a041d4d9c4a399d8970cd6ec4d7b2\",\"title\":\"WSON-8_L8.0-W6.10-P1.27-BL-EP\",\"source\":\"\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints, 3D ",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

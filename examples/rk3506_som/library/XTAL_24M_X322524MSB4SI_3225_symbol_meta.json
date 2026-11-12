@@ -1,0 +1,51 @@
+{
+  "createTime": 1620739716,
+  "created_at": "2021-05-11T13:28:36.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/17/f1/7c/cd/929473a2e3c50e7a07095110",
+  "description": "YSX321SL 24MHZ 20PF 10PPM -40~+85℃",
+  "display_title": "X322524MSB4SI",
+  "docType": 2,
+  "has_device": true,
+  "iv": "e78ecd7cf919559ea7c419ce",
+  "key": "b84cb14cff50da4bfa4f96f60f5646a6050eb404dca41d5d28188d23025e7680",
+  "modifier": {
+    "nickname": "",
+    "username": "",
+    "uuid": ""
+  },
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "0d9ae5b817d8d8f74b607f6d6c53a96c",
+  "tags": {
+    "child_tag": {
+      "name": "Crystals",
+      "name_cn": "无源晶振",
+      "uuid": "bc136e7b5196496085164ac88a2df066"
+    },
+    "parent_tag": {
+      "name": "Crystals, Oscillators, Resonators",
+      "name_cn": "振荡器/谐振器",
+      "uuid": "8e857e0bb05947dfae4266702061e90d"
+    }
+  },
+  "ticket": 3,
+  "title": "x322524msb4si",
+  "type": 3,
+  "updateTime": 1727166303,
+  "updated_at": "2026-11-11T19:25:43.000Z",
+  "uuid": "c9e5064122f2435d8532161e69429fb9",
+  "version": 1730293706298
+}

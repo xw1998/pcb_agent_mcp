@@ -3,7 +3,7 @@
   (generator "pcb_agent_mcp")
   (generator_version "0.1.4")
   (layer "F.Cu")
-  (descr "MT41K256M16 DDR3L 4Gb x16, FBGA-96 9.00x14.00 mm, pitch 0.800 mm, pad 0.4572 mm transcribed from LCEDA C248057; unit solved against the 0.8 mm pitch and the 9x14 body, not read from CANVAS")
+  (descr "MT41K256M16 DDR3L 4Gb x16, FBGA-96 9.00x14.00 mm, pitch 0.800 mm, pad 0.4572 mm transcribed from LCEDA C248057; unit solved against the 0.8 mm pitch and the 9x14 body, not read from CANVAS | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)")
   (tags "DDR3L FBGA-96 MT41K256M16 0.8mm")
   (attr smd)
   (duplicate_pad_numbers_are_jumpers no)
@@ -38,7 +38,7 @@
         )
       )
     )
-    (property "Description" "MT41K256M16 DDR3L 4Gb x16, FBGA-96 9.00x14.00 mm, pitch 0.800 mm, pad 0.4572 mm transcribed from LCEDA C248057; unit solved against the 0.8 mm pitch and the 9x14 body, not read from CANVAS"
+    (property "Description" "MT41K256M16 DDR3L 4Gb x16, FBGA-96 9.00x14.00 mm, pitch 0.800 mm, pad 0.4572 mm transcribed from LCEDA C248057; unit solved against the 0.8 mm pitch and the 9x14 body, not read from CANVAS | Geometry from 嘉立创EDA/EasyEDA官方库 official library (https://lceda.cn/ , https://easyeda.com/)"
       (at 0.0000 0.0000 0)
       (layer "F.Fab")
       (effects

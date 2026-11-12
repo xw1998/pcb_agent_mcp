@@ -1,0 +1,51 @@
+{
+  "createTime": 1629273131,
+  "created_at": "2021-08-18T07:52:11.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/89/87/7e/4f/a416e9303a1e117b6701e89d",
+  "description": "",
+  "display_title": "NX2012SA-32.768KHZ-STD-MUB-1",
+  "docType": 2,
+  "has_device": true,
+  "iv": "0f270bc4b04b7d51b53985b3",
+  "key": "e5f765c2f494d02b467c50a8d90dcac78eb42247731e07bcdc36ca0640abed47",
+  "modifier": {
+    "nickname": "",
+    "username": "",
+    "uuid": ""
+  },
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "f45b3d8e2b074abcaba1457fc2768c07",
+  "tags": {
+    "child_tag": {
+      "name": "Crystals",
+      "name_cn": "无源晶振",
+      "uuid": "bc136e7b5196496085164ac88a2df066"
+    },
+    "parent_tag": {
+      "name": "Crystals, Oscillators, Resonators",
+      "name_cn": "振荡器/谐振器",
+      "uuid": "8e857e0bb05947dfae4266702061e90d"
+    }
+  },
+  "ticket": 3,
+  "title": "nx2012sa-32.768khz-std-mub-1",
+  "type": 3,
+  "updateTime": 1779943250,
+  "updated_at": "2026-11-11T18:07:53.000Z",
+  "uuid": "f9f5472c6258428f88b91d3bb8688000",
+  "version": 1779943503989
+}

@@ -1,0 +1,54 @@
+{
+  "createTime": 1620741532,
+  "created_at": "2021-05-11T13:58:52.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/8b/f9/aa/7d/a8b57130cc3d73e845b4c484",
+  "description": ";WSON-8(6x8);WSON-8-EP(6.1x8);WSON-8;WSON-8-EP(6x8);WSON-8_L8.0-W6.10-P1.27-BL-EP",
+  "display_title": "WSON-8_L8.0-W6.10-P1.27-BL-EP",
+  "docType": 4,
+  "has_device": true,
+  "iv": "8b9f3b3cdc1d9b1c559500a8",
+  "key": "dd7e2ab97fbba09b040a4f090d2e942dc87a900c52df53bee04065b9bcd07a65",
+  "model_3d": {
+    "title": "WSON-8_L8.0-W6.0-H0.78-P1.27",
+    "transform": "315.7474,236.22,0,90,0,0,0,0,0",
+    "uri": "43ef51fbc8554229856bf47998ce0c31"
+  },
+  "modifier": {
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "need_sync_easyeda_pro": true,
+  "need_sync_pro": true,
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "329a041d4d9c4a399d8970cd6ec4d7b2",
+  "tags": {
+    "child_tag": [],
+    "parent_tag": {
+      "name": "WSON-8",
+      "name_cn": "",
+      "uuid": "817238d2e0494071a4b638f5c4f627f9"
+    }
+  },
+  "ticket": 3,
+  "title": "wson-8_l8.0-w6.10-p1.27-bl-ep",
+  "type": 3,
+  "updateTime": 1706176625,
+  "updated_at": "2025-01-08T02:18:06.000Z",
+  "uuid": "a583434a75024da7969702748eac2f50",
+  "version": 1736302686582
+}

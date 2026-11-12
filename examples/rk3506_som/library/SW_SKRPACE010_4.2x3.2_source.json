@@ -1,0 +1,19 @@
+{
+  "component_uuid": "d68fb37867914d819b985c6db541b3eb",
+  "device_uuid": null,
+  "footprint_uuid": null,
+  "symbol_uuid": null,
+  "lcsc": null,
+  "doc_title": "key-smd_4p-l4.2-w3.2-p2.20-ls4.6",
+  "doc_doctype": 4,
+  "doc_version": 1736302224335,
+  "dataStrId": "https://modules.lceda.cn/datastr/79/5d/bf/c1/7acccde9d3c814985dd995ec",
+  "aes_key_hex": "9d324f395d53ec3642f100fc0fbc164e97df12145eff3992303cf49ea167c231",
+  "aes_iv_hex": "faa755d8470286a46840f9f1",
+  "fetched": "2026-11-12",
+  "cipher_bytes": 2371,
+  "doc_bytes": 5082,
+  "doc_sha256": "594640e98456c783d9bd67713b8ffe0c943e83e6ea872267209ed6ccd75c0c91",
+  "copyright": "[\"HEAD\",{\"editorVersion\":\"2.2.C\",\"importFlag\":0,\"uuid\":\"6cecadb1e7764552b8e7c4700a6567b5\",\"title\":\"KEY-SMD_4P-L4.2-W3.2-P2.20-LS4.6\",\"source\":\"\",\"license\":\"【版权归属/Copyright】嘉立创EDA/EasyEDA官方库（包括但不限于器件参数、原理图符号、PCB封装、3D模型、模块及相关数据）的版权及相关权利归嘉立创EDA所有。The copyright and related rights of the JLCEDA/EasyEDA Official Library, including but not limited to device parameters, schematic symbols, PCB footprints, ",
+  "note": "Geometry source for transcription only. The document is the LCEDA/EasyEDA official library's; do not redistribute it as a library and do not treat its declared CANVAS unit as truth (solve the scale against a datasheet dimension instead)."
+}

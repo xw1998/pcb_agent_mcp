@@ -1,0 +1,54 @@
+{
+  "createTime": 1628852102,
+  "created_at": "2021-08-13T10:55:02.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/21/41/73/18/80843aba7c8c37c8da05c78b",
+  "description": ";SMD2012-2P",
+  "display_title": "OSC-SMD-2P_-L2.1-W1.2",
+  "docType": 4,
+  "has_device": true,
+  "iv": "9e2fb7f0a977c7874ca75d1e",
+  "key": "2d60fa14769b0fc72e773812d20602bc3d23635fddeee04abdfd459f322b2e2a",
+  "model_3d": {
+    "title": "OSC-SMD-2P_-L2.1-W1.2",
+    "transform": "81.4959,48.0314,0,0,0,0,0,0,0",
+    "uri": "c0b17d6cb4284600ab1d613f6c68292c"
+  },
+  "modifier": {
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "need_sync_easyeda_pro": true,
+  "need_sync_pro": true,
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "d12c981021184949a6e742a7722e0510",
+  "tags": {
+    "child_tag": [],
+    "parent_tag": {
+      "name": "OSC-SMD",
+      "name_cn": "",
+      "uuid": "a3c56a4d817743bab7d4bb500d7fa5c4"
+    }
+  },
+  "ticket": 3,
+  "title": "osc-smd-2p_-l2.1-w1.2",
+  "type": 3,
+  "updateTime": 1632706832,
+  "updated_at": "2025-01-08T02:22:35.000Z",
+  "uuid": "008b03bb3158456cb0348c46d0cb8ea3",
+  "version": 1736302955391
+}

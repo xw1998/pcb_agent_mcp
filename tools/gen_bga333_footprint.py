@@ -40,6 +40,9 @@ import sys
 import collections
 from decimal import Decimal, ROUND_HALF_UP
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lceda_fp
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 EX = os.path.join(REPO, "examples", "rk3506_som")
@@ -286,11 +289,12 @@ def build_footprint(rep, body_wh, silk_half, dot, meta):
     L.append('\t(generator "pcb_agent_mcp")')
     L.append('\t(generator_version "0.1.3")')
     L.append('\t(layer "F.Cu")')
-    L.append('\t(descr "%s")' % (
+    descr = lceda_fp.with_source(
         "RK3506J WBBGA-333L (FBGA-333L), 333 ball, 0.562 / 0.650 mm pitch. "
-        "Geometry transcribed from JLCEDA official library LCSC C48642327 "
-        "(footprint uuid %s); scale and sizes audited against datasheet Rev 1.3 Fig 2-5. "
-        "Nothing here is a route." % meta.get("footprint_uuid", "?")))
+        "LCSC C48642327 (footprint uuid %s); scale and sizes audited against "
+        "datasheet Rev 1.3 Fig 2-5. Nothing here is a route."
+        % meta.get("footprint_uuid", "?"))
+    L.append('\t(descr "%s")' % descr)
     L.append('\t(tags "RK3506 WBBGA-333L BGA 0.562 0.65")')
     L.append('\t(attr smd)')
     L.append('\t(duplicate_pad_numbers_are_jumpers no)')

@@ -1,0 +1,54 @@
+{
+  "createTime": 1620741692,
+  "created_at": "2021-05-11T14:01:32.000Z",
+  "creator": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "dataStrId": "https://modules.lceda.cn/datastr/0b/d7/6e/10/ca99aa42c1170e389100201d",
+  "description": "SMD-4P;SMD2520-4P;SMD3225-4P;SMD5032-4P;SMD3225-2P;SMD2016-4P;SX-3225;SMD,3.2x2.5x1mm;SMD3225;SMD3215;SMD-3225;-;---;SMD3225_4P;SMD-3225_4P;SMD,2520_4P;1210;SMD-4_2.5X3.2X1.50P;SMD-4_2.5X3.2X1.65P;CRYSTAL-SMD_4P-L3.2-W2.5;SMD-4_2.5X3.2X1.70P;SMD_3225;SMD-4_3225;SMD-4_2.5X3.2X1.60P;SMD-4_3225P;SMD4_3225;CRYSTAL32MHZ;48MHz/10ppm/12pF;SMD3225-4;SMD-4_3525;24MHz;XTAL3225;12MHz/22pF(10PPM);OSC3225-4P;8M20ppm18PF;CRYSTAL-SMD_4P-L3.2-W2.5-BL;XTAL_3225;CY_3225;SMD-4;smd-3225-4p;SMD-4_5232;COSC-SMD-3225_4P;SMD;3225;3225-4P;CRYSTALS_3225;CAYSTAL-SMD_4P-L3.2-W2.5;CRYSTAL-SMD;XTAL4_3225;SMD_4P-3225;3225T;晶振Crystal.32MHZ15PF,+/-30PPM,-40°C~85°C,5032SMD4PAD;SMT-3225;LC-SMD-3225_4P;CJ13-271201210B20-27.12MHZ;SMD-CRY-3225_4P;OSC-3225_4P;smd_xtal4-3225;smd-3225;晶振,SMD-8M-20PF-20PPM,3225,ROHS;CRYSTAL-SMD_4P_3225;X3225;32254PIN;XTALS-2_5X3_2MM;12M;3225-4p;OSC_3225-4P;OSC-SMD-4P;DSX321G;BT-XTAL_2520;CY3225;Y-3.2X2.5MM;24M-12pF-10PPM;26M-20pF-10ppm;3225_4P;8MHz10ppm;SMD 3225;OSC-SMD_3225;CRYSTAL-SMD_4PL3.2-W2.5;晶振3225;3.2x2.5x0.7mm;SMD_3225-4P;CRYSTAL3225;晶振3225-SMD-4P;CRYSTAL-SMD3225-4P;OSC3225-SMD-4P;CRX3225-SMD-4P;XTAL3225-SMD-4P;OSC3225_4P;Crystal-SMT-3225-4P;CRY_4P_SMD3.2X2.5X0.7;CR-SMD3225-4P;SMD_3.2X2.5-4P;CRYSTAL3225-SMD_4P;SMD-3225-4P;OSC3225;3.2*2.5*0.8;CRY-D3225;SMD3225-6P;OSC4_SMD_3225;crystal-250x320x150-4n;SMD-_3225-4P;SMD_3225-4;SMD_3.2x2.5-4P;SMD2532-4P;SMD-4P-L3.2-W2.5;SMD_4P-L3.2-W2.5;SMD322-4P;SMD3225-4P 无源",
+  "display_title": "CRYSTAL-SMD_4P-L3.2-W2.5-BL",
+  "docType": 4,
+  "has_device": true,
+  "iv": "3e5c8a97f1de5cc8eb69ed3a",
+  "key": "d849fe980fd2f80e8d53efa6a4502cea29d86d7b50aefa5a3fa36aefe7864350",
+  "model_3d": {
+    "title": "CRYSTAL-SMD_4P-L3.2-W2.5-BL",
+    "transform": "125.984,98.425,0,0,0,0,0,0,0",
+    "uri": "ff2dfd5650294453a14147960efe1838"
+  },
+  "modifier": {
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "need_sync_easyeda_pro": true,
+  "need_sync_pro": true,
+  "owner": {
+    "avatar": "//image.lceda.cn/avatars/2018/6/kFlrasi7W06gTdBLAqW3fkrqbDhbowynuSzkjqso.png",
+    "nickname": "LCSC",
+    "username": "LCSC",
+    "uuid": "0819f05c4eef4c71ace90d822a990e87"
+  },
+  "path": "0819f05c4eef4c71ace90d822a990e87",
+  "public": true,
+  "source": "",
+  "std_uuid": "9e297fbdb6c24ee39419d7ac96617dbf",
+  "tags": {
+    "child_tag": [],
+    "parent_tag": {
+      "name": "CRYSTAL-SMD",
+      "name_cn": "",
+      "uuid": "b9bd9f9fa0bd4c1783d1dbad8189dd2c"
+    }
+  },
+  "ticket": 6,
+  "title": "crystal-smd_4p-l3.2-w2.5-bl",
+  "type": 3,
+  "updateTime": 1766627124,
+  "updated_at": "2025-12-25T01:50:03.000Z",
+  "uuid": "7ad2c95bfc5a4739a91ef8a01dcb9dc1",
+  "version": 1766627403350
+}

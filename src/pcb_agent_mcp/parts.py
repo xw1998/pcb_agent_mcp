@@ -65,6 +65,20 @@ UNIT_MM = {"mil": 0.0254, "thou": 0.0254, "mm": 1.0, "millimeter": 1.0,
 # familiar 32 x 100 mil column.
 SYMBOL_UNIT_MM = 0.254
 
+# The LCEDA document HEAD carries a licence that requires every output to name
+# "嘉立创EDA/EasyEDA官方库" and link both home pages. Kept here as well as in
+# tools/lceda_fp.py (that tool must run without importing the package); a test
+# asserts the two strings are identical so they cannot drift apart.
+SOURCE_NOTE = ("Geometry from 嘉立创EDA/EasyEDA官方库 official library "
+               "(https://lceda.cn/ , https://easyeda.com/)")
+
+def with_source(text):
+    """Append the mandatory source declaration, once (idempotent)."""
+    d = " ".join((text or "").split())
+    if "EasyEDA" in d or "嘉立创" in d:
+        return d
+    return (d + " | " + SOURCE_NOTE) if d else SOURCE_NOTE
+
 STD_LIB_ENV = "PCB_AGENT_LCEDA_STD"
 STD_LIB_REL = os.path.join("resources", "app", "assets", "db", "lceda-std.elib")
 
@@ -888,6 +902,7 @@ def symbol_to_kicad(data, name=None, reference="U", footprint="",
         raise PartError("symbol document has no PIN rows; nothing to convert",
                         "SYMBOL_EMPTY")
     name = name or "part"
+    description = with_source(description)
     s = SYMBOL_UNIT_MM
     report = {"pins": len(doc["pins"]), "shapes": 0, "dropped": [],
               "unit_mm": s, "unknown_rows": doc["note"]}
