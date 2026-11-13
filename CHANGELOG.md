@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.12] - 2026-11-13
+
+RK3506 核心板第十二步：**BGA 逃逸落铜 + 设计下限降到 0.1 mm** —— 429 个 BGA 球里 417 个逃出到 0.2/0.1 通孔（拒绝 0、空网跳过 12），834 个 op 一次过 `postconditions`+`token_identity`；原地 DRC 结构性违规从 562 条降到 **只剩 199 条 `via_dangling`**（内层还没接线的诚实计数）。
+
+- **逃逸读数**：`footprints 45 / tracks 559 / vias 462 / zones 3 / nets 187`；`worst = {via_to_via_gap 0.3618, via_to_ball_pad_gap 0.1723, stub_w 0.1, via 0.2/0.1}`。官方 `ZONE_FILLER` 重铺后 `/GND 1788.09 mm²`（原 1891.837，被 256 个异网通孔各吃约 0.4 mm²）、`/+3V3 149.028`、`/+5V_IN 23.776`。
+- **interstitial 偏移写成 `pitch/√2` 是硬错**：每个过孔落在斜对角球焊盘边缘（到 A3 球心 0.233 mm，焊盘半径 0.125 + 过孔半径 0.1 = 0.225）。正确是 `pitch/2`，修正后 `via_to_ball_pad_gap 0.1723`。连带推得内层容量：内层只有过孔没有 SMD pad ⇒ 每道缝只过一根 0.1 mm 线，中缝余量 0.031 mm。
+- **`unconnected-(U1-NC-Pad1G2)` 让后置校验失败**：网名带圆括号，写盘后重解析与原文不一致 ⇒ `plan()` 跳过 `unconnected-*` 与 `/NC_*` 并计入 `stats["nc"]`（12 个），不再靠转义硬撑。
+- **段级过滤把 `refused 52` 打到 0**：只做点级检查时 stub 中段会穿过别的球心。新增 `_pt_seg`（到球心 `SEG_BALL 0.30`）与 `_seg_seg`（stub 之间 `SEG_SEG 0.20`，相交返回 0.0），候选表扩到 ring-1..3 × 四象限。
+- **`precheck_clearance_mm` 必须与 `min_clearance` 同步**：规则降到 0.1 后不同步，`clearance_no_worse` 会以 `tightest 0.0 mm` 拦下整批 op。
+- **DDR 直线阶梯在物理上不成立**：U1 侧 x 序 vs U2 行主序逆序 **130/1225**；试遍 U2 的 8 种朝向 × 2 扫向，最小逆序 **133** ⇒ 必须分组 + 绕行，不是布线器参数问题。
+- **丝印归零**：45 个位号移 F.Fab（`silk_overlap 18→0`）、4 段拨杆 + U2 pin-1 圆点移 F.Fab（`silk_over_copper 3→0`）；板上改了封装同步改库（`lib_footprint_mismatch 2→0`）。
+- **`lib_footprint_issues 34` 是假警报**：`KICAD_CONFIG_HOME` 隔离目录缺全局 `fp-lib-table`/`sym-lib-table`，拷入后 0。另：`_rawdrc2.py` 拷板到 temp 会连带丢 `lib/`，产生假库问题，准确读法是原地跑 `kicad-cli pcb drc`。
+- 未做：DDR 50 条 + J1 约 100 条信号线仍在逃逸过孔为止（见 docs/149）；不使用 `board_route`/`board_fanout`/`autoLayout`，也不写通用布线器。
+
 ## [0.1.11] - 2026-11-13
 
 RK3506 核心板第十一步：**电源走线真的落成了铜** —— 142 段手工 45° 走线、45 个焊盘内过孔、3 块官方 `ZONE_FILLER` 铺铜；新增违规 **0**（DRC 562 与落铜前基线逐类型相同）。

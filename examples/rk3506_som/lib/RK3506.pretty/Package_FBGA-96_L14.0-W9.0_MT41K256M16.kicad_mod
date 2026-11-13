@@ -144,7 +144,7 @@
     (end -3.0480 -5.9690)
     (stroke (width 0.1500) (type solid))
     (fill no)
-    (layer "F.SilkS")
+    (layer "F.Fab")
   )
   (pad "A1" smd circle
     (at -3.1999 -6.0000)
