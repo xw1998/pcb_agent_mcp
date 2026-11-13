@@ -301,7 +301,12 @@ def copper_clearance(doc, region=None, threshold_mm=0.2, worst=10):
             if a["layer"] != "*" and b["layer"] != "*" and a["layer"] != b["layer"]:
                 continue
             d = G.dist_segment_segment(a["a"], a["b"], b["a"], b["b"]) - a["half"] - b["half"]
-            if d < threshold_mm:
+            # a gap of exactly `threshold_mm` is compliant; only a gap that is
+            # materially smaller than it is a violation.  Without this epsilon a
+            # pair sitting exactly on the rule (float noise of a few 1e-16 mm)
+            # would be reported as "closer than", which the geometry engine can
+            # never satisfy.
+            if d < threshold_mm - 1e-6:
                 pairs.append({"gap_mm": round(max(d, 0.0), 4),
                               "net_a": a["net"], "net_b": b["net"],
                               "layer": a["layer"] if a["layer"] != "*" else b["layer"],
