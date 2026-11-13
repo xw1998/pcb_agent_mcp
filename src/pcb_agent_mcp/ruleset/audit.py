@@ -35,6 +35,14 @@ _CATALOG_LEVEL = {
     "layout.bulk_per_ic": "P2",
     "layout.power_pad_thermal_vias": "P2",
     "layout.crystal_keepout": "P2",
+    # P1: the field, the loop and the heat are power-integrity facts, not
+    # conventions. A bead at P1 is the same rule at a smaller scale.
+    "layout.magnetic_keepout": "P1",
+    "layout.magnetic_via_keepout": "P1",
+    "layout.magnetic_keepout_deep": "P2",
+
+    "layout.magnetic_keepout_graze": "P3",
+    "layout.crystal_keepout_adjacent": "P2",
     "layout.silkscreen_over_pad": "P2",
     "layout.test_points_present": "P2",
     "layout.rf_z0_tolerance": "P3",

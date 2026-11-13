@@ -87,6 +87,36 @@ def _split_pair(name, fam):
 
 _XTAL_WORDS = ("crystal", "resonator", "xtal", "quartz")
 
+_MAG_WORDS = ("inductor", "ferrite", "bead", "choke")
+_MAG_VALUE = ("h",)  # 4.3uH / 600R@100MHz, checked with a number in front
+
+def _is_magnetic(footprint):
+    """An inductor, ferrite bead or common-mode choke.
+
+    Three independent tells, because a library id is not always spelled the
+    usual way and a value is not always present: the library id / value word
+    (inductor, ferrite, bead, choke), the reference prefix (L, FB -- KiCad
+    and every ECAD convention agree on these), or a value that is a
+    henry-denominated number (4.3uH, 6.2uH). A capacitor value never matches
+    the last one. Anything undecidable returns False and the part is skipped:
+    a false keep-out on a resistor would move copper for no reason.
+    """
+    ref = str(footprint.get("ref") or "").strip().upper()
+    if ref[:2] == "FB" or ref[:1] == "L":
+        # L is also a library designator for a connector in some old
+        # libraries; those carry a library id that says connector, so the
+        # word test below removes them.
+        if "connector" not in str(footprint.get("lib_id") or "").lower():
+            return True
+    hay = " ".join(str(footprint.get(k) or "")
+                   for k in ("lib_id", "value", "ref")).lower()
+    if any(w in hay for w in _MAG_WORDS):
+        return True
+    import re as _re
+    return _re.search(r"[0-9]+(\.[0-9]+)?\s*(u|m|n|µ|μ)h",
+                      hay) is not None
+
+
 def _is_crystal(footprint):
     """A crystal or resonator, judged by its library id / value / reference."""
     hay = " ".join(str(footprint.get(k) or "") for k in ("lib_id", "value", "ref"))
@@ -714,6 +744,7 @@ def measure(board, window_mm=WINDOW_MM):
         m["trace_under_crystal"] = _na("no crystal or resonator footprint on this board")
     else:
         hits = []
+        xtal_inner = []
         for f in xtals:
             cy = f.get("courtyard") or {}
             shape = [list(c) for c in (cy.get("contours") or []) if len(c) > 2]
@@ -741,14 +772,22 @@ def measure(board, window_mm=WINDOW_MM):
             for t in board.tracks:
                 if not t.get("net") or t["net"] in own:
                     continue
-                # The crystal is a part on ONE side. A track on an inner layer
-                # below it is in another plane of the stackup, not "under the
-                # crystal" - royalblue has one on In4 four layers down and the
-                # rule called it a keep-out violation.
-                if t.get("layer") != side:
-                    continue
+                # The crystal rule proper is about the part's OWN side: a
+                # track there runs straight across the body. A track on
+                # another layer is a different question with a different
+                # answer -- the oscillator node is high impedance and the
+                # laminate still couples, so it is graded separately
+                # (layout.crystal_keepout_adjacent) instead of being folded
+                # into this bool. royalblue has one on In4 four layers down.
                 a, b = t.get("start"), t.get("end")
                 if not (a and b):
+                    continue
+                hw_pre = float(t.get("width") or 0.0) / 2.0
+                if t.get("layer") != side:
+                    if _segment_meets_polygons((a[0], a[1]), (b[0], b[1]),
+                                               shape, hw_pre):
+                        xtal_inner.append({"ref": f.get("ref"), "net": t["net"],
+                                           "layer": t.get("layer")})
                     continue
                 hw = float(t.get("width") or 0.0) / 2.0
                 # The courtyard's bounding BOX is not the courtyard.  A 45
@@ -776,6 +815,151 @@ def measure(board, window_mm=WINDOW_MM):
             "examples": hits[:5],
         }
 
+        m["trace_under_crystal_inner"] = {
+            "value": bool(xtal_inner),
+            "count": len(xtal_inner),
+            "where": (", ".join("%s on %s under %s"
+                                % (h["net"], h.get("layer"), h["ref"])
+                                for h in xtal_inner[:6]) if xtal_inner
+                      else "no other-net copper crosses the crystal body on "
+                           "any layer but its own side"),
+            "method": "as the crystal rule, but on the other copper layers",
+            "examples": xtal_inner[:8],
+        }
+    # --------------------------------------------------- magnetic keep-out
+    # A switching inductor is a field source sitting on a small closed loop.
+    # Copper under it is a shorted turn: the eddy current heats the part and
+    # the ripple finds every track that crosses it. The scope is what matters:
+
+    #   same side  - a track crosses the body area. Hard.
+    #   adjacent   - one copper layer away. Hard, but a POUR there is the
+    #                shield, so this tier counts tracks and vias only.
+    #   deeper     - behind at least one solid plane. Real but weak: measured,
+    #                graded at P2, never folded into the P1 answer.
+    mags = [f for f in board.footprints if _is_magnetic(f)]
+    if not mags:
+        for k in ("trace_under_magnetic", "via_under_magnetic",
+                  "trace_under_magnetic_deep"):
+            m[k] = _na("no inductor, ferrite bead or choke on this board")
+    else:
+        stack = [str(s.get("name")) for s in (board.stackup or [])
+                 if str(s.get("name") or "").endswith(".Cu")]
+        order = {n: i for i, n in enumerate(stack)}
+        def _adjacent(side):
+            """The one layer next to the part, in the stackup the board declares."""
+            if side not in order or len(stack) < 3:
+                return None
+            i = order[side]
+            # In1 for an F.Cu part, and the layer above B.Cu for a B.Cu part.
+            if i == 0:
+                return stack[1]
+            if i == len(stack) - 1:
+                return stack[i - 1]
+            return stack[i - 1]
+        p1_hits, p1_vias, deep_hits, grazes = [], [], [], []
+        for f in mags:
+            hull = _pad_hull(f.get("pads") or [], 0.10)
+            if hull is None:
+                continue
+            x0, y0, x1, y1 = hull
+            own = {q.get("net") for q in (f.get("pads") or []) if q.get("net")}
+            rect = [[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]]
+            side = "B.Cu" if str(f.get("layer") or "F").upper().startswith("B") \
+                else "F.Cu"
+            adj = _adjacent(side)
+            for t in board.tracks:
+                if t.get("_arc") or not t.get("net"):
+                    continue
+                a, b = t.get("start"), t.get("end")
+                if not (a and b):
+                    continue
+                hw = float(t.get("width") or 0.0) / 2.0
+                layer = t.get("layer")
+                # The hull is the bounding rectangle over the pads, so its four
+                # corners are empty space: a two-pad part has an L-shaped copper
+                # set whose bbox is a full rectangle.  A track whose EDGE merely
+                # clips such a corner sits 0.1 mm from real copper and is not
+                # routed under the body; one whose AXIS runs inside is.  Grading
+                # both with the half-width test turned 9 corner clips into hits
+                # out of 17 -- the rule cried wolf on a board that also had a
+                # real problem buried inside it.
+                if not _segment_meets_polygons((a[0], a[1]), (b[0], b[1]),
+                                               rect, 0.0):
+                    if _segment_meets_polygons((a[0], a[1]), (b[0], b[1]),
+                                               rect, hw):
+                        grazes.append({"ref": f.get("ref"),
+                                       "net": t["net"], "layer": layer})
+                    continue
+                # The part's own pad joint has to terminate somewhere. An
+                # own-net track that STOPS inside the body is that joint; one
+                # that crosses the body and keeps going is the switch node or
+                # the rail running under its own inductor.
+                ends_inside = ((x0 <= a[0] <= x1 and y0 <= a[1] <= y1)
+                               or (x0 <= b[0] <= x1 and y0 <= b[1] <= y1))
+                if t["net"] in own and ends_inside:
+                    continue
+                row = {"ref": f.get("ref"), "net": t["net"], "layer": layer}
+                if layer == side or (adj and layer == adj):
+                    p1_hits.append(row)
+                else:
+                    deep_hits.append(row)
+            for v in board.vias:
+                vx, vy = v.get("x"), v.get("y")
+                if vx is None or vy is None:
+                    continue
+                if x0 <= vx <= x1 and y0 <= vy <= y1 and v.get("net") not in own:
+                    p1_vias.append({"ref": f.get("ref"), "net": v.get("net")})
+        m["trace_under_magnetic"] = {
+            "value": bool(p1_hits),
+            "count": len(p1_hits),
+            "where": (", ".join("%s on %s under %s" % (h["net"], h.get("layer"),
+                                                     h["ref"])
+                                for h in p1_hits[:6]) if p1_hits
+                      else "no track of another net crosses the body of %s on the "
+                           "part's own layer or the layer next to it"
+                           % ", ".join(str(f.get("ref")) for f in mags[:4])),
+            "method": "tracks whose centreline (grown by half its width) meets a "
+                      "magnetic part's pad hull, on the part's own side or the "
+                      "single copper layer beneath it; an own-net track counts only "
+                      "when it crosses the body instead of terminating on it",
+            "examples": p1_hits[:8],
+        }
+        m["trace_under_magnetic_graze"] = {
+            "value": bool(grazes),
+            "count": len(grazes),
+            "where": (", ".join("%s on %s clips the %s pad-hull corner" %
+                                (h["net"], h["layer"], h["ref"])
+                                for h in grazes[:6]) if grazes
+                      else "no track edge grazes a magnetic pad-hull corner"),
+            "method": "tracks whose copper EDGE meets a magnetic pad hull but "
+                      "whose AXIS stays outside it; the hull is a rectangle over "
+                      "the pads and its corners are empty, so this is advisory "
+                      "(P3), never folded into layout.magnetic_keepout",
+            "examples": grazes[:8],
+        }
+        m["via_under_magnetic"] = {
+            "value": bool(p1_vias),
+            "count": len(p1_vias),
+            "where": (", ".join("%s via under %s" % (h["net"], h["ref"])
+                                for h in p1_vias[:6]) if p1_vias
+                      else "no via of another net sits inside a magnetic part"),
+            "method": "board_vias whose centre lies inside a magnetic part's "
+                      "pad hull",
+            "examples": p1_vias[:8],
+        }
+        m["trace_under_magnetic_deep"] = {
+            "value": bool(deep_hits),
+            "count": len(deep_hits),
+            "where": (", ".join("%s on %s under %s" % (h["net"], h.get("layer"),
+                                                     h["ref"])
+                                for h in deep_hits[:6]) if deep_hits
+                      else "no copper under a magnetic part on a layer deeper than "
+                           "the one next to it"),
+            "method": "as layout.magnetic_keepout, but on every copper layer "
+                      "below the adjacent one - the field is shielded there, not "
+                      "absent, so this is graded P2 and reported apart",
+            "examples": deep_hits[:8],
+        }
     # ------------------------------------------------- courtyard collisions
     fps = []
     for f in board.footprints:
@@ -2791,6 +2975,11 @@ def catalog_facts(m):
     take("min_plated_drill", "min_via_hole_mm")
     take("diffpair_length_skew_mm", "diffpair_length_skew_mm")
     take("trace_under_crystal", "trace_under_crystal")
+    take("trace_under_crystal_inner", "trace_under_crystal_inner")
+    take("trace_under_magnetic", "trace_under_magnetic")
+    take("via_under_magnetic", "via_under_magnetic")
+    take("trace_under_magnetic_deep", "trace_under_magnetic_deep")
+    take("trace_under_magnetic_graze", "trace_under_magnetic_graze")
     take("decoupling_max_distance_to_pin_mm", "decoupling_max_distance_to_pin_mm")
     take("layer_changes_without_return_via", "layer_changes_without_return_via")
     take("power_trace_width_mm", "power_trace_width_mm")

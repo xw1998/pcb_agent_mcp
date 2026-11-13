@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.17] - 2026-11-14
+
+RK3506 核心板第十七步：**把「电感/磁珠/晶振本体下方禁走线」变成可执行判据**，并在本板上把数字量到底。规则不是文本，是 fact + 判据 + 级别；补完之后做了两条独立否证，结论是本板的违规属摆位缺陷，改摆位与改布线都不通。
+
+- **新增四个 fact**（`ruleset/measure.py`）：`trace_under_magnetic`（器件自身层或紧邻层，轴线进本体矩形）、`via_under_magnetic`（过孔中心进本体）、`trace_under_magnetic_deep`（更深的层，至少隔一层实心平面）、`trace_under_magnetic_graze`（铜边擦到外接矩形角但轴线没进）。磁器件识别三重判定：位号 `L`/`FB`（排除连接器）+ 库名/值含 `inductor/ferrite/bead/choke` + 值里有数字带 `uH/mH/nH`。
+- **新增四条判据**（`calc/rules.py`）：`layout.magnetic_keepout`（P1）、`layout.magnetic_via_keepout`（P1）、`layout.magnetic_keepout_deep`（P2）、`layout.magnetic_keepout_graze`（P3，advisory）；`audit.py` 同步 P1/P1/P2/P3 映射，另有 `layout.crystal_keepout_adjacent`（P2，晶振相邻层）。
+- **口径改一次，数字降一半**：先按「轴线+半个线宽」判得 17 段；发现焊盘外接矩形四角是空的（两焊盘器件铜是「日」字少一横，矩形四角无铜），改按「轴线进矩形」判，17 段里 9 段只是擦角 => P1 = 8 处真穿越，擦角单列 P3，不混进 P1。
+- **本板读数**（`_v18` 交付板）：`layout.magnetic_keepout` 17 段、`magnetic_via_keepout` 3 孔（都在 L1 本体里）、`magnetic_keepout_deep` 139 段、`magnetic_keepout_graze` 17 段、`crystal_keepout_adjacent` 4 段（UART0_TX×2 / CLK_OUT / ETH_CLK0_25M）、同层 `crystal_keepout` 0 段。
+- **否证一：全板没有空地**。0.25 mm 栅格 + 滑窗，要求 4.6×3.9 本体矩形在四个信号层全干净（只允许 GND 与器件自有网）：L1/L2/L3/L4 与 Y1 的可行位置都是 **0**；FB1/FB2 有 382/368 个，但最近的也在 5.1 mm 外（磁珠挪 5 mm 等于把滤波回路拉长 5 mm）。四层占用率 49%~61%，并集覆盖到「最优窗口仍撞 12 格」。
+- **否证二：网级重布 7/9 被拒，且与禁布无关**。撕掉 10 个违规网（226 段 + 27 孔）后重布两遍，只差 `KEEPOUT` 有无：带禁布 OK 2 个（SDMMC_D2 14 段/2 孔、RMII0_MDC 30 段/3 孔）、REFUSED 7 个；不带禁布**逐网相同**（连段数都一样）=> 拒绝来自逃逸口袋不存在（0.1.13 量过四层可达 400/204216），不是来自新加的禁布。故重布候选不能上板（会把 7 个网变成死网），`_v18` 保持交付。
+- **布线器知道障碍物了**：`_mazeH.py` 加 `KEEPOUT=<json>`，用不可能与任何真实网同名的 net 名注入矩形，绕过 `raster()` 里的 `it['net'] == net` 自网豁免，对全部网生效。
+- **两个坑**：① `pcbnew.PCB_VIA.GetWidth()` 不传层参数时 release 版不报错、返回不可预期值，脚本表现为卡死 60 s（debug 下才有 `assert "false" failed in GetWidth()`），量直径一律 `GetWidth(pcbnew.F_Cu)`；② 判据文件是 CRLF/LF 混排（`measure.py` 多数 CRLF、`calc/rules.py` LF），按字符串打补丁会逐个失配，改按行尾自适应。
+- **规则清单对外版**：`docs/154-RK3506核心板-画板规则清单与优先级.md`，52 条判据（P0 20 / P1 8 / P2 9 / P3 11 / P4 4）逐条给「实测 / 限值 / 判定」，并写清五级优先级的判停顺序（`first_action` 取最低级别第一条非 pass，本板是 `PCB.EDGE.ROUTED` 0.0 mm vs 0.2 mm）。
 ## [0.1.16] - 2026-11-14
 
 RK3506 核心板第十六步：**把 DDR 整组拆开重布，验证 0.1.15 那条「束外有空地」的推论**。结论是推论错了，根因在摆位不在布线。零放宽、零新板框，DRC 仍是工程模板官方值。

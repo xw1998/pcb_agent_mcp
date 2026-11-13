@@ -262,6 +262,59 @@ LAYOUT_RULES = [
        "L1", "kicad-free (散热过孔); thermal.via_array",
        "a bottom-side plane only helps if the heat can get there; the via field "
        "is the only path through the laminate"),
+    _r("layout.magnetic_keepout",
+       "no track crosses an inductor or ferrite bead body on its own layer or "
+       "the layer beside it",
+       "isolation", "High", "trace_under_magnetic", "bool", "bool_false", False,
+       "board_components and board_nets: every track whose centreline (grown by "
+       "half its width) meets a magnetic part's pad hull, on the part's own "
+       "side and on the one copper layer next to it",
+       "L0", "kicad-free (电感/磁珠下方禁走线); 电源完整性常识",
+       "a switching inductor is a field source sitting on a small closed loop: "
+       "copper under it is a shorted turn that heats the part and couples the "
+       "ripple into every track that crosses it, and a bead is the same "
+       "argument at a smaller scale"),
+    _r("layout.magnetic_keepout_graze",
+       "no track edge grazes a magnetic part's pad hull",
+       "isolation", "Low", "trace_under_magnetic_graze", "bool", "bool_true",
+       False,
+       "board_nets whose copper edge meets a magnetic pad hull but whose axis "
+       "stays outside it",
+       "L3", "kicad-free (电感下方禁走线, 几何口径)",
+       "the hull is a rectangle over the pads, so its corners are empty space; "
+       "a diagonal track clipping such a corner is 0.1 mm from real copper. "
+       "Measuring the edge here keeps the P1 crossing number honest instead of "
+       "inflating it (17 hits minus 9 corner clips = 8 real crossings)"),
+    _r("layout.magnetic_keepout_deep",
+       "no other-net copper sits under a magnetic part on deeper layers",
+       "isolation", "Low", "trace_under_magnetic_deep", "bool", "bool_false",
+       False,
+       "board_nets and board_vias on every copper layer below the one next to "
+       "the part",
+       "L1", "kicad-free (电感下方禁走线, 层间耦合)",
+       "the field is shielded by the plane underneath, not absent: copper two "
+       "or three layers down still sees the fringe. It is a placement cost, so "
+       "it is graded P2 and reported separately from the crossing on the part's "
+       "own side - one number for both hid a 15-object failure inside 173"),
+    _r("layout.magnetic_via_keepout",
+       "no via sits under an inductor or ferrite bead",
+       "isolation", "High", "via_under_magnetic", "bool", "bool_false", False,
+       "board_vias whose centre lies inside a magnetic part's pad hull",
+       "L0", "kicad-free (电感下方禁过孔)",
+       "a via in the middle of the inductor's loop punches the plane the field "
+       "is trying to stay out of, and the switch node's return current then "
+       "has a path straight through the part"),
+    _r("layout.crystal_keepout_adjacent",
+       "no copper crosses a crystal body on the layers beside it either",
+       "isolation", "Medium", "trace_under_crystal_inner", "bool", "bool_false",
+       False,
+       "board_nets on every copper layer other than the crystal's own side, "
+       "inside the crystal body",
+       "L0", "kicad-free (晶振下方禁走线, 含层间耦合)",
+       "the oscillator node is high impedance and the coupling that gets "
+       "forgotten is the one through the laminate: a track two layers down "
+       "still pulls the frequency, and it is invisible to a check that only "
+       "looks at the crystal's own side"),
     _r("layout.crystal_keepout",
        "no trace runs under a crystal or its load capacitors",
        "isolation", "Medium", "trace_under_crystal", "bool", "bool_false", False,
