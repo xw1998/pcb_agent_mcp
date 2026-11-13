@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.10] - 2026-11-13
+
+RK3506 核心板第十步：**邮票孔整圈重排** —— 0.1.9 的 140 个半孔不是等距环，而是每边从起始角点起排、远端空出 6.00 mm 的断环，而且每边第 1 个焊盘正好压在 R2 圆角点上。
+
+- **缺陷实测（旧几何）**：pad 1 `(-22.5,-22.5)`（封装局部）＝板角点；N 边 pad 40 停在 `16.5`，到 pad 41（`22.5`，E 边第 1 个）之间 **6.00 mm 空档**；E 边 pad 70 停在 `6.5`，到 pad 71（`22.5,22.5`）同样 6.00 mm 空档。四边同构。
+- **根因**：`edge_axis()` 用 `-HALF + off` 起排，即整段**锚在起始角点**上；同时审计 F5 用 `HALF - span/2` 算「到角点余量」——算的是**假设居中**的模型，不校验实际落点，于是 `corner_clear_mm 3.0` 一路 PASS，实际起始端余量 0.00。
+- **修法**：`edge_axis()` 改半跨 `half_span = span/2` 居中起排；F5 改为**按已生成坐标实测**（`HALF - max(|min|,|max|)`），并改报错文案 `pad sits in the R2 arc`，让同类错误不可能再假绿。
+- **新几何实测**：N/S `x = ±19.5`（span 39.0、角点余量 **3.00**），E/W `y = ±14.5`（span 29.0、角点余量 **8.00**）；140 盘、1.000 节距、盘 0.85 / 孔 0.55 不变（docs/143 §5 冻结值）。整圈对称、无缺口、圆角区不放盘。
+- **重建链**：旧板移到 `D:/tmp/_rk_old/`（不删），`--create` → `--castellation` → `--planes`。In1.Cu 实测 `outline 1933.988 mm² / fill 1922.446 mm² / zones 1`；DRC `641`（`clearance 499` 全是相邻半孔 0.15 < 0.20、`copper_edge_clearance 140`、`isolated_copper 1`、`lib_footprint_issues 1`），与 0.1.9 同量级同构成，留待板厂半孔工艺口径裁定。
+- **看图口径（两条硬读数）**：① `kicad-cli pcb export pdf --scale 1` 会把板画到页面之外——实测墨迹只剩 4887 px 且 bbox 贴左上边界（板在负 Y 区被页顶裁掉），**`--scale 0`（自动缩放）既完整又保彩色**；② pcbnew `PLOT_CONTROLLER.SetColorMode(True)` 对 PDF 不生效（实测整图 5 档灰阶、无 RGB 色）。
+- **中断原因不是 MCP**：受限档下 `kicad-cli` 要建 `C:\Users\<u>\Documents\KiCad\10.0` 得 `error 5` 并被 SIGSEGV，`mkdir` 也被沙箱拒；`pcb-agent` 连接器工具列表拉取正常（50 个工具）。属写权限，不属连接器故障。
 ## [0.1.9] - 2026-11-13
 
 RK3506 核心板第九步：**从图纸走到板子**——45 mm 方板 / 6 层 / R2 圆角 / 140 邮票孔落地，并把第一块 GND 平面交给 KiCad 官方 `ZONE_FILLER` 铺。

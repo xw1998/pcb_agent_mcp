@@ -63,14 +63,19 @@ def edge_axis(edge, index, count):
     """
     span = (count - 1) * PITCH_MM
     off = index * PITCH_MM
+    # The run must be CENTRED on its edge: a run anchored at the start corner
+    # puts pad 1 exactly on the R2 corner point and leaves 6 mm naked at the
+    # far end (that is what 0.1.9 shipped).  Half of each run sits on either
+    # side of the edge midpoint.
+    half_span = span / 2.0
     if edge == "N":
-        return (-HALF + off, -HALF)
+        return (-half_span + off, -HALF)
     if edge == "S":
-        return (HALF - off, HALF)
+        return (half_span - off, HALF)
     if edge == "E":
-        return (HALF, -HALF + off)
+        return (HALF, -half_span + off)
     if edge == "W":
-        return (-HALF, HALF - off)
+        return (-HALF, half_span - off)
     raise SystemExit("unknown edge %r" % edge)
 
 
@@ -108,11 +113,17 @@ def plan(rows):
             span = round(max(ys) - min(ys), 6)
         if abs(span - (want - 1) * PITCH_MM) > 1e-9:
             raise SystemExit("F3 %s span %s != %s" % (edge, span, (want - 1) * PITCH_MM))
+        # F5 is measured on the emitted coordinates, not on the model above:
+        # the old code scored the *assumed centred* run and therefore passed a
+        # board whose first pad sat on the corner point.
+        edge_vals = [p[2] for p in out if p[1] == edge] if edge in ("N", "S") \
+            else [p[3] for p in out if p[1] == edge]
+        clear_start = round(HALF - max(abs(min(edge_vals)), abs(max(edge_vals))), 6)
         per_edge[edge] = {"pins": want, "span_mm": span,
-                          "corner_clear_mm": round(HALF - span / 2.0, 6)}
-        if per_edge[edge]["corner_clear_mm"] < CORNER_R_MM:
-            raise SystemExit("F5 %s corner clearance %s < %s"
-                             % (edge, per_edge[edge]["corner_clear_mm"], CORNER_R_MM))
+                          "corner_clear_mm": clear_start}
+        if clear_start < CORNER_R_MM:
+            raise SystemExit("F5 %s corner clearance %s < %s (pad sits in the R2 arc)"
+                             % (edge, clear_start, CORNER_R_MM))
     if PAD_D_MM - HOLE_D_MM < RING_MIN_MM - 1e-9:      # F6
         raise SystemExit("F6 ring %s < %s" % (round(PAD_D_MM - HOLE_D_MM, 6), RING_MIN_MM))
     nums = [p[0] for p in out]
