@@ -347,3 +347,112 @@ def digest(doc, before=None):
         out["delta"] = {k: counts[k] - was.get(k, 0) for k in counts
                         if counts[k] != was.get(k, 0)}
     return out
+
+# --------------------------------------------------------------- length match
+# Rule priority for a DDR3L point-to-point bus (highest first), because the
+# checks below are ordered by how badly a violation hurts, not by how easy it
+# is to measure:
+#   1. intra-pair skew            - a P/N pair is one wire; skew turns the
+#                                   differential signal into common-mode noise.
+#   2. within-byte-lane skew      - DQ/DM are sampled by that lane's DQS, so
+#                                   the lane is the timing unit.
+#   3. address/command vs clock   - one clock edge launches the whole group.
+#   4. inter-lane skew            - only matters for lane-to-lane deskew, and
+#                                   the controller can absorb it.
+# A meander can only ever *add* copper, so the reference of a group is its
+# longest member; anything needing to be shortened is a re-route, not a tweak.
+DDR_LANES = {
+    "lane0": ["DQ0", "DQ1", "DQ2", "DQ3", "DQ4", "DQ5", "DQ6", "DQ7", "DM0"],
+    "lane1": ["DQ8", "DQ9", "DQ10", "DQ11", "DQ12", "DQ13", "DQ14", "DQ15", "DM1"],
+}
+DDR_PAIRS = [("DQS0P", "DQS0N"), ("DQS1P", "DQS1N"), ("CLKP", "CLKN")]
+DDR_CMD = ["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10",
+           "A11", "A12", "A13", "A14", "BA0", "BA1", "BA2", "CSN", "RASN",
+           "CASN", "WEN", "ODT", "RESET", "CKE"]
+
+
+def track_lengths(doc, prefix="/DDR_"):
+    """Copper length per net, from the converted tree (tracks only).
+
+    Vias are deliberately excluded from the length: a plated barrel is not a
+    transmission line segment whose electrical length is its drill depth, and
+    counting it would silently reward a net for taking more layer changes.
+    """
+    out = {}
+    for node in doc.board().items[1:]:
+        if not isinstance(node, S.Seq) or S.head(node) != "segment":
+            continue
+        net = S.arg_text(S.child(node, "net"), 1) or ""
+        st, en = S.child(node, "start"), S.child(node, "end")
+        d = G.dist_point_point((S.arg_num(st, 1, 0.0), S.arg_num(st, 2, 0.0)),
+                               (S.arg_num(en, 1, 0.0), S.arg_num(en, 2, 0.0)))
+        out[net] = out.get(net, 0.0) + d
+    if prefix is not None:
+        out = {k: v for k, v in out.items() if k.startswith(prefix)}
+    return {k: round(v, 4) for k, v in out.items()}
+
+
+def length_match(doc, tol_pair=0.25, tol_lane=0.5, tol_cmd=1.0, prefix="/DDR_"):
+    """DDR3L length-match verdict.  Every number is a measurement of the file,
+    so `authoritative` stays false - the vendor engine is still the judge."""
+    L = track_lengths(doc, prefix)
+    L = {k[len(prefix):]: v for k, v in L.items()}
+    named = lambda n: L.get(n)
+    groups = []
+
+    for p, n in DDR_PAIRS:
+        a, b = named(p), named(n)
+        if a is None or b is None:
+            groups.append({"group": "%s/%s" % (p, n), "kind": "pair",
+                           "status": "unmeasurable",
+                           "detail": "one of the nets has no copper"})
+            continue
+        sk = abs(a - b)
+        groups.append({"group": "%s/%s" % (p, n), "kind": "pair",
+                       "skew_mm": round(sk, 4), "tol_mm": tol_pair,
+                       "status": "ok" if sk <= tol_pair else "fail",
+                       "lengths": {p: a, n: b},
+                       "needs_mm": (0.0 if sk <= tol_pair else round(sk, 4))})
+
+    for lane, members in DDR_LANES.items():
+        vals = {m: named(m) for m in members if named(m) is not None}
+        if len(vals) < 2:
+            groups.append({"group": lane, "kind": "lane", "status": "unmeasurable",
+                           "detail": "fewer than two routed nets"})
+            continue
+        ref = max(vals.values())
+        worst = max(vals.items(), key=lambda kv: abs(ref - kv[1]))
+        d = ref - worst[1]
+        groups.append({"group": lane, "kind": "lane",
+                       "ref_mm": round(ref, 4), "tol_mm": tol_lane,
+                       "worst_net": worst[0], "dev_mm": round(d, 4),
+                       "status": "ok" if d <= tol_lane else "fail",
+                       "routed": len(vals), "of": len(members),
+                       "needs_mm": (0.0 if d <= tol_lane else round(d, 4)),
+                       "lengths": {k: round(v, 4) for k, v in vals.items()}})
+
+    ck = named("CLKP")
+    vals = {m: named(m) for m in DDR_CMD if named(m) is not None}
+    if ck is None or not vals:
+        groups.append({"group": "addr/cmd vs CLK", "kind": "cmd",
+                       "status": "unmeasurable",
+                       "detail": "no clock copper or no command net routed"})
+    else:
+        ref = max([ck] + list(vals.values()))
+        worst = max(vals.items(), key=lambda kv: abs(ref - kv[1]))
+        d = ref - worst[1]
+        groups.append({"group": "addr/cmd vs CLK", "kind": "cmd",
+                       "ref_net": "CLKP", "ref_mm": round(ref, 4),
+                       "tol_mm": tol_cmd, "worst_net": worst[0],
+                       "dev_mm": round(d, 4),
+                       "status": "ok" if d <= tol_cmd else "fail",
+                       "needs_mm": (0.0 if d <= tol_cmd else round(d, 4))})
+
+    bad = [g["group"] for g in groups if g["status"] == "fail"]
+    return {"authoritative": False,
+            "rule": "DDR3L: intra-pair <= %.2f, lane <= %.2f, cmd-vs-clock <= %.2f mm"
+                    % (tol_pair, tol_lane, tol_cmd),
+            "groups": groups, "failed": bad, "ok": not bad,
+            "note": "a meander can only add copper, so the reference of every "
+                    "group is its longest member; a net that is too long is a "
+                    "re-route, not a tweak"}
