@@ -12,7 +12,8 @@ RK3506 核心板第九步：**从图纸走到板子**——45 mm 方板 / 6 层 
 - **`fill.add_zone` 三处修复，每处都留失败原文**：① 内层被 `_COPPER_LAYERS=("F.Cu","B.Cu")` 硬拒 ⇒ `is_copper_name()` 正则 + 解析后 `board_copper_layers()` 精确校验（`LAYER_NOT_ON_BOARD`）；② `_available_nets` 读 arg1 拿到净编号 ⇒ `arg_text(node,2) or arg_text(node,1)`（原报错 `NET_NOT_FOUND: … no net GND; 98 nets exist, e.g. 1, 10, 11`）；③ 新增 `y_flip(board)`——按板已有 `Edge.Cuts` 的 y 符号判定翻转，因为 `create_board` 写 Y 向下而老板是 Y 向上，**判定法而非新参数**（强行翻转会打坏 `sky_star` 的正 Y zone）。写错方向的症状是 `kimathLogOverflow(): Overflow converting value -2147493567.024006 to int`。
 - **`--planes` 四层逐层实跑（同文件/同多边形/同网/各次先剥净既有 zone）**：`In1.Cu` **ok（fill 1922.987 mm²，1 个填充多边形）**；`In3.Cu`、`In4.Cu` 都 `ENGINE_FAILED` 于同一个 `-2147493567.024006`；`F.Cu` `TIMEOUT`（300 s 不返回）。判别式只剩层本身——「带既有填充」「多边形形状」「6 层堆叠」「模板缺字段」逐一被排除。故 `PLANE_LAYERS_NOW = [In1.Cu]`，`GND_PLANE_LAYERS` 三层仍是设计目标；`planes()` 失败记进 `out[layer]` 后 `continue`，一层的失败不掩盖另一层的读数。
 - **铺完的 DRC 如实照抄**：`not_clean / errors 637 / unconnected 42 / by_type clearance 499 + copper_edge_clearance 138 + isolated_copper 1 + lib_footprint_issues 1`，`top_errors` 全是相邻 J1 PTH 焊盘的 `间距 0.2000 实际 0.1500`（节距 1.000、盘 0.85 ⇒ 边距 0.15）。这些**不是铺铜造成**（板上无走线），邮票孔本就骑边，要按板厂工艺口径裁定，**不当缺陷清掉**。
-- 没做完：In4/B.Cu 平面（下一步拿 KiCad GUI 在同一块板上复现同层 zone，分清「缺参数」还是「我们写错层 id」）、45 器件手工单面布局、In3 按轨分块、手工 45° 布线
+- **修 `rounded_rect` 的圆角弧 `mid`（用户 GUI 打开报 `kimathLogOverflow` 的直接原因）**：第 1 个弧写成 `y0 + d`（到圆心 0.766 r，三点不同圆）⇒ pcbnew 算弧心溢出 `Overflow converting value -2147493567.024006 to int`；`kicad-cli` 对同一文件 stats/DRC/SVG 全绿，所以 CLI 全绿**不能**当"文件能打开"的证据。判读链：demo 板 LoadBoard 正常 → demo 压成单行仍正常（单行不是因）→ 本板与删 zone 版都 40 s 不返回 → `_noJ1`（仅板框）直接断言 → 删掉 4 个 `gr_arc` 即 rc 0 ⇒ 圆角弧是根因。修后 `LoadBoard rc 0 / zones 1 / footprints 1`，`--check` `drc 641`（`copper_edge_clearance` 138→140）
+- 没做完：In4/B/Cu 平面（下一步拿 KiCad GUI 在同一块板上复现同层 zone，分清「缺参数」还是「我们写错层 id」）、45 器件手工单面布局、In3 按轨分块、手工 45° 布线
 
 ## [0.1.8] - 2026-11-13
 

@@ -129,7 +129,10 @@ def rounded_rect(x0, y0, x1, y1, r, layer, width, sp, seed):
     The arcs are OUTLINE geometry (Edge.Cuts), not copper - the 45-degree rule
     that bans arcs is about traces. Each arc's mid point is on the 45-degree
     diagonal of its corner, which is the definition of a quarter circle and the
-    only mid point KiCad will accept for one.
+    only mid point KiCad will accept for one. Every mid point must be r away
+    from the arc's centre: on the first corner `y0 + d` is 0.766 r and pcbnew
+    then aborts with `kimathLogOverflow(): Overflow converting value
+    -2147493567.024006 to int` while kicad-cli reads the same file happily.
     """
     x0, x1 = sorted((float(x0), float(x1)))
     y0, y1 = sorted((float(y0), float(y1)))
@@ -137,7 +140,7 @@ def rounded_rect(x0, y0, x1, y1, r, layer, width, sp, seed):
     d = r * 0.7071067811865476
     out = [
         line2("gr_line", x0 + r, y0, x1 - r, y0, layer, width, sp, seed + ":s0"),
-        arc3("gr_arc", x1 - r, y0, x1 - r + d, y0 + d, x1, y0 + r,
+        arc3("gr_arc", x1 - r, y0, x1 - r + d, y0 + r - d, x1, y0 + r,
              layer, width, sp, seed + ":a1"),
         line2("gr_line", x1, y0 + r, x1, y1 - r, layer, width, sp, seed + ":s1"),
         arc3("gr_arc", x1, y1 - r, x1 - r + d, y1 - r + d, x1 - r, y1,
