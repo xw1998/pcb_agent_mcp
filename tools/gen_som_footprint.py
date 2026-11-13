@@ -21,7 +21,10 @@ F2 每边的焊盘中心严格在本边的板边线上（|x| = |y| = 板半宽�
 F3 同边相邻焊盘间距严格 1.000 mm，跨度 = (n-1) * 1.000；
 F4 边内序号方向符合 R8（N 是 +x，E 是 +y，S 是 -x，W 是 -y：KiCad 板坐标 y 向下）；
 F5 任一半孔盘到最近板角的边内距离 >= 2.000 mm（R2 禁布）；
-F6 焊盘孔 0.55 / 盘 0.85 与 docs/143 冻结值一致，且盘 - 孔 >= 0.30（立创半孔环下限）。
+F6 焊盘孔 0.55 / 盘 0.85 与 docs/143 冻结值一致，且盘 - 孔 >= 0.30（立创半孔环下限）；
+F7 庭院必须是**环**：每个半孔盘中心都落在四条边带之一以内（盘在庭院内），
+   且四条带围出的内部是空的（0.1.11 之前是一整块 45 x 45 的矩形，会让板上
+   每个器件都被判成与 J1 庭院重叠）。
 """
 
 from __future__ import annotations
@@ -49,6 +52,13 @@ EDGE_SLOTS = {"N": 40, "E": 30, "S": 40, "W": 30}
 EDGES = ("N", "E", "S", "W")
 
 HALF = BOARD_MM / 2.0
+CRTYD_BAND_MM = 1.0      # courtyard band thickness, measured inward from the edge
+CRTYD_BANDS = (
+    (-HALF, -HALF, HALF, -HALF + CRTYD_BAND_MM),
+    (-HALF, HALF - CRTYD_BAND_MM, HALF, HALF),
+    (-HALF, -HALF, -HALF + CRTYD_BAND_MM, HALF),
+    (HALF - CRTYD_BAND_MM, -HALF, HALF, HALF),
+)
 
 
 def read_rows():
@@ -181,10 +191,10 @@ def footprint_text(pads):
                    "board edge; pads only, no BOM line" % (BOARD_MM, BOARD_MM),
                    "F.Fab", 0, True)
 
-    def rect(layer, width):
+    def rect(layer, width, box=(-HALF, -HALF, HALF, HALF)):
         return [T + '(fp_rect',
-                T + T + '(start %s %s)' % (-HALF, -HALF),
-                T + T + '(end %s %s)' % (HALF, HALF),
+                T + T + '(start %s %s)' % (box[0], box[1]),
+                T + T + '(end %s %s)' % (box[2], box[3]),
                 T + T + '(stroke',
                 T + T + T + '(width %s)' % width,
                 T + T + T + '(type solid)',
@@ -193,7 +203,12 @@ def footprint_text(pads):
                 T + T + '(layer "%s")' % layer,
                 T + ')']
 
-    lines += rect("F.CrtYd", "0.05")
+    # The courtyard is a RING, not a slab (0.1.11). A single full-board rectangle
+    # makes every component that sits inside it "overlap" J1's courtyard, and
+    # DRC then reports one courtyards_overlap per placed part (measured: 44 of
+    # them). Four bands follow the pads and leave the interior to the parts.
+    for box in CRTYD_BANDS:
+        lines += rect("F.CrtYd", "0.05", box)
     lines += rect("F.Fab", "0.1")
     for pin, edge, x, y in pads:
         lines += [T + '(pad "%d" thru_hole circle' % pin,
@@ -207,9 +222,23 @@ def footprint_text(pads):
     return "\n".join(lines) + "\n"
 
 
+def audit_courtyard(pads):
+    """F7: every pad centre is inside one of the four bands."""
+    for pin, edge, x, y in pads:
+        if not any(b[0] - 1e-9 <= x <= b[2] + 1e-9 and b[1] - 1e-9 <= y <= b[3] + 1e-9
+                   for b in CRTYD_BANDS):
+            raise SystemExit("F7 pad %d at (%s, %s) is outside the courtyard ring"
+                             % (pin, x, y))
+    inner = (CRTYD_BAND_MM, -HALF + CRTYD_BAND_MM, HALF - CRTYD_BAND_MM,
+             HALF - CRTYD_BAND_MM)
+    return {"bands": len(CRTYD_BANDS), "band_mm": CRTYD_BAND_MM,
+            "inner_free_box": inner}
+
+
 def main(argv=None):
     rows = read_rows()
     pads, per_edge = plan(rows)
+    crtyd = audit_courtyard(pads)
     text = footprint_text(pads)
     os.makedirs(PRETTY, exist_ok=True)
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
@@ -217,7 +246,8 @@ def main(argv=None):
     print(json.dumps({"out": OUT, "pads": len(pads),
                       "pad_mm": PAD_D_MM, "drill_mm": HOLE_D_MM,
                       "per_edge": per_edge,
-                      "audits": "F1-F6 passed",
+                      "courtyard": crtyd,
+                      "audits": "F1-F7 passed",
                       "bytes": len(text)}, ensure_ascii=False, indent=2))
     return 0
 

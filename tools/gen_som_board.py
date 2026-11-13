@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 EXAMPLES = os.path.join(REPO, "examples", "rk3506_som")
 BOARD = os.path.join(EXAMPLES, "rk3506_som.kicad_pcb")
 LIB = os.path.join(EXAMPLES, "lib", "RK3506.pretty")
+SCHEMATIC = os.path.join(EXAMPLES, "rk3506_som.kicad_sch")
 
 # ---- the frozen design (docs/143): 45 x 45, 1.6 mm, 6 layers, single side SMD
 SIZE = 45.0
@@ -60,12 +61,47 @@ def read_csv(name):
         return list(csv.DictReader(fh))
 
 
+def schematic_pad_names():
+    """{(ref, pin): net name} straight out of the schematic netlist.
+
+    The schematic, not the CSV, is the authority for a net's *name*: it is one
+    root sheet, so KiCad writes every net as "/NAME". The CSV writes plain
+    "NAME". Feeding the CSV names straight to the pad made two nets out of one
+    rail -- measured on the 0.1.10 board, /+5V_IN (12 pads) and +5V_IN (4 stamp
+    pads), with the same split on +3V3. Eight stamp pads were islanded.
+    """
+    from pcb_agent_mcp.fidelity import engine
+    res = engine.sch_netlist(SCHEMATIC)
+    if str(res.get("status")) != "ok":
+        raise SystemExit("the schematic will not netlist: %s" % res.get("message"))
+    out = {}
+    for net in res["nets"]:
+        for ref, pin in net["nodes"]:
+            out[(ref, str(pin))] = net["name"]
+    return out
+
 def stamp_pad_nets():
-    """{pad number: net} for J1, straight out of the frozen netlist."""
+    """{pad number: net} for J1: the CSV says *which* net, the schematic says
+    what it is called. A name that no schematic net backs is refused, not
+    prefixed by guesswork."""
+    sch = schematic_pad_names()
     out = {}
     for row in read_csv("netmap_terminals.csv"):
-        if row["device"] == "STAMP":
-            out[row["pin"]] = row["net"]
+        if row["device"] != "STAMP":
+            continue
+        pin, plain = row["pin"], row["net"]
+        named = [n for (r, p), n in sch.items()
+                 if r == "J1" and p == pin]
+        if not named:
+            raise SystemExit("stamp pin %s (%s) is not in the schematic netlist"
+                             % (pin, plain))
+        if len(named) > 1:
+            raise SystemExit("stamp pin %s is on %d schematic nets (%s)"
+                             % (pin, len(named), ", ".join(sorted(named))))
+        if named[0].lstrip("/") != plain:
+            raise SystemExit("stamp pin %s: CSV says %r, the schematic says %r"
+                             % (pin, plain, named[0]))
+        out[pin] = named[0]
     if len(out) != 140:
         raise SystemExit("the netlist has %d stamp terminals, the footprint has 140"
                          % len(out))
@@ -142,14 +178,27 @@ def castellation(path=BOARD):
     return res
 
 
+def ground_net_name():
+    """The name the schematic gives ground. A pour on the un-prefixed "GND"
+    would be a *different net* from every pad the schematic placed (measured:
+    the In1 pour sat on net "GND" while all 228 ground pads were on "/GND"), so
+    the plane is named from the netlist, not from a constant."""
+    sch = schematic_pad_names()
+    names = sorted({n for n in sch.values() if n.lstrip("/") == "GND"})
+    if len(names) != 1:
+        raise SystemExit("the schematic names ground %r, expected exactly one"
+                         % (names,))
+    return names[0]
+
 def planes(path=BOARD):
     """Ground planes, poured by KiCad's own ZONE_FILLER (PLANE_LAYERS_NOW)."""
     from pcb_agent_mcp.fidelity import fill as F
 
     pts = plane_outline()
+    ground = ground_net_name()
     out = {}
     for layer in PLANE_LAYERS_NOW:
-        res = F.add_zone(path, "GND", layer, pts, priority=0, clearance=0.25,
+        res = F.add_zone(path, ground, layer, pts, priority=0, clearance=0.25,
                          min_thickness=0.25, connect="thermal",
                          fill_it=True, verify_drc=True)
         if str(res.get("status")) != "ok":
@@ -195,12 +244,172 @@ def check(path=BOARD):
     return report
 
 
+def netnames(path=BOARD):
+    """Re-point any pad whose net name the schematic spells differently.
+
+    This is the repair for the split described in schematic_pad_names(): only
+    pads whose current name is the un-prefixed twin of a schematic name move.
+    Anything else is reported and left alone -- a rename this step cannot back
+    with the netlist is exactly the kind of quiet edit that hides a defect.
+    """
+    from pcb_agent_mcp.edit import plan as P
+    from pcb_agent_mcp.fidelity import engine
+    S = __import__("pcb_agent_mcp.fidelity", fromlist=["sexpr"]).sexpr
+
+    doc = S.parse(open(path, encoding="utf-8").read())
+    board = doc.items[0]
+    names = {}
+    for n in S.children(board, "net"):
+        names[S.arg_num(n, 1)] = S.arg_text(n, 2)
+    have = set(names.values())
+
+    sch = schematic_pad_names()
+    ops, moved, skipped = [], [], []
+    for fp in S.children(board, "footprint"):
+        ref = None
+        for t in S.children(fp, "fp_text"):
+            if S.arg_text(t, 1) == "reference":
+                ref = S.arg_text(t, 2)
+        if ref is None:
+            continue
+        for pad in S.children(fp, "pad"):
+            num = S.arg_text(pad, 1)
+            nn = S.child(pad, "net")
+            if nn is None:
+                continue
+            cur = names.get(S.arg_num(nn, 1), "")
+            want = sch.get((ref, str(num)))
+            if want is None or want == cur:
+                continue
+            if want.lstrip("/") != cur:
+                skipped.append("%s.%s keeps %r (schematic %r)" % (ref, num, cur, want))
+                continue
+            if want not in have:
+                skipped.append("%s.%s wants %r, which is not a board net"
+                               % (ref, num, want))
+                continue
+            ops.append({"op": "set_pad_net", "ref": ref, "pad": str(num),
+                        "net": want, "create_nets": False})
+            moved.append({"ref": ref, "pad": str(num), "from": cur, "to": want})
+
+    print(json.dumps({"moved": moved, "skipped": skipped}, ensure_ascii=False,
+                     indent=2))
+    if not ops:
+        return {"moved": [], "skipped": skipped}
+    plan = P.propose(path, ops)
+    if plan.get("blocking"):
+        raise SystemExit("blocking: %s" % json.dumps(plan["blocking"])[:300])
+    # A rename moves no copper: the pad sits where it sat. The "new violation"
+    # counter still fires because a violation is keyed by the offending net
+    # pair, and the pair's name changed -- so it is accepted here and the DRC
+    # total is compared before/after instead of trusted on its own.
+    before = engine.drc(path).get("violations_total")
+    res = P.apply_plan(plan["plan_id"], confirm=True,
+                       options={"allow_new_violations": True})
+    after = engine.drc(path).get("violations_total")
+    print("DRC before/after", before, after)
+    print("applied", len(ops), "pad net repairs; gates",
+          json.dumps(res.get("gates_passed"), ensure_ascii=False))
+    return res
+
+def prune_nets(path=BOARD):
+    """Drop net-table rows nothing references, and renumber what is left.
+
+    Why this is a table rewrite and not `delete_net`: deleting one net makes the
+    editor renumber the rest, and the pads that were written by an earlier step
+    keep their old code -- measured, 66 phantom clearance errors at stamp pads
+    that were fine before. Here the whole table is rebuilt at once and every
+    reference is remapped in the same pass, so there is no moment where the file
+    is half-renumbered. Codes must stay sequential: a table with gaps makes
+    kicad-cli produce no report at all (measured).
+
+    The unused rows are the un-prefixed names the castellation step used to
+    write (see schematic_pad_names). Nothing that carries copper is touched: a
+    code is kept when any pad/zone/track/via/arc names it.
+    """
+    from pcb_agent_mcp.fidelity import engine
+    S = __import__("pcb_agent_mcp.fidelity", fromlist=["sexpr"]).sexpr
+
+    before_drc = engine.drc(path).get("violations_total")
+    before_pads = _pad_net_names(path)
+    doc = S.parse(open(path, encoding="utf-8").read())
+    board = doc.items[0]
+
+    used = set()
+
+    def walk(n, depth):
+        if isinstance(n, S.Seq):
+            if S.head(n) == "net" and depth > 1:
+                used.add(S.arg_num(n, 1))
+            for it in n.items:
+                walk(it, depth + 1)
+
+    walk(board, 0)
+
+    rows = S.children(board, "net")
+    keep = [r for r in rows if S.arg_num(r, 1) in used or S.arg_text(r, 2) == ""]
+    dropped = [S.arg_text(r, 2) for r in rows if r not in keep]
+    remap = {S.arg_num(r, 1): i for i, r in enumerate(keep)}
+    drop_ids = set(id(r) for r in rows if r not in keep)
+    board.items = [it for it in board.items
+                   if not (isinstance(it, S.Seq) and S.head(it) == "net"
+                           and id(it) in drop_ids)]
+
+    def renumber(n, depth):
+        if isinstance(n, S.Seq):
+            if S.head(n) == "net" and depth > 1:
+                old = S.arg_num(n, 1)
+                if old in remap:
+                    n.items[1] = S.Atom("%d" % remap[old])
+            for it in n.items:
+                renumber(it, depth + 1)
+
+    for r in keep:
+        r.items[1] = S.Atom("%d" % remap[S.arg_num(r, 1)])
+    for it in board.items:
+        renumber(it, 1)
+
+    open(path, "w", encoding="utf-8", newline="\n").write(
+        S.dumps(doc.items[0]) + "\n")
+
+    after_drc = engine.drc(path).get("violations_total")
+    after_pads = _pad_net_names(path)
+    changed = {k: (before_pads.get(k), after_pads.get(k))
+               for k in before_pads if before_pads.get(k) != after_pads.get(k)}
+    report = {"dropped": len(dropped), "kept": len(keep),
+              "drc_before": before_drc, "drc_after": after_drc,
+              "pad_net_names_changed": len(changed)}
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if after_drc != before_drc or changed:
+        raise SystemExit("prune changed the board: %s"
+                         % json.dumps(list(changed.items())[:5], ensure_ascii=False))
+    return report
+
+def _pad_net_names(path):
+    from pcb_agent_mcp.fidelity import sexpr as S
+    doc = S.parse(open(path, encoding="utf-8").read())
+    names = {S.arg_num(n, 1): S.arg_text(n, 2)
+             for n in S.children(doc.items[0], "net")}
+    out = {}
+    for fp in S.children(doc.items[0], "footprint"):
+        ref = None
+        for t in S.children(fp, "fp_text"):
+            if S.arg_text(t, 1) == "reference":
+                ref = S.arg_text(t, 2)
+        for pad in S.children(fp, "pad"):
+            nn = S.child(pad, "net")
+            key = "%s.%s" % (ref, S.arg_text(pad, 1))
+            out[key] = names.get(S.arg_num(nn, 1), "") if nn is not None else ""
+    return out
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--create", action="store_true")
     g.add_argument("--castellation", action="store_true")
     g.add_argument("--planes", action="store_true")
+    g.add_argument("--netnames", action="store_true")
+    g.add_argument("--prune-nets", action="store_true")
     g.add_argument("--check", action="store_true")
     ap.add_argument("--path", default=BOARD)
     a = ap.parse_args(argv)
@@ -210,6 +419,10 @@ def main(argv=None):
         castellation(a.path)
     elif a.planes:
         planes(a.path)
+    elif a.netnames:
+        netnames(a.path)
+    elif a.prune_nets:
+        prune_nets(a.path)
     else:
         check(a.path)
     return 0
