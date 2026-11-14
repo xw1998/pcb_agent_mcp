@@ -464,7 +464,7 @@ def astar(blk, w, h, si, sj, gi, gj, gsteps, cap):
 
 VIA_COST = 20000
 
-def astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf=None):
+def astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf=None, glay=None):
     """3-D lattice search: one node per (layer, cell).  A via transition is
     allowed only where a 0.2/0.1 through via body fits on every searched layer
     with 0.10 mm clearance.  `vf` is that mask, precomputed by eroding the free
@@ -492,7 +492,7 @@ def astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf=None):
     while heap:
         f, g, nid, lk, a, c = heapq.heappop(heap)
         if best.get(nid, -1) != g: continue
-        if a == gi and c == gj:
+        if a == gi and c == gj and (glay is None or slay[lk] in glay):
             path = []; q = nid
             while q != -1:
                 l2, idx2 = divmod(q, WH)
@@ -652,29 +652,78 @@ def find_escape(net, comp, tgt):
     return None
 
 def route(net, comp, tree, cap, clr0, ntry, mgs):
-    """join one cluster to any through terminal of tree; exact-gap verified.
-    If the cluster holds no through terminal, one pad is escaped to a new
-    through via with a single 45-degree F.Cu stub first."""
+    """join one cluster to any terminal of tree, on the layers BOTH ends can use,
+    exact-gap verified.  A through via is only inserted where a layer change is
+    actually needed; a BGA ball wired straight to a stamp-hole pad on F.Cu is a
+    legal single-layer route and must not be refused because neither pad is
+    through-hole.  Requiring the target to carry every searched layer was the
+    reason SMD-to-SMD nets were refused by construction, and that refusal is how
+    copper ended up running under the inductors."""
     global STEP
     full = set(LAYERS)
     cth = [a for a in comp if full <= items[a]['layers']]
-    tth = [a for a in tree if full <= items[a]['layers']]
     esc = None
+    esc_t = None
+    tp2 = None
     if cth:
-        slay = list(LAYERS); st0 = cth[0]; start = items[st0]['geom'][:2]
+        st0 = cth[0]
+        start = items[st0]['geom'][:2]
+        avail = set(items[st0]['layers']) & full
     else:
-        if not tth:
+        # Neither end is through-hole: two 0402 pads, or a BGA ball to a buck
+        # pad.  Start from the pad itself, on the layers the pad is drawn on.
+        # A via is inserted only when the path really has to leave those layers;
+        # forcing an escape up front both wastes a via and, when the pad is a big
+        # inductor terminal, fails outright because no legal site exists beside it.
+        cpads = [a for a in comp if items[a]['kind'] in ('disc', 'rect')]
+        tpads = [a for a in tree if items[a]['kind'] in ('disc', 'rect')]
+        if not cpads or not tpads:
             return None
-        tp = min((items[a]['geom'][:2] for a in tth),
-                 key=lambda p: min(math.hypot(p[0]-items[c]['geom'][0], p[1]-items[c]['geom'][1])
-                                   for c in comp))
-        esc = find_escape(net, comp, tp)
-        if esc is None:
+        st0 = min(cpads, key=lambda a: min(
+            math.hypot(items[a]['geom'][0]-items[b]['geom'][0],
+                       items[a]['geom'][1]-items[b]['geom'][1]) for b in tpads))
+        start = items[st0]['geom'][:2]
+        avail = set(items[st0]['layers']) & full
+        if not avail:
             return None
-        slay = list(LAYERS); start = (esc[1], esc[2])
-    need = set(slay)
+    # Layers usable by both ends.  Anything outside this intersection can never
+    # be reached without a via, so searching it only wastes time and, worse,
+    # makes the net look unrouteable.
+    need = set(L for L in LAYERS
+               if L in avail and any(L in items[a]['layers'] for a in tree))
     tth = [a for a in tree if need <= items[a]['layers']]
+    if os.environ.get('DBG'):
+        print('   DBG net=%s start=%s comp=%d tree=%d need=%s tth=%d' % (
+            net, [round(v, 2) for v in start], len(comp), len(tree),
+            sorted(need), len(tth)), flush=True)
+        print('   DBG comp layers=%s' % (
+            sorted(set(tuple(sorted(items[a]['layers'])) for a in comp)),), flush=True)
+        print('   DBG tree layers=%s' % (
+            sorted(set(tuple(sorted(items[a]['layers'])) for a in tree)),), flush=True)
     if not tth:
+        # The tree side is pad-only (a BGA ball).  Give that side a through-via
+        # escape so a real layer change is still possible, instead of refusing.
+        tpad = [a for a in tree if items[a]['kind'] in ('disc', 'rect')]
+        if not tpad:
+            return None
+        tp2 = min(tpad, key=lambda a: math.hypot(items[a]['geom'][0]-start[0],
+                                                 items[a]['geom'][1]-start[1]))
+        e = find_escape(net, tree, items[tp2]['geom'][:2])
+        if e is None:
+            return None
+        esc_t = (e[0], e[1], e[2])
+        mk('disc', net, set(full) | {'F.Cu'}, (e[1], e[2], e[1], e[2]), 0.1)
+        tth = [len(items) - 1]
+        need = set(avail)
+    tl = set()
+    for a in tree:
+        tl |= (set(items[a]['layers']) & full)
+    # Search ALL copper layers: a via is legal here (it is only placed where
+    # the gap on every searched layer is clear), so a congested single layer
+    # must not make the net unrouteable.  The target still has to be reached
+    # on one of its own layers, which astar3 enforces via glay.
+    slay = list(LAYERS)
+    if not slay:
         return None
     tg = sorted(tth, key=lambda a: math.hypot(items[a]['geom'][0]-start[0],
                                               items[a]['geom'][1]-start[1]))[:6]
@@ -744,9 +793,14 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
             gi = int(round((g[1]-y0)/STEP)); gj = int(round((g[0]-x0)/STEP))
             gi = max(0, min(h-1, gi)); gj = max(0, min(w-1, gj))
             gr = 0   # the target's own copper is never blocked, so no disc clearing
+            # A pad only exists on the layers it is drawn on: clearing its cell
+            # on any other layer would let the search "arrive" on a layer the
+            # pad is not on, which is a short that the DRC then reports.
+            gl = set(items[a]['layers']) & set(slay)
             bl = {L: bytearray(arrs[L].tobytes()) for L in slay}
             for L in slay:
                 bl[L][si*w+sj] = 0
+            for L in gl:
                 for di in range(-gr, gr+1):
                     for dj in range(-gr, gr+1):
                         ii, jj = gi+di, gj+dj
@@ -770,7 +824,7 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
                           % (L, si, sj, gi, gj, len(seen), w*h, (gi, gj) in seen), flush=True)
                 for i in range(max(0, gi-3), min(h, gi+4)):
                     print("   PROBE row %d: %s" % (i, ''.join('#' if bl[slay[0]][i*w+j] else '.' for j in range(max(0, gj-6), min(w, gj+7)))), flush=True)
-            p3 = astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf)
+            p3 = astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf, gl)
             if p3 and len(p3) > 1:
                 sc = len(p3) + int(60.0 * cong[p3[0][0]])
                 if sc < bestsc:
@@ -818,6 +872,10 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
                 off[i] = min(d, off.get(i, 9.0))
         if not off:
             parts = list(segs_by_layer)
+            if esc_t is not None:
+                p2 = items[tp2]['geom']
+                parts = parts + [('F.Cu', [(esc_t[1], esc_t[2], p2[0], p2[1])])]
+                vlist = vlist + [(esc_t[1], esc_t[2])]
             if esc is not None and esc[0] is not None:
                 p0 = items[esc[0]]['geom']
                 parts = [('F.Cu', [(p0[0], p0[1], esc[1], esc[2])])] + parts
