@@ -17,12 +17,15 @@ used to be spread across the twelve files.
     250 -> 252   0.0.145: board_plane_resonance (a board-level cavity solve) and
                  board_crosstalk (a board-level coupling solve) - two new
                  questions, not two flags on existing tools
+    252 -> 253   0.1.21: pcb_rule_projection - which of the 27 rules the
+                 generator can consume, as what shape, and the live payload.
+                 A new question ("why was the rule not used"), not a flag.
 
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 252
+EXPECTED_TOOL_COUNT = 253
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

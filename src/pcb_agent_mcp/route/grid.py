@@ -66,7 +66,8 @@ def _axis_rect(poly):
 class Grid(object):
     """Cell occupancy per copper layer, plus exact geometry for acceptance."""
 
-    def __init__(self, board, layers, pitch, bundle, ignore_zone_areas=False):
+    def __init__(self, board, layers, pitch, bundle, ignore_zone_areas=False,
+                 extra_keepouts=None):
         if pitch <= 0:
             raise ValueError("pitch must be > 0")
         self.board = board
@@ -150,6 +151,16 @@ class Grid(object):
         self._mark_edge()
         self._mark_copper()
         self._mark_keepouts(ignore_zone_areas)
+        # Rectangles that come from the rule catalogue rather than from the board
+        # file (design_constraints.keepout_rects). They go through the SAME two
+        # paths a zone keepout does - the raster and the exact ring check - so a
+        # rule cannot be honoured by the search and quietly ignored by the judge.
+        # Marking only the raster would let a proposed segment cross the rect and
+        # still be reported clean, which is the defect this whole version is about.
+        self.rule_keepouts = 0
+        self.dropped_rule_keepouts = []
+        if extra_keepouts:
+            self._add_rule_keepouts(extra_keepouts)
 
     # ------------------------------------------------------------- geometry
     def _extent(self):
@@ -428,41 +439,7 @@ class Grid(object):
                 # the rim is marked, so the search keeps off the pour's edge.
                 fill_in = False
             sid = self._sid(nets)
-            bx = G.bbox_of(ring)
-            m_tr, m_v = self.margin, self.margin_via
-            m = m_tr if m_tr > m_v else m_v
-            nx = self.nx
-            i0 = max(0, int(math.floor((bx[0] - m - self.x0) / self.pitch)))
-            i1 = min(nx - 1, int(math.ceil((bx[2] + m - self.x0) / self.pitch)))
-            j0 = max(0, int(math.floor((bx[1] - m - self.y0) / self.pitch)))
-            j1 = min(self.ny - 1, int(math.ceil((bx[3] + m - self.y0) / self.pitch)))
-            onb = self.onboard
-            pitch = self.pitch
-            for j in range(j0, j1 + 1):
-                y = self.y0 + j * pitch
-                base = j * nx
-                for i in range(i0, i1 + 1):
-                    k = base + i
-                    if not onb[k]:
-                        continue
-                    px = self.x0 + i * pitch
-                    d = G.dist_point_polygon((px, y), ring)
-                    # A keepout's whole interior is forbidden, not just a band
-                    # around its rim: copper inside it is what the zone is FOR.
-                    # Marking only the rim let the search walk straight through
-                    # the middle of a keepout and call it free. The test has to
-                    # be against the ring, before either margin decides anything
-                    # - checking it only past the larger margin left a band where
-                    # the track map said free and the via map said blocked.
-                    if fill_in and d > 0.0 and G.point_in_polygon((px, y), ring):
-                        d = 0.0
-                    if d >= m:
-                        continue
-                    for layer in zl:
-                        if no_tr and d < m_tr:
-                            self._put(self._map[layer], k, sid)
-                        if no_via and d < m_v:
-                            self._put(self._mapv[layer], k, sid)
+            self._fill_ring(ring, zl, sid, no_tr, no_via, fill_in)
         if n_keep:
             open_keep = n_keep - sum(1 for k in self.keepouts
                                      if k["tracks"] or k["vias"])
@@ -475,6 +452,95 @@ class Grid(object):
             self.notes.append(
                 "%d pour/zone area(s) block every net except their own; a pour is "
                 "not re-cut around new tracks by this router" % n_zone)
+
+    def _fill_ring(self, ring, zl, sid, no_tr=True, no_via=True, fill_in=True):
+        """Block every raster cell within the margin of `ring` on layers `zl`.
+
+        One implementation for board keepouts, pour rims and catalogue
+        rectangles: a second copy is how the raster and the exact check drift
+        apart, and then the search routes through a rule the judge still sees.
+        """
+        bx = G.bbox_of(ring)
+        m_tr, m_v = self.margin, self.margin_via
+        m = m_tr if m_tr > m_v else m_v
+        nx = self.nx
+        i0 = max(0, int(math.floor((bx[0] - m - self.x0) / self.pitch)))
+        i1 = min(nx - 1, int(math.ceil((bx[2] + m - self.x0) / self.pitch)))
+        j0 = max(0, int(math.floor((bx[1] - m - self.y0) / self.pitch)))
+        j1 = min(self.ny - 1, int(math.ceil((bx[3] + m - self.y0) / self.pitch)))
+        onb = self.onboard
+        pitch = self.pitch
+        for j in range(j0, j1 + 1):
+            y = self.y0 + j * pitch
+            base = j * nx
+            for i in range(i0, i1 + 1):
+                k = base + i
+                if not onb[k]:
+                    continue
+                px = self.x0 + i * pitch
+                d = G.dist_point_polygon((px, y), ring)
+                # A keepout's whole interior is forbidden, not just a band
+                # around its rim: copper inside it is what the zone is FOR.
+                # Marking only the rim let the search walk straight through
+                # the middle of a keepout and call it free. The test has to
+                # be against the ring, before either margin decides anything
+                # - checking it only past the larger margin left a band where
+                # the track map said free and the via map said blocked.
+                if fill_in and d > 0.0 and G.point_in_polygon((px, y), ring):
+                    d = 0.0
+                if d >= m:
+                    continue
+                for layer in zl:
+                    if no_tr and d < m_tr:
+                        self._put(self._map[layer], k, sid)
+                    if no_via and d < m_v:
+                        self._put(self._mapv[layer], k, sid)
+
+    def _add_rule_keepouts(self, rects):
+        """Wall off rectangles a rule forbids copper in, not the board file.
+
+        `rects` carries ``x0/y0/x1/y1`` in file coordinates plus the rule id and
+        the owner that produced it; a rectangle with no owner is dropped, because
+        a block nobody can re-derive is a block nobody can audit.
+        """
+        kept = 0
+        dropped = []
+        for r in rects:
+            rule = r.get("rule") or r.get("name")
+            owner = r.get("owner") or r.get("ref")
+            if not rule or not owner:
+                dropped.append({"rect": [r.get("x0"), r.get("y0"),
+                                          r.get("x1"), r.get("y1")],
+                                "why": "no rule id or no owner"})
+                continue
+            x0, y0 = float(r["x0"]), float(r["y0"])
+            x1, y1 = float(r["x1"]), float(r["y1"])
+            if x1 < x0:
+                x0, x1 = x1, x0
+            if y1 < y0:
+                y0, y1 = y1, y0
+            layers = [l for l in (r.get("layers") or self.layers)
+                      if l in self.layers]
+            if not layers:
+                continue
+            ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            self.keepouts.append({
+                "ring": ring, "layers": set(layers),
+                "tracks": True, "vias": True, "pads": True,
+                "copperpour": True, "footprints": False,
+                "bbox": [x0, y0, x1, y1],
+                "rule": rule, "owner": owner})
+            self._fill_ring(ring, layers, self._sid(frozenset([None])))
+            kept += 1
+        self.rule_keepouts = kept
+        if kept or dropped:
+            self.notes.append(
+                "%d rectangle(s) from the rule catalogue block every net "
+                "(same raster and same exact check as a board keepout)"
+                % kept
+                + ("; %d dropped for having no rule id or no owner" % len(dropped)
+                   if dropped else ""))
+        self.dropped_rule_keepouts = dropped
 
     # ----------------------------------------------- growing the map with copper
     def add_copper(self, item):

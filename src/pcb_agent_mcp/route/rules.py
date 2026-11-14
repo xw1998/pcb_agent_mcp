@@ -612,6 +612,128 @@ def resolve(board, clearance_mm=None, track_mm=None, via_diameter_mm=None,
     }
 
 
+def apply_overrides(bundle, overrides):
+    """Merge rule-catalogue numbers into a resolved bundle, stricter side wins.
+
+    `overrides` comes from `ruleset.projection.router_inputs` and may carry:
+
+      ``track_mm``          {net or "*": mm}    floor on finished width
+      ``clearance_mm``      {net or "*": mm}    floor on that net's clearance
+      ``clearance_factor``  {net: k}            clearance >= k x that net's width
+      ``via_drill_mm``      mm                  floor on drill
+      ``via_diameter_mm``   mm                  floor on pad diameter
+
+    Every number is a MINIMUM. A rule that would LOOSEN the board's own DRC is
+    recorded as ``not_applied`` and named, never applied: a catalogue must not be
+    able to talk the router into thinner copper or a smaller gap than the board
+    (or the fab) already requires. Returning a report rather than a bare bundle
+    is what makes "the rule was fed to the router" checkable instead of asserted.
+
+    Returns ``(bundle2, report)``; `bundle` itself is not modified.
+    """
+    if not overrides:
+        return bundle, {"applied": [], "not_applied": [], "sources": []}
+    out = dict(bundle)
+    out["per_net"] = dict((k, dict(v))
+                          for k, v in (bundle.get("per_net") or {}).items())
+    out["default"] = dict(bundle.get("default") or {})
+    applied, refused = [], []
+
+    def _entry(net):
+        if net == "*":
+            return out["default"]
+        got = out["per_net"].get(net)
+        if got is None:
+            got = dict(out["default"])
+            got["source"] = "rule catalogue (no net class on the board)"
+            out["per_net"][net] = got
+        return got
+
+    for net, want in (overrides.get("track_mm") or {}).items():
+        ent = _entry(net)
+        have = float(ent.get("track_mm") or 0.0)
+        if float(want) > have + 1e-9:
+            ent["track_mm"] = float(want)
+            applied.append({"fact": "track_mm", "net": net, "was": have,
+                            "now": float(want), "source": ent.get("source")})
+        else:
+            refused.append({"fact": "track_mm", "net": net,
+                            "rule_mm": float(want), "board_mm": have,
+                            "why": "the board already asks for at least this much"})
+
+    for net, want in (overrides.get("clearance_mm") or {}).items():
+        ent = _entry(net)
+        have = float(ent.get("clearance_mm") or 0.0)
+        floor = float(out.get("min_clearance_floor") or 0.0)
+        want = max(float(want), floor)
+        if want > have + 1e-9:
+            ent["clearance_mm"] = want
+            applied.append({"fact": "clearance_mm", "net": net, "was": have,
+                            "now": want, "source": ent.get("source")})
+        else:
+            refused.append({"fact": "clearance_mm", "net": net,
+                            "rule_mm": want, "board_mm": have,
+                            "why": "the board already asks for at least this much"})
+
+    for net, k in (overrides.get("clearance_factor") or {}).items():
+        ent = _entry(net)
+        have = float(ent.get("clearance_mm") or 0.0)
+        width = float(ent.get("track_mm") or 0.0)
+        if width <= 0.0:
+            raise RulesError(
+                "cannot apply a %g x width spacing to net %r: its width is "
+                "%.3f mm" % (float(k), net, width), "RULES_INVALID",
+                hint="a spacing written as a multiple of the width needs a width; "
+                     "pass track_mm for that net too")
+        want = max(float(k) * width, float(out.get("min_clearance_floor") or 0.0))
+        if want > have + 1e-9:
+            ent["clearance_mm"] = want
+            applied.append({"fact": "clearance_mm", "net": net, "was": have,
+                            "now": want,
+                            "source": "%g x width %.3f mm (%s)"
+                                      % (float(k), width, ent.get("source"))})
+        else:
+            refused.append({"fact": "clearance_mm", "net": net,
+                            "rule_mm": want, "board_mm": have,
+                            "why": "the board already asks for at least this much"})
+
+    for fact in ("via_drill_mm", "via_diameter_mm"):
+        want = overrides.get(fact)
+        if want is None:
+            continue
+        ent = out["default"]
+        have = float(ent.get(fact) or 0.0)
+        if float(want) > have + 1e-9:
+            ent[fact] = float(want)
+            for spec in out["per_net"].values():
+                if float(spec.get(fact) or 0.0) < float(want):
+                    spec[fact] = float(want)
+            applied.append({"fact": fact, "net": "*", "was": have,
+                            "now": float(want), "source": "rule catalogue"})
+        else:
+            refused.append({"fact": fact, "net": "*", "rule_mm": float(want),
+                            "board_mm": have,
+                            "why": "the board already asks for at least this much"})
+
+    drill = float(out["default"].get("via_drill_mm") or 0.0)
+    dia = float(out["default"].get("via_diameter_mm") or 0.0)
+    if drill > 0.0 and dia > 0.0 and drill >= dia:
+        raise RulesError(
+            "after the catalogue overrides the via drill is %.3f mm and its pad "
+            "%.3f mm, so there would be no annular ring" % (drill, dia),
+            "RULES_INVALID",
+            hint="a via needs drill < diameter; the rule floor and the via size "
+                 "come from different places, so one of them has to move")
+
+    out["sources"] = dict(bundle.get("sources") or {})
+    if applied:
+        out["sources"]["rule_catalogue"] = [
+            "%s %s: %s -> %s (%s)" % (i["fact"], i["net"], i.get("was"),
+                                      i.get("now"), i.get("source"))
+            for i in applied]
+    return out, {"applied": applied, "not_applied": refused,
+                 "sources": [i.get("source") for i in applied]}
+
 def for_net(bundle, net):
     """One net's numbers out of a resolved bundle (falls back to the board)."""
     got = (bundle.get("per_net") or {}).get(net)

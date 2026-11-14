@@ -390,7 +390,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          congestion_rounds=2, congestion_max_rips=12, congestion_weight=1.0,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          return_path=True, return_path_net=None, topology="mst",
-         progress=None, blind_vias=False):
+         progress=None, blind_vias=False, keepout_rects=None):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -401,6 +401,14 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     (`net`, `ok`, `status`, `s`). Routing a dense 50-net board takes minutes, and
     a caller who cannot see which net it is on has no way to tell "working" from
     "wedged".
+
+    `keepout_rects` are rectangles the RULE CATALOGUE forbids copper in (see
+    `ruleset.projection.router_inputs`), each a dict with ``x0/y0/x1/y1``,
+    ``rule`` and ``owner``. They enter the same two gates a board keepout does -
+    the raster the search walks on and the exact ring check every emitted segment
+    is measured against. Passing them and having the router silently ignore them
+    would be worse than not passing them at all, so a rect without a rule id or
+    an owner is named in ``grid.dropped_rule_keepouts`` rather than dropped.
 
     `topology` says how a multi-pad net is joined: `"mst"` (default) is a
     spanning tree over the pad centres, `"steiner"` adds branch points that are
@@ -429,7 +437,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
 
     grid_layers = list(routing) + [l for l in planes if l not in routing]
     grid = Grid(board, grid_layers, float(pitch_mm), bundle,
-                ignore_zone_areas=ignore_zone_areas)
+                ignore_zone_areas=ignore_zone_areas,
+                extra_keepouts=keepout_rects)
     em = _Emitter(grid, bundle, board=board, layers=grid_layers,
                   pitch=float(pitch_mm), ignore_zone_areas=ignore_zone_areas,
                   blind_vias=blind_vias)
@@ -1145,6 +1154,9 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                   "impedance_targets": bundle["impedance_targets"],
                   "sources": bundle["sources"],
                   "assumed": bundle["assumed"]},
+        "rule_keepouts": {"used": grid.rule_keepouts,
+                          "dropped": grid.dropped_rule_keepouts,
+                          "cells_raster": len(grid.keepouts)},
         "diff_pairs": tune_report["diff_pairs"],
         "length_groups": tune_report["length_groups"],
         "return_path": tune_report.get("return_path"),

@@ -4770,6 +4770,54 @@ _tool(
     _board_tool(_rule_audit, derived=True),
 )
 
+def _rule_projection(board, args):
+    """Which rules can reach the generator, and the payload the router consumes."""
+    from .ruleset import projection as PR
+    grow = args.get("grow_mm")
+    try:
+        rep = PR.project(board, None if grow is None else float(grow))
+    except Exception as exc:                        # noqa: BLE001
+        return err(str(exc), "PROJECTION_INVALID")
+    return ok(value=rep, unit="rule_projection",
+              model="rules_to_generator_projection",
+              basis="calc.rules (27 rules) classified by the shape a generator "
+                    "can consume: rect_keepout / net_geometry / paired / "
+                    "layer_policy / audit_only",
+              precision="projected means code in this package consumes it now; "
+                        "by_construction means the emitter cannot produce the "
+                        "violation; not_wired names the missing channel",
+              assumptions={
+                  "status_is_a_code_claim": "projected is checked by grep-able "
+                                            "code, not by a hopeful comment",
+                  "net_matching": "RF and power nets are matched by NAME pattern "
+                                  "only; an unmatched rail gets no floor rather "
+                                  "than a guessed one",
+                  "keepout_grow_mm": "rectangles grow past the pad hull by the "
+                                     "same 0.1 mm the audit uses"})
+
+_tool(
+    "pcb_rule_projection",
+    "Which of the 27 layout rules can reach the GENERATOR today, as what shape, and "
+    "which ones only ever judge a finished board. Every rule is classified as "
+    "rect_keepout (forbidden rectangle -> route.router.plan(keepout_rects=...) -> the "
+    "same raster and exact ring check a board keepout gets), net_geometry (width / "
+    "drill / spacing floor -> route.rules.apply_overrides, which refuses to loosen "
+    "the board's own DRC), paired (needs a declared pair or an ohm target), "
+    "layer_policy (a whole-layer or placement property) or audit_only. Status says "
+    "projected / by_construction / not_wired (with the missing channel named) / "
+    "audit_only, so 'the rule was fed in' and 'the rule reads nice' stay different "
+    "claims. Also returns the live payload: the keep-out rectangles with their "
+    "owner and rule id, the per-net floors, and the nets each one was matched to. "
+    "Read-only; writes nothing.",
+    {"type": "object",
+     "properties": dict({
+         "path": _str("board file: KiCad .kicad_pcb or EasyEDA Pro .epro"),
+         "grow_mm": _num("how far the keep-out rectangles grow past the pad hull "
+                         "(default 0.1, the same number the audit uses)"),
+     }, **_COMMON), "required": ["path"]},
+    _board_tool(_rule_projection, derived=True),
+)
+
 _tool(
     "pcb_rule_catalog",
     "List the rules this server audits, each with the priority level it sits at, its "

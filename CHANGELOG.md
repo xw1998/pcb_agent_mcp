@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.21] - 2026-11-14
+
+RK3506 核心板第二十一步：**回答「这些经验规则布局布线时为什么没用上」——并把能接的那几条真接进布线器**。用户原话就是这一句。核查结论：规则停在审计端，27 条里只有「矩形禁布」这一种形式在 0.1.19 被投影出去，而且只落成一张**要外部脚本手动读的 JSON**；包内 `route/` 那套布线器根本不认识规则目录。本版把这条通路做成包内的、可测的、默认就在的一条。
+
+- **新增** `ruleset/projection.py`：把 27 条规则按「生成器能吃的形状」逐条分类——`rect_keepout`（矩形禁布）/ `net_geometry`（宽度、钻孔、间距下限）/ `paired`（成对或阻抗，需板子声明）/ `layer_policy`（整层或摆位属性）/ `audit_only`。每条再带 `status`：`projected`（本仓库代码今天真消费它）/ `by_construction`（发射器根本产生不出这种违规）/ `not_wired`（形状清楚、通道缺，`why` 点名缺什么）/ `audit_only`。`table()` 做漂移检查：目录里多一条而这里没分类、或这里多一条而目录没有，都**抛异常**，不是默默留个 unprojected。
+- **本板实测账**（`python -m pcb_agent_mcp.ruleset.projection _v18.kicad_pcb`）：**projected 9 / by_construction 2 / not_wired 7 / audit_only 9**，合计 27。7 个禁布 owner（FB1/FB2/L1–L4/Y1）带规则号与矩形坐标；9 个电源网（`/+0V675_REF`、`/+0V9_*`、`/+1V35_DDR`、`/+1V8_ANA`、`/+3V3`、`/+5V_IN`）拿到 0.508 mm 宽度下限，同时下发 0.1524 mm 线宽与 0.3 mm 钻孔两个全局下限。
+- **矩形禁布第一次真进布线器**：`route.grid.Grid(..., extra_keepouts=[...])` 把规则矩形走**和板内 keepout 完全相同的两条路**——栅格与逐段精确环检（`seg_blockers`/`via_blockers`）。只标栅格就是本版要防的那种假：搜索绕开了、判官没看见。没 `rule` 号或没 owner 的矩形被丢进 `dropped_rule_keepouts` 并写明原因，不静默。`_mark_keepouts` 里那段填环逻辑抽成 `_fill_ring` 复用，避免两份环判定各自漂移。`route.router.plan(..., keepout_rects=...)` 接上，返回值新增 `rule_keepouts {used, dropped, cells_raster}`。
+- **规则数字第二通道**：`route.rules.apply_overrides(bundle, overrides)` 把 `track_mm / clearance_mm / clearance_factor / via_drill_mm / via_diameter_mm` 合进 resolve 出的 bundle，**每个数都是下限**：规则比板子 DRC 更松时记 `not_applied` 并同时报两个数（「不是没喂进去」与「喂进去没起作用」由此可分）。三个硬拒绝：`clearance_factor` 无宽度可乘时报 `RULES_INVALID`（3W 没有 W 不是距离）、钻孔 ≥ 焊盘时报「没有环宽」、面内 `min_clearance_floor` 永远压过规则。
+- **修掉一个会吞掉全部电源网的正则 bug**：KiCad 的网名是 `/+3V3` 这种带 sheet 路径的形式，首版电源网正则锚在字符串开头，于是**这块板的 9 个电源网一个都没匹配上**，`power_trace_width` 看起来「已投影」实际作用于零。新增 `bare_net()` 去 sheet 路径，并给出正反例：`/+0V9_CPU`/`/+1V35_DDR`/`/+5V_IN` 命中，`/GND`（铺铜问题）、`/DDR_A0`、`/SDMMC_D0`、`/USB0_VBUSDET` 不命中。首版 `bare_net` 还写成空针 `startswith` 死循环，已改单次 rsplit；两处都写进测试。
+- **新增工具** `pcb_rule_projection`（只读，`_board_tool` 派生）：返回 27 条的 status/form/why、禁布矩形（带 owner 与规则号）、逐网下限、以及 `deferred` 名单。工具数棘轮 252 → **253**。
+- **测试** `tests/test_rule_projection.py`（17 个）：分类覆盖 27 条且计数非全乐观；目录多一条 / 表里多一条都抛异常；矩形**同时**关掉栅格与判官（带「不传矩形时必须 free / 必须无 blocker」的正控制）；缺 owner 的矩形被丢弃且不生效；层不在布线集时跳过不放大；宽度规则取严、更松的规则被拒并报两个数；3W 无宽度报错；钻孔≥焊盘报错；真实网名正反例；工具 27 条且不改文件。`test_route + test_design_constraints + test_rule_sources + test_ruleset + test_rule_projection + test_blockers + test_45_corners` 共 **202 passed**。
+- **交付板复核**（`_v18.kicad_pcb`，4209 段）：用本版投影出的 7 个矩形逐段做线段-矩形裁剪，**穿过规则的铜 0 段**，与 0.1.19 修完禁布后重跑的结果一致——所以本版改的不是那块板，而是「谁提供这张表」：从手写 JSON 变成从规则目录与板子本身推导。
+- **对外文档** `docs/158-规则为什么没进生成端-投影台账与两条新通道.md`。
+- **没做**（不许读成做了）：`not_wired` 的 7 条一条没接（差分对仍要板子声明、RF 到板边仍是全板一个数、bend_radius 因本项目禁圆弧出局）；`layer_policy` 9 条仍只由审计判；没有用新通道重画这块板（重画要动 `_mazeH.py`，那是工作区脚本不是包内代码）。
+
 ## [0.1.20] - 2026-11-14
 
 RK3506 核心板第二十步：**把用户丢过来的那本书真读进去，并把读到的句子逐条落成出处**。用户原话「你全网找资料学习学完以后让我过目，不然我就认为你没学」。本版只补出处与台账，不动任何判据逻辑、不动规则等级。
