@@ -16,22 +16,26 @@ What is deliberately NOT here, and what the report therefore says:
 * **vias are not length.** Neither counted nor tuned - the electrical length of a
   barrel is not its drill depth, so counting it would make two different numbers
   look like one.
-* **arcs are not tuned.** A track arc in the file is a shape, not a segment, and
-  `delete_track` means "segments". The number of arcs on each net is reported as
-  `arcs_not_counted`, so a net whose length looks short because an arc was
-  skipped is visible instead of silently mis-measured.
+* **arcs ARE length.** The length of a track arc is measured through its three
+  points (`edit.ops.arc_length_mm`), not guessed from a chord polyline, and it is
+  counted in every number this module reports (`arcs_counted` says how many).
+  `style="arc"` writes arcs (a rounded meander - the user rejected 45-degree
+  teeth on sight); `style="chamfer"` writes the 45-degree version.
 * **a meander only ever ADDS copper.** The reference of a group is its longest
   member (or `target_mm`); a net that is too LONG is reported as
   `needs_reroute`, never shortened by moving its copper.
 * **only 0/45/90/135 segments are tuned.** A tooth fanned off a segment at 30
   degrees comes out at 75/105 degrees - exactly the angle nobody asked for, and
-  this package's own rule is "45-degree bends only".
+  this package's own rule is "45-degree bends only". An arc meander is exempt by
+  construction: every piece is either on the segment's own axis or a circular arc
+  tangent to it, so no new angle is ever introduced.
 * **locked copper is refused by name** (`copper_is_locked`) rather than moved.
 """
 import math
 
 from .. import geometry as G
 from ..edit import checks as CHK
+from ..edit import ops as OPS
 from . import rules as R
 from . import tune as T
 from .grid import Grid
@@ -88,6 +92,20 @@ def segments(board, net=None):
     return out
 
 
+def _node_arc_length(node):
+    """Length of one arc node, through its three points when the file kept them.
+
+    A chord polyline is the fallback (an older parse), and it UNDER-measures by
+    the sagitta - which is why it is the fallback and not the rule.
+    """
+    s, m, e = node.get("start"), node.get("mid"), node.get("end")
+    if s and m and e:
+        return OPS.arc_length_mm(_pt(s), _pt(m), _pt(e))
+    pts = node.get("_points") or []
+    return sum(G.dist_point_point(pts[k], pts[k + 1])
+               for k in range(len(pts) - 1))
+
+
 def _arc_count(board, net=None):
     n = 0
     for node in board.tracks:
@@ -98,29 +116,54 @@ def _arc_count(board, net=None):
     return n
 
 
+def _net_lengths(board):
+    """Copper length per net: straight segments AND arcs."""
+    out = {}
+    for seg in segments(board):
+        out[seg["net"]] = out.get(seg["net"], 0.0) + seg["length_mm"]
+    for node in board.tracks:
+        if node.get("_arc"):
+            net = node.get("net")
+            out[net] = out.get(net, 0.0) + _node_arc_length(node)
+    return out
+
+
 def measure(board, nets=None):
     """Track length per net, plus what the number does not include.
 
-    `arcs_not_counted` is per net and travels with the length so a reader can see
-    that the number is "tracks only" rather than assume it is all the copper.
+    An arc's length is measured through its three points and IS added to
+    `length_mm` - `arcs_counted` says how many arcs that number includes, so a
+    reader can tell "tracks only" from "all the copper" by looking.
     """
     out = {}
     for seg in segments(board):
         if nets and seg["net"] not in nets:
             continue
         got = out.setdefault(seg["net"], {"length_mm": 0.0, "segments": 0,
-                                          "layers": {}, "locked": 0})
+                                          "layers": {}, "locked": 0, "arcs": 0})
         got["length_mm"] += seg["length_mm"]
         got["segments"] += 1
         got["layers"][seg["layer"]] = got["layers"].get(seg["layer"], 0) + 1
         got["locked"] += 1 if seg["locked"] else 0
+    for node in board.tracks:
+        if not node.get("_arc"):
+            continue
+        net = node.get("net")
+        if nets and net not in nets:
+            continue
+        got = out.setdefault(net, {"length_mm": 0.0, "segments": 0,
+                                   "layers": {}, "locked": 0, "arcs": 0})
+        got["length_mm"] += _node_arc_length(node)
+        got["arcs"] += 1
+        got["layers"][node.get("layer")] = got["layers"].get(
+            node.get("layer"), 0) + 1
+        got["locked"] += 1 if node.get("locked") else 0
     for net in list(out):
         out[net]["length_mm"] = round(out[net]["length_mm"], 6)
-        out[net]["arcs_not_counted"] = _arc_count(board, net)
+        out[net]["arcs_counted"] = out[net].pop("arcs")
         out[net]["vias_not_counted"] = sum(1 for v in board.vias
                                            if v.get("net") == net)
     return out
-
 
 def _angle_deg(a, b):
     return math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 180.0
@@ -261,14 +304,261 @@ def _floor_hits(grid, net, seg, pts):
                 break
     return out
 
+
+# ---------------------------------------------------------------- arc meander
+# A 45-degree tooth is a chamfer: the user rejected it on sight ("应该是圆弧蛇形
+# 线不是这样的三角线"). An arc meander is the same length added, drawn as a
+# rounded square wave: straight along the axis, a 90-degree arc of radius r, a
+# straight run of height h across, a 90-degree arc back, and so on. Every turn is
+# tangent-continuous (no kinks), it stays on ONE side of the axis (a tight bundle
+# still has room on the other side), and its length is closed-form:
+#
+#   added per tooth = h + r * (pi - 2)
+#
+# so the number the tool reports is the number the file carries - not a sampled
+# approximation of it.
+# The ladder runs from the widest radius that still fits down to the smallest
+# one that keeps a bump visible: a 3 mm correction on a 10 mm run wants a
+# large radius (few teeth), a 0.3 mm correction on a 1.3 mm run only fits a
+# small one - and without the small ones the short segments would all answer
+# "does_not_fit", which would be a limit of the ladder, not of the copper.
+ARC_R_LADDER = (0.35, 0.30, 0.25, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06)
+ARC_H_MIN = 0.05
+ARC_RUN_MIN = 0.10
+# Where inside the segment's spare room the wave may sit, as a fraction of that
+# room: centred first (0.0), then either end. A bundle rarely blocks symmetrically.
+ARC_SHIFTS = (0.0, 0.5, -0.5, 0.25, -0.25)
+# A rounded wave has a floor on how little it can add (a bump is never free), and
+# its blocker set is not monotone in the added length: a 0.35 mm wave can be
+# refused where a 0.30 mm one fits. So the deficit is tried at these fractions of
+# the room available - a smaller wave is still progress, and the caller's loop
+# asks for the rest afterwards instead of being told "cannot".
+ARC_EXTRA_FACTORS = (1.0, 0.85, 0.7, 0.55, 0.4, 0.28, 0.18)
+ARC_EXTRA_MIN_MM = 0.10
+
+def arc_meander(seg, extra_mm, amp_max, side=1, r_ladder=None, shift=0.0):
+    """Pieces of a ROUNDED meander that adds `extra_mm` to `seg`.
+
+    Returns {"pieces": [("line", a, b) | ("arc", s, m, e)], ...} or None when no
+    (r, teeth) choice both fits the segment and stays under `amp_max`. `side` is
+    +1 / -1: the whole wave lives on that side of the axis, so the other side is
+    untouched. `shift` in [-0.5, 0.5] slides the wave inside the room it has
+    (0 = centred): a wave that is refused at one end of a bundle is often legal a
+    little further along, and the two end points do not move either way.
+
+    The shape is a rounded square wave. Per tooth: a straight run along the axis,
+    a 90-degree arc of radius r, a straight climb h, a 90-degree arc back to the
+    axis direction. Both arcs are tangent to what they join, so there is no kink
+    anywhere, and every piece is a circle or a line - nothing here is an
+    approximation of a curve. Length is closed form, per tooth:
+
+        added = h + r * (pi - 2)
+
+    which is exactly what `measure()` re-reads out of the written file.
+    """
+    L = seg["length_mm"]
+    if extra_mm <= 1e-9 or L <= 0:
+        return None
+    ax, ay = seg["start"]
+    bx, by = seg["end"]
+    ux, uy = (bx - ax) / L, (by - ay) / L
+    nx, ny = -uy * side, ux * side          # one normal, flipped by `side`
+
+    best = None
+    for r in (r_ladder or ARC_R_LADDER):
+        for teeth in range(2, 65, 2):
+            h = extra_mm / teeth - r * (math.pi - 2.0)
+            if h < ARC_H_MIN:
+                continue
+            amp = h + 2.0 * r
+            if amp > amp_max + 1e-9:
+                continue
+            run = L / teeth - 2.0 * r
+            if run < ARC_RUN_MIN:
+                continue
+            if best is None or teeth < best["teeth"]:
+                best = {"r": r, "teeth": teeth, "h": h, "amp": amp, "run": run}
+            break                           # fewest teeth for this radius wins
+        if best is not None:
+            break
+    if best is None:
+        return None
+
+    r, teeth = best["r"], best["teeth"]
+    h, amp, run = best["h"], best["amp"], best["run"]
+    advance = teeth * (run + 2.0 * r)
+    slack = L - advance
+    if slack < -1e-9:
+        return None
+    t0 = slack / 2.0 + float(shift) * slack   # both end points keep their position;
+    if t0 < -1e-9 or t0 + advance > L + 1e-9:  # the wave is the only new copper
+        return None                            # inside the segment's span
+
+    def W(t, y, from_amp=False):
+        """Local (along-axis t, off-axis y) -> world, mirrored for a down tooth."""
+        if from_amp:
+            y = amp - y
+        return (ax + ux * t + nx * y, ay + uy * t + ny * y)
+
+    def near2(v):
+        return (round(v[0], 6), round(v[1], 6))
+
+    d45 = 0.7071067811865476
+    pieces = []
+    if t0 > 1e-6:
+        # The wave does not have to begin at the segment's start, but the copper
+        # does: without this lead-in the net would be open at that end.
+        pieces.append(("line", (round(ax, 6), round(ay, 6)), near2(W(t0, 0.0))))
+    t = t0
+    for k in range(teeth):
+        down = (k % 2 == 1)
+        m = (lambda y: amp - y) if down else (lambda y: y)
+        pieces.append(("line", near2(W(t, m(0.0))), near2(W(t + run, m(0.0)))))
+        pieces.append(("arc", near2(W(t + run, m(0.0))),
+                       near2(W(t + run + r * d45, m(r - r * d45))),
+                       near2(W(t + run + r, m(r)))))
+        pieces.append(("line", near2(W(t + run + r, m(r))),
+                       near2(W(t + run + r, m(r + h)))))
+        pieces.append(("arc", near2(W(t + run + r, m(r + h))),
+                       near2(W(t + run + 2.0 * r - r * d45,
+                              m(r + h + r * d45))),
+                       near2(W(t + run + 2.0 * r, m(h + 2.0 * r)))))
+        t += run + 2.0 * r
+    # `teeth` is always even, so the wave closes back onto the axis exactly; the
+    # last piece carries the path to the segment end - and when the wave already
+    # ended there, it is dropped rather than written as a zero-length track (a
+    # track between two identical points is not copper, it is a refusal).
+    tail_a, tail_b = near2(W(t, 0.0)), (round(bx, 6), round(by, 6))
+    if abs(tail_a[0] - tail_b[0]) > 1e-6 or abs(tail_a[1] - tail_b[1]) > 1e-6:
+        pieces.append(("line", tail_a, tail_b))
+    return {"pieces": pieces, "teeth": teeth, "r": r, "h": h, "amp": amp,
+            "added_mm": round(extra_mm, 6), "advance_mm": round(advance, 4),
+            "start_offset_mm": round(t0, 4), "shift": round(float(shift), 3)}
+
+# A chord stands in for an arc during the blocking check, so the check has to be
+# told how far the chord can be from the copper it replaces: that is the sagitta,
+# and the probe is widened by exactly that much. 0.01 mm is an order of magnitude
+# under the tightest net rule this package will tune (0.1 mm), and the arc's length
+# is never taken from the chords - only its clearance is.
+ARC_CHORD_SAG_MM = 0.01
+
+
+def _arc_geom(s, m, e):
+    """(centre, radius, start_deg, swept_deg) of the circle through three points."""
+    ax, ay = s
+    bx, by = m
+    cx, cy = e
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-12:
+        return None
+    ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay)
+          + (cx * cx + cy * cy) * (ay - by)) / d
+    uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
+          + (cx * cx + cy * cy) * (bx - ax)) / d
+    r = math.hypot(ax - ux, ay - uy)
+    a0 = math.degrees(math.atan2(ay - uy, ax - ux))
+    am = math.degrees(math.atan2(by - uy, bx - ux))
+    a1 = math.degrees(math.atan2(cy - uy, cx - ux))
+
+    def _n(a):
+        while a < 0:
+            a += 360.0
+        while a >= 360.0:
+            a -= 360.0
+        return a
+
+    sweep = _n(a1 - a0)
+    if not (_n(am - a0) <= sweep + 1e-6):
+        sweep -= 360.0                 # the mid point decides which way round
+    return (ux, uy), r, a0, sweep
+
+
+def _arc_chords(s, m, e):
+    """Chord polyline of a 3-point arc, and the sagitta those chords can hide.
+
+    The end points are the caller's exact points (not re-derived), so a chord
+    chain always joins the pieces it sits between.
+    """
+    got = _arc_geom(s, m, e)
+    if got is None:
+        return [(tuple(s), tuple(e))], 0.0
+    (ux, uy), r, a0, sweep = got
+    if r <= 1e-9 or abs(sweep) < 1e-9:
+        return [(tuple(s), tuple(e))], 0.0
+    if ARC_CHORD_SAG_MM >= r:
+        step_max = 90.0
+    else:
+        step_max = math.degrees(2.0 * math.acos(1.0 - ARC_CHORD_SAG_MM / r))
+    n = max(1, int(math.ceil(abs(sweep) / max(step_max, 1.0))))
+    pts = []
+    for k in range(n + 1):
+        ang = math.radians(a0 + (sweep / n) * k)
+        pts.append((round(ux + r * math.cos(ang), 6),
+                    round(uy + r * math.sin(ang), 6)))
+    pts[0] = (round(float(s[0]), 6), round(float(s[1]), 6))
+    pts[-1] = (round(float(e[0]), 6), round(float(e[1]), 6))
+    return [(pts[k], pts[k + 1]) for k in range(n)], ARC_CHORD_SAG_MM
+
+
+def _pieces_probe(pieces, width):
+    """(a, b, probe_width) for every stretch of copper the blockers must see."""
+    for piece in pieces:
+        if piece[0] == "line":
+            yield piece[1], piece[2], width
+        else:
+            chords, sag = _arc_chords(piece[1], piece[2], piece[3])
+            for a, b in chords:
+                yield a, b, width + 2.0 * sag
+
+
+def _pieces_blockers(grid, net, seg, pieces, floor_mm=0.0):
+    """The first blocker of a whole path, or [] - arcs are checked chord by chord."""
+    blocked = []
+    for a, b, w in _pieces_probe(pieces, seg["width"]):
+        hits = grid.seg_blockers(a, b, seg["layer"], net, w, floor_mm=floor_mm)
+        if hits:
+            for h in hits[:1]:
+                h["at"] = [round(a[0], 3), round(a[1], 3)]
+            blocked.extend(hits[:1])
+            break
+    return blocked
+
+
+def _pieces_floor_hits(grid, net, seg, pieces):
+    """Pairs a path brings below the APPLY floor - see `_floor_hits`."""
+    out = []
+    for a, b, w in _pieces_probe(pieces, seg["width"]):
+        for h in grid.seg_blockers(a, b, seg["layer"], net, w,
+                                   floor_mm=FLOOR_MM):
+            if h.get("reason") == "clearance":
+                out.append({"at": [round(a[0], 3), round(a[1], 3)],
+                            "net": h.get("net"), "gap_mm": h.get("actual_mm"),
+                            "needed_mm": h.get("needed_mm")})
+                break
+    return out
+
+
+def _occupy_pieces(grid, net, seg, pieces):
+    """Teach the raster the new copper, so the NEXT candidate sees it."""
+    for a, b, w in _pieces_probe(pieces, seg["width"]):
+        grid.add_track(net, seg["layer"], a, b, w)
+
+
 def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
          amp_ladder=None, max_replacements=24, layers=None, allow_locked=False,
-         floor_mm=0.0):
+         floor_mm=0.0, style="chamfer"):
     """Plan meanders on the board's EXISTING copper.
 
-    Returns ops in the standard shape (delete_track + add_track), so the caller
-    feeds them to `edit.propose` + `edit.apply_plan` and every gate runs on them.
+    Returns ops in the standard shape (delete_track + add_track [+ add_track_arc]),
+    so the caller feeds them to `edit.propose` + `edit.apply_plan` and every gate
+    runs on them.
+
+    `style` picks the shape: "chamfer" (the 45-degree tooth, default) or "arc"
+    (a rounded meander - 90-degree arcs tangent to the axis, no kink anywhere).
     """
+    if style not in ("chamfer", "arc"):
+        raise TuneError("style must be 'chamfer' or 'arc', got %r" % (style,),
+                        "ARG_INVALID")
     segs = segments(board)
     if not segs:
         raise TuneError("the board carries no track segments, so there is nothing "
@@ -283,8 +573,10 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
     inventory = {}
     for s in segs:
         inventory.setdefault(s["net"], []).append(s)
-    lengths = dict((k, sum(s["length_mm"] for s in v))
-                   for k, v in inventory.items())
+    # Lengths come from `_net_lengths`, not from the segment inventory: an arc
+    # already in the file is real copper and has to be in the number this tool
+    # compares, or every group would look short by however much arced.
+    lengths = _net_lengths(board)
 
     groups_n = _norm_groups(board, groups if groups is not None
                             else ddr_groups(board))
@@ -326,6 +618,8 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                 refusal = None
                 for seg in sorted(inventory.get(net) or [],
                                   key=lambda s: -s["length_mm"]):
+                    if seg.get("_arc"):
+                        continue     # an arc is a shape; only straight copper is cut
                     if seg["locked"] and not allow_locked:
                         refusal = refusal or {"reason": "copper_is_locked",
                                               "uuid": seg["uuid"],
@@ -343,67 +637,133 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                         T.AMP_FLOOR_MM, T.AMP_FACTOR * seg["width"])
                     cands = [base] + [a for a in ladder if a < base - 1e-9]
                     for amp in cands:
-                        extra = min(deficit, T.max_extra(seg["length_mm"], amp))
+                        # `T.max_extra` is the CHAMFER's capacity (a tooth spends
+                        # 2 mm of run per mm of amplitude). An arc tooth spends
+                        # `run + 2r` instead, so capping the arc branch with that
+                        # formula would silently shrink every candidate on the
+                        # short segments - `arc_meander` already refuses what does
+                        # not fit, so the arc branch asks for the whole deficit.
+                        extra = (deficit if style == "arc"
+                                 else min(deficit,
+                                          T.max_extra(seg["length_mm"], amp)))
                         if extra <= 1e-6:
                             continue
                         for side in (1, -1):
-                            pts, blocked = _insert_meander(grid, net, seg,
-                                                           extra, amp, side,
-                                                           floor_mm=floor_mm)
-                            if pts is None:
-                                # "too short for a tooth" is an answer: without it
-                                # the group would report not_matched and no reason,
-                                # which reads identically to a blocker.
-                                refusal = refusal or {
-                                    "reason": "does_not_fit",
-                                    "amplitude_mm": round(amp, 4),
-                                    "uuid": seg["uuid"]}
-                                continue
-                            if blocked:
-                                refusal = refusal or dict(blocked[0],
-                                                          uuid=seg["uuid"])
-                                continue
-                            # Accepted: the segment becomes this polyline.
-                            hits = _floor_hits(grid, net, seg, pts)
+                            if style == "arc":
+                                got = None
+                                for factor in ARC_EXTRA_FACTORS:
+                                    step = extra * factor
+                                    if step < ARC_EXTRA_MIN_MM:
+                                        continue
+                                    for shift in ARC_SHIFTS:
+                                        cand = arc_meander(seg, step, amp, side,
+                                                           shift=shift)
+                                        if cand is None:
+                                            continue
+                                        blocked = _pieces_blockers(
+                                            grid, net, seg, cand["pieces"],
+                                            floor_mm=floor_mm)
+                                        if blocked:
+                                            refusal = refusal or dict(
+                                                blocked[0], uuid=seg["uuid"])
+                                            continue
+                                        got = cand
+                                        break
+                                    if got is not None:
+                                        break
+                                if got is None:
+                                    refusal = refusal or {
+                                        "reason": "does_not_fit",
+                                        "style": "arc",
+                                        "amplitude_mm": round(amp, 4),
+                                        "uuid": seg["uuid"]}
+                                    continue
+                                pieces = got["pieces"]
+                                hits = _pieces_floor_hits(grid, net, seg, pieces)
+                            else:
+                                pts, blocked = _insert_meander(
+                                    grid, net, seg, extra, amp, side,
+                                    floor_mm=floor_mm)
+                                if pts is None:
+                                    # "too short for a tooth" is an answer: without
+                                    # it the group reports not_matched and no reason,
+                                    # which reads identically to a blocker.
+                                    refusal = refusal or {
+                                        "reason": "does_not_fit",
+                                        "amplitude_mm": round(amp, 4),
+                                        "uuid": seg["uuid"]}
+                                    continue
+                                if blocked:
+                                    refusal = refusal or dict(blocked[0],
+                                                              uuid=seg["uuid"])
+                                    continue
+                                pieces = [("line", pts[k], pts[k + 1])
+                                          for k in range(len(pts) - 1)]
+                                hits = _floor_hits(grid, net, seg, pts)
+                            # Accepted: the segment becomes this path. A line piece
+                            # is a track, an arc piece is a copper arc; each carries
+                            # the length it actually has, and both are measured the
+                            # same way afterwards.
                             for h in hits:
                                 floor_pairs.append(dict(h, net=net,
-                                                        uuid=seg["uuid"]))
+                                                       uuid=seg["uuid"]))
                             entry["below_apply_floor"] = (
-                                int(entry.get("below_apply_floor") or 0) + len(hits))
+                                int(entry.get("below_apply_floor") or 0)
+                                + len(hits))
                             inventory[net].remove(seg)
                             new_ops = []
-                            for k in range(len(pts) - 1):
-                                a, b = pts[k], pts[k + 1]
-                                grid.add_track(net, seg["layer"], a, b,
-                                               seg["width"])
-                                inv = {"uuid": None, "net": net,
-                                       "layer": seg["layer"],
-                                       "width": seg["width"], "start": a,
-                                       "end": b,
-                                       "locked": False,
-                                       "length_mm": G.dist_point_point(a, b)}
+                            inv_added = []
+                            for piece in pieces:
+                                if piece[0] == "line":
+                                    a, b = piece[1], piece[2]
+                                    grid.add_track(net, seg["layer"], a, b,
+                                                   seg["width"])
+                                    length = G.dist_point_point(a, b)
+                                    new_ops.append({
+                                        "op": "add_track",
+                                        "x1": round(a[0], 6), "y1": round(a[1], 6),
+                                        "x2": round(b[0], 6), "y2": round(b[1], 6),
+                                        "width": seg["width"],
+                                        "layer": seg["layer"], "net": net})
+                                    inv = {"_arc": False}
+                                else:
+                                    a, m, b = piece[1], piece[2], piece[3]
+                                    _occupy_pieces(grid, net, seg, [piece])
+                                    length = OPS.arc_length_mm(a, m, b)
+                                    new_ops.append({
+                                        "op": "add_track_arc",
+                                        "x1": round(a[0], 6), "y1": round(a[1], 6),
+                                        "mx": round(m[0], 6), "my": round(m[1], 6),
+                                        "x2": round(b[0], 6), "y2": round(b[1], 6),
+                                        "width": seg["width"],
+                                        "layer": seg["layer"], "net": net})
+                                    inv = {"_arc": True}
+                                inv.update({"uuid": None, "net": net,
+                                            "layer": seg["layer"],
+                                            "width": seg["width"],
+                                            "start": piece[1], "end": piece[-1],
+                                            "locked": False,
+                                            "length_mm": length})
                                 inventory[net].append(inv)
-                                new_ops.append({
-                                    "op": "add_track",
-                                    "x1": round(a[0], 6), "y1": round(a[1], 6),
-                                    "x2": round(b[0], 6), "y2": round(b[1], 6),
-                                    "width": seg["width"], "layer": seg["layer"],
-                                    "net": net})
+                                inv_added.append(inv)
                             ops.append({"op": "delete_track",
                                         "uuid": seg["uuid"]})
                             ops.extend(new_ops)
-                            gained = sum(o["length_mm"] for o in inventory[net]
-                                         [-len(new_ops):]) - seg["length_mm"]
+                            gained = (sum(i["length_mm"] for i in inv_added)
+                                      - seg["length_mm"])
                             lengths[net] += gained
                             deficit = ref - lengths[net]
                             entry["meanders"] += 1
                             entry["last"] = {
                                 "segment_mm": round(seg["length_mm"], 3),
+                                "style": style,
                                 "amplitude_mm": amp,
                                 "added_mm": round(gained, 4),
-                                "pieces": len(new_ops)}
+                                "pieces": len(new_ops),
+                                "arcs": sum(1 for q in pieces if q[0] == "arc")}
                             made = True
                             break
+
                         if made:
                             break
                     if made:
@@ -416,7 +776,7 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                     break
             entry["after_mm"] = round(lengths[net], 6)
             entry["achieved_skew_mm"] = round(abs(lengths[net] - ref), 6)
-            entry["arcs_not_counted"] = _arc_count(board, net)
+            entry["arcs_counted"] = _arc_count(board, net)
             per_net.append(entry)
         after_skew = max(e["achieved_skew_mm"] for e in per_net)
         reports.append({
@@ -455,8 +815,13 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
         "assumptions": {
             "vias_are_not_length": "tracks only on both sides of the comparison; "
                                    "vias are counted per net and NOT added",
-            "arcs_not_tuned": "a track arc is a shape, not a segment; each net "
-                              "carries arcs_not_counted",
+            "arcs_are_length": "a track arc's length is measured through its three "
+                               "points and IS in length_mm; arcs_counted says how "
+                               "many arcs each number includes",
+            "arc_clearance": "an arc is checked chord by chord with the probe "
+                             "widened by the chord sagitta (%.2f mm), so a chord can "
+                             "never read farther from a neighbour than the arc it "
+                             "stands for" % ARC_CHORD_SAG_MM,
             "meander_adds_only": "the reference of a group is its longest member "
                                  "(or target_mm); a too-long net is `needs_reroute`",
             "angles": "only segments on the 0/45/90/135 grid are meandered, so "

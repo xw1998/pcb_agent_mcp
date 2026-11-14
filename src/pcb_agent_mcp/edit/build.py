@@ -169,6 +169,22 @@ def segment(x1, y1, x2, y2, width, layer, net_code, sp, uid):
              L(A("net"), A(str(net_code))),
              sp.id_node(uid))
 
+def track_arc(sx, sy, mx, my, ex, ey, width, layer, net_code, sp, uid):
+    """A copper arc: same three points as `gr_arc`, plus the net.
+
+    `arc3` is outline geometry and carries no net; a copper arc must say
+    which net it belongs to or KiCad reports it as unconnected copper.
+    """
+    return L(
+        A("arc"),
+        L(A("start"), A(num(sx)), A(num(y_file(sy)))),
+        L(A("mid"), A(num(mx)), A(num(y_file(my)))),
+        L(A("end"), A(num(ex)), A(num(y_file(ey)))),
+        L(A("width"), A(num(width))),
+        L(A("layer"), A(layer, True)),
+        L(A("net"), A(str(net_code))),
+        sp.id_node(uid))
+
 def via(x, y_up, dia, drill, net_code, sp, uid, layers=("F.Cu", "B.Cu")):
     return L(A("via"), at(x, y_up),
              L(A("size"), A(num(dia))), L(A("drill"), A(num(drill))),

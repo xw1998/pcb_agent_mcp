@@ -19,6 +19,7 @@ the file is refused (a typo'd layer name silently creates a drawing on nothing).
 """
 import hashlib
 import inspect as _inspect
+import math
 import os
 
 from ..fidelity import sexpr as S
@@ -1570,6 +1571,87 @@ op("add_track", {"copper"},
    {"x1": "mm", "y1": "mm", "x2": "mm", "y2": "mm", "width": "mm",
     "layer": "copper layer", "net": "net name", "create_net": "bool"},
    _run_add_track, _verify_add_track)
+
+def _run_add_track_arc(ed, o, seed):
+    layer = _layer(o, ed)
+    if not layer.endswith(".Cu"):
+        raise OpError("%r is not a copper layer" % layer, "LAYER_NOT_ALLOWED")
+    net = _str(o, "net")
+    code = ed.net_code(net, allow_create=_bool(o, "create_net", False))
+    w = _width(o, ed, default=0.25)
+    sx, sy = _num(o, "x1"), _num(o, "y1")
+    mx, my = _num(o, "mx"), _num(o, "my")
+    ex, ey = _num(o, "x2"), _num(o, "y2")
+    # Three collinear points are not an arc: KiCad would have to invent a radius
+    # of infinity, and the file would be unreadable by pcbnew. That is checked
+    # here rather than at read time because the file must never be written wrong.
+    cross = ((mx - sx) * (ey - sy) - (my - sy) * (ex - sx))
+    if abs(cross) < 1e-9:
+        raise OpError("an arc needs a mid point OFF the chord; these three points "
+                      "are collinear (cross=%r)" % (cross,), "ARG_INVALID")
+    if abs(sx - ex) < 1e-9 and abs(sy - ey) < 1e-9:
+        raise OpError("an arc needs two distinct end points", "ARG_INVALID")
+    ed.append(B.track_arc(sx, sy, mx, my, ex, ey, w, layer, code, ed.sp,
+                          B.new_id(seed)))
+    length = arc_length_mm((sx, sy), (mx, my), (ex, ey))
+    return {"nodes_added": 1, "net": net, "net_code": code, "width": w,
+            "length_mm": round(length, 6)}
+
+def arc_length_mm(s, m, e):
+    """Length along the arc through three points.
+
+    The radius comes from the circle through them; the swept angle is measured
+    from the centre and clamped to (0, 2*pi). A file arc that spans nearly the
+    whole circle is legal, so "the bigger angle" is the one to keep when the mid
+    point sits past the half-way mark - choosing the minor arc there would report
+    a 340-degree arc as 20 degrees.
+    """
+    ax, ay = s
+    bx, by = m
+    cx, cy = e
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-12:
+        return ((cx - ax) ** 2 + (cy - ay) ** 2) ** 0.5
+    ux = ((ax ** 2 + ay ** 2) * (by - cy) + (bx ** 2 + by ** 2) * (cy - ay)
+          + (cx ** 2 + cy ** 2) * (ay - by)) / d
+    uy = ((ax ** 2 + ay ** 2) * (cx - bx) + (bx ** 2 + by ** 2) * (ax - cx)
+          + (cx ** 2 + cy ** 2) * (bx - ax)) / d
+    r = ((ax - ux) ** 2 + (ay - uy) ** 2) ** 0.5
+    a0 = math.atan2(ay - uy, ax - ux)
+    a1 = math.atan2(by - uy, bx - ux)
+    a2 = math.atan2(cy - uy, cx - ux)
+    two = 2.0 * math.pi
+    sweep = (a2 - a0) % two
+    mid = (a1 - a0) % two
+    if mid > sweep:                 # the mid point lies on the long way round
+        sweep = two - sweep
+    return r * sweep
+
+def _verify_add_track_arc(ed, o):
+    layer = _str(o, "layer")
+    code = ed.net_by_name.get(_str(o, "net"))
+    sx, sy = _num(o, "x1"), _num(o, "y1")
+    for node in ed.items("arc"):
+        if S.arg_text(S.child(node, "layer"), 1) != layer:
+            continue
+        if S.arg_text(S.child(node, "net"), 1) != code:
+            continue
+        st = S.child(node, "start")
+        if st is None:
+            continue
+        if (abs(S.arg_num(st, 1, 0) - sx) < 1e-4 and
+                abs(-S.arg_num(st, 2, 0) - sy) < 1e-4):
+            return {"ok": True, "net_code": code}
+    return {"ok": False}
+
+op("add_track_arc", {"copper"},
+   "Add one COPPER arc (a rounded meander piece) on a copper layer: start, a "
+   "mid point that must sit off the chord, end. Same net rules as add_track. "
+   "Length is the swept arc length, reported so a caller never has to guess.",
+   {"x1": "mm", "y1": "mm", "mx": "mm", "my": "mm", "x2": "mm", "y2": "mm",
+    "width": "mm", "layer": "copper layer", "net": "net name",
+    "create_net": "bool"},
+   _run_add_track_arc, _verify_add_track_arc)
 
 def _select_tracks(ed, o):
     uid = o.get("uuid")

@@ -4808,7 +4808,8 @@ def _tune_length(board, args):
         res = TB.plan(board, groups, _rrules.resolve(board), keepout_rects=keep,
                       pitch_mm=float(args.get("pitch_mm") or 0.1),
                       max_replacements=int(args.get("max_replacements") or 24),
-                      allow_locked=args.get("allow_locked") is True)
+                      allow_locked=args.get("allow_locked") is True,
+                      style=str(args.get("style") or "chamfer"))
     except ValueError as exc:
         return err(str(exc), "ARG_INVALID")
     except TB.TuneError as exc:
@@ -4822,9 +4823,13 @@ def _tune_length(board, args):
                     "ops_preview": res["ops"][:6]},
              unit="mm/groups",
              model="board_length_tuning",
-             basis="the FIXED 45-degree tooth of route.tune._serpentine applied to "
-                   "the board's existing straight segments; every new segment "
-                   "checked by the same exact polygon test board_route uses",
+             basis=("the 45-degree tooth of route.tune._serpentine (style=chamfer) "
+                    "or a rounded 90-degree-arc meander (style=arc: straight run, "
+                    "arc of radius r, climb h, arc back - tangent continuous, "
+                    "closed-form length h+r*(pi-2) per tooth) applied to the "
+                    "board's existing straight segments; every new piece checked "
+                    "by the same exact polygon test board_route uses, arcs chord by "
+                    "chord with the probe widened by the chord sagitta"),
              precision="matched means the measured track skew landed inside tol; it "
                        "does NOT mean the vendor DRC agrees - run board_drc after "
                        "writing, and the silent-rule keep-out rectangles travelled "
@@ -4897,7 +4902,9 @@ def _tune_length(board, args):
 _tool(
     "board_tune_length",
     "Length-match nets on copper that is ALREADY routed: the short member of each "
-    "group gets a 45-degree serpentine cut into one of its own straight segments "
+    "group gets a serpentine cut into one of its own straight segments - "
+    "style=chamfer draws the 45-degree tooth, style=arc draws a rounded meander "
+    "(90-degree arcs tangent to the axis, length h+r*(pi-2) per tooth) "
     "(same two end points, so the net stays connected), and every new segment is "
     "checked against the whole board - other nets' clearance, the rule-derived "
     "keep-out rectangles, the board edge - before it becomes an op. board_route can "
@@ -4909,8 +4916,9 @@ _tool(
     "whose reference cannot be reached comes back as status length_not_matched with "
     "the length it did reach and, per net, which segment refused and why "
     "(blocked / does_not_fit / not_on_45_grid / copper_is_locked / "
-    "replacement_budget). Vias are counted but NEVER added to length, arcs are "
-    "reported as arcs_not_counted rather than tuned, and a meander only adds copper "
+    "replacement_budget). Vias are counted but NEVER added to length; an arc's "
+    "length IS counted (through its three points, not from chords) and "
+    "arcs_counted says how many, and a meander only adds copper "
     "- a net that is too long is `needs_reroute`, not shortened. Plan by default; "
     "apply=true writes through board_propose + board_apply.",
     {"type": "object",
@@ -4931,6 +4939,9 @@ _tool(
                         "reference_net": _str("net that also sets the reference "
                                               "length (the clock, typically)"),
                     }, **{"required": ["nets"]})}},
+         "style": _str("meander shape: chamfer = 45-degree tooth (default), arc = "
+                       "rounded meander of tangent 90-degree arcs", ["chamfer", "arc"],
+                       "chamfer"),
          "pitch_mm": _num("search raster for the blocking check", 0.1),
          "max_replacements": _num("segments one net may have replaced", 24),
          "keepout_grow_mm": _num("rule rectangles grow past the pad hull by this", 0.1),

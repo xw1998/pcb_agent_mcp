@@ -3,8 +3,9 @@
 The tool's value is not "it made a squiggle". It is four claims, each of which can
 be false while the output still looks right:
 
-* the length it reports is the length of the TRACKS it wrote (vias are counted and
-  NOT added, arcs are reported and NOT tuned);
+* the length it reports is the length of the COPPER it wrote (vias are counted and
+  NOT added; an arc's length IS counted, through its three points rather than from
+  a chord polyline);
 * every new segment went through the same exact polygon test the router uses -
   and the rule-derived rectangles travelled into that test, not just into the
   audit;
@@ -79,13 +80,25 @@ class TestWhatTheMeasurementIncludes(_Board):
         self.assertAlmostEqual(m["length_mm"], 10.0, places=6)
         self.assertEqual(m["vias_not_counted"], 1)
 
-    def test_arcs_are_reported_not_counted(self):
-        # A board with no arc says so with a zero; the field exists per net
-        # because a length that skipped an arc has to be readable as such.
+    def test_a_net_with_no_arc_says_so(self):
+        # The field travels with the length, so "arcs_counted: 0" and a number
+        # that skipped arcs cannot be confused for each other.
         self.write(self.track("A", (5.0, 5.0), (15.0, 5.0)))
         m = TB.measure(self.reload())["A"]
-        self.assertEqual(m["arcs_not_counted"], 0)
+        self.assertEqual(m["arcs_counted"], 0)
         self.assertEqual(m["segments"], 1)
+
+    def test_a_written_arc_has_its_length_counted_not_chorded(self):
+        # A half circle of radius 1 is pi mm of copper; the chord polyline of it
+        # (three points on a 1 um sagitta) is 0.02% short, and that difference is
+        # what tells "measured through the arc" from "measured along chords".
+        self.write(self.track("A", (5.0, 5.0), (7.0, 5.0)))
+        self.write({"op": "add_track_arc", "x1": 5.0, "y1": 5.0, "mx": 6.0,
+                    "my": 6.0, "x2": 7.0, "y2": 5.0, "width": 0.25,
+                    "layer": "F.Cu", "net": "A"})
+        m = TB.measure(self.reload())["A"]
+        self.assertEqual(m["arcs_counted"], 1)
+        self.assertAlmostEqual(m["length_mm"], math.pi + 2.0, places=5)
 
 
 class TestTheSerpentineLands(_Board):
@@ -284,6 +297,124 @@ class TestTheApplyFloor(_Board):
         self.assertEqual(out["status"], "ok", out.get("message"))
         self.assertIn("allow_new_violations", out["next_step"])
         self.assertEqual(os.stat(self.path).st_mtime, before)
+
+class TestArcMeander(_Board):
+    """The rounded meander, and the four things it must be at once.
+
+    The user rejected the 45-degree tooth on sight: "这个等长线画的不对，应该是圆弧
+    蛇形线不是这样的三角线". So an arc meander has to be (a) the same length added,
+    reported in closed form rather than sampled, (b) tangent at EVERY joint - no
+    kink anywhere, (c) on one side of the axis only, and (d) refused by name when
+    it cannot fit. Each of those has a failing twin below.
+    """
+
+    SEG = {"start": (5.0, 8.0), "end": (13.0, 8.0), "length_mm": 8.0,
+           "width": 0.25, "net": "SHORT", "layer": "F.Cu", "locked": False}
+
+    def _tangent(self, piece, at_end):
+        if piece[0] == "line":
+            a, b = piece[1], piece[2]
+            d = (b[0] - a[0], b[1] - a[1])
+        else:
+            (ux, uy), r, a0, sweep = TB._arc_geom(piece[1], piece[2], piece[3])
+            ang = math.radians(a0 + (sweep if at_end else 0.0))
+            sgn = 1.0 if sweep >= 0 else -1.0
+            d = (-math.sin(ang) * sgn, math.cos(ang) * sgn)
+        n = math.hypot(d[0], d[1])
+        self.assertGreater(n, 1e-9, "a piece with no direction")
+        return (d[0] / n, d[1] / n)
+
+    def _length_of(self, pieces):
+        total = 0.0
+        for piece in pieces:
+            if piece[0] == "line":
+                total += math.hypot(piece[2][0] - piece[1][0],
+                                    piece[2][1] - piece[1][1])
+            else:
+                total += TB.OPS.arc_length_mm(piece[1], piece[2], piece[3])
+        return total
+
+    def test_the_reported_length_is_the_path_not_a_sample_of_it(self):
+        for extra, amp_max in ((0.5, 1.0), (2.0, 1.5), (1.9517, 1.0)):
+            got = TB.arc_meander(self.SEG, extra, amp_max, 1)
+            self.assertIsNotNone(got, "extra=%r amp_max=%r" % (extra, amp_max))
+            self.assertEqual(got["teeth"] % 2, 0,
+                             "an odd tooth count cannot close back onto the axis")
+            self.assertLessEqual(got["amp"], amp_max + 1e-9)
+            self.assertGreaterEqual(got["h"], TB.ARC_H_MIN - 1e-9)
+            self.assertAlmostEqual(self._length_of(got["pieces"]),
+                                   8.0 + extra, places=5)
+
+    def test_every_joint_is_tangent_so_the_copper_has_no_kink(self):
+        for extra, amp_max in ((0.5, 1.0), (2.0, 1.5), (3.0, 2.2)):
+            pieces = TB.arc_meander(self.SEG, extra, amp_max, 1)["pieces"]
+            for k in range(len(pieces) - 1):
+                p, q = pieces[k], pieces[k + 1]
+                a, b = p[-1], q[1]
+                self.assertLessEqual(math.hypot(a[0] - b[0], a[1] - b[1]), 1e-6,
+                                     "piece %d does not join piece %d" % (k, k + 1))
+                t1, t2 = self._tangent(p, True), self._tangent(q, False)
+                self.assertLessEqual(math.hypot(t1[0] - t2[0], t1[1] - t2[1]),
+                                     1e-5, "kink at joint %d" % k)
+                if p[0] == "line":
+                    # Every straight piece is either along the axis (the run) or
+                    # across it (the climb) - the two directions a rounded square
+                    # wave uses. A third direction would be an oblique run, i.e.
+                    # the triangle the user rejected.
+                    self.assertAlmostEqual(
+                        min(abs(_angle(p[1], p[2]) - a)
+                            for a in (0.0, 90.0)), 0.0, places=5)
+
+    def test_the_wave_stays_on_the_side_it_was_asked_for(self):
+        # A tight bundle has room on ONE side of the axis; a wave that leaked
+        # into both would be the shape that gets refused for clearance.
+        def ys(side):
+            out = []
+            for piece in TB.arc_meander(self.SEG, 2.0, 1.5, side)["pieces"]:
+                for pt in piece[1:]:
+                    out.append(pt[1])
+            return out
+        up, down = ys(1), ys(-1)
+        self.assertAlmostEqual(min(up), 8.0, places=6)
+        self.assertGreater(max(up), 9.0)
+        self.assertAlmostEqual(max(down), 8.0, places=6)
+        self.assertLess(min(down), 7.0)
+
+    def test_planning_with_style_arc_writes_arcs_and_still_matches(self):
+        self.write(self.track("LONG", (5.0, 5.0), (15.0, 5.0)),
+                   self.track("SHORT", (5.0, 8.0), (13.0, 8.0)))
+        board = self.reload()
+        res = TB.plan(board, [{"name": "p", "nets": ["LONG", "SHORT"],
+                               "tol_mm": 0.05}], style="arc")
+        self.assertEqual(res["status"], "ok", res["groups"])
+        kinds = [o["op"] for o in res["ops"]]
+        self.assertGreater(kinds.count("add_track_arc"), 2)
+        self.assertEqual(kinds.count("delete_track"), 1)
+        plan = E.propose(self.path, res["ops"])
+        self.assertEqual(plan["blocking"], [], plan["blocking"])
+        E.apply_plan(plan["plan_id"], confirm=True, options={"engine": False})
+        after = TB.measure(self.reload())
+        self.assertGreater(after["SHORT"]["arcs_counted"], 0)
+        # The number the tool reported before the write is the number the file
+        # carries afterwards: 3 um of coordinate rounding, not a tolerance.
+        self.assertAlmostEqual(after["SHORT"]["length_mm"],
+                               after["LONG"]["length_mm"], delta=0.05)
+        last = res["groups"][0]["per_net"][1]["last"]
+        self.assertEqual(last["style"], "arc")
+        self.assertGreater(last["arcs"], 0)
+
+    def test_an_unknown_style_is_refused_by_name(self):
+        with self.assertRaises(TB.TuneError) as ctx:
+            TB.plan(self.board, [{"nets": ["A", "B"]}], style="wave")
+        self.assertEqual(ctx.exception.reason_code, "ARG_INVALID")
+
+    def test_three_collinear_points_are_not_an_arc(self):
+        self.write(self.track("A", (5.0, 5.0), (15.0, 5.0)))
+        with self.assertRaises(E.OpError) as ctx:
+            E.propose(self.path, [{"op": "add_track_arc", "x1": 5.0, "y1": 9.0,
+                                   "mx": 6.0, "my": 9.0, "x2": 7.0, "y2": 9.0,
+                                   "width": 0.25, "layer": "F.Cu", "net": "A"}])
+        self.assertEqual(ctx.exception.reason_code, "ARG_INVALID")
 
 FOUR = {"width_mm": 40, "height_mm": 24, "copper_layers": 4, "engine": False,
         "title": "tune4"}

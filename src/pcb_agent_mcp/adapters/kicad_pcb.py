@@ -1416,6 +1416,10 @@ def parse_board_text(text, path="<memory>", project_path=None):
                 "layer": atom(child(arc, "layer"), 1),
                 "width": num(child(arc, "width"), 1, 0.0),
                 "start": list(pts[0]), "end": list(pts[-1]),
+                # The mid point is kept so the arc's LENGTH can be measured
+                # through the three points instead of summed from chords
+                # (a chord polyline under-measures an arc by its sagitta).
+                "mid": list(xy(m)) if m else None,
                 "locked": child(arc, "locked") is not None,
                 "_arc": True,
                 "_points": [list(p) for p in pts],
