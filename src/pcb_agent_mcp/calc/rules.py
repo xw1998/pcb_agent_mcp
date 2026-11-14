@@ -192,7 +192,7 @@ LAYOUT_RULES = [
        "impedance", "High", "has_right_angle_bend_on_rf", "bool", "bool_false", False,
        "look at the routed RF nets' vertices; a right angle is a lumped "
        "capacitance and an etch trap",
-       "L0", "rf-circuit-design 3.4 (45 度/圆弧)",
+       "L0", "ROHM DC/DC layout (拐角布线不要设计为直角，设计为45°或圆弧状); this project forbids arcs, so 45 only [1 source + user rule]",
        "a right angle is a small shunt capacitance at the corner plus a place "
        "the etchant undercuts"),
     _r("layout.rf_bend_radius", "bends on RF lines keep radius >= 3 line widths",
@@ -269,7 +269,7 @@ LAYOUT_RULES = [
        "board_components and board_nets: every track whose centreline (grown by "
        "half its width) meets a magnetic part's pad hull, on the part's own "
        "side and on the one copper layer next to it",
-       "L0", "kicad-free (电感/磁珠下方禁走线); 电源完整性常识",
+       "L0", "ADI RAQ#164 (no sensitive control traces under an inductor, internal layers or backside); NEXTPCB inductor-placement; ROHM DC/DC layout (电感正下方禁布线) [3 sources agree]",
        "a switching inductor is a field source sitting on a small closed loop: "
        "copper under it is a shorted turn that heats the part and couples the "
        "ripple into every track that crosses it, and a bead is the same "
@@ -280,7 +280,7 @@ LAYOUT_RULES = [
        False,
        "board_nets whose copper edge meets a magnetic pad hull but whose axis "
        "stays outside it",
-       "L3", "kicad-free (电感下方禁走线, 几何口径)",
+       "L3", "derived: the same three sources state the body is off-limits, so the corner of a rectangular pad hull is not a place to aim at either [3 sources]",
        "the hull is a rectangle over the pads, so its corners are empty space; "
        "a diagonal track clipping such a corner is 0.1 mm from real copper. "
        "Measuring the edge here keeps the P1 crossing number honest instead of "
@@ -291,7 +291,7 @@ LAYOUT_RULES = [
        False,
        "board_nets and board_vias on every copper layer below the one next to "
        "the part",
-       "L1", "kicad-free (电感下方禁走线, 层间耦合)",
+       "L1", "ADI RAQ#164 + ROHM (any layer incl. backside) vs NEXTPCB (backside allowed over a solid GND) - conflict recorded, this repo takes the strict reading",
        "the field is shielded by the plane underneath, not absent: copper two "
        "or three layers down still sees the fringe. It is a placement cost, so "
        "it is graded P2 and reported separately from the crossing on the part's "
@@ -300,7 +300,7 @@ LAYOUT_RULES = [
        "no via sits under an inductor or ferrite bead",
        "isolation", "High", "via_under_magnetic", "bool", "bool_false", False,
        "board_vias whose centre lies inside a magnetic part's pad hull",
-       "L0", "kicad-free (电感下方禁过孔)",
+       "L0", "ADI RAQ#164 (a solid ground plane even under the coil); NEXTPCB (solid, unbroken ground plane) - a via breaks it, so this is derived not quoted",
        "a via in the middle of the inductor's loop punches the plane the field "
        "is trying to stay out of, and the switch node's return current then "
        "has a path straight through the part"),
@@ -310,7 +310,7 @@ LAYOUT_RULES = [
        False,
        "board_nets on every copper layer other than the crystal's own side, "
        "inside the crystal body",
-       "L0", "kicad-free (晶振下方禁走线, 含层间耦合)",
+       "L0", "GENUWAY (keep the area under the crystal well-grounded; keep clock/switching lines away) - the inner-layer extension is inferred, hence P2 not P1",
        "the oscillator node is high impedance and the coupling that gets "
        "forgotten is the one through the laminate: a track two layers down "
        "still pulls the frequency, and it is invisible to a check that only "

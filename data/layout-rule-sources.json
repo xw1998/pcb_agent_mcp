@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "description": "布局规则的逐字外部出处台账。只有在本文件 entries 里出现、且带 quote 的 rule_id 才算「有出处」；未出现在此文件的规则在 docs/155 中一律记为 uncited，不得声称有文献依据。",
+  "why_this_file_exists": "0.1.17 之前 calc/rules.py 里布局规则的 source 字段写的是本仓库自带技能名（kicad-free / rf-circuit-design），不是外部文献。结果「电感本体下方不能走线」这类常识没有任何可核对的出处，也就没有被当成 P1。此文件是补这个缺口的第一批：只登记真正抓到了原文的规则。",
+  "sources": {
+    "S_ADI": {
+      "tier": "T1",
+      "title": "Analog Dialogue RAQ Issue #164: How to Select Inductors and Capacitors for DC/DC Switching Regulators (Frederik Dostal)",
+      "url": "https://www.analog.com/en/resources/analog-dialogue/raqs/raq-issue-164.html",
+      "fetched_at": "2026-11-14",
+      "kind": "vendor_app_note"
+    },
+    "S_NEXTPCB": {
+      "tier": "T2",
+      "title": "Inductor Placement and PCB Design Rules (NEXTPCB technical blog)",
+      "url": "https://www.nextpcb.com/blog/inductor-placement-pcb-design-rules",
+      "fetched_at": "2026-11-14",
+      "kind": "fab_house_guideline"
+    },
+    "S_ROHM": {
+      "tier": "T1",
+      "title": "ROHM 降压型DC/DC转换器 电路板布局基础与案例（中译）",
+      "url": "https://m.elecfans.com/article/7114464.html",
+      "fetched_at": "2026-11-14",
+      "kind": "vendor_app_note"
+    },
+    "S_GENUWAY": {
+      "tier": "T2",
+      "title": "晶诺威科技：晶振在PCB布局中的走线与接地要求",
+      "url": "https://www.genuway.com/8085.html",
+      "fetched_at": "2026-11-14",
+      "kind": "component_vendor_guideline"
+    }
+  },
+  "entries": [
+    {
+      "rule_id": "layout.magnetic_keepout",
+      "rule_level": "L0",
+      "severity": "High",
+      "level_note": "P1 功能不可靠档：本板同层 + 相邻层穿越磁器件本体",
+      "agreement": "three_independent_sources_agree",
+      "quotes": [
+        {
+          "src": "S_ADI",
+          "quote": "No sensitive control traces should be routed under an inductor, neither right on the PCB surface nor below, in internal layers, or on the backside of the PCB."
+        },
+        {
+          "src": "S_NEXTPCB",
+          "quote": "Do not route any signal traces directly underneath a power inductor on the top layer or the immediate inner layers."
+        },
+        {
+          "src": "S_ROHM",
+          "quote": "电感的正下方不可配置GND或其他布线(图26)。…非GND的信号线也有因涡电流使开关噪声传递给信号的可能性，因此应避免电感正下方的布线。不得不布信号线时，请使用漏磁较少的闭磁路电感。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "三个来源对「同层与相邻层不许布线」没有任何分歧，因此这条给 P1 是文献支撑的，不是我的直觉。",
+      "read_on_this_board": "17 段命中，其中只有 8 段轴线真正进本体（≥0.3 mm），另 9 段是矩形 pad hull 四角无铜导致的 0.03-0.11 mm 擦角，已单列 P3 不混计。"
+    },
+    {
+      "rule_id": "layout.magnetic_keepout_deep",
+      "rule_level": "L1",
+      "severity": "Low",
+      "level_note": "P2 余量档：磁器件本体下方再往下的铜层",
+      "agreement": "sources_conflict_resolved_从严",
+      "quotes": [
+        {
+          "src": "S_ADI",
+          "quote": "No sensitive control traces should be routed under an inductor, neither right on the PCB surface nor below, in internal layers, or on the backside of the PCB."
+        },
+        {
+          "src": "S_ROHM",
+          "quote": "电感的正下方不可配置GND或其他布线(图26)。"
+        },
+        {
+          "src": "S_NEXTPCB",
+          "quote": "If you must route under an inductor due to severe space constraints, do it on the bottom layer of a multi-layer board, ensuring a solid ground plane exists between the inductor and the signal traces."
+        }
+      ],
+      "conflict_note": "真冲突，必须如实记录：ADI 与 ROHM 都要求任何层（含内层与背面）都不许布信号线；NEXTPCB 允许在背面布线，前提是电感与信号线之间有一整片实心 GND。本仓库取从严（按 ADI/ROHM），因此本板深层 139 段仍计为未达标；不因为 NEXTPCB 一句「背面可以」就把 139 段清零。取从严的理由是：NEXTPCB 的豁免条件（实心 GND 完整隔开）在本板 In4 上无法逐段证明，而在无法证明时按「宁可报错不给错答案」应保守。",
+      "why_severity": "字段是 field，不是 current；铜层越深仍受边缘场照到，但已经不是「必然功能性失效」，故降为 P2 余量而非 P1。",
+      "read_on_this_board": "139 段。"
+    },
+    {
+      "rule_id": "layout.magnetic_via_keepout",
+      "rule_level": "L0",
+      "severity": "High",
+      "level_note": "P1 功能不可靠档",
+      "agreement": "derived_from_magnetic_keepout",
+      "quotes": [
+        {
+          "src": "S_ADI",
+          "quote": "I am in favor of a solid ground plane layer, even under the coil."
+        },
+        {
+          "src": "S_NEXTPCB",
+          "quote": "Should you put copper directly under the inductor? Yes, but it should be a solid, unbroken ground plane."
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "两个来源都要求电感下方的平面是完整的实心 GND；过孔在电感环流正中间把这片平面打出一个洞并按网连接到别处，直接违背「solid, unbroken」。虽然来源没有逐字说「不许放过孔」，但它是这两句的直接推论，所以 agreement 标为 derived 而不是独立三源一致。",
+      "read_on_this_board": "3 孔，全部在 L1 本体之内。"
+    },
+    {
+      "rule_id": "layout.crystal_keepout_adjacent",
+      "rule_level": "L0",
+      "severity": "Medium",
+      "level_note": "P2 余量档：晶振本体的相邻层",
+      "agreement": "single_source",
+      "quotes": [
+        {
+          "src": "S_GENUWAY",
+          "quote": "Keep the area under the crystal well-grounded."
+        },
+        {
+          "src": "S_GENUWAY",
+          "quote": "Keep clock lines and switching signal lines away from the crystal and its connections as far as possible."
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "来源只直接给了「下方要好好接地」与「时钟/开关线远离」两句，没有明确点出「内层不可布线」。本板把它落成 P2 而不是 P1，正是因为出处强度只到这一步；这条的 level 由出处强度决定，不由我口头上的重要性决定。",
+      "read_on_this_board": "4 段（UART0_TX×2 on In4、CLK_OUT on In2、ETH_CLK0_25M on B.Cu）；同层 trace_under_crystal = 0。"
+    },
+    {
+      "rule_id": "layout.rf_right_angle_bend",
+      "rule_level": "L0",
+      "severity": "High",
+      "level_note": "本项目硬约束（用户当面指定，另有文献佐证）",
+      "agreement": "single_source_plus_user_instruction",
+      "quotes": [
+        {
+          "src": "S_ROHM",
+          "quote": "拐角布线不要设计为直角，设计为45°或圆弧状比较好。"
+        }
+      ],
+      "conflict_note": "来源写「45° 或圆弧」，本项目用户明确禁用圆弧（铜层 arc=0），因此只取 45° 这一支；这是本项目的裁剪，不是来源的原文范围，必须显式记下。",
+      "why_severity": "直角在阻抗不连续处产生反射与尖峰场，属于 SI；来源强度只到「比较好」的措辞，因此这条的文献分量弱于前四条，主要依据是用户当面要求。",
+      "read_on_this_board": "全板段角度 ∈ {0,45,90,135}，90 只出现在与轴线共线的直线段（角度 0/90 都是正交网格方向，不是折角）；折角一律 45。"
+    }
+  ]
+}

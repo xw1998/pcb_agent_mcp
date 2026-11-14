@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.18] - 2026-11-14
+
+RK3506 核心板第十八步：**把「布局/布线规则出处」这件事摊开并给出账**。用户问「让你全网学习的规则和优秀板子学去哪里了」，核查结论属实——P0 制程层、磁材数据、官方板校准本来就有真出处，但布局/布线 27 条 `source` 全部写成自家技能名（`kicad-free`/`rf-circuit-design`），一条外部文献都没有，这就是「电感下方不能走线」漏判的根因。本版只补出处，不动任何判据逻辑。
+
+- **新增外部出处台账** `data/layout-rule-sources.json`（4 源 / 5 entry）：`S_ADI` TIER T1（Analog Devices RAQ #164）、`S_ROHM` T1（ROHM DC/DC 布局应用笔记）、`S_NEXTPCB` T2（NextPCB 电感摆位指南）、`S_GENUWAY` T2（晶诺威晶振应用说明）。每条 entry 带逐字 `quote` + `agreement` 五档 + `conflict_note` + `read_on_this_board`；文件里写死「只有出现在 entries 且 quote 非空才算有出处」。
+- **新增只读模块** `calc/rule_sources.py`：`ledger()/citation(rule_id)/source_line(rule_id)/coverage(rule_ids)`。未登记的规则返回 `(None, "...UNCITED...")` 而不是空字典；`_validate()` 会丢弃「quote 引用了未定义 source key」的 entry 并记入 problems（防伪造引文的机械闸门）。`python -m pcb_agent_mcp.calc.rule_sources` 直接打印 `cited 5/27` + 每条出处行 + `uncited 22/27` 全表。
+- **27 条里有出处的 5 条**（`calc/rules.py` 的 `source` 已换真出处）：`layout.magnetic_keepout`（P1，3 源一致）、`layout.magnetic_keepout_deep`（P2，2 源 vs 1 源冲突）、`layout.magnetic_via_keepout`（P1，派生非直引）、`layout.crystal_keepout_adjacent`（P2，单源）、`layout.rf_right_angle_bend`（P0，单源 + 本项目禁圆弧）。
+- **三源冲突不隐藏、取从严**：ADI 与 ROHM 说任何层（含背面）都禁走线，NEXTPCB 说背面有实心 GND 平面时可以放。取从严的理由写死为「豁免前提在本板 In4 无法逐段证明，按宁可报错不给错答案应保守」，因此 `magnetic_keepout_deep` 的 139 段**没有**被 NEXTPCB 一句清零，冲突原文进 `conflict_note` 与 `docs/155 §3.1`。
+- **级别跟证据强度走，不跟愿望走**：`crystal_keepout_adjacent` 只有一个 T2 来源，且原文只到「well-grounded / 远离时钟与开关线」，没点明内层 => 只给 P2，不升 P1。
+- **uncited 22 条逐条点名**（`docs/155 §4`），不藏清单：`layout.min_via_hole` 源码自己写着「a cheap-process convention, not a law」（本来就不是规则）、`layout.min_trace_width` 与 jlc 库重复（自造阈值应改为引用）、`layout.power_trace_width` 只有载流那半走 IPC-2221。
+- **自我对照**：本版唯一代码行为改动是 `source` 字符串。`_audit.py _v18.kicad_pcb` 复核 P0 20 / P1 8 / P2 9 / P3 11 / P4 4（总 52）与 `first_action = PCB.EDGE.ROUTED` 0.0 vs 0.2 mm，与 `docs/154` 逐条一致 => 判定逻辑未被改动。
+- **新增 13 个测试** `tests/test_rule_sources.py`，含反向对照：未引规则必须是 `(None, "...UNCITED...")`、`coverage` 两侧不相交、删台账文件必须报错而不是返回空台账、伪造 source key 的 entry 必须被丢弃。
+- **对外文档** `docs/155-布局规则的出处台账与uncited清单.md`。
+
 ## [0.1.17] - 2026-11-14
 
 RK3506 核心板第十七步：**把「电感/磁珠/晶振本体下方禁走线」变成可执行判据**，并在本板上把数字量到底。规则不是文本，是 fact + 判据 + 级别；补完之后做了两条独立否证，结论是本板的违规属摆位缺陷，改摆位与改布线都不通。
