@@ -464,7 +464,8 @@ def astar(blk, w, h, si, sj, gi, gj, gsteps, cap):
 
 VIA_COST = 20000
 
-def astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf=None, glay=None):
+def astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf=None, glay=None,
+           slay0=None):
     """3-D lattice search: one node per (layer, cell).  A via transition is
     allowed only where a 0.2/0.1 through via body fits on every searched layer
     with 0.10 mm clearance.  `vf` is that mask, precomputed by eroding the free
@@ -484,7 +485,14 @@ def astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf=None, glay=None):
         return max(di, dj)*1000 + 414*min(di, dj)
     startidx = si*w+sj
     best = {}; prev = {}; heap = []
+    # The start may only be seeded on the layers its own terminal is drawn on.
+    # Seeding every layer let a path leave an F.Cu-only BGA ball on In4/B.Cu, and
+    # the 0.0045 mm stub that produced was reported by the DRC as a dangling
+    # track plus a missing connection (measured on /RMII0_CLK, /RMII0_TXD0,
+    # /RMII0_MDC).
     for lk in range(NL):
+        if slay0 is not None and slay[lk] not in slay0:
+            continue
         nid = lk*WH + startidx
         best[nid] = 0; prev[nid] = -1
         heapq.heappush(heap, (heur(si, sj), 0, nid, lk, si, sj))
@@ -824,7 +832,7 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
                           % (L, si, sj, gi, gj, len(seen), w*h, (gi, gj) in seen), flush=True)
                 for i in range(max(0, gi-3), min(h, gi+4)):
                     print("   PROBE row %d: %s" % (i, ''.join('#' if bl[slay[0]][i*w+j] else '.' for j in range(max(0, gj-6), min(w, gj+7)))), flush=True)
-            p3 = astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf, gl)
+            p3 = astar3(bl, w, h, si, sj, gi, gj, slay, cap, vf, gl, avail)
             if p3 and len(p3) > 1:
                 sc = len(p3) + int(60.0 * cong[p3[0][0]])
                 if sc < bestsc:

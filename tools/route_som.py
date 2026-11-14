@@ -46,7 +46,9 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
 EXAMPLES = os.path.join(REPO, "examples", "rk3506_som")
-BOARD = os.path.join(EXAMPLES, "rk3506_som.kicad_pcb")
+# The committed example is the default, but a copy can be named here so a whole
+# regeneration never has to edit the file under version control to try it.
+BOARD = os.environ.get("SOM_BOARD") or os.path.join(EXAMPLES, "rk3506_som.kicad_pcb")
 
 CHAMFER = 0.30          # mm cut off a square corner
 CHAMFER_WIDE = 0.50      # the switch node is wide, so its miter is longer
