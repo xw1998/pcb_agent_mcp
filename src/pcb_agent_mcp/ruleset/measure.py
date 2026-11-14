@@ -113,7 +113,10 @@ def _is_magnetic(footprint):
     if any(w in hay for w in _MAG_WORDS):
         return True
     import re as _re
-    return _re.search(r"[0-9]+(\.[0-9]+)?\s*(u|m|n|µ|μ)h",
+    # `24 MHz` is a crystal, not a 24 mH choke: without the lookahead the
+    # henry test matches the "mh" inside "mhz" and every clocked part becomes
+    # an inductor, which moves a keep-out onto the wrong geometry.
+    return _re.search(r"[0-9]+(\.[0-9]+)?\s*(u|m|n|µ|μ)h(?![a-z])",
                       hay) is not None
 
 

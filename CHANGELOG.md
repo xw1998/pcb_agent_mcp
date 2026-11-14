@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.19] - 2026-11-14
+
+RK3506 核心板第十九步：**把规则从「审计端」接到「生成端」**，接的过程中抓到两个静默缺陷。用户问「布局和布线是不是没借用转换的信息，规则呢」，核查结论分开：布线 100% 挂 net（4209/4209 段、0 段无名），布局坐标是从立创工程解析出来的原设计坐标（`_build.py` 读 `_clone/data/pcb.json`），不是规则生成的——所以原板的摆位缺陷被继承，这也是 0.1.17 那 17 段/139 段的来源。
+
+- **新增** `ruleset/design_constraints.py`：用审计同一套几何（`_is_magnetic`/`_is_crystal`/`_pad_hull`）直接产出布线器输入。`keepout_rects` / `maze_keepout` / `write_maze_keepout` / `legal_window` / `net_binding` / `classify_row` / `constraints`；CLI `python -m pcb_agent_mcp.ruleset.design_constraints BOARD [OUT.json]`。本板 7 个 owner（FB1/FB2/L1–L4/Y1）、0 skipped。
+- **缺陷一：`24 MHz` 被读成 `24 mH`**。`_is_magnetic` 的亨利值正则没有词边界，`"24 mhz"` 命中 `24 m`+`h`，于是晶振 Y1 被判成电感。加 `(?![a-z])` 前瞻后 Y1 归位 `crystal`。审计 52 条的级别计数不变（P0 20/P1 8/P2 9/P3 11/P4 4）、`first_action` 不变——变的是归属：`magnetic_keepout` 证据里不再有 Y1，`crystal_keepout_adjacent` 的 4 段（UART0_TX×2/CLK_OUT/ETH_CLK0_25M）归位。
+- **缺陷二：禁布矩形从来没有生效过**。两处叠加：① 0.1.17 的 `_ko.json` 每行写的是 `[x_min, y_min, hx, hy]`，布线器按 `[cx, cy, hx, hy]` 读，整体偏移 (−hx, −hy)（7/7 判 `corner_min`）；② `_mazeH.py` 注入时 `mkrect(..., cx, -cy, ...)`，而器件坐标已是 `-ToMM(pos.y)`（KiCad 内部 pos.y 为负，两负号抵消 ⇒ 器件在 y>0），再取一次负就把矩形送到 y<0 板外。**正控制**：修前把禁布改成覆盖全板的矩形，`/SDMMC_D2` 仍 `OK 14 segs 2 vias`；修后 9 网全 `REFUSED`。
+- **用真正生效的禁布重跑 0.1.17 的重布实验**（`_rip` 板 9 网）：主结论不变（2 OK / 7 REFUSED，拒绝来自逃逸口袋不存在），但两个能布的网路径改了——`/SDMMC_D2` 14 段2孔 → **10 段2孔**，`/RMII0_MDC` 30 段3孔 → **27 段4孔**；新结果 37 段 0 段落在禁布内。0.1.17 的「带/不带禁布逐网相同」由此作废，原因是禁布没生效，不是禁布无关。
+- **新增 10 个测试** `tests/test_design_constraints.py`：`24 MHz` 不是亨利、真亨利值仍是磁器件、`600R@100MHz` 仍按位号判、矩形中心/半尺寸、角形式行必须被判 `corner_min` 而不是被容忍、晶振不借磁规则、无焊盘器件被点名跳过、payload 与 row 一致、无名 net 走线被计数、全绑定时的计数。
+- **对外文档** `docs/156-规则进生成端-禁布台账与两个静默缺陷.md`。
+- **没做**（不许读成做了）：摆位仍不由规则生成（`legal_window` 只答 part-to-part）；布线仍不接等长/差分约束；22 条 uncited 规则未补出处；根 `data/` 仍不进 wheel。
+
 ## [0.1.18] - 2026-11-14
 
 RK3506 核心板第十八步：**把「布局/布线规则出处」这件事摊开并给出账**。用户问「让你全网学习的规则和优秀板子学去哪里了」，核查结论属实——P0 制程层、磁材数据、官方板校准本来就有真出处，但布局/布线 27 条 `source` 全部写成自家技能名（`kicad-free`/`rf-circuit-design`），一条外部文献都没有，这就是「电感下方不能走线」漏判的根因。本版只补出处，不动任何判据逻辑。
