@@ -209,7 +209,16 @@ def propose(path, operations, options=None):
     # The seed is kept on the plan: generated ids (uuid / tstamp) are a function
     # of (seed, absolute operation index), so a stepped write can reproduce them
     # exactly instead of inventing its own and then failing the byte gate.
-    seed_base = "%s:%d" % (_path_key(path), int(time.time()))
+    #
+    # The seed carries a random tail, not just the clock. Two plans on the same
+    # file within the SAME second used to share a seed, so the second plan's
+    # operation #1 was handed the uuid the first plan's operation #1 already
+    # owned - and a "delete that segment, then add the meander" plan then
+    # re-created the very uuid it had just deleted, which the postcondition gate
+    # (correctly) read as "the delete did not take". Reproducibility is kept by
+    # storing the seed on the plan, so a stepped write still replays it.
+    seed_base = "%s:%d:%s" % (_path_key(path), int(time.time()),
+                              _uuid.uuid4().hex[:8])
     records = _ops.run_all(work, operations, seed_base=seed_base)
     new_text = work.to_text()
     new_bytes = work.to_bytes()

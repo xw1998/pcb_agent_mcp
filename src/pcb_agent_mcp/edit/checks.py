@@ -270,9 +270,33 @@ def _copper_items(doc):
             if at is None:
                 continue
             d = S.arg_num(S.child(node, "size"), 1) or 0.0
-            items.append({"kind": "via", "net": S.arg_text(S.child(node, "net"), 1),
-                          "layer": "*", "a": _xy(at), "b": _xy(at), "half": d / 2.0,
-                          "uuid": _uid(node)})
+            # A via does NOT always span the whole stack: a 0.2/0.1 laser via
+            # from F.Cu to In1.Cu was compared against B.Cu and In2.Cu tracks as
+            # if it were drilled through, inventing 0.0 mm pairs KiCad's own DRC
+            # never sees - and making an edit gate refuse work over copper that
+            # is not there. The file states the span; no `layers` line means a
+            # KiCad 6 through via, `*.Cu` / `F&B.Cu` mean every copper layer.
+            span = S.child(node, "layers")
+            names = []
+            if span is not None:
+                for i in range(1, len(span.items)):
+                    t = S.arg_text(span, i)
+                    if t:
+                        names.append(t)
+            if not names or any(n.startswith("*.") or "&" in n for n in names):
+                names = ["*"]
+            elif "F.Cu" in names and "B.Cu" in names:
+                # `(layers "F.Cu" "B.Cu")` is a THROUGH via: KiCad does not
+                # stop its ring at the two ends, it has copper on every
+                # inner layer too. Reading it as two layers made a real
+                # 0.0069 mm clearance (GND via vs an In2.Cu track) invisible
+                # to this check while `kicad-cli pcb drc` reported it.
+                names = ["*"]
+            for lay in names:
+                items.append({"kind": "via",
+                              "net": S.arg_text(S.child(node, "net"), 1),
+                              "layer": lay, "a": _xy(at), "b": _xy(at),
+                              "half": d / 2.0, "uuid": _uid(node)})
     return items
 
 def copper_clearance(doc, region=None, threshold_mm=0.2, worst=10):

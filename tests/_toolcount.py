@@ -20,12 +20,16 @@ used to be spread across the twelve files.
     252 -> 253   0.1.21: pcb_rule_projection - which of the 27 rules the
                  generator can consume, as what shape, and the live payload.
                  A new question ("why was the rule not used"), not a flag.
+    253 -> 254   0.1.22: board_tune_length - length matching as a POST-PASS on
+                 copper that is already routed (board_route can only tune the
+                 nets it routes in the same run). A new question ("tune this
+                 board"), not a flag.
 
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 253
+EXPECTED_TOOL_COUNT = 254
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

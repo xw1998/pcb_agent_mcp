@@ -168,7 +168,14 @@ def _items(board, layer=None, nets=None):
                                   float(tr.get("width") or 0.0)),
                           "ref": "track@%s" % (tr.get("layer") or "?")})
     for via in board.vias:
-        if layer and layer not in (via.get("from"), via.get("to")):
+        # A via's copper is the layers it RESOLVES to, not just its two endpoints.
+        # A through via written `(layers "F.Cu" "B.Cu")` has an annular ring on
+        # every inner layer, and filtering by (from, to) hid it there: a meander
+        # on In2.Cu was accepted 0.0069 mm from a GND via, which `kicad-cli pcb
+        # drc` flagged on _v19 while this filter reported no blocker at all.
+        vlayers = (via.get("layers")
+                   or _layer_span(board, via.get("from"), via.get("to")))
+        if layer and layer not in vlayers:
             continue
         if nets and via.get("net") not in nets:
             continue

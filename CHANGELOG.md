@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.22] - 2026-11-14
+
+RK3506 核心板第二十二步：**回答「等长蛇形线 mcp 是不是没有工具」——有算法，没有工具，本版补上**；顺带修掉一个只有真写盘才会现形的通孔层跨缺陷。用户原话：「你现在继续改进重画rk3506的板子，还有就是等长蛇形线mcp是不是没有工具？没有就加」。
+
+- **现状核查**：`route/tune.py::_serpentine` 早就在，但它只服务 `board_route` 的 `length_groups`，**只调自己布出来的线**；对已经布好的板没有入口、不量盘上铜、不能只改一条网。所以答案是「对已布铜等于没有」。
+- **新增工具** `board_tune_length`（第 **254** 个）：量长 → 选组 → 在短网的一条直段上插 45° 蛇形（**两端点不变**，拓扑不动）→ 每段新铜过 `Grid.seg_blockers` → 出 `delete_track` + `add_track` → 走 `edit.propose` + `edit.apply_plan` 四道闸。`apply=false` 默认只给计划。vias 只计数不进长度、arc 报 `arcs_not_counted` 不调、只加不减。
+- **0.2 mm 地板当「代价」不当「判据」**：本板 netclass 只要 0.1 mm、走线按 0.1 密排，把 `CLEARANCE_FLOOR_MM` 当硬约束喂进搜索会让三组 pair 全部 `length_not_matched`（只剩 0.03 mm 余量）＝禁止等长。改为搜索按规则判、另用 0.2 复判只统计**新**落在 0.2 以下的不同网对，返回 `clearance_floor {floor_mm, new_pairs, worst, why}`；`new_pairs>0` 且没显式 `allow_new_violations=true` 时**不写盘**并点名最紧那一对。`tune_board.FLOOR_MM` 由测试断言等于 `precondition.CLEARANCE_FLOOR_MM`。
+- **修通孔层跨（真实缺陷，两个方向都错过）**：第一次写盘被 `kicad-cli pcb drc` 判 1 条 —— `0.0069 mm`，`Via [/GND] on F.Cu - B.Cu` vs `Track [/DDR_DQS1P] on In2.Cu`。根因是 `oracle.py::_items` 按 `(from, to)` 过滤 via 层 ⇒ 通孔的环**在内层不存在**，蛇形被放进 0.0069 mm 的空隙；而 `edit/checks.py::_copper_items` 反过来把 `(layers "F.Cu" "B.Cu")` 读成「只有两层」⇒ 把真实的内层净空对藏起来、闸门读数偏乐观。两处统一为：`F.Cu`+`B.Cu` 同时出现＝通孔＝所有铜层；盲孔/埋孔（本板 2 颗 0.2/0.1 激光孔 `F.Cu → In1.Cu`）才是名字里那两层。
+- **真板写盘（`_v18.kicad_pcb` 副本 `_v19.kicad_pcb`）**：`/DDR_DQS0P` 11.6525 → **13.2563**、`DQS1P` 18.0244 → **19.9761**、`CLKP` 14.5736 → **15.5131**，三条 N 侧不动；skew 1.6038 / 1.9517 / 0.9395 → **0.0000 / 0.0000 / 0.0000**（写后复测）。tracks 4209 → 4245（+36 删 4）、vias 630 不变、铜层 arc **0**、`copper_clearance(0.1)` = **0 对**、`kicad-cli pcb drc` **41 条与基线逐条相同**。
+- **修 `edit/plan.py` 的 plan seed**：原为 `path:秒级时间戳`，同秒两次 propose 撞同一 base、生成同 id 的 op（表现为「改 A 却改到 B」）；改为 `path:秒:uuid4[:8]`。
+- **测试** `tests/test_tune_board.py` **20 个**：量长含 via/arc 两问、45 栅格逐段、写后文件与内存一致、地板代价三问（4 组）、通孔判 `"*"`、地板以下不写盘，以及新增 `TestThroughViaCopperIsOnEveryInnerLayer` 三个含反向对照（通孔在 In2.Cu 必须被拦 `actual = 0.5−0.125−0.3`、同坐标盲孔在 In2.Cu **必须不被拦**、`_copper_items` 通孔出 `"*"` 盲孔出 `["F.Cu","In1.Cu"]`）。`test_tune_board + test_edit + test_ops_edit + test_route + test_route_fixed + test_45_corners + test_via_sites + test_blockers + test_dangling + test_ruleset + test_rule_sources + test_rule_projection + test_design_constraints + test_drc_geometry + test_drc_policy + test_drc_reads_only + test_engine_drc_project + test_fidelity + test_tools + _toolcount` 共 **511 passed**；oracle 改动后追加 `test_oracle + test_net_gaps + test_fanout + test_routability + test_dfm + test_escape_width + test_trunk_plan` 共 **494 passed**。
+- **没做到，逐条点名**：lane0 11.90 → 11.16、lane1 10.15 → 6.73、addr/cmd vs CLK 32.08 → 32.06 —— 16–32 mm 缺口是**重新布线**问题，不是蛇形问题，`plan` 报 `length_not_matched` 并逐网点名 `clearance` / `no_candidate_segment` / `does_not_fit` / `replacement_budget`，**不得读成「已修好」**。
+- **对外文档** `docs/159-等长蛇形线工具与通孔层跨.md`。
+
 ## [0.1.21] - 2026-11-14
 
 RK3506 核心板第二十一步：**回答「这些经验规则布局布线时为什么没用上」——并把能接的那几条真接进布线器**。用户原话就是这一句。核查结论：规则停在审计端，27 条里只有「矩形禁布」这一种形式在 0.1.19 被投影出去，而且只落成一张**要外部脚本手动读的 JSON**；包内 `route/` 那套布线器根本不认识规则目录。本版把这条通路做成包内的、可测的、默认就在的一条。

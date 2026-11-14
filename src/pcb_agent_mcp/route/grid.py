@@ -673,11 +673,17 @@ class Grid(object):
                         "net": n, "layer": layer, "at": list(self.xy(i, j))}
         return None
 
-    def seg_blockers(self, a, b, layer, net, width=None):
+    def seg_blockers(self, a, b, layer, net, width=None, floor_mm=0.0):
         """Every other-net item this segment would violate, worst first.
 
         Exact geometry, per-pair clearance. This is the acceptance test; the
         raster above only proposed the move.
+
+        `floor_mm` raises every pair's requirement to at least that number. The
+        routing rules may allow 0.1 mm, but `edit.apply_plan` refuses a plan that
+        lands copper inside its 0.2 mm floor (`clearance_no_worse`), so a caller
+        that wants its plan to be writable passes the same floor here and never
+        proposes copper the judge is going to throw out.
         """
         width = float(width if width is not None
                       else R.for_net(self.bundle, net)["track_mm"])
@@ -704,6 +710,8 @@ class Grid(object):
             if it.get("net") == net:
                 continue                      # its own copper never blocks it
             need = R.pair_spacing(self.bundle, net, it.get("net"))
+            if floor_mm > need:
+                need = floor_mm
             ib = boxes[k]
             gapx = max(0.0, ib[0] - bx[2], bx[0] - ib[2])
             gapy = max(0.0, ib[1] - bx[3], bx[1] - ib[3])

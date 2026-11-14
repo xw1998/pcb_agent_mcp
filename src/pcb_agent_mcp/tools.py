@@ -4795,6 +4795,161 @@ def _rule_projection(board, args):
                   "keepout_grow_mm": "rectangles grow past the pad hull by the "
                                      "same 0.1 mm the audit uses"})
 
+def _tune_length(board, args):
+    """Length tuning on the board's OWN copper, for the groups the caller names."""
+    from .route import tune_board as TB
+    from .route import rules as _rrules
+    from .ruleset import projection as PR
+    try:
+        groups = _parse_object_list(args.get("groups"), "groups") or None
+        grow = args.get("keepout_grow_mm")
+        keep, skipped = PR.keepout_rects(
+            board, None if grow is None else float(grow))
+        res = TB.plan(board, groups, _rrules.resolve(board), keepout_rects=keep,
+                      pitch_mm=float(args.get("pitch_mm") or 0.1),
+                      max_replacements=int(args.get("max_replacements") or 24),
+                      allow_locked=args.get("allow_locked") is True)
+    except ValueError as exc:
+        return err(str(exc), "ARG_INVALID")
+    except TB.TuneError as exc:
+        return err(str(exc), exc.reason_code)
+    except Exception as exc:                        # noqa: BLE001
+        return err("%s: %s" % (type(exc).__name__, exc), "TUNE_FAILED")
+
+    out = ok(value={"groups": res["groups"], "totals": res["totals"],
+                    "grid": res["grid"],
+                    "clearance_floor": res["clearance_floor"],
+                    "ops_preview": res["ops"][:6]},
+             unit="mm/groups",
+             model="board_length_tuning",
+             basis="the FIXED 45-degree tooth of route.tune._serpentine applied to "
+                   "the board's existing straight segments; every new segment "
+                   "checked by the same exact polygon test board_route uses",
+             precision="matched means the measured track skew landed inside tol; it "
+                       "does NOT mean the vendor DRC agrees - run board_drc after "
+                       "writing, and the silent-rule keep-out rectangles travelled "
+                       "into the check (%d applied, %d dropped)"
+                       % (res["grid"]["rule_keepouts"],
+                          len(res["grid"]["dropped_rule_keepouts"])),
+             assumptions=res["assumptions"])
+    out["value"]["rule_keepouts_dropped"] = res["grid"]["dropped_rule_keepouts"]
+    out["value"]["keepout_rects_skipped_by_projection"] = skipped
+    if res["status"] != "ok":
+        out["status"] = res["status"]
+        out["reason_code"] = "TUNE_INCOMPLETE"
+        out["message"] = ("%d group(s) could not be brought inside their tolerance "
+                          "and %d could not be measured; each per-net entry says "
+                          "which segment refused (blocked / does_not_fit / "
+                          "not_on_45_grid / copper_is_locked)."
+                          % (len([g for g in res["groups"]
+                                  if g.get("status") == "length_not_matched"]),
+                             len(res["unmatched_groups"])))
+    if not res["ops"]:
+        out["next_step"] = ("no segment was replaced, so there is nothing to write; "
+                            "the refusals above name the copper that stopped it")
+        return out
+    if args.get("apply") is not True:
+        out["next_step"] = ("pass apply=true to write these meanders through "
+                            "board_propose + board_apply (checkpoint, four gates, "
+                            "KiCad DRC)")
+        return out
+    if res["status"] != "ok" and not args.get("allow_partial"):
+        return out
+    floor = res["clearance_floor"]
+    if floor["new_pairs"] and args.get("allow_new_violations") is not True:
+        out["next_step"] = (
+            "%d new different-net pair(s) land closer than the apply-time %.1f mm "
+            "floor (tightest %s mm, net rule aside), and apply_plan refuses that "
+            "unless allow_new_violations=true says so; the pairs and their nets are "
+            "in clearance_floor.worst"
+            % (floor["new_pairs"], floor["floor_mm"],
+               (floor["worst"][0]["gap_mm"] if floor["worst"] else "?")))
+        return out
+    from . import edit as _edit
+    # The same options go to propose AND apply: the clearance window is measured in
+    # propose, and apply re-checks the stored numbers against the same floor.
+    opts = {"engine": True,
+            "allow_new_violations": bool(args.get("allow_new_violations")),
+            "strict_drc": bool(args.get("strict_drc")),
+            "precheck_clearance_mm": args.get("precheck_clearance_mm")}
+    if args.get("precheck_region"):
+        opts["precheck_region"] = args["precheck_region"]
+    plan = _edit.propose(args["path"], res["ops"], opts)
+    try:
+        applied = _edit.apply_plan(plan["plan_id"], confirm=True, options=opts)
+    except _edit.EditError as exc:
+        return _edit_error(exc)
+    board_after = _open_board(args["path"], member=args.get("member"),
+                              project=args.get("project"))
+    measured = TB.measure(board_after)
+    out["value"]["plan_id"] = plan["plan_id"]
+    out["applied"] = applied
+    out["value"]["measurable_after_write"] = dict(
+        (g["group"], {"lengths": dict((e["net"], measured.get(e["net"], {})
+                                      .get("length_mm"))
+                                     for e in g["per_net"]),
+                      "status": g["status"]})
+        for g in res["groups"] if g.get("per_net"))
+    out["next_step"] = ("board_drc is the judge of this copper; the lengths above "
+                        "are re-measured from the file AFTER the write")
+    return out
+
+_tool(
+    "board_tune_length",
+    "Length-match nets on copper that is ALREADY routed: the short member of each "
+    "group gets a 45-degree serpentine cut into one of its own straight segments "
+    "(same two end points, so the net stays connected), and every new segment is "
+    "checked against the whole board - other nets' clearance, the rule-derived "
+    "keep-out rectangles, the board edge - before it becomes an op. board_route can "
+    "only tune what it routes in the same run; this is the post-pass for a board "
+    "that already exists. Groups: [{name, nets, target_mm?, tol_mm?, "
+    "amplitude_mm?}] (nets matched by name, '/DDR_DQ0' also answers to 'DQ0'); with "
+    "no groups it uses the package's DDR3L pair/lane/command tables for the nets "
+    "that actually carry copper, and reports the ones it could not find. A group "
+    "whose reference cannot be reached comes back as status length_not_matched with "
+    "the length it did reach and, per net, which segment refused and why "
+    "(blocked / does_not_fit / not_on_45_grid / copper_is_locked / "
+    "replacement_budget). Vias are counted but NEVER added to length, arcs are "
+    "reported as arcs_not_counted rather than tuned, and a meander only adds copper "
+    "- a net that is too long is `needs_reroute`, not shortened. Plan by default; "
+    "apply=true writes through board_propose + board_apply.",
+    {"type": "object",
+     "properties": dict({
+         "apply": _bool("write the meanders (default false: plan only)"),
+         "groups": {"type": "array", "description":
+                    "length groups: [{name, nets, target_mm?, tol_mm?, "
+                    "amplitude_mm?, reference_net?}]; omitted -> DDR3L tables",
+                    "items": {"type": "object", "properties": dict({
+                        "name": _str("label for the report"),
+                        "nets": {"type": "array", "items": {"type": "string"}},
+                        "target_mm": _num("length to reach (default: the longest "
+                                          "member)", None),
+                        "tol_mm": _num("how close counts as matched", 0.05),
+                        "amplitude_mm": _num("meander amplitude (default "
+                                             "3*sqrt(2)*width, narrowed when it "
+                                             "does not fit)", None),
+                        "reference_net": _str("net that also sets the reference "
+                                              "length (the clock, typically)"),
+                    }, **{"required": ["nets"]})}},
+         "pitch_mm": _num("search raster for the blocking check", 0.1),
+         "max_replacements": _num("segments one net may have replaced", 24),
+         "keepout_grow_mm": _num("rule rectangles grow past the pad hull by this", 0.1),
+         "precheck_clearance_mm": _num(
+             "the gap apply_plan refuses to shrink below (default 0.2 mm). Bundles "
+             "already at 0.1 mm cannot take a meander under that floor, so a caller "
+             "passes the net rule here to have the plan judged against the clearance "
+             "it actually asked for", None),
+         "allow_locked": _bool("move copper the file marks (locked)", False),
+         "allow_partial": _bool("write even when a group stayed outside tolerance",
+                                False),
+         "allow_new_violations": _bool("let board_apply accept new DRC violations",
+                                       False),
+         "strict_drc": _bool("treat every DRC severity as blocking", False),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_tune_length, derived=True),
+)
+
 _tool(
     "pcb_rule_projection",
     "Which of the 27 layout rules can reach the GENERATOR today, as what shape, and "
