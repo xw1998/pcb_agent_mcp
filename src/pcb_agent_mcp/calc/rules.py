@@ -146,7 +146,7 @@ LAYOUT_RULES = [
        False,
        "board_cross_split on the real board, or look at every zone on the plane "
        "layer under each signal",
-       "L1", "kicad-free (return path); rf-circuit-design 3.5",
+       "L1", "ADI《PCB设计秘籍》p23/p38 (接地层割裂: 返回电流必须绕行、电感增加; 一般规则: 接地层或直流电压层不应被分隔开) [T1]",
        "a slot in the reference turns the return current into a loop antenna: "
        "it is the single largest EMC mistake and it is invisible in the schematic"),
     _r("layout.decoupling_distance",
@@ -155,7 +155,7 @@ LAYOUT_RULES = [
        "max", 3.0,
        "board_components positions plus the schematic's rail mapping, or measure "
        "pad-to-pad on the layout",
-       "L0", "kicad-free (decoupling, same layer < 3 mm)",
+       "L0", "ADI《PCB设计秘籍》p13/p42 (陶瓷电容应尽量靠近IC电源引脚; 去耦电容应靠近各自的引脚) — 原则有原文, 3 mm 阈值是本仓库默认值 [T1]",
        "beyond about 3 mm the trace inductance dominates and the cap stops "
        "bypassing anything at the frequencies it was bought for"),
     _r("layout.decoupling_same_layer",
@@ -163,7 +163,7 @@ LAYOUT_RULES = [
        "power integrity", "Medium", "decoupling_via_in_path", "bool", "bool_false",
        False,
        "look at the cap's own connection: a via between pad and pin adds ~1 nH",
-       "L0", "kicad-free (去耦电容…同层)",
+       "L0", "ADI《PCB设计秘籍》p42 (好的方法是将去耦电容直接接到引脚上, 而不通过过孔) [T1]",
        "a via in the decoupling path adds inductance that no capacitance value "
        "can buy back"),
     _r("layout.bulk_per_ic", "one bulk capacitor (>=1 uF) per IC, per rail",
@@ -192,7 +192,7 @@ LAYOUT_RULES = [
        "impedance", "High", "has_right_angle_bend_on_rf", "bool", "bool_false", False,
        "look at the routed RF nets' vertices; a right angle is a lumped "
        "capacitance and an etch trap",
-       "L0", "ROHM DC/DC layout (拐角布线不要设计为直角，设计为45°或圆弧状); this project forbids arcs, so 45 only [1 source + user rule]",
+       "L0", "ROHM DC/DC layout (拐角布线不要设计为直角，设计为45°或圆弧状); ADI《PCB设计秘籍》p48 (差分对布线时应避免急转弯 90°) [T1, 2 sources]; this project forbids arcs, so 45 only [user rule]",
        "a right angle is a small shunt capacitance at the corner plus a place "
        "the etchant undercuts"),
     _r("layout.rf_bend_radius", "bends on RF lines keep radius >= 3 line widths",
@@ -205,7 +205,7 @@ LAYOUT_RULES = [
        "adjacent same-layer traces keep 3 line widths of edge-to-edge gap",
        "isolation", "High", "rf_min_spacing_to_other_trace_mm", "mm", "min", None,
        "board_clearance restricted to the RF nets, or measure the closest approach",
-       "L1", "kicad-free (3W 规则); rf-circuit-design 3.4",
+       "L1", "ADI《PCB设计秘籍》p48 (同层铜皮铺地: 从走线到铜皮的推荐最小间隙为走线宽度的3倍) — 原语境是差分对到铜皮, 3W 用于线-线属外推 [T1]",
        "3W is the point where coupling to a neighbour stops moving the impedance; "
        "below it the neighbour is part of your matching network",
        limit_fn=_limit_three_w_rf),
@@ -237,21 +237,21 @@ LAYOUT_RULES = [
        "differential pairs are matched within 5 mil (0.127 mm)",
        "impedance", "High", "diffpair_length_skew_mm", "mm", "max", 0.127,
        "board_nets length per net, differenced inside each pair",
-       "L1", "rf-circuit-design 3.4 (等长匹配 < 5 mil)",
+       "L1", "ADI《PCB设计秘籍》p47 (成对差分走线的长度须相同; 信号须同时到达接收器) — 5 mil 容差是本仓库默认值, 原文未给数字 [T1]",
        "skew turns the differential signal into common mode, which is exactly "
        "what the pair was built to avoid"),
     _r("layout.diffpair_gap_constant",
        "the gap inside a differential pair does not change along the run",
        "impedance", "Medium", "diffpair_gap_varies", "bool", "bool_false", False,
        "walk the pair's centre line and compare gaps",
-       "L0", "rf-circuit-design 3.4 (差分对内间距恒定)",
+       "L0", "ADI《PCB设计秘籍》p47 (同一差分对内的走线间距在全长范围内须保持不变, 否则阻抗不匹配导致反射) [T1]",
        "a local gap change is a local impedance change, i.e. a reflection; the "
        "coupling is set by the gap, not by the nominal width"),
     _r("layout.power_trace_width",
        "power traces are wide enough for their current at the allowed rise",
        "power integrity", "High", "power_trace_width_mm", "mm", "min", None,
        "board_nets per net, plus the current each rail actually carries",
-       "L1", "IPC-2221 chart (current.py); kicad-free 载流直觉表",
+       "L1", "ADI《PCB设计秘籍》p39/p44 (大电流走线应短而宽; 小信号 10~15 mil, 大电流网络建议至少 20 mil) — 书本是固定下限, 按电流算是 IPC-2221 口径 [T1]",
        "an undersized trace is a fuse you did not design: the drop is invisible "
        "until the board browns out or the mask discolours",
        limit_fn=_limit_width_for_current),
@@ -259,7 +259,7 @@ LAYOUT_RULES = [
        "power pads that must dissipate have a via field under them",
        "thermal", "Medium", "power_pad_has_thermal_vias", "bool", "bool_true", True,
        "count vias inside the pad / thermal relief of each hot part",
-       "L1", "kicad-free (散热过孔); thermal.via_array",
+       "L1", "ADI《PCB设计秘籍》p27/p30/p41 (裸露焊盘各部分都要有过孔连到地, 每区多个过孔; 大电流回路用多个过孔并塞孔; 这些过孔不要用热风焊盘) [T1]",
        "a bottom-side plane only helps if the heat can get there; the via field "
        "is the only path through the laminate"),
     _r("layout.magnetic_keepout",

@@ -64,13 +64,14 @@ class TestUncitedIsReportedAsUncited(unittest.TestCase):
     """The reverse control the user's question needed: what happens to the rest."""
 
     def test_an_unlisted_rule_is_refused_with_a_reason(self):
-        e, why = RS.citation("layout.decoupling_distance")
+        # control rule: still uncited after 0.1.20 - the book says nothing about it
+        e, why = RS.citation("layout.rf_to_board_edge")
         self.assertIsNone(e)
         self.assertIn("UNCITED", why)
-        self.assertIn("layout.decoupling_distance", why)
+        self.assertIn("layout.rf_to_board_edge", why)
 
     def test_source_line_returns_none_not_a_guess(self):
-        line, why = RS.source_line("layout.diffpair_skew")
+        line, why = RS.source_line("layout.stitching_via_pitch")
         self.assertIsNone(line)
         self.assertIn("UNCITED", why)
 
@@ -81,9 +82,21 @@ class TestUncitedIsReportedAsUncited(unittest.TestCase):
         self.assertEqual(rep["n_rules"], len(RULE_IDS))
         self.assertEqual(set(rep["cited"]) | set(rep["uncited"]), set(RULE_IDS))
         self.assertEqual(set(rep["cited"]) & set(rep["uncited"]), set())
-        # this round's honest number: five rules got a sentence, the rest did not
-        self.assertEqual(rep["n_cited"], 5)
-        self.assertEqual(rep["n_uncited"], len(RULE_IDS) - 5)
+        # this round's honest number. 0.1.18 had 5; 0.1.20 read ADI's book and
+        # added 8. If a later round bumps this, the ledger must grow with it.
+        self.assertEqual(rep["n_cited"], 13)
+        self.assertEqual(rep["n_uncited"], len(RULE_IDS) - 13)
+
+    def test_principle_only_is_not_counted_as_a_full_citation(self):
+        """The distinction 0.1.20 exists for: intent cited, number still ours."""
+        rep, err = RS.coverage(RULE_IDS)
+        self.assertIsNone(err)
+        self.assertEqual(rep["n_quantitative"] + rep["n_principle_only"], rep["n_cited"])
+        self.assertTrue(set(rep["principle_only"]) <= set(rep["cited"]),
+                        "a principle-only rule must still be listed as cited")
+        self.assertIn("layout.decoupling_distance", rep["principle_only"])
+        # control in the other direction: the same book DOES state this number
+        self.assertNotIn("layout.decoupling_same_layer", rep["principle_only"])
 
     def test_coverage_is_not_a_global_number(self):
         """Ask about one uncited rule and the report must say 0 cited, not 5."""
@@ -92,10 +105,14 @@ class TestUncitedIsReportedAsUncited(unittest.TestCase):
         self.assertEqual((rep["n_cited"], rep["n_uncited"], rep["n_rules"]), (0, 1, 1))
 
 
-class TestTheFiveCitedRulesNowSaySomethingReal(unittest.TestCase):
+class TestCitedRulesNowSaySomethingReal(unittest.TestCase):
     CITED = ["layout.magnetic_keepout", "layout.magnetic_keepout_deep",
              "layout.magnetic_via_keepout", "layout.crystal_keepout_adjacent",
-             "layout.rf_right_angle_bend"]
+             "layout.rf_right_angle_bend", "layout.reference_plane_continuous",
+             "layout.decoupling_same_layer", "layout.decoupling_distance",
+             "layout.diffpair_skew", "layout.diffpair_gap_constant",
+             "layout.power_pad_thermal_vias", "layout.power_trace_width",
+             "layout.rf_spacing_3w"]
 
     def test_source_strings_no_longer_name_only_our_own_skill(self):
         for rid in self.CITED:
@@ -108,8 +125,8 @@ class TestTheFiveCitedRulesNowSaySomethingReal(unittest.TestCase):
 
     def test_uncited_rules_still_self_cite(self):
         """Control in the other direction: an uncited rule must NOT look cited."""
-        for rid in ("layout.decoupling_distance", "layout.antenna_keepout",
-                    "layout.stitching_via_pitch"):
+        for rid in ("layout.antenna_keepout", "layout.stitching_via_pitch",
+                    "layout.bulk_per_ic"):
             self.assertNotEqual(SRC_BY_ID[rid].strip(), "")
             _, why = RS.citation(rid)
             self.assertIsNotNone(why, "%s looks cited but is not in the ledger" % rid)
@@ -173,6 +190,65 @@ class TestMissingFileIsAnErrorNotAnEmptyLedger(unittest.TestCase):
             if os.path.exists(tmp):
                 os.remove(tmp)
 
+
+class TestTheBookQuotesCarryAPage(unittest.TestCase):
+    """A book quote without a page is a paraphrase nobody can look up."""
+
+    def test_every_book_quote_has_a_page_inside_the_book(self):
+        led, err = RS.ledger()
+        self.assertIsNone(err)
+        n = 0
+        for rid, e in led["entries"].items():
+            for q in e["quotes"]:
+                if q["src"] != "S_PDBSECRETS":
+                    continue
+                n += 1
+                self.assertIsInstance(q.get("page"), int, "%s quote has no page" % rid)
+                self.assertTrue(1 <= q["page"] <= 100,
+                                "%s cites page %r of a 100-page pdf" % (rid, q.get("page")))
+        self.assertGreaterEqual(n, 15, "the book should back more than a couple of rules")
+
+    def test_a_book_quote_without_a_page_is_dropped(self):
+        """Reverse control: strip the page and the entry must stop counting."""
+        saved = RS.DATA_PATH
+        tmp = os.path.join(tempfile.gettempdir(), "__nopage_ledger__.json")
+        try:
+            ledger = {
+                "schema_version": 1,
+                "sources": {"S_BOOK": {"tier": "T1", "title": "b", "url": "http://x",
+                                       "fetched_at": "2026-11-14", "requires_page": True}},
+                "entries": [{"rule_id": "layout.diffpair_skew",
+                             "quotes": [{"src": "S_BOOK", "quote": "lengths must match"}]}],
+            }
+            with io.open(tmp, "w", encoding="utf-8") as f:
+                json.dump(ledger, f)
+            RS.DATA_PATH = tmp
+            led, err = RS.ledger()
+            self.assertIsNone(err)
+            self.assertEqual(led["entries"], {}, "a page-less book quote must not count")
+            self.assertIn("no page number", " ".join(led["problems"]))
+        finally:
+            RS.DATA_PATH = saved
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    def test_the_book_upgraded_two_rules_in_different_ways(self):
+        # one rule now has a second independent source
+        e, why = RS.citation("layout.rf_right_angle_bend")
+        self.assertIsNone(why)
+        self.assertEqual(e["agreement"], "two_independent_sources_agree")
+        self.assertIn("S_PDBSECRETS", {q["src"] for q in e["quotes"]})
+        # the other settles the strict/loose conflict rather than adding a peer
+        e2, why2 = RS.citation("layout.magnetic_keepout_deep")
+        self.assertIsNone(why2)
+        self.assertIn("S_PDBSECRETS", {q["src"] for q in e2["quotes"]})
+        self.assertIn("背面", " ".join(q["quote"] for q in e2["quotes"]))
+
+    def test_bulk_per_ic_stays_uncited_on_purpose(self):
+        """The book argues AGAINST blanket per-IC caps. Citing it would be a lie."""
+        _, why = RS.citation("layout.bulk_per_ic")
+        self.assertIsNotNone(why)
+        self.assertIn("UNCITED", why)
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,10 +36,25 @@ DATA_PATH = os.path.join(
 AGREEMENT_RANK = {
     "three_independent_sources_agree": 3,
     "sources_conflict_resolved_从严": 2,
+    "two_independent_sources_agree": 2,
     "derived_from_magnetic_keepout": 2,
     "single_source_plus_user_instruction": 1,
     "single_source": 1,
 }
+
+# A citation can back the *principle* of a rule without backing its *number*.
+# 0.1.20 needed the distinction because ADI's book says "as close as possible to
+# the pin" but never says 3 mm, and "lengths must be equal" but never says 5 mil.
+# Counting those as fully cited would be the same lie as calling kicad-free a
+# source, only harder to see. So an entry carries `scope`:
+#   quantitative   - the source states the thing this rule actually measures
+#   principle_only - the source states the intent; the threshold is ours
+SCOPE_QUANTITATIVE = "quantitative"
+SCOPE_PRINCIPLE = "principle_only"
+
+def scope_of(entry):
+    """An entry without an explicit scope is treated as quantitative."""
+    return (entry or {}).get("scope") or SCOPE_QUANTITATIVE
 
 
 def _load():
@@ -77,6 +92,14 @@ def _validate(ledger):
         if empty:
             problems.append("%s: empty quote from %s" % (rid, empty))
             continue
+        # A source that declares requires_page is a book/PDF: its quotes must
+        # say where in the book they are, or a reader cannot check them.
+        need = [q.get("src") for q in quotes
+                if (sources.get(q.get("src")) or {}).get("requires_page")
+                and not isinstance(q.get("page"), int)]
+        if need:
+            problems.append("%s: quote from %s has no page number" % (rid, need))
+            continue
         ok[rid] = e
     return ok, problems
 
@@ -109,10 +132,24 @@ def citation(rule_id):
     return e, None
 
 
+def source_label(source):
+    """One short name for a source: its declared `short`, else first 4 words.
+
+    Chinese titles have no spaces, so word-slicing mangles them (it produced
+    'ADI《PCB设计秘籍》(ADI 智库工具书, 17 章,'). A source may declare `short`
+    and that label is used verbatim; the fallback stays for the older entries.
+    """
+    if not isinstance(source, dict):
+        return str(source)
+    if source.get("short"):
+        return source["short"]
+    t = source.get("title") or "?"
+    return " ".join(str(t).split()[:4])
+
 def source_line(rule_id):
     """A compact one-line citation suitable for a rule's `source` field, or None.
 
-    Format: '<first three words of each title> [T1,T2,T2]'
+    Format: '<short label per source> [T1,T2]'
     Keeping it short is deliberate: the full quote lives in the ledger, and a
     source field that repeats paragraphs is a source field nobody reads.
     """
@@ -124,14 +161,10 @@ def source_line(rule_id):
     for q in e["quotes"]:
         s = led["sources"][q["src"]]
         tiers.append(s.get("tier", "?"))
-        if s.get("title") not in names:
-            names.append(s.get("title") or q["src"])
-    short = []
-    for t in names:
-        words = str(t).split()
-        # the vendor name is usually the first word; keep it plus the doc type
-        short.append(" ".join(words[:4]))
-    return "%s [%s]" % ("; ".join(short), ",".join(sorted(set(tiers)))), None
+        label = source_label(s)
+        if label not in names:
+            names.append(label)
+    return "%s [%s]" % ("; ".join(names), ",".join(sorted(set(tiers)))), None
 
 
 def coverage(rule_ids):
@@ -144,13 +177,23 @@ def coverage(rule_ids):
     led, err = ledger()
     if err:
         return None, err
-    cited, uncited = [], []
+    cited, weak, uncited = [], [], []
     for rid in rule_ids:
-        (cited if rid in led["entries"] else uncited).append(rid)
+        e = led["entries"].get(rid)
+        if e is None:
+            uncited.append(rid)
+        elif scope_of(e) == SCOPE_PRINCIPLE:
+            weak.append(rid)
+            cited.append(rid)
+        else:
+            cited.append(rid)
     return {
         "cited": cited,
+        "principle_only": weak,
         "uncited": uncited,
         "n_cited": len(cited),
+        "n_quantitative": len(cited) - len(weak),
+        "n_principle_only": len(weak),
         "n_uncited": len(uncited),
         "n_rules": len(cited) + len(uncited),
         "problems": led["problems"],
@@ -173,10 +216,13 @@ if __name__ == "__main__":
         sys.exit(2)
     print("ledger: %s" % rep["path"])
     print("sources: %s" % ", ".join(rep["sources"]))
-    print("cited  %d/%d" % (rep["n_cited"], rep["n_rules"]))
+    print("cited  %d/%d  (threshold also cited %d, principle only %d)"
+          % (rep["n_cited"], rep["n_rules"], rep["n_quantitative"],
+             rep["n_principle_only"]))
     for rid in rep["cited"]:
         line, _ = source_line(rid)
-        print("  + %-34s %s" % (rid, line))
+        mark = "~" if rid in rep["principle_only"] else "+"
+        print("  %s %-34s %s" % (mark, rid, line))
     print("uncited %d/%d" % (rep["n_uncited"], rep["n_rules"]))
     for rid in rep["uncited"]:
         print("  - %s" % rid)

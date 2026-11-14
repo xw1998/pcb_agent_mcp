@@ -8,28 +8,45 @@
       "title": "Analog Dialogue RAQ Issue #164: How to Select Inductors and Capacitors for DC/DC Switching Regulators (Frederik Dostal)",
       "url": "https://www.analog.com/en/resources/analog-dialogue/raqs/raq-issue-164.html",
       "fetched_at": "2026-11-14",
-      "kind": "vendor_app_note"
+      "kind": "vendor_app_note",
+      "short": "ADI RAQ#164"
     },
     "S_NEXTPCB": {
       "tier": "T2",
       "title": "Inductor Placement and PCB Design Rules (NEXTPCB technical blog)",
       "url": "https://www.nextpcb.com/blog/inductor-placement-pcb-design-rules",
       "fetched_at": "2026-11-14",
-      "kind": "fab_house_guideline"
+      "kind": "fab_house_guideline",
+      "short": "NEXTPCB"
     },
     "S_ROHM": {
       "tier": "T1",
       "title": "ROHM 降压型DC/DC转换器 电路板布局基础与案例（中译）",
       "url": "https://m.elecfans.com/article/7114464.html",
       "fetched_at": "2026-11-14",
-      "kind": "vendor_app_note"
+      "kind": "vendor_app_note",
+      "short": "ROHM DC/DC 布局"
     },
     "S_GENUWAY": {
       "tier": "T2",
       "title": "晶诺威科技：晶振在PCB布局中的走线与接地要求",
       "url": "https://www.genuway.com/8085.html",
       "fetched_at": "2026-11-14",
-      "kind": "component_vendor_guideline"
+      "kind": "component_vendor_guideline",
+      "short": "晶诺威晶振布局"
+    },
+    "S_PDBSECRETS": {
+      "tier": "T1",
+      "title": "ADI《PCB设计秘籍》(ADI 智库工具书, 17 章, 中文, 100 页 PDF)",
+      "url": "https://www.analog.com/cn/lp/002/intelligence/pcb-design-secrets.html",
+      "fetched_at": "2026-11-14",
+      "kind": "vendor_ebook",
+      "local_copy": "D:\\学习\\pcb-design-secrets.pdf",
+      "local_copy_bytes": 9037782,
+      "page_numbering": "引文里的 page 是 PDF 物理页；书内印刷页码 = page - 1。",
+      "quote_policy": "逐字摘句，仅去掉原 PDF 的换行与行尾空格；未改字。个别 OCR 错字（如 '这些络'）保留原样并在 note 中指出。",
+      "short": "ADI《PCB设计秘籍》",
+      "requires_page": true
     }
   },
   "entries": [
@@ -75,10 +92,15 @@
         {
           "src": "S_NEXTPCB",
           "quote": "If you must route under an inductor due to severe space constraints, do it on the bottom layer of a multi-layer board, ensuring a solid ground plane exists between the inductor and the signal traces."
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 46,
+          "quote": "不得在电感下方（PCB 表面或下方都不行）、在内层里或PCB 背面布设敏感的控制走线。"
         }
       ],
       "conflict_note": "真冲突，必须如实记录：ADI 与 ROHM 都要求任何层（含内层与背面）都不许布信号线；NEXTPCB 允许在背面布线，前提是电感与信号线之间有一整片实心 GND。本仓库取从严（按 ADI/ROHM），因此本板深层 139 段仍计为未达标；不因为 NEXTPCB 一句「背面可以」就把 139 段清零。取从严的理由是：NEXTPCB 的豁免条件（实心 GND 完整隔开）在本板 In4 上无法逐段证明，而在无法证明时按「宁可报错不给错答案」应保守。",
-      "why_severity": "字段是 field，不是 current；铜层越深仍受边缘场照到，但已经不是「必然功能性失效」，故降为 P2 余量而非 P1。",
+      "why_severity": "字段是 field，不是 current；铜层越深仍受边缘场照到，但已经不是「必然功能性失效」，故降为 P2 余量而非 P1。 本资料原句把'表面 / 内层 / PCB 背面'三处一次说全，直接支持从严一侧。",
       "read_on_this_board": "139 段。"
     },
     {
@@ -126,16 +148,223 @@
       "rule_level": "L0",
       "severity": "High",
       "level_note": "本项目硬约束（用户当面指定，另有文献佐证）",
-      "agreement": "single_source_plus_user_instruction",
+      "agreement": "two_independent_sources_agree",
       "quotes": [
         {
           "src": "S_ROHM",
           "quote": "拐角布线不要设计为直角，设计为45°或圆弧状比较好。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 48,
+          "quote": "差分对布线时应避免急转弯 (90°)（参见图2）。"
         }
       ],
       "conflict_note": "来源写「45° 或圆弧」，本项目用户明确禁用圆弧（铜层 arc=0），因此只取 45° 这一支；这是本项目的裁剪，不是来源的原文范围，必须显式记下。",
-      "why_severity": "直角在阻抗不连续处产生反射与尖峰场，属于 SI；来源强度只到「比较好」的措辞，因此这条的文献分量弱于前四条，主要依据是用户当面要求。",
-      "read_on_this_board": "全板段角度 ∈ {0,45,90,135}，90 只出现在与轴线共线的直线段（角度 0/90 都是正交网格方向，不是折角）；折角一律 45。"
+      "why_severity": "两个独立厂商（ROHM 布局指南 + ADI 应用笔记）都说拐角不要做成直角；本项目另要求不用圆弧，所以可用角度只剩 45°。",
+      "read_on_this_board": "全板段角度 ∈ {0,45,90,135}，90 只出现在与轴线共线的直线段（角度 0/90 都是正交网格方向，不是折角）；折角一律 45。",
+      "notes": "本资料的语境是差分对，但 '避免 90° 急转弯' 是同一几何理由（直角是集总电容 + 蚀刻陷阱）。本项目另禁圆弧，故只允许 45°。"
+    },
+    {
+      "rule_id": "layout.reference_plane_continuous",
+      "rule_level": "L1",
+      "severity": "High",
+      "level_note": "P1 功能不可靠档：信号跨过参考平面割缝",
+      "agreement": "single_source",
+      "scope": "quantitative",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 23,
+          "quote": "如果导线下方的接地层上有割裂，接地层返回电流必须环绕裂缝流动。这会导致电路电感增加，而且电路也更容易受到外部场的影响。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 38,
+          "quote": "作为一般规则，多层PCB 板的接地层或直流电压层均不应被分隔开。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 38,
+          "quote": "如果这种分隔不可避免，就要尽量域少这些层上走线的数量和长度，并且走线的布放要与大电流保持相同的方向，使影响最小化。",
+          "note": "'域少' 为 PDF OCR 原文，应为 '减少'。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "书里把割裂的代价写死为返回电流必须绕行、电感增加、更易受外部场影响，与我方判据测的东西（信号跨缝）是同一件事。",
+      "read_on_this_board": "本板 GND 在 In1 整层连续；判据仍按每段信号与其参考层投影是否越缝计。"
+    },
+    {
+      "rule_id": "layout.decoupling_same_layer",
+      "rule_level": "L0",
+      "severity": "Medium",
+      "level_note": "P1：去耦路径里有一个过孔",
+      "agreement": "single_source",
+      "scope": "quantitative",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 42,
+          "quote": "为尽量减少连接阻抗，好的方法是将去耦电容直接接到引脚上，而不通过过孔。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 13,
+          "quote": "应使用低电感、表面贴装陶瓷电容，将电源引脚直接去耦至接地层。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "规则是布尔量（路径里有没有过孔），原句给的正是这条布尔量：'而不通过过孔'。",
+      "read_on_this_board": "本板去耦电容与引脚同层；判据逐电容检查 pad→pin 之间是否经过过孔。"
+    },
+    {
+      "rule_id": "layout.decoupling_distance",
+      "rule_level": "L0",
+      "severity": "High",
+      "level_note": "P1：去耦电容离被服务引脚过远",
+      "agreement": "single_source",
+      "scope": "principle_only",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 42,
+          "quote": "控制IC 的去耦电容应靠近各自的引脚。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 13,
+          "quote": "陶瓷电容应尽量靠近IC 电源引脚。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "'尽量靠近' 这条原则有原文；但 3 mm 这个阈值**不是**书给的，是本仓库默认值，不得写成文献值。",
+      "read_on_this_board": "判据用 decoupling_max_distance_to_pin_mm 实测；数值口径见 docs/157 §3。"
+    },
+    {
+      "rule_id": "layout.diffpair_skew",
+      "rule_level": "L1",
+      "severity": "High",
+      "level_note": "P2：对内等长超差",
+      "agreement": "single_source",
+      "scope": "principle_only",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 47,
+          "quote": "成对差分走线的长度须相同"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 47,
+          "quote": "信号须同时到达接收器才能正常工作。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "'长度须相同' 有原文；5 mil 这个容差**不是**书给的（书没给数字），阈值属本仓库默认。",
+      "read_on_this_board": "本板 SDMMC / USB 差分对的实测等长数字见 docs/153、docs/157 §3。"
+    },
+    {
+      "rule_id": "layout.diffpair_gap_constant",
+      "rule_level": "L0",
+      "severity": "Medium",
+      "level_note": "P2：对内间距沿全长变化",
+      "agreement": "single_source",
+      "scope": "quantitative",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 47,
+          "quote": "同一差分对内的走线间距在全长范围内须保持不变"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 47,
+          "quote": "如果此间距在驱动器与接收器之间变化不定，则一路上会存在阻抗不匹配，导致反射。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "规则与原文是同一句：间距全长不变，理由是阻抗不匹配。",
+      "read_on_this_board": "判据沿中心线逐段比较间距；本板差分对走样见 docs/157 §3。"
+    },
+    {
+      "rule_id": "layout.power_pad_thermal_vias",
+      "rule_level": "L1",
+      "severity": "Medium",
+      "level_note": "P1：需要散热的功率焊盘下没有过孔场",
+      "agreement": "single_source",
+      "scope": "quantitative",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 41,
+          "quote": "如果在布局时用过孔来传导大电流，要确保它们有充足的数量，以减少阻抗。此外，不要对这些过孔使用热风焊盘。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 30,
+          "quote": "最后，应当确保各部分都有过孔连接到地。各区域通常都很大，足以放置多个过孔。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 27,
+          "quote": "最后，应当确保各部分都有过孔连接到地。各区域通常都很大，足以放置多个过孔。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "规则是布尔量（焊盘下有没有多个地过孔），三处原句都直接支持'多个过孔 + 不要热风焊盘'。",
+      "read_on_this_board": "本板磁器件与功率器件焊盘下的过孔数见 docs/157 §3。"
+    },
+    {
+      "rule_id": "layout.power_trace_width",
+      "rule_level": "L1",
+      "severity": "High",
+      "level_note": "P0/P1：功率走线宽度不足",
+      "agreement": "single_source",
+      "scope": "principle_only",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 44,
+          "quote": "小信号网络可以窄些，采用10mil~15mil 宽度的走线。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 44,
+          "quote": "大电流网络（栅极驱动、Vcc 以及PGND 则应采用短而宽的走线。这些络的走线建议至少为20mil 宽。",
+          "note": "'这些络' 为 PDF OCR 原文，应为 '这些网络'。"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 39,
+          "quote": "大电流走线应短而宽，尽量减少PCB 的电感、电阻和压降。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "书给的是固定下限（小信号 10–15 mil、功率 ≥20 mil）；我方判据是'按电流算所需宽度'（IPC-2221）。两者量纲不同，故标 principle_only：原则一致、口径不同。",
+      "read_on_this_board": "本板电源层走线宽度分布见 docs/148。"
+    },
+    {
+      "rule_id": "layout.rf_spacing_3w",
+      "rule_level": "L1",
+      "severity": "High",
+      "level_note": "P1：同层边到边间距小于 3 倍线宽",
+      "agreement": "single_source",
+      "scope": "principle_only",
+      "quotes": [
+        {
+          "src": "S_PDBSECRETS",
+          "page": 48,
+          "quote": "如果在同一层上使用铜皮铺地，应加大从差分走线到铜皮铺地之间的间隙"
+        },
+        {
+          "src": "S_PDBSECRETS",
+          "page": 48,
+          "quote": "推荐最小间隙为走线宽度的3 倍。"
+        }
+      ],
+      "conflict_note": null,
+      "why_severity": "数值 3W 确实出自原文，但原语境是'差分走线到同层铜皮'；我方规则是'相邻同层走线之间 3W'。把 3W 当同类间距的下界是合理外推，不是原句直陈，故 scope=principle_only。",
+      "read_on_this_board": "本板射频线最小间距见 docs/154 规则表。"
     }
   ]
 }

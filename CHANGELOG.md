@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.20] - 2026-11-14
+
+RK3506 核心板第二十步：**把用户丢过来的那本书真读进去，并把读到的句子逐条落成出处**。用户原话「你全网找资料学习学完以后让我过目，不然我就认为你没学」。本版只补出处与台账，不动任何判据逻辑、不动规则等级。
+
+- **资料来源**：ADI《PCB设计秘籍》（ADI 智库工具书，17 章，中文，100 页 PDF，`D:\学习\pcb-design-secrets.pdf`，9,037,782 B；官方页 https://www.analog.com/cn/lp/002/intelligence/pcb-design-secrets.html ）。逐页读了 p8–p49（接地/高速 ADC/开关电源/电感/差分）与 p62–p70（降压调节器布局、AGND/PGND）。
+- **新增 source `S_PDBSECRETS`（T1）带 `requires_page: true`**：`rule_sources._validate()` 会**丢掉**任何一条没有整数 `page` 的书内引文，并记入 problems。页码是 PDF 物理页（书内页码 = page − 1），逐字摘句只去换行与行尾空格。
+- **新增 8 条有出处的规则**：`reference_plane_continuous`（p23 割裂/p38 层不应被分隔开）、`decoupling_same_layer`（p42「直接接到引脚上，而不通过过孔」）、`decoupling_distance`（p13/p42「尽量靠近」）、`diffpair_skew`（p47「长度须相同」）、`diffpair_gap_constant`（p47「间距在全长范围内须保持不变」）、`power_pad_thermal_vias`（p27/p30/p41 多过孔 + 不许热风焊盘）、`power_trace_width`（p39/p44 短而宽、10–15 mil / ≥20 mil）、`rf_spacing_3w`（p48 铜皮 3W）。
+- **升级 2 条既有规则**：`rf_right_angle_bend` 得到第二个独立厂商出处（p48「差分对布线时应避免急转弯 (90°)」），agreement 升为 `two_independent_sources_agree`；`magnetic_keepout_deep` 补入 p46 原句「不得在电感下方（PCB 表面或下方都不行）、在内层里或PCB 背面布设敏感的控制走线」，从严一侧第一次有了直陈原句。
+- **新增 `scope` 分层**：`quantitative`（原句说的就是这条规则测的东西）/ `principle_only`（原则有原文、阈值仍是本项目默认）。`coverage()` 现在返回 `n_cited / n_quantitative / n_principle_only / n_uncited` 四个数，CLI 打印 `cited 13/27 (threshold also cited 9, principle only 4)`。分这一层是因为 p42 只说「靠近」而没说 3 mm、p47 只说「相同」而没说 5 mil——把它们算成全绿就是换一种伪造。
+- **一条冲突不入账**：`layout.bulk_per_ic`（每 IC 一颗 ≥1 μF）与书 p26/p33「没有必要各处都配置电容；电容正对着每个IC 放置会破坏许多制造规则」方向相反。**不**把它登记成出处，保持 uncited，由 `test_bulk_per_ic_stays_uncited_on_purpose` 钉住。规则本身保留，理由写清为本项目工程取舍而非文献结论。
+- **未产出判据的候选规则 13 条**（热回路最小面积、裸露焊盘棋盘分割、开关结点下铺地、电源层不留空洞、层电容 2–4 mil、AGND/PGND 单点、Kelvin 检测、大电流过孔不用热风焊盘、去耦过孔成对、控制/功率 0.5–1 英寸、测试点不引分支、小信号层不被夹、至少一层专用地）：原句与页码齐了，但目录里没有对应 rule_id，故**不写进 ledger**，只在 docs/157 §3 登记。
+- **测试**：`tests/test_rule_sources.py` 更新为 `n_cited==13`，重定向两条「必须仍 uncited」的对照（`rf_to_board_edge` / `stitching_via_pitch`），新增 `principle_only` 分账测试、书内引文必须带 1–100 页测试、去掉页码必须被丢弃的反向对照、以及两条升级规则的分型测试。`test_rule_sources + test_design_constraints + test_ruleset + test_rules_rf` 共 **85 passed**。
+- **对外文档** `docs/157-布局布线规则学习台账-ADI应用笔记合集逐条.md`（逐条台账：原文/页码/规则化/rule_id/状态；冲突一节；候选 13 条；仍 uncited 的 14 条逐条给原因）。`docs/155` 顶部加 0.1.20 更正块，声明其 §4 的 22 条清单只是 0.1.18 快照。
+- **没做**（不许读成做了）：没有为候选规则写判据；没有改任何规则等级；没有读 p50–p100（散热/返修/环境温度/isoPower）；根 `data/` 仍不进 wheel。
+
 ## [0.1.19] - 2026-11-14
 
 RK3506 核心板第十九步：**把规则从「审计端」接到「生成端」**，接的过程中抓到两个静默缺陷。用户问「布局和布线是不是没借用转换的信息，规则呢」，核查结论分开：布线 100% 挂 net（4209/4209 段、0 段无名），布局坐标是从立创工程解析出来的原设计坐标（`_build.py` 读 `_clone/data/pcb.json`），不是规则生成的——所以原板的摆位缺陷被继承，这也是 0.1.17 那 17 段/139 段的来源。
