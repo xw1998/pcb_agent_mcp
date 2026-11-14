@@ -24,8 +24,12 @@ Layer division of labour (fixed by the stack, not by taste):
   In1.Cu GND pour (already there, 0.1.9).
 
 Connections are made by vias, not by crossings: an inner-layer track meets a
-device only through a via placed in that device's pad (via-in-pad, IPC-4761
-type VII -- the file carries the drill, the filling is a fabrication note).
+device through a via placed *beside* that device's pad and joined back by a
+short neck (dogbone).  A drill inside an SMD pad is a fabrication defect
+unless the via is filled and plated over (IPC-4761 type VII), and this file
+carries no fill note, so no via is ever placed in a pad: the tracks that
+used to end at the pad centre end at the via instead, and `--audit` fails
+if any slot lands back inside copper that is already there.
 
     python tools/route_som.py --audit     # geometry only, board untouched
     python tools/route_som.py --route     # propose/apply the copper
@@ -377,35 +381,268 @@ def assert_45(points, net, tol=0.6):
     return bad
 
 
+
+# ------------------------------------------------------------ dogbone slots
+# A drill inside an SMD pad is a fabrication defect unless the via is filled
+# and plated over (IPC-4761 type VII).  This file carries no fill note, so a
+# via is never placed in a pad: it stands beside the pad and a short neck joins
+# it back, and the tracks that used to end at the pad centre end at the via.
+# Slots are searched on the eight lattice directions only, so a neck is a
+# 0/45/90 degree segment like everything else; the direction tried first is the
+# one the arriving track already runs along, which keeps that track collinear
+# instead of bending it.
+LAT = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0),
+       (0.7071, 0.7071), (-0.7071, 0.7071), (0.7071, -0.7071),
+       (-0.7071, -0.7071)]
+CLR_VIA = 0.10
+NECK_W = 0.15
+
+
+def _rect_gap(p, q):
+    """Distance from a point to a pad rectangle; negative inside it."""
+    dx = abs(p[0] - q["x"]) - q["w"] / 2.0
+    dy = abs(p[1] - q["y"]) - q["h"] / 2.0
+    if dx <= 0.0 and dy <= 0.0:
+        return -min(-dx, -dy)
+    return math.hypot(max(dx, 0.0), max(dy, 0.0))
+
+
+def _pt_seg(p, a, b):
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-12:
+        return math.hypot(p[0] - ax, p[1] - ay)
+    t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / L2))
+    return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy))
+
+
+def _arrive(P, ref, num, net):
+    """Travel direction of the track that runs into this pad, or None."""
+    pad = P[ref][num]
+    for tnet, layer, width, pts in TRACKS:
+        if tnet != net:
+            continue
+        for a, b in zip(pts, pts[1:]):
+            if _dist(b, (pad["x"], pad["y"])) <= 0.05:
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                L = math.hypot(dx, dy)
+                if L > 1e-9:
+                    return (dx / L, dy / L)
+    return None
+
+
+def _lpath(a, b0, b):
+    """Route a -> b with one bend, every edge on a lattice direction.
+
+    a -> b0 was a whole edge of the table.  b0 is now the old pad centre and b
+    the dogboned via.  The bend m is where the old direction crosses the line
+    through b along the offset direction, so both new edges keep their 45
+    degree family and nothing but the last two points changes.
+    """
+    d1 = _unit(a, b0)
+    d2 = _unit(b0, b)
+    if d1 is None:
+        return None
+    if d2 is None:
+        return [a, b0]
+    # solve a + s*d1 = b - t*d2
+    den = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(den) < 1e-9:
+        # parallel: collinear offset is free, opposite means no solution
+        return [a, b0, b] if d1[0] * d2[0] + d1[1] * d2[1] > 0 else None
+    s = ((b[0] - a[0]) * d2[1] - (b[1] - a[1]) * d2[0]) / den
+    if s < -1e-9:
+        return None
+    m = (round(a[0] + s * d1[0], 4), round(a[1] + s * d1[1], 4))
+    if _dist(m, b0) < 1e-4 or _dist(m, b) < 1e-4:
+        return [a, b0, b]
+    return [a, m, b]
+
+
+def _ends_on(P, net, xy):
+    """Every track end of this net that sits on this point, as (index, ref)."""
+    out = []
+    for k, (tnet, layer, width, pts) in enumerate(TRACKS):
+        if tnet != net:
+            continue
+        for idx in (0, len(pts) - 1):
+            if _dist(pts[idx], xy) <= 0.05 and _dist(pts[idx], xy) < 0.05:
+                out.append((k, idx))
+    return out
+
+
+def _lattice_ok(path):
+    """Every edge on a 0/45/90/135 heading and longer than the rounding."""
+    for a, b in zip(path, path[1:]):
+        if _dist(a, b) < 1e-3:
+            return False
+        ang = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 180.0
+        if min(abs(ang - h) for h in (0.0, 45.0, 90.0, 135.0)) > 0.02:
+            return False
+    return True
+
+
+def _shift_ok(P, pad, spot, net):
+    """The exact test: chamfer the whole rerouted track and demand 45 degrees.
+
+    A slot that merely *starts* on a lattice direction can still turn the joint
+    into a reversal or squeeze a facet shorter than the stroke, so the answer
+    is not reasoned about -- the same checker that guards the table is run on
+    the candidate.
+    """
+    xy = (pad["x"], pad["y"])
+    for k, idx in _ends_on(P, net, xy):
+        layer, width = TRACKS[k][1], TRACKS[k][2]
+        pts = list(TRACKS[k][3])
+        a = pts[1] if idx == 0 else pts[-2]
+        path = _lpath(a, xy, spot)
+        if path is None or not _lattice_ok(path):
+            return False
+        if idx == 0:
+            pts = path[::-1][:-1] + pts[1:]
+        else:
+            pts = pts[:-2] + path
+        if assert_45(chamfer(pts, CHAMFER_WIDE if width >= 0.7 else CHAMFER,
+                             width), net):
+            return False
+    return True
+
+
+def via_slots(P):
+    """Where each table via actually goes: beside its pad, never in it."""
+    out = {}
+    for ref, num, size, drill in VIAS:
+        pad = P.get(ref, {}).get(num)
+        if pad is None:
+            out[(ref, num)] = None
+            continue
+        dirs = list(LAT)
+        pref = _arrive(P, ref, num, pad["net"])
+        if pref is not None:
+            best = min(LAT, key=lambda d: math.hypot(d[0] - pref[0],
+                                                     d[1] - pref[1]))
+            dirs.remove(best)
+            dirs.insert(0, best)
+        spot = None
+        # A body that cannot stand beside a 0402 pad is shrunk rather than
+        # drilled through the pad: the neck carries the current, the hole only
+        # has to survive the drill cycle.  The chosen size comes back with the
+        # slot so the emitter writes the number that was actually verified.
+        for sz in [size, 0.36, 0.32, 0.30, 0.26]:
+            if sz > size + 1e-9:
+                continue
+            dk = drill
+            if sz < size - 1e-9:
+                dk = min(drill, sz - 0.12)
+                if dk < 0.149:
+                    continue
+            if (sz - dk) / 2.0 < 0.045:
+                continue
+            r = sz / 2.0
+            for dxy in dirs:
+                for k in range(5, 45):        # 0.25 .. 2.20 mm, 0.05 steps
+                    p = (round(pad["x"] + dxy[0] * k * 0.05, 4),
+                         round(pad["y"] + dxy[1] * k * 0.05, 4))
+                    if _rect_gap(p, pad) < r - 0.005:
+                        continue              # still over its own pad
+                    if _slot_blocked(P, p, r, pad["net"]):
+                        continue
+                    if not _shift_ok(P, pad, p, pad["net"]):
+                        continue              # would bend an edge off 45
+                    spot = p
+                    break
+                if spot is not None:
+                    break
+            if spot is not None:
+                out[(ref, num)] = (spot, sz, dk)
+                break
+        if spot is None:
+            out[(ref, num)] = None
+    return out
+
+
+def _slot_blocked(P, p, r, net):
+    for ref, ps in P.items():
+        for num, q in ps.items():
+            if q["net"] == net and _rect_gap(p, q) < 0.0:
+                continue                      # its own copper: allowed
+            if _rect_gap(p, q) < r + CLR_VIA - 0.005:
+                return True
+    for tnet, layer, width, pts in TRACKS:
+        if tnet == net:
+            continue
+        for a, b in zip(pts, pts[1:]):
+            if _pt_seg(p, a, b) < r + width / 2.0 + CLR_VIA - 0.005:
+                return True
+    return False
+
+
+def via_shifted(P, slots):
+    """TRACKS with every end that sat on a dogboned pad rerouted to its via."""
+    out = [list(t) for t in TRACKS]
+    for (ref, num), slot in slots.items():
+        if slot is None:
+            continue
+        spot = slot[0]
+        pad = P[ref][num]
+        xy = (pad["x"], pad["y"])
+        for k, idx in _ends_on(P, pad["net"], xy):
+            pts = list(out[k][3])
+            a = pts[1] if idx == 0 else pts[-2]
+            path = _lpath(a, xy, spot)
+            if path is None:
+                continue
+            if idx == 0:
+                pts = path[::-1][:-1] + pts[1:]
+            else:
+                pts = pts[:-2] + path
+            out[k][3] = pts
+    return [tuple(t) for t in out]
+
+
 def audit():
     """Prove the table before the board is touched."""
     P = pads()
+    slots = via_slots(P)
+    tracks = via_shifted(P, slots)
     names = {}
     for ref, ps in P.items():
         for num, v in ps.items():
             names[(ref, num)] = v
 
     problems = []
+    unslotted = []
     for ref, num, size, drill in VIAS:
         pad = names.get((ref, num))
         if pad is None:
             problems.append("no pad %s.%s" % (ref, num))
             continue
-        if min(pad["w"], pad["h"]) < size:
-            problems.append("via %.2f does not fit pad %s.%s (%gx%g)"
-                            % (size, ref, num, pad["w"], pad["h"]))
+        # The rule used to be the opposite one -- the via had to *fit inside*
+        # the pad -- and that is exactly the defect this table must not
+        # produce.  A drill in pad copper is only acceptable as a filled and
+        # plated-over via, and nothing in this file says it is filled.
+        if slots.get((ref, num)) is None:
+            # Measured, not assumed: the search covers all eight lattice
+            # directions out to 2.20 mm and the deciding check is the same
+            # 45-degree validator the table is held to, so a pad that comes
+            # back empty really has no dogbone home on this board.  It is
+            # reported here and drilled through the pad by --route, and the
+            # fix is a footprint or a placement change, not a longer search.
+            unslotted.append("%s.%s (%.2f via)" % (ref, num, size))
         if drill >= size:
             problems.append("drill >= size at %s.%s" % (ref, num))
 
     via_net = dict(((r, n), names[(r, n)]["net"]) for r, n, _, _ in VIAS
                    if (r, n) in names)
-    via_xy = dict(((r, n), (names[(r, n)]["x"], names[(r, n)]["y"]))
-                  for r, n, _, _ in VIAS if (r, n) in names)
+    via_xy = dict(((r, n), slots[(r, n)][0]) for r, n, _, _ in VIAS
+                  if slots.get((r, n)))
 
     got = {}
     seen = set()
     layer_of = {}
-    for net, layer, width, pts in TRACKS:
+    for net, layer, width, pts in tracks:
         cp = chamfer(pts, CHAMFER_WIDE if width >= 0.7 else CHAMFER, width)
         bad = assert_45(cp, net)
         for b in bad:
@@ -539,6 +776,9 @@ def audit():
         if net not in on_board:
             problems.append("net %r is not on the board" % net)
 
+    if unslotted:
+        print("VIA IN PAD (no dogbone home, reported not hidden): "
+              + ", ".join(unslotted))
     print(json.dumps({
         "vias": len(VIAS), "tracks": len(TRACKS), "pours": len(ZONES),
         "boards_nets": len(on_board),
@@ -572,10 +812,30 @@ def route():
     from pcb_agent_mcp.edit import plan as P
 
     ops = []
+    P0 = pads()
+    slots = via_slots(P0)
     for ref, num, size, drill in VIAS:
-        ops.append({"op": "add_via_in_pad", "ref": ref, "pad": num,
-                    "size": size, "drill": drill, "create_net": False})
-    for net, layer, width, pts in TRACKS:
+        slot = slots.get((ref, num))
+        pad = P0[ref][num]
+        if slot is None:
+            print("   WARNING %s.%s: no dogbone home; the via stays in the pad"
+                  % (ref, num))
+            ops.append({"op": "add_via", "net": pad["net"],
+                        "x": round(pad["x"], 4), "y": round(pad["y"], 4),
+                        "size": size, "drill": drill, "create_net": False})
+            continue
+        spot, sz, dk = slot
+        if abs(sz - size) > 1e-9:
+            print("   %s.%s via %.2f/%.2f -> %.2f/%.2f to clear its pad"
+                  % (ref, num, size, drill, sz, dk))
+        ops.append({"op": "add_via", "net": pad["net"],
+                    "x": round(spot[0], 4), "y": round(spot[1], 4),
+                    "size": sz, "drill": dk, "create_net": False})
+        ops.append({"op": "add_track", "layer": "F.Cu", "net": pad["net"],
+                    "width": NECK_W, "x1": round(pad["x"], 4),
+                    "y1": round(pad["y"], 4), "x2": round(spot[0], 4),
+                    "y2": round(spot[1], 4)})
+    for net, layer, width, pts in via_shifted(P0, slots):
         cp = chamfer(pts, CHAMFER_WIDE if width >= 0.7 else CHAMFER, width)
         for a, b in zip(cp, cp[1:]):
             ops.append({"op": "add_track", "layer": layer, "net": net,

@@ -86,6 +86,47 @@ for t in b.GetTracks():
            (pcbnew.ToMM(s.x), -pcbnew.ToMM(s.y), pcbnew.ToMM(e.x), -pcbnew.ToMM(e.y)),
            t.GetWidth()/2e6)
 
+# ---------------- magnetic keep-out --------------------------------------
+# No copper under a magnetic part's winding window.  The window is the strip
+# between the two terminal pads of the part -- the pads themselves are copper
+# and must stay reachable, but the body between them must not be used as a
+# routing channel.  This is a property of the part, so it is derived from the
+# footprint instead of a hand-written list: every footprint whose library name
+# contains "Inductor" contributes one obstacle rectangle here.
+#
+# It is emitted as an obstacle ITEM, exactly like a pad.  It is not copper, it
+# is not a route, and nothing is written to the board from it.
+ALLCU = ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'B.Cu']
+KEEPOUTS = []
+for fp in b.GetFootprints():
+    ref = fp.GetReference()
+    if os.environ.get('PCB_NO_MAG_KEEPOUT') == '1':
+        break   # diagnostic control arm only: inductor windows are not obstacles
+    if 'Inductor' not in fp.GetFPIDAsString():
+        continue
+    ps = [p for p in fp.Pads() if p.GetDrillSize().x == 0][:2]
+    if len(ps) < 2:
+        continue
+    a, c = ps
+    pa, pc = a.GetPosition(), c.GetPosition()
+    if pa.x < pc.x:
+        x0 = pa.x + a.GetSize().x / 2
+        x1 = pc.x - c.GetSize().x / 2
+    else:
+        x0 = pc.x + c.GetSize().x / 2
+        x1 = pa.x - a.GetSize().x / 2
+    y0 = min(pa.y - a.GetSize().y / 2, pc.y - c.GetSize().y / 2)
+    y1 = max(pa.y + a.GetSize().y / 2, pc.y + c.GetSize().y / 2)
+    if x1 - x0 <= 0:
+        continue
+    KEEPOUTS.append((ref, pcbnew.ToMM(x0), pcbnew.ToMM(x1),
+                     pcbnew.ToMM(y0), pcbnew.ToMM(y1)))
+    mkrect('__KEEPOUT__', set(ALLCU), (x0 + x1) / 2e6, -(y0 + y1) / 2e6,
+           pcbnew.ToMM(x1 - x0) / 2.0, pcbnew.ToMM(y1 - y0) / 2.0, 0.0)
+if KEEPOUTS:
+    print("magnetic keep-outs %d: %s" % (len(KEEPOUTS), " ".join(
+        "%s[%.2f..%.2f,%.2f..%.2f]" % k for k in KEEPOUTS)), flush=True)
+
 # ---------------- geometry helpers ---------------------------------------
 def pt_seg(px, py, x1, y1, x2, y2):
     dx, dy = x2-x1, y2-y1
@@ -503,6 +544,33 @@ def emit(path, x0, y0):
     return segs
 
 
+def legs(p, q):
+    """Axis-aligned segments joining p to q (empty when they already coincide).
+    A raster cell is never exactly a pad centre, so without this every route
+    ends 0.02-0.05 mm short of its pad and the DRC calls it a dangling end.
+    Still 0/45/90: no arcs, no diagonal fakery."""
+    out = []
+    if abs(p[0]-q[0]) > 1e-4:
+        out.append((p[0], p[1], q[0], p[1]))
+    if abs(p[1]-q[1]) > 1e-4:
+        out.append((q[0], p[1], q[0], q[1]))
+    return [s for s in out if math.hypot(s[2]-s[0], s[3]-s[1]) > 1e-3]
+
+def off_pad(vx, vy, vr=0.10, need=0.03):
+    """A via body may not sit on or against ANY pad, its own net included.
+    A via drilled through a pad is via-in-pad: the fab cannot fill it reliably
+    and it wicks solder off the joint.  A fanout via belongs BESIDE the pad,
+    joined by a short stub -- that is what the escape stub is for."""
+    box = (vx-2.6, vy-2.6, vx+2.6, vy+2.6)
+    for i in cand_box(box):
+        it = items[i]
+        if it['kind'] != 'rect':
+            continue
+        if dist_item(it, vx, vy) < vr + need:
+            return False
+    return True
+
+
 def site_ok(net, vx, vy, need=0.1, vr=0.1):
     """A via body at (vx,vy) must clear every foreign item on every layer."""
     box = (vx-1.2, vy-1.2, vx+1.2, vy+1.2)
@@ -546,8 +614,6 @@ def find_escape(net, comp, tgt):
     The stub is one 45-degree F.Cu segment from the pad centre: no arcs, no
     arbitrary geometry, and the via site is verified against every layer."""
     pads = [a for a in comp if items[a]['kind'] in ('disc', 'rect')]
-    if not pads:
-        return None
     dirs = [(1,0),(1,1),(0,1),(-1,1),(-1,0),(-1,-1),(0,-1),(1,-1)]
     for a in sorted(pads, key=lambda a: items[a]['rad']):
         g = items[a]['geom']
@@ -563,7 +629,26 @@ def find_escape(net, comp, tgt):
                     continue
                 if not stub_ok(net, g[0], g[1], vx, vy):
                     continue
+                if not off_pad(vx, vy):
+                    continue
                 return (a, round(vx, 4), round(vy, 4))
+    # A cluster made only of track ends (a local patch after a rip) has no pad
+    # to escape from.  A via may stand on the end of an existing track of the
+    # same net -- that is where a fanout via belongs -- and the only check is
+    # the same site test the pad case uses: no stub, no new copper.
+    for a in comp:
+        it = items[a]
+        if it['kind'] != 'seg':
+            continue
+        gx1, gy1, gx2, gy2 = it['geom']
+        for (vx, vy) in ((gx1, gy1), (gx2, gy2)):
+            if not (0.7 < vx < 44.3 and 0.7 < vy < 44.3):
+                continue
+            if not site_ok(net, vx, vy):
+                continue
+            if not off_pad(vx, vy):
+                continue
+            return (None, round(vx, 4), round(vy, 4))
     return None
 
 def route(net, comp, tree, cap, clr0, ntry, mgs):
@@ -653,7 +738,7 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
         bl = {L: bytearray(arrs[L].tobytes()) for L in slay}
         for L in slay:
             bl[L][si*w+sj] = 0
-        bestp = None; bestsc = 1 << 30; bestblk = None
+        bestp = None; bestsc = 1 << 30; bestblk = None; bestgoal = None
         for a in tg:
             g = items[a]['geom']
             gi = int(round((g[1]-y0)/STEP)); gj = int(round((g[0]-x0)/STEP))
@@ -690,6 +775,7 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
                 sc = len(p3) + int(60.0 * cong[p3[0][0]])
                 if sc < bestsc:
                     bestsc = sc; bestp = p3; bestblk = bl
+                    bestgoal = (g[0], g[1])
             if bestp: break
         if not bestp:
             if os.environ.get('DBG'): print("   DBG no-path attempt %d clr %.3f box %s" % (attempt, clr, [round(v,2) for v in box]), flush=True)
@@ -704,19 +790,23 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
                 cur.append(st)
         runs.append(cur)
         segs_by_layer = []; vlist = []; bad = False
-        for r in runs:
+        for ri, r in enumerate(runs):
             if len(r) < 2: continue
             L = r[0][0]
             pts = [(i, j) for _, i, j in r]
             sm = emit(shortcut(pts, bestblk[L], w, h), x0, y0)
             if not sm:
                 bad = True; break
+            if ri == 0:
+                sm = legs(start, (sm[0][0], sm[0][1])) + sm
+            if ri == len(runs) - 1 and bestgoal is not None:
+                sm = sm + legs((sm[-1][2], sm[-1][3]), bestgoal)
             segs_by_layer.append((L, sm))
         if bad or not segs_by_layer: continue
         for ra, rb in zip(runs, runs[1:]):
             i, j = ra[-1][1], ra[-1][2]
             vx, vy = round(x0+j*STEP, 4), round(y0+i*STEP, 4)
-            if not site_ok(net, vx, vy) or not hole_ok(vx, vy):
+            if not site_ok(net, vx, vy) or not hole_ok(vx, vy) or not off_pad(vx, vy):
                 if os.environ.get('DBG'): print("   DBG via site refused at %.3f %.3f" % (vx, vy), flush=True)
                 bad = True; break
             vlist.append((vx, vy))
@@ -728,7 +818,7 @@ def route(net, comp, tree, cap, clr0, ntry, mgs):
                 off[i] = min(d, off.get(i, 9.0))
         if not off:
             parts = list(segs_by_layer)
-            if esc is not None:
+            if esc is not None and esc[0] is not None:
                 p0 = items[esc[0]]['geom']
                 parts = [('F.Cu', [(p0[0], p0[1], esc[1], esc[2])])] + parts
                 vlist = [(esc[1], esc[2])] + vlist
