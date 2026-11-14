@@ -573,6 +573,14 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
     inventory = {}
     for s in segs:
         inventory.setdefault(s["net"], []).append(s)
+    # Ops are emitted per ORIGIN segment, once, at the END - not appended as each
+    # tooth is decided. A piece this plan creates carries no uuid yet, so a second
+    # tooth on copper that already got one could not be named by a later
+    # delete_track; asking for more length than one tooth gives therefore crashed
+    # at apply time ("delete_track needs a selector"). Each block remembers the
+    # segment the FILE has (that uuid) and the atom list the plan is building for
+    # it, and only the final list is written.
+    blocks = {}
     # Lengths come from `_net_lengths`, not from the segment inventory: an arc
     # already in the file is real copper and has to be in the number this tool
     # compares, or every group would look short by however much arced.
@@ -647,6 +655,13 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                                  else min(deficit,
                                           T.max_extra(seg["length_mm"], amp)))
                         if extra <= 1e-6:
+                            refusal = refusal or {
+                                "reason": "does_not_fit",
+                                "detail": "segment_too_short_for_a_tooth",
+                                "segment_mm": round(seg["length_mm"], 3),
+                                "amplitude_mm": round(amp, 4),
+                                "uuid": (seg.get("_block") or {}).get("uuid")
+                                or seg["uuid"]}
                             continue
                         for side in (1, -1):
                             if style == "arc":
@@ -705,39 +720,31 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                             # the length it actually has, and both are measured the
                             # same way afterwards.
                             for h in hits:
-                                floor_pairs.append(dict(h, net=net,
-                                                       uuid=seg["uuid"]))
+                                floor_pairs.append(dict(
+                                    h, net=net,
+                                    uuid=(seg.get("_block") or {}).get("uuid")
+                                    or seg["uuid"]))
                             entry["below_apply_floor"] = (
                                 int(entry.get("below_apply_floor") or 0)
                                 + len(hits))
                             inventory[net].remove(seg)
-                            new_ops = []
                             inv_added = []
+                            made_atoms = []
                             for piece in pieces:
                                 if piece[0] == "line":
                                     a, b = piece[1], piece[2]
                                     grid.add_track(net, seg["layer"], a, b,
                                                    seg["width"])
                                     length = G.dist_point_point(a, b)
-                                    new_ops.append({
-                                        "op": "add_track",
-                                        "x1": round(a[0], 6), "y1": round(a[1], 6),
-                                        "x2": round(b[0], 6), "y2": round(b[1], 6),
-                                        "width": seg["width"],
-                                        "layer": seg["layer"], "net": net})
+                                    atom = ("line", tuple(a), tuple(b))
                                     inv = {"_arc": False}
                                 else:
                                     a, m, b = piece[1], piece[2], piece[3]
                                     _occupy_pieces(grid, net, seg, [piece])
                                     length = OPS.arc_length_mm(a, m, b)
-                                    new_ops.append({
-                                        "op": "add_track_arc",
-                                        "x1": round(a[0], 6), "y1": round(a[1], 6),
-                                        "mx": round(m[0], 6), "my": round(m[1], 6),
-                                        "x2": round(b[0], 6), "y2": round(b[1], 6),
-                                        "width": seg["width"],
-                                        "layer": seg["layer"], "net": net})
+                                    atom = ("arc", tuple(a), tuple(m), tuple(b))
                                     inv = {"_arc": True}
+                                made_atoms.append(atom)
                                 inv.update({"uuid": None, "net": net,
                                             "layer": seg["layer"],
                                             "width": seg["width"],
@@ -746,9 +753,29 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                                             "length_mm": length})
                                 inventory[net].append(inv)
                                 inv_added.append(inv)
-                            ops.append({"op": "delete_track",
-                                        "uuid": seg["uuid"]})
-                            ops.extend(new_ops)
+                            blk = seg.get("_block")
+                            if blk is None:
+                                # First tooth on the file's own segment: the whole
+                                # segment becomes this path, so its atom list is the
+                                # new one outright.
+                                blk = {"uuid": seg["uuid"], "net": net,
+                                       "layer": seg["layer"],
+                                       "width": seg["width"],
+                                       "items": [{"atom": ("line",
+                                                           tuple(seg["start"]),
+                                                           tuple(seg["end"]),
+                                                           ), "inv": None}]}
+                                blocks.setdefault(net, []).append(blk)
+                                at = 0
+                            else:
+                                at = int(seg["_atom"])
+                            blk["items"][at:at + 1] = [{"atom": a_, "inv": i_}
+                                                       for a_, i_ in
+                                                       zip(made_atoms, inv_added)]
+                            for idx, item in enumerate(blk["items"]):
+                                if item["inv"] is not None:
+                                    item["inv"]["_block"] = blk
+                                    item["inv"]["_atom"] = idx
                             gained = (sum(i["length_mm"] for i in inv_added)
                                       - seg["length_mm"])
                             lengths[net] += gained
@@ -759,7 +786,7 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                                 "style": style,
                                 "amplitude_mm": amp,
                                 "added_mm": round(gained, 4),
-                                "pieces": len(new_ops),
+                                "pieces": len(made_atoms),
                                 "arcs": sum(1 for q in pieces if q[0] == "arc")}
                             made = True
                             break
@@ -787,6 +814,26 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
             "status": "matched" if after_skew <= tol else "length_not_matched",
             "per_net": per_net,
             "missing": g.get("missing")})
+
+    # One delete per origin segment, then the whole final path: the file's uuid is
+    # the only selector that exists before the write.
+    for net in blocks:
+        for blk in blocks[net]:
+            ops.append({"op": "delete_track", "uuid": blk["uuid"]})
+            for item in blk["items"]:
+                atom = item["atom"]
+                a = atom[1]
+                b = atom[-1]
+                common = {"x1": round(a[0], 6), "y1": round(a[1], 6),
+                          "x2": round(b[0], 6), "y2": round(b[1], 6),
+                          "width": blk["width"],
+                          "layer": blk["layer"], "net": net}
+                if atom[0] == "line":
+                    ops.append(dict(common, op="add_track"))
+                else:
+                    ops.append(dict(common, op="add_track_arc",
+                                    mx=round(atom[2][0], 6),
+                                    my=round(atom[2][1], 6)))
 
     bad = [r["group"] for r in reports if r.get("status") == "length_not_matched"]
     unm = [r["group"] for r in reports if r.get("status") == "unmeasurable"]

@@ -188,6 +188,34 @@ class TestRastersArePessimistic(RouteBase):
         outside = grid.node(-5.0, 20.0)       # off the board entirely
         self.assertFalse(grid.free(outside[0], outside[1], "F.Cu", "A"))
 
+class TestTheLatticeCanBeAnchoredOnThePads(RouteBase):
+    """A pitch the pads do not share is a 1 um rejection waiting to happen."""
+
+    def test_the_origin_sets_the_phase_and_not_the_extent(self):
+        board = self.load()
+        bundle = R.resolve(board)
+        plain = GRID.Grid(board, ["F.Cu"], 0.05, bundle)
+        moved = GRID.Grid(board, ["F.Cu"], 0.05, bundle, origin=[18.0749, 24.1001])
+        # Same extent: the origin moves the lattice, it does not crop the board.
+        self.assertAlmostEqual(plain.x1, moved.x1, places=6)
+        self.assertAlmostEqual(plain.y1, moved.y1, places=6)
+        ox = (moved.x0 - 18.0749) % 0.05
+        oy = (moved.y0 - 24.1001) % 0.05
+        self.assertLess(min(ox, 0.05 - ox), 1e-6)
+        self.assertLess(min(oy, 0.05 - oy), 1e-6)
+        # And a pad centre is on the lattice to the last digit.
+        pt = moved.xy(*moved.node(18.0749, 24.1001))
+        self.assertAlmostEqual(pt[0], 18.0749, places=6)
+        self.assertAlmostEqual(pt[1], 24.1001, places=6)
+
+    def test_an_unaligned_lattice_misses_the_pad_centre(self):
+        board = self.load()
+        bundle = R.resolve(board)
+        plain = GRID.Grid(board, ["F.Cu"], 0.05, bundle)
+        pt = plain.xy(*plain.node(18.0749, 24.1001))
+        self.assertLess(abs(pt[0] - 18.0749), 0.05)
+        self.assertGreater(abs(pt[0] - 18.0749), 1e-4)
+
 class TestOneNetRoute(RouteBase):
     def setUp(self):
         RouteBase.setUp(self)

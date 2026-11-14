@@ -403,6 +403,32 @@ class TestArcMeander(_Board):
         self.assertEqual(last["style"], "arc")
         self.assertGreater(last["arcs"], 0)
 
+    def test_copper_that_needs_more_than_one_tooth_still_writes(self):
+        # A 2 mm run that has to give up 10 mm: no single tooth reaches that, so
+        # the plan reshapes the SAME origin segment more than once. Those later
+        # teeth exist only in the plan - they carry no uuid yet - and the write
+        # used to crash on them ('delete_track needs a selector'). The file's own
+        # segment uuid is the only selector that can exist, so one delete plus the
+        # whole final path must be what lands.
+        self.write(self.track("LONGR", (5.0, 21.0), (17.0, 21.0)),
+                   self.track("SHORTR", (5.0, 23.0), (7.0, 23.0)))
+        res = TB.plan(self.reload(), [{"name": "r", "nets": ["LONGR",
+                                                          "SHORTR"],
+                                      "tol_mm": 0.05}], style="arc")
+        self.assertEqual(res["status"], "ok", res["groups"])
+        entry = [e for e in res["groups"][0]["per_net"]
+                 if e["net"] == "SHORTR"][0]
+        self.assertGreater(entry["meanders"], 1, entry)
+        deletes = [o for o in res["ops"] if o["op"] == "delete_track"]
+        self.assertEqual(len(deletes), 1, deletes)
+        self.assertTrue(deletes[0].get("uuid"))
+        plan = E.propose(self.path, res["ops"])
+        self.assertEqual(plan["blocking"], [], plan["blocking"])
+        E.apply_plan(plan["plan_id"], confirm=True, options={"engine": False})
+        after = TB.measure(self.reload())
+        self.assertAlmostEqual(after["SHORTR"]["length_mm"],
+                               after["LONGR"]["length_mm"], delta=0.05)
+
     def test_an_unknown_style_is_refused_by_name(self):
         with self.assertRaises(TB.TuneError) as ctx:
             TB.plan(self.board, [{"nets": ["A", "B"]}], style="wave")

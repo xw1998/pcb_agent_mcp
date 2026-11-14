@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.24] - 2026-11-14
+
+RK3506 核心板第二十四步：**lane0 的 11 根 DDR 线全部重新走一遍，然后报等长程度**。用户原话：「开始重新走线，然后告诉我等长程度」。
+
+- **为什么必须整条重走**：0.1.23 的等长是在 0.1.18~0.1.22 那批已有铜上做蛇形，而重走的路径换层/绕行与旧铜占位相撞 **3~21 处、间距 0.0000 mm** ⇒ 旧铜叠加不可能，只能从剥空的板子（`_v22_stripped.kicad_pcb`，两层铜全清、5 个 zone 保留）重走。
+- **平面层被当成布线层**（修在调用纪律，不是代码）：`plan` 的 `layers` 只给 4 个信号的 `['F.Cu','In2.Cu','In4.Cu','B.Cu']`；`In1.Cu`/`In3.Cu` 是 `/GND` 与 `/+3V3`+`/+1V35_DDR` 的铺铜层，让路由器上去就是 0.0000 mm 的假净空。
+- **栅格相位与焊盘相位打架**（`route/grid.py` + `route/router.py`，新增 `Grid(origin=)`）：`Grid` 的 `x0/y0` 缺省从**板 bbox 角**起步，而 U1 是 333 球 BGA、节距 **0.5621 mm**、焊盘中心落在 `.x749/.x001` 的相位 ⇒ 一半格点落在两球之间，走出来的线贴着焊盘边过。新增 `origin` 参数做相位锚定（`self.x0 = ox + floor((self.x0-ox)/pitch)*pitch`，y 同理），`router.plan(... grid_origin=[18.7249, 24.1001])` 透传；不传时逐位不变。
+  ```python
+  # 内部：self.x0 = ox + floor((self.x0-ox)/pitch)*pitch（y 同理）
+  ```
+- **三阶段布线**：A 11 网一次性协商 8 轮 ⇒ 10/11（DQS0N 失败）；B 先让最难的 DQ3+DQS 对在空板上选路、其余 8 网协商 ⇒ **11/11 布通**（`_v23_full`）；C `board_tune_length`（`style=arc`）等长 ⇒ `_v24f`。阶段 B 原始长度 DQ0 11.136 / DQ1 12.499 / DQ2 12.322 / DQ3 23.916 / DQ4 15.282 / DQ5 15.338 / DQ6 13.160 / DQ7 15.503 / DQS0N 12.476 / DQS0P 10.961 / DM0 17.022。
+- **「布线失败」有 budget 与真阻塞两种，必须分开报**：`grid.MAX_BUDGET=400000`（≈4 s）下 DQ1 必失败，提到 1.5 M 后 24.5 s 布通、11.87 mm；DQ3 反过来——1200 k 预算、`VIA_COST` 从 9.0 降到 1.0，三次读数逐位相同 **24.157**，在已等长的板上单独重布仍是 24.157 ⇒ **通道容量结构性结果**（它只在「第一个布、板子还空」时拿到 14.805，那样其余 8 网必吃长弯）。
+- **DQS 差分对无弯折空间，精确到过孔**：DQS0N 要 0.1000 实际 **0.0975**（`/DDR_DM1` via@(19.800,14.000) F.Cu，差 0.0025）；DQS0P 要 0.1000 实际 **0.0859**（`/DDR_DQ6` via@(19.000,12.600) In2.Cu，差 0.0141）；振幅阶梯降到 0.25 mm 仍 0.0975 / 0.0815 ⇒ 差分组只能停在自己的最短长度。
+- **等长程度（交付读数）**：分两组写盘，组 1 `DQ0..DQ7+DM0` 目标 **17.022**（DM0 原始长度为基准）、组 2 `DQS0N+DQS0P` 目标 **12.476**（对内较长者）。`_v24f` 实测（`_len6.py` 六位小数）：DQ0 17.021995 / DQ1 17.022006 / DQ2 17.021996 / **DQ3 23.916043** / DQ4 17.021998 / DQ5 17.021998 / DQ6 17.022003 / DQ7 17.022000 / DQS0N 12.476346 / DQS0P 12.476002 / DM0 17.021930 ⇒ **DQ 子组（9 网含 DM0）极差 0.000076 mm**、**DQS0 对内极差 0.000344 mm**、**全组极差 11.440041 mm**（0.1.23 基线 `_v20` 为 11.903582、`_v23_full` 为 12.955383）。
+- **两条没匹配，原因不同，不许合并**：① DQ3 比组基准长 **6.894 mm**（通道容量，见上）；② DQS 对整组比 DQ 组短 **4.546 mm**（过孔卡死，见上）。⇒ **不得读成「DDR 全部等长了」**：lane0 的 11 根里 10 根内部自洽，缺口是真的；lane1、addr/cmd 本轮一根没动。
+- **等长写盘的真缺陷（`route/tune_board.py`）**：同一原段第二次弯折时会删一个**合成片**（`uuid=None`）⇒ `OpError: delete_track needs a selector`（DQS 对算出 `after_skew 0.000346` 却 apply 崩）。改成 **ops 按原段归集、末尾一次性发出**：块模型 `{"uuid": 原段 uuid, "items": [atoms + 各自的弯折品]}`，最后每块先 `delete_track(uuid)` 再按顺序 `add_track`/`add_track_arc`。另修两处诚实性：`extra <= 1e-6` 由静默 `continue` 改为记 `does_not_fit` / `segment_too_short_for_a_tooth`；`floor_pairs` 的 `uuid` 取块 uuid；`last.pieces` 由 `len(new_ops)`（含 delete）改回 `len(made_atoms)`。
+- **一个必须记住的坑：新过孔让铺铜填充过期**。交付板第一次 DRC 报 **86 violations**，多出的 45 条全是 `Via [/DDR_*] F.Cu-B.Cu` 对 `Zone [/GND] In1` / `Zone[/+1V35_DDR] In3` 的 `实际 0.0000 mm`——填铜是文件里的静态几何，加过孔不自动重算。修法只能是官方 `ZONE_FILLER`（`pcbnew.LoadBoard` → `ZONE_FILLER.Fill(board.Zones())` → `Save`，5 个 zone），86 → 42。
+- **我们的精确检查与 KiCad 在这一条上不一致**：`copper_clearance(0.1)` 报 0 对而 KiCad 报差 **1.5 µm**——`Via /DDR_DQ5 @(23.250,-10.800)` 与 `Pad G8 [/GND] of U2` 实际 0.0985。根因：我们按 0.25 盘算，U2（96 球 FBGA-96、节距 0.8）真实盘 **0.4572**；0.8 缝里过孔 0.2 要求盘心距 ≥ 0.4286，而 0.05 网格给的最近格点是 0.4271 ⇒ 差的是**网格量子**。修法不是改判据而是换一次布线：剥掉 DQ5 单独重布（1.5 M、19.6 s、15.508 mm、16 ops）⇒ 落点换位 ⇒ 重铺 + DRC **41/8、clearance 0** ⇒ 再等长到 17.022（2 齿）。**口径写死：`copper_clearance` 只当粗筛，判官永远是 `kicad-cli pcb drc --severity-all`**；这里漏的是「过孔 vs 大焊盘」的尺寸口径，登记为缺陷未修。
+- **三道验收门（交付板 `_v24f`）**：`copper_clearance(0.1)` **0 对**；`kicad-cli pcb drc --severity-all` **41 violations / 8 unconnected**（`29 via_dangling + 11 lib_footprint_issues + 1 zones_intersect + 8 unconnected`），与基线 `_v20` **逐类别相同** ⇒ 本轮没引入新问题；`_len6.py` 逐网复算与工具回报差 ≤1e-5 mm。
+- **测试**：`tests/test_route.py` 新增 `TestTheLatticeCanBeAnchoredOnThePads` 两例（原点只定相位不改范围 / 未对齐栅格错过焊盘中心），`tests/test_tune_board.py` 新增 `TestArcMeander::test_copper_that_needs_more_than_one_tooth_still_writes`（同一段第二次弯折仍写盘、`delete_track` 恰 1 条且带 uuid、写盘后差 ≤0.05）；两个文件 **113 passed（85.6 s）**。
+- **没做到，点名**：lane1（10.15→6.73）、addr/cmd vs CLK（32.08→32.06）没动；DQ3 与 DQS↔DQ 两条缺口未闭合（原因已精确到过孔与容量，不是搜索不足）；`copper_clearance` 的「过孔 vs 大焊盘」尺寸口径缺陷未修；只出 `_v24f` 这一版交付板，未做 lane1/addr/cmd 的整板等长。
+- **对外文档** `docs/161-重新走线lane0与等长程度.md`。
+
 ## [0.1.23] - 2026-11-14
 
 RK3506 核心板第二十三步：**用户看图判 45° 三角齿等长线是错的，改成圆弧蛇形**。用户原话：「这个等长线画的不对，应该是圆弧蛇形线不是这样的三角线这个是不对的」。

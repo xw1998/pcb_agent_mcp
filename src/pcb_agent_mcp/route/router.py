@@ -390,7 +390,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          congestion_rounds=2, congestion_max_rips=12, congestion_weight=1.0,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          return_path=True, return_path_net=None, topology="mst",
-         progress=None, blind_vias=False, keepout_rects=None):
+         progress=None, blind_vias=False, keepout_rects=None, grid_origin=None):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -438,7 +438,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     grid_layers = list(routing) + [l for l in planes if l not in routing]
     grid = Grid(board, grid_layers, float(pitch_mm), bundle,
                 ignore_zone_areas=ignore_zone_areas,
-                extra_keepouts=keepout_rects)
+                extra_keepouts=keepout_rects, origin=grid_origin)
     em = _Emitter(grid, bundle, board=board, layers=grid_layers,
                   pitch=float(pitch_mm), ignore_zone_areas=ignore_zone_areas,
                   blind_vias=blind_vias)

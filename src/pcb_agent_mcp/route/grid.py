@@ -67,7 +67,7 @@ class Grid(object):
     """Cell occupancy per copper layer, plus exact geometry for acceptance."""
 
     def __init__(self, board, layers, pitch, bundle, ignore_zone_areas=False,
-                 extra_keepouts=None):
+                 extra_keepouts=None, origin=None):
         if pitch <= 0:
             raise ValueError("pitch must be > 0")
         self.board = board
@@ -114,6 +114,17 @@ class Grid(object):
 
         box = self._extent()
         self.x0, self.y0, self.x1, self.y1 = box
+        if origin is not None:
+            # Lattice PHASE, not a new extent. The default phase is the board
+            # bbox corner, so on a fine-pitch BGA (U1: 0.5621 mm pitch, pad
+            # centres at .x749/.x001) every pad centre sits a fraction of a step
+            # off the lattice: the search draws a segment 0.099 mm from a
+            # neighbour pad and the exact check rejects it by 0.001 mm. Anchoring
+            # the phase on a pad centre makes the lattice coincide with the pad
+            # grid instead of drifting against it.
+            ox, oy = float(origin[0]), float(origin[1])
+            self.x0 = ox + math.floor((self.x0 - ox) / self.pitch) * self.pitch
+            self.y0 = oy + math.floor((self.y0 - oy) / self.pitch) * self.pitch
         self.nx = _steps(self.pitch, self.x0, self.x1)
         self.ny = _steps(self.pitch, self.y0, self.y1)
 
