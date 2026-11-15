@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.28] - 2026-11-15
+
+RK3506 核心板第二十八步：**把"丑"变成两道会拒绝的闸门**。用户判词是「mcp对你缺少太多约束了……锐角走线……布局根本没改……线还是很丑」，所以这一版的主角不是新铜，是两条裁决：铜形有 `board_shape_gate`，布局有 `board_place_gate`，各自五条规则、按优先级排序、给一条 `next_fix`，失败就是 `shape_fail`/`place_fail`，不再只是"描述一下"。
+
+- **新工具 `board_shape_gate`（五条，按优先级）**：① `acute_corner`（内角 < 90°，酸角陷阱，不可修）② `off_45_heading`（既不是 0/90 也不是 45）③ `duplicate_copper`（同网同层两端点重合）④ `square_corner`（可用 135 倒角却走 90°，仅 `strict=true` 拦）⑤ `detour_ratio`（实布长 / 焊盘中心生成树，硬帽 2.5 信号 / 3.2 电源才拦，因为分母是下界）。圆弧单独计数且从角度/转角两行里排除——等长蛇形被采样成上百段弦，不排除的话每一段都是一条"随机角度"。
+- **新工具 `board_place_gate`（五条，按优先级）**：① `hole_in_pad`（同网过孔钻头落在焊盘内，工艺缺陷）② `courtyard_overlap`（凸包 + 分离轴，齐平不误报；先 bbox 粗筛）③ `edge_keepout`（courtyard 到板边 < 0.5 mm）④ `copper_under_magnetics`（任何外网铜从电感本体下方穿过）⑤ `decoupling_far`（分三档 hard > 4.5 mm / soft > 3.0 mm / **bulk > 1 uF 只报不拦**——大电容的职责是储能，强行判死会让这条规则永远红、最后被关掉，而"一条永远红的规则约束不了任何人"）。面积 ≥ 板面积 40% 的器件按模组本体豁免 overlap/edge（实测只豁免 `J1`），因为 SOM 载板本来就被它盖满。
+- **`oracle.angle_audit` 两处度量修复**：默认排除 176 条 arc track（`count_arcs=False`），逐层给出 `arc_tracks`；两端点重合（零长）的"转角"不再算成一个 0° 角。上一版把这两类算进角度审计，锐角/非 45° 的数字都是虚高的。
+- **配套的六个只读/重画工具**（都写死 "Nothing here is a route."）：`tools/dedup_copper.py`（同网同层两端点各差 ≤0.02 的重复段，删完连通数变差就 `REFUSED`）、`fix_angles.py`（单段就地重画成两条腿，端点不动）、`snap_corners.py`（八向重建 + 整链两状态 DP）、`chamfer_acute.py`（把锐角倒成两个 135°：沿各自方向退 d1/d2，再用一条**落在晶格上**的弦连起来；d1/d2 用解析式 `d1/d2 = cross(u2,e)/cross(u1,e)` 求，因为 45° 接头需要 `d1 = sqrt(2) d2`，任何 0.05 mm 网格都解不出）、`straighten.py`（Douglas-Peucker 拉直"阶梯链"，偏差预算 0.03–0.08 mm，逐段走净空）、`audit_geometry.py` / `simplify_copper.py`（分别做只读审计和反面对照，证明朴素 DP 会破坏 45°）。
+- **交付板 `_r7`：DRC 44 violations + 8 unconnected，比基线 45 少一条**（29 `via_dangling` + 11 `lib_footprint_issues` + 8 `unconnected` + **3** `track_dangling` + 1 `zones_intersect`）。逐项：`_z9`（基线 45）→ `_c1` 去重 37 段（`duplicate_copper` 9 → 0）→ `_c2` 修 2 个盘中孔 → `_p0` 重布 `/BS_U7`、`/SW_U7` 并把 `C10` 从 (43, 28.4) 搬到 (41.75, 30.7) 旋转 90°（`decoupling_far` 3.774 → 1.57 mm）→ `_r3` 八向重建 246 链 → `_r4` 倒角 → `_r6/_r7` 删掉两段被重复铜顺带掩盖的 `/FSPI_D1` 悬空桩。`detour_ratio` **硬档 3 → 0**，`off_45_heading` **19 → 14**，`acute_corner` **12 → 10**，`duplicate_copper` **0**。
+- **两条诚实的负读数**（都不粉饰）：① **阶梯链拉不直**——全板 3910 段里 1470 段短于 0.25 mm，是 0.055 mm 一步的锯齿（45 上、横一格、45 上）。用 DP 拉直时有 74–103 条链在净空上被拒：直线比锯齿最多近 0.08 mm，而板本来就按 0.10 mm 贴边走，**锯齿是绕净空墙的必然产物，不是画错的线**。要真正变直得改布线器的栅格/算法，不是后处理。② **`fix_angles`/`snap_corners` 弄不动剩下的 14 条非 45° 段**：`fix_angles` 报 `LEFT (no legal order)`（两种拆法都会在端点造出非法转角），`snap_corners` 报 `REFUSED turn 135 / longer 0.3 / clearance -0.05`。它们全是焊盘入口的斜挂段。
+- 欠账逐条点名：① 锐角 **10** 条、非 45° **14** 条仍在（都在焊盘入口，要么改焊盘出口方向要么改布线器）；② 盘中孔 **8** 个（`via_off_pad.py` 已修 2 个，其余 `REFUSED`：无合法落点或搬了就断连）③ `copper_under_magnetics` **41** 段（`L1/L2/L3` 站在 In2/In4 总线走廊里，要真解决必须把三簇 buck 挪走——上一版实测刚体南移 5.5 mm 会让 DRC 涨到 90，连带要重布穿体网）；④ `decoupling_far` 4 个已全部降到 **bulk** 档（两块 10 uF 离引脚 5.157/4.656 mm，按规则只报不拦）；⑤ 布局只搬了 `C10` 一颗——`C16/C18` 要搬必须重布 `/+0V9_ANA`，而该网含 0.25 mm 手工 BGA 逃逸，整网撕掉后布线器两次 `REFUSED`。细节见 `docs/165-两道闸门与倒角拉直.md`。
+
 ## [0.1.27] - 2026-11-14
 
 RK3506 核心板第二十七步：**第一次真的把铜从电感窗里搬出去，代价为零**。用户三条判词没变，②有了实测收益，③只给了量化口径，文末照旧逐条点名。

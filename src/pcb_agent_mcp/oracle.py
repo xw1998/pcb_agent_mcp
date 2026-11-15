@@ -6139,7 +6139,8 @@ def _fold180(deg):
     return deg % 180.0
 
 
-def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20):
+def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20,
+                count_arcs=False):
     """Are the tracks actually H / V / 45, and where do the corners come from?
 
     Three things get measured, and they must not be mixed together:
@@ -6160,6 +6161,15 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20):
     The three numbers answer three different questions, which is the point:
     "did the 45-degree rule get followed" is the first row, "why does the back
     copper look full of right angles" is the second and third.
+
+    Arcs are excluded by default, and that default is the measured one. KiCad
+    stores a tuned serpentine or a rounded corner as `(arc)`, which the adapter
+    samples into 8 points; read as 7 straight chords every one of them has an
+    arbitrary heading, so this board's 176 arc tracks alone reported 1165
+    "non 45" segments and 104 acute corners - all of them the curve being
+    measured as a polyline. An arc is a drawn curve, not a straight segment that
+    misses 45, so it is counted apart (`arc_tracks`) and `count_arcs=True` puts
+    the chords back for anyone who wants that reading.
     """
     tol = float(angle_tol_deg)
     cu = _copper_layers(board)
@@ -6181,12 +6191,16 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20):
 
     per_layer = {}
     segged = {}
+    arcs_n = {}
     for lay in cu:
         if layer and lay != layer:
             continue
         segs = []
         for tr in board.tracks or []:
             if tr.get("layer") != lay:
+                continue
+            if tr.get("_arc") and not count_arcs:
+                arcs_n[lay] = arcs_n.get(lay, 0) + 1
                 continue
             pts = tr.get("_points") or [tr["start"], tr["end"]]
             for i in range(len(pts) - 1):
@@ -6209,6 +6223,7 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20):
             "H": cnt["H"], "V": cnt["V"], "diag45": cnt["45"],
             "other": cnt["other"],
             "other_pct": round(100.0 * cnt["other"] / tot, 2),
+            "arc_tracks": int(arcs_n.get(lay, 0)),
             "other_segments": [
                 {"net": s["net"], "w": s["w"], "length_mm": round(s["L"], 2),
                  "heading_deg": round(s["hd"], 1),
@@ -6229,13 +6244,23 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20):
                 rays.setdefault((key, s["net"]), []).append(
                     (_seg_ray(p, q), (round(q[0], 3), round(q[1], 3)), s))
         bend = {"corner_135": 0, "corner_90": 0, "corner_acute": 0,
-                "collinear": 0, "right_angle_list": [], "acute_list": []}
+                "collinear": 0, "coincident": 0, "right_angle_list": [],
+                "acute_list": []}
         # de-duplicate a pair of segments meeting at both ends (a 2-seg loop)
         seen_pairs = set()
         for (key, net), lst in rays.items():
             for i in range(len(lst)):
                 for j in range(i + 1, len(lst)):
                     r1, r2 = lst[i][0], lst[j][0]
+                    if lst[i][1] == lst[j][1]:
+                        # Two segments leaving the same vertex towards the same
+                        # point: they are the same piece of copper twice, not a
+                        # corner. Measured reason this branch exists - 0.1 mm and
+                        # 0.25 mm tracks with identical endpoints on /+1V8_ANA
+                        # read as a 0 degree corner, and 33 of them on /GND turned
+                        # a 17 acute-corner board into a reported 104.
+                        bend["coincident"] = bend.get("coincident", 0) + 1
+                        continue
                     sig = (key, net, tuple(sorted([lst[i][1], lst[j][1]])))
                     if sig in seen_pairs:
                         continue
@@ -6334,4 +6359,5 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20):
                   "%.2f deg" % tol,
         assumptions={"layer": layer or "all copper",
                      "angle_tol_deg": tol,
-                     "top_other": int(top_other)})
+                     "top_other": int(top_other),
+                     "count_arcs": bool(count_arcs)})

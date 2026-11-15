@@ -19,6 +19,8 @@ from . import lceda_api as _lceda_api
 from . import lceda_live as _live
 from . import fidelity as _fidelity
 from . import oracle as _oracle
+from . import place_gate as _place_gate
+from . import shape_gate as _shape_gate
 from . import snapshot as _snapshot
 from .fidelity import views as _fviews
 from .calc import current as _current
@@ -4473,6 +4475,74 @@ _tool(
         b, layer=a.get("layer") or None,
         angle_tol_deg=a.get("angle_tol_deg", 1.0),
         top_other=a.get("top_other", 20)), derived=True),
+)
+
+_tool(
+    "board_shape_gate",
+    "One verdict for \"is this copper drawn the way the house draws it\", with the "
+    "rules in priority order, so a failing board is REFUSED instead of described. "
+    "The five rules, highest priority first: (1) acute_corner - an interior angle "
+    "under 90 deg is an acid trap and cannot be tuned away; (2) off_45_heading - a "
+    "segment that is neither H, V nor 45; (3) duplicate_copper - two tracks with "
+    "the same net, layer and both endpoints (pure waste, and it doubles every "
+    "length and detour number the other audits report); (4) square_corner - a 90 "
+    "turn where a 135 chamfer may have been available, blocking only with "
+    "strict=true because a pocket between pads can force it; (5) detour_ratio - "
+    "routed length over the pad-centre spanning tree, blocking only past a hard "
+    "cap because that denominator is a LOWER bound. `next_fix` names the single "
+    "highest-priority item. Arcs are counted apart (arc_tracks) and excluded from "
+    "the heading and corner rows: a tuned serpentine sampled into chords looks "
+    "like a thousand random-angle segments. This is NOT a DRC - clearance, holes, "
+    "mask and connectivity are board_drc's job. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "strict": _bool("also block square corners and every detour past 1.8", False),
+         "angle_tol_deg": _num("tolerance when snapping to 0/45/90 (default 1.0)", 1.0),
+         "hard_ratio_signal": _num("a signal net past this detour ratio blocks "
+                                   "(default 2.5)", 2.5),
+         "hard_ratio_power": _num("a rail past this detour ratio blocks "
+                                  "(default 3.2)", 3.2),
+         "top": _num("how many offending items to list per rule", 20),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _shape_gate.gate(
+        b, strict=bool(a.get("strict")), angle_tol_deg=a.get("angle_tol_deg", 1.0),
+        hard_ratio_signal=a.get("hard_ratio_signal"),
+        hard_ratio_power=a.get("hard_ratio_power"),
+        top=a.get("top", 20)), derived=True),
+)
+
+_tool(
+    "board_place_gate",
+    "One verdict for \"is this board placed the way the house places it\", with the "
+    "rules in priority order, so a bad placement is REFUSED instead of described. "
+    "The five rules, highest priority first: (1) hole_in_pad - a via drill sitting "
+    "inside a pad of the same net (a drilled pad is a process defect, not a tight "
+    "corner); (2) courtyard_overlap - two footprints whose courtyards intersect, "
+    "measured by convex hull + separating axis so a butt joint does not read as an "
+    "overlap; (3) edge_keepout - a courtyard closer than 0.5 mm to the board edge; "
+    "(4) copper_under_magnetics - any foreign net running under an inductor body, "
+    "which is a shield, a heater and an EMC antenna at once; (5) decoupling_far - a "
+    "small cap whose rail pad is far from the pin it decouples, in three bands: "
+    "hard (past 4.5 mm), soft (past 3.0 mm) and bulk (anything larger than 1 uF is "
+    "storage, not loop, and is reported but NEVER blocking - a rule that is always "
+    "red is a rule that gets switched off). A footprint covering 40% or more of the "
+    "board is treated as the module itself and exempt from the courtyard and edge "
+    "rules, because a SOM carrier covers the whole board by construction. This is "
+    "NOT a DRC - clearance, mask, hole-to-hole and connectivity are board_drc's "
+    "job. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "edge_keepout_mm": _num("courtyard-to-edge minimum (default 0.5)", 0.5),
+         "soft_mm": _num("decoupling distance that warns (default 3.0)", 3.0),
+         "hard_mm": _num("decoupling distance that blocks (default 4.5)", 4.5),
+         "top": _num("how many offending items to list per rule", 20),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _place_gate.gate(
+        b, edge_keepout_mm=a.get("edge_keepout_mm"),
+        soft_mm=a.get("soft_mm"), hard_mm=a.get("hard_mm"),
+        top=a.get("top", 20)), derived=True),
 )
 
 _tool(
