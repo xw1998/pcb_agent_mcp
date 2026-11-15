@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.1.35] - 2026-11-15
+
+RK3506 核心板第三十五步：上一版交出去时 `hole_in_pad` 报的是 **8**，那是**弱判据造成的假绿**——旧判据只问
+「孔心在不在焊盘矩形里」，孔心挪到焊盘边上一半、钻孔整个压在焊盘铜上的孔一律漏判。这一版把判据改成几何的，
+同一块交付板如实报 **62**，并把 62 个里**能合法搬出去的 52 个搬出去**。**剩下 9 个在现有板规下不可解，交付板未替换**
+——这是负读数，不粉饰。细节与逐孔障碍表在 `docs/172`。
+
+- **判据从严**：`place_gate.hole_in_pad`（priority 1，blocking）改读 `gap = 孔心到焊盘铜外轮廓多边形的距离`、
+  `hit = gap < drill/2 - 1e-6`。焊盘轮廓用 `canonical.pad_points()` 的真实多边形（矩形/圆形/椭圆/圆角矩形/自定义），
+  不是包围盒；`_rect_contains` 保留但降级为矩形探针。物理含义写死：**孔环压住焊盘铜是合法 dogbone**
+  （焊盘自带 0.10 mm `DRILL_PAD_GAP` 余量），只有**钻孔碰铜**才是工艺缺陷。报告新增 `hole_gap_mm`，能读出「差多少」。
+  verdict 文案改成描述后果：`"%d via drill(s) stand inside a same-net pad - a process defect, not a clearance:
+  the barrel wicks solder out of the joint"`。
+- **反向对照** `tests/test_place_gate_hole.py` **7 用例全绿（0.27 s）**：孔心在矩形外但钻孔切轮廓 ⇒ 1、孔心外且净空 ⇒ 0、
+  圆焊盘内孔 ⇒ 1、刚擦边 ⇒ 0、异网 ⇒ 0、THT 焊盘旁的孔 ⇒ 0、规则必须 priority 1 且 blocking。
+- **新工具 `tools/off_pad_dogbone.py`**（`tools/via_off_pad.py` 的 BFS stub 弃用）：以孔的实际接触面为出发点，
+  `contacts_of()` 带出离开方向/长度/宽度/接触端/远端；点位须同时过 `point_ok`（同网焊盘 0.10 gap / 异网铜 `r+CLR` /
+  孔到孔 H2H / 板边 0.50）、`stitch_ok`（同层同网铜不穿异物）、`held ≥ 2`、**`pinned`**（不把任何同网 track 端点
+  落在孔外：被新孔铜覆盖 / 被 45° pick-up stitch 接住 / 沿自身轴线滑动）；允许 **2 段 45° 狗腿**，**135° 转永不生成**
+  （内角 45° 是锐角）；孔到孔冲突按 `alts` 换备选；只在孔太胖进不了窄缝时缩径且**只缩孔体不缩钻**（`ANNULAR_MIN`
+  保环宽）；`--apply` 每搬一孔做一次 `GetUnconnectedCount(False)` 闸门、变大就整孔 revert。参数全来自板子自己的规则
+  `OPD_CLR=0.11`（板 netclass 0.10，留 0.01 浮点余量）/ `OPD_DPG=0.10` / `OPD_DMAX=3.0` / `OPD_HOPS` / `OPD_EDGE=0.50`。
+- **读数**（输入始终是交付板原件）：`_dg_a` 交付板 via-in-pad **62** / DRC 0 / unconnected 7；
+  `_dg_h` **52 moved / 0 reverted** ⇒ via-in-pad **10**、DRC 真实违规 **0**（另有 11 条 `lib_footprint_issues` 是
+  仓库 cwd 的已知伪影）、`unconnected_items` **7 → 7**。每搬一孔都跑「官方 `ZONE_FILLER` 重灌注 →
+  `kicad-cli pcb drc --severity-all` → 严口径盘点」三步。
+- **负读数（不粉饰）**：剩 10 个孔**全部承载真实层间连接**——逐孔 `Remove` + 重灌注 + `GetUnconnectedCount` ⇒
+  **10/10 使未连接 7 → 8**（`/+0V9_CPU` 7 → 9），**不能靠删孔清零**。用板规 `OPD_CLR=0.10` + `DMAX=4.0` +
+  6 档狗腿（0.25/0.35/0.45/0.60/0.80/1.00）重规划：**只有 `FB1.1` 可解**（→ `(12.466,26.046)`，0.50 mm，lattice），
+  **9 个仍无解**，逐孔障碍（need = 孔体半径 + CLR）：`FB1.2` 0.109–0.142/0.21、`C1.1` 0.204/0.30、
+  `U3.8` 0.000–0.206/0.35（该孔无任何同网 track 接触，孔就是唯一引出）、`C2.1` 全贴死（In4 `/RMII0_CLK` 0.002、
+  `L1.1` 0.020）、`U6.3` 0.200/0.335、`C9.1` 0.068–0.143/0.31、`U3.7` 0.000/0.35、`U7.1` 0.152/0.335、
+  `L4.1` 0.251/0.335。机制：板全 0.10 mm 间距 + 最小孔 0.20/0.10 ⇒ 一个孔要占 `0.20+2×0.10 = 0.40 mm` 宽，
+  这些焊盘正下/正侧挤着 0.10 mm 并行总线，余量只剩 0.07–0.25 mm。
+- **合法出路只有两条**：① VIPPO（用户明令禁止，不选用）；② 改布局/布线（让出 0.40 mm 通道或移件 ≥0.5 mm，
+  属布局层，现有工具链只滑端点、只加 45° 缝合，做不到）。
+- **交付板 `examples/rk3506_som/rk3506_som.kicad_pcb` 未替换**，新判据下它如实报 **62**（旧口径的 8 作废）。
+- 欠账：9 个孔的布局级修复 / 7 条未连接网 / DDR 等长 need 342.2 只填 10.73 / `square_corner` 422。
+
 ## [0.1.34] - 2026-11-15
 
 RK3506 核心板第三十四步：上一版交出去时 `kicad-cli pcb drc --severity-all` 的 **24 条违规全部是

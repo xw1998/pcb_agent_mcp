@@ -13,8 +13,11 @@ So the rules below are ordered by how expensive they are to discover late:
 1. `hole_in_pad` - a via drill standing inside a pad. Not a routing style
    question: it is a process defect (the drill pierces the pad, the barrel wicks
    solder out of the joint), and the board cannot be fixed by moving copper. On
-   the SOM board ten of these survived a full DRC because the pad and the via
-   share a net, so no clearance rule fires.
+   the SOM board 62 of these survived a full DRC because the pad and the via
+   share a net, so no clearance rule fires. The test is geometric: the drill
+   wall must not reach the pad's copper, so the pad outline is taken from its
+   real polygon (round, oval and rounded-rect included) and a hole that stays
+   clear of that outline is a legal dogbone.
 2. `courtyard_overlap` - two bodies occupy the same square millimetre. Whatever
    the netlist says, one of them has to move, and every route attached to it is
    wasted work.
@@ -192,8 +195,66 @@ def _convex_overlap(a, b):
     return True
 
 
+def _pad_polygon(pad):
+    """The pad's real copper outline, or None when the pad has no area.
+
+    Using the pad's `w`/`h` rectangle instead is what made this rule report 8
+    holes on a board that has 62: an oval pad is 0.56 x 1.40 mm, so a hole at the
+    end of a track inside that oval sits outside the 0.56-wide rectangle while
+    still removing the pad's copper. The outline comes from the same builder the
+    router uses, so the two cannot disagree about where the copper is.
+    """
+    from .adapters.canonical import pad_points
+    try:
+        pts = pad_points(pad)
+    except Exception:
+        return None
+    return pts if len(pts) >= 3 else None
+
+def _point_in_polygon(px, py, pts):
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > py) != (y2 > py):
+            if px < (x2 - x1) * (py - y1) / (y2 - y1) + x1:
+                inside = not inside
+    return inside
+
+def _seg_point_distance(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    l2 = dx * dx + dy * dy
+    if l2 < 1e-18:
+        return math.hypot(px - x1, py - y1)
+    t = ((px - x1) * dx + (py - y1) * dy) / l2
+    if t <= 0.0:
+        return math.hypot(px - x1, py - y1)
+    if t >= 1.0:
+        return math.hypot(px - x2, py - y2)
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+def _to_polygon(px, py, pts):
+    """Distance from a point to a closed outline; 0.0 when the point is inside."""
+    if _point_in_polygon(px, py, pts):
+        return 0.0
+    best = float("inf")
+    n = len(pts)
+    for i in range(n):
+        d = _seg_point_distance(px, py, pts[i][0], pts[i][1],
+                                pts[(i + 1) % n][0], pts[(i + 1) % n][1])
+        if d < best:
+            best = d
+    return best
+
 def _rect_contains(cx, cy, pad):
-    """Is (cx, cy) inside this pad's copper rectangle?"""
+    """Is (cx, cy) inside this pad's copper rectangle?
+
+    Kept for callers that only have a pad box (a footprint courtyard probe, a
+    test fixture). It is NOT the `hole_in_pad` test any more: a drill removes pad
+    copper whenever its wall crosses the outline, and the rectangle is a poor
+    stand-in for that outline on a round or oval pad.
+    """
     px, py = float(pad.get("x") or 0.0), float(pad.get("y") or 0.0)
     w = float(pad.get("w") or 0.0)
     h = float(pad.get("h") or 0.0)
@@ -263,18 +324,33 @@ def gate(board, edge_keepout_mm=None, soft_mm=None, hard_mm=None, top=20):
             modules.add(ref)
 
     # -- 1 hole_in_pad ------------------------------------------------------
+    # The test is "the drill wall removes pad copper", not "the drill centre is
+    # inside the pad's box". A hole whose wall stays clear of the outline is a
+    # dogbone and is fine; a hole that grazes the outline is a process defect
+    # however small the overlap, because that is where the barrel meets the
+    # joint. `hole_gap_mm` is echoed so a reader can see how deep it went.
     hole_hits = []
+    pad_polys = []
+    for p in pads:
+        pts = _pad_polygon(p)
+        if pts is not None:
+            pad_polys.append((p, pts))
     for v in (board.vias or []):
         vx, vy = float(v.get("x") or 0.0), float(v.get("y") or 0.0)
         vnet = v.get("net")
-        for p in pads:
+        drill = float(v.get("drill") or 0.0)
+        if drill <= 0.0:
+            continue
+        for p, pts in pad_polys:
             if p.get("net") != vnet:
                 continue
-            if _rect_contains(vx, vy, p):
+            gap = _to_polygon(vx, vy, pts)
+            if gap < drill / 2.0 - 1e-6:
                 hole_hits.append({
                     "ref": p.get("ref"), "pad": p.get("number"), "net": vnet,
                     "via": [round(vx, 3), round(vy, 3)],
-                    "drill_mm": round(float(v.get("drill") or 0.0), 3),
+                    "drill_mm": round(drill, 3),
+                    "hole_gap_mm": round(gap, 3),
                     "layer": v.get("from") if v.get("from") == v.get("to")
                     else "%s-%s" % (v.get("from"), v.get("to")),
                 })
@@ -450,10 +526,11 @@ def gate(board, edge_keepout_mm=None, soft_mm=None, hard_mm=None, top=20):
                 "measurement, not by name." % (MODULE_AREA_FRAC * 100)),
         },
         unit="count / mm",
-        model="courtyards (drawn contour, convex hull + separating axis) + pads "
-              "(rotated rectangles) + via drills + track segments vs inductor "
-              "bodies, each folded into a ranked pass/fail",
-        basis="the board's own footprint courtyards and pad rectangles; a "
+        model="courtyards (drawn contour, convex hull + separating axis) + pad "
+              "copper (real outline polygon: round, oval, rounded rectangle) + "
+              "via drills + track segments vs inductor bodies, each folded into "
+              "a ranked pass/fail",
+        basis="the board's own footprint courtyards and pad outlines; a "
               "footprint with no courtyard falls back to its bounding box, and "
               "the fallback is named in the row",
         precision="overlap is exact for convex courtyards (all rectangles here) "
