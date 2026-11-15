@@ -22,10 +22,16 @@ The order is by "how unrecoverable is this in copper":
 3. `duplicate_copper` - two tracks with the same net, layer and both endpoints.
    Pure waste, and it silently doubles every length and detour number the other
    audits report (`/FSPI_CLK` on the SOM board carried exactly this pair).
-4. `square_corner` - a 90 degree turn where 135 was available. Reported always,
+4. `redundant_loop` - a signal net that closes a ring against itself. Two paths
+   between the same pair of pins is copper drawn twice, and it inflates every
+   length the other rules read. `duplicate_copper` cannot see it (the endpoints
+   differ) and `detour_ratio` cannot see it until the ring is long enough to break
+   a cap. Rails are reported and exempt from blocking: feeding one ball row from
+   two stitched rails is how a rail shares current without being widened.
+5. `square_corner` - a 90 degree turn where 135 was available. Reported always,
    blocking only in `strict`. A pocket between pads can force a 90, so this one
    is a judgement and says so.
-5. `detour_ratio` - routed length over the minimum spanning tree of the net's pad
+6. `detour_ratio` - routed length over the minimum spanning tree of the net's pad
    centres. Blocking only past `hard_ratio`, because the denominator is a LOWER
    bound: a multi-drop net or a net whose parts sit on opposite edges of the board
    legitimately scores high.
@@ -51,9 +57,11 @@ RULES = (
      "rule": "every segment heading is 0/45/90 degrees"},
     {"priority": 3, "id": "duplicate_copper", "blocking": True,
      "rule": "no two tracks share net, layer and both endpoints"},
-    {"priority": 4, "id": "square_corner", "blocking": False,
+    {"priority": 4, "id": "redundant_loop", "blocking": True,
+     "rule": "no signal net closes a ring against itself (a rail may be a grid)"},
+    {"priority": 5, "id": "square_corner", "blocking": False,
      "rule": "a 90 degree turn where a 135 chamfer was available"},
-    {"priority": 5, "id": "detour_ratio", "blocking": False,
+    {"priority": 6, "id": "detour_ratio", "blocking": False,
      "rule": "routed length stays near the pad spanning tree"},
 )
 
@@ -102,6 +110,231 @@ def _duplicate_copper(board, tol_mm=0.002):
     return dups
 
 
+#: A ring inside one net is copper the net does not need, and nothing else in
+#: this module sees it: `duplicate_copper` only catches a copy with the SAME two
+#: endpoints, and `detour_ratio` only fires once the ring is long enough to push
+#: the ratio past a cap. "Drawn twice between the same two pins" is the ordinary
+#: way a redundant path appears - a second attempt left in place beside the first.
+#:
+#: Nodes are (layer, x, y) snapped to SNAP_MM, so copper that merely CROSSES is
+#: not a connection. Layers are fused only where the board itself says they are:
+#: at a via and at a through-hole pad. A same-net pair of tracks meeting on two
+#: different layers with no via between them is a different defect (a connection
+#: that is not one), and calling it a ring here would hide it.
+#:
+#: A vertex landing on another segment's interior SPLITS that segment, because
+#: that is how the copper actually meets: on the SOM board the 4.455 mm In3 arm
+#: ends at (12.355, 3.600), in the middle of the 12.110 -> 13.390 tie, and an
+#: endpoint-only graph read the ring as two unrelated paths.
+SNAP_MM = 0.01
+MIN_EDGE_MM = 0.02
+
+
+def _redundant_loop(board, snap_mm=None, min_edge_mm=None):
+    """Per net, the rings it closes: copper that could be taken out.
+
+    Returns one row per net with at least one ring, listing the segments that
+    close it (longest first - the long way around is the one to drop, the short
+    direct link is the one to keep). `cycles` is `edges - nodes + components` of
+    that net's copper graph, which counts independent rings, not walks over them.
+    """
+    snap = float(SNAP_MM if snap_mm is None else snap_mm)
+    floor = float(MIN_EDGE_MM if min_edge_mm is None else min_edge_mm)
+    by_net = {}
+    for t in board.tracks or []:
+        net, lay = t.get("net"), t.get("layer")
+        st, en = t.get("start"), t.get("end")
+        if net is None or lay is None or not st or not en:
+            continue
+        by_net.setdefault(net, []).append(
+            (lay, float(st[0]), float(st[1]), float(en[0]), float(en[1]),
+             float(t.get("width") or 0.0)))
+
+    vias_by_net, pads_by_net = {}, {}
+    for v in board.vias or []:
+        if v.get("net") is None or v.get("x") is None or v.get("y") is None:
+            continue
+        vias_by_net.setdefault(v["net"], []).append((float(v["x"]), float(v["y"])))
+    for p in board.pads() or []:
+        if p.get("net") is None or p.get("x") is None or p.get("y") is None:
+            continue
+        lays = [str(v) for v in (p.get("layers") or [])]
+        if not (p.get("hole_mm") or any(v.startswith("*") for v in lays)):
+            continue
+        pads_by_net.setdefault(p["net"], []).append((float(p["x"]), float(p["y"])))
+
+    def node(lay, x, y):
+        return (lay, int(round(x / snap)), int(round(y / snap)))
+
+    rows = []
+    for net, segs in by_net.items():
+        verts = {}
+        for lay, x1, y1, x2, y2, _w in segs:
+            s = verts.setdefault(lay, set())
+            s.add(node(lay, x1, y1)[1:])
+            s.add(node(lay, x2, y2)[1:])
+
+        edges = []
+        for lay, x1, y1, x2, y2, w in segs:
+            dx, dy = x2 - x1, y2 - y1
+            L2 = dx * dx + dy * dy
+            cuts = []
+            if L2 > 0.0:
+                L = math.sqrt(L2)
+                for vx, vy in verts.get(lay, ()):
+                    px, py = vx * snap, vy * snap
+                    t = ((px - x1) * dx + (py - y1) * dy) / L2
+                    if t <= 0.0 or t >= 1.0:
+                        continue
+                    # a vertex sitting ON an endpoint is not a split: cutting
+                    # there invents a near-zero edge and a phantom ring
+                    if t * L < floor or (1.0 - t) * L < floor:
+                        continue
+                    cx, cy = x1 + t * dx, y1 + t * dy
+                    if math.hypot(px - cx, py - cy) > snap:
+                        continue
+                    cuts.append((t, px, py))
+            cuts.sort()
+            pts = [(x1, y1)] + [(cx, cy) for _t, cx, cy in cuts] + [(x2, y2)]
+            for i in range(len(pts) - 1):
+                a, b = pts[i], pts[i + 1]
+                ka, kb = node(lay, *a), node(lay, *b)
+                if ka == kb:
+                    continue
+                edges.append((math.hypot(b[0] - a[0], b[1] - a[1]),
+                              lay, ka, kb, a, b, w))
+        if not edges:
+            continue
+
+        # Two separate union-finds, and they must stay separate.
+        #
+        # `ident` answers "are these two snap keys the same physical point of
+        # copper". It is fed ONLY by the board's own evidence of a join: a via,
+        # a through-hole pad, or a track end a few microns off. `conn` answers
+        # "are these two points electrically on the same piece of this net",
+        # and it is fed by the edges.
+        #
+        # Conflating them is the trap this code already fell into twice. Using
+        # one map for both makes every pair of points on a connected net share a
+        # root, so every edge becomes a zero-length stub and the ring disappears;
+        # and merging identities without shrinking `nodes` leaves `nodes` too
+        # high, so each joined via cancels a real ring and the count can even go
+        # negative (the /FB_U7 loop on the SOM board read -1).
+        ident = {}
+
+        def ifind(a):
+            ident.setdefault(a, a)
+            r = a
+            while ident[r] != r:
+                r = ident[r]
+            while ident[a] != r:
+                ident[a], a = r, ident[a]
+            return r
+
+        def iunion(a, b):
+            ra, rb = ifind(a), ifind(b)
+            if ra != rb:
+                ident[ra] = rb
+
+        for _L, _lay, ka, kb, _a, _b, _w in edges:
+            ifind(ka)
+            ifind(kb)
+
+        def join_at(x, y):
+            # the via / pad anchor can sit a few microns off the track end that
+            # reaches it (9.400 vs 9.406 on the SOM board), so the join looks
+            # within 2 snap cells instead of demanding an exact hit. The epsilon
+            # is load-bearing: 3.582 against 3.600 is 0.020000000000000018 in
+            # floats, so a bare `<= 2*snap` refuses to join a pad the track
+            # actually reaches, and the ring that hangs off it goes unseen.
+            near = [n for n in ident
+                    if abs(n[1] * snap - x) <= 2 * snap + 1e-9
+                    and abs(n[2] * snap - y) <= 2 * snap + 1e-9]
+            for n in near[1:]:
+                iunion(near[0], n)
+
+        for x, y in vias_by_net.get(net, ()):
+            join_at(x, y)
+        for x, y in pads_by_net.get(net, ()):
+            join_at(x, y)
+
+        # Collapse every endpoint onto its merged identity BEFORE counting, so
+        # `nodes` counts physical points. An edge whose two ends collapse onto
+        # the same identity is a stub shorter than the join tolerance, not
+        # copper, and dropping it is what keeps a joined via from eating a ring.
+        merged = []
+        for L, lay, ka, kb, a, b, w in edges:
+            ra, rb = ifind(ka), ifind(kb)
+            if ra == rb:
+                continue
+            merged.append((L, lay, ra, rb, a, b, w))
+        if not merged:
+            continue
+
+        nodes = set()
+        for _L, _lay, ra, rb, _a, _b, _w in merged:
+            nodes.add(ra)
+            nodes.add(rb)
+
+        conn = {}
+
+        def cfind(a):
+            conn.setdefault(a, a)
+            r = a
+            while conn[r] != r:
+                r = conn[r]
+            while conn[a] != r:
+                conn[a], a = r, conn[a]
+            return r
+
+        for _L, _lay, ra, rb, _a, _b, _w in merged:
+            cra, crb = cfind(ra), cfind(rb)
+            if cra != crb:
+                conn[cra] = crb
+        comps = set(cfind(n) for n in nodes)
+        cycles = len(merged) - len(nodes) + len(comps)
+        if cycles <= 0:
+            continue
+
+        # which segments close a ring: add the shortest first, so the short
+        # direct link becomes the kept tree and the long way around is what is
+        # left over - removing the long one loses the least
+        tree = {}
+
+        def tfind(a):
+            tree.setdefault(a, a)
+            r = a
+            while tree[r] != r:
+                r = tree[r]
+            return r
+
+        removable = []
+        for e in sorted(merged, key=lambda r: r[0]):
+            ra, rb = tfind(e[2]), tfind(e[3])
+            if ra == rb:
+                removable.append(e)
+            else:
+                tree[ra] = rb
+        removable.sort(key=lambda r: -r[0])
+        rows.append({
+            "net": net,
+            "cycles": int(cycles),
+            "segments": len(edges),
+            "nodes": len(nodes),
+            "components": len(comps),
+            "removable": [
+                {"layer": e[1],
+                 "start": [round(e[4][0], 3), round(e[4][1], 3)],
+                 "end": [round(e[5][0], 3), round(e[5][1], 3)],
+                 "length_mm": round(e[0], 3),
+                 "width_mm": round(e[6], 3)}
+                for e in removable[:3]],
+            "removable_length_mm": round(sum(e[0] for e in removable), 3),
+        })
+    rows.sort(key=lambda r: (-r["removable_length_mm"], r["net"]))
+    return rows
+
+
 def gate(board, strict=False, angle_tol_deg=1.0,
          hard_ratio_signal=None, hard_ratio_power=None, top=20):
     """One verdict for "is this copper drawn the way the house draws it".
@@ -144,6 +377,7 @@ def gate(board, strict=False, angle_tol_deg=1.0,
                      for s in (av.get("per_layer") or {}).values())
 
     dups = _duplicate_copper(board)
+    loops = _redundant_loop(board)
 
     geo = _oracle.net_geometry_report(board, min_segments=1, top=0, detour_flag=1.8)
     gv = (geo.get("value") if isinstance(geo, dict) else None) or {}
@@ -184,10 +418,27 @@ def gate(board, strict=False, angle_tol_deg=1.0,
     _rule(RULES[2], len(dups), bool(dups),
           "%d duplicated track(s): same net, layer and both endpoints" % len(dups),
           dups)
-    _rule(RULES[3], square_total, False,
+    # A rail is allowed to be a grid. Feeding one ball row from two stitched
+    # rails is how power is shared without widening a trace, and `/ +1V8_ANA` on
+    # the SOM board does exactly that between y=31.246 and y=31.521. A signal has
+    # no such reason: two paths between the same two pins is copper drawn twice.
+    # Both are listed, only the signal rings block, and the rail rows are still
+    # in the report so nobody can hide an accident behind the exemption.
+    loop_rail = [r for r in loops if _is_powerish(r["net"])]
+    loop_sig = [r for r in loops if not _is_powerish(r["net"])]
+    _rule(RULES[3], len(loop_sig), bool(loop_sig),
+          "%d signal net(s) close a ring against themselves (%d ring(s)); the long "
+          "way around is listed first and is the piece to take out. %d rail net(s) "
+          "with %d ring(s) are listed but not blocking - a rail may be a stitched "
+          "grid on purpose" % (len(loop_sig),
+                               sum(r["cycles"] for r in loop_sig),
+                               len(loop_rail),
+                               sum(r["cycles"] for r in loop_rail)),
+          loop_sig + loop_rail)
+    _rule(RULES[4], square_total, False,
           "%d square (90 deg) corner(s); a 135 chamfer may or may not have been "
           "available - blocking only with strict=true" % square_total, square_list)
-    _rule(RULES[4], len(detour_hard), bool(detour_hard),
+    _rule(RULES[5], len(detour_hard), bool(detour_hard),
           "%d net(s) past the hard detour cap (%d more between 1.8 and the cap)"
           % (len(detour_hard), len(detour_soft)),
           [dict(r, severity="hard") for r in detour_hard]
@@ -227,13 +478,16 @@ def gate(board, strict=False, angle_tol_deg=1.0,
         unit="count / ratio",
         model="angle_audit (segment headings, corner interior angles) + "
               "net_geometry_report (length over pad MST) + an endpoint duplicate "
-              "scan, each folded into a ranked pass/fail",
+              "scan + a per-net copper graph whose rings are counted, each folded "
+              "into a ranked pass/fail",
         basis="the board's own track list; corners are seen only where two "
               "segments share an endpoint to 0.001 mm; the detour denominator is "
               "the pad-centre spanning tree, a lower bound",
         precision="duplicates are matched to %.2f mm on the endpoints; headings to "
-                  "%.2f deg; the detour caps are judgements, echoed per net"
-                  % (0.002, float(angle_tol_deg)),
+                  "%.2f deg; rings are found on a graph snapped to %.2f mm with "
+                  "cuts shallower than %.2f mm ignored; the detour caps are "
+                  "judgements, echoed per net"
+                  % (0.002, float(angle_tol_deg), SNAP_MM, MIN_EDGE_MM),
         assumptions={"strict": bool(strict),
                      "angle_tol_deg": float(angle_tol_deg),
                      "hard_ratio_signal": hard_s,
