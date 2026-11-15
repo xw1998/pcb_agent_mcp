@@ -132,6 +132,36 @@ class TestEproAdapter(unittest.TestCase):
         self.assertEqual(len(zone["outline"]), 5)      # chained, not flattened
         self.assertEqual(len(zone["filled_polygons"]), 1)
 
+    def test_poured_fill_is_written_in_ten_mil(self):
+        """A POURED contour is 10 mil, not mil: a hint read at 1:1 is 10x off.
+
+        Measured over 220 (pour, fill) pairs on 5 real projects: the fill bbox is
+        the pour bbox divided by 10 with a ~0.11 mm inset. Read at 1:1 the pour
+        lands a decade too close to the origin, and on `99593ab6...epro` every
+        GND via came back "copper on 0 layers" because GND is delivered by a pour.
+        """
+        zone = [z for z in self.board.zones if z["origin_type"] == "POUR"][0]
+        fill = zone["filled_polygons"][0]
+        xs = [pt[0] for pt in fill]
+        ys = [pt[1] for pt in fill]
+        # pour spans 50..900 x 50..700 mil; the fill is stored as 5..90 x 5..70
+        self.assertAlmostEqual(min(xs), fx.mil(50), places=6)
+        self.assertAlmostEqual(max(xs), fx.mil(900), places=6)
+        self.assertAlmostEqual(min(ys), fx.mil(50), places=6)
+        self.assertAlmostEqual(max(ys), fx.mil(700), places=6)
+        # and the fill therefore sits where the pour is, not a decade away
+        ox = [pt[0] for pt in zone["outline"]]
+        self.assertGreaterEqual(min(xs), min(ox) - 1e-6)
+        self.assertLessEqual(max(xs), max(ox) + 1e-6)
+
+    def test_a_pour_zone_carries_a_layers_list(self):
+        """`zone["layer"]` alone left `zone["layers"]` empty, so every consumer
+        (pour connectivity, plane coverage, the dead-end rule) read the pour as
+        absent - 176 of 176 GND vias came back "copper on 0 layers"."""
+        zone = [z for z in self.board.zones if z["origin_type"] == "POUR"][0]
+        self.assertEqual(zone["layers"], ["TOP"])
+        self.assertEqual(zone["layer"], "TOP")
+
     def test_zone_slot_that_is_not_a_distance_is_reported_raw(self):
         """POUR[5] holds only 0.2 or 1 in 12,400 measured pours: a flag."""
         for zone in self.board.zones:
@@ -235,6 +265,62 @@ class TestEproRectOutline(unittest.TestCase):
         bbox = self.board.as_dict()["outline_bbox"]
         self.assertAlmostEqual(bbox["width_mm"], 80.0, places=6)
         self.assertAlmostEqual(bbox["height_mm"], 60.0, places=6)
+
+
+class TestEproManyPouredRecordsForOnePour(unittest.TestCase):
+    """One pour, several `POURED` islands - assignment kept only the last one."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="epro_fill_")
+        cls.board = open_board(fx.write_epro(directory=cls.tmp,
+                                            name="two.islands.epro",
+                                            fill_records=2))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_every_poured_record_of_a_pour_is_kept(self):
+        zone = [z for z in self.board.zones if z["origin_type"] == "POUR"][0]
+        self.assertEqual(len(zone["filled_polygons"]), 2)
+        spans = []
+        for poly in zone["filled_polygons"]:
+            xs = [pt[0] for pt in poly]
+            spans.append((round(min(xs), 6), round(max(xs), 6)))
+        self.assertEqual(spans[0], (fx.mil(50), fx.mil(900)))
+        self.assertEqual(spans[1], (fx.mil(100), fx.mil(400)))
+
+
+class TestEproFourCopperLayers(unittest.TestCase):
+    """A 4-layer stackup whose two inner layers are both literally "SIGNAL"."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="epro_4l_")
+        cls.board = open_board(fx.write_epro(directory=cls.tmp,
+                                            name="four.layers.epro",
+                                            four_layers=True))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_inner_copper_layers_with_the_same_name_are_kept_apart(self):
+        """Layer 15 and 16 are both "SIGNAL": one bucket for two layers makes a
+        via's span, a plane's adjacency and a same-layer crossing all answer
+        about a layer that does not exist (measured: 1,460 of 1,509 vias on
+        `1dc6aafb...epro` read as "copper on one side only")."""
+        self.assertEqual(self.board.source["copper_layers"],
+                         ["TOP", "SIGNAL#15", "SIGNAL#16", "BOTTOM"])
+        self.assertIn("SIGNAL#15", self.board.source["layer_note"])
+
+    def test_a_via_spans_every_copper_layer(self):
+        via = self.board.vias[0]
+        self.assertEqual(via["layers"],
+                         ["TOP", "SIGNAL#15", "SIGNAL#16", "BOTTOM"])
+        self.assertEqual(via["from"], "TOP")
+        self.assertEqual(via["to"], "BOTTOM")
 
 
 class TestEproInspect(unittest.TestCase):

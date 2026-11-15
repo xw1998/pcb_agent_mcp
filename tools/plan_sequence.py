@@ -113,6 +113,14 @@ BOARD_TIMEOUT = 180.0
 #: assume stdout is clean JSON.
 _EMIT = "<<<PLAN_SEQUENCE_REP>>>"
 
+#: What a corpus directory may hold.  The gate chain reads the *canonical* board,
+#: not a `pcbnew` object, so a 立创EDA container (`.epro`/`.eprj`) is judgeable
+#: too - only the two steps that need pcbnew (`bus` needs a meander search on the
+#: raw board, `closure` needs `GetUnconnectedCount`) come back `n/a` with the
+#: reason written down.  Leaving them out would keep the rules validated on
+#: nothing but KiCad demo boards while 20 real hand-drawn boards sat unread.
+CORPUS_SUFFIXES = (".kicad_pcb", ".epro", ".eprj", ".eprj2")
+
 
 # --------------------------------------------------------------------------- #
 # geometry helpers (canonical, mm, y up)
@@ -190,6 +198,32 @@ def board_area(board):
     return max(0.0, area)
 
 
+def pad_wh(pad):
+    """A pad's (w, h) in mm, never None.
+
+    A custom (polygon) pad carries a point list instead of a size, so the 立创EDA
+    adapter stores `w`/`h` as null.  `max(None, None)` raised inside `gate_frame`
+    and turned the whole board into `error` (measured: 13 such pads on
+    1dc6aafb…__52x_), so the extent is taken from the polygon itself.
+    """
+    w, h = pad.get("w"), pad.get("h")
+    if w is not None and h is not None:
+        return float(w), float(h)
+    poly = pad.get("polygon") or []
+    if poly:
+        xs = [float(pt[0]) for pt in poly]
+        ys = [float(pt[1]) for pt in poly]
+        if w is None:
+            w = max(xs) - min(xs)
+        if h is None:
+            h = max(ys) - min(ys)
+    return float(w or 0.0), float(h or 0.0)
+
+def pad_half(pad):
+    """Half of the pad's larger side, in mm (the `copper_items` convention)."""
+    w, h = pad_wh(pad)
+    return max(w, h) / 2.0
+
 def copper_items(board, with_pads=True):
     """Every copper object as (kind, net, layer, half, geom) in canonical mm.
 
@@ -216,7 +250,7 @@ def copper_items(board, with_pads=True):
     if not with_pads:
         return items
     for p in board.pads():
-        half = max(p["w"], p["h"]) / 2.0
+        half = pad_half(p)
         layers = p["layers"] or []
         items.append({"kind": "disc", "net": p["net"],
                       "layer": layers[0] if len(layers) == 1 else "*",
@@ -266,7 +300,7 @@ def castellated_nets(board):
         return set(), []
     out, pts = set(), []
     for p in board.pads():
-        half = max(p["w"], p["h"]) / 2.0
+        half = pad_half(p)
         d = min(pt_seg(p["x"], p["y"], a[0], a[1], b[0], b[1])
                 for a, b in segs) - half
         if d < 0.0:
@@ -333,8 +367,14 @@ def gate_frame(board, ctx):
     rule = (board.rules or {}).get("clearance", {}).get("min_copper_edge_clearance")
     need = rule if rule else 0.30            # house number, reported not judged
     closed = bool(board.outline) and len(board.outline[0]) >= 4
+    open_note = (board.source or {}).get("outline_note")
+    # No closed edge means no distance to measure, not a copper fault.  Calling it
+    # `fail` let three real 立创EDA boards (shipped products) convict the rule in a
+    # corpus run - reported as "好板子多数不过 => 这条规则是错的" when the truth is
+    # "板边没连成闭环，这一关无法测量".  Whether an outline closes is DRC's entry
+    # (`malformed outline`); this gate only judges copper-to-edge distance.
     if not closed:
-        ok = False
+        ok = None
     elif worst is None and not under:
         # nothing routed / no via at all: the "copper near the edge" question has
         # no object to measure.  Vacuously "passing" would be a false green if the
@@ -342,8 +382,22 @@ def gate_frame(board, ctx):
         ok = None
     else:
         ok = bool(worst >= EDGE_HARD_MM - 1e-9 and not under)
+    if ok is None and not closed:
+        note = ("板框没闭合（%s）：没有板边，铜到板边的距离无从测量——这一条是"
+                "「测不出」，不是「不合格」" % (open_note or "没有任何闭合板框"))
+    elif ok is None:
+        note = "这块板上没有走线也没有过孔，板边间距无从测量"
+    elif not ok:
+        note = ("铜离板边不到 %.2f mm（蚀刻公差内就会破）：这一条不是「以后会出问题」，"
+                "是已经存在" % EDGE_HARD_MM)
+    else:
+        note = "板框闭合，铜离板边 %.4f mm ≥ 物理下限 %.2f mm" % (worst, EDGE_HARD_MM)
+        if worst < need - 1e-9:
+            note += ("；比本项目 %.2f mm 的用户规则紧 %.4f mm（house，不判）"
+                     % (need, need - worst))
     return {"outline_contours": len(board.outline or []),
             "outline_closed": closed,
+            "outline_note": open_note,
             "edge_min_mm": None if worst is None else round(worst, 4),
             "edge_needed_mm": round(need, 4),
             "edge_hard_mm": EDGE_HARD_MM,
@@ -351,17 +405,23 @@ def gate_frame(board, ctx):
             "tracks_vias_under": len(under),
             "castellated_nets": len(cast),
             "castellated_pads": len(pad_under),
-            "pad_edge_min_mm": None if pad_worst is None else round(pad_worst, 4)}, ok, (
-        ("这块板上没有走线也没有过孔，板边间距无从测量" if ok is None else
-         ("板框没闭合，或铜离板边不到 %.2f mm（蚀刻公差内就会破）：这一条不是"
-          "「以后会出问题」，是已经存在" % EDGE_HARD_MM if not ok else
-          ("板框闭合，铜离板边 %.4f mm ≥ 物理下限 %.2f mm" % (worst, EDGE_HARD_MM)
-           + ("；比本项目 %.2f mm 的用户规则紧 %.4f mm（house，不判）"
-              % (need, need - worst) if worst < need - 1e-9 else "")))))
-
+            "pad_edge_min_mm": None if pad_worst is None else round(pad_worst, 4)}, ok, note
 
 def gate_floorplan(board, ctx):
     import plan_floorplan
+    # No closed board edge means there are no four sides, so "is this
+    # connector on the wrong edge" has no object to measure.  That is the
+    # same unmeasurable case as the frame gate above, not a copper fault -
+    # but plan_floorplan raises for it, and a raise reads as `error` and
+    # stops the whole chain.  Measured: three shipped 立创EDA boards
+    # (5c71f32e / 99593ab6 / fadd8cdd) turned floorplan into `error` in a
+    # corpus run purely because their outline never closes.
+    if board is not None and not (getattr(board, "outline", None) or []):
+        return {"crossing_nets": 0, "nets_priced": 0,
+                "outline_note": (getattr(board, "source", None) or {}).get(
+                    "outline_note")}, None, \
+               ("这块板的板边没有连成闭环，没有四条边可量，「朝向错」这一问测不出"
+                "（与 frame 同一类：板框闭不闭合是 DRC 的入口，不是这一关的判据）")
     rep = plan_floorplan.analyse(ctx["path"])
     priced = rep.get("nets_priced") or 0
     cross = rep.get("crossing_total") or 0
@@ -478,7 +538,8 @@ def _in_pad(pad, x, y, extra=0.0):
     th = math.radians(pad.get("rotation") or 0.0)
     c, s = math.cos(th), math.sin(th)
     u, v = dx * c + dy * s, -dx * s + dy * c
-    return abs(u) <= pad["w"] / 2.0 + extra and abs(v) <= pad["h"] / 2.0 + extra
+    pw, ph = pad_wh(pad)
+    return abs(u) <= pw / 2.0 + extra and abs(v) <= ph / 2.0 + extra
 
 def _seg_in_pad(pad, x1, y1, x2, y2, extra=0.0):
     """Does the segment touch the pad rectangle (grown by `extra`)?
@@ -498,8 +559,9 @@ def _seg_in_pad(pad, x1, y1, x2, y2, extra=0.0):
 
     ax, ay = local(x1, y1)
     bx, by = local(x2, y2)
-    hx = pad["w"] / 2.0 + extra
-    hy = pad["h"] / 2.0 + extra
+    pw, ph = pad_wh(pad)
+    hx = pw / 2.0 + extra
+    hy = ph / 2.0 + extra
     t0, t1 = 0.0, 1.0
     dx, dy = bx - ax, by - ay
     for pp, qq in ((-dx, ax + hx), (dx, hx - ax), (-dy, ay + hy), (dy, hy - ay)):
@@ -556,7 +618,7 @@ def gate_fanout(board, ctx):
             if pad_count.get((p.get("net") or "").strip(), 0) <= 1:
                 esc += 1                    # single-pad net: nothing to connect
                 continue
-            r = max(p["w"], p["h"]) / 2.0 + ESCAPE_REACH_MM
+            r = pad_half(p) + ESCAPE_REACH_MM
             got = any((x - p["x"]) ** 2 + (y - p["y"]) ** 2 <= r * r for x, y in vias)
             if not got:
                 got = any(_in_pad(p, x, y, ESCAPE_TOUCH_MM) for x, y in ends)
@@ -789,6 +851,26 @@ WHY = {
 #: A corpus verdict below this many judged boards is not a verdict.  A rule
 #: "convicted" by one board is the mirror image of a false green.
 MIN_JUDGED = 3
+
+def corpus_paths(spec):
+    """Board files under `spec` (a directory, or a glob when it names one).
+
+    A directory is scanned for every supported suffix, deepest-first so a
+    project folder (`project.epro` + `PCB/*.epcb`) is picked up at its container.
+    """
+    if os.path.isdir(spec):
+        hits = []
+        for root, _dirs, names in os.walk(spec):
+            for n in names:
+                if n.lower().endswith(CORPUS_SUFFIXES):
+                    hits.append(os.path.join(root, n))
+        return sorted(hits)
+    hits = sorted(glob.glob(spec))
+    if hits:
+        return hits
+    return sorted(p for p in glob.glob(spec + "*")
+                  if p.lower().endswith(CORPUS_SUFFIXES))
+
 
 #: Where a rule comes from decides what a corpus can say about it.
 #:
@@ -1176,12 +1258,10 @@ def main(argv=None):
         return 0
 
     if args.corpus:
-        pat = args.corpus
-        if os.path.isdir(pat):
-            pat = os.path.join(pat, "*.kicad_pcb")
-        paths = sorted(glob.glob(pat))
+        paths = corpus_paths(args.corpus)
         if not paths:
-            print("no .kicad_pcb under %r" % args.corpus, file=sys.stderr)
+            print("no board under %r (looked for %s)"
+                  % (args.corpus, ", ".join(CORPUS_SUFFIXES)), file=sys.stderr)
             return 2
         out = run_corpus(paths, args.amplitude, args.clearance, args.quiet,
                          timeout=args.timeout, drc=args.drc,

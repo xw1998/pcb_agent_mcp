@@ -172,11 +172,77 @@ def test_frame_on_a_board_with_no_copper_is_na_not_pass():
     assert measured["edge_min_mm"] is None
     assert "无从测量" in note
 
-def test_frame_on_an_open_outline_still_fails():
+def test_frame_on_an_open_outline_is_unmeasurable_not_a_fault():
+    """No edge means no distance to measure.
+
+    This used to come back `fail`, and on a corpus of real 立创EDA boards three
+    shipped products "failed" the edge rule because their outline is drawn as
+    segments that do not meet. The corpus then printed "好板子多数不过 => 这条规则
+    是错的" - a rule convicted by a missing measurement. Whether an outline closes
+    is DRC's entry; this gate judges copper-to-edge distance only.
+    """
     b = Board("test", "memory")
     b.outline = []                             # no closed edge at all
-    _, ok, _ = S.gate_frame(b, {})
-    assert ok is False
+    measured, ok, note = S.gate_frame(b, {})
+    assert ok is None and measured["outline_closed"] is False
+    assert "测不出" in note
+
+def test_frame_survives_a_polygon_pad_with_no_width_or_height():
+    """A custom pad carries a point list, not a size (`w`/`h` are None).
+
+    `max(None, None)` raised inside the castellation test and turned a whole
+    board into `error` (measured: 13 such pads on a real 立创EDA board).
+    """
+    b = _board()
+    b.tracks = [_track("SIG", 20.0, 20.0, 25.0, 20.0)]
+    b.footprints = [{"ref": "U1", "pads": [
+        {"number": "69", "net": "GND", "x": 20.0, "y": 20.0,
+         "w": None, "h": None, "shape": "custom", "layers": ["F.Cu"],
+         "polygon": [[2.744995, 2.744995], [2.744995, -2.744995],
+                     [-2.744995, -2.744995], [-2.744995, 2.744995]]}]}]
+    measured, ok, _ = S.gate_frame(b, {})
+    assert ok is True                        # measured, not crashed
+    assert S.pad_half(b.pads()[0]) == 2.744995
+
+def test_corpus_paths_finds_easyeda_containers_too():
+    """A 立创EDA project is judgeable: the gates read the canonical board.
+
+    Globbing only `*.kicad_pcb` kept 20 real hand-drawn boards out of every
+    rule audit while sitting in the same corpus directory.
+    """
+    import tempfile
+    d = tempfile.mkdtemp()
+    for name in ("a.kicad_pcb", "b.epro", "c.eprj", "notes.txt"):
+        open(os.path.join(d, name), "w").close()
+    found = [os.path.basename(p) for p in S.corpus_paths(d)]
+    assert found == ["a.kicad_pcb", "b.epro", "c.eprj"]
+
+def test_floorplan_without_an_outline_is_unmeasurable_not_an_error():
+    """No sides means "wrong edge" has no object - and it must not stop the chain.
+
+    `plan_floorplan.analyse` raises `ValueError("board has no outline")`, which
+    the orchestrator turns into `error` and stops every later step. On three
+    shipped 立创EDA boards whose outline is drawn as open segments, that is
+    what happened: a missing measurement was printed as a broken board. The
+    frame gate already treats the same fact as n/a, so this one must too.
+    """
+    b = Board("test", "memory")
+    b.outline = []
+    measured, ok, note = S.gate_floorplan(b, {"path": "memory.kicad_pcb"})
+    assert ok is None                     # not a pass, not a fail
+    assert "测不出" in note
+    assert measured["nets_priced"] == 0
+
+def test_floorplan_still_measures_a_board_that_has_a_closed_outline(monkeypatch):
+    """The guard above must not swallow the real reading."""
+    import plan_floorplan
+    calls = []
+    monkeypatch.setattr(plan_floorplan, "analyse",
+                        lambda path: calls.append(path) or {"nets_priced": 0})
+    measured, ok, note = S.gate_floorplan(_board(), {"path": "memory.kicad_pcb"})
+    assert calls == ["memory.kicad_pcb"]      # the file really was measured
+    assert "outline_note" not in measured
+    assert "闭环" not in note                  # the no-outline wording, not this one
 
 def test_stackup_two_layer_is_na():
     b = _board(stackup=[{"name": "F.Cu"}, {"name": "B.Cu"}])

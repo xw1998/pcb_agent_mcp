@@ -179,6 +179,55 @@ def _layer_names(pcb):
             names[rec[1]] = str(rec[2])
     return names
 
+CU_COPPER_NAMES = {"TOP", "BOTTOM", "SIGNAL"}
+
+def _copper_layer_ids(pcb, names):
+    """Copper layers the stackup actually uses, in stackup order.
+
+    The `LAYER` table names every unused inner layer `SIGNAL` (codes 15..46 are
+    all literally "SIGNAL" in a 4-layer project), so the table alone cannot say
+    which two are in play - `LAYER_PHYS` can.
+    """
+    ids = [rec[1] for rec in pcb.get("LAYER_PHYS", []) if len(rec) > 1]
+    out = [i for i in ids if names.get(i) in CU_COPPER_NAMES]
+    if not out:
+        out = [c for c, n in sorted(names.items()) if n in CU_COPPER_NAMES][:2]
+    return out
+
+def _disambiguate_copper(pcb, names):
+    """Give each used copper layer a name of its own.
+
+    Two inner layers are both literally "SIGNAL", so a track on layer 15 and one
+    on layer 16 land in the same bucket: every per-layer question (a via's span,
+    a plane's adjacency, a same-layer crossing) then answers about a layer that
+    does not exist.  Measured on `_scratch/corpus/packed/1dc6aafb...__52x_.epro`:
+    714 tracks sit on the inner layers and 1,460 of 1,509 vias read as "copper on
+    one side only" because the via span had no layer name the tracks shared.
+
+    The written name is kept and the layer code appended (`SIGNAL#15`), so the
+    file's own word survives and the identity does not.  A name used once is
+    left exactly as written.
+    """
+    ids = _copper_layer_ids(pcb, names)
+    seen = {}
+    for i in ids:
+        seen.setdefault(names.get(i), []).append(i)
+    out = dict(names)
+    renamed = {}
+    for name, codes in seen.items():
+        if len(codes) < 2:
+            continue
+        for code in codes:
+            out[code] = "%s#%d" % (name, code)
+            renamed[code] = out[code]
+    note = None
+    if renamed:
+        note = ("%d copper layer(s) share a written name; they are kept apart by "
+                "appending the layer code (%s)"
+                % (len(renamed), ", ".join("%s -> %s" % (names[c], n)
+                                           for c, n in sorted(renamed.items()))))
+    return out, [out.get(i, str(i)) for i in ids], note
+
 def _layer_of(pcb, code, names):
     if code is None:
         return None
@@ -223,7 +272,23 @@ def _round_rect(x, y, w, h, radius):
     return pts
 
 def _rect_prims(raw):
-    """`["R", x, y, w, h, rotation_deg, corner_radius]` -> primitives + flags."""
+    """`["R", x, y, w, h, rotation_deg, corner_radius]` -> primitives + flags.
+
+    `y` is the **upper** edge: the rectangle spans `x .. x+w` and `y-h .. y`.
+    Measured against copper, not assumed - 6 such records on 2 projects, and the
+    rectangle only holds the copper area when it is read that way:
+
+        5c71f32e  GND pour   `y 3522.73  h 7176.96` -> its own tracks sit at
+                  y -370..1094 mil (`-3654..3523` holds them, `+3523..10699`
+                  does not)
+        fadd8cdd  `$6N3821`  `y 1330.84  h 34.66`    -> tracks at 1304..1307 mil
+        7f8fbddc  the board edge itself, `["R",5,2610,6340,2375]`, holds the
+                  whole copper area (5.97..66.30 mm) only as `235..2610` mil
+
+    Read the other way a board-wide pour lands one rectangle-height above the
+    board, which is what made 348 of 503 vias on `fadd8cdd` read as "copper on
+    one side only" - the pour that holds them was placed off the board.
+    """
     x, y = _num(raw[1]), _num(raw[2])
     w, h = _num(raw[3]), _num(raw[4])
     if None in (x, y, w, h):
@@ -231,14 +296,15 @@ def _rect_prims(raw):
     rot = _num(raw[5]) if len(raw) > 5 else 0.0
     radius = _num(raw[6]) if len(raw) > 6 else 0.0
     flags = []
-    pts = _round_rect(x, y, w, h, radius or 0.0)
+    y0 = y - h                       # `y` is the upper edge (see above)
+    pts = _round_rect(x, y0, w, h, radius or 0.0)
     if radius:
         flags.append("rect_corner_radius_sampled")
     if rot:
         # The rotation pivot is not established by the file; the rectangle is
         # turned about its own centre, the only choice that leaves it where the
         # record puts it.
-        cx, cy = x + w / 2.0, y + h / 2.0
+        cx, cy = x + w / 2.0, y0 + h / 2.0
         ar = math.radians(rot)
         pts = [(cx + (px - cx) * math.cos(ar) - (py - cy) * math.sin(ar),
                 cy + (px - cx) * math.sin(ar) + (py - cy) * math.cos(ar))
@@ -599,6 +665,12 @@ def _parse(container, path, member):
     })
     pcb = _records(chosen_doc)
     names = _layer_names(pcb)
+    # Two inner copper layers are both called "SIGNAL"; per-layer answers are
+    # meaningless until each has a name of its own (see `_disambiguate_copper`).
+    names, copper_layers, layer_note = _disambiguate_copper(pcb, names)
+    board.source["copper_layers"] = copper_layers
+    if layer_note:
+        board.source["layer_note"] = layer_note
     board.source["layers"] = [{"code": c, "name": n} for c, n in sorted(names.items())]
 
     # ---------------------------------------------------------- nets
@@ -808,7 +880,16 @@ def _parse(container, path, member):
             "x": mm(_num(rec[5])), "y": mm(_num(rec[6])),
             "drill": mm(_num(rec[7])),
             "diameter": mm(_num(rec[8])) if len(rec) > 8 else None,
-            "from": "TOP", "to": "BOTTOM", "kind": "through",
+            "from": copper_layers[0] if copper_layers else "TOP",
+            "to": copper_layers[-1] if copper_layers else "BOTTOM",
+            "kind": "through",
+            # A `VIA` record carries no span (`VIA [3]net [5]x [6]y [7] [8]`),
+            # and the only via record this format has is the plated through
+            # hole, so the span is every copper layer the stackup uses.
+            # Leaving `layers` out made every via fall back to F.Cu/B.Cu -
+            # names this format never uses - so on one real board 1,460 of
+            # 1,509 vias read as "copper on one side only".
+            "layers": list(copper_layers),
         })
 
     # ---------------------------------------------------------- pours / fills
@@ -820,6 +901,7 @@ def _parse(container, path, member):
         zone = {
             "net": rec[3] if len(rec) > 3 else None,
             "layer": _layer_of(pcb, rec[4], names),
+            "layers": _zone_layers(_layer_of(pcb, rec[4], names), copper_layers),
             # POUR[5] holds only 0.2 (12,232 pours) or 1 (168) in all 194
             # measured archives - it is a flag, not a distance, so it is kept
             # raw and no millimetre value is claimed for it.
@@ -845,7 +927,38 @@ def _parse(container, path, member):
         contours = _contours(rec[5])
         if rec[4] is False or (contours == [] and rec[3] == 0 and rec[4] is False):
             continue
-        zone["filled_polygons"] = [_to_mm_poly(c) for c in contours]
+        # A pour has one `POURED` record per filled island group (measured: up to
+        # 4 for a single GND pour), so this must extend.  Assigning kept only the
+        # last group: a via standing in the second island then read as "copper on
+        # one side only".
+        zone["filled_polygons"].extend(_filled_polygons(contours))
+        zone["fill_source"] = "POURED"
+    # 1 of the 6 packed projects carries **no `POURED` record at all**: the file
+    # was saved with its 10 pours unfilled, and every question about copper
+    # inside a pour then answered "no copper here". On `fadd8cdd` that turned
+    # 348 of 503 vias (342 of them GND stitching vias standing in the GND pour)
+    # into dead ends. The pour region is not the fill, but a filled pour of net N
+    # does cover its own region (minus clearance to other nets), so the region is
+    # used as the fill and **says so**: `fill_source` is the provenance, and a
+    # note is left on `board.source`.
+    from_outline = 0
+    for zone in pour_by_id.values():
+        if zone.get("filled_polygons"):
+            zone.setdefault("fill_source", "POURED")
+            continue
+        if len(zone.get("outline") or []) < 3:
+            zone["fill_source"] = None
+            continue
+        zone["filled_polygons"] = [list(zone["outline"])]
+        zone["fill_source"] = "pour_outline"
+        from_outline += 1
+    if from_outline:
+        board.source["fill_note"] = (
+            "%d pour(s) carry no POURED record, so their region is used as the "
+            "fill and flagged `fill_source=pour_outline`; copper inside them is "
+            "assumed present (a filled pour covers its own region apart from "
+            "clearance to other nets)" % from_outline)
+
     for rec in pcb.get("FILL", []):
         if len(rec) < 8:
             continue
@@ -856,6 +969,7 @@ def _parse(container, path, member):
         board.zones.append({
             "net": rec[3] if len(rec) > 3 else None,
             "layer": _layer_of(pcb, rec[4], names),
+            "layers": _zone_layers(_layer_of(pcb, rec[4], names), copper_layers),
             "clearance": None,
             "clearance_raw": _num(rec[5]) if len(rec) > 5 else None,
             "outline": _to_mm_poly(poly),
@@ -865,6 +979,7 @@ def _parse(container, path, member):
             "keepout": None,
             "is_keepout": False,
             "origin_type": "FILL",
+            "fill_source": "FILL",
         })
     for rec in pcb.get("REGION", []):
         if len(rec) < 8:
@@ -1140,6 +1255,40 @@ def _rules(board, pcb):
         board.rules["lceda"] = out
         board.rules["source"] = ("RULE records; every number is mil, the label in "
                                  "RULE[4][0] is the unit the user typed it in")
+
+def _zone_layers(layer_name, copper_layers):
+    """A zone's copper layers as a list, which is the canonical spelling.
+
+    `POUR [4]layer` is a single code, and `MULTI` (code 12) means "every copper
+    layer".  Writing only `zone["layer"]` left `zone["layers"]` empty, and every
+    consumer of a pour (a via's "copper on both sides", a plane's adjacency, the
+    dead-end rule) read the pour as absent: on `99593ab6...epro` 176 of 176 GND
+    vias came back "copper on 0 layers" because GND is delivered by a pour.
+    """
+    name = layer_name
+    if name is None:
+        return []
+    if str(name).upper() in ("MULTI", "*.CU", "*"):
+        return list(copper_layers)
+    return [name]
+
+#: A `POURED` contour is stored in **10 mil**, not mil.
+#:
+#: Measured, not assumed: over 220 (pour, fill) pairs on 5 real projects the fill
+#: bounding box is the pour's bounding box divided by 10 with a ~0.11 mm inset
+#: (pour `1530.7..2344.4` mil -> fill `153.5..234.0`; pour `1510.1..1648.7` ->
+#: fill `151.4..164.5`).  Read at 1:1000 in, every poured net looked empty - on
+#: `99593ab6...epro` 176 of 176 GND vias came back "copper on 0 layers", because
+#: GND is delivered by a pour and the pour was placed 10x too close to the origin.
+FILL_UNIT_MIL = 10.0
+
+def _filled_polygons(contours):
+    """POURED/FILL contours -> mm polygons, honouring `FILL_UNIT_MIL`."""
+    out = []
+    for cont in contours:
+        out.append(_to_mm_poly([(x * FILL_UNIT_MIL, y * FILL_UNIT_MIL)
+                                for x, y in cont]))
+    return out
 
 def _stackup(board, pcb, names):
     """LAYER_PHYS: [id, ?, ?, ?, ?, ?, ?]. Only the adjacency and copper weight

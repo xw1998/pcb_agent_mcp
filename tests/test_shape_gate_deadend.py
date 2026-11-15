@@ -40,11 +40,15 @@ D = "0.10"
 
 
 class _Board(object):
-    def __init__(self, tracks, vias=None, pads=None, zones=None):
+    def __init__(self, tracks, vias=None, pads=None, zones=None, stackup=None):
         self.tracks = tracks
         self.vias = vias or []
         self._pads = pads or []
         self.zones = zones or []
+        # `gate()` asks for copper layer names in stackup order to decide whether
+        # a via spans; the two-layer list keeps every case below unchanged.
+        self.stackup = stackup or [{"name": "F.Cu"}, {"name": "B.Cu"}]
+        self.footprints = []           # no part bodies: `pads()` is the flat list
 
     def pads(self):
         return self._pads
@@ -150,6 +154,28 @@ class TestDeadEnd(unittest.TestCase):
         n, ends, vias = _count(_Board(tracks, pads=pads))
         # F.Cu side is held by its pad; the B.Cu run holds nothing at either end
         self.assertEqual(ends, 2)
+
+    def test_a_foreign_pad_end_is_listed_but_does_not_block(self):
+        """A track end standing on another net's pad has copper under it.
+
+        The copper is there; the two nets disagree. That is a net-identity
+        question (DRC/connection), not a stub, so it is listed with
+        `kind="track_end_on_foreign_pad"` and must NOT be counted in `measured`
+        and must NOT turn the board into `shape_fail`. Measured on a real
+        立创EDA board (99593ab6): 0 dead ends, 7 such ends, and it still read
+        `shape_fail` - the blocking flag was computed from the item list.
+        """
+        tracks = [_seg("N1", "F.Cu", (0, 0), (10, 0))]
+        pads = [_pad("N2", 0, 0), _pad("N1", 10, 0)]   # (0,0) is N2's pad
+        board = _Board(tracks, pads=pads)
+        items, ends, vias = shape_gate._dead_end(board)
+        self.assertEqual((ends, vias), (0, 0))        # nothing counting
+        foreign = [i for i in items if i["kind"] == "track_end_on_foreign_pad"]
+        self.assertEqual(len(foreign), 1)
+        self.assertEqual(foreign[0]["on_pad_of"], "N2")
+        rule = {r["id"]: r for r in shape_gate.gate(board)["value"]["rules"]}
+        self.assertEqual(rule["dead_end"]["measured"], 0)
+        self.assertFalse(rule["dead_end"]["blocking"])
 
     def test_rule_rank_and_blocking(self):
         order = [r["id"] for r in shape_gate.RULES]

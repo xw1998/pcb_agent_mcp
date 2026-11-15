@@ -43,6 +43,7 @@ routes or places; it reads a `canonical.Board` and returns a dict.
 Nothing here is a route.
 """
 import math
+import re
 
 from . import oracle as _oracle
 from .calc.result import ok, err
@@ -82,6 +83,24 @@ HARD_RATIO_POWER = 3.2
 def _is_powerish(name):
     low = (name or "").lower()
     return any(h in low for h in POWER_HINTS)
+
+#: Ground is a rail too, for the ring rule: stitching a ground ring is how the
+#: same node is held on both sides of a board, exactly like feeding one ball row
+#: from two rails. Measured on `1dc6aafb` (a real 4-layer project): 9 of its 25
+#: rings are GND and `_is_powerish` did not know the word, so the board's `route`
+#: gate failed for doing the ordinary thing.
+GROUND_HINTS = ("gnd", "ground", "vss")
+
+#: A rail can be named by its voltage and nothing else: `24V`, `1V8`, `0V9`,
+#: `12V_ISO`. Matching only a fixed word list missed `24V` on `dcfea2db` and made
+#: its 24 V ring a blocking signal ring.
+_RAIL_VOLT = re.compile(r"\d+(?:[._-]?\d+)?v")
+
+def _is_rail(name):
+    low = (name or "").lower()
+    return (any(h in low for h in POWER_HINTS)
+            or any(h in low for h in GROUND_HINTS)
+            or bool(_RAIL_VOLT.search(low)))
 
 
 def _duplicate_copper(board, tol_mm=0.002):
@@ -408,16 +427,17 @@ def _dead_end(board, tol_mm=None):
              [str(x) for x in (v.get("layers") or [])]))
 
     pads_by_net = {}
+    every_pad = []              # (x, y, net, layers|None, polygon) for any net
     for p in board.pads() or []:
         net = p.get("net")
         if net is None or p.get("x") is None or p.get("y") is None:
             continue
         lays = [str(x) for x in (p.get("layers") or [])]
         thru = bool(p.get("hole_mm")) or any(x.startswith("*") for x in lays)
-        pads_by_net.setdefault(net, []).append(
-            (float(p["x"]), float(p["y"]),
-             None if thru else [x for x in lays if not x.startswith("*")],
-             pad_points(p)))
+        on = None if thru else [x for x in lays if not x.startswith("*")]
+        row = (float(p["x"]), float(p["y"]), on, pad_points(p))
+        pads_by_net.setdefault(net, []).append(row)
+        every_pad.append((row[0], row[1], net, on, row[3]))
 
     zones_by_net = {}
     for z in board.zones or []:
@@ -469,12 +489,40 @@ def _dead_end(board, tol_mm=None):
                 return True
         return zone_holds(net, lay, x, y)
 
+    def pad_here(lay, x, y, radius):
+        """The net of a pad of *any* net standing at (x,y), or None.
+
+        A track end that lands on a pad of another net is not a hanging tail:
+        the copper exists, the two nets just disagree (the file keeps both in its
+        NET table). Measured on `1dc6aafb`: 94 of its 136 "dead ends" stand
+        exactly on a pad of another net, e.g. a `$$$10132` trace ending on the
+        `PA_35_USB_DP_U1_TXD_EC1` pad - a net-identity question, not a stub.
+        """
+        for px, py, pnet, pl, poly in every_pad:
+            if pl is not None and lay not in pl:
+                continue
+            if math.hypot(x - px, y - py) <= radius + tol:
+                return pnet
+            if len(poly) >= 3 and _point_in_polygon(x, y, poly):
+                return pnet
+        return None
+
     items = []
     n_track_ends = 0
+    n_on_foreign_pad = 0
     for (net, lay), rows in segs.items():
         for x1, y1, x2, y2, w, uid in rows:
             for ex, ey in ((x1, y1), (x2, y2)):
                 if copper_here(net, lay, ex, ey, w / 2.0, skip_uuid=uid):
+                    continue
+                other = pad_here(lay, ex, ey, w / 2.0)
+                if other is not None:
+                    n_on_foreign_pad += 1
+                    items.append({"kind": "track_end_on_foreign_pad",
+                                  "net": net, "on_pad_of": other,
+                                  "layer": lay,
+                                  "x": round(ex, 4), "y": round(ey, 4),
+                                  "width_mm": round(w, 3)})
                     continue
                 n_track_ends += 1
                 items.append({"kind": "track_end", "net": net, "layer": lay,
@@ -498,6 +546,10 @@ def _dead_end(board, tol_mm=None):
                           "layers_with_copper": held,
                           "layers_spanned": len(layers)})
     items.sort(key=lambda r: (r["kind"] != "via", r["net"] or "", r["x"], r["y"]))
+    if n_on_foreign_pad:
+        _dead_end.last_on_foreign_pad = n_on_foreign_pad
+    else:
+        _dead_end.last_on_foreign_pad = 0
     return items, n_track_ends, n_vias
 
 def gate(board, strict=False, angle_tol_deg=1.0,
@@ -590,8 +642,8 @@ def gate(board, strict=False, angle_tol_deg=1.0,
     # no such reason: two paths between the same two pins is copper drawn twice.
     # Both are listed, only the signal rings block, and the rail rows are still
     # in the report so nobody can hide an accident behind the exemption.
-    loop_rail = [r for r in loops if _is_powerish(r["net"])]
-    loop_sig = [r for r in loops if not _is_powerish(r["net"])]
+    loop_rail = [r for r in loops if _is_rail(r["net"])]
+    loop_sig = [r for r in loops if not _is_rail(r["net"])]
     _rule(RULES[3], len(loop_sig), bool(loop_sig),
           "%d signal net(s) close a ring against themselves (%d ring(s)); the long "
           "way around is listed first and is the piece to take out. %d rail net(s) "
@@ -601,13 +653,20 @@ def gate(board, strict=False, angle_tol_deg=1.0,
                                len(loop_rail),
                                sum(r["cycles"] for r in loop_rail)),
           loop_sig + loop_rail)
-    _rule(RULES[4], dead_ends + dead_vias, bool(dead_items),
+    foreign = getattr(_dead_end, "last_on_foreign_pad", 0)
+    # Blocking on `dead_items` would put a board back in `shape_fail` for the
+    # foreign-pad rows, which are listed but deliberately not counted - measured
+    # on 99593ab6: 0 dead ends, 7 foreign-pad ends, verdict still `shape_fail`.
+    _rule(RULES[4], dead_ends + dead_vias, bool(dead_ends + dead_vias),
           "%d track end(s) touch no copper and %d via(s) have copper on one side "
           "only - neither joins anything. Copper that carries nothing is a stub "
           "the etcher still has to make and a hole that is drilled and paid for "
           "and does nothing. Touching is judged by half-width overlap, so two "
-          "0.1 mm tracks whose ends sit 0.0139 mm apart count as joined"
-          % (dead_ends, dead_vias), dead_items)
+          "0.1 mm tracks whose ends sit 0.0139 mm apart count as joined. "
+          "%d more end(s) stand on a pad of another net - the copper is there, "
+          "the two nets disagree, so that is a net-identity question and it is "
+          "listed but not counted above"
+          % (dead_ends, dead_vias, foreign), dead_items)
     _rule(RULES[5], square_total, False,
           "%d square (90 deg) corner(s); a 135 chamfer may or may not have been "
           "available - blocking only with strict=true" % square_total, square_list)

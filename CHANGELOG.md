@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.1.39] - 2026-11-15
+
+`docs/174` 的语料全是 KiCad demo 板，只能证明「规则在 KiCad 的读法下自洽」。这一版把 **6 块立创 EDA 工程（`.epro`）**
+接进同一套八关，接进去的第一秒就发现：**不是规则不对，是我把文件读错了**。**没有改任何板子，也没有改任何判据门槛**
+（`CROSS_FRAC_MAX` 0.15 / `EDGE_HARD_MM` 0.10 / 环路规则的 blocking 属性一个字没变）。
+
+- **`["R", x, y, w, h, …]` 里的 `y` 是上边缘**（矩形跨度 `x…x+w` × `y-h…y`）。三组独立证据：`5c71f32e` 的 GND 铺铜
+  （`y=3522.73 h=7176.96`，走线在 −370…1094 mil，只有 `−3654…3523` 包得住）、`fadd8cdd` 的 `$6N3821`
+  （`y=1330.84 h=34.66`，铜实测在 1304…1307 mil）、`7f8fbddc` 的**板框本身**（`POLY ["R",5,2610,6340,2375]`）。
+  读反的后果可量化：`fadd8cdd` 503 个过孔里 **348 个**被判「只有一侧铜」。
+- **`POURED` 的坐标单位是 10 mil 不是 mil**（同一块板上 `POUR` 用 mil、`POURED` 用 10 mil）；**一个铺铜可以有多条
+  `POURED`**（多岛，`extend` 不是覆盖）；**有的项目根本没有 `POURED`**（`fadd8cdd`：10 个 `POUR`、0 个 `POURED`）
+  ⇒ 轮廓回退当 fill 用并**声明出处**（`fill_source = "POURED"|"pour_outline"|"FILL"|None`、`board.source["fill_note"]`），
+  `fadd8cdd` 死过孔 **363 → 3**。方向写死：不回退会把好板判死（948 死过孔），回退不声明会掩盖真断点，选后者+公开出处。
+- **重名内层铜**改 `SIGNAL#15` / `SIGNAL#16`（两条都叫 `SIGNAL` 时按名字去重会让一条内层整个消失）；via 补 `layers`；
+  custom 焊盘没有 `w`/`h`（实测一块板 **13 个**）时取点集跨度，不再 `max(None, None)` 把整板变 `error`。
+- **`shape_gate.dead_end` 新增 `track_end_on_foreign_pad`**：`1dc6aafb` 报的 136 个死端里 **93 个**端点正落在**别的网的焊盘中心**
+  （铜是有的，两个网名不一致 ⇒ 网身份/连接性问题，属 DRC）。现在列出 `on_pad_of`、**不计入 `measured`、不 blocking**，
+  detail 单列数量。读数：`1dc6` **136 → 43**、`99593ab6` **7 → 0**。
+- **`GND` 与按电压命名的电源轨（`24V`/`1V8`）按 rail 豁免环路**（`GROUND_HINTS` + `_RAIL_VOLT` + `_is_rail`）：
+  缝合环本来就是标准做法。`1dc6` 信号环 **17 → 16**，另 **9 个 rail 网 / 25 个环**列出但不阻塞；`dcfea2db` 的 `24V` 环被豁免。
+- **自曝并修掉 `dead_end` 的 blocking 误用 `items`**：别网焊盘条目排在 `items` 里，`bool(dead_items)` 于是一块
+  **0 死端**的板（`99593ab6`，7 个别网焊盘）仍读 `shape_fail`。「列出来」和「算它」被同一行代码粘在了一起。
+- **`floorplan` 没有板框 ⇒ `n/a`**（原来 `plan_floorplan` 抛 `ValueError`，编排层翻译成 `error`，而 `error` 会**打断整条链**）：
+  三块量产板因此从「1 pass」变成 3 个 `error`。同一个事实（板边没闭合），`frame` 上一关说「测不出」、这一关说「算不出来还打断别人」，
+  口径自相矛盾。现在两关同一口径，并补 **两条**反向对照（无板框 ⇒ `n/a`；**有板框时必须真的去调 `analyse()`**——
+  只写第一条的话，一个「永远返回 n/a」的实现也能过）。
+- **`CORPUS_SUFFIXES` 收 `.epro/.eprj/.eprj2`**：立创工程以前躺在同一个目录里却从没进过任何一次规则体检。
+- **读数**（`D:/tmp/_seq_lceda5.json` / `_seq_corpus12.json`）：立创 6 板 `frame 3 pass/3 n/a`、`fanout 6/6`、`power 6/6`、
+  `route 2 pass/4 fail（house，不算反证）`、`floorplan/stackup/bus/closure` 全 `n/a`（立创容器没有 KiCad 叠层表、`bus`/`closure` 要 `pcbnew`）；
+  形状闸门逐板 `5c71f32e`/`7f8fbddc` `shape_pass`、其余四块 `shape_fail`（`1dc6` 16 信号环/43 死端/93 别网焊盘，`dcfea` 6 死端，`fadd8cdd` 2 环/18 死端）；
+  **KiCad 12 板回归无一块由 `pass` 变 `n/a`**（`floorplan` 的 10 个 `n/a` 里 9 个是本来就有的「没有到板边的网」）。
+- **不粉饰**：`4/6` 块量产板 `shape_fail` 是一个**待决的判据问题**，不是读取问题——失败项的可删长度是
+  `0.025…1.62 mm`（`1dc6` 16 个环的完整分布见 `docs/177` §6），全是 0.1 mm 量级的微桥而不是「绕一大圈」。
+  加可删长度下限等于宣布「0.1 mm 级冗余铜可以接受」，不加等于拒收 2/3 的量产板 ⇒ **本轮不动，把分布列出来，不拍阈值**。
+- **新增 `tests/conftest.py`**：`pytest tests/test_blockers.py` 单独跑报 `ModuleNotFoundError`
+  （收藏失败 ⇒ 文件里的用例一条都没跑，而 `pytest tests` 的数字和跑过了一模一样）。受影响的有 **60 个测试文件**，
+  它们一直只因为别处先做了 `sys.path.insert` 才「能跑」。修法是一处 `conftest.py`，不是给 60 个文件各抄三行；
+  补后 `test_blockers.py` 23 passed、`test_board_ops_footprint.py` 19 passed。
+- 测试：`test_epro.py` **31 passed**、`test_plan_sequence.py` **25 passed**、
+  `test_shape_gate_deadend.py` + `test_shape_gate_loop.py` **18 passed**。详见
+  `docs/177-立创EDA真实语料的六条格式缺陷与八关接入.md`。
+
 ## [0.1.38] - 2026-11-15
 
 `docs/174` 留下的欠账里**能补的都补掉了**（用户原话：「补上全部缺陷再给我」）。这一版**没有改任何板子**，

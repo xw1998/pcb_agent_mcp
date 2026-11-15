@@ -46,7 +46,7 @@ def stream(items, term="\n", trailing=False):
 
 
 # ------------------------------------------------------------------ documents
-def pcb_records(outline="closed"):
+def pcb_records(outline="closed", fill_records=1, four_layers=False):
     """The `PCB` document body, minus the DOCTYPE line.
 
     `outline` picks the board edge shape:
@@ -54,6 +54,11 @@ def pcb_records(outline="closed"):
         open   - four edges with one corner left 5 mil short (a real file does
                  this; the reader must not fit a contour over it)
         rect   - a single ``["R", ...]`` rectangle, as in the quick-start project
+
+    `fill_records` is how many ``POURED`` records the GND pour has (real projects
+    write up to 4: one poured outline per disjoint island). `four_layers` swaps
+    the 2-layer table for a 4-layer one whose two inner layers are both literally
+    called "SIGNAL", which is what the vendor writes.
     """
     recs = [
         ["HEAD", {"editorVersion": "2.2.36.7", "importFlag": 0, "uuid": PCB_UUID}],
@@ -62,6 +67,8 @@ def pcb_records(outline="closed"):
         ["LAYER", 2, "BOTTOM", "#0000ff"],
         ["LAYER", 3, "TOP_SILK", "#ffffff"],
         ["LAYER", 11, "OUTLINE", "#ffff00"],
+    ] + ([["LAYER", 15, "SIGNAL", "#00ff00"],
+          ["LAYER", 16, "SIGNAL", "#00ff00"]] if four_layers else []) + [
         ["NET", "GND", None, None, 1, None, 0, None],
         ["NET", "VCC", None, None, 1, None, 0, None],
         # id, group, layer, x, y, rotation, meta, locked
@@ -89,8 +96,13 @@ def pcb_records(outline="closed"):
         ["POUR", "p1", 0, "GND", 1, 0.2, "GND-pour", 0,
          [[50, 50, "L", 900, 50, 900, 700, 50, 700, 50, 50]], ["SOLID", 6], 0, 0],
         # POURED: id, pour id, ?, filled?, [contours]
+        # coordinates are **10 mil**, not mil: measured, the fill bbox is the
+        # pour bbox / 10 (see `epro.FILL_UNIT_MIL`). Same shape, one decade in.
         ["POURED", "pd1", "p1", 0, True,
-         [[50, 50, "L", 900, 50, 900, 700, 50, 700, 50, 50]]],
+         [[5, 5, "L", 90, 5, 90, 70, 5, 70, 5, 5]]]
+    ] + ([["POURED", "pd2", "p1", 0, True,
+           [[10, 10, "L", 40, 10, 40, 40, 10, 40, 10, 10]]]]
+         if fill_records > 1 else []) + [
         # FILL: id, ?, net, layer, <flag>, ?, [["R", x, y, w, h, rot, r]], ..
         ["FILL", "f1", 0, "VCC", 1, 0.2, 0, [["R", 100, 600, 200, 100, 0, 0]], 0],
         # REGION: id, ?, layer, <flag>, keepout flags, [contours], ..
@@ -98,14 +110,19 @@ def pcb_records(outline="closed"):
          [["CIRCLE", 3000, 3000, 100]], 0, None],
         ["LAYER_PHYS", 1, None, 1.379, None, None, 1],
         ["LAYER_PHYS", 101, "FR4", 60.236, 4.5, 0, 1],
+    ] + ([["LAYER_PHYS", 15, None, 1.379, None, None, 1],
+          ["LAYER_PHYS", 102, "FR4", 60.236, 4.5, 0, 1],
+          ["LAYER_PHYS", 16, None, 1.378, None, None, 1]] if four_layers else []) + [
         ["LAYER_PHYS", 2, None, 1.378, None, None, 1],
         ["RULE", "r1", "safeClearance", True, ["mm", 6]],
         ["STRING", "s1", 0, 3, 100, 50, "REV A", "default", 78.7402,
          0, 0, 0, 0, -270, 0, 0, 0, 0, 0],
     ]
     if outline == "rect":
+        # measured convention: `["R", x, y, w, h]` has `y` as the UPPER edge,
+        # so 2362.2047 (60 mm) is the top of the board, not its bottom
         recs.append(["POLY", "e10", 0, "", 11, 10,
-                     ["R", 0, 0, 3149.6063, 2362.2047, 0, 0], 0])
+                     ["R", 0, 2362.2047, 3149.6063, 2362.2047, 0, 0], 0])
     else:
         short = 5 if outline == "open" else 0       # leave the corner 5 mil short
         recs.append(["POLY", "e10", 0, "", 11, 10,
@@ -116,13 +133,13 @@ def pcb_records(outline="closed"):
     return recs
 
 
-def pcb_member_text(outline="closed"):
+def pcb_member_text(outline="closed", **opts):
     """One `.epcb` member: a FOOTPRINT document, then the PCB document (LF)."""
     items = [
         ["DOCTYPE", "FOOTPRINT", "1.9"],
         ["HEAD", {"editorVersion": "2.2.36.7", "uuid": PCB_UUID}],
         ["DOCTYPE", "PCB", "1.9"],
-    ] + pcb_records(outline) + [[]]        # a literal `[]` line really occurs
+    ] + pcb_records(outline, **opts) + [[]]    # a literal `[]` line really occurs
     return stream(items, term="\n", trailing=True)
 
 
@@ -159,7 +176,7 @@ def project_json(pcb_uuid=PCB_UUID, sch_uuid=SCH_UUID, fp_uuid=FP_UUID,
 
 
 # ------------------------------------------------------------------ archive
-def epro_bytes(outline="closed"):
+def epro_bytes(outline="closed", **opts):
     """A readable `.epro`: ZIP with the measured member layout."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -167,7 +184,7 @@ def epro_bytes(outline="closed"):
         zf.writestr("PCB/", b"")
         zf.writestr("FOOTPRINT/", b"")
         zf.writestr("SHEET/", b"")
-        zf.writestr("PCB/%s.epcb" % PCB_UUID, pcb_member_text(outline))
+        zf.writestr("PCB/%s.epcb" % PCB_UUID, pcb_member_text(outline, **opts))
         zf.writestr("FOOTPRINT/%s.efoo" % FP_UUID, footprint_member_text())
         zf.writestr("SHEET/%s/1.esch" % SCH_UUID,
                     stream([["DOCTYPE", "SCH", "1.9"],
