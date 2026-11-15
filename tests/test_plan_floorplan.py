@@ -75,3 +75,19 @@ def test_real_board_plan_cannot_be_worse_than_the_board():
                for g in got["groups"])
     assert got["crossing_total"] > 0
     assert got["nets_priced"] > 0
+    # a number from a heuristic must never be printed as "exact"
+    assert got["method"] in ("exact", "coordinate_descent")
+    assert got["method"] in got["how"]
+    assert got["enum_budget"] == P.ENUM_BUDGET
+
+
+def test_the_budget_is_what_decides_exactness(monkeypatch):
+    """Lowering the budget must change the reported method, not silently keep
+    calling a descent answer exact."""
+    board = os.path.join(REPO, "examples", "rk3506_som", "rk3506_som.kicad_pcb")
+    if not os.path.exists(board):
+        return
+    monkeypatch.setattr(P, "ENUM_BUDGET", 1)
+    got = P.analyse(board)
+    assert got["method"] == "coordinate_descent"
+    assert got["airwire_mm_best"] <= got["airwire_mm_now"] + 1e-6

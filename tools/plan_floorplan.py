@@ -62,6 +62,13 @@ TARGET_INSET_MM = 0.50
 
 SIDES = ("W", "E", "S", "N")
 
+#: How many side assignments the exact search may look at before it gives up on
+#: being exact.  4**8 = 65536 already takes a second on a 400-net board; a board
+#: with 12 movable groups would be 16.7 million and look like a hang.  Past this
+#: budget the search degrades to coordinate descent and the answer SAYS so in
+#: `method` - a number from a heuristic must never be printed as "exact".
+ENUM_BUDGET = 30000000
+
 
 def load(path):
     from pcb_agent_mcp.adapters import open_board
@@ -75,7 +82,7 @@ def outline_box(board):
             xs.append(float(pt[0]))
             ys.append(float(pt[1]))
     if not xs:
-        raise SystemExit("board has no outline - cannot measure sides")
+        raise ValueError("board has no outline - cannot measure sides")
     return min(xs), min(ys), max(xs), max(ys)
 
 
@@ -290,12 +297,35 @@ def analyse(path, top=12):
 
     names = [g["name"] for g in movable if g["name"] != hub]
     best = None
-    if names and len(names) <= 8:
+    method = "exact"
+    if names and 4 ** len(names) <= ENUM_BUDGET:
         for combo in itertools.product(SIDES, repeat=len(names)):
             assign = dict(zip(names, combo))
             t = total_for(assign)
             if best is None or t < best[0] - 1e-9:
                 best = (t, assign)
+    elif names:
+        # Too many groups for 4**N.  Coordinate descent: sweep one group at a
+        # time until no single move helps.  Said out loud in `method`.
+        method = "coordinate_descent"
+        actual = {g["name"]: g["actual_side"] for g in movable}
+        assign = {n: actual[n] for n in names}
+        t = total_for(assign)
+        for _ in range(4):
+            moved = False
+            for n in names:
+                keep = assign[n]
+                for s in SIDES:
+                    if s == keep:
+                        continue
+                    assign[n] = s
+                    cand = total_for(assign)
+                    if cand < t - 1e-9:
+                        t, keep, moved = cand, s, True
+                assign[n] = keep
+            if not moved:
+                break
+        best = (t, dict(assign))
     if best is None:
         best = (base_total, {})
     best_total, best_assign = best
@@ -357,7 +387,9 @@ def analyse(path, top=12):
         "outline_box": [round(v, 3) for v in box],
         "how": ("every functional group is one rigid body; each takes one of W/E/S/N; "
                 "the total is the half-perimeter airwire of every net that reaches a "
-                "board-edge terminal; the search is exact over 4**N"),
+                "board-edge terminal; the search is %s over 4**N" % method),
+        "method": method,
+        "enum_budget": ENUM_BUDGET,
         "airwire_mm_now": round(base_total, 3),
         "airwire_mm_best": round(best_total, 3),
         "airwire_saved_mm": round(base_total - best_total, 3),
@@ -388,7 +420,11 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=12)
     a = ap.parse_args(argv)
 
-    got = analyse(a.board, top=a.top)
+    try:
+        got = analyse(a.board, top=a.top)
+    except ValueError as exc:
+        print("error : %s" % exc, file=sys.stderr)
+        return 2
     if a.json:
         print(json.dumps(got, indent=2, ensure_ascii=False))
         return 0

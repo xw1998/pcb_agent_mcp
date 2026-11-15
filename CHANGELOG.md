@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.1.37] - 2026-11-15
+
+RK3506 核心板第三十七步：`docs/173` 诊断出的**第四个缺口**（好板子只被提炼成阈值、没被提炼成编排）
+这一版造成可执行的东西——`tools/plan_sequence.py` 八关线性链，并用 **12 块 KiCad demo 板**做反向检验。
+仍然**不写板、不挪件、不布线、不加 `--apply`**（不许自动布局/自动布线）。另修 `plan_floorplan` 的三处自曝缺陷。
+
+- **新 `tools/plan_sequence.py`（设计顺序编排器，~900 行，纯只读）**：`frame → floorplan → stackup → fanout → power → bus
+  → route → closure` 线性链。判词五种：`pass / fail / blocked / n/a / error`，其中**只有前面每一步都 pass 才可能判 `fail`**，
+  否则 `blocked`（数照测照打、明确不作判、写清被哪步挡住）、不适用判 `n/a`（**不是通过**）、算不出来判 `error`（**绝不等通过**）。
+  `ORIGIN` 把规则分 `physical`（物理上不行）与 `house`（本项目方针：45°/禁圆弧/禁死端/盘中孔/线宽/去耦距离），
+  语料不过 house 规则**不算反证**——否则拿 2005 年的手绘板反证 45° 是不讲理。
+  **实测 RK3506：`frame PASS`（`edge_min 0.4512`、`tracks_vias_under 0`、邮票孔 98 网/268 焊盘）→ `floorplan FAIL`
+  （`crossing_nets 36 / nets_priced 98 = 0.3673`、`airwire 2964.207→2962.169`、`proposal_overlaps 5`、hub `mcu` 占 33 条跨板网）
+  ⇒ 终判 `verdict = blocked_at_floorplan`、`next = floorplan`、`held = stackup,fanout,power,bus,route,closure`**。
+  这条输出本身就是结论：`bus` 的 47/49 放不下蛇形带、`closure` 的 7 条未连通，都在 `floorplan` 之下 ⇒ 不是该去修的地方，
+  是 `floorplan` 的账单（与 `docs/173` 第五节把 5 条归到布局层是同一件事，现在由程序说，不靠我事后归因）。
+- **`--corpus DIR` 独立评测模式**：`evaluate(..., chain=False)`，每关按自己判据独立判、不经链式阻断（样本数=板数），
+  回答「好板子违不违反这条规则」；`judge_corpus` 判：`rate≥0.9` 成立 / `0.5≤rate<0.9` 阈值可能过严 / `<0.5` 且 physical 则规则错 /
+  house 不算反证 / **`n < MIN_JUDGED(3)` ⇒ 样本不足不下结论**（n=1 定罪与假绿同类）。
+  **12 块 demo 板最终表**：`frame 10/1/1`（0.91，唯一 FAIL `tiny_tapeout` 真无闭合板框；`microwave` 0 track/0 via ⇒ n/a 不判 pass）、
+  `floorplan 0/2/9 n/a`（**n=2 ⇒ 样本不足**：`royalblue54L` 8/28=0.2857、`stickhub` 3/4=0.75）、`stackup 5/0/7`（1.00）、
+  **`fanout 12/0`（1.00）**、**`power 12/0`（1.00）**、`bus 0/0/12 n/a`（demo 板无 DDR 网）、
+  `route 1/11`（0.08，**house 不算反证**）、`closure 10/0/2 n/a`（1.00；两块 `LoadBoard` 卡死 ⇒ n/a 不判 pass）。
+- **判据按语料证据修订四处（每处都因为「好板子被判有罪」）**：① `fanout` 四修——同网铺铜算逃逸（`_in_poly`/`zone_cover`/`_poured`）、
+  焊盘盒测试认 rotation（`_in_pad` 在焊盘自身坐标系）、线段穿过焊盘算逃逸（`_seg_in_pad` Liang–Barsky）、单焊盘网直接计逃逸
+  ⇒ cm5_minima 三阵列 **1.0 / 12 块全过**；② `power` 只判「电源网只有焊盘、一点铜都没有」，段数/线宽只是未声明电流的代理量
+  ⇒ 7/12 不过 → 12/12（RK3506 的 9 条电源网全 0.10 mm 与 2002 年 demo 的 0.8 mm 不该互相判罪）；③ `closure` 只判 `unconnected==0`，
+  `hole_in_pad` 降 house ⇒ 10 块「未收口」消失；④ `frame` 改双阈值：物理下限 `EDGE_HARD_MM=0.10` 判决、本项目 house 0.30 只报告
+  ⇒ `stickhub` 0.2414 不再被诬告（附「比 0.30 紧 0.0586 mm（house，不判）」）。
+- **本轮写代码时自曝的四个 bug（都留了判据/注释）**：① `outline_segments` 用 `range(len(contour)-1)` 不闭合环
+  ⇒ 45×45 板左边距读成 **19.9 mm**（真值 0.05）的假绿，补末段闭合；② `plan_floorplan.outline_box()` 的 `raise SystemExit`
+  逃过 `except Exception` ⇒ 一块 `tiny_tapeout` 打断整轮 `exit=1`，改 `ValueError` + `evaluate` 捕 `(Exception, SystemExit)`；
+  ③ `pcbnew.LoadBoard` 静默卡死（`faulthandler` 定位 `pcbnew.py:9896`）⇒ `_ctx` 改惰性加载、`gate_bus` 按网名前缀便宜预筛、
+  `gate_closure` 未连接数走**子进程 + 120 s 超时**，超时判 `n/a` 不判 pass（本轮 royalblue 124.6 s、tiny_tapeout 吃满 125.7 s）；
+  ④ `plan_floorplan` 的 `4**N` 精确枚举无预算且报告仍写「exact」⇒ 新增 `ENUM_BUDGET = 30000000`，超预算降级坐标下降并加
+  `method ∈ {exact, coordinate_descent}` 自曝，`how` 一起改；反向对照测试把预算降到 1 断言 `method` 必须变。
+  同批修掉真 bug：坐标下降分支引用未定义的 `now_side`（`UnboundLocalError`，只有超预算的板会走到——没测过的分支就是没写过的分支）。
+- **`tools/plan_floorplan.py`**：`ENUM_BUDGET` + 坐标下降降级 + `method`/`enum_budget` 字段 + `outline_box` 改 `ValueError`
+  （CLI 打印 `error : ...` 返回 2）；RK3506 读数逐位不变（`2964.207 → 2962.169`、`method exact`）。
+- **`tools/plan_meander.py`**：新增 `length_group(net)` 按网名前缀归组（正则去序号与极性后缀）与 `--group-by-prefix`，
+  返回加 `groups`/`group_count`/`group_by`——`bus` 这一关靠它按组判「每组都放得下」。
+- **新 `tests/test_plan_sequence.py`（16 用例全过）**：链式语义（后来 fail 要变 `blocked`、`n/a` 不断链、`error` 永不当 pass、
+  普通异常也停链）、语料判词分 physical/house、`route` 是唯一 house 关、`all_nets` 读 track 不读网表、frame 六条（铜守规矩 pass /
+  进红线 fail / 真跨边 fail / 无铜 n/a 不是 pass / 开环仍 fail）、stackup 三条（2 层 n/a / 4 层无平面 fail / 有平面 pass）、
+  `length_group` 去序号与极性。`tests/test_plan_floorplan.py` 加 `method` 自曝与预算反向对照。
+- 174 → `docs/174-设计顺序编排八关与语料体检.md`（八关口径表、五种判词语义、`physical`/`house`、RK3506 `blocked_at_floorplan`、
+  12 板最终表、四个自曝 bug、四处判据修订、边界与欠账，以及**这块 RK3506 上做错的 12 件事**逐条带证据）。
+  欠账：`floorplan` 的 0.15 与 `bus` 的 0.30 振幅是假设（语料只证到「样本不足」）；`bus` 只有 RK3506 一块样本；
+  `LoadBoard` 卡死只能靠超时兜住、无根因。
+
 ## [0.1.36] - 2026-11-15
 
 RK3506 核心板第三十六步：0.1.35 之后用户问「为什么不能按规则画板子、为什么布局布得好、你学习了好板子却画不出、缺了什么」。

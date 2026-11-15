@@ -137,7 +137,30 @@ def net_segments(board, net_pat):
     return out
 
 
-def analyse(board, patterns, amplitude, clr=CLR_MM, step=STEP_MM):
+def length_group(net):
+    """The length-matching group a net belongs to, derived from its own name.
+
+    A length budget is never global: `DDR_A8` is matched against the address
+    group, never against a 33 mm clock.  Comparing every bus net to the longest
+    net on the board reads "47/49 short" on a board where the honest answer is
+    per-group, so the group key comes from the name: strip a leading `/`, then
+    strip the trailing instance bits (`13`, `0P`, `1N`, ...).
+
+        /DDR_DQ13  -> DDR_DQ      /DDR_DQS0P -> DDR_DQS
+        /DDR_A8    -> DDR_A       /DDR_BA0   -> DDR_BA
+    """
+    name = net.lstrip("/")
+    return re.sub(r"[0-9]*[PMN]?$", "", name).rstrip("_") or name
+
+
+def analyse(board, patterns, amplitude, clr=CLR_MM, step=STEP_MM, group_by=None):
+    """`group_by="prefix"` splits the matched nets into length groups.
+
+    Default (None) keeps the original single-target behaviour: every matched net
+    is compared to the longest one.  That is right when the caller narrowed the
+    net set to one group already (what the CLI does with `--nets DDR_A`), and it
+    is wrong for `--nets DDR`, so the split has to be asked for.
+    """
     import copper_geo                                            # noqa: F401
     items, holes, index, size = build_items(board)
     segs = net_segments(board, patterns)
@@ -150,10 +173,21 @@ def analyse(board, patterns, amplitude, clr=CLR_MM, step=STEP_MM):
         length = sum(math.hypot(p2[0] - p1[0], p2[1] - p1[1]) for _, _, p1, p2 in parts)
         width = sorted(w for _, w, _, _ in parts)[len(parts) // 2]
         rows.append({"net": name, "length_mm": round(length, 3),
-                     "width_mm": round(width, 3), "segments": len(parts)})
+                     "width_mm": round(width, 3), "segments": len(parts),
+                     "group": (length_group(name) if group_by == "prefix" else None)})
     if not rows:
         return {"error": "no net matched %r" % (patterns,), "rows": []}
 
+    targets = {}
+    for r in rows:
+        g = r["group"] if r["group"] is not None else ""
+        targets[g] = max(targets.get(g, 0.0), r["length_mm"])
+    for r in rows:
+        key = r["group"] if r["group"] is not None else ""
+        t = targets[key]
+        r["group_target_mm"] = round(t, 3)
+        r["need_mm"] = round(t - r["length_mm"], 3)
+        r["required_path_mm"] = round(r["need_mm"] / GAIN_PER_MM, 3) if r["need_mm"] > 0 else 0.0
     target = max(r["length_mm"] for r in rows)
     for r in rows:
         r["need_mm"] = round(target - r["length_mm"], 3)
@@ -200,7 +234,11 @@ def analyse(board, patterns, amplitude, clr=CLR_MM, step=STEP_MM):
                 "the amplitude; a sample can host a tooth only if the perpendicular "
                 "room beside it is at least amplitude + width/2 + clearance"
                 % GAIN_PER_MM),
-        "target_mm": round(target, 3),
+        "target_mm": round(max(r["length_mm"] for r in rows), 3),
+        "groups": ({k: round(v, 3) for k, v in sorted(targets.items()) if k}
+                   if group_by else {}),
+        "group_count": (len([k for k in targets if k]) if group_by else 1),
+        "group_by": group_by,
         "rows": rows,
         "not_fitting": [r["net"] for r in rows if not r["fits"]],
     }
@@ -215,6 +253,9 @@ def main(argv=None):
                     help="tooth height proposed (mm); 0.30 clears a 0.10 pitch")
     ap.add_argument("--clearance", type=float, default=CLR_MM)
     ap.add_argument("--step", type=float, default=STEP_MM)
+    ap.add_argument("--group-by-prefix", action="store_true",
+                    help="split the matched nets into length groups by name "
+                         "prefix (DDR_DQ13 -> DDR_DQ); use with --nets DDR")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
 
@@ -222,7 +263,8 @@ def main(argv=None):
     import json
     board = pcbnew.LoadBoard(a.board)
     pats = [p.strip() for p in a.nets.split(",") if p.strip()]
-    got = analyse(board, pats, a.amplitude, clr=a.clearance, step=a.step)
+    got = analyse(board, pats, a.amplitude, clr=a.clearance, step=a.step,
+                  group_by=("prefix" if a.group_by_prefix else None))
     if a.json:
         print(json.dumps(got, indent=2, ensure_ascii=False))
         return 0
