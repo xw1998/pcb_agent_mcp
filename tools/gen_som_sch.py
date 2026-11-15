@@ -222,7 +222,8 @@ def write_castellation_symbol(path=None):
            '    (property "Datasheet" "" (at 0 0 0)'
            ' (effects (font (size 1.27 1.27)) (hide yes)))',
            '    (property "Description" "140 castellation half-holes on the board'
-           ' edge; not a purchased part - pads only, no BOM line" (at 0 0 0)'
+           ' edge; not a purchased part - pads only, no BOM line. Geometry:'
+           ' docs/143 ss5 (r1) and ss8 R8" (at 0 0 0)'
            ' (effects (font (size 1.27 1.27)) (hide yes)))',
            '    (pin_names (offset 0.508) (hide yes))',
            '    (symbol "SOM_CASTELLATION_140_0_1"',

@@ -7,7 +7,7 @@
     (property "Value" "SOM_CASTELLATION_140" (at 0 93.64 0) (effects (font (size 1.27 1.27)) (justify left)))
     (property "Footprint" "RK3506:SOM_CASTELLATION_140" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
-    (property "Description" "140 castellation half-holes on the board edge; not a purchased part - pads only, no BOM line" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "140 castellation half-holes on the board edge; not a purchased part - pads only, no BOM line. Geometry: docs/143 ss5 (r1) and ss8 R8" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
     (pin_names (offset 0.508) (hide yes))
     (symbol "SOM_CASTELLATION_140_0_1"
       (rectangle (start -5.08 91.44) (end 5.08 -91.44) (stroke (width 0.254) (type default)) (fill (type background)))

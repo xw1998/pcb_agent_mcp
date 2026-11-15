@@ -58,7 +58,9 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
 EXAMPLES = os.path.join(REPO, "examples", "rk3506_som")
-BOARD = os.path.join(EXAMPLES, "rk3506_som.kicad_pcb")
+# A rebuild runs on a copy so a whole regeneration never has to edit the file
+# under version control (same convention as tools/route_som.py).
+BOARD = os.environ.get("SOM_BOARD") or os.path.join(EXAMPLES, "rk3506_som.kicad_pcb")
 
 TRACK_W = 0.10
 VIA_DIA = 0.20

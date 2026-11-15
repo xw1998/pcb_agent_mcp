@@ -10,6 +10,7 @@ Nothing here is a route; it is a package-geometry check.
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -397,19 +398,33 @@ class SourceNoteTest(unittest.TestCase):
         self.assertIn("EasyEDA", once)
         self.assertEqual(lceda_fp.with_source(""), lceda_fp.SOURCE_NOTE)
 
+    @staticmethod
+    def _declares_source(text):
+        """每个产物都要说出几何从哪来，但不许统一成同一个来源。
+
+        两条合法血脉：
+        1. 从立创（EasyEDA）官方库转换 ⇒ 文里必须有 "EasyEDA"；
+        2. 本文自己从图纸量的（如 SOM_CASTELLATION_140 由 docs/143 ss5/ss8 推出）
+           ⇒ 必须点名 docs/<编号>。
+        只认一条会让第 2 类产物永远红，或者逼着把 EasyEDA 写进不是它做的文件里。
+        """
+        if "EasyEDA" in text:
+            return True
+        return re.search(r"docs/\d+", text) is not None
+
     def test_every_generated_file_declares_the_source(self):
         missing = []
         for name in sorted(os.listdir(PRETTY)):
             if not name.endswith(".kicad_mod"):
                 continue
             with open(os.path.join(PRETTY, name), "r", encoding="utf-8") as fh:
-                if "EasyEDA" not in fh.read():
+                if not self._declares_source(fh.read()):
                     missing.append(name)
         for name in sorted(os.listdir(LIB)):
             if not name.endswith(".kicad_sym"):
                 continue
             with open(os.path.join(LIB, name), "r", encoding="utf-8") as fh:
-                if "EasyEDA" not in fh.read():
+                if not self._declares_source(fh.read()):
                     missing.append(name)
         self.assertEqual(missing, [], "这些产物缺出处声明：%s" % missing)
 

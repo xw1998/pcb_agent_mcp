@@ -31,7 +31,9 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
 EXAMPLES = os.path.join(REPO, "examples", "rk3506_som")
-BOARD = os.path.join(EXAMPLES, "rk3506_som.kicad_pcb")
+# SOM_BOARD lets a rebuild target a copy, exactly like tools/route_som.py and
+# tools/fanout_som.py, so no regeneration has to edit the committed example.
+BOARD = os.environ.get("SOM_BOARD") or os.path.join(EXAMPLES, "rk3506_som.kicad_pcb")
 SCHEMATIC = os.path.join(EXAMPLES, "rk3506_som.kicad_sch")
 LIB = os.path.join(EXAMPLES, "lib", "RK3506.pretty")
 KICAD_FP = os.environ.get("KICAD10_FOOTPRINTS",
