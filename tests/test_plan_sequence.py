@@ -212,3 +212,73 @@ def test_length_group_strips_index_and_polarity():
     assert M.length_group("/DDR_A0") == "DDR_A"
     # a net without a trailing index is its own group, not an empty name
     assert M.length_group("/DDR_CLK") == "DDR_CLK"
+
+
+def test_a_board_that_never_ran_is_never_a_pass():
+    """A hung/timed-out child has NO verdict: every step is error, and the
+    report says `not_run` instead of leaving steps to look judged."""
+    rep = S._unrun_report("B.kicad_pcb", "5.0 秒内没跑完")
+    assert rep["verdict"] == "not_run"
+    assert [s["status"] for s in rep["steps"]] == ["error"] * len(S.ORDER)
+    assert rep["not_judged"] == list(S.ORDER)
+    assert rep["first_failing_step"] is None
+
+
+def test_isolation_reports_a_broken_child_instead_of_raising():
+    rep = S.evaluate_isolated("nope.kicad_pcb", timeout=20)
+    assert rep["verdict"] == "not_run"
+    assert rep["note"]
+
+
+def test_corpus_does_not_count_a_hung_board_as_judged(monkeypatch, capsys):
+    hung = S._unrun_report("a.kicad_pcb", "deadline")
+    good = {"board": "b.kicad_pcb", "order": list(S.ORDER), "mode": "independent",
+            "verdict": "sequence_ok", "first_failing_step": None,
+            "not_judged": [],
+            "steps": [{"id": sid, "title": sid, "why": "", "requires": None,
+                       "status": "pass", "measured": {}, "note": ""}
+                      for sid in S.ORDER]}
+    monkeypatch.setattr(S, "evaluate_isolated",
+                        lambda p, *a, **kw: hung if p == "a.kicad_pcb" else good)
+    out = S.run_corpus(["a.kicad_pcb", "b.kicad_pcb"], 0.30, 0.10, quiet=False)
+    assert out["steps"]["frame"]["counts"]["not_run"] == 1
+    assert out["steps"]["frame"]["counts"]["pass"] == 1
+    assert out["steps"]["frame"]["judged"] == 1
+
+
+def test_the_drc_flag_reaches_the_closure_step(monkeypatch):
+    """`--drc` parsed and printed nothing for one round: the flag existed on the
+    CLI but `evaluate()` never put it in `ctx`, so `ctx.get("drc")` was always
+    falsy and no DRC reading ever appeared.  A flag that cannot reach the code
+    it names is worse than no flag - it reads as 'ran and found nothing'."""
+    seen = {}
+
+    def fake_gate(canon, ctx):
+        seen["drc"] = ctx.get("drc")
+        return {}, True, ""
+
+    monkeypatch.setattr(S, "_ctx", lambda path: {"path": path, "canonical": None})
+    monkeypatch.setattr(S, "ORDER", ("closure",))
+    monkeypatch.setattr(S, "GATES", {"closure": (fake_gate, "t")})
+    S.evaluate("B.kicad_pcb", drc=True)
+    assert seen["drc"] is True
+    S.evaluate("B.kicad_pcb")
+    assert seen["drc"] is False
+
+
+def test_floorplan_reports_its_threshold_sweep(monkeypatch):
+    import plan_floorplan
+    monkeypatch.setattr(plan_floorplan, "analyse",
+                        lambda path, top=12: {"nets_priced": 100,
+                                              "crossing_total": 10,
+                                              "overlaps": [],
+                                              "overlap_basis": "padding",
+                                              "airwire_saved_frac": 0.0,
+                                              "crossing_by_group": {}})
+    measured, ok, note = S.gate_floorplan(None, {"path": "B.kicad_pcb"})
+    assert ok is True
+    # 10/100 = 0.10 => passes at 0.10 as well; the sweep must say so instead of
+    # only printing the one threshold that was used for the verdict.
+    assert measured["by_threshold"]["0.10"] == "pass"
+    assert measured["by_threshold"]["0.30"] == "pass"
+    assert measured["overlap_basis"] == "padding"

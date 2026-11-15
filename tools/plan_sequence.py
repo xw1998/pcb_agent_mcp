@@ -92,6 +92,27 @@ ARRAY_PADS_MIN = 64
 #: A track end this far outside the pad still counts as leaving from the pad.
 ESCAPE_TOUCH_MM = 0.06
 
+#: The crossing share the floorplan step is judged at.  The step also reports the
+#: same board at every other value, because a threshold with no sensitivity
+#: reading is a number somebody picked.
+CROSS_SWEEP = (0.10, 0.15, 0.20, 0.25, 0.30)
+
+#: Meander tooth heights the bus step is reported at.  Judged at --amplitude
+#: (0.30); the other two exist so "47/49 short" cannot be read as "the number is
+#: an artefact of the tooth height I happened to choose".
+AMPLITUDE_SWEEP = (0.20, 0.25, 0.30)
+
+#: One board gets this long inside its own process before the run calls it a
+#: hang.  Measured worst case on the 12-board corpus is 125 s (a real file that
+#: spins inside `pcbnew.LoadBoard`); 180 keeps a slow-but-honest board and cuts
+#: a hung one.
+BOARD_TIMEOUT = 180.0
+
+#: Written by the child process in front of its JSON.  pcbnew prints
+#: "Adding duplicate image handler for ..." to stdout, so the parent cannot
+#: assume stdout is clean JSON.
+_EMIT = "<<<PLAN_SEQUENCE_REP>>>"
+
 
 # --------------------------------------------------------------------------- #
 # geometry helpers (canonical, mm, y up)
@@ -352,13 +373,16 @@ def gate_floorplan(board, ctx):
     overlaps = rep.get("overlaps") or []
     saved = rep.get("airwire_saved_frac") or 0.0
     ok = (not overlaps) and frac <= CROSS_FRAC_MAX
+    sweep = {("%.2f" % t): ("pass" if frac <= t else "fail") for t in CROSS_SWEEP}
     return {"crossing_nets": cross, "nets_priced": priced,
             "crossing_frac": round(frac, 4), "cross_frac_max": CROSS_FRAC_MAX,
+            "by_threshold": sweep,
             "airwire_mm_now": rep.get("airwire_mm_now"),
             "airwire_mm_best": rep.get("airwire_mm_best"),
             "airwire_saved_frac": saved,
             "hub_group": rep.get("hub_group"),
             "proposal_overlaps": len(overlaps),
+            "overlap_basis": rep.get("overlap_basis"),
             "crossing_by_group": rep.get("crossing_by_group")}, ok, (
         "%d 条网要跨板（占 %d 条可定价网的 %.0f%%），这些网无论后面怎么走都是绕大圈"
         % (cross, priced, frac * 100) if not ok else "没有跨板网堆积")
@@ -643,6 +667,23 @@ def gate_bus(board, ctx):
                "这块板上没有总线网，这一关不适用"
     rows = rep["rows"]
     short = [r for r in rows if not r["fits"]]
+    # Same board, three tooth heights.  A judgement that only holds at one of
+    # them is a judgement about the number I typed, not about the board.
+    sweep = {}
+    judged_amp = ctx.get("amplitude", 0.30)
+    for amp in AMPLITUDE_SWEEP:
+        if abs(amp - judged_amp) < 1e-9:
+            sweep["%.2f" % amp] = "%d/%d" % (len(short), len(rows))
+            continue
+        try:
+            alt = plan_meander.analyse(raw, BUS_PATTERNS, amp,
+                                      clr=ctx.get("clearance", 0.10),
+                                      group_by="prefix")
+            alt_rows = alt.get("rows") or []
+            sweep["%.2f" % amp] = "%d/%d" % (
+                len([r for r in alt_rows if not r["fits"]]), len(alt_rows))
+        except Exception as exc:                               # noqa: BLE001
+            sweep["%.2f" % amp] = "error: %r" % exc
     by_group = {}
     for r in rows:
         g = by_group.setdefault(r["group"], {"nets": 0, "short": 0,
@@ -660,7 +701,8 @@ def gate_bus(board, ctx):
                        "need_mm": r["need_mm"], "room_short_mm": r.get("room_short_mm")}
                       for r in sorted(short, key=lambda r: -(r.get("room_short_mm") or 0))[:5]],
             "amplitude_mm": rep["amplitude_mm"],
-            "gain_per_mm": rep["gain_per_mm"]}, ok, (
+            "gain_per_mm": rep["gain_per_mm"],
+            "short_by_amplitude": sweep}, ok, (
         "%d/%d 条总线在布线后找不到 %0.2f mm 的蛇形带 ⇒ 长度预算在布线阶段就没地方兑现"
         % (len(short), len(rows), ctx.get("amplitude", 0.30)) if not ok
         else "总线旁都留着蛇形带")
@@ -693,6 +735,26 @@ def gate_closure(board, ctx):
     # made 10 of 12 good boards read as "not closed" when their unconnected count
     # was 0.  One step, one claim.
     ok = (unconn == 0)
+    extra = {}
+    if ctx.get("drc"):
+        # Same reader board_loop.py uses, so the two tools cannot drift into
+        # "30 here, 41 there" for the same file.  Opt-in: it costs a kicad-cli
+        # run per board and it never decides this step.
+        try:
+            import board_loop
+            got = board_loop.drc(os.path.abspath(ctx["path"]),
+                                 os.path.abspath(ctx["path"]) + ".drc.json")
+            extra = {"drc_real": got.get("real"),
+                     "drc_artefact": got.get("artefact"),
+                     "drc_by_type": got.get("by_type"),
+                     "drc_origin": "reported only, never judged"}
+        except Exception as exc:                               # noqa: BLE001
+            extra = {"drc_error": repr(exc)}
+    if extra:
+        return dict({"unconnected": unconn, "hole_in_pad": hole,
+                     "hole_in_pad_origin": "house",
+                     "shape_verdict_reported_only": shape["verdict"]}, **extra), ok, (
+            "还有 %d 条网没连通" % unconn if not ok else "网表全连通")
     return {"unconnected": unconn, "hole_in_pad": hole,
             "hole_in_pad_origin": "house",
             "shape_verdict_reported_only": shape["verdict"]}, ok, (
@@ -817,7 +879,7 @@ def unconnected_count(path, timeout=120):
     return None, "pcbnew 子进程没给出未连接数：%s" % tail
 
 
-def evaluate(path, amplitude=0.30, clearance=0.10, chain=True):
+def evaluate(path, amplitude=0.30, clearance=0.10, chain=True, drc=False):
     """Walk the chain.  `fail` only when everything before it passed.
 
     `chain=False` judges every step on its own merits and skips the blocking,
@@ -830,6 +892,10 @@ def evaluate(path, amplitude=0.30, clearance=0.10, chain=True):
     ctx = _ctx(path)
     ctx["amplitude"] = amplitude
     ctx["clearance"] = clearance
+    # Opt-in DRC in the closure step.  It was a flag on the CLI before it was a
+    # flag here, so `--drc` parsed, said nothing, and printed no DRC reading -
+    # a flag that cannot reach the code it names is worse than no flag.
+    ctx["drc"] = bool(drc)
     steps = []
     broken = None
     for i, sid in enumerate(ORDER):
@@ -881,6 +947,67 @@ def evaluate(path, amplitude=0.30, clearance=0.10, chain=True):
                 "otherwise it is blocked - measured and printed, not judged"),
     }
 
+
+def _unrun_report(path, why, mode="isolated"):
+    """Every step `error`.  A board whose process timed out has NO verdict.
+
+    The tempting shortcut is one `n/a` or one `blocked` at the top - both would
+    let the corpus count a hung file as "not judged" on some steps and leave the
+    rest to be judged by whatever happened to finish.
+    """
+    steps = []
+    for i, sid in enumerate(ORDER):
+        steps.append({"id": sid, "title": GATES[sid][1], "why": WHY[sid],
+                      "requires": ORDER[i - 1] if i else None,
+                      "status": "error", "measured": {"error": why},
+                      "note": "这块板整块没跑完 ⇒ 每一关都是未判，不能当成通过"})
+    return {"board": os.path.abspath(path), "order": list(ORDER), "mode": mode,
+            "steps": steps, "first_failing_step": None,
+            "not_judged": list(ORDER), "verdict": "not_run", "note": why,
+            "how": "one board, one child process"}
+
+def evaluate_isolated(path, amplitude=0.30, clearance=0.10, chain=False,
+                      timeout=BOARD_TIMEOUT, drc=False):
+    """Evaluate one board in a child process with a hard deadline.
+
+    Why a process and not a thread: `pcbnew.LoadBoard` blocks inside C++ and
+    holds the GIL, so a Python-level timer cannot interrupt it.  Measured on
+    _corpus/royalblue54L_feather.kicad_pcb: 124.6 s in the main process, 0% CPU
+    inside the call, and no way to cancel it.  The only honest containment is a
+    boundary the OS can enforce.
+    """
+    cmd = [sys.executable, "-u", os.path.abspath(__file__),
+           "--board", os.path.abspath(path), "--emit-json",
+           "--amplitude", repr(float(amplitude)),
+           "--clearance", repr(float(clearance))]
+    if not chain:
+        cmd.append("--independent")
+    if drc:
+        cmd.append("--drc")
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["PYTHONPATH"] = os.pathsep.join([os.path.join(REPO, "src"), HERE])
+    t0 = time.time()
+    try:
+        got = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=timeout, env=env, cwd=REPO)
+    except subprocess.TimeoutExpired:
+        return _unrun_report(path, "%s 秒内没跑完（pcbnew.LoadBoard 卡死，或某一关算不完）"
+                             % timeout)
+    except OSError as exc:
+        return _unrun_report(path, "起不了子进程：%r" % exc)
+    out = got.stdout or ""
+    cut = out.rfind(_EMIT)
+    if cut < 0:
+        tail = ((got.stderr or "").strip().splitlines() or ["<no stderr>"])[-1]
+        return _unrun_report(path, "子进程没吐出报告：%s" % tail)
+    try:
+        rep = json.loads(out[cut + len(_EMIT):].strip())
+    except ValueError as exc:
+        return _unrun_report(path, "子进程报告解析失败：%r" % exc)
+    rep["elapsed_s"] = round(time.time() - t0, 1)
+    return rep
 
 # --------------------------------------------------------------------------- #
 # reporting
@@ -935,14 +1062,23 @@ def judge_corpus(origin, rate, n=None):
         return "好板子半数不过 => 阈值可能过严，待复核"
     return "好板子多数不过 => 这条规则是错的（不是板子错）"
 
-def run_corpus(paths, amplitude, clearance, quiet=False):
+def run_corpus(paths, amplitude, clearance, quiet=False,
+               timeout=BOARD_TIMEOUT, drc=False, inprocess=False):
     rows = []
     for i, p in enumerate(paths, 1):
         t0 = time.time()
         print("[%d/%d] %s ..." % (i, len(paths), os.path.basename(p)),
               file=sys.stderr, flush=True)
         try:
-            rep = evaluate(p, amplitude, clearance, chain=False)
+            if inprocess:
+                rep = evaluate(p, amplitude, clearance, chain=False)
+                if drc:
+                    # in-process mode has no child to carry --drc; report the
+                    # gap instead of silently dropping the flag
+                    rep["drc_note"] = "--drc needs the isolated runner"
+            else:
+                rep = evaluate_isolated(p, amplitude, clearance, chain=False,
+                                        timeout=timeout, drc=drc)
             print("        %.1fs  %s" % (time.time() - t0, rep["verdict"]),
                   file=sys.stderr, flush=True)
         except Exception as exc:                                # noqa: BLE001
@@ -951,10 +1087,17 @@ def run_corpus(paths, amplitude, clearance, quiet=False):
         rows.append({"board": os.path.basename(p), "rep": rep})
     summary = {}
     for sid in ORDER:
-        got = {"pass": 0, "fail": 0, "blocked": 0, "n/a": 0, "error": 0}
+        got = {"pass": 0, "fail": 0, "blocked": 0, "n/a": 0, "error": 0,
+               "not_run": 0}
         fail_on = []
         for r in rows:
             if "rep" not in r:
+                continue
+            if r["rep"].get("verdict") == "not_run":
+                # The process never finished: nothing about this board is known.
+                # Counting its 8 `error` steps as "measured" would blur a hang
+                # into a measurement.
+                got["not_run"] += 1
                 continue
             for s in r["rep"]["steps"]:
                 if s["id"] != sid:
@@ -972,18 +1115,25 @@ def run_corpus(paths, amplitude, clearance, quiet=False):
                    "that is too strict, not a corpus that is broken")}
     if quiet:
         return out
+    hung = [r["board"] for r in rows if r.get("rep", {}).get("verdict") == "not_run"]
     print("corpus %d board(s), bus amplitude %.2f, each step judged on its own "
-          "(no chain blocking)\n" % (len(rows), amplitude))
-    print("%-9s %-5s %-5s %-5s %-4s %-7s %-3s  %s"
-          % ("step", "pass", "fail", "blk", "n/a", "rate", "n", "judgement"))
+          "(no chain blocking)%s\n"
+          % (len(rows), amplitude,
+             (", one child process per board, %g s deadline" % timeout)
+             if not inprocess else ", in-process (no deadline)"))
+    if hung:
+        print("not run (process did not finish, NOT counted as pass): %s\n"
+              % ", ".join(hung))
+    print("%-9s %-5s %-5s %-5s %-4s %-3s %-7s %-3s  %s"
+          % ("step", "pass", "fail", "blk", "n/a", "nr", "rate", "n", "judgement"))
     for sid in ORDER:
         s = summary[sid]
         c = s["counts"]
         rate = "-" if s["pass_rate"] is None else "%.2f" % s["pass_rate"]
         judge = judge_corpus(ORIGIN[sid], s["pass_rate"], s["judged"])
-        print("%-9s %-5d %-5d %-5d %-4d %-7s %-3d  %s"
-              % (sid, c["pass"], c["fail"], c["blocked"], c["n/a"], rate,
-                 s["judged"], judge))
+        print("%-9s %-5d %-5d %-5d %-4d %-3d %-7s %-3d  %s"
+              % (sid, c["pass"], c["fail"], c["blocked"], c["n/a"],
+                 c["not_run"], rate, s["judged"], judge))
         if s["fail_on"]:
             print("          fail on: %s" % ", ".join(s["fail_on"][:8]))
     return out
@@ -999,7 +1149,31 @@ def main(argv=None):
     ap.add_argument("--clearance", type=float, default=0.10)
     ap.add_argument("--json", help="write the full report here")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--timeout", type=float, default=BOARD_TIMEOUT,
+                    help="seconds one board gets inside its own process (default %g)"
+                         % BOARD_TIMEOUT)
+    ap.add_argument("--drc", action="store_true",
+                    help="also run kicad-cli DRC in the closure step (reported, "
+                         "never judged; costs one kicad-cli run per board)")
+    ap.add_argument("--inprocess", action="store_true",
+                    help="run in this process instead of a child - no deadline, "
+                         "for debugging only")
+    ap.add_argument("--independent", action="store_true",
+                    help="judge every step on its own (no chain blocking)")
+    ap.add_argument("--emit-json", dest="emit_json", action="store_true",
+                    help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    chain = not args.independent
+
+    if args.emit_json and args.board:
+        # child mode: stdout carries one marker line and one JSON blob, nothing else
+        rep = evaluate(args.board, args.amplitude, args.clearance, chain=chain,
+                       drc=args.drc)
+        if args.drc:
+            rep["drc_requested"] = True
+        sys.stdout.write(_EMIT + json.dumps(rep))
+        sys.stdout.flush()
+        return 0
 
     if args.corpus:
         pat = args.corpus
@@ -1009,9 +1183,17 @@ def main(argv=None):
         if not paths:
             print("no .kicad_pcb under %r" % args.corpus, file=sys.stderr)
             return 2
-        out = run_corpus(paths, args.amplitude, args.clearance, args.quiet)
+        out = run_corpus(paths, args.amplitude, args.clearance, args.quiet,
+                         timeout=args.timeout, drc=args.drc,
+                         inprocess=args.inprocess)
     elif args.board:
-        rep = evaluate(args.board, args.amplitude, args.clearance)
+        if args.inprocess:
+            rep = evaluate(args.board, args.amplitude, args.clearance, chain=chain,
+                           drc=args.drc)
+        else:
+            rep = evaluate_isolated(args.board, args.amplitude, args.clearance,
+                                    chain=chain, timeout=args.timeout,
+                                    drc=args.drc)
         if not args.quiet:
             print_board(rep)
         out = rep

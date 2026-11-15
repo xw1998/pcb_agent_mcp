@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.1.38] - 2026-11-15
+
+`docs/174` 留下的欠账里**能补的都补掉了**（用户原话：「补上全部缺陷再给我」）。这一版**没有改任何板子**，
+也没有动任何门槛值（`CROSS_FRAC_MAX` 0.15 / 总线振幅 0.30 / `PLANE_COVER_MIN` 0.25 一个字没变），
+改的全是**读数的可信度结构**，并在补的过程里自曝出一个真缺陷（`--drc` 解析了却永远不生效）。
+
+- **每块板一个子进程 + `BOARD_TIMEOUT = 180 s` 硬超时**（`evaluate_isolated`）：`pcbnew.LoadBoard` 在 C++ 里阻塞且持有 GIL，
+  Python 层定时器无法中断（实测 `royalblue54L_feather` **124.6 s、0 % CPU**），唯一诚实的兜底是 OS 能强制的边界。
+  子进程用 `_EMIT = "<<<PLAN_SEQUENCE_REP>>>"` 标记把 JSON 从 pcbnew 的 `Adding duplicate image handler ...` 噪声里分出来。
+  **换边界后读数逐字段不变**：RK3506 `elapsed_s 18.9`、`verdict blocked_at_floorplan`、`crossing 36/98 = 0.3673`、
+  `airwire 2964.207 → 2962.169`、`overlaps 5`、hub `mcu` 33。
+- **`not_run` 独立成一个桶**（`_unrun_report` + `run_corpus` 里整板跳过 + 表格新增 `nr` 列 + 表头上方一行
+  `not run (process did not finish, NOT counted as pass)`）：把 hang 的 8 个 `error` 混进 measured，等于让「没跑完」和
+  「跑完了没通过」同权。反向对照可复现：`--corpus _corpus/royalblue54L_feather.kicad_pcb --timeout 5` ⇒ **5.0 s `not_run`**、
+  八关 `n=0`、判词 `无可判样本`；12 板语料上 `nr` **全 0**（180 s 是兜底不是常态）。
+- **两个「拍的数」变成读数**：`floorplan` 的 `crossing_frac` 在 `CROSS_SWEEP=(0.10,0.15,0.20,0.25,0.30)` 五档各报一格
+  （RK3506 **5 档全 fail**，判决不是 0.15 卡的）；`bus` 的齿高在 `AMPLITUDE_SWEEP=(0.20,0.25,0.30)` 三档各报
+  （`short_by_amplitude`：**0.20 → 44/49、0.25 → 45/49、0.30 → 47/49**，齿高加到 1.5 倍只从 44 挪到 47）。
+- **`overlap_basis`**：canonical 没有器件本体几何，`overlaps` 量的是**功能簇焊盘包围盒相交**，
+  现在报告里写死 `"group pad bounding boxes (not part bodies)"`，不许再被引用成物理碰撞。
+- **`--drc` 真接通（本轮自曝的缺陷）**：CLI 有 `--drc`、`evaluate_isolated` 会传给子进程、子进程还写 `drc_requested`，
+  但 `evaluate()` **从没把 `drc` 放进 `ctx`** ⇒ `gate_closure` 里 `ctx.get("drc")` 恒 falsy，**一条读数都不会出现**——
+  「以为跑了、报告里没有」是最坏的一种缺陷。改为 `evaluate(..., drc=False)` + `ctx["drc"]`，两条执行路径都接上，
+  并加 `test_the_drc_flag_reaches_the_closure_step` 反向对照（monkeypatch `_ctx`/`ORDER`/`GATES` 断言 `ctx["drc"]`）。
+  接上后的新读数：`_corpus/microwave.kicad_pcb` 判 `sequence_ok` 但 `drc_real 24`
+  （`shorting_items 6 / clearance 2 / text_thickness 8 / text_height 8`）；另 4 块板 `closure pass`、`unconnected 0`
+  却有 **1 / 2 / 3 / 12** 条真 DRC ⇒ **`unconnected == 0` 不等于 DRC 干净**，两个数不许互相代替；
+  DRC 读数**只报不判**（`drc_origin="reported only, never judged"`），因为丝印/热焊盘/`lib_footprint_issues`
+  在本项目是 house 项，塞进 physical 判据就是冒充。读取器复用 `board_loop.drc`，避免「这里 30、那里 41」。
+- **12 板语料 corpus9 与 corpus8 逐格相同**（frame 10/1/1、floorplan 0/2/9、stackup 5/0/7、fanout 12/0、power 12/0、
+  bus 全 n/a、route 1/11、closure 10/0/2），`nr` 全 0 ⇒ 这一版改的是可信度不是结论。
+- **仍然补不掉的写清原因**：`bus` 在语料上仍是**单样本**（12 块好板一块 DDR 都没有）；`LoadBoard` 卡死**无根因**
+  （KiCad C++ 内部，0 % CPU）；**布局层 5 条**（`docs/167`）因明令禁自动布局/布线而无解；`hole_in_pad 61`
+  （剩 10 孔 10/10 承载真实层间连接，VIPPO 禁用）；`--drc` 的读数**刻意不进语料汇总表**（表答「规则对不对」，
+  DRC 答「这块板干不干净」）。详见 `docs/175`。
+- `tests/test_plan_sequence.py` 新增 5 条反向对照；`tests/test_plan_sequence.py` + `tests/test_plan_floorplan.py` = **27 passed**。
+
 ## [0.1.37] - 2026-11-15
 
 RK3506 核心板第三十七步：`docs/173` 诊断出的**第四个缺口**（好板子只被提炼成阈值、没被提炼成编排）

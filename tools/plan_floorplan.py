@@ -402,6 +402,12 @@ def analyse(path, top=12):
         "nets_priced": len(nets_worth),
         "hub_group": hub,
         "overlaps": overlaps,
+        # What "overlap" was measured on.  The canonical board carries pad
+        # geometry, not part bodies, so these are GROUP PAD bounding boxes: an
+        # overlap here means two groups' pads would share space, not that two
+        # parts collide.  Naming it keeps the reading from being quoted as a
+        # physical collision it never measured.
+        "overlap_basis": "group pad bounding boxes (not part bodies)",
         "targets": {n: {"side": s,
                          "dx_mm": round(targets[n][s][0], 3),
                          "dy_mm": round(targets[n][s][1], 3)}
