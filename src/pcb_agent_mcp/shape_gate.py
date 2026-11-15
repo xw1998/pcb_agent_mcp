@@ -59,9 +59,11 @@ RULES = (
      "rule": "no two tracks share net, layer and both endpoints"},
     {"priority": 4, "id": "redundant_loop", "blocking": True,
      "rule": "no signal net closes a ring against itself (a rail may be a grid)"},
-    {"priority": 5, "id": "square_corner", "blocking": False,
+    {"priority": 5, "id": "dead_end", "blocking": True,
+     "rule": "every track end and every via touches copper on more than one side"},
+    {"priority": 6, "id": "square_corner", "blocking": False,
      "rule": "a 90 degree turn where a 135 chamfer was available"},
-    {"priority": 6, "id": "detour_ratio", "blocking": False,
+    {"priority": 7, "id": "detour_ratio", "blocking": False,
      "rule": "routed length stays near the pad spanning tree"},
 )
 
@@ -335,6 +337,169 @@ def _redundant_loop(board, snap_mm=None, min_edge_mm=None):
     return rows
 
 
+#: Copper that is not part of any circuit. Two shapes, one defect:
+#:
+#:   * a track end that touches nothing -- a tail drawn off a real node and left
+#:     hanging. It conducts nothing, it is a stub the etcher has to remove, and on
+#:     a dense board it is an antenna.
+#:   * a via with copper on one side only. The hole is drilled, plated and paid
+#:     for, and it joins nothing. This is what "via_dangling" means in KiCad's own
+#:     DRC, and it is the defect that hid 24 times on the SOM board.
+#:
+#: "Touches" is decided the way copper actually behaves, not the way coordinates
+#: look: two pieces touch when their half-widths overlap, so two 0.1 mm tracks
+#: whose ends sit 0.0139 mm apart ARE connected. An endpoint-only reading calls
+#: that pair two dead ends and is wrong -- it reported 296 of them on a board
+#: whose DRC was clean. The zone fill is consulted last, and only for a point
+#: that nothing else holds, because a rail via is often held by its pour alone.
+TOUCH_TOL_MM = 0.006
+
+def _seg_point_distance(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    l2 = dx * dx + dy * dy
+    if l2 < 1e-18:
+        return math.hypot(px - x1, py - y1)
+    t = ((px - x1) * dx + (py - y1) * dy) / l2
+    if t <= 0.0:
+        return math.hypot(px - x1, py - y1)
+    if t >= 1.0:
+        return math.hypot(px - x2, py - y2)
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+def _point_in_polygon(px, py, pts):
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > py) != (y2 > py):
+            if px < (x2 - x1) * (py - y1) / (y2 - y1) + x1:
+                inside = not inside
+    return inside
+
+def _dead_end(board, tol_mm=None):
+    """Track ends that touch nothing, and vias with copper on one side only.
+
+    Returns (items, n_track_ends, n_vias). Each item names `kind` so a reader can
+    tell a hanging tail from a dead hole without reading the detail string.
+    """
+    tol = float(TOUCH_TOL_MM if tol_mm is None else tol_mm)
+    from .adapters.canonical import pad_points
+
+    # A segment's identity is its index, not its uuid: a caller may hand this
+    # function bare dicts (the tests do), and "skip myself" has to work there too.
+    segs = {}
+    for idx, t in enumerate(board.tracks or []):
+        net, lay = t.get("net"), t.get("layer")
+        st, en = t.get("start"), t.get("end")
+        if net is None or lay is None or not st or not en:
+            continue
+        segs.setdefault((net, lay), []).append(
+            (float(st[0]), float(st[1]), float(en[0]), float(en[1]),
+             float(t.get("width") or 0.0), idx))
+
+    vias_by_net = {}
+    for v in board.vias or []:
+        if v.get("net") is None or v.get("x") is None or v.get("y") is None:
+            continue
+        vias_by_net.setdefault(v["net"], []).append(
+            (float(v["x"]), float(v["y"]),
+             float(v.get("diameter") or 0.0),
+             [str(x) for x in (v.get("layers") or [])]))
+
+    pads_by_net = {}
+    for p in board.pads() or []:
+        net = p.get("net")
+        if net is None or p.get("x") is None or p.get("y") is None:
+            continue
+        lays = [str(x) for x in (p.get("layers") or [])]
+        thru = bool(p.get("hole_mm")) or any(x.startswith("*") for x in lays)
+        pads_by_net.setdefault(net, []).append(
+            (float(p["x"]), float(p["y"]),
+             None if thru else [x for x in lays if not x.startswith("*")],
+             pad_points(p)))
+
+    zones_by_net = {}
+    for z in board.zones or []:
+        net = z.get("net")
+        polys = z.get("filled_polygons") or []
+        if net is None or not polys:
+            continue
+        lays = [str(x) for x in (z.get("layers") or [])]
+        for poly in polys:
+            if len(poly) >= 3:
+                xs = [q[0] for q in poly]
+                ys = [q[1] for q in poly]
+                zones_by_net.setdefault(net, []).append(
+                    (lays, poly, min(xs), min(ys), max(xs), max(ys)))
+
+    def zone_holds(net, lay, x, y):
+        for lays, poly, x0, y0, x1, y1 in zones_by_net.get(net, ()):
+            if lays and lay not in lays:
+                continue
+            if x < x0 or x > x1 or y < y0 or y > y1:
+                continue
+            if _point_in_polygon(x, y, poly):
+                return True
+        return False
+
+    def copper_here(net, lay, x, y, radius, skip_uuid=None, skip_via=None):
+        """Is there same-net copper on `lay` at (x,y) other than the caller?
+
+        `skip_via` is not a nicety: without it a via is its own copper on every
+        layer it spans, so every via reads as held six times and the rule can
+        never fire. That is exactly what the first draft of this function did.
+        """
+        for x1, y1, x2, y2, w, uid in segs.get((net, lay), ()):
+            if skip_uuid is not None and uid == skip_uuid:
+                continue
+            if _seg_point_distance(x, y, x1, y1, x2, y2) <= radius + w / 2.0 + tol:
+                return True
+        for px, py, pl, poly in pads_by_net.get(net, ()):
+            if pl is not None and lay not in pl:
+                continue
+            if math.hypot(x - px, y - py) <= radius + tol:
+                return True
+            if len(poly) >= 3 and _point_in_polygon(x, y, poly):
+                return True
+        for vx, vy, vd, _vl in vias_by_net.get(net, ()):
+            if skip_via is not None and math.hypot(vx - skip_via[0], vy - skip_via[1]) <= 1e-9:
+                continue
+            if math.hypot(x - vx, y - vy) <= radius + vd / 2.0 + tol:
+                return True
+        return zone_holds(net, lay, x, y)
+
+    items = []
+    n_track_ends = 0
+    for (net, lay), rows in segs.items():
+        for x1, y1, x2, y2, w, uid in rows:
+            for ex, ey in ((x1, y1), (x2, y2)):
+                if copper_here(net, lay, ex, ey, w / 2.0, skip_uuid=uid):
+                    continue
+                n_track_ends += 1
+                items.append({"kind": "track_end", "net": net, "layer": lay,
+                              "x": round(ex, 4), "y": round(ey, 4),
+                              "width_mm": round(w, 3)})
+
+    n_vias = 0
+    for net, rows in vias_by_net.items():
+        for vx, vy, vd, vlayers in rows:
+            layers = vlayers or ["F.Cu", "B.Cu"]
+            held = 0
+            for lay in layers:
+                if copper_here(net, lay, vx, vy, vd / 2.0, skip_via=(vx, vy)):
+                    held += 1
+            if held > 1:
+                continue
+            n_vias += 1
+            items.append({"kind": "via", "net": net,
+                          "x": round(vx, 4), "y": round(vy, 4),
+                          "diameter_mm": round(vd, 3),
+                          "layers_with_copper": held,
+                          "layers_spanned": len(layers)})
+    items.sort(key=lambda r: (r["kind"] != "via", r["net"] or "", r["x"], r["y"]))
+    return items, n_track_ends, n_vias
+
 def gate(board, strict=False, angle_tol_deg=1.0,
          hard_ratio_signal=None, hard_ratio_power=None, top=20):
     """One verdict for "is this copper drawn the way the house draws it".
@@ -378,6 +543,7 @@ def gate(board, strict=False, angle_tol_deg=1.0,
 
     dups = _duplicate_copper(board)
     loops = _redundant_loop(board)
+    dead_items, dead_ends, dead_vias = _dead_end(board)
 
     geo = _oracle.net_geometry_report(board, min_segments=1, top=0, detour_flag=1.8)
     gv = (geo.get("value") if isinstance(geo, dict) else None) or {}
@@ -435,10 +601,17 @@ def gate(board, strict=False, angle_tol_deg=1.0,
                                len(loop_rail),
                                sum(r["cycles"] for r in loop_rail)),
           loop_sig + loop_rail)
-    _rule(RULES[4], square_total, False,
+    _rule(RULES[4], dead_ends + dead_vias, bool(dead_items),
+          "%d track end(s) touch no copper and %d via(s) have copper on one side "
+          "only - neither joins anything. Copper that carries nothing is a stub "
+          "the etcher still has to make and a hole that is drilled and paid for "
+          "and does nothing. Touching is judged by half-width overlap, so two "
+          "0.1 mm tracks whose ends sit 0.0139 mm apart count as joined"
+          % (dead_ends, dead_vias), dead_items)
+    _rule(RULES[5], square_total, False,
           "%d square (90 deg) corner(s); a 135 chamfer may or may not have been "
           "available - blocking only with strict=true" % square_total, square_list)
-    _rule(RULES[5], len(detour_hard), bool(detour_hard),
+    _rule(RULES[6], len(detour_hard), bool(detour_hard),
           "%d net(s) past the hard detour cap (%d more between 1.8 and the cap)"
           % (len(detour_hard), len(detour_soft)),
           [dict(r, severity="hard") for r in detour_hard]

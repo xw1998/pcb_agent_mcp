@@ -116,8 +116,10 @@ class TestRuleTable(unittest.TestCase):
     def test_rank_and_blocking(self):
         order = [r["id"] for r in shape_gate.RULES]
         self.assertEqual(order[3], "redundant_loop")
-        self.assertEqual(order[4], "square_corner")
+        self.assertEqual(order[4], "dead_end")
+        self.assertEqual(order[5], "square_corner")
         self.assertTrue(shape_gate.RULES[3]["blocking"])
+        self.assertTrue(shape_gate.RULES[4]["blocking"])
 
 if __name__ == "__main__":
     unittest.main()

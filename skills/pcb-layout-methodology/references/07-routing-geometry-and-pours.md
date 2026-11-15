@@ -140,6 +140,7 @@ KiCad（以及所有 EDA）把铺铜结果**烘成多边形顶点**存进文件�
 
 | 项 | 通过标准 | 读数来源 |
 |---|---|---|
+| 死头铜 | `dead_end == 0`：每个线端都接住同网铜、每个过孔至少两面接铜（判据是**半宽重叠** `dist ≤ (w1+w2)/2`，不是端点坐标——0.0139 mm 端点间隙而铜重叠 0.086 mm 是一根导体） | `board_shape_gate`（priority 5）或 `board_drc` 的 `via_dangling`/`track_dangling` |
 | 锐角 | `acute_corners == 0` | `board_45_corners` |
 | 直角 | `corner_kinds.right` 尽量为 0；不为 0 要能解释（例如焊盘处不可避免） | `board_45_corners` |
 | 切角尺寸 | `L ≤ 0.4W`、`R ≥ 0.5W` | 尺寸可在 `chamfer` 的 `cut_mm_range` 上核 |
