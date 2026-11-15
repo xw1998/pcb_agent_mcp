@@ -12,9 +12,14 @@ import pcbnew
 import time
 
 BOARD, OUT = sys.argv[1], sys.argv[2]
-STEP = 0.05
-CLR = 0.15
-TW = 0.10
+# The search pitch and the clearance are the board's rules, not a taste: this
+# board's Default netclass says clearance 0.10 mm and track 0.10 mm, so a run at
+# the old hard-coded 0.15 refused every net on a legal board.  Both are now
+# overridable so a refusal can be attributed to the placement instead of to a
+# number this file invented (CLR=0.10 STEP=0.05 ...).
+STEP = float(os.environ.get("STEP") or 0.05)
+CLR = float(os.environ.get("CLR") or 0.15)
+TW = float(os.environ.get("TW") or 0.10)
 LAYERS = ["F.Cu", "In2.Cu", "In4.Cu", "B.Cu"]
 FALLBACK_F = False
 BUCK = 2.0
