@@ -1048,7 +1048,7 @@ DIRS_K = tuple((k, d[0], d[1], d[2]) for k, d in enumerate(DIRS))
 
 def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
           allow_vias=True, via_check=None, diag=None, soft=0.0, guide=None,
-          guide_outside=1.0):
+          guide_outside=1.0, walk_layers=None):
     # NOTE ON THE INLINING BELOW. The inner loop reads the rasters directly
     # (`grid._map[layer]` is a flat list indexed by `j * nx + i`) instead of
     # calling `grid.free()`, and goal lookup goes through an integer key instead
@@ -1091,6 +1091,13 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
     is, so a member that could cut a shorter line of its own pays for doing
     so. That is what makes the group's *length* follow the skeleton rather
     than merely its direction.
+
+    `walk_layers` is the set of layers the path may put copper on. `None` is
+    every layer in the grid. A node on a layer outside the set can still be a
+    source or a goal - that is how a terminal on an outer layer is entered - but
+    no step leaves it, so the only way off such a node is a via. The grid keeps
+    all layers regardless: a via still has to clear the copper on the layers it
+    is not allowed to use, which is the whole point of routing a bus inside.
 
     Returns the path as `[(i, j, layer), ...]` or `None`.
     """
@@ -1159,7 +1166,8 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
         mp = maps[l]
         gmap = gd_maps.get(l) if gd_maps is not None else None
         base = j * nx
-        for k, di, dj, step in DIRS_K:
+        for k, di, dj, step in (DIRS_K if (walk_layers is None or l in walk_layers)
+                                else ()):
             ni = i + di
             nj = j + dj
             if ni < 0 or nj < 0 or ni >= nx or nj >= ny:

@@ -3396,6 +3396,22 @@ _tool(
          "layers": _str("comma separated routers layers (default: every copper layer "
                         "that no power pour covers)"),
          "nets": _str("comma separated nets to route (default: all)"),
+         "new_copper_layers": _str(
+             "comma separated layers this plan may PLACE copper on - different "
+             "from `layers`, which only says which pads are reachable. Without "
+             "it an inner-layer plan keeps coming back with outer-layer segments: "
+             "the terminals are pinned to the inner layers, then the middle of "
+             "each path walks the outer one because that layer was legal to "
+             "collect a terminal from. A pad left with no layer in this set is "
+             "reported per net as `no_terminal_on_new_copper_layers` rather than "
+             "disappearing from the report"),
+         "via_gate": _str("how much geometry the search sees before paying for "
+                          "a via: \"raster\" (default, the occupancy raster "
+                          "alone - cheap and optimistic) or \"exact\" (the "
+                          "emitter's own 64-gon clearance test as well, so a "
+                          "restricted layer set stops planning vias the write is "
+                          "going to refuse; costs a geometric test per candidate "
+                          "node)"),
          "clearance_mm": _num("override the net-class clearance", None),
          "track_mm": _num("override the net-class track width", None),
          "via_diameter_mm": _num("override the via diameter", None),
@@ -5402,7 +5418,7 @@ def _board_route(args):
         kw["length_groups"] = lgroups
     if itargets:
         kw["impedance_targets"] = itargets
-    for key in ("layers", "nets", "fixed_nets"):
+    for key in ("layers", "nets", "fixed_nets", "new_copper_layers"):
         val = args.get(key)
         if isinstance(val, str):
             val = [x.strip() for x in val.split(",") if x.strip()]
@@ -5412,7 +5428,7 @@ def _board_route(args):
                 "return_path", "blind_vias"):
         if args.get(key) is not None:
             kw[key] = bool(args[key])
-    for key in ("material_group", "insulation", "topology"):
+    for key in ("material_group", "insulation", "topology", "via_gate"):
         if args.get(key) is not None:
             kw[key] = str(args[key])
     if args.get("coating") is not None:

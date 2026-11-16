@@ -497,7 +497,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          return_path=True, return_path_net=None, topology="mst",
          progress=None, blind_vias=False, keepout_rects=None, grid_origin=None,
-         terminal_override=None, net_priority=None, bundle_bands=None):
+         terminal_override=None, net_priority=None, bundle_bands=None,
+         via_gate="raster", new_copper_layers=None):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -527,6 +528,39 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     verbatim - a point that is not on the board is the caller's error, not
     something to guess around, so a net named here with no usable point is
     reported rather than silently falling back to the pad centre.
+
+    `via_gate` says how much geometry the A* is allowed to see before it
+    pays for a via. "raster" (default, and the historical behaviour) is the
+    occupancy raster alone: cheap, and OPTIMISTIC - the raster knows the
+    cell is not obviously occupied, not that a 0.6 mm ring fits between two
+    exactly-on-the-rule neighbours. "exact" runs `grid.via_blockers` - the
+    same 64-gon test the emitter is judged by - as a confirmation before the
+    via is priced, so a search that is short of space stops planning vias the
+    emitter is going to reject. `exact` costs a real geometric test per
+    candidate node, so it is a knob and not the default, and the criterion for
+    turning it on is measured rather than felt: it earns its cost only when the
+    run reports vias refused at emission (`stats.rejected_ops` carrying
+    `clearance`). On the RK3506 SOM it earned nothing - the plan came out
+    byte-identical to the raster gate's while taking 8.0x as long - so the
+    honest reading there is "not needed", not "better". (An earlier note here
+    blamed the raster gate for a DDR bus escaping to F.Cu; that turned out to
+    be wrong - see `docs/189`, where the copper source is the middle of the
+    path and the fix is `new_copper_layers`.)
+
+    `new_copper_layers` separates two things that used to be one number.
+    `layers` answers "which pads may I start from" - a terminal is collected
+    when the pad has copper on one of them. It does NOT answer "where may this
+    net put new copper", and conflating the two is how an inner-layer-only DDR
+    plan kept coming back with F.Cu segments: the terminals were pinned to
+    In2.Cu/B.Cu, and then the search walked the middle of the path on F.Cu
+    because F.Cu was a legal terminal-collecting layer. Naming
+    `new_copper_layers` narrows the WALK (A* steps) and the terminals'
+    accepted layers to that set, while the grid keeps every layer for physics -
+    a via still has to clear the copper on F.Cu it is not allowed to use. A
+    terminal left with no layer in the set is reported per pad rather than
+    quietly dropped, because "no terminal" is a layout fact and silent failure
+    is a wrong answer. `None` (default) is the historical behaviour: any
+    collected layer is also a new-copper layer.
 
     `bundle_bands` is how a bus gets a geometry instead of a pile of
     independently shortest paths. Each entry is
@@ -598,6 +632,43 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                          "nothing to connect", "NO_GEOMETRY",
                          hint="pads with no net are not routed; a board whose only "
                               "nets are planes needs no router")
+
+    # New copper layers. See the docstring: the terminal set above answers
+    # "which pads are reachable at all", this answers "where may copper be
+    # placed". The two differ on a board whose pads fan out on an outer layer
+    # and whose bus is supposed to live on the inner ones.
+    new_layers = None
+    lost_terminals = []
+    if new_copper_layers:
+        named = [str(l) for l in new_copper_layers]
+        copper_set = set(copper)
+        bad = [l for l in named if l not in copper_set]
+        if bad:
+            raise RouteError(
+                "%s is not a copper layer on this board (board has %s)"
+                % (", ".join(bad), ", ".join(copper)), "ARG_INVALID",
+                hint="new_copper_layers is read against the board, not guessed; "
+                     "the layer names must match the stackup verbatim")
+        new_layers = [l for l in named if l in routing]
+        if not new_layers:
+            raise RouteError(
+                "none of %s is a routing layer, so no new copper could be placed"
+                % (", ".join(named),), "ARG_INVALID",
+                hint="routing layers on this board are %s"
+                     % (", ".join(routing) or "(none)"))
+        allowed = set(new_layers)
+        kept = []
+        for t in terms:
+            keep_l = [l for l in t["layers"] if l in allowed]
+            if not keep_l:
+                lost_terminals.append({"net": t["net"], "pad": t["pad"],
+                                       "reference": t["reference"],
+                                       "at": t["at"],
+                                       "layers": list(t["layers"])})
+                continue
+            t["layers"] = keep_l
+            kept.append(t)
+        terms = kept
 
     plane_nets = {}
     for layer, spec in planes.items():
@@ -708,6 +779,25 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                               "it fixed would report an open net as settled"}
             continue
         work.append((span, net, plist))
+    if lost_terminals:
+        # A net whose every pad sits only on layers the caller forbade has no
+        # legal place to start. "Not routed" is the answer, but a net that simply
+        # disappears from the report reads as "not asked for", so it is entered
+        # as failed with the pads and their layers named.
+        by_lost = {}
+        for row in lost_terminals:
+            by_lost.setdefault(row["net"], []).append(row)
+        for net, rows in sorted(by_lost.items()):
+            if net in by_net:
+                continue
+            results[net] = {"net": net, "status": "failed", "pads": len(rows),
+                            "mst_mm": 0.0, "length_mm": 0.0, "vias": 0,
+                            "segments": 0, "blind_vias": 0, "edges": 0,
+                            "on_plane": None,
+                            "reason": {"code": "no_terminal_on_new_copper_layers",
+                                       "detail": rows[:6],
+                                       "new_copper_layers": list(new_layers)}}
+
     work.sort(reverse=True)          # longest first - see the module docstring
     bands = []
     band_of = {}
@@ -1020,9 +1110,10 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             ast_diag = {}
             path = astar(grid, net, tree_nodes, goals, glayers,
                          allow_vias=allow_vias,
-                         via_check=_via_gate(grid, net) if allow_vias else None,
+                         via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
+                               if allow_vias else None),
                          diag=ast_diag, guide=guide_now[0],
-                         guide_outside=guide_now[1])
+                         guide_outside=guide_now[1], walk_layers=new_layers)
             if path is None:
                 src = goals
                 back = {(s[0], s[1]) for s in tree_nodes}
@@ -1032,9 +1123,10 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 path = astar(grid, net, {(i, j, l) for (i, j) in src
                                          for l in glayers[(i, j)]},
                              back, bl, allow_vias=allow_vias,
-                             via_check=_via_gate(grid, net) if allow_vias else None,
+                             via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
+                               if allow_vias else None),
                              diag=ast_diag, guide=guide_now[0],
-                             guide_outside=guide_now[1])
+                             guide_outside=guide_now[1], walk_layers=new_layers)
             if path is None:
                 t = (terminals[b]["term"] if b < len(terminals) else
                      {"reference": "(branch)", "pad": "-",
@@ -1268,8 +1360,9 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                          {(i, j): set(nodes[b][0]["layers"]) | {layer}},
                          budget=WISH_BUDGET,
                          allow_vias=allow_vias,
-                         via_check=_via_gate(grid, net) if allow_vias else None,
-                         soft=SOFT_BLOCK)
+                         via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
+                               if allow_vias else None),
+                         soft=SOFT_BLOCK, walk_layers=new_layers)
             if path is None:
                 continue
             for p in path:
@@ -1442,6 +1535,9 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     routed_n = sum(1 for r in out_nets if r["status"] == "routed")
     fixed_n = sum(1 for r in out_nets if r["status"] == "fixed")
     failed = [r for r in out_nets if r["status"] not in ("routed", "fixed")]
+    if new_layers is not None:
+        stats["new_copper_layers"] = list(new_layers)
+        stats["terminals_off_new_copper_layers"] = len(lost_terminals)
     stats["elapsed_s"] = round(time.time() - t0, 3)
     stats["nets_total"] = len(out_nets)
     stats["nets_routed"] = routed_n
@@ -1570,17 +1666,26 @@ def _between(layers, a, b, cand):
     return min(ia, ib) < ic < max(ia, ib)
 
 
-def _via_gate(grid, net):
-    """A* asks this before paying for a via. Raster-only, on purpose: the exact
-    check runs once at emission (see `_Emitter.via`).
+def _via_gate(grid, net, exact=False):
+    """A* asks this before paying for a via.
 
     It asks the VIA raster, not the track raster: a via is 0.6 mm where a track
     is 0.25 mm, and using one raster for both is exactly how seven nets on the
     F401 core board ended up "routed" with a via the exact check rejected.
+
+    `exact=True` adds the emitter's own test (`grid.via_blockers`, a 64-gon at
+    the class diameter, judged pair by pair against each net rule) after the
+    raster says yes. The raster is the cheap rejection; this is the answer.
+    Without it the search and the write disagree by exactly the amount the
+    raster is optimistic - and the search is the one that loses, because the
+    emitter then refuses the via the plan was built on.
     """
     def check(i, j, _net):
         for layer in grid.layers:
             if not grid.free_via(i, j, layer, net):
                 return False
-        return True
+        if not exact:
+            return True
+        x, y = grid.xy(i, j)
+        return grid.via_blockers(x, y, net) == []
     return check
