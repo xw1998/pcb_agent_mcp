@@ -33,6 +33,9 @@ _CATALOG_LEVEL = {
     "layout.min_trace_width": "P0",
     "layout.min_via_hole": "P0",
     "layout.bulk_per_ic": "P2",
+    # A rail with no bypass part at all is the missing part found on RK3506: it
+    "layout.hf_per_rail": "P1",
+
     "layout.power_pad_thermal_vias": "P2",
     "layout.crystal_keepout": "P2",
     # P1: the field, the loop and the heat are power-integrity facts, not

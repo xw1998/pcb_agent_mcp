@@ -1673,6 +1673,136 @@ def _bulk_caps(board, pours):
     return out
 
 
+_HF_FARADS = 220e-9
+# A decoupling capacitor is measured AGAINST the return net, so a net named like
+# ground is never a rail to be decoupled, whatever else it is called.
+_RETURN_NAME = re.compile(r"(?:^|[+_/\-])(?:[AP]?GND|PGND|VSS|EARTH)|^0V(?:$|[+_/\-])",
+                          re.I)
+# Which names mean "this net feeds power". Deliberately a token match, not a
+# whole-name match: `+1V35_DDR`, `AVDD1V6` and `VDD_CORE` all say it, and a board
+# that calls its rail `Net-(U1-Pad7)` still gets told what was and was not counted.
+_POWER_NAME = re.compile(r"VCC|VDD|VSS|VEE|VBUS|VBAT|VSYS|VIN|VOUT|VREF|VCM|"
+                         r"[0-9]V[0-9]|[AP]?GND|PGND", re.I)
+
+def _hf_caps(board, pours):
+    """Rails that reach several pins and carry no small capacitor anywhere.
+
+    ``ics_without_bulk_cap`` counts parts of 1 uF and more, one per IC per rail.
+    That rule is silent about the other half of the pair: the small part that
+    supplies the switching edge. A board can hold a 10 uF on every rail and still
+    have no capacitor of 220 nF or less on any of them - real, common, and
+    invisible to the bulk counter, which reads a 10 uF as coverage.
+
+    A rail is either a poured net or a net that reaches two or more pads of a part
+    with six or more pads, minus the return net (the largest flood, plus any net
+    whose name says ground). The reading is deliberately coarse: one small part
+    anywhere on the rail clears it. Which pin it serves is the question
+    ``decoupling_max_distance_to_pin_mm`` asks, and asking it twice here would make
+    this rule fail on placement, not on the bill of materials.
+    """
+    caps, unparsed = [], 0
+    for f in board.footprints:
+        ref = str(f.get("ref") or "")
+        if not _CAP_REF.match(ref):
+            continue
+        far = _farads(f.get("value"))
+        if far is None:
+            unparsed += 1
+            continue
+        nets = {p.get("net") for p in (f.get("pads") or []) if p.get("net")}
+        caps.append((ref, nets, far))
+    if not caps:
+        return _na("no capacitor on this board states a value that parses as a "
+                   "capacitance, so nothing can be shown as small (%d capacitor(s) "
+                   "read none)" % unparsed)
+
+    areas = _pour_area_by_net(board)
+    return_net = max(areas, key=areas.get) if areas else None
+
+    pins = {}
+    for f in board.footprints:
+        pads = f.get("pads") or []
+        if len(pads) < 6:
+            continue
+        for p in pads:
+            net = p.get("net")
+            if net:
+                pins[net] = pins.get(net, 0) + 1
+
+    # A pour says "this is the copper that distributes current"; a name says what
+    # the designer meant. Either is enough to LOOK at a net, and neither is enough
+    # to grade it: `/USB0_VBUSDET` carries the word VBUS and is a two-pad sense
+    # line. So a net that reaches only two pads, has no capacitor on it and is not
+    # poured is named in the note instead of being counted as a bare rail.
+    rails, borderline = set(), []
+    for net, k in pins.items():
+        if not (_POWER_NAME.search(str(net)) or (net in pours and k >= 3)):
+            continue
+        if net == return_net or _RETURN_NAME.search(str(net)):
+            continue
+        has_cap = any(net in cnets for _r, cnets, _f in caps)
+        if k < 3 and net not in pours and not has_cap:
+            borderline.append(str(net))
+            continue
+        rails.add(net)
+    rails = sorted(rails)
+    if not rails:
+        return _na("no net on this board both reaches several pads of a multi-pin "
+                   "part and is not the return net, so there is no rail here for a "
+                   "small capacitor to sit on")
+
+    bad = []
+    for net in rails:
+        if any(net in cnets and far <= _HF_FARADS for _r, cnets, far in caps):
+            continue
+        present = [(r, far) for r, cnets, far in caps if net in cnets]
+        bad.append((net, pins.get(net, 0), present))
+
+    def _f(far):
+        if far >= 1e-6:
+            return "%guF" % round(far / 1e-6, 3)
+        if far >= 1e-9:
+            return "%gnF" % round(far / 1e-9, 1)
+        return "%gpF" % round(far / 1e-12, 1)
+
+    def _say(net, k, present):
+        has = ", ".join("%s %s" % (r, _f(far)) for r, far in present) or "no capacitor"
+        return "%s (%d pin(s), has %s)" % (net, k, has)
+
+    where = (("%d of %d rail(s) carry no capacitor of 220 nF or less: %s"
+              % (len(bad), len(rails),
+                 "; ".join(_say(n, k, p) for n, k, p in bad[:6])))
+             if bad else
+             ("all %d rail(s) carry a capacitor of 220 nF or less" % len(rails)))
+    out = {
+        "value": float(len(bad)),
+        "where": where,
+        "method": "a rail is a net that reaches pads of parts with six or more pads "
+                  "AND either its name says power or the board pours it, minus the "
+                  "largest flood and any net named like ground; a two-pad net with no "
+                  "capacitor on it is listed separately and not graded; the value "
+                  "field of each capacitor is parsed (100n, 0.1uF, 4u7) and 220 nF "
+                  "separates the bypass part from bulk; one small part anywhere on "
+                  "the rail clears it",
+        "examples": [n for n, _k, _p in bad[:8]],
+        "rails": [{"net": n, "pins": k,
+                   "caps": [{"ref": r, "farads": far} for r, far in present]}
+                  for n, k, present in bad],
+    }
+    notes = []
+    if unparsed:
+        notes.append("%d capacitor(s) state a value that does not parse as a "
+                     "capacitance and are not counted either way" % unparsed)
+    if borderline:
+        notes.append("%d name-like-a-rail net(s) reach only two pads and carry no "
+                     "capacitor, so they are not graded (a detect or sense line and "
+                     "a rail look the same in the file): %s"
+                     % (len(borderline), ", ".join(sorted(borderline)[:6])))
+    if notes:
+        out["note"] = "; ".join(notes)
+    return out
+
+
 def _crystal_guard(board, pours):
     """Is each crystal enclosed by copper of the board's own return net?
 
@@ -1812,6 +1942,7 @@ def _assembly_facts(board):
         "stitching_via_pitch_mm": _stitching(board, pours),
         "diffpair_gap_varies": _diffpair_gap(board),
         "ics_without_bulk_cap": _bulk_caps(board, pours),
+        "rails_without_hf_cap": _hf_caps(board, pours),
         "test_points_on_rails_and_connectors": _test_points(board, pours),
         "min_mask_expansion": _mask_expansion(board),
         "crystal_has_guard_ring": _crystal_guard(board, pours),
@@ -2996,6 +3127,7 @@ def catalog_facts(m):
     take("stitching_via_pitch_mm", "stitching_via_pitch_mm")
     take("diffpair_gap_varies", "diffpair_gap_varies")
     take("ics_without_bulk_cap", "ics_without_bulk_cap")
+    take("rails_without_hf_cap", "rails_without_hf_cap")
     take("test_points_on_rails_and_connectors", "test_points_on_rails_and_connectors")
     take("min_mask_expansion", "min_mask_expansion")
     take("crystal_has_guard_ring", "crystal_has_guard_ring")

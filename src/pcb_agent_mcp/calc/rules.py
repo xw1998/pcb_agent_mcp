@@ -172,6 +172,17 @@ LAYOUT_RULES = [
        "L0", "kicad-free (每 IC 10 uF)",
        "the bulk cap holds the rail through load steps; the 100 nF only handles "
        "the switching edge"),
+    _r("layout.hf_per_rail",
+       "every rail that feeds several pins has a high-frequency capacitor "
+       "(<= 220 nF) on it",
+       "power integrity", "High", "rails_without_hf_cap", "count", "count_max", 0,
+       "count the capacitors per rail in the schematic or the BOM; one 100 nF per "
+       "rail clears this rule, placement is layout.decoupling_distance",
+       "L0", "docs/144 电源树 (每域一颗 10uF 输出) + docs/154 P1 去耦 + "
+       "kicad-free (每 IC 0.1uF 与 10uF 并联)",
+       "the bulk cap holds the rail through a load step but is inductive at the "
+       "switching edge; without a small part the rail has no low-impedance path "
+       "above a few hundred kHz, and the bulk counter reads that hole as covered"),
     _r("layout.stitching_via_pitch",
        "ground fence / stitching vias are closer than lambda_g/20",
        "shielding", "High", "stitching_via_pitch_mm", "mm", "max", None,

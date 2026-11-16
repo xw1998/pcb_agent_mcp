@@ -164,6 +164,9 @@ ENTRIES = [
     ("layout.bulk_per_ic", "layer_policy", "audit_only",
      "a bulk cap per IC is placement, and the catalogue's own source for this rule "
      "is this project (the book argues against it): it is never cited as external"),
+    ("layout.hf_per_rail", "layer_policy", "audit_only",
+     "whether a rail carries a 100 nF AT ALL is a bill-of-materials decision: the layout can place one close and the router can wire it, neither can add "
+     "the part"),
     ("layout.power_pad_thermal_vias", "layer_policy", "audit_only",
      "the via array under a thermal pad is a footprint/pour decision; the router "
      "places vias to reach a layer, not to move heat"),

@@ -391,5 +391,50 @@ class TestSilkOverPad(_Board):
         self.assertIs(v["value"], False)
 
 
+# ---------------------------------------------------- high-frequency bypass cap
+class TestHfCapacitor(_Board):
+    """The rule that a 10 uF per rail made invisible: `ics_without_bulk_cap` counts
+    parts of 1 uF and up, so a board with one bulk cap on every rail and no small
+    part anywhere reads as fully covered. RK3506 read exactly that way."""
+
+    def _gnd_pour(self):
+        return _zone(1, [(0, 0), (40, 0), (40, 40), (0, 40)])
+
+    def test_a_rail_with_only_bulk_on_it_is_reported(self):
+        v = self.fact("rails_without_hf_cap", _ic(net=2),
+                      _cap("C1", "10uF", net=2), self._gnd_pour())
+        self.assertEqual(v["value"], 1.0)
+        self.assertEqual(v["examples"], ["+3V3"])
+        self.assertEqual(v["rails"][0]["caps"][0]["ref"], "C1")
+        self.assertAlmostEqual(v["rails"][0]["caps"][0]["farads"], 1e-05, places=12)
+
+    def test_a_100nF_on_the_same_rail_answers_it(self):
+        v = self.fact("rails_without_hf_cap", _ic(net=2),
+                      _cap("C1", "10uF", net=2), _cap("C2", "100n", net=2),
+                      self._gnd_pour())
+        self.assertEqual(v["value"], 0.0)
+
+    def test_a_1uF_is_not_a_bypass_part(self):
+        """Control from the other side of the 220 nF line: 1 uF is bulk in this
+        reading, so the rail is still bare."""
+        v = self.fact("rails_without_hf_cap", _ic(net=2),
+                      _cap("C1", "10uF", net=2), _cap("C2", "1uF", net=2),
+                      self._gnd_pour())
+        self.assertEqual(v["value"], 1.0)
+
+    def test_a_100nF_on_another_rail_does_not_count(self):
+        v = self.fact("rails_without_hf_cap", _ic(net=2),
+                      _cap("C1", "10uF", net=2), _cap("C2", "100n", net=4),
+                      self._gnd_pour())
+        self.assertEqual(v["value"], 1.0)
+
+    def test_the_return_net_is_never_a_rail(self):
+        """Control: the largest flood is what a bypass part sits AGAINST. Counting
+        it as a bare rail would report every board in the world."""
+        v = self.fact("rails_without_hf_cap", _ic(net=1),
+                      _cap("C9", "100n", net=3), self._gnd_pour())
+        self.assertIn("unmeasurable", v)
+        self.assertIn("no rail", v["unmeasurable"])
+
 if __name__ == "__main__":
     unittest.main()
