@@ -1054,6 +1054,11 @@ def _zone(node):
                       if fill is not None else None)
     return {
         "net": net_name or net_code,
+        # A rule area's name is how `reserve_region` writes `reserve:<nets>` and
+        # how `board_reservations` / `release_region` find it again. KiCad has
+        # carried the field since v7 and writes it on its own auto-placement
+        # areas, so reading it is reading a fact the format already has.
+        "name": atom(child(node, "name"), 1) or "",
         "layers": layer_list,
         "outline": outline,
         "filled_polygons": filled,

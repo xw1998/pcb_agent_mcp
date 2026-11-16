@@ -6361,3 +6361,451 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20,
                      "angle_tol_deg": tol,
                      "top_other": int(top_other),
                      "count_arcs": bool(count_arcs)})
+
+
+# --------------------------------------------------------------------------
+# Equal-length budget, group consistency, reservations. All three answer a
+# question the tool surface could not: "can this group still be matched?",
+# "does this group look like one bundle?", "which band is being held, and for
+# whom?" - measured with the SAME meander geometry the tuner writes, so a
+# "fits" here is a "fits" the route tool can actually realise.
+# --------------------------------------------------------------------------
+
+# `route/tune.py::_serpentine` and `max_extra`: one tooth of amplitude A buys
+# `2*(sqrt(2)-1)*A` mm of copper and consumes `2*A` of the straight run, so the
+# extra length is a function of the CONSUMED RUN, not of the amplitude. Imported
+# from there rather than re-derived: two copies of this constant had already
+# drifted apart once in this repo.
+def _meander_unit():
+    """`2*(sqrt(2)-1)`: extra length per mm of meander amplitude.
+
+    Derived from the tuner's own `max_extra` rather than written out again - the
+    whole point is that this budget and the tuner cannot disagree. max_extra(L, A)
+    = unit*(L-0.5)/2, so probing it at L=2.5 gives the unit back exactly.
+    """
+    from .route import tune as _tune
+    return _tune.max_extra(2.5, 1.0) * 2.0 / (2.5 - 0.5)
+
+def _track_list(board, net=None, layer=None):
+    out = []
+    for t in board.tracks:
+        if net is not None and t.get("net") != net:
+            continue
+        if layer is not None and t.get("layer") != layer:
+            continue
+        st, en = t.get("start"), t.get("end")
+        if not st or not en:
+            continue
+        out.append((st, en, t.get("width") or 0.0, t.get("layer"), t.get("net")))
+    return out
+
+def _seg_len(seg):
+    return math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1])
+
+# route/tune.py refuses a single serpentine call with more than this many teeth
+# (`len(amps) > 400`), so straight run beyond that is not usable at a given
+# amplitude. It is the only way a NARROW band can lose length capacity - the
+# tooth formula itself is amplitude-neutral (unit*A teeth = unit*s/2 either way).
+TEETH_CAP = 400
+
+
+def length_budget(board, nets, band_mm=1.0, target_mm=None, tolerance_mm=0.2,
+                  layer=None, min_segment_mm=0.5):
+    """Can this group of nets still be brought to one length, and what would it take?
+
+    Measured with the tuner's own meander model (`route/tune.py`): a tooth of
+    amplitude A adds `2*(sqrt(2)-1)*A` mm and eats `2*A` of straight run, so a
+    segment of length s holds `floor((s-0.5)/(2*A))` teeth and a net's ceiling is
+    `0.414*(sum of its usable straight length)` - the amplitude changes HOW MANY
+    teeth you need, not how much length is available. `band_mm` is the free
+    half-width beside the track, i.e. the largest amplitude the surroundings
+    allow; it is what decides whether the teeth are feasible at all.
+
+    Three answers, deliberately distinct:
+      * `in_tolerance` - the gap is already inside the skew budget;
+      * `fits` - a meander of `band_mm` inside the existing straight run closes it;
+      * `needs_wider_band` - the straight run holds enough length in principle,
+        but not at this amplitude: either the teeth it would take do not fit the
+        segment grid, or (the real case) the band is so narrow that one segment
+        needs more than `TEETH_CAP` teeth and the tuner refuses that call.
+        Widen the band, or split the run;
+      * `route_too_short` - even an infinitely fine meander cannot reach the
+        target on this route; the track has to be moved, not tuned.
+    """
+    if not nets:
+        return err("name the nets that must come out equal length (e.g. "
+                   "['DDR_D0','DDR_D1'])", "ARG_MISSING")
+    if isinstance(nets, str):
+        nets = [nets]
+    unit = _meander_unit()
+    amp = float(band_mm or 0.0)
+    if amp <= 0:
+        return err("band_mm must be positive: it is the free half-width beside "
+                   "the track and therefore the largest meander amplitude the "
+                   "surroundings allow", "ARG_RANGE")
+    rows = []
+    for name in nets:
+        segs = _track_list(board, net=name, layer=layer)
+        if not segs:
+            return err("net %r has no copper on this board%s"
+                       % (name, " (layer %s)" % layer if layer else ""),
+                       "NO_GEOMETRY",
+                       hint="length_budget measures routed copper, not the netlist")
+        lengths = [_seg_len(s) for s in segs]
+        total = sum(lengths)
+        teeth = 0
+        capped = False
+        for s in lengths:
+            if s < 2.0 * amp + float(min_segment_mm):
+                continue          # not even one tooth fits inside this segment
+            want = int((s - float(min_segment_mm)) // (2.0 * amp))
+            if want > TEETH_CAP:
+                # route/tune._serpentine refuses more than this many teeth in one
+                # call, so the excess straight run is NOT usable at this amplitude
+                want = TEETH_CAP
+                capped = True
+            teeth += want
+        rows.append({"net": name, "routed_mm": round(total, 3),
+                     "segments": len(segs),
+                     "longest_segment_mm": round(max(lengths), 3),
+                     "teeth_at_band": teeth,
+                     "teeth_capped": capped,
+                     "capacity_at_band_mm": round(unit * amp * teeth, 3),
+                     "ceiling_mm": round(unit * sum(max(0.0, s - float(min_segment_mm))
+                                                    for s in lengths) / 2.0, 3)})
+    target = float(target_mm) if target_mm is not None else max(r["routed_mm"] for r in rows)
+    tol = float(tolerance_mm)
+    worst = None
+    for r in rows:
+        gap = target - r["routed_mm"]
+        need = max(0.0, gap - tol)
+        r["gap_mm"] = round(gap, 3)
+        r["short_of_target_by_mm"] = round(need, 3)
+        r["teeth_needed"] = (int(math.ceil(need / (unit * amp))) if need > 0 else 0)
+        r["teeth_needed_per_call"] = min(r["teeth_needed"], TEETH_CAP)
+        if need <= 1e-9:
+            r["verdict"] = "in_tolerance"
+        elif need <= r["capacity_at_band_mm"] + 1e-9:
+            r["verdict"] = "fits"
+        elif need <= r["ceiling_mm"] + 1e-9:
+            r["verdict"] = "needs_wider_band"
+        else:
+            r["verdict"] = "route_too_short"
+        r["run_consumed_mm"] = round(2.0 * amp * r["teeth_needed"], 3)
+        if worst is None or r["short_of_target_by_mm"] > worst["short_of_target_by_mm"]:
+            worst = r
+    bad = [r for r in rows if r["verdict"] not in ("in_tolerance", "fits")]
+    verdict = "budget_met" if not bad else "budget_exceeded"
+    if len(rows) == 1 and target_mm is None:
+        verdict = "nothing_to_match"
+    return ok(
+        value={
+            "verdict": verdict,
+            "nets_in_group": len(rows),
+            "note": ("one net with the target taken from itself: every net is "
+                     "the same length as itself, so this answer carries no "
+                     "information - name the group, or pass target_mm"
+                     if verdict == "nothing_to_match" else ""),
+            "target_mm": round(target, 3),
+            "target_source": "given" if target_mm is not None else "longest net in the group",
+            "band_mm": amp, "tolerance_mm": tol,
+            "nets": rows,
+            "unreachable": [r["net"] for r in rows if r["verdict"] == "route_too_short"],
+            "needs_band": [r["net"] for r in rows if r["verdict"] == "needs_wider_band"],
+            "worst_net": (worst or {}).get("net"),
+            "read_it_like_this": (
+                "`fits` is a statement about the tuner's own geometry, not a "
+                "promise: the meander still has to clear its neighbours, and the "
+                "tuners refuse a tooth that does not. `route_too_short` is the one "
+                "answer that no band width can change - the copper there is simply "
+                "not long enough to absorb the skew, so the route has to move."),
+        },
+        unit="mm",
+        model="extra length = 2*(sqrt(2)-1)*A per tooth of amplitude A; a tooth "
+              "consumes 2*A of straight run; a segment holds floor((s-min_seg)/2A) "
+              "teeth, capped at %d per segment (route/tune.py refuses more in one "
+              "call) - same formulas as the tuner, plus its own cap" % TEETH_CAP,
+        basis="the track segments on each net as stored in the file; routed_mm is "
+              "their straight-line sum, which is the length a tuner would measure",
+        precision="the ceiling treats every straight segment as usable run and "
+                  "ignores clearance, so it is an UPPER bound; a real tuner that "
+                  "must clear neighbours gets less, never more",
+        assumptions={"band_mm": amp, "tolerance_mm": tol,
+                     "min_segment_mm": float(min_segment_mm),
+                     "layer": layer or "all copper"})
+
+def _heading(seg):
+    a, b = seg[0], seg[1]
+    return math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 180.0
+
+def _parallel_frac(segs_a, segs_b, tol_deg):
+    if not segs_a or not segs_b:
+        return None
+    hits = 0
+    total = 0
+    for x in segs_a:
+        hx = _heading(x)
+        for y in segs_b:
+            hy = _heading(y)
+            d = abs(hx - hy)
+            d = min(d, 180.0 - d)
+            total += 1
+            if d <= tol_deg:
+                hits += 1
+    return (hits / float(total)) if total else None
+
+def _pair_spacing(segs_a, segs_b):
+    """Tightest edge-to-edge clearance between two nets' copper (centreline -
+    both half widths), plus the pair that produced it."""
+    best = None
+    for sa, ea, wa, la, _na in segs_a:
+        for sb, eb, wb, lb, _nb in segs_b:
+            if la != lb:
+                continue
+            d = G.dist_segment_segment(sa, ea, sb, eb) - (wa + wb) / 2.0
+            if best is None or d < best[0]:
+                best = (d, sa, sb)
+    return best
+
+def group_consistency(board, nets, layer=None, tolerance_mm=0.5,
+                      parallel_deg=15.0, parallel_min=0.5, spacing_cv_max=0.5):
+    """Does this group look like ONE bundle? Three measurements, no verdict soup.
+
+    For a length-matched group the three things a person checks by eye are:
+    do the nets come out the same length, do they run alongside each other, and is
+    the gap between neighbours even. Each is measured and reported with its own
+    limit, and the verdict names the checks that failed instead of averaging them
+    into a score nobody can act on.
+
+    `spacing_cv` is the coefficient of variation of the pairwise minimum
+    clearances: a real bundle has a roughly constant gap, a bundle that wanders
+    has a large one. It is a smell test with a stated limit, NOT a design rule -
+    a group that has to fan out to reach its pads legitimately fails it.
+    """
+    if not nets:
+        return err("name the nets of the group", "ARG_MISSING")
+    if isinstance(nets, str):
+        nets = [nets]
+    if len(nets) < 2:
+        return err("a group needs at least two nets: with one net there is nothing "
+                   "to be consistent with", "ARG_RANGE")
+    per = []
+    segs_of = {}
+    missing = []
+    for name in nets:
+        segs = _track_list(board, net=name, layer=layer)
+        if not segs:
+            missing.append(name)
+            segs_of[name] = []
+            continue
+        segs_of[name] = segs
+        lengths = [_seg_len(s) for s in segs]
+        classes = {"H": 0, "V": 0, "45": 0, "other": 0}
+        for s in segs:
+            h = _heading(s) % 180.0
+            if h < 1.0 or h > 179.0:
+                classes["H"] += 1
+            elif abs(h - 90.0) < 1.0:
+                classes["V"] += 1
+            elif abs(h - 45.0) < 1.0 or abs(h - 135.0) < 1.0:
+                classes["45"] += 1
+            else:
+                classes["other"] += 1
+        per.append({"net": name, "length_mm": round(sum(lengths), 3),
+                    "segments": len(segs),
+                    "layers": sorted({s[3] for s in segs}),
+                    "widths_mm": sorted({round(s[2], 4) for s in segs}),
+                    "headings": classes})
+    if missing:
+        return err("net(s) with no copper on this board%s: %s"
+                   % (" (layer %s)" % layer if layer else "", ", ".join(missing)),
+                   "NO_GEOMETRY")
+    names = [p["net"] for p in per]
+    lengths = [p["length_mm"] for p in per]
+    len_of = {p["net"]: p["length_mm"] for p in per}
+    spread = max(lengths) - min(lengths)
+    mean_len = sum(lengths) / float(len(lengths))
+    sd_len = (sum((x - mean_len) ** 2 for x in lengths) / float(len(lengths))) ** 0.5
+
+    pairs = []
+    spacings = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            sp = _pair_spacing(segs_of[a], segs_of[b])
+            par = _parallel_frac(segs_of[a], segs_of[b], float(parallel_deg))
+            gap = (round(sp[0], 3) if sp else None)
+            if gap is not None:
+                spacings.append(gap)
+            pairs.append({"pair": [a, b], "min_clearance_mm": gap,
+                          "parallel_fraction": (round(par, 3) if par is not None else None),
+                          "length_delta_mm": round(abs(len_of[a] - len_of[b]), 3)})
+    spacing_cv = None
+    if len(spacings) >= 2:
+        m = sum(spacings) / float(len(spacings))
+        if m > 1e-9:
+            spacing_cv = (sum((x - m) ** 2 for x in spacings) / float(len(spacings))) ** 0.5 / m
+    worst_parallel = min((p for p in pairs if p["parallel_fraction"] is not None),
+                         key=lambda p: p["parallel_fraction"], default=None)
+    checks = [
+        {"check": "length_spread", "measured": round(spread, 3),
+         "limit": float(tolerance_mm), "ok": spread <= float(tolerance_mm) + 1e-9,
+         "unit": "mm", "means": "max - min routed length inside the group"},
+        {"check": "parallel", "measured": (worst_parallel or {}).get("parallel_fraction"),
+         "limit": float(parallel_min), "ok": bool(worst_parallel and
+                                                 worst_parallel["parallel_fraction"]
+                                                 >= float(parallel_min) - 1e-9),
+         "unit": "fraction", "means": "worst pair: share of segment pairs whose "
+                                      "headings agree within %.1f deg" % float(parallel_deg)},
+        {"check": "spacing_even", "measured": (round(spacing_cv, 3) if spacing_cv is not None else None),
+         "limit": float(spacing_cv_max),
+         # None = not measurable (a two-net group has exactly one pair, so there is
+         # no variation to take a cv of). A skip is not a failure: reporting it as
+         # one would make every two-net bundle "inconsistent" for arithmetic reasons.
+         "ok": (None if spacing_cv is None
+                else bool(spacing_cv <= float(spacing_cv_max))),
+         "unit": "cv", "means": "cv of the pairwise minimum clearances; a bundle "
+                                "spaced by eye scores high; needs three or more "
+                                "nets to have anything to measure"},
+    ]
+    failing = [c["check"] for c in checks if c["ok"] is False]
+    return ok(
+        value={"verdict": "consistent" if not failing else "inconsistent",
+               "failing": failing,
+               "nets": per,
+               "pairs": pairs,
+               "length_spread_mm": round(spread, 3),
+               "length_sd_mm": round(sd_len, 3),
+               "spacing_cv": (round(spacing_cv, 3) if spacing_cv is not None else None),
+               "worst_pair_by_length": (max(pairs, key=lambda p: p["length_delta_mm"])
+                                        if pairs else None),
+               "checks": checks,
+               "read_it_like_this": (
+                   "these are three independent measurements with independent "
+                   "limits; `inconsistent` names which one failed. `spacing_even` "
+                   "is the weakest of the three - a group that must fan out to its "
+                   "pads fails it and is still fine - so treat it as the place to "
+                   "LOOK, not a defect list. Length spread is the one that costs "
+                   "skew budget; parallel and spacing are what make a bundle "
+                   "look like a bundle."),
+        },
+        unit="mm",
+        model="length = straight-line sum of the net's segments; parallel = share "
+              "of segment pairs within parallel_deg; spacing = centreline "
+              "distance minus both half widths, minimum over the pair",
+        basis="the track segments and their widths as stored in the file; only "
+              "segments on the SAME layer are compared for spacing",
+        precision="parallel_fraction pairs every segment with every segment, so a "
+                  "net with many short segments in several directions scores low "
+                  "even when it runs alongside its partner; spacing ignores pads "
+                  "and pours",
+        assumptions={"layer": layer or "all copper",
+                     "tolerance_mm": float(tolerance_mm),
+                     "parallel_deg": float(parallel_deg),
+                     "parallel_min": float(parallel_min),
+                     "spacing_cv_max": float(spacing_cv_max)})
+
+def reservations(board):
+    """Every named rule area, what it holds, and whether it is still free.
+
+    `reserve_region` writes `reserve:<group>` rule areas to hold a band for a net
+    group before anything is routed into it. This reads them back: where they are,
+    which layers, which keepout rules, and - when the label is a net list - how
+    much copper of OTHER nets already sits inside. A reservation that quietly
+    filled up is worse than none, because the next route step believes the band
+    is free.
+    """
+    zones = [z for z in (board.zones or []) if (z.get("name") or "").strip()]
+    if not zones:
+        return ok(
+            value={"verdict": "no_reservations", "total": 0, "reservations": [],
+                   "named_rule_areas": 0,
+                   "read_it_like_this": "no zone on this board carries a name, so "
+                                        "nothing is being held. `reserve_region` is "
+                                        "what writes one."},
+            unit="mm",
+            model="zones whose `(name ...)` field is not empty",
+            basis="the zone list as parsed from the file",
+            precision="a reservation is a rule area: it FORBIDS the listed object "
+                      "classes. Whether the band is free is measured, but whether "
+                      "it is big enough for the net group is a length_budget "
+                      "question, not this one",
+            assumptions={})
+    rows = []
+    for z in zones:
+        outline = z.get("outline") or []
+        label = (z.get("name") or "").strip()
+        is_reservation = label.startswith("reserve:")
+        group = label[len("reserve:"):] if is_reservation else None
+        # A bare-named rule area (KiCad writes `auto-placement-area-/CH4/` itself)
+        # is still read, with its whole label as the candidate net list - it just
+        # is not counted as a band this tool reserved.
+        tokens = [t.strip() for t in (group if group is not None else label).split(",")
+                  if t.strip()]
+        area = abs(G.polygon_area(outline)) if len(outline) >= 3 else 0.0
+        bb = G.bbox_of(outline) if len(outline) >= 3 else None
+        inside_tracks = 0
+        inside_vias = 0
+        nets_inside = set()
+        if len(outline) >= 3:
+            for (st, en, _w, lay, net) in _track_list(board):
+                if z.get("layers") and lay not in z["layers"]:
+                    continue
+                if (G.point_in_polygon(st, outline)
+                        or G.point_in_polygon(en, outline)):
+                    inside_tracks += 1
+                    if net:
+                        nets_inside.add(net)
+            for v in board.vias or []:
+                x, y = v.get("x"), v.get("y")
+                if x is None or y is None:
+                    continue
+                if z.get("layers") and v.get("from") not in z["layers"] \
+                        and v.get("to") not in z["layers"]:
+                    continue
+                if G.point_in_polygon((x, y), outline):
+                    inside_vias += 1
+                    if v.get("net"):
+                        nets_inside.add(v["net"])
+        # A reservation label is a net list only when every token names a net
+        # this board actually has; otherwise it is a name (see reserve_region).
+        declared = set((board.nets or {}).values())
+        nets_known = bool(tokens) and all(t in declared for t in tokens)
+        foreign = sorted(n for n in nets_inside if nets_known and n not in tokens)
+        rows.append({
+            "label": label,
+            "kind": "reservation" if is_reservation else "rule_area",
+            "group": group,
+            "layers": list(z.get("layers") or []),
+            "rules": z.get("keepout") or {},
+            "area_mm2": round(area, 3),
+            "bbox_mm": [round(v, 3) for v in bb] if bb else None,
+            "occupied_tracks": inside_tracks,
+            "occupied_vias": inside_vias,
+            "nets_inside": sorted(nets_inside),
+            "nets_are_known": nets_known,
+            "foreign_nets": foreign,
+            "free": bool(nets_known and not foreign),
+        })
+    holding = [r for r in rows if r.get("group")]
+    full = [r["label"] for r in holding if r["nets_are_known"] and r["foreign_nets"]]
+    verdict = ("reservations_all_free" if holding and not full else
+               "reservations_occupied" if full else "reservations_listed")
+    return ok(
+        value={"verdict": verdict,
+               "total": len(rows), "reservations": rows,
+               "holding_bands": len(holding),
+               "occupied": full,
+               "read_it_like_this": (
+                   "`free` is only judged when every token of the label is a net "
+                   "on this board; a label like `buck cluster` is a name, not a "
+                   "net list, and calling its contents foreign would be inventing "
+                   "a rule. `occupied_*` is reported either way.")},
+        unit="mm",
+        model="zones with a non-empty name; a track counts as inside when either "
+              "endpoint is inside the polygon (ray casting), a via when its centre is",
+        basis="the zone list, tracks, vias and net table as parsed from the file",
+        precision="a track that crosses the band without ending inside is NOT "
+                  "counted - ray casting on endpoints only, so a crossing counts "
+                  "as free. Pads and pours are not counted here",
+        assumptions={"endpoint_test_only": True})

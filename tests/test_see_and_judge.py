@@ -194,6 +194,87 @@ class TestRender(unittest.TestCase):
         out = snapshot.render(b, layer="F.Cu", px_per_mm=0)
         self.assertEqual(out["status"], "error")
 
+    def test_a_region_crops_the_canvas_to_the_window_asked_for(self):
+        """Without a crop a 300 mm board is unreadable: the whole point is a window."""
+        b = board(square_board(STRAIGHT))
+        # explicit out paths: the default name is one per layer, so two renders of
+        # the same layer would share it and the second would replace the first
+        whole = snapshot.render(b, layer="F.Cu", px_per_mm=5,
+                                out=os.path.join(tempfile.gettempdir(), "reg_whole.png"))
+        # the window the square's four pads enclose; y is the server's usual Y-up
+        # frame (file y 10..20 becomes -20..-10), not the file's own sign
+        crop = snapshot.render(b, layer="F.Cu", px_per_mm=5,
+                               region=[10.0, -20.0, 20.0, -10.0],
+                               out=os.path.join(tempfile.gettempdir(), "reg_crop.png"))
+        try:
+            self.assertEqual(whole["status"], "ok", whole)
+            self.assertEqual(crop["status"], "ok", crop)
+            # 10 mm at 5 px/mm is 50 px plus the 2 px border, not the 40 mm board
+            self.assertEqual(crop["value"]["width_px"], 52)
+            self.assertEqual(crop["value"]["height_px"], 52)
+            self.assertGreater(whole["value"]["width_px"], 3 * 52)
+            self.assertEqual(crop["value"]["region_mm"], [10.0, -20.0, 20.0, -10.0])
+        finally:
+            for p in (whole["value"]["png"], crop["value"]["png"]):
+                os.unlink(p)
+
+    def test_a_backwards_region_is_refused_not_silently_widened(self):
+        b = board(square_board(STRAIGHT))
+        out = snapshot.render(b, layer="F.Cu", px_per_mm=5,
+                             region=[20.0, 20.0, 10.0, 10.0])
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "ARG_INVALID")
+
+    def test_the_difference_says_which_side_the_change_is_on(self):
+        """A diff that cannot tell 'added' from 'removed' is a rumour.
+
+        STRAIGHT vs DETOUR: DETOUR adds two legs up to y=30 and drops the
+        straight 20,10 -> 20,20 leg. So the extra copper is on the compare
+        board, and reversing the two arguments must flip the counts.
+        """
+        straight = board(square_board(STRAIGHT))
+        detour = board(square_board(DETOUR))
+        t = tempfile.gettempdir()
+        a = snapshot.render(straight, layer="F.Cu", px_per_mm=10, compare=detour,
+                            out=os.path.join(t, "diff_a.png"))
+        bb = snapshot.render(detour, layer="F.Cu", px_per_mm=10, compare=straight,
+                             out=os.path.join(t, "diff_b.png"))
+        same = snapshot.render(straight, layer="F.Cu", px_per_mm=10,
+                               compare=straight,
+                               out=os.path.join(t, "diff_same.png"))
+        try:
+            for out in (a, bb, same):
+                self.assertEqual(out["status"], "ok", out)
+            self.assertFalse(a["value"]["identical"])
+            self.assertTrue(same["value"]["identical"], same["value"])
+            self.assertEqual(same["value"]["pixels_only_here"], 0)
+            self.assertEqual(same["value"]["pixels_only_there"], 0)
+            # the extra legs are only on the compare board
+            self.assertEqual(a["value"]["pixels_only_here"], 0)
+            self.assertGreater(a["value"]["pixels_only_there"], 100)
+            self.assertEqual(bb["value"]["pixels_only_there"], 0)
+            self.assertEqual(bb["value"]["pixels_only_here"],
+                             a["value"]["pixels_only_there"])
+            # and it says WHERE: the changed window is the detour's legs, which the
+            # file draws at y 20..30 and this server reports as y -30..-20
+            x0, y0, x1, y1 = a["value"]["changed_bbox_mm"]
+            self.assertLessEqual(y0, -29.0)
+            self.assertGreaterEqual(y1, -21.0)
+            self.assertLessEqual(x0, 21.0)
+            self.assertGreaterEqual(x1, 19.0)
+        finally:
+            for out in (a, bb, same):
+                if out.get("value", {}).get("png"):
+                    os.unlink(out["value"]["png"])
+
+    def test_a_compare_that_cannot_be_read_is_an_error(self):
+        b = board(square_board(STRAIGHT))
+        out = snapshot.render(b, layer="F.Cu", px_per_mm=5,
+                             compare=os.path.join(tempfile.gettempdir(),
+                                                  "no_such_board_xyz.kicad_pcb"))
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["reason_code"], "PARSE_FAILED")
+
 
 # --- angle audit fixtures --------------------------------------------------
 # A 45-chamfered turn: 10,10 -> 20,10 straight, then 20,10 -> 21,11 (45), then

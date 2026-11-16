@@ -25,11 +25,21 @@ used to be spread across the twelve files.
                  nets it routes in the same run). A new question ("tune this
                  board"), not a flag.
 
+    256 -> 259   0.1.40: three readings that sit between "the copper is wrong"
+                 and "here is how much room you have to fix it" -
+                 board_length_budget (can this group still be length-matched, and
+                 does it fail for want of band or want of straight run),
+                 board_group_consistency (same length / parallel / even gap, three
+                 separate limits) and board_reservations (read back the named rule
+                 areas). New questions, not flags. The four editing primitives
+                 that came with them (move_cluster, swap_pad_nets,
+                 reserve_region, release_region) are board_edit ops, not tools.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 256
+EXPECTED_TOOL_COUNT = 259
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

@@ -4433,6 +4433,80 @@ _tool(
 )
 
 _tool(
+    "board_length_budget",
+    "Can these nets still be brought to one length, and what would it cost? Uses "
+    "the tuner's OWN meander model, so the answer is what route_tune_net can "
+    "actually deliver: a tooth of amplitude A adds 0.828*A mm and eats 2*A of "
+    "straight run, which makes a net's ceiling 0.414 * its usable straight length. "
+    "So the band width (`band_mm`, free half-width beside the track) decides how "
+    "MANY teeth are needed, while the straight length available decides how much "
+    "extra is possible at all - they fail differently and are reported apart: "
+    "`needs_wider_band` (the room is too narrow) vs `route_too_short` (there is "
+    "nothing left to meander). Run this BEFORE tuning, not after.",
+    {"type": "object",
+     "properties": dict({
+         "nets": {"type": "array", "items": {"type": "string"},
+                  "description": "net names to check as one group"},
+         "band_mm": _num("free half-width beside the track, i.e. the largest "
+                         "meander amplitude the neighbours allow (default 1.0)", 1.0),
+         "target_mm": _num("length to reach (default: the longest net in the group)"),
+         "tolerance_mm": _num("+/- band accepted as matched (default 0.2)", 0.2),
+         "layer": _str("only this copper layer; omit for all"),
+         "min_segment_mm": _num("a straight run shorter than this cannot host a "
+                                "tooth (default 0.5)", 0.5),
+     }, **_COMMON),
+     "required": ["path", "nets"]},
+    _board_tool(lambda b, a: _oracle.length_budget(
+        b, a["nets"], band_mm=a.get("band_mm", 1.0), target_mm=a.get("target_mm"),
+        tolerance_mm=a.get("tolerance_mm", 0.2), layer=a.get("layer") or None,
+        min_segment_mm=a.get("min_segment_mm", 0.5)), derived=True),
+)
+
+_tool(
+    "board_group_consistency",
+    "Does this net group look like ONE bundle? The three things a person checks by "
+    "eye, measured separately instead of averaged into a score: (1) length_spread - "
+    "are the nets the same length; (2) parallel - do they actually run alongside "
+    "each other rather than wandering off; (3) spacing_even - is the gap between "
+    "neighbours constant (coefficient of variation of the pairwise minimum "
+    "clearances). Each carries its own limit and the verdict names the failing "
+    "checks. This is a smell test with stated limits, not a design rule.",
+    {"type": "object",
+     "properties": dict({
+         "nets": {"type": "array", "items": {"type": "string"},
+                  "description": "net names to check as one bundle"},
+         "layer": _str("only this copper layer; omit for all"),
+         "tolerance_mm": _num("length spread accepted as matched (default 0.5)", 0.5),
+         "parallel_deg": _num("headings within this many degrees count as parallel "
+                              "(default 15)", 15.0),
+         "parallel_min": _num("fraction of a pair's length that must run parallel "
+                              "(default 0.5)", 0.5),
+         "spacing_cv_max": _num("pairwise clearance variation allowed (default 0.5)", 0.5),
+     }, **_COMMON),
+     "required": ["path", "nets"]},
+    _board_tool(lambda b, a: _oracle.group_consistency(
+        b, a["nets"], layer=a.get("layer") or None,
+        tolerance_mm=a.get("tolerance_mm", 0.5),
+        parallel_deg=a.get("parallel_deg", 15.0),
+        parallel_min=a.get("parallel_min", 0.5),
+        spacing_cv_max=a.get("spacing_cv_max", 0.5)), derived=True),
+)
+
+_tool(
+    "board_reservations",
+    "Read back every named rule area (`reserve_region` writes `reserve:<group>`): "
+    "where it is, which layers, which keepout rules, and - when the label is a net "
+    "list - how much copper of OTHER nets already sits inside. A reservation that "
+    "quietly filled up is worse than none, because the next route step believes the "
+    "band is free. A label that is not a net list is reported as not-known rather "
+    "than guessed at. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({}, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.reservations(b), derived=True),
+)
+
+_tool(
     "board_render",
     "Rasterise one copper layer to a PNG and return its path, so the routing can "
     "be LOOKED at instead of described. Draws the pour polygons, tracks, vias, "
@@ -4445,11 +4519,23 @@ _tool(
                        "default F.Cu"),
          "px_per_mm": _num("resolution (default 12; canvas capped at 4000 px)", 12),
          "out": _str("PNG path to write (default: a file in the temp directory)"),
+         "region": {"type": "array", "items": {"type": "number"},
+                    "description": "crop to [x0, y0, x1, y1] in mm (view frame, "
+                                   "Y up) instead of the whole board - the only "
+                                   "way to SEE a cluster on a 300 mm board"},
+         "compare": _str("another board file (.kicad_pcb / .epro): draw the same "
+                          "region of both and return a difference image - grey "
+                          "= copper both share, red = only on `path`, blue = only "
+                          "on `compare`, plus the pixel counts"),
+         "compare_layer": _str("layer to draw on the comparison board (default: "
+                               "same as `layer`)"),
      }, **_COMMON),
      "required": ["path"]},
     _board_tool(lambda b, a: _snapshot.render(
         b, layer=a.get("layer") or "F.Cu",
-        px_per_mm=a.get("px_per_mm", 12), out=a.get("out"))),
+        px_per_mm=a.get("px_per_mm", 12), out=a.get("out"),
+        region=a.get("region"), compare=a.get("compare"),
+        compare_layer=a.get("compare_layer"))),
 )
 
 _tool(

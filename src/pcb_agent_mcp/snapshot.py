@@ -27,6 +27,10 @@ COL = {
     "hole": (18, 18, 22, 255),
     "pad": (232, 196, 110, 255),
     "edge": (240, 240, 240, 255),
+    # difference image: ink on both / only here / only there
+    "diff_both": (96, 96, 104, 255),
+    "diff_only_a": (232, 72, 72, 255),
+    "diff_only_b": (86, 148, 232, 255),
 }
 
 
@@ -148,25 +152,26 @@ def _bboxes(board):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
-           pour=True, track=True, via=True, pad=True, edge=True):
-    box = _bboxes(board)
-    if not box:
-        return err("the board model has no geometry to draw", "NO_GEOMETRY")
+def _box_from_region(region):
+    """`[x0, y0, x1, y1]` in mm, view frame (Y up), or None when unusable."""
+    if region is None:
+        return None
+    try:
+        vals = [float(v) for v in region]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) != 4:
+        return None
+    x0, y0, x1, y1 = vals
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+def _canvas(board, layer, s, box, opts):
+    """Draw one board model into a fixed transform. Shared by `render`/compare."""
     x0, y0, x1, y1 = box
-    s = float(px_per_mm)
-    if s <= 0:
-        return err("px_per_mm must be positive", "ARG_RANGE")
-    # A 300 mm board at 40 px/mm is 12000 px wide: cap the canvas, never OOM a call.
     w = int((x1 - x0) * s) + 2
     h = int((y1 - y0) * s) + 2
-    cap = 4000
-    shrink = 1.0
-    if max(w, h) > cap:
-        shrink = cap / float(max(w, h))
-        s *= shrink
-        w = int((x1 - x0) * s) + 2
-        h = int((y1 - y0) * s) + 2
 
     def tf(x, y):
         return ((x - x0) * s + 1, (y1 - y) * s + 1)
@@ -174,7 +179,7 @@ def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
     pix = bytearray(bytes(BG) * (w * h))
     drawn = {"pour_polygons": 0, "tracks": 0, "vias": 0, "pads": 0, "edge_segments": 0}
 
-    if pour:
+    if opts.get("pour"):
         for z in board.zones:
             if z.get("keepout"):
                 continue
@@ -186,7 +191,7 @@ def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
                 _fill_polys(pix, w, h, polys, COL["pour"], tf)
                 drawn["pour_polygons"] += len(polys)
 
-    if track:
+    if opts.get("track"):
         for t in board.tracks:
             if t.get("layer") != layer:
                 continue
@@ -197,7 +202,7 @@ def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
             _capsule(pix, w, h, tf(*st), tf(*en), r, COL["track"])
             drawn["tracks"] += 1
 
-    if pad:
+    if opts.get("pad"):
         for fp in board.footprints:
             for pd in fp.get("pads") or []:
                 layers = pd.get("layers") or []
@@ -220,7 +225,7 @@ def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
                                 COL["pad"], lambda a, b: (a, b))
                 drawn["pads"] += 1
 
-    if via:
+    if opts.get("via"):
         for v in board.vias:
             fl, tl = v.get("from"), v.get("to")
             if fl and tl and layer not in (fl, tl):
@@ -235,7 +240,7 @@ def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
             _disc(pix, w, h, (px, py), dr, COL["hole"])
             drawn["vias"] += 1
 
-    if edge:
+    if opts.get("edge"):
         chains = list(board.outline or []) + list(board.cutouts or []) + \
                  list(board.outline_open or [])
         for ch in chains:
@@ -243,16 +248,182 @@ def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
                 _capsule(pix, w, h, tf(*ch[i]), tf(*ch[i + 1]), 1.2, COL["edge"])
                 drawn["edge_segments"] += 1
 
+    return pix, w, h, drawn, tf
+
+def _ink(pix):
+    """Which pixels carry anything that is not background."""
+    n = len(pix) // 4
+    bg = bytes(BG)
+    out = bytearray(n)
+    for i in range(n):
+        j = i * 4
+        if pix[j:j + 4] != bg:
+            out[i] = 1
+    return out
+
+def _load_compare(compare):
+    """A board model from an already-parsed model or from a path.
+
+    The canonical model is an OBJECT (`adapters.canonical.Board`), not a dict, so
+    "is this a board" is `hasattr(tracks)`, not a type check on one shape.
+    """
+    if not isinstance(compare, str):
+        return compare
+    from .adapters import open_board
+    return open_board(str(compare))
+
+def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
+           pour=True, track=True, via=True, pad=True, edge=True,
+           region=None, compare=None, compare_layer=None):
+    """Draw one copper layer, or the DIFFERENCE between two boards.
+
+    ``region`` crops the canvas to `[x0, y0, x1, y1]` in mm, in the SAME frame the
+    rest of this server reports (`board_components`'s `y_mm`: the file's Y
+    negated, so a board drawn at file y 0..40 spans y -40..0 here), instead of
+    the whole board. Asking "what is going on around U7" otherwise
+    means reading a 300 mm board at 3 px/mm, which shows nothing: at 40 px/mm on
+    a 30 mm window it shows the copper.
+
+    ``compare`` (a board path, or an already-parsed model) draws the same region
+    of both boards through the same transform and returns a difference image:
+    grey is copper both boards have, red is only on THIS board, blue is only on
+    the other. The counts are in the answer, so "did that edit do what I meant"
+    is a number as well as a picture - a pixel-level difference of the same
+    drawing model, not a claim that the boards are electrically equivalent.
+    """
+    opts = {"pour": pour, "track": track, "via": via, "pad": pad, "edge": edge}
+    other = None
+    if compare is not None:
+        try:
+            other = _load_compare(compare)
+        except Exception as exc:  # noqa: BLE001
+            return err("the comparison board could not be read: %s: %s"
+                       % (type(exc).__name__, exc), "PARSE_FAILED")
+        if not hasattr(other, "tracks") or not hasattr(other, "zones"):
+            return err("the comparison board parsed into something that is not a "
+                       "board model", "PARSE_FAILED")
+
+    box = _box_from_region(region)
+    if box is None and region is not None:
+        return err("region must be [x0, y0, x1, y1] with x1 > x0 and y1 > y0 "
+                   "(mm, Y up)", "ARG_INVALID")
+    if box is None:
+        box = _bboxes(board)
+        if other is not None:
+            ob = _bboxes(other)
+            if ob is not None:
+                box = ob if box is None else (min(box[0], ob[0]), min(box[1], ob[1]),
+                                              max(box[2], ob[2]), max(box[3], ob[3]))
+    if not box:
+        return err("the board model has no geometry to draw", "NO_GEOMETRY")
+    x0, y0, x1, y1 = box
+    s = float(px_per_mm)
+    if s <= 0:
+        return err("px_per_mm must be positive", "ARG_RANGE")
+    # A 300 mm board at 40 px/mm is 12000 px wide: cap the canvas, never OOM a call.
+    cap = 4000
+    w = int((x1 - x0) * s) + 2
+    h = int((y1 - y0) * s) + 2
+    if max(w, h) > cap:
+        s *= cap / float(max(w, h))
+
+    pix, w, h, drawn, _tf = _canvas(board, layer, s, box, opts)
+
+    value = {"png": None, "width_px": w, "height_px": h,
+             "px_per_mm": round(s, 3), "layer": layer,
+             "drawn": drawn,
+             "bbox_mm": [round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3)]}
+    if region is not None:
+        value["region_mm"] = [round(v, 3) for v in box]
+
+    if other is not None:
+        olayer = compare_layer or layer
+        opix, ow, oh, odrawn, _otf = _canvas(other, olayer, s, box, opts)
+        a_ink = _ink(pix)
+        b_ink = _ink(opix)
+        diff = bytearray(bytes(BG) * (w * h))
+        both = only_a = only_b = 0
+        changed_bbox = None
+        for i in range(w * h):
+            a, b = a_ink[i], b_ink[i]
+            if not a and not b:
+                continue
+            j = i * 4
+            if a and b:
+                both += 1
+                c = COL["diff_both"]
+            elif a:
+                only_a += 1
+                c = COL["diff_only_a"]
+            else:
+                only_b += 1
+                c = COL["diff_only_b"]
+            diff[j:j + 4] = bytes(c)
+            if not (a and b):
+                x = i % w
+                y = i // w
+                if changed_bbox is None:
+                    changed_bbox = [x, y, x, y]
+                else:
+                    changed_bbox[0] = min(changed_bbox[0], x)
+                    changed_bbox[1] = min(changed_bbox[1], y)
+                    changed_bbox[2] = max(changed_bbox[2], x)
+                    changed_bbox[3] = max(changed_bbox[3], y)
+        if out is None:
+            # The compare name carries a tail of the OTHER file's name. Two
+            # comparisons in a row otherwise write the same default path and the
+            # second silently replaces the first - measured: a self-compare
+            # (all grey) overwrote the real difference image of the pair before it.
+            tail = str(compare) if isinstance(compare, str) else "<model>"
+            stem = re.sub(r"[^A-Za-z0-9]", "_", os.path.basename(tail))[-24:]
+            out = os.path.join(tempfile.gettempdir(),
+                               "pcb_diff_%s_vs_%s.png"
+                               % (re.sub(r"[^A-Za-z0-9]", "_", layer), stem))
+        out = os.path.abspath(out)
+        _png(out, w, h, diff)
+        changed_mm = None
+        if changed_bbox is not None:
+            # pixel -> mm through the same transform the drawing used
+            changed_mm = [round(x0 + (changed_bbox[0] - 1) / s, 3),
+                          round(y1 - (changed_bbox[3] - 1) / s, 3),
+                          round(x0 + (changed_bbox[2] - 1) / s, 3),
+                          round(y1 - (changed_bbox[1] - 1) / s, 3)]
+        total = max(1, both + only_a + only_b)
+        value.update({
+            "png": out,
+            "compare_to": compare if isinstance(compare, str) else "<model>",
+            "compare_layer": olayer,
+            "drawn_other": odrawn,
+            "pixels_shared": both,
+            "pixels_only_here": only_a,
+            "pixels_only_there": only_b,
+            "changed_fraction": round((only_a + only_b) / float(total), 6),
+            "changed_bbox_mm": changed_mm,
+            "identical": only_a == 0 and only_b == 0,
+        })
+        return ok(
+            value=value, unit="px",
+            model="pixel difference of two rasters of the same drawing "
+                  "model: grey = ink on both boards, red = only on the board "
+                  "named by `path`, blue = only on `compare`. A pixel counts as "
+                  "ink when it is not the background colour.",
+            basis="both boards were parsed by this server and drawn through the "
+                  "same transform, so the difference is exactly the drawn "
+                  "difference - no registration, no resampling",
+            precision="pixel-level and transform-level only: two boards whose "
+                      "geometry differs by less than one pixel at this px_per_mm "
+                      "read as identical, and a colour change inside one class "
+                      "is invisible. It is a picture of what changed, not a DRC.",
+            assumptions={"same_layer_unless_compare_layer": True})
+
     if out is None:
         out = os.path.join(tempfile.gettempdir(),
                            "pcb_render_%s.png" % re.sub(r"[^A-Za-z0-9]", "_", layer))
     out = os.path.abspath(out)
-    nbytes = _png(out, w, h, pix)
+    _png(out, w, h, pix)
+    value["png"] = out
     return ok(
-        value={"png": out, "width_px": w, "height_px": h,
-               "px_per_mm": round(s, 3), "layer": layer,
-               "drawn": drawn,
-               "bbox_mm": [round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3)]},
+        value=value,
         unit="px",
         model="flat raster: pour polygons (even-odd), tracks as capsules, "
               "via rings, pads, board edge",

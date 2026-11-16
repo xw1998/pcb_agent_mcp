@@ -195,7 +195,8 @@ def via(x, y_up, dia, drill, net_code, sp, uid, layers=("F.Cu", "B.Cu")):
 def zone_polygon_conf(net_code, net_name, layer, points, sp, uid,
                       clearance=0.2, min_thickness=0.25, priority=None,
                       hatch=0.5, keepout=None, pad_connection=None,
-                      thermal_gap=None, thermal_bridge_width=None, holes=None):
+                      thermal_gap=None, thermal_bridge_width=None, holes=None,
+                      name=None):
     """A zone: keepout when `keepout` is given, copper pour otherwise.
 
     A pour written this way carries `(fill yes)` but no `filled_polygon`: the
@@ -236,6 +237,15 @@ def zone_polygon_conf(net_code, net_name, layer, points, sp, uid,
     if priority is not None:
         items.append(L(A("priority"), A(str(int(priority)))))
     items.append(sp.id_node(uid))
+    # A zone may carry a NAME, and KiCad writes it right after the id (read off
+    # `_corpus/multichannel.kicad_pcb`, whose auto-placement rule areas are named
+    # "auto-placement-area-/CH4/"). A rule area without a name cannot be found
+    # again by anything but its geometry, which is exactly what a reservation
+    # needs: `reserve_region` writes `reserve:<net,net>` here and `release_region`
+    # looks for it. Writing it only when the caller asked keeps every existing
+    # zone byte-identical.
+    if name:
+        items.append(L(A("name"), A(str(name), True)))
     items.append(L(A("hatch"), A("edge"), A(num(hatch))))
     if keepout is not None:
         # Every rule flag has to be spelled out, allowed ones included. KiCad reads

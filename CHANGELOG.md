@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.1.40] - 2026-11-16
+
+用户问「要让你这样一个模型画好板子还缺什么」，答复点了五处缺口，这一版补的是其中最硬的两处：
+**「看见要改的地方」与「真的能改」之间没有原语**，以及**改之前算不出还剩多少余量**。
+底层的判据一条都没动（`shape_gate` 五条、`place_gate` 五条、八关门槛、DRC 是判官）——只是让「知道错了」
+之后有可执行、可回退、可验证的下一步。详见 `docs/178-腾地方原语与三处读数.md`。
+
+- **四个 `board_edit` op（46 → 50）**：`move_cluster`（一组成员整体平移/绕质心旋转，`with_copper` 连铜一起搬，
+  铜会留下而器件走了 ⇒ 默认 `ORPHAN_COPPER`，同意后仍如实报 `copper_orphaned_nets`）、`swap_pad_nets`
+  （一组焊盘网名的**一环旋转**，不是两两互换——三盘换网要的是轮转）、`reserve_region`（用 KiCad 原生命名 zone
+  `reserve:<group>` 先占住一条带，同名 ⇒ `RESERVE_EXISTS`、区内已有他网铜 ⇒ `RESERVE_OCCUPIED`）、
+  `release_region`（所有图层一起撤，无同名 ⇒ `RESERVE_NOT_FOUND` 并列出已有命名 zone）。
+  三条设计取舍：**只做一步不做布局**（挪谁挪多少由调用方给，不因为多了个好用的原语就松动「不许自动布局」）、
+  **orphan 默认拒绝**（断网是这四件事里唯一不会当场报错的一种）、**用原生对象不自造**（`(name ...)` 是 KiCad
+  自己会写的字段，round-trip 有官方保证，与「铜只能由官方 `ZONE_FILLER` 生成」同一条道理）。
+- **`build.zone_polygon_conf(name=...)` + `kicad_pcb` 解析 zone 的 `name`**：名字写在 `(uuid ...)` 之后、
+  `(hatch ...)` 之前，与真实文件（`auto-placement-area-/CH4/`）逐字一致。
+- **`board_length_budget`**：复用 `route/tune.py` 自己的齿模型（不另发明一套），四种答案分开报——
+  `in_tolerance` / `fits` / `needs_wider_band` / `route_too_short`。天花板 `0.414 × 可用直线长` **与振幅无关**，
+  `band_mm` 只决定齿数；唯一的容量损失来自 `_serpentine` 的 **400 齿/次上限**（实测 band 0.02 时
+  `teeth_capped=True`、容量 7.456 → 6.627 mm，而 `ceiling_mm` 一分不变）。第五种答案 `nothing_to_match`：
+  只给一条网又没给 `target_mm` 时，目标从自己身上取，等于问「这条网和自己一样长吗」——第一轮探针就在这个坑里
+  返回了 `budget_met`。
+- **`board_group_consistency`**：`length_spread` / `parallel` / `spacing_even` 三件事分开量、分开限、分开报，
+  不合成一个分数。`spacing_even` 在只有两网时是 `ok: None`（**跳过不是失败**）：两条网只有一个净空值没有变异，
+  判它失败会让每一对两网组因为算术原因变成 `inconsistent`——实测踩到，`failing` 只收 `is False`。
+  `precision` 里写死 `parallel_fraction` 是段对全配对，一条由很多短段组成、方向又杂的网即使真并行也会得低分，
+  所以它是「该看的地方」，不是缺陷清单。
+- **`board_reservations`**：把每个带名字的 zone 读回来（位置/图层/keepout 规则/区内他网铜）。只有标签里
+  **每个词都是本板真有的网名**时才判 `free`；`buck cluster` 这种名字判 `nets_are_known=False` —— 猜哪个 token
+  是网名，就是 checker 开始编造拒绝的起点。`kind` 区分 `reservation`（本工具写的）与 `rule_area`
+  （KiCad 自己写的 `auto-placement-area-*`），两种都读但不混算。占用判据是**端点入界**（射线法），
+  一条横穿带子两端都在外面的线不算占用——刻意选宽口径并写进 `precision`：宁可漏报，不可把「穿过」当「占了」。
+- **`snapshot.render(region=..., compare=..., compare_layer=...)` + `board_render` 三个参数**：`region` 只画一个窗口
+  （300 mm 板上看一个 20 mm 的簇，唯一可行的办法；帧是视图帧 Y 向上，反向矩形报 `ARG_INVALID` 不静默纠正）；
+  `compare` 同窗口同比例画两块板出差分图（灰=共有、红=只在 `path`、蓝=只在 `compare`）+ 像素计数与
+  `changed_bbox_mm`。两处实测修正：差分默认名必须带被比较文件尾部（否则连续两次比较互相覆盖，
+  自比的「全灰」会盖掉真差分图，数字对、看到的图是空的）、`compare` 判型不能用 `isinstance(other, dict)`
+  （另一块板是 `adapters.canonical.Board`，判错直接吐 `PARSE_FAILED`）。
+- **反向失败对照**（`tests/test_length_budget.py` 18 例、`tests/test_see_and_judge.py` 19 例）：
+  `route_too_short` → 目标 45 降到 40 翻 `budget_met`；`fits` → `band_mm` 1.0 收到 0.02 翻 `needs_wider_band`
+  而 `ceiling_mm` 不变；`consistent` → 一条网绕出 20 mm 翻 `inconsistent` 且 `failing` 点名 `length_spread`；
+  `spacing_even` → 第三条平行线从 8 mm 挪到 2 mm 通过；`free=True` → 一条他网 track 端点落进带子翻
+  `free=False` + `foreign_nets=['SIG']`；七个错误码各一条具名断言。
+- **没做到**：**审美代理量**（两个都合法但一个好看，仍无排序量，只有 `detour_ratio` 与 `shape_gate` 五条）与
+  **语料分层**（哪几块板算「完美板」、规则通过率怎么按板品质加权，`judge_corpus` 仍是纯失败率）。
+
 ## [0.1.39] - 2026-11-15
 
 `docs/174` 的语料全是 KiCad demo 板，只能证明「规则在 KiCad 的读法下自洽」。这一版把 **6 块立创 EDA 工程（`.epro`）**

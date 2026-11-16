@@ -4386,3 +4386,555 @@ def affects(ops):
     for op in ops:
         out |= set(OPS[validate(op)]["affects"])
     return sorted(out)
+
+# ------------------------------------------------------- regions and clusters
+# Three things the write path could not say before this section existed, and all
+# three came out of the same read of RK3506 (`docs/173` §5): five of the twelve
+# defects on that board had no operation that could express their answer.
+#
+# * every generative op took a 1-D object - a point, a segment, a via, a pad.
+#   Four of the five remaining defects are "make room here", and the only way to
+#   fix them is to move a GROUP of parts plus the copper that belongs to it in
+#   one rigid step. `move_cluster` is that step. It refuses unless nothing is
+#   orphaned, because a footprint that moves while its tracks stay behind is a
+#   net that silently disconnects - and that failure is invisible in the file.
+# * `add_keepout` can only forbid and `add_zone` can only add copper. Neither
+#   says "this band is being held for these nets", which is what routing a
+#   length-matched group BEFORE routing anything else needs. `reserve_region`
+#   writes a NAMED rule area and reports how much foreign copper already sits
+#   inside it; `release_region` takes it back.
+# * `set_pad_net` changes one pad, so swapping two nets takes two operations and
+#   any board read between them has both pads on the same net. `swap_pad_nets`
+#   rotates the assignment around a ring in one step: on a BGA whose ball order
+#   is wrong, the ring is the whole fix and the intermediate state is a short.
+
+def _pts_bbox(pts):
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+def _pt_in_poly(x, y, poly):
+    """Ray casting. Points exactly on an edge are not tested: a rule area's
+    boundary is not a place copper is either inside or outside of, and pretending
+    otherwise would turn a 1e-9 rounding error into a refusal."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y):
+            xc = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < xc:
+                inside = not inside
+        j = i
+    return inside
+
+def _sub_xy(node, sub):
+    """`(sub x y)` in the view frame (mm, Y up), or None when the node has none."""
+    n = S.child(node, sub)
+    if n is None or len(n.items) < 3:
+        return None
+    try:
+        return (S.arg_num(n, 1), -S.arg_num(n, 2))
+    except (TypeError, ValueError):
+        return None
+
+def _set_sub_xy(node, sub, x, y_up):
+    n = S.child(node, sub)
+    if n is None or len(n.items) < 3:
+        return False
+    n.items[1].text = B.num(x)
+    n.items[2].text = B.num(-float(y_up))
+    return True
+
+_ITEM_POINTS = ("start", "mid", "end", "at")
+
+def _item_points(node):
+    out = []
+    for sub in _ITEM_POINTS:
+        p = _sub_xy(node, sub)
+        if p is not None:
+            out.append(p)
+    return out
+
+def _shift_item(node, fn):
+    moved = 0
+    for sub in _ITEM_POINTS:
+        p = _sub_xy(node, sub)
+        if p is None:
+            continue
+        x, y = fn(p)
+        if _set_sub_xy(node, sub, x, y):
+            moved += 1
+    return moved
+
+def _item_layers(node):
+    ls = S.child(node, "layers")
+    if ls is not None:
+        return [S.arg_text(ls, i) for i in range(1, len(ls.items))
+                if S.arg_text(ls, i)]
+    one = S.arg_text(S.child(node, "layer"), 1)
+    return [one] if one else []
+
+def _item_net(node):
+    n = S.child(node, "net")
+    if n is None:
+        return ""
+    return S.arg_text(n, 2) or S.arg_text(n, 1) or ""
+
+def _net_name(ed, node):
+    """The net a copper item declares, by NAME.
+
+    Tracks, vias and zones written by this server carry `(net <code>)` only - the
+    name lives in the board's `(net <code> "name")` table, which is where KiCad
+    keeps it - so reporting the raw token tells a user "net 1" when the answer
+    they asked for is "SIG". Measured need: the orphan refusal named `(1)` before
+    this, and the reservation's foreign list did the same. A name-only board has
+    no table and its references already are names.
+    """
+    raw = _item_net(node)
+    if not raw:
+        return ""
+    return ed.name_by_code.get(raw, raw)
+
+def _fp_origin(node):
+    at = S.child(node, "at")
+    if at is None:
+        return (0.0, 0.0, 0.0)
+    return (S.arg_num(at, 1, 0.0), -S.arg_num(at, 2, 0.0),
+            S.arg_num(at, 3, 0.0) or 0.0)
+
+def _set_fp_origin(ed, node, x, y_up, rot):
+    """Write `(at x y rot)` the way `move_footprint` does, pads' angles included."""
+    at = S.child(node, "at")
+    old = _fp_origin(node)
+    want_rot = rot
+    if at is not None and len(at.items) < 4 and abs(float(rot or 0.0)) < 1e-12:
+        want_rot = None          # a footprint that never had an angle keeps none
+    new = B.at(x, y_up, want_rot)
+    if at is not None:
+        for i, item in enumerate(node.items):
+            if item is at:
+                node.items[i] = new
+                break
+    else:
+        S.insert_child(node, 1, new)
+    delta = float(want_rot or 0.0) - float(old[2] or 0.0)
+    pads = _rotate_pads(node, delta) if abs(delta) > 1e-9 else 0
+    return pads
+
+def _fp_pads_abs(node):
+    """(x, y, net, pad number) for every pad, in the VIEW frame.
+
+    The measured convention, not a guess: pad `(at x y)` is relative to the
+    footprint in the FILE frame (Y down), and the footprint's angle turns it
+    **counter-clockwise on screen**, which in the file frame is clockwise.
+    Measured on `_corpus/multichannel.kicad_pcb` J5 (ori 90, pad 1 rel (0, -6.2),
+    fp at (191.285, 87.385), pcbnew reports the pad at (185.085, 87.385)):
+    rotating the view-frame offset (0, +6.2) by +90 gives (-6.2, 0). The other
+    sign lands the pad on the wrong side by 12.4 mm.
+    """
+    ox, oy, rot = _fp_origin(node)
+    th = math.radians(float(rot or 0.0))
+    co, si = math.cos(th), math.sin(th)
+    out = []
+    for pad in S.children(node, "pad"):
+        at = S.child(pad, "at")
+        if at is None:
+            continue
+        rx = S.arg_num(at, 1, 0.0) or 0.0
+        ry = -(S.arg_num(at, 2, 0.0) or 0.0)
+        out.append((ox + rx * co - ry * si, oy + rx * si + ry * co,
+                    _item_net(pad), S.arg_text(pad, 1) or ""))
+    return out
+
+def _rot_about(p, c, deg):
+    th = math.radians(float(deg))
+    co, si = math.cos(th), math.sin(th)
+    dx, dy = p[0] - c[0], p[1] - c[1]
+    return (c[0] + dx * co - dy * si, c[1] + dx * si + dy * co)
+
+def _run_move_cluster(ed, o, seed):
+    refs = o.get("members") or o.get("refs")
+    if not isinstance(refs, (list, tuple)) or not refs:
+        raise OpError("move_cluster needs 'members': a list of reference "
+                      "designators to move as one rigid body", "ARG_MISSING")
+    dx = _num(o, "dx", required=False, default=0.0)
+    dy = _num(o, "dy", required=False, default=0.0)
+    rot = _num(o, "rot", required=False, default=0.0)
+    grow = _num(o, "grow_mm", required=False, default=0.0)
+    with_copper = _bool(o, "with_copper", True)
+    allow_orphan = _bool(o, "allow_orphan", False)
+    if abs(dx) < 1e-12 and abs(dy) < 1e-12 and abs(rot) < 1e-12:
+        raise OpError("move_cluster would not move anything (dx, dy and rot are "
+                      "all zero)", "ARG_INVALID")
+
+    nodes = []
+    missing = []
+    for ref in refs:
+        try:
+            nodes.append((ref, ed.footprint(ref)))
+        except OpError:
+            missing.append(ref)
+    if missing:
+        raise OpError("no footprint with reference(s) %s on this board"
+                      % ", ".join(missing), "REFERENCE_NOT_FOUND")
+
+    origins = [(ref, node) + _fp_origin(node) for ref, node in nodes]
+    cx = sum(e[2] for e in origins) / float(len(origins))
+    cy = sum(e[3] for e in origins) / float(len(origins))
+    centre = (cx, cy)
+
+    pts = [(e[2], e[3]) for e in origins]
+    pads_of = {}
+    for ref, node in nodes:
+        pads = _fp_pads_abs(node)
+        pads_of[ref] = pads
+        pts.extend([(p[0], p[1]) for p in pads])
+    x0, y0, x1, y1 = _pts_bbox(pts)
+    box = (x0 - grow, y0 - grow, x1 + grow, y1 + grow)
+
+    def inside(p):
+        return (box[0] - 1e-9 <= p[0] <= box[2] + 1e-9
+                and box[1] - 1e-9 <= p[1] <= box[3] + 1e-9)
+    box_area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+    box_perimeter = 2.0 * ((box[2] - box[0]) + (box[3] - box[1]))
+    # A bbox that has collapsed to a line is not a cluster; it would sweep every
+    # track on the board into the move set.
+    if box_area < 1e-6 or box_perimeter < 1e-6:
+        raise OpError("the %d member(s) have a degenerate bounding box (%0.4f mm "
+                      "area) - name the parts that actually make up the cluster"
+                      % (len(nodes), box_area), "ARG_INVALID")
+
+    # Which copper belongs to the cluster: anything with a point inside the box,
+    # PLUS anything that lands on a pad of a moved part. The second half is what
+    # keeps a bbox that happens to sit over an unrelated track from dragging it.
+    pad_tol = 0.05
+    pad_pts = [p for pads in pads_of.values() for p in pads]
+    copper = []
+    for kind in ("segment", "arc", "via"):
+        for node in ed.items(kind):
+            pts_i = _item_points(node)
+            if not pts_i:
+                continue
+            if not any(inside(p) for p in pts_i):
+                continue
+            on_pad = any(abs(p[0] - q[0]) <= pad_tol and abs(p[1] - q[1]) <= pad_tol
+                         for p in pts_i for q in pad_pts)
+            copper.append({"node": node, "points": pts_i, "on_pad": on_pad,
+                           "net": _net_name(ed, node), "layers": _item_layers(node),
+                           "kind": kind, "whole": all(inside(p) for p in pts_i)})
+
+    move_set = [c for c in copper if c["whole"]]
+    orphan = [c for c in copper if c["on_pad"] and not c["whole"]]
+    if not with_copper:
+        orphan = [c for c in copper if c["on_pad"]]
+        move_set = []
+    orphan_nets = sorted({c["net"] for c in orphan if c["net"]})
+    if orphan and not allow_orphan:
+        raise OpError(
+            "%d copper item(s) land on a moved pad but reach outside the cluster, "
+            "so moving the parts would leave them behind (%s)%s. Widen the cluster "
+            "(more members, or grow_mm) so they ride along, or pass "
+            "allow_orphan=true and re-route them."
+            % (len(orphan), ", ".join(orphan_nets[:6]) or "no net",
+               "" if len(orphan_nets) <= 6 else " and %d more" % (len(orphan_nets) - 6)),
+            "ORPHAN_COPPER",
+            hint="the measured cost on RK3506 is that every one of these is a net "
+                 "that opens, and board_drc's unconnected_total is the only thing "
+                 "that sees it afterwards",
+            orphaned=len(orphan), orphaned_nets=orphan_nets[:20])
+
+    def xf(p):
+        q = _rot_about(p, centre, rot) if abs(rot) > 1e-12 else p
+        return (q[0] + dx, q[1] + dy)
+
+    expect = {}
+    for ref, node, ox, oy, orot in origins:
+        nx, ny = xf((ox, oy))
+        nrot = ((orot or 0.0) + float(rot) + 180.0) % 360.0 - 180.0
+        pads = _set_fp_origin(ed, node, nx, ny, nrot)
+        expect[ref] = [round(nx, 6), round(ny, 6), round(nrot, 6), pads]
+
+    moved_items = 0
+    sample = []
+    for c in move_set:
+        if _shift_item(c["node"], xf):
+            moved_items += 1
+            if len(sample) < 8:
+                first = _item_points(c["node"])
+                if first:
+                    sample.append([c["kind"], round(first[0][0], 6),
+                                   round(first[0][1], 6)])
+    return {"members": [e[0] for e in origins],
+            "centre": [round(cx, 6), round(cy, 6)],
+            "delta": [dx, dy, rot],
+            "bbox": [round(v, 4) for v in box],
+            "bbox_area_mm2": round(box_area, 3),
+            "copper_considered": len(copper),
+            "copper_moved": moved_items,
+            "copper_orphaned": len(orphan),
+            "copper_orphaned_nets": orphan_nets[:20],
+            "expect": expect, "expect_sample": sample}
+
+def _verify_move_cluster(ed, o, record=None):
+    detail = (record or {}).get("detail") or {}
+    expect = detail.get("expect") or {}
+    if not expect:
+        return {"ok": False, "why": "no expected positions were recorded, so the "
+                                    "move cannot be checked against anything"}
+    bad = []
+    for ref, want in expect.items():
+        try:
+            node = ed.footprint(ref)
+        except OpError:
+            bad.append([ref, "gone"])
+            continue
+        got = _fp_origin(node)
+        if (abs(got[0] - want[0]) > 1e-5 or abs(got[1] - want[1]) > 1e-5
+                or abs((got[2] or 0.0) - (want[2] or 0.0)) > 1e-5):
+            bad.append([ref, [round(got[0], 6), round(got[1], 6), round(got[2], 6)]])
+    sample_bad = []
+    for kind, x, y in (detail.get("expect_sample") or []):
+        hit = False
+        for node in ed.items(kind):
+            p = _item_points(node)
+            if p and abs(p[0][0] - x) <= 1e-4 and abs(p[0][1] - y) <= 1e-4:
+                hit = True
+                break
+        if not hit:
+            sample_bad.append([kind, x, y])
+    return {"ok": not bad and not sample_bad, "members_checked": len(expect),
+            "moved_wrong": bad, "copper_sample_missing": sample_bad,
+            "copper_sample": len(detail.get("expect_sample") or [])}
+
+op("move_cluster", {"copper", "silk"},
+   "Move and/or rotate a GROUP of footprints, plus the copper that belongs to "
+   "them, as one rigid body. This is the only operation that can express 'make "
+   "room here' - the fix for four of the five layout debts on RK3506 - and it is "
+   "NOT an auto-placer: it moves exactly the parts you name, by exactly the "
+   "offset you give. Before writing it measures which copper rides along (whole "
+   "inside the cluster box, or landing on a moved pad) and which would be left "
+   "behind; it REFUSES when anything would be orphaned unless allow_orphan=true, "
+   "because a footprint that moves while its tracks stay put is a net that opens "
+   "silently. Coordinates are the board frame (mm, Y up). `rot` turns the cluster "
+   "counter-clockwise about its own centroid.",
+   {"members": "[reference, ...] moved as one rigid body",
+    "dx": "mm (+X to the right)", "dy": "mm (+Y up)",
+    "rot": "deg, counter-clockwise about the cluster centroid",
+    "with_copper": "move the copper that belongs to the cluster (default true)",
+    "grow_mm": "widen the cluster box by this much before deciding what is inside",
+    "allow_orphan": "proceed even though some copper would be left behind"},
+   _run_move_cluster, _verify_move_cluster)
+
+def _run_swap_pad_nets(ed, o, seed):
+    ring = o.get("pads") or o.get("swaps")
+    if not isinstance(ring, (list, tuple)) or len(ring) < 2:
+        raise OpError("swap_pad_nets needs 'pads': at least two [ref, pad] pairs",
+                      "ARG_MISSING")
+    targets = []
+    for i, entry in enumerate(ring):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise OpError("entry %d must be [reference, pad number], got %r"
+                          % (i, entry), "ARG_INVALID")
+        ref, number = str(entry[0]), str(entry[1])
+        fp = ed.footprint(ref)
+        pad = None
+        for p in S.children(fp, "pad"):
+            if (S.arg_text(p, 1) or "") == number:
+                pad = p
+                break
+        if pad is None:
+            raise OpError("footprint %r has no pad %r" % (ref, number), "PAD_NOT_FOUND")
+        targets.append((ref, number, pad, _net_name(ed, pad)))
+
+    # Rotate the assignment one step: pad i gets pad i+1's net. A cycle of length
+    # n is n assignments but only ONE board state, which is the point - a
+    # two-step version leaves two pads on the same net in between, and that is
+    # the short this operation exists to avoid.
+    before = [t[3] for t in targets]
+    after = before[1:] + before[:1]
+    for (ref, number, pad, _old), net in zip(targets, after):
+        for old_node in list(S.children(pad, "net")):
+            pad.items.remove(old_node)
+        if net:
+            if ed.name_only:
+                pad.items.append(B.L(B.A("net"), B.A(net, True)))
+            else:
+                pad.items.append(B.L(B.A("net"), B.A(ed.net_code(net)),
+                                     B.A(net, True)))
+    return {"pads": [[t[0], t[1]] for t in targets],
+            "before": before, "after": after}
+
+def _verify_swap_pad_nets(ed, o, record=None):
+    detail = (record or {}).get("detail") or {}
+    want = detail.get("after")
+    pads = detail.get("pads")
+    if not want or not pads:
+        return {"ok": False, "why": "nothing to check against"}
+    bad = []
+    for (ref, number), net in zip(pads, want):
+        fp = ed.footprint(ref)
+        got = ""
+        for p in S.children(fp, "pad"):
+            if (S.arg_text(p, 1) or "") == number:
+                got = _net_name(ed, p)
+                break
+        if got != net:
+            bad.append([ref, number, got, net])
+    return {"ok": not bad, "checked": len(pads), "wrong": bad}
+
+op("swap_pad_nets", {"nets"},
+   "Rotate the net assignment around a ring of pads in ONE step. Board books this "
+   "as a BGA whose ball order does not match the pinout: moving the assignment "
+   "costs nothing and swapping pads two at a time leaves an intermediate board "
+   "where both pads sit on the same net. Nothing moves - only which net each pad "
+   "declares.",
+   {"pads": "[[ref, pad], ...] - pad i takes pad i+1's net, last takes first's"},
+   _run_swap_pad_nets, _verify_swap_pad_nets)
+
+def _reserve_label(group):
+    return "reserve:" + str(group).strip()
+
+def _zone_name(node):
+    return S.arg_text(S.child(node, "name"), 1) or ""
+
+def _run_reserve_region(ed, o, seed):
+    group = _str(o, "group")
+    label = _reserve_label(group)
+    layers = o.get("layers") or ([_str(o, "layer")] if o.get("layer") else None)
+    if not layers:
+        raise OpError("a reservation needs 'layer' or 'layers'", "ARG_MISSING")
+    for l in layers:
+        ed.require_layer(l)
+    points = _zone_points(o)
+    rules = o.get("rules") or ["tracks", "vias", "copperpour"]
+    if isinstance(rules, str):
+        rules = [rules]
+    allow_existing = _bool(o, "allow_existing", False)
+    for node in ed.items("zone"):
+        if _zone_name(node) == label:
+            raise OpError("a reservation named %r already exists on this board - "
+                          "release it first (release_region) or use a different "
+                          "group label" % group, "RESERVE_EXISTS")
+
+    # Who the band is held FOR. If every comma-separated token is a net on this
+    # board, the label IS a net list and occupancy can be judged (foreign copper
+    # is a conflict). If not, it is just a label: the area is still written, but
+    # nothing is called foreign, because guessing which tokens are nets is how a
+    # checker starts inventing refusals.
+    tokens = [t.strip() for t in str(group).split(",") if t.strip()]
+    known = all(t in ed.net_by_name for t in tokens) if tokens else False
+    inside = {"tracks": [], "vias": []}
+    nets_inside = []
+    for kind in ("segment", "arc"):
+        for node in ed.items(kind):
+            if not (set(_item_layers(node)) & set(layers)):
+                continue
+            pts = _item_points(node)
+            if any(_pt_in_poly(p[0], p[1], points) for p in pts):
+                inside["tracks"].append(node)
+                nets_inside.append(_net_name(ed, node))
+    for node in ed.items("via"):
+        if not (set(_item_layers(node)) & set(layers)):
+            continue
+        p = _sub_xy(node, "at")
+        if p is not None and _pt_in_poly(p[0], p[1], points):
+            inside["vias"].append(node)
+            nets_inside.append(_net_name(ed, node))
+    foreign = sorted({n for n in nets_inside if n and n not in tokens}) if known else []
+    if foreign and not allow_existing:
+        raise OpError(
+            "the area already carries %d copper item(s) of nets that are not in "
+            "the reservation (%s). A reservation that overlaps someone else's "
+            "copper is not a reservation - pick a free band, or pass "
+            "allow_existing=true to record the overlap as known."
+            % (len(inside["tracks"]) + len(inside["vias"]), ", ".join(foreign[:6])),
+            "RESERVE_OCCUPIED",
+            occupied={"tracks": len(inside["tracks"]), "vias": len(inside["vias"])},
+            foreign_nets=foreign[:20])
+    for l in layers:
+        ed.append(B.zone_polygon_conf(0, "", l, points, ed.sp,
+                                      B.new_id("%s:reserve:%s" % (seed, l)),
+                                      keepout=rules, name=label))
+    return {"group": group, "label": label, "layers": list(layers),
+            "rules": rules, "vertices": len(points),
+            "nets_are_known": known, "nets": tokens if known else [],
+            "occupied_tracks": len(inside["tracks"]),
+            "occupied_vias": len(inside["vias"]),
+            "foreign_nets": foreign[:20],
+            "bbox": [round(v, 4) for v in _pts_bbox(points)]}
+
+def _verify_reserve_region(ed, o, record=None):
+    detail = (record or {}).get("detail") or {}
+    label = detail.get("label") or _reserve_label(_str(o, "group"))
+    want_layers = set(detail.get("layers") or (
+        o.get("layers") or ([o.get("layer")] if o.get("layer") else [])))
+    # One zone per layer, so the layers the plan asked for are the UNION of what
+    # the matching zones cover - asking every single zone to cover all of them
+    # would fail the very case this operation is for (a band held on F.Cu and
+    # B.Cu). Measured: the first version required each zone to hold the full set
+    # and refused its own two-layer write.
+    found = []
+    covered = set()
+    for node in ed.items("zone"):
+        if _zone_name(node) != label:
+            continue
+        poly = S.child(node, "polygon")
+        pts = S.child(poly, "pts") if poly is not None else None
+        ok_pts = pts is not None and len(S.children(pts, "xy")) >= 3
+        ko = S.child(node, "keepout")
+        layers = _item_layers(node)
+        covered |= set(layers)
+        found.append({"layer": layers, "polygon_points": ok_pts,
+                      "keepout": ko is not None})
+    missing = sorted(want_layers - covered)
+    return {"ok": bool(found) and not missing
+                    and all(f["polygon_points"] and f["keepout"] for f in found),
+            "reservations_found": found, "layers_missing": missing,
+            "label": label}
+
+op("reserve_region", {"copper"},
+   "Hold an area for a named group of nets by writing a NAMED rule area "
+   "(`reserve:<nets>`), and report what already sits inside it. add_keepout can "
+   "only forbid and add_zone can only add copper; neither can say 'this band is "
+   "being held for these nets', which is what routing a length-matched group "
+   "BEFORE anything else needs. If every comma-separated token is a net on the "
+   "board the label is a net list and existing copper of any other net is "
+   "refused (allow_existing=true records it instead). Nothing about the board's "
+   "existing copper is changed - this only adds the area.",
+   {"group": "label, or a comma-separated net list e.g. \"DDR_D0,DDR_D1\"",
+    "points": "[[x,y], ...] or x0/y0/x1/y1",
+    "layer": "layer", "layers": "[layers]",
+    "rules": "subset of tracks, vias, pads, copperpour, footprints (default "
+             "tracks, vias, copperpour)",
+    "allow_existing": "record existing foreign copper instead of refusing"},
+   _run_reserve_region, _verify_reserve_region)
+
+def _run_release_region(ed, o, seed):
+    group = _str(o, "group")
+    label = _reserve_label(group)
+    removed = 0
+    for node in list(ed.items("zone")):
+        if _zone_name(node) == label:
+            ed.remove(node)
+            removed += 1
+    if not removed:
+        raise OpError("no reservation named %r on this board (it has: %s)"
+                      % (label, ", ".join(sorted(_zone_name(z) for z in ed.items("zone")
+                                                 if _zone_name(z))) or "no named zones"),
+                      "RESERVE_NOT_FOUND")
+    return {"group": group, "label": label, "zones_removed": removed}
+
+def _verify_release_region(ed, o, record=None):
+    label = _reserve_label(_str(o, "group"))
+    left = [z for z in ed.items("zone") if _zone_name(z) == label]
+    return {"ok": not left, "left_behind": len(left), "label": label}
+
+op("release_region", {"copper"},
+   "Delete a reservation written by reserve_region (every layer it was written "
+   "on). Refuses when there is nothing with that name, and lists the names that "
+   "do exist, so a typo is a refusal instead of a silent no-op.",
+   {"group": "the same label reserve_region was given"},
+   _run_release_region, _verify_release_region)
