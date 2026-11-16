@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.1.42] - 2026-11-16
+
+上一版结尾登记的七条欠账，这一版逐条做掉，或**写明为什么不做**（不做的那条给了辖区分界，不是「没排期」）。
+一行既有判据都没动：八关门槛、`shape_gate` 五条、`place_gate` 五条、DRC 仍是判官；本版只做读数与报告层。
+详见 `docs/180-欠账清零-网名口径与无铜板与语料扩样.md`。
+
+- **欠账 ①（`bundle_share` 需网名）——欠账描述本身是错的。** 实测 **14 块有铜板每根 track 都带网名**
+  （59–7932 段全带），其中 `sky_star` / `rk3506` / `pic_programmer` 三块只是 `(net …)` **表**为空；
+  旧判据 `bool(board.nets) and any(...)` 问的是**表**，于是把本项目自己两块板误标 `degraded`。
+  新口径问 track：`named_segments` 非零即 `names`，只把 `(net 0)` / 空名算无名（`"0"` 是解析出来的字符串，
+  `not in (None, "")` 会把它当有名）。新增两格可核读数 `segments_with_net` / `net_table_entries`。
+  改后 **14 块数值一格未变**，`net_source` 全为 `names`；那 7 块 0.0 是**实测零**（两层板单线独走，没邻居可并），
+  不是读不出来。另给「真无名」补**连通分量代理**（同层共享端点 + 端点落在别人中段 ⇒ 同一导体；交叉不算连接），
+  标 `net_source: "connected copper"` 且仍算 `degraded`——代理是**过并而非漏并**，且不假装是真名。
+- **欠账 ②（`microwave` 无铜）——点名，并摘掉它的假绿。** 新增 `copper_inventory()`
+  （tracks/vias/zones/**filled_zones**/pads）与 `is_copper_free()`；`filled_zones` 只数有 `filled_polygons`
+  且非 keepout 的 zone。`evaluate()` 多返回 `copper` 块，`COPPER_STEPS = (bus, route, closure)` 上无铜板的
+  `pass` 改判 `n/a` + note，`run_corpus()` 输出 `copper_free` 名单并单独打印一段。两条反向口径写死：
+  **缺 inventory 不等于空**（`is_copper_free` 要求 `"tracks" in inv`，超时板不许被当干净）、
+  **全铺铜交付的电源板不算无铜**（只有 keepout 也不算）。结果：`microwave`（0 track / 0 填充 / 8 pad）
+  从 `shape_pass` 摘掉，`route` 由 `0 pass / 13 fail` 变 `0 pass / 14 fail / 1 n/a`。
+- **欠账 ③（`floorplan`/`stackup` 干净层 0–2 块）——语料 12 → 15 块，干净层仍是 0，但原因换了。**
+  新增 `sonde_xilinx`（2 层，38 defects）、`kit_dev_coldfire`（4 层，161）、`royalblue_nfc_antenna`（2 层，2），
+  每块跑 `kicad-cli pcb drc --format json` 落 `<board>.kicad_pcb.drc.json`，按排名三等分重排 low/mid/high 各 5 块。
+  实跑：`frame` 12/12 / `fanout` 15/15 / `power` 15/15 判 1.00 `hold_across_strata`；`floorplan` 只有 2 块
+  判得了且都在 high ⇒ **扩两层板从方向上救不了它**，真因是适用条件（`no net reaches a board-edge terminal`）
+  与公开语料形态冲突；`stackup` 的干净层 n=0 是**结构性**的——最干净的 5 块全是两层板，两层板没有内层参考平面，
+  要判 `stackup` 需要一块**干净的多层板**，而公开演示里的多层板都带大量 DRC 历史债。两条都如实记，不再加两层板凑数。
+- **欠账 ④（没做图像美学）——不做，给辖区分界。** 对齐、间距节奏、丝印层次已有实现：`layout_quality` 管摆位、
+  `place_gate` 管出厂门禁。再写一套视觉美感打分等于同一个问题两把尺子，而两把尺子必然打架、打架时没有第三方仲裁。
+  `aesthetics.py` 的辖区在文件头写死：**只看铜的形状，不看图**。
+- **欠账 ⑤（没做焊盘级扇出几何）——新增 `pad_stub_mm`。** 每个焊盘上「**端点**落在焊盘铜矩形内」的最短 track
+  长度取中位（外放宽 20 µm、按 `-rotation` 反旋转判、层要匹配、2 mm 网格分桶）；**无 track 的焊盘单独计数不记 0**
+  （没接线不是「桩长 0」）。`better_when: no_direction`，不进 `DIRECTED`、不进 `place_quality`——BGA 短桩与被逼的
+  via fence 都不叫丑，排序会与 `bends_per_pad` 重复计分。实测：手画 1.3382 / 自画 0.3973 / 语料中位 2.3165 /
+  区间 0.288–3.595（逐板已记在文档里）。
+- **欠账 ⑥（校准表是 11 块语料）——按 14 块有铜板重测**（`corpus_n` 11 → 14）：`bends_per_100mm` 中位 21.6403、
+  `bends_per_pad` 中位 1.8481；后者的上界被 `royalblue_nfc_antenna`（160 段绕线圈、pad 极少）拉到 **44.0**，
+  note 里点名并写清「读中位，别读上界」。`collinear_per_100mm` 仍是唯一 `separates: False`（手画 0.5531 高于自画 0.1188）。
+- **欠账 ⑦（全量 `pytest tests/` 没跑完）——跑完了，0 失败。** 176 个测试文件切成 7 组并行（`-p no:randomly`、随机种子固定 `20261116`、七组并集=全部文件、组间无重叠）：**4631 passed / 9 skipped / 53 subtests passed / 0 failed**，组内最长 861.57 s，CPU 合计约 59.6 min。改并行的原因是实测：单进程串行跑到 12% 已用 9 分钟，按此外推全量要 75 min 以上——这是测量成本问题，不是有测试挂了。**工具数仍 260**（本版只加读数不加工具）。
+- **RK3506 板级 6 条（锐角 10 / 非 45° 14 / 盘中孔 8 / `copper_under_magnetics` 41 段 / 未连接 7 / DDR 等长 need 342.2 只填 10.73）
+  仍不动**：全部是**布局层**后果，不是布线器能自己修的东西。盘中孔要换扇出策略（改的是焊盘级几何，`pad_stub_mm` 只测不修）、
+  电感底下走线绕不动的根因是器件位置、未连接与等长是拓扑与空间约束。前提不变时任何「修一下布线」都只是把同一条错线挪个位置。
+
 ## [0.1.41] - 2026-11-16
 
 上一版结尾登记的两件「没做到」：**没有能量化「两块都合法、哪一块好看」的读数**，以及

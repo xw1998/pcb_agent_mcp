@@ -312,6 +312,70 @@ def test_corpus_does_not_count_a_hung_board_as_judged(monkeypatch, capsys):
     assert out["steps"]["frame"]["judged"] == 1
 
 
+def _rep(steps_override=None, copper=None, verdict="sequence_ok"):
+    steps = []
+    for sid in S.ORDER:
+        steps.append({"id": sid, "title": sid, "why": "", "requires": None,
+                      "status": (steps_override or {}).get(sid, "n/a"),
+                      "measured": {}, "note": ""})
+    rep = {"board": "x.kicad_pcb", "order": list(S.ORDER), "mode": "independent",
+           "steps": steps, "first_failing_step": None, "not_judged": [],
+           "verdict": verdict}
+    if copper is not None:
+        rep["copper"] = copper
+    return rep
+
+def test_a_copper_free_board_is_named_and_never_counted_as_passing_route(
+        monkeypatch, capsys):
+    """`shape_pass` on a board with no track means "nothing failed", which is the
+    same shape of false green as a rule with nothing to check. Such a board is
+    named in the report and its copper steps become n/a."""
+    empty = _rep({"route": "pass", "closure": "pass", "bus": "pass", "frame": "pass"},
+                 copper={"tracks": 0, "vias": 0, "zones": 1, "filled_zones": 0,
+                         "pads": 40})
+    monkeypatch.setattr(S, "evaluate_isolated", lambda p, *a, **kw: empty)
+    out = S.run_corpus(["empty.kicad_pcb"], 0.30, 0.10, quiet=False)
+    assert [c["board"] for c in out["copper_free"]] == ["empty.kicad_pcb"]
+    assert out["copper_free"][0]["tracks"] == 0
+    for sid in S.COPPER_STEPS:
+        assert out["steps"][sid]["counts"]["pass"] == 0, sid
+        assert out["steps"][sid]["judged"] == 0, sid
+    # a step about pads and the outline is still judged on such a board
+    assert out["steps"]["frame"]["counts"]["pass"] == 1
+    printed = capsys.readouterr().out
+    assert "copper-free boards" in printed
+    assert "empty.kicad_pcb" in printed
+
+def test_a_board_with_one_track_is_not_copper_free(monkeypatch):
+    one = _rep({"route": "pass"}, copper={"tracks": 1, "vias": 0, "zones": 0,
+                                          "filled_zones": 0, "pads": 4})
+    monkeypatch.setattr(S, "evaluate_isolated", lambda p, *a, **kw: one)
+    out = S.run_corpus(["one.kicad_pcb"], 0.30, 0.10, quiet=False)
+    assert out["copper_free"] == []
+    assert out["steps"]["route"]["counts"]["pass"] == 1
+
+def test_a_filled_plane_counts_as_copper():
+    """A board routed entirely by plane (a power board) has no tracks and IS
+    copper: calling it copper-free would throw away the only copper it has."""
+    inv = {"tracks": 0, "vias": 0, "zones": 2, "filled_zones": 1, "pads": 10}
+    assert S.is_copper_free(inv) is False
+
+def test_an_unmeasured_board_is_not_copper_free():
+    """Missing inventory = we did not look. That must not read as empty."""
+    assert S.is_copper_free(None) is False
+    assert S.is_copper_free({}) is False
+
+def test_copper_inventory_ignores_keepout_zones():
+    board = Board("kicad_pcb", "mem.kicad_pcb")
+    board.zones = [
+        {"net": "GND", "is_keepout": False, "filled_polygons": [[[(0, 0)]]]},
+        {"net": None, "is_keepout": True, "filled_polygons": [[[(0, 0)]]]},
+        {"net": "V3", "is_keepout": False, "filled_polygons": []},
+    ]
+    inv = S.copper_inventory(board)
+    assert inv["tracks"] == 0 and inv["zones"] == 3
+    assert inv["filled_zones"] == 1     # a keepout is not copper, an empty fill is not either
+
 def test_the_drc_flag_reaches_the_closure_step(monkeypatch):
     """`--drc` parsed and printed nothing for one round: the flag existed on the
     CLI but `evaluate()` never put it in `ctx`, so `ctx.get("drc")` was always

@@ -146,6 +146,40 @@ class TestReadings(Base):
         teeth = seg(10, 10, 30, 10, net=1) + seg(30, 10.4, 10, 10.4, net=1)
         self.assertEqual(self.value(self.board(teeth), "bundle_share"), 0.0)
 
+    def test_an_unnamed_meander_is_not_its_own_bundle(self):
+        # the normal state of a file whose tracks carry no net name at all: `(net 0)`
+        # everywhere. Connectivity has to stand in for the net name, or a serpentine
+        # reads as 100% bundled because its own teeth are "another net".
+        # a proper U-turn: the two parallel pieces are joined end to end, so they
+        # are one conductor and only connectivity (not a net name) can say so
+        teeth = (seg(10, 10, 30, 10, net=0) + seg(30, 10, 30, 10.4, net=0)
+                 + seg(30, 10.4, 10, 10.4, net=0))
+        got = aesthetics.readings(self.board(teeth))
+        self.assertFalse(got["nets_known"])
+        self.assertEqual(got["bundle_share"]["net_source"], "connected copper")
+        self.assertEqual(got["bundle_share"]["value"], 0.0)
+
+    def test_two_unnamed_neighbours_are_still_two_conductors(self):
+        near = seg(10, 10, 50, 10, net=0) + seg(10, 10.3, 50, 10.3, net=0)
+        far = seg(10, 10, 50, 10, net=0) + seg(10, 12.0, 50, 12.0, net=0)
+        self.assertGreater(self.value(self.board(near), "bundle_share"), 0.9)
+        self.assertEqual(self.value(self.board(far), "bundle_share"), 0.0)
+
+    def test_an_unnamed_branch_on_a_trunk_is_one_conductor(self):
+        trunk = seg(10, 10, 50, 10, net=0)
+        branch = seg(30, 10, 30, 30, net=0)   # its end lands on the trunk interior
+        got = aesthetics.readings(self.board(trunk + branch))["bundle_share"]
+        self.assertEqual(got["net_source"], "connected copper")
+        self.assertEqual(got["value"], 0.0)
+
+    def test_named_tracks_use_names_even_when_the_net_table_is_missing(self):
+        # this project's own boards: a name on every track, an empty `(net ...)`
+        # table. Asking the table answered "no names" about a file that has them.
+        tracks = seg(10, 10, 50, 10, net=1) + seg(10, 10.3, 50, 10.3, net=2)
+        got = aesthetics.readings(self.board(tracks))
+        self.assertTrue(got["nets_known"])
+        self.assertEqual(got["bundle_share"]["net_source"], "names")
+
     def test_copper_free_board_says_so_instead_of_reading_zero(self):
         got = aesthetics.readings(self.board(""))
         self.assertIn("why_nothing_measured", got)
@@ -348,6 +382,41 @@ class TestCalibration(Base):
         for key in ("via_per_100mm", "offgrid_share"):
             self.assertIn("better_when", rows[key])
         self.assertEqual(rows["via_per_100mm"]["better_when"], "no_direction")
+
+
+class TestPadStub(Base):
+    """Pad-level escape geometry - reported, never ranked."""
+
+    def test_the_stub_is_the_shortest_track_that_ends_on_the_pad(self):
+        pads = pad_footprint("P0", 20, 20)
+        tracks = seg(20, 20, 24, 20) + seg(20, 20, 20, 22)
+        got = aesthetics.readings(self.board(tracks, pads))["pad_stub_mm"]
+        self.assertAlmostEqual(got["value"], 2.0, places=3)   # 2 mm, not 4 mm
+        self.assertEqual(got["pads_measured"], 1)
+        self.assertEqual(got["pads_without_track"], 0)
+
+    def test_a_pad_with_no_track_is_counted_not_zeroed(self):
+        pads = pad_footprint("P0", 20, 20) + pad_footprint("P1", 60, 60)
+        tracks = seg(20, 20, 24, 20)
+        got = aesthetics.readings(self.board(tracks, pads))["pad_stub_mm"]
+        self.assertEqual(got["pads_measured"], 1)
+        self.assertEqual(got["pads_without_track"], 1)
+        self.assertAlmostEqual(got["value"], 4.0, places=3)
+
+    def test_a_track_that_ends_next_to_the_pad_does_not_count(self):
+        pads = pad_footprint("P0", 20, 20)             # 1 x 1 mm pad: x in 19.5..20.5
+        tracks = seg(23, 20, 30, 20)                   # its end is 2.5 mm clear of it
+        got = aesthetics.readings(self.board(tracks, pads))["pad_stub_mm"]
+        self.assertEqual(got["pads_measured"], 0)
+        self.assertEqual(got["pads_without_track"], 1)
+        self.assertIsNone(got["value"])
+
+    def test_the_stub_reading_is_reported_and_never_ranked(self):
+        pads = pad_footprint("P0", 20, 20)
+        got = aesthetics.readings(self.board(seg(20, 20, 24, 20), pads))
+        self.assertEqual(got["pad_stub_mm"]["better_when"], "no_direction")
+        self.assertNotIn("pad_stub_mm", aesthetics.DIRECTED)
+        self.assertNotIn("pad_stub_mm", got["place_quality"]["readings"])
 
 
 if __name__ == "__main__":

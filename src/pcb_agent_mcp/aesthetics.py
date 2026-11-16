@@ -77,47 +77,64 @@ DIRECTED = {
 #: Measured 2026-11-16, canonical adapter, whole board, all copper layers.
 #:   hand-routed `examples/sky_star/sky_star_routed.kicad_pcb`
 #:   drawn by this project `examples/rk3506_som/rk3506_som.kicad_pcb`
-#:   twelve boards in `_corpus/` (KiCad demos + shipped third-party boards)
-#: `n` is how many of the twelve corpus boards were available for that reading.
+#:   fifteen boards in `_corpus/` (KiCad demos + shipped third-party boards),
+#:   of which fourteen carry copper - `microwave` has no track at all and reports
+#:   no value for anything
+#: `n` is how many of the corpus boards were available for that reading. Re-measured
+#: 2026-11-16 after `nets_known` was corrected (it asked the board's net TABLE, which
+#: this project's own boards leave empty, and so mislabelled two of its own files):
+#: no reading moved except by the three boards added to the corpus, and hand vs
+#: machine still separates on all five separators.
 #: Kept as data, not as thresholds: nothing is refused for crossing these.
 CALIBRATION = {
     "chunk_median_mm": {
         "hand": 1.3439, "machine": 0.3606,
-        "corpus_median": 1.7961, "corpus_n": 11,
+        "corpus_median": 1.7961, "corpus_n": 14,
         "corpus_range": [0.2767, 3.4925], "separates": True,
         "note": "the hand board sits BELOW the corpus median: it is dense (462 "
                 "pads), so its runs are broken by fanout stubs even though the "
                 "long pieces it does have are 40 mm"},
     "bends_per_100mm": {
         "hand": 33.2362, "machine": 77.3997,
-        "corpus_median": 21.4903, "corpus_n": 11,
+        "corpus_median": 21.6403, "corpus_n": 14,
         "corpus_range": [9.1542, 136.5284], "separates": True,
         "note": "the hand board is WORSE than the corpus median here for the same "
                 "density reason; what it does separate is hand vs machine, by "
                 "2.3x, and pads differ only 1.48x, so density does not explain it"},
     "bends_per_pad": {
         "hand": 1.4307, "machine": 4.7757,
-        "corpus_median": 1.6485, "corpus_n": 11,
-        "corpus_range": [1.1012, 3.6367], "separates": True,
+        "corpus_median": 1.8481, "corpus_n": 14,
+        "corpus_range": [1.1012, 44.0], "separates": True,
         "note": "the density-normalised twin, and here the hand board is better "
-                "than the corpus median as well as 3.3x better than this project"},
+                "than the corpus median as well as 3.3x better than this project. "
+                "The 44.0 top of the range is RoyalBlue54L-NFC-Antenna - 160 "
+                "segments tracing a coil on a two-pad board - so the top of this "
+                "range is not a scale: read the median, and do not be surprised "
+                "that a 4.8 bends/pad board lands in the bottom few percent"},
     "bundle_share": {
         "hand": 0.2454, "machine": 0.1603,
-        "corpus_median": 0.1179, "corpus_n": 11,
+        "corpus_median": 0.1179, "corpus_n": 14,
         "corpus_range": [0.0, 0.3510], "separates": True,
-        "note": "the weakest of the five separators: this reading needs net names "
-                "and eight of the twelve corpus boards route almost nothing "
-                "alongside anything, which pulls the median down"},
+        "note": "the weakest of the five separators, and the zeros here are "
+                "MEASURED zeros, not missing data: seven of the fourteen corpus "
+                "boards (complex_hierarchy, ecc83, interf_u, multichannel, "
+                "pic_programmer, royalblue_nfc_antenna, sonde_xilinx) put nothing "
+                "inside the 0.15..0.70 mm band, which is what a two-layer board of "
+                "single traces looks like. Every one of the fourteen carries an "
+                "identity on every track - `nets_known` asks the TRACKS, not the "
+                "board's `(net ...)` table, which this project's own two boards "
+                "leave empty - so no board reads degraded; the empty one "
+                "(microwave) has no tracks at all and reports no value"},
     "long_seg_share": {
         "hand": 0.1087, "machine": 0.0533,
-        "corpus_median": 0.1876, "corpus_n": 11,
+        "corpus_median": 0.1823, "corpus_n": 14,
         "corpus_range": [0.0085, 0.3926], "separates": True,
         "note": "separates hand from machine, but the two-layer demo boards in "
                 "the corpus are mostly long power trunks and read higher"},
     "collinear_per_100mm": {
         "hand": 0.5531, "machine": 0.1188,
-        "corpus_median": 1.6592, "corpus_n": 11,
-        "corpus_range": [0.8233, 8.4257], "separates": False,
+        "corpus_median": 1.6843, "corpus_n": 14,
+        "corpus_range": [0.6481, 8.4257], "separates": False,
         "note": "does NOT separate: the hand board carries MORE stitches than "
                 "this project's board (0.553 vs 0.119). It is a waste counter - "
                 "an extra piece of copper is an extra piece - and it is ranked, "
@@ -177,14 +194,8 @@ def _segment_grid(segs):
                 cells.setdefault((s["layer"], cx, cy), []).append(i)
     return cells
 
-def _lands_inside(segs, grid, i, p):
-    """True when point p sits on the INTERIOR of another piece of the same net.
-
-    An end-to-end meeting is already a joint in `_joints`; this is the other way
-    a trunk gets a branch: the branch's end is dropped onto the middle of a run.
-    Stored as two pieces, that looks like nothing at all from the ends' point of
-    view, which is how a tee used to disappear from the readings.
-    """
+def _lands_on(segs, grid, i, p):
+    """Index of a same-layer segment whose INTERIOR point p sits on, else None."""
     me = segs[i]
     cx = int(math.floor(p[0] / _TEE_CELL_MM))
     cy = int(math.floor(p[1] / _TEE_CELL_MM))
@@ -192,8 +203,6 @@ def _lands_inside(segs, grid, i, p):
         if j == i:
             continue
         o = segs[j]
-        if o["net"] != me["net"]:
-            continue
         a, b = o["s"], o["e"]
         dx, dy = b[0] - a[0], b[1] - a[1]
         den = dx * dx + dy * dy
@@ -203,8 +212,20 @@ def _lands_inside(segs, grid, i, p):
         if t * o["len"] <= JOIN_MM or (1.0 - t) * o["len"] <= JOIN_MM:
             continue
         if geometry.dist_point_segment(p, a, b) <= JOIN_MM:
-            return True
-    return False
+            return j
+    return None
+
+
+def _lands_inside(segs, grid, i, p):
+    """True when point p sits on the INTERIOR of another piece of the same net.
+
+    An end-to-end meeting is already a joint in `_joints`; this is the other way
+    a trunk gets a branch: the branch's end is dropped onto the middle of a run.
+    Stored as two pieces, that looks like nothing at all from the ends' point of
+    view, which is how a tee used to disappear from the readings.
+    """
+    j = _lands_on(segs, grid, i, p)
+    return j is not None and segs[j]["net"] == segs[i]["net"]
 
 def _joints(segs):
     """Group segment ends by position. Returns (pairs, dangling, tees)."""
@@ -258,12 +279,23 @@ def readings(board, layer=None):
     pads = 0
     for fp in board.footprints:
         pads += len(fp.get("pads") or [])
-    nets_known = bool(board.nets) and any(s["net"] not in (None, "") for s in segs)
+    # "Are net names available?" is a question about the TRACKS, not about the
+    # board's net table: this project's own two boards carry a name on every one
+    # of their tracks and still have an empty `(net ...)` table, so testing the
+    # table answered "no" about files that answer yes.
+    # `(net 0)` is KiCad for "no net", and an empty name means the same thing. Any
+    # other value is an identity, whether it is a name ("GND") or a bare number
+    # whose table entry is missing - two different numbers are still two nets.
+    named_segments = sum(1 for s in segs
+                         if s["net"] not in (None, "", "0", 0))
+    nets_known = named_segments > 0
 
     out = {"board": (getattr(board, "source", None) or {}).get("path"),
            "layer": layer or "all copper",
            "segments": len(segs), "copper_mm": round(total, 3),
-           "vias": len(board.vias), "pads": pads, "nets_known": nets_known}
+           "vias": len(board.vias), "pads": pads,
+           "nets_known": nets_known, "segments_with_net": named_segments,
+           "net_table_entries": len(board.nets)}
     if not segs or total <= 0:
         out["why_nothing_measured"] = (
             "no routed copper on this board (or on this layer): every reading "
@@ -350,23 +382,31 @@ def readings(board, layer=None):
         "unit": "vias/100mm", "better_when": "no_direction",
         "how": "reported, never ranked: an inner-layer board and a dense BGA use "
                "more vias to route BETTER, so a low number is not a virtue"}
-    bundle = _bundle_share(segs)
+    # Same-net suppression needs to know which pieces of copper are one conductor.
+    # Net names answer that exactly; when the file has none, connectivity does.
+    group = None if nets_known else _proxy_groups(segs)
+    bundle = _bundle_share(segs, group)
     out["bundle_share"] = {
         "value": round(bundle, 4) if bundle is not None else None,
         "unit": "share", "better_when": "higher",
+        "net_source": "names" if nets_known else "connected copper",
         "degraded": not nets_known,
-        "how": "share of segments that have another net's copper running alongside "
-               "them, parallel within %g deg at %g..%g mm. Two nets side by side "
-               "is what a bundle looks like; a board where nothing runs alongside "
-               "anything has every trace solving its own maze" % (
+        "how": "share of segments that have another conductor's copper running "
+               "alongside them, parallel within %g deg at %g..%g mm. Two nets "
+               "side by side is what a bundle looks like; a board where nothing "
+               "runs alongside anything has every trace solving its own maze" % (
                    PARALLEL_DEG, PARALLEL_MIN_MM, PARALLEL_MAX_MM)}
     if bundle is None:
         out["bundle_share"]["why"] = "fewer than two segments: nothing to run alongside"
     if not nets_known:
         out["bundle_share"]["why_degraded"] = (
-            "this file does not carry net names on its tracks, so same-net "
-            "suppression is impossible: a meander's own teeth count as a bundle. "
-            "Comparable between boards in the same state, not across states")
+            "this file carries no net names on its tracks, so 'another net' is "
+            "approximated by 'not connected to me'. Pieces that share an endpoint "
+            "or land on each other's interior on the same layer are one "
+            "conductor and never count as each other's bundle; two nets that "
+            "merely cross stay separate. It over-merges only in the case where "
+            "one continuous polyline is really two nets, which a router does not "
+            "emit. Still labelled degraded because a proxy is not the real thing")
 
     out["offgrid_share"] = {
         "value": round(sum(1 for s in segs
@@ -376,6 +416,18 @@ def readings(board, layer=None):
         "how": "share of segments that are not a multiple of 45 degrees. This is "
                "house compliance (shape_gate owns the verdict), reported here only "
                "because it is the reading people reach for first"}
+    stubs = _pad_stubs(board, segs)
+    out["pad_stub_mm"] = {
+        "value": stubs.get("value"), "unit": "mm", "better_when": "no_direction",
+        "pads_measured": stubs.get("pads_measured"),
+        "pads_without_track": stubs.get("pads_without_track"),
+        "pads_total": stubs.get("pads_total"),
+        "how": "median, over pads, of the shortest track that ends ON that pad: the "
+               "pad-level escape geometry. Reported and never ranked - a 0.4 mm-pitch "
+               "BGA is forced into short escapes and a via fence is deliberately a "
+               "series of short stubs, so neither end of this number is a verdict"}
+    if stubs.get("value") is None:
+        out["pad_stub_mm"]["why"] = stubs.get("why")
     out["place_quality"] = _calibration_row(out)
     return out
 
@@ -414,22 +466,176 @@ def _calibration_row(rows):
                                "where this board sits among boards that ship"}
 
 
-def _bundle_share(segs):
+def _proxy_groups(segs):
+    """Group segments into "the same piece of copper" without net names.
+
+    The bundle reading needs to know which two segments are the SAME net, so that
+    a meander's own teeth are not counted as someone running alongside it. Plenty
+    of real files (this repo's own two boards included) carry no net name on the
+    tracks at all. In that state the honest substitute is connectivity: two
+    pieces of copper that touch ARE the same conductor, and two that never touch
+    are not. Touching means sharing an endpoint (within JOIN_MM) on one layer, or
+    one piece's END landing on the INTERIOR of another piece of the same layer
+    (a branch dropped onto a trunk). Crossing pieces do not touch, so two nets
+    that simply cross a plane stay separate.
+
+    This is an over-merge, not an under-merge: a trunk and its branch become one
+    group, which is correct, but two physically distinct nets that happen to be
+    drawn as one continuous polyline also become one group (they would be one net
+    then). It is never better than net names, which is why `net_source` says
+    which one was used.
+    """
+    n = len(segs)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    index = {}
+    for i, s in enumerate(segs):
+        index.setdefault(_key(None, s["layer"], s["s"]), []).append(i)
+        index.setdefault(_key(None, s["layer"], s["e"]), []).append(i)
+    for hits in index.values():
+        for j in hits[1:]:
+            union(hits[0], j)
+
+    grid = _segment_grid(segs)
+    for i, s in enumerate(segs):
+        for p in (s["s"], s["e"]):
+            j = _lands_on(segs, grid, i, p)
+            if j is not None:
+                union(i, j)
+    return [find(i) for i in range(n)]
+
+
+#: A track endpoint counts as landing ON a pad when it is inside the pad rectangle
+#: grown by this much. 20 um absorbs the rounding of a file stored in mm.
+_PAD_TOL_MM = 0.020
+#: Cell of the endpoint grid used to answer "which tracks end on this pad?".
+_PAD_CELL_MM = 2.0
+
+def _pad_copper_layers(pad):
+    """The copper layers this pad sits on, or None for "all of them"."""
+    layers = pad.get("layers") or []
+    if any(l in ("*.Cu", "F&B.Cu") for l in layers):
+        return None
+    return [l for l in layers if str(l).endswith(".Cu")]
+
+def _pad_stubs(board, segs):
+    """Length of the shortest track attached to each pad: the escape geometry.
+
+    Why this exists as its own reading: `bends_per_100mm` cannot tell a 0.4 mm-pitch
+    BGA from a through-hole board, and `bends_per_pad` only renormalises it. The
+    thing a person actually sees at a pad is where the copper leaves it and how
+    far it gets before it stops being a stub.
+
+    What it measures, exactly: for every pad, the length of the SHORTEST segment
+    with an ENDPOINT inside that pad's copper rectangle (grown by 20 um), on a
+    copper layer the pad is on, then the median over all pads that have at least
+    one such segment. Pads with nothing attached are counted separately and
+    excluded - a via in a ground plane, or a test point, has no escape and should
+    not read as a 0 mm stub.
+
+    Reported, never ranked: a long stub is not a virtue (it may be a via fence)
+    and a short one is not a sin (it may be a 0.4 mm-pitch escape).
+    """
+    if not segs:
+        return {"value": None, "pads_measured": 0, "pads_without_track": 0,
+                "why": "no track segments on this board"}
+    cell = _PAD_CELL_MM
+    grid = {}
+    for s in segs:
+        for p in (s["s"], s["e"]):
+            grid.setdefault((s["layer"], int(math.floor(p[0] / cell)),
+                             int(math.floor(p[1] / cell))), []).append(
+                (p[0], p[1], s["len"]))
+    all_layers = sorted({s["layer"] for s in segs})
+    measured = []
+    bare = 0
+    total = 0
+    for fp in getattr(board, "footprints", None) or []:
+        for pad in fp.get("pads") or []:
+            try:
+                px, py = float(pad["x"]), float(pad["y"])
+                w, h = float(pad.get("w") or 0.0), float(pad.get("h") or 0.0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if w <= 0.0 or h <= 0.0:
+                continue
+            total += 1
+            want = _pad_copper_layers(pad)
+            layers = all_layers if want is None else [l for l in want if l in all_layers]
+            rot = float(pad.get("rotation") or 0.0)
+            ca, sa = math.cos(math.radians(-rot)), math.sin(math.radians(-rot))
+            reach = 0.5 * math.hypot(w, h) + _PAD_TOL_MM
+            best = None
+            for cx in range(int(math.floor((px - reach) / cell)),
+                            int(math.floor((px + reach) / cell)) + 1):
+                for cy in range(int(math.floor((py - reach) / cell)),
+                                int(math.floor((py + reach) / cell)) + 1):
+                    for lay in layers:
+                        for ex, ey, ln in grid.get((lay, cx, cy), ()):
+                            dx, dy = ex - px, ey - py
+                            if dx * dx + dy * dy > reach * reach:
+                                continue
+                            # un-rotate the offset so the test is against the pad's
+                            # own rectangle, not its axis-aligned bounding box
+                            lx = dx * ca - dy * sa
+                            ly = dx * sa + dy * ca
+                            if (abs(lx) <= 0.5 * w + _PAD_TOL_MM
+                                    and abs(ly) <= 0.5 * h + _PAD_TOL_MM):
+                                if best is None or ln < best:
+                                    best = ln
+            if best is None:
+                bare += 1
+            else:
+                measured.append(best)
+    if not measured:
+        return {"value": None, "pads_measured": 0, "pads_without_track": bare,
+                "pads_total": total,
+                "why": "no pad has a track ending on it"}
+    ordered = sorted(measured)
+    return {"value": round(ordered[len(ordered) // 2], 4),
+            "pads_measured": len(measured), "pads_without_track": bare,
+            "pads_total": total,
+            "min": round(ordered[0], 4), "max": round(ordered[-1], 4)}
+
+def _bundle_share(segs, group=None):
+    """Share of segments with another conductor running alongside them.
+
+    `group[i]` is the identity of the piece of copper segment i belongs to. When
+    net names are present it is never needed; when they are absent it is the
+    connected-component proxy from `_proxy_groups`, and two segments in the same
+    group are the same conductor, so they do not count as each other's bundle.
+    """
     if len(segs) < 2:
         return None
     by_layer = {}
-    for s in segs:
-        by_layer.setdefault(s["layer"], []).append(s)
+    for i, s in enumerate(segs):
+        by_layer.setdefault(s["layer"], []).append(i)
     paired = 0
-    for group in by_layer.values():
-        if len(group) < 2:
+    for layer_ids in by_layer.values():
+        if len(layer_ids) < 2:
             continue
-        for s in group:
+        for i in layer_ids:
+            s = segs[i]
             ux, uy = math.cos(math.radians(s["ang"])), math.sin(math.radians(s["ang"]))
-            for o in group:
-                if o is s:
+            for j in layer_ids:
+                if j == i:
                     continue
-                if s["net"] is not None and o["net"] is not None and s["net"] == o["net"]:
+                o = segs[j]
+                if group is not None:
+                    if group[j] == group[i]:
+                        continue
+                elif s["net"] is not None and o["net"] is not None and s["net"] == o["net"]:
                     continue
                 d = min(_angle_between(o["ang"], s["ang"]),
                         _angle_between(o["ang"], (s["ang"] + 180.0) % 360.0))
@@ -446,7 +652,6 @@ def _bundle_share(segs):
                     paired += 1
                     break
     return paired / float(len(segs))
-
 
 # ------------------------------------------------------------------ report
 def report(board, layer=None):

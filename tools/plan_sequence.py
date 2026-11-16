@@ -1102,6 +1102,42 @@ def unconnected_count(path, timeout=120):
     return None, "pcbnew 子进程没给出未连接数：%s" % tail
 
 
+#: Steps that measure TRACK geometry. On a board with no tracks at all these have
+#: nothing to look at, and `shape_pass` there means "no shape failed", which is not
+#: the same sentence as "the routing is legal".
+COPPER_STEPS = ("bus", "route", "closure")
+
+def copper_inventory(board):
+    """What copper this board actually carries, in the form the corpus reports on.
+
+    A board with no track and no filled plane contributes nothing to any reading
+    about copper. That is a fact about the FILE, not a verdict about the board, so
+    it is measured once here and named in the corpus report instead of being
+    silently scored as a pass on every copper rule.
+    """
+    zones = getattr(board, "zones", None) or []
+    filled = 0
+    for z in zones:
+        polys = z.get("filled_polygons") or []
+        if polys and not z.get("is_keepout"):
+            filled += 1
+    pads = 0
+    for fp in getattr(board, "footprints", None) or []:
+        pads += len(fp.get("pads") or [])
+    return {"tracks": len(getattr(board, "tracks", None) or []),
+            "vias": len(getattr(board, "vias", None) or []),
+            "zones": len(zones), "filled_zones": filled, "pads": pads}
+
+def is_copper_free(inv):
+    """No track and no filled plane: there is no copper shape to judge.
+
+    False when the inventory is missing entirely: "we did not look" must never be
+    read as "empty", which would turn a hung or unparsed board into a clean one.
+    """
+    if not isinstance(inv, dict) or "tracks" not in inv:
+        return False
+    return inv.get("tracks", 0) == 0 and inv.get("filled_zones", 0) == 0
+
 def evaluate(path, amplitude=0.30, clearance=0.10, chain=True, drc=False):
     """Walk the chain.  `fail` only when everything before it passed.
 
@@ -1161,6 +1197,7 @@ def evaluate(path, amplitude=0.30, clearance=0.10, chain=True, drc=False):
         "board": os.path.abspath(path),
         "order": list(ORDER),
         "mode": "chain" if chain else "independent",
+        "copper": copper_inventory(ctx["canonical"]),
         "steps": steps,
         "first_failing_step": frontier,
         "not_judged": blocked,
@@ -1309,6 +1346,27 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
             row["error"] = repr(exc)
             rows.append(row)
             continue
+        inv = rep.get("copper") or {}
+        if is_copper_free(inv):
+            # A copper-free board reading `shape_pass` on route is the exact false
+            # green this corpus is supposed to avoid: nothing failed because there
+            # was nothing. Turn those passes into "not judged" and say why, so the
+            # per-step pass rate is a rate over boards that HAVE copper.
+            touched = []
+            for step in rep.get("steps") or []:
+                if step["id"] in COPPER_STEPS and step["status"] == "pass":
+                    step["status"] = "n/a"
+                    step["note"] = ("这块板没有铜（0 track / 0 filled zone）=> 没东西可判，"
+                                    "不是通过")
+                    touched.append(step["id"])
+            if touched:
+                rep["copper_free_note"] = (
+                    "copper-free board: %s turned from pass to n/a"
+                    % ", ".join(touched))
+            rep["verdict"] = ("sequence_ok"
+                              if not rep.get("first_failing_step")
+                              and not rep.get("not_judged") else rep["verdict"])
+            row["copper_free"] = touched
         row["rep"] = rep
         rows.append(row)
     # Exogenous evidence first: the stratum of a board comes from kicad-cli, never
@@ -1362,7 +1420,21 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
                                       if judged else None),
                         "strata": per_stratum, "judge_base": base,
                         "judge": said, "judge_code": code}
+    # Boards that carry no copper at all, named rather than counted. Without this
+    # list a reader sees `route 8/8 pass` and cannot tell that one of the eight was
+    # an empty file with nothing to fail.
+    copper_free = [{
+        "board": r["board"],
+        "tracks": (r["rep"].get("copper") or {}).get("tracks"),
+        "filled_zones": (r["rep"].get("copper") or {}).get("filled_zones"),
+        "pads": (r["rep"].get("copper") or {}).get("pads"),
+        "why": ("0 track and 0 filled zone on this board: every rule about copper "
+                "shape has nothing to look at, so those steps are n/a here and the "
+                "board is excluded from their pass rate"),
+    } for r in rows
+        if r.get("rep") and is_copper_free(r["rep"].get("copper"))]
     out = {"boards": len(rows), "steps": summary, "rows": rows,
+           "copper_free": copper_free,
            "layering": ({"strata": layering, "why_not": why_no_layering}
                         if layering else {"strata": None,
                                           "why_not": why_no_layering,
@@ -1398,6 +1470,13 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
         print()
     else:
         print("no layering: %s\n" % why_no_layering)
+    if copper_free:
+        print("copper-free boards (no track, no filled plane) - not counted as "
+              "passing any copper rule:")
+        for c in copper_free:
+            print("  %-24s tracks=%-3s filled_zones=%-3s pads=%s"
+                  % (c["board"], c["tracks"], c["filled_zones"], c["pads"]))
+        print()
     if hung:
         print("not run (process did not finish, NOT counted as pass): %s\n"
               % ", ".join(hung))
