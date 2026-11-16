@@ -125,6 +125,46 @@ def legal_window(board, ref, bbox, grow_mm=DEFAULT_GROW_MM):
             "method": "grown pad-hull boxes, same geometry as the audit"}
 
 
+def placement_clearances(board):
+    """Where a PLACEMENT step must move a part, with the distance it is short by.
+
+    The router never sees this constraint, and it must not: forbidding a 3 mm
+    halo of copper around every high-speed pad would forbid the memory's own
+    escape routing. The rule is about a PART beside copper, so the only actor
+    that can honour it is whatever moves parts. This function gives that actor
+    the same number the audit grades, derived from the same scan
+    (`measure.magnet_digital_pairs`), so placement and audit cannot disagree.
+
+    ``limit_mm`` is read from the rule catalogue, not repeated here: a change to
+    the limit is a change in one place.
+    """
+    from .measure import magnet_digital_pairs
+    from ..calc.rules import LAYOUT_RULES
+    limit, rule_id = None, "layout.magnetic_to_hs_digital"
+    for r in LAYOUT_RULES:
+        if r.get("id") == rule_id:
+            limit = float(r.get("limit"))
+            break
+    if limit is None:
+        raise KeyError("%s is not in the catalogue" % rule_id)
+    pairs = magnet_digital_pairs(board)
+    rows = []
+    for p in pairs:
+        gap = float(p["gap_mm"])
+        rows.append({"magnet": p["magnet"], "part": p["part"],
+                     "gap_mm": round(gap, 3), "limit_mm": limit,
+                     "short_mm": round(max(0.0, limit - gap), 3),
+                     "action": "move the magnet away" if gap < limit else "ok"})
+    bad = [r for r in rows if r["gap_mm"] < limit]
+    return {
+        "rule": rule_id,
+        "limit_mm": limit,
+        "pairs": rows,
+        "violations": bad,
+        "method": "pad-edge to pad-edge, switching magnetic vs high-speed part "
+                  "(same scan as measure.magnetic_to_hs_digital_min_mm)",
+    }
+
 def net_binding(board):
     """Prove that copper is bound to the schematic net, not placed by geometry.
 
@@ -168,6 +208,7 @@ def constraints(board, grow_mm=DEFAULT_GROW_MM):
         "keepout": rows,
         "keepout_skipped": skipped,
         "net_binding": net_binding(board),
+        "placement_clearances": placement_clearances(board),
         "note": "rects are centre + half-extent in file coordinates, i.e. what "
                 "_mazeH.py KEEPOUT reads; corners are recoverable as "
                 "cx-hx .. cx+hx",

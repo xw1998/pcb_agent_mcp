@@ -53,6 +53,16 @@ def _pad(num, x, y, w=1.0, h=1.0, net=1, layer="F.Cu", shape="rect",
                (" " + extra) if extra else ""))
 
 
+def _np(num, x, y, w, h, netname, shape="rect"):
+    """A pad on a net named literally, for facts that key on net tokens (DDR_*,
+    SW_*): the shared `_pad` resolves names from `_NETS`, which only has the five
+    nets every other test uses."""
+    code = 40 + (abs(hash(netname)) % 900)
+    return ('    (pad "%s" smd %s (at %s %s) (size %s %s) '
+            '(layers "F.Cu" "F.Mask") (net %d "%s"))'
+            % (num, shape, x, y, w, h, code, netname))
+
+
 def _fp(ref, lib, pads, graphics=(), layer="F.Cu", value=None):
     body = ['  (footprint "%s" (layer "%s") (at 0 0)' % (lib, layer),
             '    (property "Reference" "%s" (at 0 0 0) (layer "F.SilkS"))'
@@ -435,6 +445,86 @@ class TestHfCapacitor(_Board):
                       _cap("C9", "100n", net=3), self._gnd_pour())
         self.assertIn("unmeasurable", v)
         self.assertIn("no rail", v["unmeasurable"])
+
+class TestMagneticToHsDigital(_Board):
+    """The other half of `magnetic_keepout`: not "is copper under the part" but
+    "is the part beside the copper". RK3506's +1V35_DDR buck (L3) sat 0.85 mm from
+    the DDR footprint with nothing crossing the body, so every keep-out rule read
+    clean while the inductor was inside the memory's escape corridor.
+
+    Distance is pad-edge to pad-edge because pads are the copper; a courtyard is a
+    library drawing convention (the crystal keep-out was broken by exactly that).
+    Only parts owning a switch-node pad are aggressors (a bead on a DC feed is
+    quiet), and only non-connector parts with three or more high-speed pads are
+    victims (a connector pin near an inductor says where the harness plugs in).
+    """
+
+    def _sw_ind(self, ref="L1", x=0.0, y=0.0):
+        # pad 1 is the switch node, pad 2 the rail it feeds; 1.7 x 3.7 like a
+        # 4020 inductor, centres 2.7 mm apart.
+        return _fp(ref, "X:L_4020",
+                   [_np("1", x, y, 1.7, 3.7, "/SW_U4"),
+                    _np("2", x + 2.7, y, 1.7, 3.7, "/+0V9_CPU")],
+                   value="4.7uH")
+
+    def _ddr_part(self, ref="U2", x=0.0, y=0.0, n=3, token="DDR_A"):
+        return _fp(ref, "X:FBGA-96",
+                   [_np(str(i + 1), x, y + i, 1.0, 1.0, "/%s%d" % (token, i))
+                    for i in range(n)])
+
+    def test_an_inductor_beside_ddr_pads_is_the_worst_pair(self):
+        # pad 1 spans x -0.85..0.85; the DDR pad sits at x=-4, i.e. -4.5..-3.5,
+        # so the copper gap is -3.5 - -0.85 = 2.65 mm.
+        v = self.fact("magnetic_to_hs_digital_min_mm",
+                      self._sw_ind(), self._ddr_part(x=-4.0))
+        self.assertAlmostEqual(v["value"], 2.65, places=3)
+        self.assertEqual(v["parts"][0]["magnet"], "L1")
+        self.assertEqual(v["parts"][0]["part"], "U2")
+        self.assertIn("L1 comes 2.650 mm from U2", v["where"])
+        self.assertIn("L1->U2 2.65", v["note"])
+
+    def test_the_rail_side_of_the_same_inductor_does_not_set_the_number(self):
+        """Control: pad 2 is on the output rail, not the switch node. Moving the
+        victim toward it must not change which pad is nearest, because both pads of
+        a source count - a reading that used only the switch pad would report a
+        larger gap for the same board."""
+        v = self.fact("magnetic_to_hs_digital_min_mm",
+                      self._sw_ind(), self._ddr_part(x=5.0))
+        # pad 2 spans 1.85..3.55, the victim spans 4.5..5.5 => 0.95 mm. Only the
+        # rail pad is that close; pad 1 is 3.65 away, so a reading that used the
+        # switch pad alone would report a board that is 3.65 mm clear.
+        self.assertAlmostEqual(v["value"], 0.95, places=3)
+
+    def test_a_bead_on_a_dc_feed_is_not_an_aggressor(self):
+        """FB1 has an inductor body and sits 1 mm from the DDR, but its pads are on
+        +3V3 and the analog feed: no switch node, no switching field. Flagging it
+        would move a bead that is doing its job."""
+        bead = _fp("FB1", "X:FerriteBead_0603",
+                   [_np("1", 0, 0, 0.8, 0.9, "+3V3"),
+                    _np("2", 1.6, 0, 0.8, 0.9, "VCC_ADC")], value="600R")
+        v = self.fact("magnetic_to_hs_digital_min_mm",
+                      bead, self._ddr_part(x=2.6))
+        self.assertIn("unmeasurable", v)
+        self.assertIn("no inductor or ferrite bead", v["unmeasurable"])
+
+    def test_a_connector_pin_next_to_the_inductor_is_not_a_victim(self):
+        """Control: J1's pins are the board's way out to the harness. Counting them
+        as victims would report every board whose power stage sits near its
+        connector - which is most of them, including this one."""
+        conn = _fp("J1", "X:Conn_2x30",
+                   [_np(str(i + 1), 4.0, i, 1.0, 1.0, "/MIPI_D0%d" % i)
+                    for i in range(3)])
+        v = self.fact("magnetic_to_hs_digital_min_mm", self._sw_ind(), conn)
+        self.assertIn("unmeasurable", v)
+        self.assertIn("three or more pads", v["unmeasurable"])
+
+    def test_a_far_apart_board_is_a_pass_with_no_6mm_report(self):
+        v = self.fact("magnetic_to_hs_digital_min_mm",
+                      self._sw_ind(), self._ddr_part(x=20.0))
+        self.assertAlmostEqual(v["value"], 15.95, places=3)
+        self.assertIn("every switching magnet is 6 mm or more", v["note"])
+        self.assertEqual(v["examples"], ["L1"])
+        self.assertEqual(len(v["parts"]), 1)
 
 if __name__ == "__main__":
     unittest.main()

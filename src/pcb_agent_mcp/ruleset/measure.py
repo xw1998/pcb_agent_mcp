@@ -1803,6 +1803,177 @@ def _hf_caps(board, pours):
     return out
 
 
+# Two families of net names, matched by whole TOKENS: a substring test would put
+# `SW` inside `SWITCH_EN` and `CLK` inside a part number, and `DDR` inside
+# `DDR_VREF`. The list is the set of interfaces whose pins switch fast enough for
+# the argument to hold; SPI/I2C/UART are deliberately out - they are digital, but
+# at 1-10 MHz a buck's near field is not the thing that hurts them.
+_HS_DIGITAL_TOKEN = frozenset((
+    "DDR", "DQS", "MIPI", "RMII", "RGMII", "SGMII", "PCIE", "USB", "SDMMC",
+    "LCD", "LCDC", "ETH", "CLK", "OSC", "LVDS", "HDMI", "EMMC", "SDRAM",
+))
+# The node that swings the full input voltage at the switching frequency: the
+# pin of the inductor that faces the regulator's switch. A bead on a DC feed has
+# no such pin, which is how the two kinds are told apart without a value table.
+_SWITCH_NODE_TOKEN = frozenset(("SW", "SWN", "SWITCH", "PHASE", "LX"))
+# Connectors are excluded by reference prefix: their pins are the board's way OUT
+# to another board, so "a connector pin is near the inductor" is a statement about
+# where the harness plugs in, not about coupling inside this board.
+_CONNECTOR_PREFIX = ("J", "P", "CN", "CON", "X")
+
+
+def _net_tokens_upper(name):
+    return {t.upper() for t in re.split(r"[^0-9A-Za-z]+", str(name or "")) if t}
+
+
+def _pad_box(q):
+    w = float(q.get("w") or 0.0) / 2.0
+    h = float(q.get("h") or 0.0) / 2.0
+    x, y = float(q["x"]), float(q["y"])
+    return (x - w, y - h, x + w, y + h)
+
+
+def _box_gap(a, b):
+    dx = max(0.0, max(a[0] - b[2], b[0] - a[2]))
+    dy = max(0.0, max(a[1] - b[3], b[1] - a[3]))
+    return math.hypot(dx, dy)
+
+
+def _magnet_digital_scan(board):
+    """(aggressors, victims, skipped): the two lists the distance is taken between.
+
+    Aggressor = a magnetic part owning at least one switch-node pad (a bead on a
+    DC feed has none, which is how a quiet bead is told from a switching inductor
+    without a value table). Victim = a non-connector part carrying three or more
+    high-speed interface pads. Connectors are excluded by reference prefix: their
+    pins are the board's way OUT, so "a connector pin is near the inductor" is
+    about where the harness plugs in, not about coupling inside this board.
+    """
+    mags, victims, skipped = [], [], 0
+    for f in board.footprints:
+        ref = str(f.get("ref") or "").strip()
+        pads = [q for q in (f.get("pads") or ()) if q.get("x") is not None
+                and q.get("y") is not None]
+        if not pads:
+            continue
+        if _is_magnetic(f):
+            hit = set()
+            for q in pads:
+                hit |= (_net_tokens_upper(q.get("net")) & _SWITCH_NODE_TOKEN)
+            if hit:
+                mags.append((ref, pads))
+            continue
+        if ref[:1].upper() in _CONNECTOR_PREFIX and len(ref) > 1:
+            continue
+        hs = [q for q in pads
+              if _net_tokens_upper(q.get("net")) & _HS_DIGITAL_TOKEN]
+        if len(hs) >= 3:
+            victims.append((ref, hs))
+        else:
+            skipped += 1
+    return mags, victims, skipped
+
+
+def _nearest_pair_per_magnet(mags, victims):
+    """For each aggressor, its worst (closest) distance to any victim, sorted."""
+    rows = []
+    for mref, mpads in mags:
+        mbox = [_pad_box(q) for q in mpads]
+        near = None
+        for vref, vpads in victims:
+            for pb in [_pad_box(q) for q in vpads]:
+                for mb in mbox:
+                    g = _box_gap(mb, pb)
+                    if near is None or g < near[0]:
+                        near = (g, vref)
+        if near is None:
+            continue
+        rows.append({"magnet": mref, "part": near[1], "gap_mm": round(near[0], 3)})
+    rows.sort(key=lambda r: r["gap_mm"])
+    return rows
+
+
+def magnet_digital_pairs(board):
+    """Every (magnetic, high-speed part) pair with its pad-edge gap, worst first.
+
+    The fact above reports the worst pair per magnet; a PLACEMENT step needs the
+    list, because "which magnet, which victim, how far short of the limit" is what
+    a mover can act on. Same scan, same geometry, one implementation.
+    """
+    mags, victims, _ = _magnet_digital_scan(board)
+    rows = []
+    for mref, mpads in mags:
+        mbox = [_pad_box(q) for q in mpads]
+        for vref, vpads in victims:
+            g = None
+            for pb in [_pad_box(q) for q in vpads]:
+                for mb in mbox:
+                    d = _box_gap(mb, pb)
+                    if g is None or d < g:
+                        g = d
+            if g is not None:
+                rows.append({"magnet": mref, "part": vref,
+                             "gap_mm": round(g, 3)})
+    rows.sort(key=lambda r: (r["gap_mm"], r["magnet"], r["part"]))
+    return rows
+
+
+def _magnet_digital_gap(board):
+    """How close a switching inductor's own copper comes to a high-speed pin.
+
+    ``layout.magnetic_keepout`` answers "is copper UNDER the part". The other half
+    of the same problem is "is the part BESIDE the copper", and no rule asked it:
+    on RK3506 the +1V35_DDR buck (L3, 8.2 uH) sits 0.85 mm from the DDR footprint
+    and 2.12 mm from a DDR address pad, i.e. inside the memory's escape corridor,
+    while every keep-out rule reported clean because nothing crossed the body.
+
+    The measurement is pad-edge to pad-edge, because the pads are the copper: a
+    courtyard is a drawing convention that a library can draw 5 mm too big (the
+    same trap that broke the crystal keep-out). Only parts that own a switching
+    node count as sources - a ferrite bead on an analog feed has the same body but
+    a quiet one, and flagging it would move a bead that is doing its job - and only
+    parts whose pads carry high-speed interface nets count as victims.
+
+    A 3 mm answer is the graded one, but the number is reported per part: the
+    value here is the WORST pair on the board, and `parts` says which.
+    """
+    mags, victims, skipped = _magnet_digital_scan(board)
+    if not mags:
+        return _na("no inductor or ferrite bead on this board owns a pad on a "
+                   "switch-node net (a bead on a DC feed is not a field source), "
+                   "so there is no aggressor to measure")
+    if not victims:
+        return _na("no part on this board carries three or more pads of a "
+                   "high-speed interface net, so there is no victim to measure "
+                   "(%d part(s) were read and none qualified)" % skipped)
+
+    rows = _nearest_pair_per_magnet(mags, victims)
+    if not rows:
+        return _na("no switching magnetic and no high-speed part could be placed "
+                   "from the file's own coordinates")
+    best = (rows[0]["gap_mm"], rows[0]["magnet"], rows[0]["part"])
+    value = round(best[0], 3)
+    close = [r for r in rows if r["gap_mm"] < 6.0]
+    return {
+        "value": value,
+        "where": "%s comes %.3f mm from %s" % (best[1], value, best[2]),
+        "method": "pad-edge to pad-edge: every pad of every magnetic that owns a "
+                  "switch-node pad, against every pad of every non-connector part "
+                  "carrying three or more high-speed interface pads (DDR, DQS, "
+                  "MIPI, RMII, LCD, SDMMC, USB, PCIE, ETH, CLK, OSC, ...); the "
+                  "value is the worst pair on the board",
+        "examples": [r["magnet"] for r in rows[:8]],
+        "parts": rows,
+        "note": ("%d switching magnet(s) sit closer than 6 mm to a high-speed part "
+                 "(the same-corridor report, not the graded number): %s"
+                 % (len(close), ", ".join("%s->%s %.2f" % (r["magnet"], r["part"],
+                                                           r["gap_mm"])
+                                          for r in close[:6]))
+                 if close else "every switching magnet is 6 mm or more from every "
+                               "high-speed part"),
+    }
+
+
 def _crystal_guard(board, pours):
     """Is each crystal enclosed by copper of the board's own return net?
 
@@ -1946,6 +2117,7 @@ def _assembly_facts(board):
         "test_points_on_rails_and_connectors": _test_points(board, pours),
         "min_mask_expansion": _mask_expansion(board),
         "crystal_has_guard_ring": _crystal_guard(board, pours),
+        "magnetic_to_hs_digital_min_mm": _magnet_digital_gap(board),
     }
     out.update(_rf_facts(board))
     return out
@@ -3110,6 +3282,7 @@ def catalog_facts(m):
     take("diffpair_length_skew_mm", "diffpair_length_skew_mm")
     take("trace_under_crystal", "trace_under_crystal")
     take("trace_under_crystal_inner", "trace_under_crystal_inner")
+    take("magnetic_to_hs_digital_min_mm", "magnetic_to_hs_digital_min_mm")
     take("trace_under_magnetic", "trace_under_magnetic")
     take("via_under_magnetic", "via_under_magnetic")
     take("trace_under_magnetic_deep", "trace_under_magnetic_deep")

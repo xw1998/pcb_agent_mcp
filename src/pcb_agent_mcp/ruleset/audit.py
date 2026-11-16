@@ -41,6 +41,7 @@ _CATALOG_LEVEL = {
     # P1: the field, the loop and the heat are power-integrity facts, not
     # conventions. A bead at P1 is the same rule at a smaller scale.
     "layout.magnetic_keepout": "P1",
+    "layout.magnetic_to_hs_digital": "P1",
     "layout.magnetic_via_keepout": "P1",
     "layout.magnetic_keepout_deep": "P2",
 

@@ -43,14 +43,14 @@ class TestTheLedgerCoversTheCatalogue(unittest.TestCase):
         rows = PR.table()
         from pcb_agent_mcp.calc.rules import LAYOUT_RULES
         self.assertEqual(sorted(rows), sorted(r["id"] for r in LAYOUT_RULES))
-        self.assertEqual(len(rows), 28)
+        self.assertEqual(len(rows), 29)
 
     def test_the_counts_add_up_and_are_not_all_optimistic(self):
         rows = PR.table()
         counts = {}
         for row in rows.values():
             counts[row["status"]] = counts.get(row["status"], 0) + 1
-        self.assertEqual(sum(counts.values()), 28)
+        self.assertEqual(sum(counts.values()), 29)
         # A ledger where everything is "projected" would be the flattering
         # answer; this board of numbers is checked against the bucket it must
         # contain, and the two buckets that are honest admissions are asserted.
@@ -292,12 +292,12 @@ class TestTheToolAnswers(unittest.TestCase):
             os.environ["PCB_AGENT_HOME"] = self._home
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_the_tool_reports_all_28_rules_and_writes_nothing(self):
+    def test_the_tool_reports_all_29_rules_and_writes_nothing(self):
         self.assertIn("pcb_rule_projection", tools.TOOLS)
         before = os.stat(self.path).st_mtime
         out = tools.TOOLS["pcb_rule_projection"]["handler"]({"path": self.path})
         self.assertEqual(out["status"], "ok", out)
-        self.assertEqual(out["value"]["n_rules"], 28)
+        self.assertEqual(out["value"]["n_rules"], 29)
         self.assertEqual(os.stat(self.path).st_mtime, before)
 
 if __name__ == "__main__":

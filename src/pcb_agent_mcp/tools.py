@@ -5175,7 +5175,7 @@ _tool(
 
 _tool(
     "pcb_rule_projection",
-    "Which of the 27 layout rules can reach the GENERATOR today, as what shape, and "
+    "Which of the 29 layout rules can reach the GENERATOR today, as what shape, and "
     "which ones only ever judge a finished board. Every rule is classified as "
     "rect_keepout (forbidden rectangle -> route.router.plan(keepout_rects=...) -> the "
     "same raster and exact ring check a board keepout gets), net_geometry (width / "

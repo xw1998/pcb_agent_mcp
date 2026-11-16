@@ -1,4 +1,4 @@
-"""Which of the 27 layout rules can reach the GENERATOR, and as what shape.
+"""Which of the 29 layout rules can reach the GENERATOR, and as what shape.
 
 The question this module answers is the one 0.1.20 could not: a rule that has a
 source and a limit is still only a *measurement of a board that already exists*.
@@ -170,6 +170,13 @@ ENTRIES = [
     ("layout.power_pad_thermal_vias", "layer_policy", "audit_only",
      "the via array under a thermal pad is a footprint/pour decision; the router "
      "places vias to reach a layer, not to move heat"),
+    ("layout.magnetic_to_hs_digital", "layer_policy", "not_wired",
+     "a 3 mm halo around every high-speed pad as a COPPER keep-out would forbid "
+     "the memory's own escape routing: the rule forbids a PART beside copper, so "
+     "the only actor that can honour it moves parts and the router cannot. "
+     "design_constraints.placement_clearances hands a placement step the same "
+     "number the audit grades (which magnet, which victim, how far short); the "
+     "missing channel is a placement cost, not a rectangle"),
     ("layout.antenna_keepout", "layer_policy", "audit_only",
      "no rule channel: the antenna region is a board-level area decided with the "
      "module vendor's drawing, not a rectangle this module can derive"),

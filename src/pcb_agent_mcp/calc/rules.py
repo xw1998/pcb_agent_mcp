@@ -315,6 +315,29 @@ LAYOUT_RULES = [
        "a via in the middle of the inductor's loop punches the plane the field "
        "is trying to stay out of, and the switch node's return current then "
        "has a path straight through the part"),
+    _r("layout.magnetic_to_hs_digital",
+       "a switching inductor does not sit inside a high-speed digital part's escape "
+       "corridor",
+       "isolation", "High", "magnetic_to_hs_digital_min_mm", "mm", "min", 3.0,
+       "measure pad-edge to pad-edge: every pad of every magnetic that owns a pad "
+       "on a switch-node net, against every pad of every non-connector part that "
+       "carries three or more high-speed interface pads (DDR / MIPI / RMII / LCD / "
+       "SDMMC / USB / CLK / OSC). The fact reports the worst pair and the list "
+       "behind it, so the answer names the two parts",
+       "L1", "ADI RAQ#164 + ROHM DC/DC layout (电感远离敏感线路) put the field source "
+       "and the sensitive node in different places; the 3 mm floor is this "
+       "repository's default, the same scale `layout.decoupling_max_distance_to_pin_mm` "
+       "uses [T1]",
+       "the keep-out rules answer 'is copper under the part' and stop there, so a "
+       "buck cell parked against the DDR reads clean: on RK3506 L3 (8.2 uH, the "
+       "+1V35_DDR rail) sat 0.85 mm from the memory footprint and 2.12 mm from a "
+       "DDR address pad with every keep-out reporting clean. The field itself is "
+       "not the whole story - a shielded 4x4 mm part at 2 mm induces about 0.2 mV "
+       "into a 10 mm DDR trace 0.1 mm above its plane, far under the receiver's "
+       "margin - the three costs that are real are the shared return current under "
+       "a switching loop, the escape corridor the part consumes, and the input-loop "
+       "di/dt that has nowhere tight to go once the cell is wedged between two "
+       "digital parts"),
     _r("layout.crystal_keepout_adjacent",
        "no copper crosses a crystal body on the layers beside it either",
        "isolation", "Medium", "trace_under_crystal_inner", "bool", "bool_false",
