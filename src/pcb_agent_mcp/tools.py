@@ -5021,7 +5021,8 @@ def _tune_length(board, args):
                       pitch_mm=float(args.get("pitch_mm") or 0.1),
                       max_replacements=int(args.get("max_replacements") or 24),
                       allow_locked=args.get("allow_locked") is True,
-                      style=str(args.get("style") or "chamfer"))
+                      style=str(args.get("style") or "chamfer"),
+                      with_headroom=args.get("headroom") is True)
     except ValueError as exc:
         return err(str(exc), "ARG_INVALID")
     except TB.TuneError as exc:
@@ -5165,6 +5166,11 @@ _tool(
          "allow_locked": _bool("move copper the file marks (locked)", False),
          "allow_partial": _bool("write even when a group stayed outside tolerance",
                                 False),
+         "headroom": _bool("also measure, net by net, how much length each "
+                            "member could take ON ITS OWN (blocked_by_geometry "
+                            "is final: that net cannot absorb what it owes even "
+                            "with the whole board free, so the fix is layout; "
+                            "it costs one full plan per net)", False),
          "allow_new_violations": _bool("let board_apply accept new DRC violations",
                                        False),
          "strict_drc": _bool("treat every DRC severity as blocking", False),

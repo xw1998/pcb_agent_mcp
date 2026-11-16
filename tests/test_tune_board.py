@@ -606,6 +606,80 @@ class TestThroughViaCopperIsOnEveryInnerLayer(unittest.TestCase):
         vias = [i for i in checks._copper_items(doc) if i["kind"] == "via"]
         self.assertEqual(sorted(i["layer"] for i in vias), ["F.Cu", "In1.Cu"])
 
+class TestHeadroomIsOneWay(_Board):
+    """`headroom()` answers one question, and its two answers are NOT symmetric.
+
+    The question is "how much length could this net absorb on its own", asked of
+    the planner itself on the real board with every other net left in place but
+    not competing. "blocked_by_geometry" is FINAL - a private corridor would not
+    change it, so it belongs to layout, not to tuning. "tunable" is NOT a promise:
+    in a band nine nets share one corridor, so room on its own says nothing about
+    room all at once.
+
+    The failing twins: a binding net reported as tunable (the verdict would then
+    be a lie dressed as an answer), and a net already inside tolerance counted as
+    a shortfall (which invents a layout problem out of a matched net).
+    """
+
+    def setUp(self):
+        _Board.setUp(self)
+        self.write(self.track("LONG", (5.0, 5.0), (15.0, 5.0)),
+                   self.track("SHORT", (5.0, 8.0), (13.5, 8.0)))
+        self.board = self.reload()
+
+    def _pair(self):
+        return {"name": "pair", "nets": ["LONG", "SHORT"], "tol_mm": 0.05}
+
+    def _channel(self):
+        # Two neighbours 0.46 mm either side of SHORT: legal copper (the 0.2 mm
+        # floor is met), but not enough room for a 0.15 mm tooth on EITHER side -
+        # 0.46 - 0.125 (half width) - 0.20 (floor) = 0.135 mm of usable height.
+        self.write(self.track("N1", (5.0, 8.46), (13.0, 8.46)),
+                   self.track("N2", (5.0, 7.54), (13.0, 7.54)))
+        return self.reload()
+
+    def test_a_net_with_room_is_called_tunable_and_its_mate_is_not_a_shortfall(self):
+        g = TB.headroom(self.board, [self._pair()], style="arc")["groups"][0]
+        self.assertEqual(g["verdict"], "tunable")
+        self.assertIsNone(g["binding_net"])
+        self.assertEqual(g["shortfall_mm"], 0.0)
+        by_net = dict((e["net"], e) for e in g["per_net"])
+        self.assertEqual(by_net["LONG"]["status"], "already_within_tol")
+        self.assertEqual(by_net["SHORT"]["status"], "reachable")
+        self.assertGreaterEqual(by_net["SHORT"]["reachable_add_mm"],
+                                by_net["SHORT"]["need_mm"])
+        self.assertEqual(by_net["SHORT"]["gap_mm"], 0.0)
+
+    def test_a_net_in_a_channel_is_named_the_binding_one(self):
+        board = self._channel()
+        g = TB.headroom(board, [self._pair()], style="arc",
+                        floor_mm=TB.FLOOR_MM)["groups"][0]
+        self.assertEqual(g["verdict"], "blocked_by_geometry")
+        self.assertEqual(g["binding_net"], "SHORT")
+        self.assertGreater(g["shortfall_mm"], 0.0)
+        by_net = dict((e["net"], e) for e in g["per_net"])
+        self.assertEqual(by_net["SHORT"]["status"], "shortfall")
+        self.assertLess(by_net["SHORT"]["reachable_add_mm"],
+                        by_net["SHORT"]["need_mm"])
+        self.assertTrue(by_net["SHORT"]["blocks"],
+                        "a refusal with no reason is not an answer")
+        # The number it reports has to be the arithmetic it claims: what the net
+        # owes, minus what it could take.
+        self.assertAlmostEqual(by_net["SHORT"]["gap_mm"],
+                               by_net["SHORT"]["need_mm"]
+                               - by_net["SHORT"]["reachable_add_mm"], places=5)
+
+    def test_a_plan_does_not_pay_for_headroom_unless_it_is_asked(self):
+        board = self._channel()
+        quiet = TB.plan(board, [self._pair()], style="arc", floor_mm=TB.FLOOR_MM)
+        rep = quiet["groups"][0]
+        self.assertEqual(rep["status"], "length_not_matched")
+        self.assertNotIn("headroom", rep)
+        asked = TB.plan(board, [self._pair()], style="arc", floor_mm=TB.FLOOR_MM,
+                        with_headroom=True)["groups"][0]
+        self.assertEqual(asked["headroom"]["verdict"], "blocked_by_geometry")
+        self.assertEqual(asked["headroom"]["binding_net"], "SHORT")
+
 
 if __name__ == "__main__":
     unittest.main()

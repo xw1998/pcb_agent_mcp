@@ -239,7 +239,12 @@ def _norm_groups(board, groups):
         for name in wanted:
             hit = _match_name(nets, str(name))
             (resolved if hit else missing).append(hit or name)
-        if len(resolved) < 2:
+        # A group is a COMPARISON, so one net is normally not a group. It is,
+        # though, when the caller states the length it wants (`target_mm`): that
+        # is the well-posed question "stretch this one net to X", and
+        # `headroom()` asks it once per net to find out how much copper each has
+        # left. Without this the probe could not measure a single net at all.
+        if len(resolved) < 2 and (not resolved or g.get("target_mm") is None):
             out.append({"name": g.get("name") or "group", "kind": g.get("kind"),
                         "nets": resolved, "missing": missing,
                         "tol_mm": float(g.get("tol_mm") or DEFAULT_TOL_MM),
@@ -615,7 +620,7 @@ def _occupy_pieces(grid, net, seg, pieces):
 
 def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
          amp_ladder=None, max_replacements=24, layers=None, allow_locked=False,
-         floor_mm=0.0, style="chamfer"):
+         floor_mm=0.0, style="chamfer", with_headroom=False):
     """Plan meanders on the board's EXISTING copper.
 
     Returns ops in the standard shape (delete_track + add_track [+ add_track_arc]),
@@ -624,6 +629,15 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
 
     `style` picks the shape: "chamfer" (the 45-degree tooth, default) or "arc"
     (a rounded meander - 90-degree arcs tangent to the axis, no kink anywhere).
+
+    `with_headroom` (default OFF, because it is expensive) adds a `headroom` block
+    to every group that comes back `length_not_matched`: each net measured ALONE
+    on the same board, so the number says how much length that net's own copper
+    could ever absorb. A group whose reference member has less room than the
+    length it is missing can never be matched by tuning, and that is a layout
+    answer, not a routing one - see `headroom()`. Cost is one whole `plan()`
+    pass per net (about 10 s each on a DDR lane), which is why it is opt-in
+    and not implied by a normal plan.
     """
     if style not in ("chamfer", "arc"):
         raise TuneError("style must be 'chamfer' or 'arc', got %r" % (style,),
@@ -910,14 +924,26 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
             entry["arcs_counted"] = _arc_count(board, net)
             per_net.append(entry)
         after_skew = max(e["achieved_skew_mm"] for e in per_net)
-        reports.append({
+        rep = {
             "group": g["name"], "kind": g.get("kind"), "nets": names,
             "reference_mm": round(ref, 6), "tol_mm": tol,
             "before_skew_mm": round(max(abs(ref - v) for v in before.values()), 6),
             "after_skew_mm": after_skew,
             "status": "matched" if after_skew <= tol else "length_not_matched",
             "per_net": per_net,
-            "missing": g.get("missing")})
+            "missing": g.get("missing")}
+        if with_headroom and rep["status"] == "length_not_matched":
+            # The per-net refusals above are the evidence of THIS pass, and in a
+            # lane they are contaminated: whether a wave fits depends on whether
+            # a neighbour already moved. So the question "can this group ever be
+            # matched" is answered on a clean board, one net at a time, and
+            # carried next to the numbers rather than implied by them.
+            rep["headroom"] = headroom(
+                board, [{"name": g["name"], "nets": names, "tol_mm": tol}],
+                bundle=bundle, keepout_rects=keepout_rects, pitch_mm=pitch_mm,
+                amp_ladder=amp_ladder, layers=layers, floor_mm=floor_mm,
+                style=style)["groups"][0]
+        reports.append(rep)
 
     # One delete per origin segment, then the whole final path: the file's uuid is
     # the only selector that exists before the write.
@@ -980,5 +1006,175 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
             "clearance": "candidates are judged against each pair's own net rule; "
                          "the apply-time 0.2 mm floor is COUNTED, not enforced, "
                          "because this board's bundles are already at 0.1 mm",
+        },
+    }
+
+# How much MORE than the shortfall a headroom probe asks for. The probe only has
+# to answer "can this net absorb what it is missing", so it aims just past the
+# number and stops when the planner runs out of room; asking for a huge number
+# would only make the search slower, never the answer different.
+HEADROOM_EXTRA_MM = 0.2
+
+
+def headroom(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
+             amp_ladder=None, layers=None, floor_mm=FLOOR_MM, style="arc",
+             max_replacements=32):
+    """How much length each net's OWN copper could ever absorb, measured ALONE.
+
+    This exists because a lane's per-net refusals are not evidence about the
+    board: in a band nine nets share one corridor, so whether a wave fits
+    depends on whether a neighbour has already moved. The question worth asking
+    is therefore asked on a clean board, one net at a time - "give this net a
+    target it cannot reach and see how much length the planner can still find" -
+    and it is asked of the SAME planner, with the same rules, floors and shape,
+    so the number cannot contradict `plan()`.
+
+    Why not a closed-form geometric ceiling (amplitude x radius x tooth count)?
+    Because that ceiling is easy to compute wrong and every way of getting it
+    wrong is a FAKE `blocked_by_geometry` - a wrong answer, which this package
+    does not produce. Measured on this board: the densest wave (teeth = t_max)
+    has slack = 0, so it starts at the segment's own endpoint, and DQ3's endpoint
+    sits 0.15 mm from `/DDR_DQS0N` - the ceiling said 0 while `plan()` really did
+    close the net. Any ceiling has to descend through tooth counts to notice
+    that, and once it does it is no longer closed-form, it is a search. So the
+    search IS the answer.
+
+    Direction of the reading, and it is one-way:
+
+    * `verdict="blocked_by_geometry"` is FINAL. A net alone, with the whole
+      board free and no neighbour to fight, still cannot take what it is
+      missing. No amount of tuning, re-ordering or re-running fixes that; it is
+      a layout answer (ball map, escape order, or corridor reserved for waves).
+    * `verdict="tunable"` is NOT a promise. It says every member has room on its
+      own; it does not say they all get it at once, because they share copper.
+
+    Each net costs one whole `plan()` pass (~10 s on a DDR lane), so this is
+    opt-in (`plan(..., with_headroom=True)`) and is not run unless asked.
+
+    The floor it is measured at is the caller's (`plan()` forwards its own),
+    and the reading is MONOTONE in it: a shortfall measured under a looser
+    floor stays a shortfall under every stricter one, so a `blocked_by_geometry`
+    never becomes wrong by measuring it with less safety margin - it only
+    becomes rarer. That is why `plan(..., with_headroom=True)` on a plan judged
+    by the net rules (floor 0) reports FEWER blocked nets than the same board
+    at the 0.2 mm write gate, and both numbers are true statements about
+    different floors.
+    """
+    segs = segments(board)
+    if not segs:
+        raise TuneError("the board carries no track segments, so there is no "
+                        "copper whose room could be measured", "TUNE_NO_COPPER")
+    if layers is None:
+        layers = sorted(set(s["layer"] for s in segs))
+    lengths = _net_lengths(board)
+    groups_n = _norm_groups(board, groups if groups is not None
+                            else ddr_groups(board))
+    out = []
+    for g in groups_n:
+        if g.get("unmatched"):
+            out.append({"group": g["name"], "kind": g.get("kind"),
+                        "nets": g.get("nets"), "missing": g.get("missing"),
+                        "reference_mm": None, "tol_mm": g["tol_mm"],
+                        "verdict": "unmeasurable", "binding_net": None,
+                        "shortfall_mm": None, "per_net": [],
+                        "note": "fewer than two of its nets carry copper"})
+            continue
+        names = [n for n in g["nets"] if lengths.get(n)]
+        ref = g.get("target_mm")
+        if ref is None:
+            ref = max(lengths[n] for n in names)
+            # Same reference as `plan()`: the longest member, with a declared
+            # reference_net competing rather than replacing it.
+            ref_net = g.get("reference_net")
+            if ref_net and lengths.get(ref_net):
+                ref = max(ref, lengths[ref_net])
+        tol = g["tol_mm"]
+        per_net = []
+        for net in names:
+            before = lengths[net]
+            need = ref - before
+            entry = {"net": net, "before_mm": round(before, 6),
+                     "reference_mm": round(ref, 6), "need_mm": round(need, 6)}
+            if need <= tol:
+                entry.update(status="already_within_tol", reachable_add_mm=0.0,
+                             gap_mm=0.0, blocks=[],
+                             reason="already within tol of the reference, so "
+                                    "there is nothing for this net to absorb")
+                per_net.append(entry)
+                continue
+            want = before + need + HEADROOM_EXTRA_MM
+            sub = plan(board,
+                       [{"name": net, "kind": g.get("kind"), "nets": [net],
+                         "target_mm": want, "tol_mm": 0.01}],
+                       bundle=bundle, keepout_rects=keepout_rects,
+                       pitch_mm=pitch_mm, amp_ladder=amp_ladder,
+                       max_replacements=max_replacements, layers=layers,
+                       floor_mm=floor_mm, style=style, with_headroom=False)
+            e = sub["groups"][0]["per_net"][0]
+            reach = max(0.0, float(e["after_mm"]) - before)
+            gap = need - reach
+            blocks = []
+            for r in e.get("refusals") or []:
+                code = r.get("reason")
+                if code and code not in blocks:
+                    blocks.append(code)
+            entry.update({
+                "reachable_add_mm": round(reach, 6),
+                "gap_mm": round(max(0.0, gap), 6),
+                "status": "shortfall" if gap > tol else "reachable",
+                "blocks": blocks,
+                "meanders": e.get("meanders"),
+                "reason": ("this net alone absorbs %+.4f mm of the %+.4f mm it "
+                           "owes, so it is short by %.4f mm with the board to "
+                           "itself" % (reach, need, max(0.0, gap)))
+                          if gap > tol else
+                          ("this net alone absorbs %+.4f mm and owes %+.4f mm, so "
+                           "its own copper has room - whether it KEEPS that room "
+                           "with its neighbours moved is not answered here"
+                           % (reach, need))})
+            per_net.append(entry)
+        short = [e for e in per_net if e["status"] == "shortfall"]
+        binding = max(short, key=lambda e: e["gap_mm"]) if short else None
+        out.append({
+            "group": g["name"], "kind": g.get("kind"), "nets": names,
+            "reference_mm": round(ref, 6), "tol_mm": tol,
+            "verdict": "blocked_by_geometry" if short else "tunable",
+            "binding_net": binding["net"] if binding else None,
+            "shortfall_mm": round(binding["gap_mm"], 6) if binding else 0.0,
+            "per_net": per_net,
+            "note": ("at least one member cannot take what it is missing even "
+                     "with the whole board to itself: tuning cannot close this "
+                     "group, the layout has to")
+                    if short else
+                    ("every member has room on its own; this says nothing about "
+                     "whether they can all take it at the same time, because "
+                     "they share the same corridor")})
+    blocked = [x["group"] for x in out if x["verdict"] == "blocked_by_geometry"]
+    return {
+        "status": "blocked_by_geometry" if blocked else "tunable",
+        "groups": out,
+        "blocked": blocked,
+        "floor_mm": floor_mm,
+        "assumptions": {
+            "alone_is_an_upper_bound": "each net is measured with every other "
+                                       "net still in place but not competing for "
+                                       "the same corridor, so the number is what "
+                                       "this net could take ON ITS OWN - an upper "
+                                       "bound on what it gets in a pass",
+            "same_planner": "measured by `plan()` itself with the same rules, "
+                            "floor, layers and style, so it cannot report a "
+                            "ceiling the planner would not honour",
+            "one_way": "blocked_by_geometry is final (a private corridor would "
+                       "not help); tunable is not a promise",
+            "floor_mm": "candidates are judged with the same apply-time floor "
+                        "`plan()` uses (%.2f mm here)" % floor_mm,
+            "monotone": "a shortfall under this floor is a shortfall under "
+                        "every stricter floor too, so blocked_by_geometry "
+                        "cannot be invalidated by asking for less safety "
+                        "margin - only fewer nets qualify",
+            "extra_mm": "the probe aims %.2f mm past the shortfall and stops "
+                        "when the planner runs out of room" % HEADROOM_EXTRA_MM,
+            "angles": "only 0/45/90/135 segments are meandered; arcs are exempt "
+                      "by construction (tangent, no new angle)",
         },
     }
