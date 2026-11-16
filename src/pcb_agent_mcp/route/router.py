@@ -115,6 +115,64 @@ def _split_layers(board, copper, explicit=None):
     return routing, planes
 
 
+def _apply_terminal_override(terms, override, grid, routing):
+    """Swap a pad-centre terminal for the escape-via centres the caller placed.
+
+    See `plan`'s `terminal_override`. The terminal keeps the pad's identity
+    (reference/number) so a failure still names the pad a person can look at,
+    and records the pad centre it replaced so the report stays auditable.
+    """
+    want = {}
+    for net, pts in (override or {}).items():
+        pts = list(pts or ())
+        if not pts:
+            continue
+        # A point is either `[x, y]` (the terminal sits on every routing layer,
+        # which lets the search keep a whole net on one layer and leave the
+        # escape via connected on one side only - a dangling via) or
+        # `{"at": [x, y], "layers": [...]}` (the terminal arrives on named
+        # layers only, so the via that carried the pad down is the one and only
+        # way onto that layer). The second form is what keeps every escape via
+        # carrying current.
+        out_pts = []
+        for p in pts:
+            if isinstance(p, dict):
+                at = p.get("at") or p.get("xy") or []
+                pts_only = [str(l) for l in (p.get("layers") or ())] or None
+                out_pts.append((float(at[0]), float(at[1]), pts_only))
+            else:
+                out_pts.append((float(p[0]), float(p[1]), None))
+        want[str(net)] = out_pts
+    out = []
+    used = {}
+    for t in terms:
+        pts = want.get(t["net"])
+        if not pts:
+            out.append(t)
+            continue
+        if used.get(t["net"]):
+            continue                      # one override covers the whole net
+        used[t["net"]] = True
+        for x, y, only in pts:
+            i, j = grid.node(x, y)
+            lays = [l for l in routing if l in only] if only else list(routing)
+            term = {"reference": t["reference"], "pad": t["pad"],
+                    "net": t["net"],
+                    "at": [round(x, 4), round(y, 4)],
+                    "layers": lays or list(routing), "node": (i, j),
+                    "half_mm": 0.1,
+                    "escaped_from": t["at"]}
+            # Pinned terminals are escape vias: the pad's own copper is already
+            # on the outer layer, so letting the search touch that copper makes
+            # the via dangle (it carries one layer and nothing else).  Marked so
+            # `_route_signal_net` insists on arriving on the pinned layers.
+            if only:
+                term["pinned"] = True
+            out.append(term)
+    report = {"nets": sorted(used), "points": sum(len(v) for v in want.values())}
+    return out, report
+
+
 def _pad_terminals(board, grid, layers):
     """Every pad that carries a net, as a terminal the search can reach."""
     from ..adapters.canonical import pad_points  # noqa: F401  (pad geometry)
@@ -263,10 +321,51 @@ class _Emitter(object):
         self.length = {}
         self._buf = []
         self._buf_net = None
+        # Vias the net already has, so a search that arrives at a point where a
+        # via of the same net already sits does not drill a second hole there.
+        # Two 0.1 mm drills 0.15 mm apart is a `hole_to_hole` error, and the
+        # copper is no better connected for it: a via fan-out handed to this
+        # router as pre-placed escape vias produced 25 of exactly those pairs.
+        self._vias_by_net = {}
+        self._buf_vias = []
+        self._seed_vias()
+
+    def _seed_vias(self):
+        """Start from the vias the board already has, then the ones replay adds."""
+        self._vias_by_net = {}
+        for via in (getattr(self.board, "vias", None) or []):
+            self._vias_by_net.setdefault(via.get("net"), []).append(
+                (float(via["x"]), float(via["y"]),
+                 list(via.get("layers") or [])))
+        for op in self.ops:
+            if op.get("op") == "add_via":
+                span = op.get("layers") or list(self.layers)
+                self._vias_by_net.setdefault(op.get("net"), []).append(
+                    (float(op["x"]), float(op["y"]), list(span)))
+
+    def _via_covers(self, net, x, y, span):
+        """Is there already a via of `net` close enough at (x, y) to reuse?
+
+        The tolerance is not a rounding slack: the search lands on grid nodes,
+        the escape vias were placed off-grid, so the nearest node to a placed
+        via is up to half a pitch away on both axes.  At the old 1e-3 that
+        never matched, and 25 pairs of same-net vias 0.02-0.03 mm apart came
+        out of one fan-out - `hole_to_hole` errors whose copper gains nothing.
+        """
+        tol = self.pitch * 1.5
+        known = list(self._vias_by_net.get(net, ()))
+        known += [(v[1], v[2], v[3]) for v in self._buf_vias if v[0] == net]
+        for vx, vy, vlayers in known:
+            if abs(vx - x) > tol or abs(vy - y) > tol:
+                continue
+            if not vlayers or all(l in vlayers for l in span):
+                return True
+        return False
 
     # ------------------------------------------------------------ lifecycle
     def mark(self, net):
         self._buf = []
+        self._buf_vias = []
         self._buf_net = net
         return {"net": net, "n_bad": len(self.bad)}
 
@@ -276,7 +375,10 @@ class _Emitter(object):
         for item, op in self._buf:
             self.grid.add_copper(item)
             self.ops.append(op)
+        for v in self._buf_vias:
+            self._vias_by_net.setdefault(v[0], []).append(v[1:])
         self._buf = []
+        self._buf_vias = []
 
     def rollback(self, mark):
         """The net failed: drop its buffer, keep the reasons it failed."""
@@ -310,6 +412,7 @@ class _Emitter(object):
                          ignore_zone_areas=self.ignore_zone_areas)
         for op in self.ops:
             self._replay(op)
+        self._seed_vias()             # the replayed vias are holes that exist too
 
     def _replay(self, op):
         if op["op"] == "add_track":
@@ -361,6 +464,8 @@ class _Emitter(object):
         span = self._span(span)
         if not self.blind_vias:
             span = list(self.layers)
+        if self._via_covers(net, x, y, span):
+            return True               # the hole is already there; no second one
         blockers = self.grid.via_blockers(x, y, net, span)
         if blockers:
             self.bad.append({"net": net, "via_at": [round(x, 4), round(y, 4)],
@@ -372,6 +477,7 @@ class _Emitter(object):
               "size": spec["via_diameter_mm"], "drill": spec["via_drill_mm"]}
         if span != list(self.layers):
             op["layers"] = [span[0], span[-1]]
+        self._buf_vias.append((net, x, y, list(span)))
         self._buf.append((
             {"kind": "via", "net": net, "layers": list(span),
              "poly": G.circle_points(x, y, dia / 2.0, 16), "ref": "router"},
@@ -390,7 +496,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          congestion_rounds=2, congestion_max_rips=12, congestion_weight=1.0,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          return_path=True, return_path_net=None, topology="mst",
-         progress=None, blind_vias=False, keepout_rects=None, grid_origin=None):
+         progress=None, blind_vias=False, keepout_rects=None, grid_origin=None,
+         terminal_override=None, net_priority=None):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -409,6 +516,17 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     is measured against. Passing them and having the router silently ignore them
     would be worse than not passing them at all, so a rect without a rule id or
     an owner is named in ``grid.dropped_rule_keepouts`` rather than dropped.
+
+    `terminal_override` replaces the pad centre of named nets with a caller
+    supplied list of points: `{"<net>": [[x, y], ...]}`. It exists for the case a
+    plain router cannot handle by itself - a fine-pitch BGA where the search
+    would have to drop a via in the pad centre to reach an inner layer, which is
+    a manufacturing defect (via-in-pad). The caller lays the dogbone stub and its
+    via first, then hands those via centres in as the terminals; the search then
+    starts OUTSIDE the pad and never needs a via in a pad. The points are used
+    verbatim - a point that is not on the board is the caller's error, not
+    something to guess around, so a net named here with no usable point is
+    reported rather than silently falling back to the pad centre.
 
     `topology` says how a multi-pad net is joined: `"mst"` (default) is a
     spanning tree over the pad centres, `"steiner"` adds branch points that are
@@ -447,6 +565,11 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     if nets:
         wanted = set(nets)
         terms = [t for t in terms if t["net"] in wanted]
+    if terminal_override:
+        terms, override_report = _apply_terminal_override(
+            terms, terminal_override, grid, routing)
+    else:
+        override_report = {}
     if not terms:
         raise RouteError("no pad with a net is on a routing layer, so there is "
                          "nothing to connect", "NO_GEOMETRY",
@@ -563,6 +686,17 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             continue
         work.append((span, net, plist))
     work.sort(reverse=True)          # longest first - see the module docstring
+    if net_priority:
+        # Order is a first-come-first-served decision on shared space, so the
+        # net that routes last inherits every detour the earlier ones made.
+        # A bus whose members need the same length cannot live with that: four
+        # nets paying 30 mm of the group's 32 mm of detour is what turns a
+        # length-matched byte lane into an 11 mm meander nobody can build.
+        # `net_priority` is the caller saying "these go first" - a re-route, not
+        # a tweak, and the only honest way to shorten a net this router made too
+        # long.
+        rank = dict((n, k) for k, n in enumerate(net_priority))
+        work.sort(key=lambda w: (rank.get(w[1], len(rank)), -w[0]))
 
     def _route_plane_net(net, plist):
         """A net with a plane does not get routed pad-to-pad: each pad drops one
@@ -624,12 +758,25 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 return False
             terminals.append({"term": t, "node": node})
         if incremental:
-            seed = _existing_tree(board, grid, net, grid_layers)
+            # Pinned terminals carry their own rule: the search must reach them
+            # on the named layers, so the net's existing copper is only seeded
+            # on those layers.  Seeding the outer stub as well let the route
+            # walk down the pad's own fan-out and stop there, which is exactly
+            # how an escape via ends up hanging on one layer.
+            pin_layers = set()
+            for item in terminals:
+                if item["term"].get("pinned"):
+                    pin_layers |= set(item["term"]["layers"])
+            seed_layers = ([l for l in grid_layers if l in pin_layers]
+                           if pin_layers else grid_layers)
+            seed = _existing_tree(board, grid, net, seed_layers)
             tree_nodes |= seed
             kept = []
             for item in terminals:
                 t = item["term"]
-                if _touches_own(board, net, t["at"][0], t["at"][1], t["half_mm"]):
+                if not t.get("pinned") and \
+                        _touches_own(board, net, t["at"][0], t["at"][1],
+                                     t["half_mm"]):
                     results.setdefault("_skipped", []).append(net)
                     continue
                 kept.append(item)
@@ -805,7 +952,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
              "topology": topology,
              "rip_passes": 0,
              "grid_notes": list(grid.notes), "grid_cells": grid.nx * grid.ny,
-             "pitch_mm": float(pitch_mm)}
+             "pitch_mm": float(pitch_mm),
+             "terminal_override": override_report}
 
     def _attempt(net, plist):
         """One net, one transaction: commit its copper only if it finished."""

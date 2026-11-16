@@ -395,26 +395,67 @@ DDR_CMD = ["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10",
            "CASN", "WEN", "ODT", "RESET", "CKE"]
 
 
-def track_lengths(doc, prefix="/DDR_"):
-    """Copper length per net, from the converted tree (tracks only).
+def _arc_length_from_nodes(node):
+    """Length along an `arc` node's three points (start / mid / end).
+
+    Imported lazily: `edit.ops` is a large module and `checks` must stay
+    importable from the read-only side of the package.
+    """
+    from .ops import arc_length_mm
+    st, md, en = (S.child(node, k) for k in ("start", "mid", "end"))
+    if st is None or md is None or en is None:
+        return 0.0
+    return arc_length_mm((S.arg_num(st, 1, 0.0), S.arg_num(st, 2, 0.0)),
+                         (S.arg_num(md, 1, 0.0), S.arg_num(md, 2, 0.0)),
+                         (S.arg_num(en, 1, 0.0), S.arg_num(en, 2, 0.0)))
+
+def track_lengths(doc, prefix="/DDR_", detail=None):
+    """Copper length per net, from the converted tree (segments + arcs).
 
     Vias are deliberately excluded from the length: a plated barrel is not a
     transmission line segment whose electrical length is its drill depth, and
     counting it would silently reward a net for taking more layer changes.
+
+    Arcs are NOT excluded. A meander drawn as a circular arc (the shape a
+    length-tuned DDR bus uses, because a polyline detour is an impedance step)
+    carries exactly as much copper as the arc's swept length, and ignoring it
+    under-reports every tuned net - which would make a matched bus read as
+    unmatched while looking finished.
+
+    `detail` (a dict, optional) receives `arcs_counted` / `segments_mm` /
+    `arcs_mm`, so a caller can prove which of the two was actually measured
+    instead of trusting the total.
     """
-    out = {}
+    seg = {}
+    arc = {}
+    n_arc = 0
     for node in doc.board().items[1:]:
-        if not isinstance(node, S.Seq) or S.head(node) != "segment":
+        if not isinstance(node, S.Seq):
+            continue
+        head = S.head(node)
+        if head not in ("segment", "arc"):
             continue
         net = S.arg_text(S.child(node, "net"), 1) or ""
-        st, en = S.child(node, "start"), S.child(node, "end")
-        d = G.dist_point_point((S.arg_num(st, 1, 0.0), S.arg_num(st, 2, 0.0)),
-                               (S.arg_num(en, 1, 0.0), S.arg_num(en, 2, 0.0)))
-        out[net] = out.get(net, 0.0) + d
+        if head == "segment":
+            st, en = S.child(node, "start"), S.child(node, "end")
+            d = G.dist_point_point((S.arg_num(st, 1, 0.0), S.arg_num(st, 2, 0.0)),
+                                   (S.arg_num(en, 1, 0.0), S.arg_num(en, 2, 0.0)))
+            seg[net] = seg.get(net, 0.0) + d
+        else:
+            arc[net] = arc.get(net, 0.0) + _arc_length_from_nodes(node)
+            n_arc += 1
+    out = {}
+    for net in set(seg) | set(arc):
+        out[net] = seg.get(net, 0.0) + arc.get(net, 0.0)
     if prefix is not None:
         out = {k: v for k, v in out.items() if k.startswith(prefix)}
+    if detail is not None:
+        keep = lambda d: {k: round(v, 4) for k, v in d.items()
+                          if prefix is None or k.startswith(prefix)}
+        detail["arcs_counted"] = n_arc
+        detail["segments_mm"] = keep(seg)
+        detail["arcs_mm"] = keep(arc)
     return {k: round(v, 4) for k, v in out.items()}
-
 
 def length_match(doc, tol_pair=0.25, tol_lane=0.5, tol_cmd=1.0, prefix="/DDR_"):
     """DDR3L length-match verdict.  Every number is a measurement of the file,

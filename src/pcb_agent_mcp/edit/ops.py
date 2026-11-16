@@ -4309,6 +4309,23 @@ op("add_teardrop", {"copper"},
    _run_add_teardrop, _verify_add_teardrop)
 
 # ----------------------------------------------------------------- driver
+# Keys that read as if they were parameters but are not. A misspelled key is
+# not an error anywhere in the op runner: the getter simply reports "not given"
+# and the op falls back to its default. A via written with `diameter` instead of
+# `size` therefore came out at the net-class 0.6/0.3 default - three times the
+# copper asked for - and passed every check on the way (the clearance judge then
+# saw 0.6 mm vias where 0.2 mm were meant, and 94 pairs overlap that never
+# should have existed). Refuse them by name instead of guessing.
+_PARAM_ALIASES = {
+    "diameter": "size",
+    "dia": "size",
+    "via_diameter": "size",
+    "via_size": "size",
+    "pad_diameter": "size",
+    "hole": "drill",
+}
+
+
 def validate(op):
     """Static validation: name, shape. Board-dependent checks happen in `run`."""
     if not isinstance(op, dict):
@@ -4317,6 +4334,14 @@ def validate(op):
     if not name or name not in OPS:
         raise OpError("unknown op %r (known: %s)"
                       % (name, ", ".join(sorted(OPS))), "OP_UNKNOWN")
+    for bad, good in _PARAM_ALIASES.items():
+        if bad in op:
+            raise OpError(
+                "%r is not a parameter of %r - write %r. A key the op does not "
+                "know is silently ignored, and the op then falls back to its "
+                "default (for a via that is the net class, 0.6/0.3 mm), which "
+                "produces copper nobody asked for and no check refuses"
+                % (bad, name, good), "ARG_ALIAS")
     return name
 
 def run_all(doc, ops, seed_base="op", index_offset=0):

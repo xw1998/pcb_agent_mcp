@@ -590,7 +590,7 @@ class Grid(object):
 
     def add_via(self, net, x, y, dia):
         self.add_copper({"kind": "via", "net": net, "layers": list(self.layers),
-                         "poly": G.circle_points(x, y, dia / 2.0, 16),
+                         "poly": G.circle_points(x, y, dia / 2.0, 64),
                          "ref": "router"})
 
     # -------------------------------------------------------------- queries
@@ -890,7 +890,15 @@ class Grid(object):
         """Is a via legal here? Same exact test, on a circle of the class diameter."""
         spec = R.for_net(self.bundle, net)
         dia = float(spec["via_diameter_mm"])
-        poly = G.circle_points(x, y, dia / 2.0, 16)
+        # The probe is a polygon, so its resolution is a correctness question and
+        # not a speed one. A 16-gon inscribed in the drill sits up to
+        # r*(1-cos(pi/16)) = 1.9% INSIDE the real circle: the check is then
+        # optimistic by 2 um and passes copper KiCad's DRC calls 0.0987 mm apart.
+        # 64 sides bring that error down to 0.12 um, which is below anything the
+        # DRC can see, while staying inscribed: an exactly-on-the-rule gap (the
+        # rule says 0.1 mm IS compliant) must not be refused, or a legal fan-out
+        # turns into 11 unroutable nets.
+        poly = G.circle_points(x, y, dia / 2.0, 64)
         span = span or self.layers
         out = []
         for layer in span:
@@ -921,7 +929,15 @@ class Grid(object):
                 if math.hypot(gapx, gapy) >= need:
                     continue
                 d = _dist(probe, it)
-                if d >= need - 1e-9:
+                # ZERO geometric margin, but 1 nm of float slack: the rule says
+                # a gap of exactly `need` IS compliant, and `circle_points` puts
+                # a vertex at angle 0, so the orthogonal case measures exactly
+                # `need` - which float subtraction reports a hair below it. The
+                # 1 nm only cancels that error; it is not design margin. Real
+                # margin is bought upstream by asking for a wider clearance
+                # (0.105 mm on the RK3506 run), because this check must not
+                # refuse a legal exactly-on-the-rule fan-out.
+                if d >= need - 1e-6:
                     continue
                 out.append({"reason": "clearance", "net": it.get("net"),
                             "kind": it.get("kind"), "reference": it.get("ref"),
@@ -1167,6 +1183,15 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
                 heapq.heappush(heap, (nc + heur_w * math.hypot(ni - gi, nj - gj),
                                       nc, ns))
         if not allow_vias:
+            continue
+        if node in goal_layers:
+            # A via drilled exactly on a goal node is either a via in the pad
+            # (banned) or, worse, a way to *claim* the goal without reaching it
+            # on a layer the goal accepts: on /DDR_DQ9 the search ran on F.Cu to
+            # the escape-via node and "arrived" by dropping a zero-cost via onto
+            # the pre-placed escape via - the net came back routed and left that
+            # via carrying one layer (`via_dangling`). The goal has to be
+            # reached by copper on one of its own layers, so no via here.
             continue
         if via_check is not None:
             got = via_memo.get(node)
