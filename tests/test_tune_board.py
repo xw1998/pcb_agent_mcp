@@ -75,7 +75,7 @@ class TestWhatTheMeasurementIncludes(_Board):
         self.write(self.track("A", (5.0, 5.0), (15.0, 5.0),
                               layer="F.Cu"),
                    {"op": "add_via", "x": 15.0, "y": 5.0, "net": "A",
-                    "diameter": 0.6, "drill": 0.3})
+                    "size": 0.6, "drill": 0.3})
         m = TB.measure(self.reload())["A"]
         self.assertAlmostEqual(m["length_mm"], 10.0, places=6)
         self.assertEqual(m["vias_not_counted"], 1)
@@ -354,8 +354,12 @@ class TestArcMeander(_Board):
                 self.assertLessEqual(math.hypot(a[0] - b[0], a[1] - b[1]), 1e-6,
                                      "piece %d does not join piece %d" % (k, k + 1))
                 t1, t2 = self._tangent(p, True), self._tangent(q, False)
+                # 1e-4 rad, not 1e-6: the pieces are written with coordinates
+                # rounded to 1 um, and a short atom (a 0.08 mm arc chord is 0.11 mm)
+                # turns that rounding into ~1e-5 rad of apparent direction error.
+                # The kink this test is about is a mis-joined tooth, i.e. degrees.
                 self.assertLessEqual(math.hypot(t1[0] - t2[0], t1[1] - t2[1]),
-                                     1e-5, "kink at joint %d" % k)
+                                     1e-4, "kink at joint %d" % k)
                 if p[0] == "line":
                     # Every straight piece is either along the axis (the run) or
                     # across it (the climb) - the two directions a rounded square
@@ -433,6 +437,92 @@ class TestArcMeander(_Board):
         with self.assertRaises(TB.TuneError) as ctx:
             TB.plan(self.board, [{"nets": ["A", "B"]}], style="wave")
         self.assertEqual(ctx.exception.reason_code, "ARG_INVALID")
+
+    def test_a_cross_bar_thinner_than_a_line_width_is_refused_not_drawn(self):
+        # The failing twin of the legibility floor. A 0.835 mm correction on an
+        # 8.6 mm run in 0.19 mm of room fits arithmetically as six teeth of
+        # h = 0.07 mm - a cross-bar narrower than the 0.1 mm trace. Drawn, that is
+        # a right-angle step with a fuzz of 0.06 mm arcs, and it pays for the
+        # length by shifting the whole run sideways (measured on the RK3506 DDR
+        # area: DQS1's intra-pair gap goes 0.45 -> 0.64 mm, another net down to
+        # 0.1255 mm).
+        seg = {"start": (5.0, 8.0), "end": (5.0, 16.6), "length_mm": 8.6,
+               "width": 0.1, "net": "SHORT", "layer": "F.Cu", "locked": False}
+        got = TB.arc_meander(seg, 0.835, 0.25, 1)
+        self.assertIsNone(got.get("pieces"), "a step must not be returned as a wave")
+        self.assertTrue(got.get("too_shallow"), got)
+        self.assertLess(got["h_mm"], TB.ARC_H_LEGIBLE_MM)
+        self.assertEqual(got["h_min_mm"], TB.ARC_H_LEGIBLE_MM)
+        # ... and the shape it refused is exactly what the geometric floor alone
+        # would have written: with h_min=0 the same call returns six teeth whose
+        # climb is the number the refusal quotes. Without this half, the test
+        # would pass on a segment where nothing fits at all.
+        old = TB.arc_meander(seg, 0.835, 0.25, 1, h_min=0.0)
+        self.assertIsNotNone(old)
+        self.assertEqual(old["teeth"], got["teeth"])
+        self.assertAlmostEqual(old["h"], got["h_mm"], places=6)
+        self.assertLess(old["h"], TB.ARC_H_LEGIBLE_MM)
+
+    def test_a_wave_with_a_real_climb_is_still_written(self):
+        # The other side of the same gate: the room that DOES exist must still be
+        # used, or "refuse the flat ones" would quietly become "refuse arc
+        # meanders". Same 8.6 mm run, same 0.835 mm correction, 0.6 mm of room.
+        seg = {"start": (5.0, 8.0), "end": (5.0, 16.6), "length_mm": 8.6,
+               "width": 0.1, "net": "SHORT", "layer": "F.Cu", "locked": False}
+        got = TB.arc_meander(seg, 0.835, 0.6, 1)
+        self.assertIsNotNone(got)
+        self.assertGreaterEqual(got["h"], TB.ARC_H_LEGIBLE_MM - 1e-9)
+        self.assertAlmostEqual(self._length_of(got["pieces"]), 8.6 + 0.835,
+                               places=5)
+
+    def test_a_shallow_refusal_keeps_one_layer_of_evidence_not_seventy(self):
+        # `also_blocked` exists to carry the clearance hit that came with the flat
+        # wave. It used to be built by wrapping whatever refusal came before, and
+        # the arc branch tries 7 length factors x 5 shifts x 2 sides per segment,
+        # so a refused DDR pair came back with a 70-deep self-referential dict -
+        # unbounded in the ladder, unreadable, and it grew with the search, not
+        # with the copper. One level, and only for a DIFFERENT reason.
+        self.write(self.track("LONG2", (6.0, 5.0), (6.0, 16.6)),
+                   self.track("SHORT2", (5.0, 8.0), (5.0, 16.6)),
+                   self.track("WALL3", (4.64, 3.0), (4.64, 18.0), width=0.05),
+                   self.track("WALL4", (5.36, 3.0), (5.36, 18.0), width=0.05))
+        res = TB.plan(self.reload(), [{"name": "p2", "nets": ["LONG2", "SHORT2"],
+                                       "tol_mm": 0.05}], style="arc")
+        refusals = [r for g in res["groups"] for p in g.get("per_net", [])
+                    for r in p.get("refusals", [])]
+        self.assertTrue(refusals, res["groups"])
+        for r in refusals:
+            depth, seen = 0, r
+            while isinstance(seen, dict):
+                depth += 1
+                if depth > 3:
+                    break
+                seen = seen.get("also_blocked")
+            self.assertLessEqual(depth, 2, r)
+            if "also_blocked" in r:
+                self.assertNotEqual(r["also_blocked"]["reason"], "too_shallow", r)
+
+    def test_the_plan_names_a_shallow_refusal_rather_than_saying_it_did_not_fit(self):
+        # End to end: a corridor 0.1 mm wide either side of the short net, so the
+        # only wave that fits is a flat one. The group must report
+        # `too_shallow` with the climb it reached, because "no room" and "no
+        # shape worth drawing" send the caller to different fixes.
+        # 0.36 mm either side of the short net leaves 0.11 mm of legal room once
+        # the 0.1 mm net rule is paid: enough for a ripple, not for a wave.
+        self.write(self.track("LONG", (6.0, 5.0), (6.0, 16.6)),
+                   self.track("SHORT", (5.0, 8.0), (5.0, 16.6)),
+                   self.track("WALL", (4.64, 3.0), (4.64, 18.0), width=0.05),
+                   self.track("WALL2", (5.36, 3.0), (5.36, 18.0), width=0.05))
+        board = self.reload()
+        res = TB.plan(board, [{"name": "p", "nets": ["LONG", "SHORT"],
+                               "tol_mm": 0.05}], style="arc")
+        reasons = [r["reason"] for g in res["groups"]
+                   for p in g.get("per_net", []) for r in p.get("refusals", [])]
+        self.assertIn("too_shallow", reasons, res["groups"])
+        shallow = [r for g in res["groups"] for p in g.get("per_net", [])
+                   for r in p.get("refusals", []) if r["reason"] == "too_shallow"]
+        self.assertLess(shallow[0]["climb_mm"], shallow[0]["min_climb_mm"])
+        self.assertEqual(res["totals"]["ops"], 0)
 
     def test_three_collinear_points_are_not_an_arc(self):
         self.write(self.track("A", (5.0, 5.0), (15.0, 5.0)))

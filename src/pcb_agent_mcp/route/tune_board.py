@@ -305,6 +305,27 @@ def _floor_hits(grid, net, seg, pts):
     return out
 
 
+def _first_other(refusal):
+    """First refusal in a `too_shallow` chain that is NOT itself `too_shallow`.
+
+    The arc branch records one refusal per segment, and the last thing it has to
+    say is usually `too_shallow`. Each attempt used to wrap the previous value
+    under `also_blocked`, so a segment tried at 7 length factors x 5 shifts x 2
+    sides came back as a 70-level self-referential dict - unreadable, unbounded,
+    and it grew with the ladder rather than with the copper. The evidence worth
+    keeping is the first NON-shallow hit (a clearance blocker, a locked track),
+    and there is at most one of those per segment.
+    """
+    seen = refusal
+    for _ in range(8):
+        if not isinstance(seen, dict):
+            return None
+        if seen.get("reason") != "too_shallow":
+            return {k: v for k, v in seen.items() if k != "also_blocked"}
+        seen = seen.get("also_blocked")
+    return None
+
+
 # ---------------------------------------------------------------- arc meander
 # A 45-degree tooth is a chamfer: the user rejected it on sight ("应该是圆弧蛇形
 # 线不是这样的三角线"). An arc meander is the same length added, drawn as a
@@ -324,6 +345,35 @@ def _floor_hits(grid, net, seg, pts):
 # "does_not_fit", which would be a limit of the ladder, not of the copper.
 ARC_R_LADDER = (0.35, 0.30, 0.25, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06)
 ARC_H_MIN = 0.05
+#: How tall the CROSS-BAR of a tooth has to be before it reads as a wave.
+#:
+#: `ARC_H_MIN` is a geometric floor (below it the piece is not distinguishable
+#: from its neighbours by the blocker probe); this one is about what the copper
+#: LOOKS like, and it was added after measuring a case that passed every other
+#: test on this board: a 0.835 mm correction on an 8.6 mm run came out as six
+#: teeth of `h = 0.070 mm`, `r = 0.06 mm` - a cross-bar narrower than the 0.1 mm
+#: trace that carries it. Drawn at 900 px/mm that is a right-angle step with a
+#: fuzz of 0.06 mm arcs, i.e. the shape the user rejected ("布线要 45 度你怎么又
+#: 直角"), and it bought its 0.835 mm by shifting the whole 7 mm run 0.19 mm
+#: sideways - which changes the intra-pair gap from 0.30 to 0.49 mm over that
+#: stretch and pulls another net down to 0.1255 mm.
+#:
+#: So the climb is held to 1.5x the trace width this package routes DDR on
+#: (0.1 mm). Below it the meander is REFUSED BY NAME (`too_shallow`, with the
+#: height it would have had) rather than drawn: the length would be real, but the
+#: answer to "this bundle has 0.19 mm of room" is "there is no meander here", not
+#: a ripple that eats the clearance margin.
+#: The same measuring pass found this family is not a one-off. On the board that
+#: DID pass this package's own checks (`examples/rk3506_som/_rl1_s1d.kicad_pcb`,
+#: commit 95c8f86) every equalising shape is of it: `/DDR_DQS0P` gets two 90-degree
+#: detours of `r = 0.12` with a cross-bar of `h = 0.0759` mm, `/DDR_DQS1P` two more
+#: of `r = 0.12` / `0.10` with `h = 0.0517` / `0.0655` mm - 0.5x to 0.76x the trace
+#: width in every case. Each detour displaces the run 0.25-0.32 mm sideways
+#: (DQS1's F.Cu run hops between x = 16.2345 and 16.5262 over a 1.6 mm stretch,
+#: DQS1N sitting at x = 16.8), and those 0.19 / 0.18 mm per hop are what closed
+#: the skew. So this floor does not only refuse the next attempt: it names the
+#: shape the last accepted one was made of.
+ARC_H_LEGIBLE_MM = 0.15
 ARC_RUN_MIN = 0.10
 # Where inside the segment's spare room the wave may sit, as a fraction of that
 # room: centred first (0.0), then either end. A bundle rarely blocks symmetrically.
@@ -336,11 +386,17 @@ ARC_SHIFTS = (0.0, 0.5, -0.5, 0.25, -0.25)
 ARC_EXTRA_FACTORS = (1.0, 0.85, 0.7, 0.55, 0.4, 0.28, 0.18)
 ARC_EXTRA_MIN_MM = 0.10
 
-def arc_meander(seg, extra_mm, amp_max, side=1, r_ladder=None, shift=0.0):
+def arc_meander(seg, extra_mm, amp_max, side=1, r_ladder=None, shift=0.0,
+                h_min=None):
     """Pieces of a ROUNDED meander that adds `extra_mm` to `seg`.
 
     Returns {"pieces": [("line", a, b) | ("arc", s, m, e)], ...} or None when no
-    (r, teeth) choice both fits the segment and stays under `amp_max`. `side` is
+    (r, teeth) choice both fits the segment and stays under `amp_max`, or
+    {"pieces": None, "too_shallow": True, ...} when the only shapes that fit have
+    a cross-bar below `h_min` (default `ARC_H_LEGIBLE_MM`) - a refusal with the
+    height it reached, because "no room" and "no shape worth drawing" are two
+    different answers and a caller that cannot tell them apart re-runs the tool
+    with the same inputs. `side` is
     +1 / -1: the whole wave lives on that side of the axis, so the other side is
     untouched. `shift` in [-0.5, 0.5] slides the wave inside the room it has
     (0 = centred): a wave that is refused at one end of a bundle is often legal a
@@ -364,7 +420,9 @@ def arc_meander(seg, extra_mm, amp_max, side=1, r_ladder=None, shift=0.0):
     ux, uy = (bx - ax) / L, (by - ay) / L
     nx, ny = -uy * side, ux * side          # one normal, flipped by `side`
 
+    need_h = ARC_H_LEGIBLE_MM if h_min is None else max(ARC_H_MIN, float(h_min))
     best = None
+    shallow = None                      # tallest shape that was still too flat
     for r in (r_ladder or ARC_R_LADDER):
         for teeth in range(2, 65, 2):
             h = extra_mm / teeth - r * (math.pi - 2.0)
@@ -376,13 +434,24 @@ def arc_meander(seg, extra_mm, amp_max, side=1, r_ladder=None, shift=0.0):
             run = L / teeth - 2.0 * r
             if run < ARC_RUN_MIN:
                 continue
+            if h < need_h - 1e-9:
+                # More teeth make h SMALLER, so this radius can only get flatter;
+                # keep the tallest refusal for the reason and stop scanning it.
+                if shallow is None or h > shallow["h"]:
+                    shallow = {"r": r, "teeth": teeth, "h": h, "amp": amp,
+                               "run": run}
+                break
             if best is None or teeth < best["teeth"]:
                 best = {"r": r, "teeth": teeth, "h": h, "amp": amp, "run": run}
             break                           # fewest teeth for this radius wins
         if best is not None:
             break
     if best is None:
-        return None
+        if shallow is None:
+            return None
+        return {"pieces": None, "too_shallow": True, "h_mm": shallow["h"],
+                "amp_mm": shallow["amp"], "teeth": shallow["teeth"],
+                "r_mm": shallow["r"], "h_min_mm": need_h}
 
     r, teeth = best["r"], best["teeth"]
     h, amp, run = best["h"], best["amp"], best["run"]
@@ -666,6 +735,7 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                         for side in (1, -1):
                             if style == "arc":
                                 got = None
+                                flat = None
                                 for factor in ARC_EXTRA_FACTORS:
                                     step = extra * factor
                                     if step < ARC_EXTRA_MIN_MM:
@@ -674,6 +744,14 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                                         cand = arc_meander(seg, step, amp, side,
                                                            shift=shift)
                                         if cand is None:
+                                            continue
+                                        if cand.get("pieces") is None:
+                                            # Every shape that fits is too flat to
+                                            # read as a wave; remember the tallest
+                                            # and keep looking for a real one.
+                                            if flat is None or (cand["h_mm"] >
+                                                                flat["h_mm"]):
+                                                flat = cand
                                             continue
                                         blocked = _pieces_blockers(
                                             grid, net, seg, cand["pieces"],
@@ -687,11 +765,37 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                                     if got is not None:
                                         break
                                 if got is None:
-                                    refusal = refusal or {
-                                        "reason": "does_not_fit",
-                                        "style": "arc",
-                                        "amplitude_mm": round(amp, 4),
-                                        "uuid": seg["uuid"]}
+                                    if flat is not None:
+                                        # `too_shallow` wins over the clearance hit
+                                        # that usually comes with it: "a legible wave
+                                        # exists geometrically but something is in
+                                        # its way, and the only shapes that fit are
+                                        # flat" is the actionable sentence, and the
+                                        # clearance hit travels as evidence.
+                                        earlier = _first_other(refusal)
+                                        refusal = {
+                                            "reason": "too_shallow",
+                                            "style": "arc",
+                                            "climb_mm": round(flat["h_mm"], 4),
+                                            "min_climb_mm": flat["h_min_mm"],
+                                            "would_amplitude_mm":
+                                                round(flat["amp_mm"], 4),
+                                            "teeth": flat["teeth"],
+                                            "detail": "the only rounded waves that "
+                                                      "fit here have a cross-bar "
+                                                      "narrower than a line width and a "
+                                                      "half; drawn, that is a "
+                                                      "right-angle step, not a "
+                                                      "meander",
+                                            "uuid": seg["uuid"]}
+                                        if earlier is not None:
+                                            refusal["also_blocked"] = earlier
+                                    else:
+                                        refusal = refusal or {
+                                            "reason": "does_not_fit",
+                                            "style": "arc",
+                                            "amplitude_mm": round(amp, 4),
+                                            "uuid": seg["uuid"]}
                                     continue
                                 pieces = got["pieces"]
                                 hits = _pieces_floor_hits(grid, net, seg, pieces)
