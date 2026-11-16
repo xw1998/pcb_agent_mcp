@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.1.41] - 2026-11-16
+
+上一版结尾登记的两件「没做到」：**没有能量化「两块都合法、哪一块好看」的读数**，以及
+**语料判据仍是纯失败率、没有按「哪几块板算完美板」加权**。这一版把两件都做掉，一行既有判据都没动。
+详见 `docs/179-审美代理量与外生分层的语料.md`。
+
+- **新增 `src/pcb_agent_mcp/aesthetics.py`**：六条从 canonical 几何算出的形状读数（单段长度中位数、
+  每 100 mm 转向数、每 pad 转向数、与另一张网并行的铜占比、≥5 mm 段占比、拼接点密度），每条带方向；
+  两条明确**不排序**（`via_per_100mm` 是 `no_direction`，`offgrid_share` 归 `shape_gate`）。
+  `compare()` 用**支配**排序（每条读数都不差、至少一条严格更好），不支配的对判 `incomparable` 并**点名分歧的读数**；
+  `borda` 只有一个加权假设（每条读数算一票）且写在返回值里；`bends_per_100mm` 与 `bends_per_pad` 方向相反时判
+  `confounded: density`——差异来自铜密度，不是手艺。没有铜的板进 `skipped` 并给原因，不打 0 分也不静默丢弃。
+- **新增 `board_aesthetics` 工具（工具数 259 → 260）**：`layer` + `compare: [...]`，逐板读数 + 两两支配 + `pareto_front`；
+  少于两块输入板 ⇒ `NOT_ENOUGH_BOARDS`，一块可读的都没有 ⇒ `NO_GEOMETRY`。
+- **两个把读数算错的实现缺陷**（都只在反向对照里现形）：① 共线判定写反——`d <= 1°` 判的是「180° 原路折返」，
+  于是「一根直跑被存成两段」被算成弯、拼接点恒 0，`bends_per_100mm` 虚高（正确口径是 `change = 180 − d`）；
+  ② **T 型支线看不见**——三根铜在同一点相遇能数成 tee，但支线端点落在干线**中段**时两端都不是端点对，
+  既不算弯也不算 tee，从读数里消失（现在用 `geometry.dist_point_segment` + 2 mm 网格分桶补上，并从 `dangling_ends` 摘出）。
+- **校准表 `CALIBRATION` 是数据不是阈值**：手画 `sky_star` / 本项目自画 `rk3506_som` / 12 块语料板实测。
+  五条能分开手画与自画（`bends_per_100mm` 33.24 对 77.40、`bends_per_pad` 1.43 对 4.78），
+  **第六条 `collinear_per_100mm` 不能**（手画 0.553 对自画 0.119，手画更多拼接点）⇒ 标 `separates: False`
+  并写死「never a craft verdict」，不许拿它当手艺判决。同一条口径也记下：手画板的 `chunk_median_mm` 与
+  `bends_per_100mm` 都**比语料中位更差**（它密），分开的是手画 vs 自画，不是手画 vs 全世界。
+- **`tools/plan_sequence.py` 的语料分层（外生证据）**：`corpus_evidence()` 读每块板旁边的 `<board>.kicad_pcb.drc.json`
+  （`kicad-cli pcb drc --format json`），计 `error + unconnected` 并**排除 `lib_footprint_issues`**；
+  没有报告 ⇒ `unverified`，永不落层。`strata()` 按排名三等分（low/mid/high 各 4 块），不用绝对阈值。
+  `judge_strata()` 八种判词，**只有最干净一层能定罪**；`house` 规则（八关里唯一的是 `route`）**不做分层**
+  ——分层不能把别人家的方针变成反证；整体 ≥0.9 而干净层判得了 <3 时给 `layering_silent`，不假装加了证据。
+  实跑 12 块：`frame/fanout/power` 干净层 1.00 `hold_across_strata`、`floorplan` 判得了 2 块全在 high 层 ⇒ `low_stratum_thin`、
+  `stackup` 干净层 0 块 ⇒ `layering_silent`、`route` 1/12 ⇒ `house_rule_not_stratified`、`bus/closure` 无可判样本。
+- **测试**：`tests/test_aesthetics.py` 25 例（读数该动的五组 + 该不动的不变量 + `compare` 四条拒绝/分歧 + 校准表自检
+  「每条声称能分离的读数都要把 `hand − machine` 读对符号」）；`tests/test_plan_sequence.py` 加 6 例（证据只来自 DRC 报告、
+  无报告即 `unverified`、按排名分桶留空、样本不足拒绝下结论、只有干净层能定罪、`house` 规则不分层）。
+
 ## [0.1.40] - 2026-11-16
 
 用户问「要让你这样一个模型画好板子还缺什么」，答复点了五处缺口，这一版补的是其中最硬的两处：

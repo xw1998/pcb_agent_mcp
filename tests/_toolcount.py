@@ -35,11 +35,19 @@ used to be spread across the twelve files.
                  that came with them (move_cluster, swap_pad_nets,
                  reserve_region, release_region) are board_edit ops, not tools.
 
+    259 -> 260   0.1.41: board_aesthetics - the missing question between "both of
+                 these boards are legal" and "which one is better to look at".
+                 Readings of routing SHAPE (piece length, direction changes per
+                 100 mm and per pad, how much copper runs alongside another net),
+                 ordered by dominance with the disagreeing readings named. Not a
+                 gate, not a score with tuned weights; it refuses to rank fewer
+                 than two boards and never uses corpus numbers as thresholds.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 259
+EXPECTED_TOOL_COUNT = 260
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

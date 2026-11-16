@@ -348,3 +348,79 @@ def test_floorplan_reports_its_threshold_sweep(monkeypatch):
     assert measured["by_threshold"]["0.10"] == "pass"
     assert measured["by_threshold"]["0.30"] == "pass"
     assert measured["overlap_basis"] == "padding"
+
+# --------------------------------------------------------------------------- #
+# the corpus is stratified by EXOGENOUS evidence, not by my own verdicts
+# --------------------------------------------------------------------------- #
+def test_evidence_comes_from_the_drc_report_next_to_the_board(tmp_path):
+    import json as _json
+    p = tmp_path / "b.kicad_pcb"
+    p.write_text("(kicad_pcb)")
+    doc = {"kicad_version": "10.0", "date": "2026-11-16T00:00:00",
+           "violations": [
+               {"severity": "error", "type": "clearance"},
+               {"severity": "error", "type": "lib_footprint_issues"},
+               {"severity": "warning", "type": "lib_footprint_issues"},
+               {"severity": "warning", "type": "silk_edge_clearance"}],
+           "unconnected_items": [{"x": 1}]}
+    (tmp_path / "b.kicad_pcb.drc.json").write_text(_json.dumps(doc))
+    got = S.corpus_evidence(str(p))
+    assert got["file"] == "b.kicad_pcb.drc.json"
+    # the library-mismatch ERROR is reported but not charged to the board: it says
+    # the footprint library differs, not that the copper is wrong
+    assert got["errors"] == 2 and got["board_errors"] == 1
+    assert got["unconnected"] == 1
+    assert got["defects"] == 2          # 1 board error + 1 unconnected
+    assert got["kicad_version"] == "10.0"
+
+def test_no_report_means_unverified_and_never_a_stratum(tmp_path):
+    p = tmp_path / "b.kicad_pcb"
+    p.write_text("(kicad_pcb)")
+    got = S.corpus_evidence(str(p))
+    assert got["file"] is None and got["defects"] is None
+    assert "kicad-cli" in got["why"]
+
+def test_strata_bucket_by_rank_and_leave_gaps_unverified():
+    rows = [{"board": "a%d" % i, "evidence": {"defects": d}}
+            for i, d in enumerate([0, 0, 1, 3, 8, 40])]
+    rows.append({"board": "noev", "evidence": {"defects": None}})
+    lay, why = S.strata(rows)
+    assert lay and lay["names"] == S.STRATUM_NAMES and why is None
+    by = {r["board"]: r["stratum"] for r in rows}
+    assert by["a0"] == "low" and by["a5"] == "high"
+    assert by["noev"] == "unverified"
+    assert lay["spans"]["low"][1] <= lay["spans"]["high"][0]
+
+def test_strata_refuse_to_lie_when_too_few_boards_have_evidence():
+    rows = [{"board": "a", "evidence": {"defects": 0}},
+            {"board": "b", "evidence": {"defects": 9}}]
+    lay, why = S.strata(rows)
+    assert lay is None and "不做分层" in why
+
+def test_a_rule_is_only_convicted_by_the_cleanest_stratum():
+    per = {"low": {"judged": 4, "pass_rate": 1.0},
+           "high": {"judged": 4, "pass_rate": 0.25}}
+    said, code = S.judge_strata("physical", per, "base")
+    assert code == "hold_across_strata" and "分层不改变判决" in said
+
+    per["low"]["pass_rate"] = 0.25
+    said, code = S.judge_strata("physical", per, "base")
+    assert code == "refuted_on_cleanest" and "规则是错的" in said
+
+    # the inversion is the more damning shape: the cleanest boards fail MOST
+    per = {"low": {"judged": 4, "pass_rate": 0.0},
+           "high": {"judged": 4, "pass_rate": 0.75}}
+    said, code = S.judge_strata("physical", per, "base")
+    assert code == "rule_flags_cleanest" and "问题在规则不在板子" in said
+
+    # too few judged in the clean stratum: no conviction, however bad the rest
+    per = {"low": {"judged": 1, "pass_rate": 0.0},
+           "high": {"judged": 8, "pass_rate": 0.0}}
+    said, code = S.judge_strata("physical", per, "base")
+    assert code == "low_stratum_thin" and "不能定罪" in said
+
+def test_house_rules_are_not_stratified_either():
+    per = {"low": {"judged": 9, "pass_rate": 0.0},
+           "high": {"judged": 9, "pass_rate": 1.0}}
+    said, code = S.judge_strata("house", per, "base")
+    assert code == "house_rule_not_stratified" and said == "base"

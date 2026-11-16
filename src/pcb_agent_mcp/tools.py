@@ -22,6 +22,7 @@ from . import oracle as _oracle
 from . import place_gate as _place_gate
 from . import shape_gate as _shape_gate
 from . import snapshot as _snapshot
+from . import aesthetics as _aesthetics
 from .fidelity import views as _fviews
 from .calc import current as _current
 from .calc import currentfield as _cfield
@@ -2479,6 +2480,32 @@ _COMMON = {
     "project": _str("optional side file: .kicad_pro next to a .kicad_pcb"),
 }
 
+def _aesthetics_compare(main, args):
+    """Order `path` against every board in `compare` (all read-only)."""
+    import os
+    loaded, names, errs = [], [], []
+    for one in args.get("compare") or []:
+        board, e = _load_board({"path": one})
+        if e:
+            # A board that cannot be read is reported by name, never silently
+            # dropped: a ranking over a reduced set is a different answer.
+            errs.append({"path": one,
+                         "reason_code": (e or {}).get("reason_code"),
+                         "message": (e or {}).get("message")})
+            continue
+        loaded.append(board)
+        names.append(os.path.basename(str(one)))
+    if not loaded:
+        return err("compare carried no readable board", "NOT_ENOUGH_BOARDS",
+                   hint="every path in `compare` failed to parse: "
+                        + "; ".join("%s: %s" % (x["path"], x["message"])
+                                    for x in errs))
+    out = _aesthetics.compare([main] + loaded, names=["(this board)"] + names,
+                              layer=args.get("layer") or None)
+    if out.get("status") == "ok":
+        out["value"]["unreadable"] = errs
+    return out
+
 def _board_tool(fn, derived=False):
     """Wrap a board handler. `derived` marks answers this server COMPUTED.
 
@@ -4504,6 +4531,35 @@ _tool(
      "properties": dict({}, **_COMMON),
      "required": ["path"]},
     _board_tool(lambda b, a: _oracle.reservations(b), derived=True),
+)
+
+_tool(
+    "board_aesthetics",
+    "Which of two boards that are BOTH LEGAL is the better one to look at? Every "
+    "reading here names its direction and carries the number that produced it: "
+    "median segment length, direction changes per 100 mm (a 45 chamfer, a square "
+    "turn and a hairpin are counted apart), the share of copper that runs "
+    "alongside another net (a bundle), the share in runs of 5 mm or more, "
+    "collinear pieces stored as two, and a density-normalised twin of the bend "
+    "count so a 0.4 mm-pitch fanout is not called ugly for being a fanout. "
+    "`place_quality` puts the board against a calibration set of real boards "
+    "(one hand-routed, one drawn by this project, twelve corpus boards) measured "
+    "2026-11-16. Pass `compare` to order several boards instead: dominance first, "
+    "`incomparable` pairs reported with the readings that disagree, and a mean "
+    "percentile whose only assumption is that each reading counts once. No DRC "
+    "involvement and no human labels: the order comes from the copper. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "layer": _str("only this copper layer (F.Cu / B.Cu); omit for all"),
+         "compare": {"type": "array", "items": {"type": "string"},
+                     "description": "board paths to ORDER against `path`: returns "
+                                    "per-board readings, head-to-head pair "
+                                    "verdicts, the Pareto front and a rank"},
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _aesthetics_compare(b, a) if a.get("compare")
+                else _aesthetics.report(b, layer=a.get("layer") or None),
+                derived=True),
 )
 
 _tool(

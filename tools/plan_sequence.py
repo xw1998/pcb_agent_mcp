@@ -38,12 +38,17 @@ Nothing here writes a board, moves a part or routes a net.
 """
 import argparse
 import glob
+import io
 import json
 import math
 import os
 import subprocess
 import sys
 import time
+
+def io_open(path, newline=None):
+    """Text open with an explicit encoding - the corpus holds GBK-era comments."""
+    return io.open(path, "r", encoding="utf-8", newline=newline)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -872,6 +877,142 @@ def corpus_paths(spec):
                   if p.lower().endswith(CORPUS_SUFFIXES))
 
 
+#: What an official DRC report says about a board - used to stratify a corpus by
+#: something OTHER than the rule under test.
+#:
+#: The rule under test is mine. Stratifying the corpus by my own verdicts would be
+#: circular ("the boards my rule passes are the good ones, so my rule is right"),
+#: so the stratum comes from `kicad-cli pcb drc` - a different engine, and the
+#: authority this repo defers to everywhere else. The report is written next to
+#: the board as `<board>.drc.json`; a board without one is `unverified`, and an
+#: unverified board never convicts a rule.
+DRC_EVIDENCE_SUFFIX = ".drc.json"
+
+#: Violation types that are about the footprint LIBRARY an old project was drawn
+#: with, not about its copper. The shipped demos carry 68, 114 and 199 of these
+#: because the libraries in this checkout differ from the ones the board was drawn
+#: against - counting them would rank a board by its library age.
+LIBRARY_ONLY_TYPES = ("lib_footprint_issues",)
+
+#: Stratum names, cleanest first. Buckets are by RANK, not by an absolute cut: a
+#: 2005 demo drawn to looser rules and a 2024 board drawn to today's defaults do
+#: not share a scale, so "defects" only means anything relative to the corpus.
+STRATUM_NAMES = ("low", "mid", "high")
+
+def corpus_evidence(path):
+    """The official DRC report sitting next to this board, or a note saying why not.
+
+    `defects` = board-attributable errors + unconnected items, both taken verbatim
+    from KiCad's own report. It is the number the stratification uses, and it was
+    produced by a different program than the rules being audited - which is the
+    only reason it is allowed to stratify them.
+    """
+    stem = os.path.splitext(path)[0]
+    cand = [path + DRC_EVIDENCE_SUFFIX, stem + DRC_EVIDENCE_SUFFIX]
+    for c in cand:
+        if not os.path.isfile(c):
+            continue
+        try:
+            with io_open(c) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as exc:
+            return {"file": os.path.basename(c), "defects": None,
+                    "why": "unreadable: %r" % exc}
+        viol = doc.get("violations") or []
+        errors = [v for v in viol if v.get("severity") == "error"]
+        warns = [v for v in viol if v.get("severity") == "warning"]
+        lib = sum(1 for v in viol if v.get("type") in LIBRARY_ONLY_TYPES)
+        board_errors = sum(1 for v in errors
+                           if v.get("type") not in LIBRARY_ONLY_TYPES)
+        unconn = len(doc.get("unconnected_items") or [])
+        return {"file": os.path.basename(c),
+                "errors": len(errors), "board_errors": board_errors,
+                "warnings": len(warns), "library_warnings": lib,
+                "unconnected": unconn, "defects": board_errors + unconn,
+                "kicad_version": doc.get("kicad_version"),
+                "date": doc.get("date"),
+                "how": ("kicad-cli pcb drc - KiCad's own engine, not this repo's "
+                        "checker. %s is excluded from `defects` because it reports "
+                        "the footprint library, not the copper"
+                        % (LIBRARY_ONLY_TYPES,))}
+    return {"file": None, "defects": None,
+            "why": ("no %s next to this board: `kicad-cli pcb drc --format json -o "
+                    "<board>%s <board>` gives it a stratum"
+                    % (DRC_EVIDENCE_SUFFIX, DRC_EVIDENCE_SUFFIX))}
+
+def strata(rows, parts=3):
+    """Bucket the evidenced boards by official defect count, cleanest first.
+
+    Returns (names, why_not) - `names` is None when there is nothing to stratify
+    on, and `why_not` then says how many boards were short of the requirement.
+    Rows without evidence are marked `unverified` and are excluded from every
+    stratum rate: "we did not look" is not "it is clean".
+    """
+    known = [r for r in rows
+             if (r.get("evidence") or {}).get("defects") is not None]
+    if len(known) < parts:
+        return None, ("只有 %d 块板带官方 DRC 证据（<%d）=> 不做分层，"
+                      "整份语料按同一层读" % (len(known), parts))
+    known.sort(key=lambda r: r["evidence"]["defects"])
+    n = len(known)
+    for idx, row in enumerate(known):
+        row["stratum"] = STRATUM_NAMES[min(parts - 1, idx * parts // n)]
+    for r in rows:
+        if not r.get("stratum"):
+            r["stratum"] = "unverified"
+    spans = {}
+    for row in known:
+        name = row["stratum"]
+        d = row["evidence"]["defects"]
+        lo, hi = spans.get(name, (d, d))
+        spans[name] = (min(lo, d), max(hi, d))
+    return {"names": STRATUM_NAMES, "spans": spans, "n": n}, None
+
+def judge_strata(origin, per, base, overall=None):
+    """What the corpus says once its boards are split by exogenous evidence.
+
+    `base` is the unstratified sentence from judge_corpus. This adds the part a
+    flat pass-rate cannot say: a rule that only fails on the officially-dirtiest
+    third is weakly supported, while a rule that fails on the officially-cleanest
+    third is refuted by boards nobody can call sloppy.
+
+    Returns (sentence, code). The code is what a caller switches on; the sentence
+    is what a person reads.
+    """
+    if not per:
+        return base, "no_strata"
+    low = per.get("low") or {}
+    high = per.get("high") or {}
+    if origin == "house":
+        # A house rule is not refuted by the corpus at all, so splitting the
+        # corpus cannot make it more refuted. Saying anything stronger here would
+        # turn "these boards were routed to another house's style" into evidence.
+        return base, "house_rule_not_stratified"
+    judged_low = low.get("judged") or 0
+    if judged_low < MIN_JUDGED:
+        if overall is not None and overall >= 0.9:
+            # The rule passes everywhere; the cleanest stratum simply has too few
+            # applicable boards (a 2-layer demo has no inner plane to judge).
+            # Appending "the corpus cannot convict" here would read as doubt about
+            # a rule nothing failed.
+            return (base + "；最干净的一层只有 %d 块判得了（<%d），分层不追加证据"
+                    % (judged_low, MIN_JUDGED)), "layering_silent"
+        return (base + "；最低违规层只判了 %d 块（<%d）=> 语料不能定罪"
+                % (judged_low, MIN_JUDGED)), "low_stratum_thin"
+    low_rate = low.get("pass_rate")
+    high_rate = high.get("pass_rate")
+    if low_rate is None:
+        return base, "low_stratum_unmeasured"
+    if low_rate >= 0.9:
+        return (base + "；最干净的一层也过（%.2f，n=%d）=> 分层不改变判决"
+                % (low_rate, judged_low)), "hold_across_strata"
+    if high_rate is not None and low_rate < high_rate - 0.15:
+        return (base + "；最干净的一层反而过得最少（low %.2f < high %.2f）=> "
+                "这条规则分不出干净板，问题在规则不在板子"
+                % (low_rate, high_rate)), "rule_flags_cleanest"
+    return (base + "；最干净的一层也不过（%.2f，n=%d）=> 官方 DRC 认定的好板也过不了，"
+            "这条规则是错的" % (low_rate, judged_low)), "refuted_on_cleanest"
+
 #: Where a rule comes from decides what a corpus can say about it.
 #:
 #:   physical  the board physically cannot work otherwise (castellation feeds,
@@ -1151,6 +1292,7 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
         t0 = time.time()
         print("[%d/%d] %s ..." % (i, len(paths), os.path.basename(p)),
               file=sys.stderr, flush=True)
+        row = {"board": os.path.basename(p), "path": p}
         try:
             if inprocess:
                 rep = evaluate(p, amplitude, clearance, chain=False)
@@ -1164,13 +1306,23 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
             print("        %.1fs  %s" % (time.time() - t0, rep["verdict"]),
                   file=sys.stderr, flush=True)
         except Exception as exc:                                # noqa: BLE001
-            rows.append({"board": os.path.basename(p), "error": repr(exc)})
+            row["error"] = repr(exc)
+            rows.append(row)
             continue
-        rows.append({"board": os.path.basename(p), "rep": rep})
+        row["rep"] = rep
+        rows.append(row)
+    # Exogenous evidence first: the stratum of a board comes from kicad-cli, never
+    # from the rule being audited. Rows without a report are `unverified`.
+    for r in rows:
+        r["evidence"] = corpus_evidence(r["path"]) if r.get("path") else {
+            "file": None, "defects": None, "why": "the board was not reached"}
+    layering, why_no_layering = strata(rows)
+
     summary = {}
     for sid in ORDER:
         got = {"pass": 0, "fail": 0, "blocked": 0, "n/a": 0, "error": 0,
                "not_run": 0}
+        per = {}
         fail_on = []
         for r in rows:
             if "rep" not in r:
@@ -1185,16 +1337,42 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
                 if s["id"] != sid:
                     continue
                 got[s["status"]] += 1
+                bucket = per.setdefault(r.get("stratum") or "unverified",
+                                        {"pass": 0, "fail": 0})
+                if s["status"] in ("pass", "fail"):
+                    bucket[s["status"]] += 1
                 if s["status"] == "fail":
                     fail_on.append(r["board"])
         judged = got["pass"] + got["fail"]
+        per_stratum = {}
+        for name, c in per.items():
+            total_here = c["pass"] + c["fail"]
+            per_stratum[name] = {
+                "pass": c["pass"], "fail": c["fail"], "judged": total_here,
+                "pass_rate": (round(c["pass"] / float(total_here), 3)
+                              if total_here else None)}
+        base = judge_corpus(ORIGIN[sid], (round(got["pass"] / float(judged), 3)
+                                          if judged else None), judged)
+        said, code = judge_strata(ORIGIN[sid], per_stratum, base,
+                                  overall=(round(got["pass"] / float(judged), 3)
+                                           if judged else None))
         summary[sid] = {"counts": got, "fail_on": fail_on, "origin": ORIGIN[sid],
                         "judged": judged,
                         "pass_rate": (round(got["pass"] / float(judged), 3)
-                                      if judged else None)}
+                                      if judged else None),
+                        "strata": per_stratum, "judge_base": base,
+                        "judge": said, "judge_code": code}
     out = {"boards": len(rows), "steps": summary, "rows": rows,
+           "layering": ({"strata": layering, "why_not": why_no_layering}
+                        if layering else {"strata": None,
+                                          "why_not": why_no_layering,
+                                          "evidence_present": sum(
+                                              1 for r in rows
+                                              if (r.get("evidence") or {}
+                                                  ).get("defects") is not None)}),
            "how": ("a step that fails on most of a corpus of good boards is a rule "
-                   "that is too strict, not a corpus that is broken")}
+                   "that is too strict, not a corpus that is broken; the strata "
+                   "come from kicad-cli's own DRC report, never from this checker")}
     if quiet:
         return out
     hung = [r["board"] for r in rows if r.get("rep", {}).get("verdict") == "not_run"]
@@ -1203,6 +1381,23 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
           % (len(rows), amplitude,
              (", one child process per board, %g s deadline" % timeout)
              if not inprocess else ", in-process (no deadline)"))
+    if layering:
+        print("strata by official DRC defects (kicad-cli, library-mismatch excluded):")
+        for name in STRATUM_NAMES:
+            members = [r for r in rows if r.get("stratum") == name]
+            if not members:
+                continue
+            lo, hi = layering["spans"].get(name, (None, None))
+            print("  %-5s n=%-2d defects %s..%s  %s"
+                  % (name, len(members), lo, hi,
+                     ", ".join(r["board"] for r in members)))
+        rest = [r for r in rows if r.get("stratum") == "unverified"]
+        if rest:
+            print("  unverified n=%-2d (no .drc.json)  %s"
+                  % (len(rest), ", ".join(r["board"] for r in rest[:6])))
+        print()
+    else:
+        print("no layering: %s\n" % why_no_layering)
     if hung:
         print("not run (process did not finish, NOT counted as pass): %s\n"
               % ", ".join(hung))
@@ -1212,12 +1407,22 @@ def run_corpus(paths, amplitude, clearance, quiet=False,
         s = summary[sid]
         c = s["counts"]
         rate = "-" if s["pass_rate"] is None else "%.2f" % s["pass_rate"]
-        judge = judge_corpus(ORIGIN[sid], s["pass_rate"], s["judged"])
+        judge = s["judge"]
         print("%-9s %-5d %-5d %-5d %-4d %-3d %-7s %-3d  %s"
               % (sid, c["pass"], c["fail"], c["blocked"], c["n/a"],
                  c["not_run"], rate, s["judged"], judge))
         if s["fail_on"]:
             print("          fail on: %s" % ", ".join(s["fail_on"][:8]))
+        if layering and s["strata"]:
+            bits = []
+            for name in STRATUM_NAMES:
+                got = s["strata"].get(name)
+                if not got or not got["judged"]:
+                    continue
+                bits.append("%s %.2f (n=%d)" % (name, got["pass_rate"],
+                                                got["judged"]))
+            if bits:
+                print("          by stratum: %s" % "  ".join(bits))
     return out
 
 
