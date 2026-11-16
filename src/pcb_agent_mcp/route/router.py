@@ -497,7 +497,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
          allow_vias=True, max_nets=None, ignore_zone_areas=False,
          return_path=True, return_path_net=None, topology="mst",
          progress=None, blind_vias=False, keepout_rects=None, grid_origin=None,
-         terminal_override=None, net_priority=None):
+         terminal_override=None, net_priority=None, bundle_bands=None):
     """Route what can be routed and say plainly what cannot.
 
     Returns a plain dict; the tool layer wraps it in an envelope. A net is only
@@ -527,6 +527,29 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     verbatim - a point that is not on the board is the caller's error, not
     something to guess around, so a net named here with no usable point is
     reported rather than silently falling back to the pad centre.
+
+    `bundle_bands` is how a bus gets a geometry instead of a pile of
+    independently shortest paths. Each entry is
+    `{"name": str, "nets": [...], "radius_mm": 0.8, "discount": 0.6}`:
+
+    * the named nets are routed **first** and, inside the band, **shortest
+      first** - the shortest path is the best skeleton for the others to
+      follow, and starting from the longest net would make everyone inherit
+      the worst detour;
+    * once the first member is routed, its copper becomes a *guide*: cells
+      within `radius_mm` of it refund `discount` of their step cost to the
+      remaining members (`route.grid.astar(guide=...)`). The group converges
+      on one corridor, so the spread that length matching cares about comes
+      out of the layout;
+    * the guide only changes cost. A cell the raster calls blocked stays
+      blocked for every member, so a band cannot buy tidiness with a
+      clearance violation.
+
+    This is the honest half of "bundle routing": it does not force the members
+    onto the identical polyline (that needs path templating the router does
+    not have yet), it makes the corridor the cheapest place to be. A band that
+    cannot be honoured is reported per band in `stats["bundle_bands"]` rather
+    than silently ignored.
 
     `topology` says how a multi-pad net is joined: `"mst"` (default) is a
     spanning tree over the pad centres, `"steiner"` adds branch points that are
@@ -686,6 +709,132 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             continue
         work.append((span, net, plist))
     work.sort(reverse=True)          # longest first - see the module docstring
+    bands = []
+    band_of = {}
+    if bundle_bands:
+        known = set(results)
+        for k, spec in enumerate(bundle_bands):
+            if not isinstance(spec, dict):
+                raise RouteError("bundle_bands[%d] is not an object" % (k,),
+                                 "ARG_INVALID",
+                                 hint='bundle_bands entries are '
+                                      '{name, nets: [...], radius_mm, discount}')
+            nets = [str(n) for n in (spec.get("nets") or [])]
+            name = str(spec.get("name") or ("band%d" % k))
+            if len(nets) < 2:
+                raise RouteError("bundle_bands[%d] (%s) names fewer than 2 nets"
+                                 % (k, name), "ARG_INVALID",
+                                 hint="a corridor is a group claim on shared "
+                                      "space; one net has nothing to share")
+            unknown = [n for n in nets if n not in known]
+            if unknown:
+                # Dropping a name the board does not have would leave the caller
+                # believing a corridor was built for a net that was never
+                # considered, so it is refused with the names that failed.
+                raise RouteError("bundle_bands[%d] (%s) names nets the board does "
+                                 "not have: %s" % (k, name, ", ".join(unknown[:6])),
+                                 "ARG_INVALID",
+                                 hint="net names must match the pad nets verbatim "
+                                      "(leading '/' included)")
+            radius = float(spec.get("radius_mm", 0.8))
+            discount = float(spec.get("discount", 0.6))
+            outside = float(spec.get("outside", 1.0))
+            if radius <= 0:
+                raise RouteError("bundle_bands[%d] radius_mm must be > 0" % (k,),
+                                 "ARG_INVALID")
+            if not (0.0 < discount < 0.95):
+                raise RouteError("bundle_bands[%d] discount must be in (0, 0.95): "
+                                 "1.0 would make the corridor free and the search "
+                                 "would ignore every honest detour" % (k,),
+                                 "ARG_INVALID")
+            if not (1.0 <= outside <= 4.0):
+                raise RouteError("bundle_bands[%d] outside must be in [1, 4]: "
+                                 "beyond that the corridor stops being a "
+                                 "preference and starts walling off legal space"
+                                 % (k,), "ARG_INVALID")
+            bands.append({"name": name, "nets": nets, "radius_mm": radius,
+                          "discount": discount, "outside": outside,
+                          "routed": []})
+            for n in nets:
+                band_of[n] = len(bands) - 1
+        if bands:
+            def _band_key(w):
+                bi = band_of.get(w[1])
+                if bi is None:
+                    return (len(bands), -w[0])
+                return (bi, w[0])          # shortest first inside a band
+            work.sort(key=_band_key)
+
+    band_stamp = {}
+    band_use = {}
+
+    def _stamp(maps, nets, radius_mm, discount):
+        """Paint a band's existing copper into the per-layer discount maps."""
+        g = em.grid
+        q = max(1, int(round(float(radius_mm) / g.pitch)))
+        peak = int(round(float(discount) * 255.0))
+        if peak <= 0:
+            return 0
+        stamps = 0
+        for op in em.ops:
+            if op.get("net") not in nets:
+                continue
+            if op["op"] == "add_track":
+                spans = [(op["layer"], (op["x1"], op["y1"]),
+                          (op["x2"], op["y2"]))]
+            elif op["op"] == "add_via":
+                spans = [(l, (op["x"], op["y"]), (op["x"], op["y"]))
+                         for l in (op.get("layers") or g.layers)]
+            else:
+                continue
+            for l, a, b in spans:
+                buf = maps.get(l)
+                if buf is None:
+                    continue
+                n = int(math.hypot(b[0] - a[0], b[1] - a[1]) / g.pitch) + 1
+                for kk in range(n + 1):
+                    t = kk / float(n)
+                    ci, cj = g.node(a[0] + (b[0] - a[0]) * t,
+                                    a[1] + (b[1] - a[1]) * t)
+                    for dj in range(-q, q + 1):
+                        jj = cj + dj
+                        if jj < 0 or jj >= g.ny:
+                            continue
+                        row = jj * g.nx
+                        for di in range(-q, q + 1):
+                            ii = ci + di
+                            if ii < 0 or ii >= g.nx:
+                                continue
+                            d = math.hypot(di, dj)
+                            if d > q + 0.5:
+                                continue
+                            v = int(round(peak * (1.0 - d / float(q + 1))))
+                            if v > 0:
+                                k2 = row + ii
+                                if buf[k2] < v:
+                                    buf[k2] = v
+                                stamps += 1
+        return stamps
+
+    def _band_guide(net):
+        bi = band_of.get(net)
+        if bi is None or not bands[bi]["routed"]:
+            return (None, 1.0)
+        spec = bands[bi]
+        st = band_stamp.get(bi)
+        if st is None:
+            st = band_stamp[bi] = {"maps": None, "nets": set()}
+        if st["maps"] is None:
+            st["maps"] = dict((l, bytearray(grid.nx * grid.ny))
+                              for l in grid_layers)
+        fresh = set(spec["routed"]) - st["nets"]
+        if fresh:
+            _stamp(st["maps"], fresh, spec["radius_mm"], spec["discount"])
+            st["nets"] |= fresh
+        use = band_use.setdefault(bi, {"calls": 0})
+        use["calls"] += 1
+        return (st["maps"], spec["outside"])
+
     if net_priority:
         # Order is a first-come-first-served decision on shared space, so the
         # net that routes last inherits every detour the earlier ones made.
@@ -867,11 +1016,13 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         ok = True
         for a, b in edges:
             goals, glayers = goals_of(b)
+            guide_now = _band_guide(net)
             ast_diag = {}
             path = astar(grid, net, tree_nodes, goals, glayers,
                          allow_vias=allow_vias,
                          via_check=_via_gate(grid, net) if allow_vias else None,
-                         diag=ast_diag)
+                         diag=ast_diag, guide=guide_now[0],
+                         guide_outside=guide_now[1])
             if path is None:
                 src = goals
                 back = {(s[0], s[1]) for s in tree_nodes}
@@ -882,7 +1033,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                                          for l in glayers[(i, j)]},
                              back, bl, allow_vias=allow_vias,
                              via_check=_via_gate(grid, net) if allow_vias else None,
-                             diag=ast_diag)
+                             diag=ast_diag, guide=guide_now[0],
+                             guide_outside=guide_now[1])
             if path is None:
                 t = (terminals[b]["term"] if b < len(terminals) else
                      {"reference": "(branch)", "pad": "-",
@@ -963,6 +1115,9 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
               else _route_signal_net(net, plist))
         if ok:
             em.commit(mark)
+            bi = band_of.get(net)
+            if bi is not None:
+                bands[bi]["routed"].append(net)
         else:
             em.rollback(mark)
         results[net]["route_s"] = round(time.time() - t_net, 3)
@@ -1044,6 +1199,13 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 # that still remembers ripped copper is a map of another board.
                 em.forget(rips)
                 grid = em.grid
+                # The guide maps were painted from copper that just moved out;
+                # the next member must not follow a corridor nobody occupies.
+                band_stamp.clear()
+                for n in rips:
+                    bi = band_of.get(n)
+                    if bi is not None and n in bands[bi]["routed"]:
+                        bands[bi]["routed"].remove(n)
                 em.bad[:] = [b for b in em.bad if b.get("net") not in rips]
                 for n in rips:
                     results[n]["status"] = "pending"
@@ -1287,6 +1449,24 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     stats["nets_fixed"] = fixed_n
     stats["ops"] = len(em.ops)
     stats["rejected_ops"] = len(em.bad)
+    if bands:
+        rep = []
+        for bi, spec in enumerate(bands):
+            lens = [float(results[n].get("length_mm") or 0.0)
+                    for n in spec["nets"]]
+            live = [x for x in lens if x > 0.0]
+            rep.append({"name": spec["name"],
+                        "nets": list(spec["nets"]),
+                        "radius_mm": spec["radius_mm"],
+                        "discount": spec["discount"],
+                        "outside": spec["outside"],
+                        "routed": len(live),
+                        "skeleton": (spec["routed"][0] if spec["routed"] else None),
+                        "guide_calls": band_use.get(bi, {}).get("calls", 0),
+                        "length_mm": [round(x, 3) for x in lens],
+                        "spread_mm": (round(max(live) - min(live), 3)
+                                      if len(live) > 1 else None)})
+        stats["bundle_bands"] = rep
     return {
         "layers_routing": routing,
         "layers_plane": planes,

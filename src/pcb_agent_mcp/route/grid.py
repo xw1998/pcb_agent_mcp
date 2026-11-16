@@ -36,6 +36,9 @@ TURN_COST = 0.55
 DIAG = 1.36            # sqrt(2) - diagonal step length
 HEUR_W = 1.25          # weighted A*: a slightly longer wire for a far faster search
 MAX_BUDGET = 400000
+# A guide map stores the discount of a cell as one byte (see `astar(guide=...)`),
+# so the inverse only has to be computed once.
+INV255 = 1.0 / 255.0
 
 
 def _steps(pitch, lo, hi):
@@ -1044,7 +1047,8 @@ DIRS_K = tuple((k, d[0], d[1], d[2]) for k, d in enumerate(DIRS))
 
 
 def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
-          allow_vias=True, via_check=None, diag=None, soft=0.0):
+          allow_vias=True, via_check=None, diag=None, soft=0.0, guide=None,
+          guide_outside=1.0):
     # NOTE ON THE INLINING BELOW. The inner loop reads the rasters directly
     # (`grid._map[layer]` is a flat list indexed by `j * nx + i`) instead of
     # calling `grid.free()`, and goal lookup goes through an integer key instead
@@ -1070,6 +1074,24 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
     answer is the corridor the net WANTS, and the cells it crosses name the nets
     standing in it.
 
+    `guide` is a per-layer map of cell discounts, `{layer: bytearray(nx*ny)}`,
+    where a cell's value divided by 255 is the fraction of the step cost that
+    is refunded inside it. It is how "these nets must share one corridor"
+    becomes a search preference instead of a meander added afterwards: a net
+    walking inside another member's corridor pays less per cell than one
+    cutting a fresh path of its own, so the group converges on one geometry
+    and the group's spread comes out of the layout rather than out of tuning.
+    It changes cost and only cost - a cell the raster calls blocked stays
+    blocked, so a guide can never trade legality for tidiness. `None` leaves
+    every cost exactly what it was.
+
+    `guide_outside` prices the cells a guide does NOT cover, as a multiple of
+    their usual step cost. A discount alone is a preference the search may
+    ignore; with `guide_outside` > 1 the corridor is where the cheap walking
+    is, so a member that could cut a shorter line of its own pays for doing
+    so. That is what makes the group's *length* follow the skeleton rather
+    than merely its direction.
+
     Returns the path as `[(i, j, layer), ...]` or `None`.
     """
     goals = set(goals)
@@ -1083,6 +1105,7 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
     pen = grid._pen
     if pen is None:
         pen = grid._pen = [0.0] * (nx * ny)
+    gd_maps = guide
     layers = grid.layers
     nlayer = len(layers)
     li_of = dict((l, k) for k, l in enumerate(layers))
@@ -1134,6 +1157,7 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
                 diag["expanded"] = seen
             return None
         mp = maps[l]
+        gmap = gd_maps.get(l) if gd_maps is not None else None
         base = j * nx
         for k, di, dj, step in DIRS_K:
             ni = i + di
@@ -1175,7 +1199,17 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
                         if not (len(s) == 1 and s[0] == net) and not soft:
                             continue
             cell = nj * nx + ni
-            nc = g + step + (0.0 if d == k else TURN_COST) + pen[cell] + toll
+            if gmap is None:
+                step_cost = step
+            else:
+                gv = gmap[cell]
+                if gv:
+                    step_cost = step * (1.0 - gv * INV255)
+                elif guide_outside != 1.0:
+                    step_cost = step * guide_outside
+                else:
+                    step_cost = step
+            nc = g + step_cost + (0.0 if d == k else TURN_COST) + pen[cell] + toll
             ns = (cell * nlayer + (rest % nlayer)) * 9 + k
             if nc < best.get(ns, 1e18) - 1e-9:
                 best[ns] = nc
