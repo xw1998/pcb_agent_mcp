@@ -1135,13 +1135,25 @@ def _escape(board, copper, net, rail_pad, conn, gnd_pad, stem=_STUB_MM,
 
 def _gnd_escape(board, copper, gnd_pad, stem=_STUB_MM, clearance_mm=_CLEARANCE_MM,
                 via_dia=_VIA_DIA_MM, reach_mm=_GND_ESCAPE_MM, layers=None,
-                away=None, bodies=(), own_ref=None):
-    """Nearest legal spot for the ground via, with the run that reaches it."""
-    allcu = layers or _layers_of(board)
-    fills = [(f, l) for f, l in _fills(board, "/GND") if "In1.Cu" in
+                away=None, bodies=(), own_ref=None, net="/GND",
+                track_mm=_TRACK_MM):
+    """Nearest legal spot for the ground via, with the run that reaches it.
+
+    `net` is a parameter and not the literal "/GND" because the caller may be
+    stitching a different plane: `power_loop` asks the same question about the
+    board's ground, and a helper that silently answered about "/GND" while being
+    asked about another net would return a via inside somebody else's copper.
+    """
+    # The via at the end of this escape is a THROUGH via: it carries copper on
+    # every layer, so it has to clear every layer. `layers` is the run's layer
+    # (F.Cu), and asking only that layer is how a ground via was once planned
+    # straight through an In2 data line - the far side of the board is not
+    # "outside the question".
+    allcu = _layers_of(board) or (layers or [])
+    fills = [(f, l) for f, l in _fills(board, net) if "In1.Cu" in
              (l or _layers_of(board))]
     if not fills:
-        return None, {"why": "no filled /GND flood on In1"}
+        return None, {"why": "no filled %s flood on In1" % net}
     vr = via_dia / 2.0
     dirs = [(1, 0), (-1, 0), (0, 1), (0, -1),
             (0.70710678, 0.70710678), (-0.70710678, 0.70710678),
@@ -1157,13 +1169,13 @@ def _gnd_escape(board, copper, gnd_pad, stem=_STUB_MM, clearance_mm=_CLEARANCE_M
             if _via_legal(board, bodies, x, y, own_ref,
                           margin_mm=vr + clearance_mm):
                 continue
-            d, who = _clearance_at(copper, x, y, "/GND", allcu)
+            d, who = _clearance_at(copper, x, y, net, allcu)
             if d < vr + clearance_mm:
                 continue
-            if _inside_pad(copper, x, y, own=("/GND",)):
+            if _inside_pad(copper, x, y, own=(net,)):
                 continue
-            run, why = _route45(copper, gnd_pad, (x, y), "/GND", ["F.Cu"],
-                                _TRACK_MM, clearance_mm)
+            run, why = _route45(copper, gnd_pad, (x, y), net, ["F.Cu"],
+                                track_mm, clearance_mm)
             if run is None:
                 continue
             bias = 0.0 if not away else -0.05 * ((x - gnd_pad[0]) * away[0] +

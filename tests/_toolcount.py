@@ -50,11 +50,22 @@ used to be spread across the twelve files.
                  a distance, this one returns a legal site with both legs of the
                  loop closed, or a refusal with the number that refused it.
 
+    261 -> 262   0.1.43: board_power_loop - "the copper one switching cell owes,
+                 leg by leg, before anything is written". A new question (the load
+                 side of the loop board_decap_sites closes on the supply side), and
+                 the first tool that keeps three outcomes apart for one leg:
+                 closed, over_budget (legal copper at a placement price - a 13 mm
+                 switch node is measured and NOT emitted) and blocked (named
+                 blocker, no copper). It also refuses to answer "the flood is
+                 0.33 mm away" when every holeable point of that flood is under a
+                 magnetic: the refusal names the body instead of a distance that
+                 would send the reader to draw a bus that cannot help.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 261
+EXPECTED_TOOL_COUNT = 262
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

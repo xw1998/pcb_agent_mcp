@@ -21,6 +21,7 @@ from . import fidelity as _fidelity
 from . import oracle as _oracle
 from . import place_gate as _place_gate
 from . import decap_sites as _decap
+from . import power_loop as _ploop
 from . import shape_gate as _shape_gate
 from . import snapshot as _snapshot
 from . import aesthetics as _aesthetics
@@ -4792,6 +4793,123 @@ _tool(
      }, **_COMMON),
      "required": ["path"]},
     _board_tool(_decap_sites, derived=True),
+)
+
+def _power_loop(b, a):
+    kw = {}
+    for key in ("vin_net", "gnd_net"):
+        if a.get(key):
+            kw[key] = str(a[key])
+    if a.get("nets"):
+        kw["nets"] = [str(n) for n in a["nets"]]
+    for key in ("clearance_mm", "gnd_reach_mm", "stub_mm", "via_dia_mm"):
+        if a.get(key) is not None:
+            kw[key] = a[key]
+    if a.get("width_mm"):
+        kw["width"] = {str(k): float(v) for k, v in a["width_mm"].items()}
+    if str(a.get("mode") or "plan") == "measure":
+        # `cells` alone is the placement reading: which part is which, and which
+        # legs the parts owe. It never routes, so it also never refuses.
+        cs = _ploop.cells(b, vin_net=kw.get("vin_net") or "/+5V_IN",
+                          gnd_net=kw.get("gnd_net") or "/GND")
+        value = {"cells": {}}
+        by_ref, _nets = _ploop._refs(b)
+        for ref, cell in cs.items():
+            view = {k: v for k, v in cell.items() if k != "body"}
+            if "error" not in cell:
+                view["legs"] = [{k: v for k, v in l.items() if k != "to"}
+                                for l in _ploop._legs_for(
+                                    cell, by_ref,
+                                    kw.get("vin_net") or "/+5V_IN",
+                                    kw.get("gnd_net") or "/GND")]
+            value["cells"][ref] = view
+        return ok(
+            value=value, unit="mm",
+            model="buck cell discovery by net topology + the legs it owes; no "
+                  "routing, so no length and no refusal",
+            basis="the board's own nets, pads and courtyards; the cell is found "
+                  "from /SW_<ref>, the inductor is the other footprint on that "
+                  "net, and each passive is the part that bridges a pair of nets",
+            precision="identification is exact and reference names are read, not "
+                      "guessed; a missing part is reported by the pair of nets that "
+                      "nothing bridges, never filled in with the nearest part",
+            assumptions={"vin_net": kw.get("vin_net") or "/+5V_IN",
+                         "gnd_net": kw.get("gnd_net") or "/GND",
+                         "widths_mm": dict(_ploop._WIDTH),
+                         "targets_mm": dict(_ploop._TARGET)},
+        )
+    value = _ploop.plan(b, **kw)
+    return ok(
+        value=value, unit="mm",
+        model="six legs per buck cell on F.Cu - vin, sw, out, bootstrap, divider "
+              "and one stitching via per ground pad - routed with 0/45/90/135 "
+              "runs only, each emitted run absorbed back into the obstacle set "
+              "before the next leg is placed, width from the current and not "
+              "from the part",
+        basis="the board's own pads, courtyards, tracks, vias and FILLED zone "
+              "polygons, plus two stated rules: copper does not cross the middle "
+              "of a magnetic (its own pads are exempt, because the pad stands "
+              "under the body edge), and a via is never drilled in a pad - the "
+              "stub is there for that",
+        precision="every length is the length of the emitted run, measured after "
+                  "routing and rounded to 4 decimals; a refusal is a number, not "
+                  "an opinion - `fill_shortfall` says how far this net's copper "
+                  "is from the stub point a via would occupy, and `plane` says "
+                  "which rule ate every candidate when the copper is near but "
+                  "not holeable. `straight_mm` is the floor no router can beat",
+        assumptions={"vin_net": kw.get("vin_net") or "/+5V_IN",
+                     "gnd_net": kw.get("gnd_net") or "/GND",
+                     "clearance_mm": kw.get("clearance_mm", _decap._CLEARANCE_MM),
+                     "stub_mm": kw.get("stub_mm", _decap._STUB_MM),
+                     "via_dia_mm": kw.get("via_dia_mm", _decap._VIA_DIA_MM),
+                     "gnd_reach_mm": kw.get("gnd_reach_mm",
+                                            _ploop._GND_REACH_MM),
+                     "layer": _ploop._LAYER,
+                     "widths_mm": value["rules"]["width_mm"],
+                     "targets_mm": value["rules"]["target_mm"]},
+    )
+
+_tool(
+    "board_power_loop",
+    "The copper one switching cell owes, measured leg by leg before anything is "
+    "written. For every buck cell on the board it reports six kinds of leg - "
+    "vin_ic/vin_cap (the hot loop), sw (switch pin to inductor), out (inductor "
+    "to output capacitor), boot_bs/boot_sw (bootstrap), fb_div/fb_top (divider) "
+    "and one ground via per ground pad - with the width the current needs, the "
+    "length it came out at, `straight_mm` (the floor a placement sets) and "
+    "`over_mm` against a target. Three outcomes stay apart: `closed` (copper that "
+    "exists and is emitted), `over_budget` (legal copper at a price that is a "
+    "placement defect - a switch-node run over %.2f mm is measured and NOT "
+    "emitted, because 13 mm of switch node is an antenna, not a buck), and "
+    "`blocked` (named blocker, no copper at all). A rail whose plane is missing "
+    "or unpoured is blocked with the reason and the distance - and when the "
+    "flood is near but every holeable point of it is under a magnetic, the "
+    "refusal says that instead of quoting a distance that would send the reader "
+    "to draw a bus that cannot help. mode=measure lists the cells and their legs "
+    "without routing. Reads FILLED zone polygons: an outline is not a pour. This "
+    "tool plans and measures; it writes nothing and routes nothing onto the "
+    "board. " % _ploop._SW_HARD_MM + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "mode": _str("plan = route every leg and report (default); measure = list "
+                      "cells and their legs without routing",
+                      ["plan", "measure"], "plan"),
+         "vin_net": _str("input rail net (default /+5V_IN)"),
+         "gnd_net": _str("ground net (default /GND)"),
+         "nets": _arr("only plan cells whose switch or output net is in this list"),
+         "clearance_mm": _num("copper-to-copper minimum (default 0.15)", 0.15),
+         "gnd_reach_mm": _num("how far a ground pad may run to its flood via "
+                              "(default 1.6)", 1.6),
+         "stub_mm": _num("pad centre to via centre; keeps the drill out of the "
+                         "land (default 0.65)", 0.65),
+         "via_dia_mm": _num("via diameter (default 0.3)", 0.3),
+         "width_mm": {"type": "object",
+                      "description": "override widths per leg kind, e.g. "
+                                     "{sw: 0.8, fb: 0.2}",
+                      "additionalProperties": {"type": "number"}},
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_power_loop, derived=True),
 )
 
 _tool(
