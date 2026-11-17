@@ -971,52 +971,63 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
 
     band_reserve_stamp = {}
 
-    def _paint_ring(maps, nets, radius_mm):
-        """Mark every cell within `radius_mm` of a reserved member's copper.
+    def _paint_spans(maps, spans, radius_mm):
+        """Mark every cell within `radius_mm` of a set of `(layer, a, b)` segments.
 
         Same walk as `_stamp`, minus the graduated value: a reservation is a
-        price, not a preference curve, so a cell is either inside the ring or
-        it is not.
+        price, not a preference curve, so a cell is either inside the ring or it
+        is not. A span whose layer is `None` is painted on every routing layer -
+        that is how a *contract* ring (drawn from terminals, before there is any
+        copper) claims the corridor in plan view rather than on a single layer.
+        `cells` counts raster cells once, not once per layer.
         """
         g = em.grid
         q = max(1, int(round(float(radius_mm) / g.pitch)))
         cells = 0
+        for l, a, b in spans:
+            bufs = ([maps.get(x) for x in g.layers] if l is None
+                    else [maps.get(l)])
+            bufs = [bf for bf in bufs if bf is not None]
+            if not bufs:
+                continue
+            n = int(math.hypot(b[0] - a[0], b[1] - a[1]) / g.pitch) + 1
+            for kk in range(n + 1):
+                t = kk / float(n)
+                ci, cj = g.node(a[0] + (b[0] - a[0]) * t,
+                                a[1] + (b[1] - a[1]) * t)
+                for dj in range(-q, q + 1):
+                    jj = cj + dj
+                    if jj < 0 or jj >= g.ny:
+                        continue
+                    row = jj * g.nx
+                    for di in range(-q, q + 1):
+                        ii = ci + di
+                        if ii < 0 or ii >= g.nx:
+                            continue
+                        if math.hypot(di, dj) > q + 0.5:
+                            continue
+                        idx = row + ii
+                        if any(bf[idx] for bf in bufs):
+                            continue
+                        for bf in bufs:
+                            bf[idx] = 255
+                        cells += 1
+        return cells
+
+    def _paint_ring(maps, nets, radius_mm):
+        """The same ring, drawn around copper this plan has already emitted."""
+        g = em.grid
+        spans = []
         for op in em.ops:
             if op.get("net") not in nets:
                 continue
             if op["op"] == "add_track":
-                spans = [(op["layer"], (op["x1"], op["y1"]),
-                          (op["x2"], op["y2"]))]
+                spans.append((op["layer"], (op["x1"], op["y1"]),
+                              (op["x2"], op["y2"])))
             elif op["op"] == "add_via":
-                spans = [(l, (op["x"], op["y"]), (op["x"], op["y"]))
-                         for l in (op.get("layers") or g.layers)]
-            else:
-                continue
-            for l, a, b in spans:
-                buf = maps.get(l)
-                if buf is None:
-                    continue
-                n = int(math.hypot(b[0] - a[0], b[1] - a[1]) / g.pitch) + 1
-                for kk in range(n + 1):
-                    t = kk / float(n)
-                    ci, cj = g.node(a[0] + (b[0] - a[0]) * t,
-                                    a[1] + (b[1] - a[1]) * t)
-                    for dj in range(-q, q + 1):
-                        jj = cj + dj
-                        if jj < 0 or jj >= g.ny:
-                            continue
-                        row = jj * g.nx
-                        for di in range(-q, q + 1):
-                            ii = ci + di
-                            if ii < 0 or ii >= g.nx:
-                                continue
-                            if math.hypot(di, dj) > q + 0.5:
-                                continue
-                            idx = row + ii
-                            if not buf[idx]:
-                                buf[idx] = 255
-                                cells += 1
-        return cells
+                for l in (op.get("layers") or g.layers):
+                    spans.append((l, (op["x"], op["y"]), (op["x"], op["y"])))
+        return _paint_spans(maps, spans, radius_mm)
 
     def _band_guide(net):
         bi = band_of.get(net)
@@ -1048,7 +1059,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             return (None, 1.0)
         st = band_reserve_stamp.get(bi)
         if st is None:
-            st = band_reserve_stamp[bi] = {"maps": None, "nets": set()}
+            st = band_reserve_stamp[bi] = {"maps": None, "nets": set(),
+                                           "pre": 0}
         if st["maps"] is None:
             st["maps"] = dict((l, bytearray(grid.nx * grid.ny))
                                for l in grid_layers)
@@ -1057,6 +1069,57 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             spec["painted"] += _paint_ring(st["maps"], fresh, spec["mm"])
             st["nets"] |= fresh
         return (st["maps"], spec["price"])
+
+    def _contract_ring():
+        """The reservation as a *contract*: the corridor is claimed before any
+        copper exists.
+
+        `_paint_ring` can only see copper this run has already emitted, so by
+        the time it can paint the ring the earlier members have already picked
+        their paths - which is the opposite of a reservation, where the group's
+        shared space is spoken for first and everyone else pays to cross it.
+        What a reservation can claim on day one is where the reserved nets must
+        run: their own terminals, joined the way the search will walk them (mst
+        over the pad centres of the whole reserved set, so the corridor is one
+        connected trunk rather than one blob per net). The ring is painted on
+        every routing layer because at this point no layer has been chosen yet.
+
+        Idempotent: it writes a fresh map and re-derives `painted`, so a rip-up
+        that cleared the stamps can simply call it again.
+        """
+        g = em.grid
+        for bi, spec in enumerate(bands):
+            res = spec.get("reserve")
+            if not res:
+                continue
+            st = band_reserve_stamp.get(bi)
+            if st is None:
+                st = band_reserve_stamp[bi] = {"maps": None, "nets": set(),
+                                               "pre": 0}
+            if st["maps"] is None:
+                st["maps"] = dict((l, bytearray(g.nx * g.ny))
+                                  for l in grid_layers)
+            pts = []
+            seen = set()
+            for n in res["nets"]:
+                for t in (by_net.get(n) or []):
+                    xy = (float(t["at"][0]), float(t["at"][1]))
+                    key = (round(xy[0], 4), round(xy[1], 4))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pts.append(xy)
+            if len(pts) < 2:
+                # One point is a pad, not a corridor: a ring around it would
+                # keep air the net itself is about to fill.
+                continue
+            spans = [(None, pts[e[0]], pts[e[1]])
+                     for e in TOPO.tree(pts, mode="mst")["edges"]]
+            st["pre"] = _paint_spans(st["maps"], spans, res["mm"])
+            res["pre"] = st["pre"]
+            res["painted"] = st["pre"]
+
+    _contract_ring()
 
     if net_priority:
         # Order is a first-come-first-served decision on shared space, so the
@@ -1434,6 +1497,10 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 for b in bands:
                     if b.get("reserve"):
                         b["reserve"]["painted"] = 0
+                # The contract ring is not made of copper, so ripping copper
+                # out does not remove what it claims: it has to be laid down
+                # again, or the reservation quietly ends at the first rip.
+                _contract_ring()
                 for n in rips:
                     bi = band_of.get(n)
                     if bi is not None and n in bands[bi]["routed"]:
@@ -1768,6 +1835,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             out[n] = {"gap_mm": round(best[0], 4), "nearest": best[1]}
         return {"nets": sorted(want), "mm": res["mm"],
                 "price": res["price"], "ring_cells": res["painted"],
+                "pre_cells": res.get("pre", 0),
                 "gap_mm": out}
 
     if bands:
