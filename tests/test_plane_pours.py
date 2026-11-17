@@ -33,12 +33,16 @@ from pcb_agent_mcp.ruleset import precondition as PRE  # noqa: E402
 
 # 20 x 10 mm board: 200 mm2. A pour over the whole outline is 100% (a plane);
 # the 8 x 10 one is 40% (not a plane by the 0.5 declaration).
+#
+# Every y below is written the way KiCad writes it (Y down), so the board reads
+# canonical y 0..10. Operations are in that same canonical frame - `edit/build`
+# flips only when a node becomes file text - so a track at y 5 is mid-board.
 BOARD = """(kicad_pcb (version 20221018) (generator pcbnew)
   (general (thickness 1.6))
   (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (31 "B.Cu" signal)
           (44 "Edge.Cuts" user))
   (net 0 "") (net 1 "GND") (net 2 "SIG") (net 3 "PWR")
-  (gr_rect (start 0 0) (end 20 10) (layer "Edge.Cuts") (width 0.1))
+  (gr_rect (start 0 -10) (end 20 0) (layer "Edge.Cuts") (width 0.1))
 %s
 )
 """
@@ -46,14 +50,14 @@ BOARD = """(kicad_pcb (version 20221018) (generator pcbnew)
 PLANE = """  (zone (net 1) (net_name "GND") (layer "In1.Cu") (tstamp 1) (hatch edge 0.5)
     (connect_pads (clearance 0.2))
     (min_thickness 0.25)
-    (polygon (pts (xy 0 0) (xy 20 0) (xy 20 10) (xy 0 10)))
-    (filled_polygon (layer "In1.Cu") (pts (xy 0 0) (xy 20 0) (xy 20 10) (xy 0 10))))"""
+    (polygon (pts (xy 0 -10) (xy 20 -10) (xy 20 0) (xy 0 0)))
+    (filled_polygon (layer "In1.Cu") (pts (xy 0 -10) (xy 20 -10) (xy 20 0) (xy 0 0))))"""
 
 SPLIT = """  (zone (net 3) (net_name "PWR") (layer "In1.Cu") (tstamp 2) (hatch edge 0.5)
     (connect_pads (clearance 0.2))
     (min_thickness 0.25)
-    (polygon (pts (xy 0 0) (xy 8 0) (xy 8 10) (xy 0 10)))
-    (filled_polygon (layer "In1.Cu") (pts (xy 0 0) (xy 8 0) (xy 8 10) (xy 0 10))))"""
+    (polygon (pts (xy 0 -10) (xy 8 -10) (xy 8 0) (xy 0 0)))
+    (filled_polygon (layer "In1.Cu") (pts (xy 0 -10) (xy 8 -10) (xy 8 0) (xy 0 0))))"""
 
 
 def a_track(net="SIG", layer="In1.Cu", x1=2.0, y1=5.0, x2=18.0, y2=5.0):
@@ -173,16 +177,17 @@ class ASmallPourIsReportedNotBlocked(PlaneTestBase):
 HALF = """  (zone (net 1) (net_name "GND") (layer "In1.Cu") (tstamp 3) (hatch edge 0.5)
     (connect_pads (clearance 0.2))
     (min_thickness 0.25)
-    (polygon (pts (xy 0 5) (xy 20 5) (xy 20 10) (xy 0 10)))
-    (filled_polygon (layer "In1.Cu") (pts (xy 0 5) (xy 20 5) (xy 20 10) (xy 0 10))))"""
+    (polygon (pts (xy 0 -10) (xy 20 -10) (xy 20 -5) (xy 0 -5)))
+    (filled_polygon (layer "In1.Cu") (pts (xy 0 -10) (xy 20 -10) (xy 20 -5) (xy 0 -5))))"""
 
 
 class TheFileAndTheMeasurementAgreeAboutY(PlaneTestBase):
-    """Operations are in the file's coordinates, pours are canonical (Y up).
+    """Operations and pour outlines are in the same frame (canonical, Y up).
 
-    Miss the flip and a half-board plane still answers "crossed" or "clear" - just
-    for the wrong half. This board's pour covers file y 5..10 only, so a track at
-    y 2 is clear and one at y 7 is not; a mirrored measurement says the opposite.
+    A half-board pour is the only shape that can tell a correct reading from one
+    that flips y: the whole-board pour in `PlaneTestBase` contains the mirrored
+    point too, so it would pass either way. This pour covers canonical y 5..10,
+    written as file y -10..-5; a track at y 7 is on it and one at y 2 is not.
     """
     pours = HALF
 

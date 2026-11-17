@@ -83,15 +83,15 @@ def pours(board, board_mm2=None):
     return out
 
 
-#: Operations carry the FILE's coordinates. The canonical adapter Board is Y-up
-#: (measured: a segment at file y -9.3937 reads back as +9.3937), so a plan point
-#: has to be flipped before it is tested against a pour outline. Getting this
-#: wrong is silent - a large plane still contains the mirrored point - and only
-#: bites near an edge, which is exactly where a plane is cut.
-_Y_FLIP = -1.0
-
 def _points_of(op, layers):
-    """The (x, y, layer, net) samples an operation puts copper at, FILE coords."""
+    """The (x, y, layer, net) samples an operation puts copper at.
+
+    Operations are in the canonical frame, the same one the adapter Board is in
+    (`edit/build.py` writes `y_file(y)`, i.e. it flips only at the moment a node
+    becomes file text). So an operation's coordinates can be compared with a pour
+    outline straight away - measured against U2.T8 on the RK3506 SOM, whose pad
+    reads (23.4, 4.0) and is the start point the router emits for /DDR_A8.
+    """
     kind = op.get("op") or ""
     net = op.get("net")
     if kind == "add_track":
@@ -127,8 +127,7 @@ def crossings(board, operations, board_mm2=None, plane_share=PLANE_SHARE):
         for x, y, layer, net in _points_of(op, layers):
             if not layer:
                 continue
-            # the pour ring is canonical (Y up); the operation is the file's (Y down)
-            py = _Y_FLIP * y
+            py = y
             for p in ps:
                 if layer not in p["layers"]:
                     continue
@@ -150,7 +149,7 @@ def crossings(board, operations, board_mm2=None, plane_share=PLANE_SHARE):
                              "share": p["share"],
                              "plane": p["share"] is not None and
                                       p["share"] >= plane_share,
-                             # FILE coordinates: the caller's own space
+                             # canonical frame, the caller's own space
                              "at": [round(x, 4), round(y, 4)]})
     by_net = {}
     for h in hits:
