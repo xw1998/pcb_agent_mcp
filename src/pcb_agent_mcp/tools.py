@@ -5222,7 +5222,8 @@ def _rule_audit(board, args):
     window = args.get("window_mm")
     try:
         out = _audit(board, process=process, facts=facts, levels=levels,
-                     window_mm=float(window) if window else 2.0)
+                     window_mm=float(window) if window else 2.0,
+                     headroom=args.get("headroom") is True)
     except ValueError as exc:
         return err(str(exc), "BAD_ARG")
     return ok(
@@ -5328,6 +5329,14 @@ _tool(
              "as {fact_name: value}; they are merged over the measured ones"},
          "levels": _arr("only these priority levels, e.g. ['P0','P1']"),
          "window_mm": _num("pair-search window for clearances (default 2.0)", 2.0),
+         "headroom": _bool(
+             "also answer P3 `layout.length_tuning_corridor`: is an equal-length "
+             "group short because the corridor was never reserved? It costs one "
+             "route plan per net (394 s on a 47-net DDR bus), so it is off by "
+             "default and the rule is `undetermined` with that cost named; a "
+             "caller that already ran board_length_tune(headroom=true) should pass "
+             "facts={'length_groups_blocked_by_geometry': <blocked count>} instead",
+             False),
      }, **_COMMON), "required": ["path"]},
     _board_tool(_rule_audit, derived=True),
 )

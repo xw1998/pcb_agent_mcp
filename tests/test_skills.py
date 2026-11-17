@@ -218,7 +218,9 @@ class TestRuleCatalogues(unittest.TestCase):
         sch = rules.design_rules("schematic")["value"]
         # 0.1.20/0.1.21 把 layout 台账从 22 条做到 27 条（逐条读 ADI《PCB 设计秘籍》落出处），
         # 本断言当时没跟着改。条数是门：改动台账就得同步改这里。
-        self.assertEqual(lay["count"], 29)
+        # 0.1.42 阶段 4m 加 layout.length_tuning_corridor（197 §4 第 2 条），29 -> 30。
+        # 条数是门：改动台账就得同步改这里。
+        self.assertEqual(lay["count"], 30)
         self.assertEqual(sch["count"], 14)
         for row in lay["rules"] + sch["rules"]:
             self.assertTrue(row["source"], row["id"])

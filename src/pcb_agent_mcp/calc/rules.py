@@ -384,6 +384,31 @@ LAYOUT_RULES = [
        "L1", "kicad-free (最小过孔 0.3 mm) - a cheap-process convention, not a law",
        "below the process floor the plating aspect ratio goes out of control, "
        "and the via that fails is the one under the BGA"),
+    _r("layout.length_tuning_corridor",
+       "the short members of an equal-length group have room to take what they "
+       "owe",
+       "signal quality", "High", "length_groups_blocked_by_geometry", "count",
+       "count_max", 0,
+       "board_length_tune with headroom=true (route.tune_board.headroom): every "
+       "net that owes length is planned on its own with the board unchanged, and "
+       "a net that still cannot reach its target is short by geometry. Ask it "
+       "PER SEGMENT, never per net: a net with one usable stretch must place its "
+       "teeth there and report the rest as shortfall - 'the whole net is crowded' "
+       "and 'this segment is crowded' are different answers, and only the first "
+       "one is terminal. The probe costs one plan per net (394 s on a 47-net "
+       "DDR bus), so it is opt-in",
+       "L1", "docs/197 section 4 (the OURS rule: a bus that must be length-matched "
+       "needs its corridor reserved in LAYOUT, because a meander can only exist "
+       "where the air was left) + docs/198 section 3 (measured on RK3506: honouring "
+       "the 0.2 mm apply floor costs 1.13 mm of bought-back length across 35 pairs) "
+       "- the measurement is this server's own, at P3 because the board still works",
+       "a rounded meander needs a cross-bar of at least 0.15 mm plus the 0.2 mm "
+       "apply floor on the side it bulges into; inside a BGA escape fence the "
+       "corridor is 0.281 mm wide between 0.5621 mm balls, so a tooth cannot fit "
+       "there at any width. If a group's short net has no room outside the fence, "
+       "no amount of tuning, re-ordering or re-running closes the skew - the "
+       "layout has to (reserve the corridor, change the escape order, or accept "
+       "the skew and say so)"),
     _r("layout.min_trace_width", "the narrowest trace stays at or above 6 mil",
        "manufacturability", "Low", "min_trace_width_mm", "mm", "min", 0.1524,
        "board_stats narrowest track",

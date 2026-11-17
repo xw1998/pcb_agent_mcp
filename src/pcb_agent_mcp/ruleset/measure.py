@@ -343,7 +343,7 @@ def _castellated(holes, segs, window_mm=2.0):
             refs.append(h["ref"])
     return uuids, refs
 
-def measure(board, window_mm=WINDOW_MM):
+def measure(board, window_mm=WINDOW_MM, headroom=False):
     """Return ``{fact_key: {"value"/"unmeasurable", "where", "method"}}``."""
     m = {}
     items = _items(board)
@@ -1075,6 +1075,8 @@ def measure(board, window_mm=WINDOW_MM):
     m.update(_power_traces(board))
     # ------------------------------------------- assembly, rails and the RF gap
     m.update(_assembly_facts(board))
+    # ------------------------------------------------- equal-length buses
+    m.update(_length_corridor(board, headroom=headroom))
 
     return m
 
@@ -3177,6 +3179,110 @@ def _power_traces(board):
                        % "/".join(poured_only))
     return {"power_trace_width_mm": out}
 
+# ------------------------------------------------- equal-length corridors
+#: The skew the catalogue allows a differential pair. An equal-length corridor
+#: measured with one tolerance and graded by another would be two numbers wearing
+#: one name, so the pair groups below are held to the number that rule states.
+_DIFFPAIR_TOL_MM = 0.127
+
+def _equal_length_groups(board):
+    """The groups whose length must match, and the tolerance each is held to.
+
+    Two sources, both the board's own:
+
+    * the DDR tables the tuner groups by (`route.tune_board.ddr_groups`) - that
+      function is *the* definition of what a length fix would tune, so a rule
+      built on any other list would grade nets that nothing tunes;
+    * name-recognised differential pairs (`_diffpairs`) that those tables do not
+      carry, because a pair with 0.127 mm of skew needs the same corridor and is
+      not on the DDR bus.
+
+    A pair already inside a DDR group is not added twice: two groups over one net
+    would report the same shortfall as two failures.
+    """
+    from ..route import tune_board as TB
+    groups = list(TB.ddr_groups(board))
+    seen = set(n for g in groups for n in (g.get("nets") or ()))
+    for a, b in _diffpairs(board):
+        if a in seen or b in seen:
+            continue
+        groups.append({"name": "pair %s/%s" % (a, b), "kind": "pair",
+                       "nets": [a, b], "tol_mm": _DIFFPAIR_TOL_MM})
+    return groups
+
+def _length_corridor(board, headroom=False):
+    """Is an equal-length group's short net short because of the corridor?
+
+    The rule (docs/197 section 4): a bus that has to be length-matched needs its
+    corridor reserved **in layout**, and routing cannot buy it back. The number
+    that answers it is the tuner's own, not a re-derivation: `route.tune_board.
+    headroom` gives every short net its own target on an otherwise unchanged
+    board and reports the ones that still cannot reach it. `blocked_by_geometry`
+    is FINAL - a net short with the whole board to itself is not fixed by more
+    tuning, re-ordering or a second run - which is what makes this a rule and not
+    advice. That module states why a closed-form ceiling would not do: every way
+    of getting the ceiling wrong produces a fake `blocked_by_geometry`.
+
+    The probe is opt-in and the refusal names its measured cost (8.1 s for a
+    2-net pair, 394 s for the 47-net DDR bus on RK3506): an audit that
+    silently spent four minutes would be reported as a hang, and one that guessed
+    would be reported as an answer.
+
+    A measurement that does NOT use the planner was tried and rejected on
+    evidence: sample each net's run, take the air to the nearest foreign copper
+    on the freer side, report the longest unbroken stretch with room for a tooth.
+    It runs in 2 s and answers a different question - on RK3506 every one of the
+    47 nets has such a stretch, the shortest being 1.20 mm, so `shortfall` would
+    read zero on a bus the planner demonstrably cannot match. The corridor is not
+    "is there anywhere wide", it is "can the shape be placed", and only the shape
+    can say.
+    """
+    key = "length_groups_blocked_by_geometry"
+    try:
+        groups = _equal_length_groups(board)
+    except Exception as exc:                        # noqa: BLE001
+        return {key: _na("the equal-length groups could not be read from this "
+                         "file: %s: %s" % (type(exc).__name__, exc))}
+    if not groups:
+        return {key: {"not_applicable": (
+            "this board carries no equal-length group: no /DDR_* bus and no "
+            "name-recognised differential pair, so nothing here has to be "
+            "matched and no corridor is owed")}}
+    if not headroom:
+        return {key: _na(
+            "%d equal-length group(s) on this board, and the answer costs one "
+            "route plan per net (measured on RK3506: 8.1 s for a 2-net pair, 394 s "
+            "for the 47-net DDR bus) - call board_length_tune(headroom=true) and "
+            "pass its `blocked` count back as facts={'%s': N}, or run "
+            "board_audit(headroom=true)" % (len(groups), key))}
+    from ..route import tune_board as TB
+    try:
+        res = TB.headroom(board, groups, floor_mm=TB.FLOOR_MM)
+    except Exception as exc:                        # noqa: BLE001
+        return {key: _na("the corridor probe refused: %s: %s"
+                         % (type(exc).__name__, exc))}
+    blocked = [g for g in (res.get("groups") or ())
+               if g.get("verdict") == "blocked_by_geometry"]
+    row = _rec(
+        len(blocked),
+        ", ".join("%s (short by %.3f mm at %s)"
+                  % (g.get("group"), float(g.get("shortfall_mm") or 0.0),
+                     g.get("binding_net")) for g in blocked)[:400] or
+        "no group is short by geometry",
+        "route.tune_board.headroom judged at the same %.2f mm apply floor the "
+        "write gate uses: each net that owes length is planned on its own - the "
+        "board kept as it is, every other net in place but not competing - and a "
+        "net that still cannot reach its target is short by GEOMETRY, not by "
+        "tuning" % TB.FLOOR_MM)
+    row["examples"] = [{"group": g.get("group"),
+                        "binding_net": g.get("binding_net"),
+                        "shortfall_mm": g.get("shortfall_mm")}
+                       for g in blocked]
+    row["groups"] = [{"group": g.get("group"), "verdict": g.get("verdict"),
+                      "shortfall_mm": g.get("shortfall_mm")}
+                     for g in (res.get("groups") or ())]
+    return {key: row}
+
 def grade_caps(m):
     """Facts this module measured but refuses to GRADE, and why.
 
@@ -3303,6 +3409,9 @@ def catalog_facts(m):
     take("rails_without_hf_cap", "rails_without_hf_cap")
     take("test_points_on_rails_and_connectors", "test_points_on_rails_and_connectors")
     take("min_mask_expansion", "min_mask_expansion")
+    # The corridor count comes from the tuner (opt-in), and a board with no
+    # equal-length group reports the absence of the OBJECT, not a missing number.
+    take("length_groups_blocked_by_geometry", "length_groups_blocked_by_geometry")
     take("crystal_has_guard_ring", "crystal_has_guard_ring")
     # The RF family, measured on the nets the file's names call RF.
     take("has_right_angle_bend_on_rf", "has_right_angle_bend_on_rf")

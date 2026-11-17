@@ -58,6 +58,11 @@ _CATALOG_LEVEL = {
     "layout.diffpair_skew": "P3",
     "layout.diffpair_gap_constant": "P3",
     "layout.stitching_via_pitch": "P3",
+    # P3 because the board works and only misses its own timing target - but
+    # the decision it forces is a LAYOUT one (reserve the corridor or move the
+    # escape order): `blocked_by_geometry` is final, so re-running the tuner
+    # is not the next step.
+    "layout.length_tuning_corridor": "P3",
     "layout.crystal_guard": "P4",
 }
 
@@ -291,6 +296,19 @@ def _catalog_checks(process, m, facts_in):
                                      "library",
                            "fix": rule.get("fix"), "source": rule.get("source")})
             continue
+        # A rule whose OBJECT is absent is not unmeasured: "no equal-length bus
+        # on this board" settles the rule, and reporting it as undetermined
+        # would leave every board without a DDR interface permanently
+        # incomplete - the same laundering `_fab_checks` refuses with
+        # `_spec.NONE_PRESENT`.
+        absent = (m.get(rule["fact"]) or {}).get("not_applicable")
+        if absent:
+            checks.append({"id": rule["id"], "level": lvl,
+                           "title": rule["title"],
+                           "state": "not_applicable", "reason": absent,
+                           "source": rule.get("source"),
+                           "why": rule.get("why")})
+            continue
         graded = _rules._grade(rule, facts)
         state = {"pass": "pass", "fail": "fail"}.get(graded["state"], "undetermined")
         c = {"id": graded["id"], "level": lvl, "title": graded["title"],
@@ -333,10 +351,11 @@ def _catalog_checks(process, m, facts_in):
     return checks
 
 
-def audit(board, process=None, facts=None, levels=None, window_mm=_measure.WINDOW_MM):
+def audit(board, process=None, facts=None, levels=None,
+          window_mm=_measure.WINDOW_MM, headroom=False):
     """Measure the board, grade both libraries, and resolve the priority."""
     want = None if not levels else set(levels)
-    m = _measure.measure(board, window_mm=window_mm)
+    m = _measure.measure(board, window_mm=window_mm, headroom=headroom)
 
     # Thickness is a FACT in the board file (stackup total), not a choice the
     # user has to repeat; the fab rule reads it from the process, so fill it in
