@@ -1048,7 +1048,8 @@ DIRS_K = tuple((k, d[0], d[1], d[2]) for k, d in enumerate(DIRS))
 
 def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
           allow_vias=True, via_check=None, diag=None, soft=0.0, guide=None,
-          guide_outside=1.0, walk_layers=None):
+          guide_outside=1.0, walk_layers=None, reserve=None,
+          reserve_price=1.0):
     # NOTE ON THE INLINING BELOW. The inner loop reads the rasters directly
     # (`grid._map[layer]` is a flat list indexed by `j * nx + i`) instead of
     # calling `grid.free()`, and goal lookup goes through an integer key instead
@@ -1092,6 +1093,21 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
     so. That is what makes the group's *length* follow the skeleton rather
     than merely its direction.
 
+    `reserve` is the mirror image of `guide`: a per-layer map
+    (`{layer: bytearray(nx*ny)}`) of cells this net must pay `reserve_price`
+    times their usual step cost to walk through. It exists because a corridor
+    that is merely *shared* is not the same as a corridor that leaves room to
+    work in: a bus whose members are packed at clearance has no lateral space
+    left for the meanders that length matching needs (a readable wave needs
+    ~1.5x track width of air on each side, see `route.tune_board`). Marking the
+    ring around the nets that will need that room makes everyone else take the
+    long way round *while they are still being routed*, which is the only
+    moment the room can be created - after the fact there is copper in it.
+    Like `guide` it changes cost and only cost: a cell the raster calls blocked
+    stays blocked whatever the price, so a reservation can never buy a clearance
+    violation, and a price that turns out to be too high costs a longer path
+    rather than a missing one.
+
     `walk_layers` is the set of layers the path may put copper on. `None` is
     every layer in the grid. A node on a layer outside the set can still be a
     source or a goal - that is how a terminal on an outer layer is entered - but
@@ -1113,6 +1129,7 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
     if pen is None:
         pen = grid._pen = [0.0] * (nx * ny)
     gd_maps = guide
+    rsv_maps = reserve
     layers = grid.layers
     nlayer = len(layers)
     li_of = dict((l, k) for k, l in enumerate(layers))
@@ -1165,6 +1182,7 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
             return None
         mp = maps[l]
         gmap = gd_maps.get(l) if gd_maps is not None else None
+        rmap = rsv_maps.get(l) if rsv_maps is not None else None
         base = j * nx
         for k, di, dj, step in (DIRS_K if (walk_layers is None or l in walk_layers)
                                 else ()):
@@ -1217,6 +1235,8 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
                     step_cost = step * guide_outside
                 else:
                     step_cost = step
+            if rmap is not None and rmap[cell]:
+                step_cost = step_cost * reserve_price
             nc = g + step_cost + (0.0 if d == k else TURN_COST) + pen[cell] + toll
             ns = (cell * nlayer + (rest % nlayer)) * 9 + k
             if nc < best.get(ns, 1e18) - 1e-9:
@@ -1257,6 +1277,8 @@ def astar(grid, net, sources, goals, goals_layers, budget=MAX_BUDGET,
                         if not soft:
                             continue
                         vtoll = soft
+            if rmap is not None and rmap[node]:
+                vtoll += VIA_COST * (reserve_price - 1.0)
             nc = g + VIA_COST + (0.0 if d == 8 else TURN_COST) + pen[node] + vtoll
             ns = (node * nlayer + li_of[l2]) * 9 + 8
             if nc < best.get(ns, 1e18) - 1e-9:

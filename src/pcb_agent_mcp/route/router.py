@@ -579,6 +579,20 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
       blocked for every member, so a band cannot buy tidiness with a
       clearance violation.
 
+    A band entry may also reserve room for the members that will have to
+    meander: `{"reserve_nets": [...], "reserve_mm": 0.5, "reserve_price": 4.0}`
+    marks a ring `reserve_mm` wide around those members' copper and multiplies
+    every other member's step cost inside it by `reserve_price`
+    (`route.grid.astar(reserve=...)`). A corridor that merely packs its members
+    at clearance has no lateral space left for length matching, and the space
+    cannot be created afterwards - by then there is copper in it - so the ring
+    has to be claimed while the bus is being routed. `reserve_nets` must be
+    members of the same band: a reservation is a claim the group makes on its
+    own shared space, not a global keepout. Like the guide it changes cost and
+    only cost, and the report carries the air it actually bought
+    (`bundle_bands[i].reserve.gap_mm`, measured at the corridor's waist rather
+    than at the pads, which are packed by definition).
+
     This is the honest half of "bundle routing": it does not force the members
     onto the identical polyline (that needs path templating the router does
     not have yet), it makes the corridor the cheapest place to be. A band that
@@ -842,17 +856,66 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                                  "beyond that the corridor stops being a "
                                  "preference and starts walling off legal space"
                                  % (k,), "ARG_INVALID")
+            reserve = None
+            want = [str(n) for n in (spec.get("reserve_nets") or [])]
+            if want:
+                rmm = spec.get("reserve_mm")
+                rprice = float(spec.get("reserve_price", 4.0))
+                if rmm is None:
+                    raise RouteError(
+                        "bundle_bands[%d] (%s) names reserve_nets but no "
+                        "reserve_mm: a ring with no width is not a "
+                        "reservation" % (k, name), "ARG_INVALID",
+                        hint="reserve_mm is the lateral room each reserved net "
+                             "keeps on both sides; a readable meander needs "
+                             "about 1.5x the track width, i.e. 0.15 mm on 0.1 mm "
+                             "copper")
+                rmm = float(rmm)
+                if not (0.0 < rmm <= 4.0):
+                    raise RouteError(
+                        "bundle_bands[%d] (%s) reserve_mm must be in (0, 4]: "
+                        "beyond 4 mm the ring stops being air for a meander "
+                        "and starts being a second corridor" % (k, name),
+                        "ARG_INVALID")
+                if not (1.0 < rprice <= 20.0):
+                    raise RouteError(
+                        "bundle_bands[%d] (%s) reserve_price must be in (1, 20]: "
+                        "1.0 is no reservation at all, and past 20 the price "
+                        "stops steering the search and starts deciding it"
+                        % (k, name), "ARG_INVALID")
+                outside_band = [n for n in want if n not in nets]
+                if outside_band:
+                    raise RouteError(
+                        "bundle_bands[%d] (%s) reserves room around nets that "
+                        "are not in the band: %s. A reservation is the group "
+                        "claiming its own shared space, not a global keepout, "
+                        "so the reserved net must be a member"
+                        % (k, name, ", ".join(outside_band[:6])),
+                        "ARG_INVALID",
+                        hint="put the net in this band's nets, or drop it from "
+                             "reserve_nets")
+                reserve = {"nets": want, "mm": rmm, "price": rprice,
+                           "painted": 0}
             bands.append({"name": name, "nets": nets, "radius_mm": radius,
                           "discount": discount, "outside": outside,
-                          "routed": []})
+                          "routed": [], "reserve": reserve})
             for n in nets:
                 band_of[n] = len(bands) - 1
         if bands:
+            reserving = set()
+            for b in bands:
+                if b.get("reserve"):
+                    reserving |= set(b["reserve"]["nets"])
+
             def _band_key(w):
                 bi = band_of.get(w[1])
                 if bi is None:
-                    return (len(bands), -w[0])
-                return (bi, w[0])          # shortest first inside a band
+                    return (len(bands), 1, -w[0])
+                # A reserved net goes first inside its band: the ring has to
+                # exist before anyone else is placed, or the reservation is a
+                # no-op that reports success - the exact failure mode this
+                # router refuses elsewhere. Inside each group, shortest first.
+                return (bi, 0 if w[1] in reserving else 1, w[0])
             work.sort(key=_band_key)
 
     band_stamp = {}
@@ -906,6 +969,55 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                                 stamps += 1
         return stamps
 
+    band_reserve_stamp = {}
+
+    def _paint_ring(maps, nets, radius_mm):
+        """Mark every cell within `radius_mm` of a reserved member's copper.
+
+        Same walk as `_stamp`, minus the graduated value: a reservation is a
+        price, not a preference curve, so a cell is either inside the ring or
+        it is not.
+        """
+        g = em.grid
+        q = max(1, int(round(float(radius_mm) / g.pitch)))
+        cells = 0
+        for op in em.ops:
+            if op.get("net") not in nets:
+                continue
+            if op["op"] == "add_track":
+                spans = [(op["layer"], (op["x1"], op["y1"]),
+                          (op["x2"], op["y2"]))]
+            elif op["op"] == "add_via":
+                spans = [(l, (op["x"], op["y"]), (op["x"], op["y"]))
+                         for l in (op.get("layers") or g.layers)]
+            else:
+                continue
+            for l, a, b in spans:
+                buf = maps.get(l)
+                if buf is None:
+                    continue
+                n = int(math.hypot(b[0] - a[0], b[1] - a[1]) / g.pitch) + 1
+                for kk in range(n + 1):
+                    t = kk / float(n)
+                    ci, cj = g.node(a[0] + (b[0] - a[0]) * t,
+                                    a[1] + (b[1] - a[1]) * t)
+                    for dj in range(-q, q + 1):
+                        jj = cj + dj
+                        if jj < 0 or jj >= g.ny:
+                            continue
+                        row = jj * g.nx
+                        for di in range(-q, q + 1):
+                            ii = ci + di
+                            if ii < 0 or ii >= g.nx:
+                                continue
+                            if math.hypot(di, dj) > q + 0.5:
+                                continue
+                            idx = row + ii
+                            if not buf[idx]:
+                                buf[idx] = 255
+                                cells += 1
+        return cells
+
     def _band_guide(net):
         bi = band_of.get(net)
         if bi is None or not bands[bi]["routed"]:
@@ -924,6 +1036,27 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         use = band_use.setdefault(bi, {"calls": 0})
         use["calls"] += 1
         return (st["maps"], spec["outside"])
+
+    def _band_reserve(net):
+        """The rings this net must pay to cross. `(None, 1.0)` when it is one of
+        the reserved members - the room is being kept FOR it, not FROM it."""
+        bi = band_of.get(net)
+        if bi is None:
+            return (None, 1.0)
+        spec = bands[bi].get("reserve")
+        if not spec or net in spec["nets"]:
+            return (None, 1.0)
+        st = band_reserve_stamp.get(bi)
+        if st is None:
+            st = band_reserve_stamp[bi] = {"maps": None, "nets": set()}
+        if st["maps"] is None:
+            st["maps"] = dict((l, bytearray(grid.nx * grid.ny))
+                               for l in grid_layers)
+        fresh = (set(spec["nets"]) & set(bands[bi]["routed"]) - st["nets"])
+        if fresh:
+            spec["painted"] += _paint_ring(st["maps"], fresh, spec["mm"])
+            st["nets"] |= fresh
+        return (st["maps"], spec["price"])
 
     if net_priority:
         # Order is a first-come-first-served decision on shared space, so the
@@ -1107,13 +1240,15 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         for a, b in edges:
             goals, glayers = goals_of(b)
             guide_now = _band_guide(net)
+            rsv_now = _band_reserve(net)
             ast_diag = {}
             path = astar(grid, net, tree_nodes, goals, glayers,
                          allow_vias=allow_vias,
                          via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
                                if allow_vias else None),
                          diag=ast_diag, guide=guide_now[0],
-                         guide_outside=guide_now[1], walk_layers=new_layers)
+                         guide_outside=guide_now[1], walk_layers=new_layers,
+                         reserve=rsv_now[0], reserve_price=rsv_now[1])
             if path is None:
                 src = goals
                 back = {(s[0], s[1]) for s in tree_nodes}
@@ -1126,7 +1261,8 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                              via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
                                if allow_vias else None),
                              diag=ast_diag, guide=guide_now[0],
-                             guide_outside=guide_now[1], walk_layers=new_layers)
+                             guide_outside=guide_now[1], walk_layers=new_layers,
+                             reserve=rsv_now[0], reserve_price=rsv_now[1])
             if path is None:
                 t = (terminals[b]["term"] if b < len(terminals) else
                      {"reference": "(branch)", "pad": "-",
@@ -1294,6 +1430,10 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 # The guide maps were painted from copper that just moved out;
                 # the next member must not follow a corridor nobody occupies.
                 band_stamp.clear()
+                band_reserve_stamp.clear()
+                for b in bands:
+                    if b.get("reserve"):
+                        b["reserve"]["painted"] = 0
                 for n in rips:
                     bi = band_of.get(n)
                     if bi is not None and n in bands[bi]["routed"]:
@@ -1563,6 +1703,78 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                         "spread_mm": (round(max(live) - min(live), 3)
                                       if len(live) > 1 else None)})
         stats["bundle_bands"] = rep
+
+    def _band_reserve_gap(spec):
+        """How much air the nets that must meander actually got, measured at the
+        corridor's waist.
+
+        The distance people quote for a corridor - centre to centre at the pads -
+        says nothing about meander room: the pads are packed by definition, so
+        that number is fixed before any copper is drawn. What decides whether
+        `route.tune_board` can put a readable tooth down is the nearest other
+        member's copper to the *middle* of the reserved net, so samples within
+        `1.0 mm` of the reserved net's own terminals are skipped and the rest is
+        measured segment to segment.
+        """
+        res = spec.get("reserve")
+        if not res:
+            return None
+        want = set(res["nets"])
+        flats = {}
+        for op in em.ops:
+            if op["op"] != "add_track":
+                continue
+            # Copper on another layer is not in the way - a gap measured across
+            # layers would report 0.00 mm between two nets that legally cross,
+            # which is the opposite of air.
+            flats.setdefault((op["net"], op["layer"]), []).append(
+                (op["x1"], op["y1"], op["x2"], op["y2"]))
+        pads = {}
+        for n in want:
+            pads[n] = [(p["at"][0], p["at"][1])
+                       for p in (by_net.get(n) or [])]
+        def _near_pad(n, x, y):
+            for (px, py) in pads.get(n) or ():
+                if math.hypot(x - px, y - py) < 1.0:
+                    return True
+            return False
+        out = {}
+        for n in sorted(want):
+            best = None
+            mine = [(l, seg) for (m, l), segs in flats.items() if m == n
+                    for seg in segs]
+            others = [((m, l), seg) for (m, l), segs in flats.items()
+                      if m != n for seg in segs]
+            for l_here, (x1, y1, x2, y2) in mine:
+                # Sample the run instead of testing its endpoints: a straight
+                # 4 mm segment has BOTH endpoints on pads, so an endpoint test
+                # would skip exactly the copper the question is about.
+                span = math.hypot(x2 - x1, y2 - y1)
+                steps = max(1, int(span / 0.1))
+                for kk in range(steps + 1):
+                    t = kk / float(steps)
+                    px = x1 + (x2 - x1) * t
+                    py = y1 + (y2 - y1) * t
+                    if _near_pad(n, px, py):
+                        continue
+                    for (m, l), (a1, b1, a2, b2) in others:
+                        if l != l_here:
+                            continue
+                        d = G.dist_point_segment((px, py), (a1, b1), (a2, b2))
+                        if best is None or d < best[0]:
+                            best = (d, m)
+            if best is None:
+                continue
+            out[n] = {"gap_mm": round(best[0], 4), "nearest": best[1]}
+        return {"nets": sorted(want), "mm": res["mm"],
+                "price": res["price"], "ring_cells": res["painted"],
+                "gap_mm": out}
+
+    if bands:
+        for bi_v, spec_v in enumerate(bands):
+            got = _band_reserve_gap(spec_v)
+            if got is not None:
+                stats["bundle_bands"][bi_v]["reserve"] = got
     return {
         "layers_routing": routing,
         "layers_plane": planes,
