@@ -86,6 +86,15 @@ _ARRAY_PADS = 64
 #: Anything beyond this is not decoupling, it is a wire.
 _MAX_TRACK_MM = 1.5
 
+#: How far past a refused site `_connection` looks for a flood it could grow
+#: into. A plain ``none`` says "no copper of this net" and stops: on this board
+#: that reading (C19, 4.612 mm) hid the actual shape of the problem - the In3
+#: ``/+3V3`` plane stopped 1.51 mm short of the site, and the fix was 11.0 mm^2
+#: of extra copper, not a different part of the board. The probe turns "you
+#: cannot stand here" into "the flood is 1.51 mm to the right of here", which is
+#: a number a caller can act on without reading polygon vertices.
+_FILL_PROBE_MM = 8.0
+
 _SIDE_STEP_MM = 0.25
 _OUT_STEP_MM = 0.05
 
@@ -659,6 +668,33 @@ class _Fill(object):
         return None
 
 
+    def edge_nearest(self, x, y, reach):
+        """Closest boundary point to (x, y), or None when further than `reach`.
+
+        Same ring walk as `edge_distance`, and for the same reason: a plain
+        "distance" answers the wrong question when the caller has to decide where
+        to add copper. Which way, and to which point, is the answer.
+        """
+        best = None
+        seen = set()
+        rings = max(1, int(math.ceil(reach / self.CELL)))
+        for r in range(rings + 1):
+            kx0, ky0 = int(math.floor(x / self.CELL)), int(math.floor(y / self.CELL))
+            for kx in range(kx0 - r, kx0 + r + 1):
+                for ky in range(ky0 - r, ky0 + r + 1):
+                    for e in self.cells.get((kx, ky), ()):
+                        if e in seen:
+                            continue
+                        seen.add(e)
+                        d = _pt_seg(x, y, e[0], e[1], e[2], e[3])
+                        if best is None or d < best[0]:
+                            best = (d, _closest_on_seg(x, y, e[0], e[1], e[2], e[3]))
+            if best is not None and best[0] <= max(0.0, (r - 1) * self.CELL):
+                return best
+        if best is not None and best[0] <= reach:
+            return best
+        return None
+
 #: The fill index, for ONE board at a time. Keyed on `id(board)` it would be
 #: cheap and wrong: a board that has been garbage collected hands its bucket
 #: grid to whatever object lands on the same address. Comparing the object itself
@@ -690,6 +726,73 @@ def _fills(board, net):
         cache[key] = out
     return cache[key]
 
+
+def _fill_shortfall_at(board, net, pt, probe=_FILL_PROBE_MM):
+    """Nearest boundary of any filled zone of `net` from `pt`, and where it is."""
+    best = None
+    for i, (fill, layers) in enumerate(_fills(board, net)):
+        hit = fill.edge_nearest(pt[0], pt[1], probe)
+        if hit is None:
+            continue
+        if best is None or hit[0] < best[0]:
+            best = (hit[0], hit[1], i, layers)
+    return best
+
+def _fill_shortfall(board, net, pad_xy, stub_mm=_STUB_MM, away=None,
+                    probe=_FILL_PROBE_MM):
+    """How much copper this net is missing before the rail pad can reach it.
+
+    Two numbers, because two different points matter and they are not the same
+    distance:
+
+    * ``pad_distance_mm`` - from the pad centre to the nearest boundary. This is
+      the reading a human would take off a plot, and it is what "4.6 mm away"
+      meant on C19.
+    * the chosen leg - measured from the stub point the via would occupy, because
+      the pad is not what has to end up inside the flood: the via may not sit in
+      the pad (`_STUB_MM` is the user's via-in-pad rule), so the flood has to
+      cover a point ``stub_mm`` out instead. That is the smaller requirement and
+      the one a polygon patch is drawn around, so it is what `distance_mm` /
+      `from` / `to` / `grow_mm` describe.
+
+    ``grow_mm`` is a lower bound, not a patch size: the flood has to reach the
+    measured boundary plus one via radius so the barrel has copper around it.
+    Clearance to neighbouring copper is not in the number - the patch is drawn by
+    whoever reads this, and it carries its own clearance.
+    """
+    pad_hit = _fill_shortfall_at(board, net, pad_xy, probe)
+    best = None
+    for pt in _via_points(pad_xy, stub_mm, away):
+        hit = _fill_shortfall_at(board, net, pt, probe)
+        if hit is None:
+            continue
+        if best is None or hit[0] < best[0]:
+            best = (hit[0], hit[1], hit[2], hit[3], pt)
+    out = {"probe_mm": probe,
+           "pad_distance_mm": None if pad_hit is None else round(pad_hit[0], 3)}
+    if best is None:
+        out["note"] = ("no flood of this net within %.1f mm of either the pad "
+                       "or its %.2f mm stub points" % (probe, stub_mm))
+        return out
+    d, to, i, layers, pt = best
+    out.update({
+        "at": "stub",
+        "from": [round(pt[0], 3), round(pt[1], 3)],
+        "distance_mm": round(d, 3),
+        "to": [round(to[0], 3), round(to[1], 3)],
+        "layer_index": i,
+        "layers": layers,
+        "grow_mm": round(d + _VIA_DIA_MM / 2.0, 3),
+        "note": ("the nearest copper of this net is %.2f mm from the stub point "
+                 "along the vector to `to` (%s); the flood has to grow at least "
+                 "%.2f mm, one via radius included, before anything can stand "
+                 "here"
+                 % (d, ("%.2f mm from the pad itself" % pad_hit[0]) if pad_hit
+                    else "the pad itself is further out than the %.1f mm probe"
+                    % probe,
+                    d + _VIA_DIA_MM / 2.0)),
+    })
+    return out
 
 def _via_points(pad_xy, stub_mm, away=None):
     """The four points a dogbone via can sit at: `stub_mm` out along each axis.
@@ -826,9 +929,10 @@ def _connection(board, copper, net, pad_xy, reach=_REACH_MM, stub_mm=_STUB_MM,
                 "distance_mm": round(best_c[0], 3)}
     if best is not None and best["plane_distance_mm"] <= reach:
         return best
-    return {"kind": "none", "why": ("no filled zone of this net reaches within "
-                                    "%.1f mm and no copper of it does either"
-                                    % reach)}
+    return {"kind": "none",
+            "why": ("no filled zone of this net reaches within %.1f mm and no "
+                    "copper of it does either" % reach),
+            "fill_shortfall": _fill_shortfall(board, net, pad_xy, stub_mm, away)}
 
 
 _ROUTE_STEP_MM = 0.05
@@ -1195,6 +1299,29 @@ def _copper_sites(board, copper, bodies, net, shp, clearance_mm, body_gap_mm,
             break
     return out
 
+def _best_shortfall(rows):
+    """The tightest flood gap among refused candidates, and the site it was at.
+
+    Returns ``(site, shortfall)`` or None. Ties break toward the site nearest its
+    target pin, because that is the one whose repair buys the most.
+    """
+    best = None
+    for r in rows:
+        c = r.get("connection") or {}
+        if c.get("kind") != "none":
+            continue
+        sf = c.get("fill_shortfall") or {}
+        if sf.get("distance_mm") is None:
+            continue
+        key = (round(sf["distance_mm"], 6), round(r["nearest_pin_mm"], 6))
+        site = {"x": r["x"], "y": r["y"], "rotation": r["rotation"],
+                "rail_pad": r["rail_pad"], "gnd_pad": r["gnd_pad"],
+                "nearest_pin": r.get("nearest_pin"),
+                "nearest_pin_mm": r["nearest_pin_mm"]}
+        if best is None or key < best[2]:
+            best = (site, sf, key)
+    return None if best is None else (best[0], best[1])
+
 def plan(board, shape=None, *, clearance_mm=_CLEARANCE_MM,
          body_gap_mm=_BODY_GAP_MM, via_diameter_mm=_VIA_DIA_MM,
          via_drill_mm=_VIA_DRILL_MM, stub_mm=_STUB_MM, reach_mm=_REACH_MM,
@@ -1405,7 +1532,8 @@ def plan(board, shape=None, *, clearance_mm=_CLEARANCE_MM,
             out.sort(key=lambda r: (r["escape_mm"], round(r["nearest_pin_mm"], 2)))
             return out
 
-        rows = escaped(_rows(sites))
+        all_rows = _rows(sites)
+        rows = escaped(all_rows)
         if not rows:
             # Standing beside a courtyard edge bought nothing: the rail does not
             # reach out there. The rail's own flood is then the only real ground,
@@ -1417,11 +1545,20 @@ def plan(board, shape=None, *, clearance_mm=_CLEARANCE_MM,
                                         clearance_mm, body_gap_mm,
                                         no_track=no_track, placed=placed))
             if alt:
+                all_rows = all_rows + alt
                 rows = escaped(alt)
         found[net] = {"target_part": want,
                       "pins_on_target": len(pins),
                       "sites": rows[:max(1, int(top))],
                       "sites_considered": len(rows)}
+        short = _best_shortfall(all_rows)
+        if short is not None:
+            # Where the copper would have to grow, and at which legal body
+            # position. Kept even when a site did connect: a rail placed 5 mm out
+            # with three more millimetres of copper available is a decision, and
+            # the caller is the one who gets to make it.
+            found[net]["fill_shortfall"] = short[1]
+            found[net]["shortfall_site"] = short[0]
         if not rows:
             found[net]["error"] = ("no candidate site has both a legal rail run "
                                    "and a legal ground via within %.1f mm"
@@ -1492,17 +1629,27 @@ def fill(board, *, nets=None, targets=None, sides=None, shape=None,
                    max_track_mm=max_track_mm)
         info = res["rails"].get(net) or {"error": "rail vanished between passes"}
         rows = info.get("sites") or []
-        if not rows:
-            out[net] = dict(info, chosen=None)
-            continue
-        best = rows[0]
-        if best["connection"]["kind"] == "none":
+        best = rows[0] if rows else None
+        if best is None or best["connection"]["kind"] == "none":
             # A site nobody can connect to is not a placement: it would land a
-            # part, add two unconnected pads and make the board read worse.
-            out[net] = dict(info, chosen=None,
-                            refused="no reachable copper of this rail within "
-                                    "%.2f mm and no flood under or beside the pad"
-                                    % max_track_mm)
+            # part, add two unconnected pads and make the board read worse. What
+            # it must not do is stop at "no" - the repair for C19 was 11.0 mm^2
+            # of flood, and finding that out required reading polygon vertices
+            # by hand. So the refusal carries the distance and the vector.
+            sf = ((best["connection"].get("fill_shortfall") if best else None)
+                  or info.get("fill_shortfall") or {})
+            why = (info.get("error") or
+                   "no reachable copper of this rail within %.2f mm and no flood "
+                   "under or beside the pad" % max_track_mm)
+            if sf.get("distance_mm") is not None:
+                why += ("; the nearest copper of this rail is %.2f mm from the "
+                        "stub point at (%s, %s), toward (%s, %s) - the flood has "
+                        "to grow %.2f mm along that vector first"
+                        % (sf["distance_mm"], sf["from"][0], sf["from"][1],
+                           sf["to"][0], sf["to"][1], sf["grow_mm"]))
+            out[net] = dict(info, chosen=None, refused=why,
+                            refused_shortfall=sf,
+                            refused_site=info.get("shortfall_site"))
             continue
         court, pads = _cap_rects(best["x"], best["y"], best["rotation"], shp)
         placed.append(("cap:%s" % net, court,

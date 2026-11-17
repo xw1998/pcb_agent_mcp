@@ -459,5 +459,99 @@ class TestFillRefuses(unittest.TestCase):
             self.assertEqual(row["connection"]["kind"], "none")
 
 
+# ------------------------------------------------------- how far, which way ---
+class TestFillShortfall(unittest.TestCase):
+    """A refused site must say how much copper is missing and in which direction.
+
+    "connection: none" used to be one sentence for two different situations:
+    "the flood is 1.5 mm short of here" and "there is no copper of this net
+    anywhere near". Only the first is actionable, and telling them apart by hand
+    meant reading polygon vertices - which is the step this probe removes.
+    """
+
+    def setUp(self):
+        D.reset_fill_cache()
+
+    def _board(self, zone_square, layers=("In3.Cu",)):
+        pads = [_pad("U1", i, "+3V3", 2.0, 5.0 + i) for i in range(1, 5)]
+        return _Board(footprints=[_fp("U1", 3.0, 6.0, pads,
+                                      [_square(3.0, 6.0, 2.5)])],
+                      zones=[_zone("+3V3", zone_square, layers=layers)])
+
+    def test_the_distance_is_measured_from_the_stub_point_not_the_pad(self):
+        # Flood's left edge at x = 19, rail pad at (12, 5), reach 6 mm. The plane
+        # is 7 mm from the pad - out of reach - but only 6.35 mm from the stub
+        # point the via would occupy, and that is the point a patch must cover.
+        board = self._board(_square(24.0, 5.0, 5.0))
+        conn = D._connection(board, D._Copper(board), "+3V3", (12.0, 5.0))
+        self.assertEqual(conn["kind"], "none")
+        sf = conn["fill_shortfall"]
+        self.assertEqual(sf["at"], "stub")
+        self.assertAlmostEqual(sf["from"][0], 12.0 + D._STUB_MM, places=6)
+        self.assertAlmostEqual(sf["distance_mm"], 19.0 - (12.0 + D._STUB_MM), places=3)
+        self.assertAlmostEqual(sf["pad_distance_mm"], 7.0, places=3)
+        self.assertEqual(sf["to"], [19.0, 5.0])
+        self.assertAlmostEqual(sf["grow_mm"], sf["distance_mm"] + D._VIA_DIA_MM / 2.0,
+                               places=3)
+        self.assertIn("In3.Cu", sf["layers"])
+
+    def test_a_flood_beyond_the_probe_is_not_reported_as_a_number(self):
+        # 25 mm away: outside the 8 mm probe. The answer has to be "I did not
+        # find it that far out", never a guess dressed as a measurement.
+        board = self._board(_square(45.0, 5.0, 5.0))
+        conn = D._connection(board, D._Copper(board), "+3V3", (12.0, 5.0))
+        self.assertEqual(conn["kind"], "none")
+        sf = conn["fill_shortfall"]
+        self.assertNotIn("distance_mm", sf)
+        self.assertEqual(sf["probe_mm"], D._FILL_PROBE_MM)
+        self.assertIn("no flood", sf["note"])
+
+    def test_edge_nearest_agrees_with_brute_force_on_a_crooked_polygon(self):
+        # Concave, off-axis, and not centred on a cell boundary: an index that
+        # only looks in the query's own cell has to get this wrong.
+        poly = [(10.0, 10.0), (20.0, 10.0), (20.0, 13.0), (13.5, 13.0),
+                (13.5, 17.0), (11.0, 17.0), (11.0, 12.3), (10.0, 12.3)]
+        fill = D._Fill(poly)
+
+        def brute(x, y):
+            best = None
+            n = len(poly)
+            for i in range(n):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % n]
+                d = D._pt_seg(x, y, x1, y1, x2, y2)
+                if best is None or d < best:
+                    best = d
+            return best
+
+        for pt in ((6.0, 6.0), (12.7, 9.2), (21.5, 15.0), (9.1, 14.9),
+                   (14.9, 20.0), (12.2, 14.1), (19.0, 12.0)):
+            hit = fill.edge_nearest(pt[0], pt[1], 40.0)
+            self.assertIsNotNone(hit, "edge_nearest lost a point inside its probe")
+            self.assertAlmostEqual(hit[0], brute(*pt), places=9,
+                                   msg="index disagrees with brute force at %r" % (pt,))
+
+    def test_fill_puts_the_shortfall_in_the_refusal(self):
+        # A rail that cannot be reached at all still has to answer "how far":
+        # courtyard half 7 mm puts every legal site ~7 mm from a flood that sits
+        # at the part itself, i.e. past `reach` but inside the probe.
+        pads = [_pad("U1", i, "+3V3", 19.0 + (i % 2), 19.0 + (i // 2) * 1.0)
+                for i in range(1, 9)]
+        pads += [_pad("U1", 9, "/GND", 19.0, 21.5)]
+        board = _Board(footprints=[_fp("U1", 20.0, 20.0, pads,
+                                       [_square(20.0, 20.0, 7.0)])],
+                       zones=[_zone("/GND", _square(20.0, 20.0, 19.0)),
+                              _zone("+3V3", _square(20.0, 20.0, 0.5),
+                                    layers=("In3.Cu",))])
+        info = D.fill(board, nets=["+3V3"])["rails"]["+3V3"]
+        self.assertIsNone(info.get("chosen"))
+        self.assertIn("grow", info.get("refused") or "")
+        sf = info.get("refused_shortfall") or {}
+        self.assertIsNotNone(sf.get("distance_mm"),
+                             "the refusal dropped the one number that says how "
+                             "much copper is missing: %r" % (info,))
+        self.assertGreater(sf["distance_mm"], D._REACH_MM)
+        self.assertLessEqual(sf["distance_mm"], D._FILL_PROBE_MM)
+
 if __name__ == "__main__":
     unittest.main()
