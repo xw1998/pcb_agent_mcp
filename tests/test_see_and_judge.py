@@ -78,6 +78,17 @@ def zone_with(extra_poly):
 """ % extra_poly
 
 
+# One arc from 10,10 over 15,15 to 20,10 (file frame): 5 mm of bulge above its own
+# chord. Drawn as a chord it is a straight line and this board is the CHORD one.
+ARC_SNAKE = """
+  (arc (start 10 10) (mid 15 15) (end 20 10) (width 0.25) (layer "F.Cu") (net 1))
+"""
+# The reverse control: the SAME endpoints as one straight segment. If the renderer
+# draws an arc as its chord these two boards render pixel-identically.
+CHORD_SNAKE = """
+  (segment (start 10 10) (end 20 10) (width 0.25) (layer "F.Cu") (net 1))
+"""
+
 DEAD_ISLAND = '(filled_polygon (layer "B.Cu") (pts (xy 2 2) (xy 6 2) (xy 6 6) (xy 2 6)))'
 
 
@@ -266,6 +277,53 @@ class TestRender(unittest.TestCase):
             for out in (a, bb, same):
                 if out.get("value", {}).get("png"):
                     os.unlink(out["value"]["png"])
+
+    def test_an_arc_track_is_drawn_as_its_curve_not_its_chord(self):
+        """The picture is the only proof of shape, so it must draw the curve.
+
+        KiCad stores an arc as start/mid/end; the adapter samples it into
+        `_points` so lengths stay honest. Drawing `start -> end` instead throws
+        that away and turns a 5 mm bulge into a straight line - which is how a
+        serpentine of small-radius arcs came out looking like a triangle. The
+        reverse control is the same endpoints as one segment: drawing chords
+        would make these two boards pixel-identical.
+        """
+        arc = board(square_board(ARC_SNAKE))
+        chord = board(square_board(CHORD_SNAKE))
+        self.assertEqual(len(arc.tracks), 1, arc.tracks)
+        self.assertTrue(arc.tracks[0].get("_arc"))
+        self.assertGreaterEqual(len(arc.tracks[0].get("_points") or []), 3)
+        t = tempfile.gettempdir()
+        a = snapshot.render(arc, layer="F.Cu", px_per_mm=20,
+                            out=os.path.join(t, "arc_only.png"))
+        c = snapshot.render(chord, layer="F.Cu", px_per_mm=20,
+                            out=os.path.join(t, "arc_chord.png"))
+        d = snapshot.render(arc, layer="F.Cu", px_per_mm=20, compare=chord,
+                            out=os.path.join(t, "arc_vs_chord.png"))
+        try:
+            for out in (a, c, d):
+                self.assertEqual(out["status"], "ok", out)
+            # the count says which primitive was drawn, not just that ink happened
+            self.assertEqual(a["value"]["drawn"]["arcs"], 1, a["value"]["drawn"])
+            self.assertEqual(a["value"]["drawn"]["tracks"], 0, a["value"]["drawn"])
+            self.assertEqual(c["value"]["drawn"]["arcs"], 0, c["value"]["drawn"])
+            self.assertEqual(c["value"]["drawn"]["tracks"], 1, c["value"]["drawn"])
+            # copper the arc has and the chord does not (above the chord)
+            self.assertFalse(d["value"]["identical"], d["value"])
+            self.assertGreater(d["value"]["pixels_only_here"], 200, d["value"])
+            # and copper the chord has and the arc does not (its interior)
+            self.assertGreater(d["value"]["pixels_only_there"], 200, d["value"])
+            # and WHERE: the bulge reaches file y 15, this server reports y -15
+            x0, y0, x1, y1 = d["value"]["changed_bbox_mm"]
+            self.assertLessEqual(y0, -14.0, d["value"]["changed_bbox_mm"])
+            self.assertGreaterEqual(y1, -10.5, d["value"]["changed_bbox_mm"])
+            self.assertLessEqual(x0, 10.5)
+            self.assertGreaterEqual(x1, 19.5)
+        finally:
+            for out in (a, c, d):
+                p = out.get("value", {}).get("png")
+                if p:
+                    os.unlink(p)
 
     def test_a_compare_that_cannot_be_read_is_an_error(self):
         b = board(square_board(STRAIGHT))

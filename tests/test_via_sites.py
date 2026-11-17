@@ -95,7 +95,7 @@ class TestDrillRule(_Sites):
     def test_two_drills_need_centre_distance_of_drill_plus_wall(self):
         self.apply({"op": "add_net", "name": "SIG"},
                    {"op": "add_via", "x": 30.0, "y": 20.0, "drill": 0.3,
-                    "diameter": 0.5, "net": "SIG", "layers": ["F.Cu", "B.Cu"]})
+                    "size": 0.5, "net": "SIG", "layers": ["F.Cu", "B.Cu"]})
         wall = self.at(30.0, 20.0, net="SIG")["assumptions"]["hole_to_hole_mm"]
         # 0.5 apart: 0.5 - 0.15 - 0.15 = 0.20 < wall, so refused
         too_close = self.at(30.5, 20.0, net="SIG")["value"]

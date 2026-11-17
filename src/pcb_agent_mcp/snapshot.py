@@ -140,7 +140,10 @@ def _bboxes(board):
             ys.append(y)
     if not xs:
         for t in board.tracks:
-            for p in (t.get("start"), t.get("end")):
+            # An arc's bulge lives in `_points`, not between `start` and `end`:
+            # bounding only the chord crops the picture through the very thing
+            # the arc exists to show.
+            for p in (t.get("_points") or (t.get("start"), t.get("end"))):
                 if p:
                     xs.append(p[0])
                     ys.append(p[1])
@@ -177,7 +180,8 @@ def _canvas(board, layer, s, box, opts):
         return ((x - x0) * s + 1, (y1 - y) * s + 1)
 
     pix = bytearray(bytes(BG) * (w * h))
-    drawn = {"pour_polygons": 0, "tracks": 0, "vias": 0, "pads": 0, "edge_segments": 0}
+    drawn = {"pour_polygons": 0, "tracks": 0, "arcs": 0, "vias": 0, "pads": 0,
+             "edge_segments": 0}
 
     if opts.get("pour"):
         for z in board.zones:
@@ -199,6 +203,20 @@ def _canvas(board, layer, s, box, opts):
             if not st or not en:
                 continue
             r = max(0.35, (wd * s) / 2.0)
+            pts = t.get("_points") if t.get("_arc") else None
+            if pts and len(pts) >= 3:
+                # An arc drawn as its chord is a lie: a serpentine of 0.08 mm
+                # radius arcs reads as a triangle, which is exactly the wrong
+                # answer a picture must never give. The adapter already samples
+                # the arc into `_points` (`kicad_pcb._arc_points`); draw that
+                # polyline, one capsule per sampled hop.
+                prev = tf(*pts[0])
+                for p in pts[1:]:
+                    cur = tf(*p)
+                    _capsule(pix, w, h, prev, cur, r, COL["track"])
+                    prev = cur
+                drawn["arcs"] += 1
+                continue
             _capsule(pix, w, h, tf(*st), tf(*en), r, COL["track"])
             drawn["tracks"] += 1
 
@@ -426,6 +444,7 @@ def render(board, layer="F.Cu", px_per_mm=12.0, out=None,
         value=value,
         unit="px",
         model="flat raster: pour polygons (even-odd), tracks as capsules, "
+              "arc tracks as their sampled polyline (see `drawn.arcs`), "
               "via rings, pads, board edge",
         basis="the geometry the parsed file contains, drawn at one colour per "
               "object class; nothing is inferred and nothing is hidden",

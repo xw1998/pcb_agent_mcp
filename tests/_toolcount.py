@@ -69,11 +69,23 @@ used to be spread across the twelve files.
                  could produce: reference_changes_net - a defect no via fixes.
                  New question, not a flag.
 
+    263 -> 264   (no version bump - docs/202 is a stage note): board_power_copper -
+                 "what carries this rail, plane or width". board_net_report's
+                 power_net_thin could only see width, so a rail backed by a filled
+                 plane read as thin through its 0.1 mm escape stubs. This one
+                 separates plane_area_mm2 from trace_area_mm2, gives IPC-2221
+                 ampacity for the narrowest segment on external and internal
+                 copper, and lists the zone owners per layer with their priority
+                 (the only 'plane split' this format expresses). New question, and
+                 the older flag is now plane-aware too. Not added to the
+                 `available` list: it reads a board, so it is not a pure
+                 calculator, and that count stays 222.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 263
+EXPECTED_TOOL_COUNT = 264
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

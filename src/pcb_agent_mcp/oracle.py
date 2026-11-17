@@ -14,6 +14,7 @@ with no plane zones cannot be answered, and answering "no split" would be a
 lie that the DRC would happily confirm.
 """
 import math
+import re
 
 from . import geometry as G
 from .calc.result import ok, err
@@ -5913,9 +5914,36 @@ def _sig2(x):
 _POWERISH = ("+3V3", "+5V", "+12V", "VCC", "VDD", "VBUS", "VBAT", "VIN", "3V3",
              "5V", "AGND", "GND", "VREF")
 
+#: `<number>V<number>` at the start of the name: 1V8, 0V9, 3V3. This is how a
+#: rail names its own voltage, and it is the ONLY way a core rail such as
+#: `/+1V8_ANA` or `/+0V9_CPU` gets recognised - the tuple above never matched
+#: them, so every report built on it silently skipped the nets on this board
+#: that carry the most current.
+_VOLTAGE_RE = re.compile(r"^\d+V\d*(?:_|$)", re.I)
+
+#: Words that turn a rail name into a SIGNAL hanging off that rail: VBUS_DET,
+#: 3V3_EN, VDD_SENSE, 1V8_PG. Judging those on width is a false accusation, so
+#: they are refused before the sign test - `+3V3_PG` carries no current either.
+_SIGNAL_TAIL = ("DET", "EN", "SENSE", "FB", "INT", "STAT", "PG", "ALERT", "FLAG",
+                "OK", "FAULT")
 
 def _is_powerish(name):
-    n = (name or "").upper()
+    n = (name or "").strip().upper()
+    if not n:
+        return False
+    core = n
+    while core[:1] in ("+", "-", "/", "~"):
+        core = core[1:]
+    toks = [t for t in re.split(r"[_/ .]+", core) if t]
+    if not toks:
+        return False
+    tail = toks[-1]
+    if any(tail.endswith(k) for k in _SIGNAL_TAIL):
+        return False
+    if n[:1] in ("+", "-"):
+        return True                       # a rail written as +3V3 / -12V
+    if _VOLTAGE_RE.match(core):
+        return True                       # a rail written as 1V8 / 0V675
     return any(k in n for k in _POWERISH)
 
 
@@ -5981,6 +6009,7 @@ def net_geometry_report(board, min_segments=4, top=40, detour_flag=1.8):
     if not nets:
         return err("no routed copper on this board", "NO_GEOMETRY")
 
+    planes = _plane_area_by_net(board)
     rows = []
     for name, e in nets.items():
         if e["segs"] < int(min_segments):
@@ -5993,7 +6022,13 @@ def net_geometry_report(board, min_segments=4, top=40, detour_flag=1.8):
             flags.append("very_long_detour")
         elif ratio is not None and ratio >= float(detour_flag):
             flags.append("long_detour")
-        if _is_powerish(name) and widest < 0.25:
+        plane_mm2 = sum((planes.get(name) or {}).get("layers", {}).values())
+        # A rail backed by a filled plane legitimately runs 0.1 mm escapes from
+        # pad to plane; calling that thin hides the plane and sends the reader
+        # to widen copper that is not the conductor. `board_power_copper` has
+        # the per-layer breakdown; here the flag only survives when there is no
+        # filled copper under the name at all.
+        if _is_powerish(name) and widest < 0.25 and plane_mm2 <= 1e-9:
             flags.append("power_net_thin")
         if e["segs"] >= 8 and e["vias"] / float(e["segs"]) > 0.25:
             flags.append("via_heavy")
@@ -6003,6 +6038,7 @@ def net_geometry_report(board, min_segments=4, top=40, detour_flag=1.8):
                      "pad_mst_mm": round(mst, 2),
                      "detour_ratio": (round(ratio, 2) if ratio else None),
                      "widest_mm": round(widest, 3),
+                     "plane_mm2": round(plane_mm2, 2),
                      "layers": sorted(e["layers"]), "flags": flags})
     rows.sort(key=lambda r: (-(r["detour_ratio"] or 0), -r["length_mm"]))
     shown = rows[:int(top)] if top else rows
@@ -6025,6 +6061,256 @@ def net_geometry_report(board, min_segments=4, top=40, detour_flag=1.8):
                   "denominator ignores pad geometry, keepouts and layer changes",
         assumptions={"min_segments": int(min_segments),
                      "detour_flag": float(detour_flag)})
+
+
+def _zone_area(poly):
+    a = 0.0
+    n = len(poly)
+    for k in range(n):
+        x0, y0 = poly[k]
+        x1, y1 = poly[(k + 1) % n]
+        a += x0 * y1 - x1 * y0
+    return abs(a) / 2.0
+
+
+def _plane_area_by_net(board):
+    """net -> {layer: mm2 of FILLED copper}, plus how many outlines never filled.
+
+    Only filled polygons count. A zone outline that was drawn and never filled
+    carries no copper, and a report that adds its outline area would say the rail
+    is backed by a plane that does not exist - which is exactly the mistake
+    `power_loop` refuses to make when it looks for a way home.
+    """
+    out = {}
+    for z in (board.zones or []):
+        if z.get("keepout"):
+            continue
+        net = z.get("net")
+        polys = [q for q in (z.get("filled_polygons") or []) if len(q) >= 3]
+        e = out.setdefault(net, {"layers": {}, "unfilled": 0, "outlines": 0})
+        e["outlines"] += 1
+        if not polys:
+            e["unfilled"] += 1
+            continue
+        area = sum(_zone_area(q) for q in polys)
+        for lay in (z.get("layers") or []):
+            e["layers"][lay] = e["layers"].get(lay, 0.0) + area
+    return out
+
+
+def power_copper(board, nets=None, current_a=None, delta_t_c=10.0, copper_oz=1.0,
+                 standard="ipc2221", min_widest_mm=0.25, top=None):
+    """Per net: what actually carries the current - plane copper or trace width.
+
+    `board_net_geometry` already flags `power_net_thin` on `widest < 0.25`, and
+    the flag is wrong on any board that pours: a rail backed by a filled plane
+    legitimately runs 0.1 mm escape stubs from pad to plane, and calling that
+    "thin" hides the plane. This report separates the two carriers and then
+    judges each one on its own evidence:
+
+      * `trace_area_mm2` = sum(length x width) over the net's straight segments;
+      * `plane_area_mm2` = area of FILLED zone copper, per layer (an unfilled
+        outline contributes 0 and is counted in `zone_outlines_unfilled`);
+      * `plane_share` = plane / (plane + trace), so "mostly plane" and "mostly
+        traces" stop being the same number;
+      * `backing` = `plane` (plane_share >= 0.5), `mixed`, `traces_only` (no
+        filled copper at all) or `none` (no copper of any kind);
+      * `narrowest_capacity_a` = IPC-2221 ampacity of the narrowest segment on
+        the layer it runs on - two numbers, because inner copper is derated.
+
+    `flags` name the defects with the evidence that produced them:
+    `rail_on_signal_width` (no filled plane AND widest < min_widest_mm - this is
+    the old thin flag, now plane-aware), `plane_outline_unfilled`,
+    `narrower_than_asked` (only when the net has no plane: with a plane the stub
+    is the escape, not the conductor, so comparing it to the demand would be a
+    false accusation).
+
+    `plane_map` is the layer-by-layer list of zone owners with their priority,
+    which is the only form of "plane split" this format expresses: two nets on
+    one layer are told apart by priority and outline, nothing else.
+    """
+    from .calc import current as CUR
+    wanted = None
+    if nets:
+        wanted = [str(n) for n in nets]
+
+    tracks = {}
+    for t in board.tracks:
+        n = t.get("net")
+        if n is None:
+            continue
+        e = tracks.setdefault(n, {"length": 0.0, "segs": 0, "widths": [],
+                                  "layers": set()})
+        st, en = t.get("start"), t.get("end")
+        if st and en:
+            e["length"] += math.hypot(en[0] - st[0], en[1] - st[1])
+        e["segs"] += 1
+        w = float(t.get("width") or 0.0)
+        e["widths"].append(w)
+        if t.get("layer"):
+            e["layers"].add(t["layer"])
+
+    pads = {}
+    for fp in board.footprints:
+        for pd in fp.get("pads") or []:
+            n = pd.get("net")
+            if n is None or pd.get("x") is None:
+                continue
+            pads.setdefault(n, []).append("%s.%s"
+                                          % (fp.get("ref") or "?",
+                                             pd.get("number") or "?"))
+
+    vias = {}
+    for v in board.vias:
+        n = v.get("net")
+        if n is not None:
+            vias[n] = vias.get(n, 0) + 1
+
+    planes = _plane_area_by_net(board)
+
+    names = wanted if wanted is not None else sorted(
+        set(tracks) | set(planes) | set(pads))
+    if wanted is None:
+        names = [n for n in names if _is_powerish(n)]
+    if not names:
+        return err("no power net matched; pass nets=[...] or pour a plane first",
+                   "NO_GEOMETRY")
+
+    ext = set(_copper_layers(board)[:1] + _copper_layers(board)[-1:])
+    rows = []
+    for name in names:
+        e = tracks.get(name)
+        pl = planes.get(name) or {"layers": {}, "unfilled": 0, "outlines": 0}
+        plane_area = sum(pl["layers"].values())
+        # width x length summed per segment, not length x mean width: a 0.1 mm stub
+        # next to a 0.8 mm bus must not be averaged away.
+        trace_area = 0.0
+        if e:
+            trace_area = 0.0
+            for t in board.tracks:
+                if t.get("net") != name:
+                    continue
+                st, en = t.get("start"), t.get("end")
+                if not st or not en:
+                    continue
+                trace_area += (math.hypot(en[0] - st[0], en[1] - st[1])
+                               * float(t.get("width") or 0.0))
+        total = plane_area + trace_area
+        share = (plane_area / total) if total > 1e-9 else None
+        if plane_area <= 1e-9 and trace_area <= 1e-9:
+            backing = "none"
+        elif plane_area <= 1e-9:
+            backing = "traces_only"
+        elif share is not None and share >= 0.5:
+            backing = "plane"
+        else:
+            backing = "mixed"
+
+        hist = {}
+        for w in (e["widths"] if e else []):
+            k = round(w, 3)
+            hist[k] = hist.get(k, 0) + 1
+        narrowest = min(hist) if hist else None
+        widest = max(hist) if hist else None
+
+        cap = {}
+        if narrowest is not None:
+            for which in ("external", "internal"):
+                r = CUR.current_capacity(narrowest, delta_t_c=float(delta_t_c),
+                                         copper_oz=float(copper_oz),
+                                         layer=which, standard=standard)
+                cap[which] = (r["value"] if r.get("status") == "ok" else None)
+
+        req = None
+        # Only where the trace IS the conductor. On a poured rail the 0.1 mm
+        # segment is an escape stub and comparing it to the demand would send
+        # the reader to widen copper that carries nothing.
+        if current_a is not None and narrowest is not None and plane_area <= 1e-9:
+            lay = "external" if (e["layers"] & ext) or not e["layers"] else "internal"
+            r = CUR.width_for_current(float(current_a),
+                                      delta_t_c=float(delta_t_c),
+                                      copper_oz=float(copper_oz), layer=lay,
+                                      standard=standard)
+            if r.get("status") == "ok":
+                req = {"layer": lay, "width_mm": r["value"]}
+
+        flags = []
+        if backing in ("traces_only", "none") and widest is not None \
+                and widest < float(min_widest_mm):
+            flags.append("rail_on_signal_width")
+        if pl["unfilled"]:
+            flags.append("plane_outline_unfilled")
+        if backing in ("traces_only",) and req is not None and narrowest is not None \
+                and narrowest < req["width_mm"]:
+            flags.append("narrower_than_asked")
+
+        rows.append({
+            "net": name,
+            "backing": backing,
+            "pads": len(pads.get(name, [])),
+            "vias": vias.get(name, 0),
+            "trace_length_mm": round(e["length"], 2) if e else 0.0,
+            "segments": e["segs"] if e else 0,
+            "widths_mm": {("%.3f" % k): v for k, v in sorted(hist.items())},
+            "narrowest_mm": narrowest,
+            "widest_mm": widest,
+            "trace_area_mm2": round(trace_area, 2),
+            "plane_area_mm2": round(plane_area, 2),
+            "plane_layers": {k: round(v, 2) for k, v in
+                             sorted(pl["layers"].items())},
+            "zone_outlines": pl["outlines"],
+            "zone_outlines_unfilled": pl["unfilled"],
+            "plane_share": (round(share, 3) if share is not None else None),
+            "narrowest_capacity_a": cap,
+            "required_width_mm": req,
+            "flags": flags,
+        })
+    rows.sort(key=lambda r: (r["backing"] != "traces_only" and
+                             r["backing"] != "none",
+                             -r["trace_length_mm"]))
+    shown = rows[:int(top)] if top else rows
+
+    plane_map = {}
+    for z in (board.zones or []):
+        if z.get("keepout"):
+            continue
+        polys = [q for q in (z.get("filled_polygons") or []) if len(q) >= 3]
+        area = round(sum(_zone_area(q) for q in polys), 2)
+        for lay in (z.get("layers") or []):
+            plane_map.setdefault(lay, []).append(
+                {"net": z.get("net"), "priority": z.get("priority", 0),
+                 "area_mm2": area, "filled": bool(polys),
+                 "name": z.get("name") or ""})
+    for lay in plane_map:
+        plane_map[lay].sort(key=lambda r: (-r["priority"], r["net"] or ""))
+
+    return ok(
+        value={"nets": shown,
+               "flagged": [r["net"] for r in rows if r["flags"]],
+               "plane_map": {k: plane_map[k] for k in sorted(plane_map)},
+               "read_it_like_this": (
+                   "backing=traces_only means the rail has no filled plane and is "
+                   "carried by the width in widths_mm alone - compare "
+                   "narrowest_capacity_a against the current the rail must pass. "
+                   "backing=plane means the 0.1 mm segments are escape stubs; their "
+                   "ampacity is NOT the rail's limit. plane_map is the whole "
+                   "'plane split' story: nets that share a layer are separated only "
+                   "by outline and priority, so two entries on one layer at the "
+                   "same priority is a question the file cannot answer")},
+        unit="mm/mm2/A",
+        model="per-net carrier ledger: filled plane copper vs trace width x length",
+        basis="straight track segments (arcs by chord here - an arc's length is "
+              "longer, so trace_area is a slight under-count on arc runs); filled "
+              "zone polygons by shoelace; ampacity by calc.current (IPC-2221), "
+              "inner copper derated",
+        precision="a zone spanning several layers is counted at full area on each "
+                  "of them, so plane_area_mm2 summed across layers is not copper "
+                  "volume; plane_share is area-share, not current-share; "
+                  "required_width_mm is only filled in for nets with no plane",
+        assumptions={"min_widest_mm": float(min_widest_mm),
+                     "delta_t_c": float(delta_t_c),
+                     "copper_oz": float(copper_oz),
+                     "standard": standard})
 
 
 def pour_audit(board, zone_index=None, min_island_mm2=0.0):

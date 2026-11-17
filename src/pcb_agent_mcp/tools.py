@@ -4444,7 +4444,9 @@ _tool(
     "denominator is a LOWER bound, so a multi-drop net or one whose parts sit on "
     "opposite edges legitimately scores high - use it to pick which nets to look "
     "at, not as a defect verdict. Flags: long_detour, very_long_detour, "
-    "power_net_thin (a power net whose widest segment is under 0.25 mm), "
+    "power_net_thin (a power net whose widest segment is under 0.25 mm AND which "
+    "has no filled plane under it - a rail backed by a pour legitimately runs "
+    "0.1 mm escapes, so the flag is no longer about width alone), "
     "via_heavy. " + _NOT_WRITTEN,
     {"type": "object",
      "properties": dict({
@@ -4475,6 +4477,49 @@ _tool(
     _board_tool(lambda b, a: _oracle.pour_audit(
         b, zone_index=a.get("zone_index"), min_island_mm2=a.get("min_island_mm2", 0)),
         derived=True),
+)
+
+_tool(
+    "board_power_copper",
+    "Per net: WHAT CARRIES THE CURRENT - filled plane copper or trace width. "
+    "board_net_report's power_net_thin only knows width, and on a poured board "
+    "that reads a 0.1 mm escape stub as a thin rail while the plane underneath "
+    "carries amps. This separates the two carriers: trace_area_mm2 = "
+    "sum(length x width) per segment (a 0.1 mm stub next to a 0.8 mm bus is not "
+    "averaged away), plane_area_mm2 = area of FILLED zone copper per layer "
+    "(an outline drawn and never filled contributes 0 and is counted in "
+    "zone_outlines_unfilled), plane_share, and backing = plane (share >= 0.5) / "
+    "mixed / traces_only / none. narrowest_capacity_a is IPC-2221 ampacity of the "
+    "narrowest segment on external and on internal copper - two numbers because "
+    "inner copper is derated. Give current_a and required_width_mm comes back for "
+    "the layer the net runs on. plane_map lists every zone owner per layer with "
+    "its priority: nets that share a layer are separated only by outline and "
+    "priority, so that table IS the whole 'plane split' story this format "
+    "expresses. Flags name the defect with its evidence: rail_on_signal_width "
+    "(no filled plane and widest < min_widest_mm), plane_outline_unfilled, "
+    "narrower_than_asked (only without a plane - with one the stub is the escape, "
+    "not the conductor). " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "nets": {"type": "array", "items": {"type": "string"},
+                  "description": "nets to measure; omit for every power-shaped net "
+                                 "(sign, or a voltage in the name, or VCC/GND/...)"},
+         "current_a": _num("current the rail must pass; adds required_width_mm"),
+         "delta_t_c": _num("allowed temperature rise (default 10)", 10),
+         "copper_oz": _num("copper weight (default 1)", 1),
+         "standard": _str("IPC chart to fit: ipc2221 (default) or ipc2152",
+                          ["ipc2221", "ipc2152"], "ipc2221"),
+         "min_widest_mm": _num("a rail with no plane and a widest segment under "
+                               "this is flagged rail_on_signal_width", 0.25),
+         "top": _num("how many nets to return (0 = all)"),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(lambda b, a: _oracle.power_copper(
+        b, nets=a.get("nets"), current_a=a.get("current_a"),
+        delta_t_c=a.get("delta_t_c", 10), copper_oz=a.get("copper_oz", 1),
+        standard=a.get("standard") or "ipc2221",
+        min_widest_mm=a.get("min_widest_mm", 0.25),
+        top=a.get("top")), derived=True),
 )
 
 _tool(
@@ -5253,7 +5298,9 @@ def _tune_length(board, args):
                       pitch_mm=float(args.get("pitch_mm") or 0.1),
                       max_replacements=int(args.get("max_replacements") or 24),
                       allow_locked=args.get("allow_locked") is True,
-                      style=str(args.get("style") or "chamfer"),
+                      style=str(args.get("style") or "arc"),
+                      arc_r_min_mm=(None if args.get("arc_r_min_mm") is None
+                                    else float(args.get("arc_r_min_mm"))),
                       floor_mm=floor_mm,
                       with_headroom=args.get("headroom") is True)
     except ValueError as exc:
@@ -5283,6 +5330,8 @@ def _tune_length(board, args):
                        % (res["grid"]["rule_keepouts"],
                           len(res["grid"]["dropped_rule_keepouts"])),
              assumptions=res["assumptions"])
+    out["value"]["sub_legible_meanders"] = res["totals"].get(
+        "sub_legible_meanders", 0)
     out["value"]["rule_keepouts_dropped"] = res["grid"]["dropped_rule_keepouts"]
     out["value"]["keepout_rects_skipped_by_projection"] = skipped
     if res["status"] != "ok":
@@ -5348,9 +5397,10 @@ def _tune_length(board, args):
 _tool(
     "board_tune_length",
     "Length-match nets on copper that is ALREADY routed: the short member of each "
-    "group gets a serpentine cut into one of its own straight segments - "
-    "style=chamfer draws the 45-degree tooth, style=arc draws a rounded meander "
-    "(90-degree arcs tangent to the axis, length h+r*(pi-2) per tooth) "
+    "group gets a serpentine cut into one of its own straight segments. The default "
+    "shape is style=arc: a rounded meander (90-degree arcs tangent to the axis, "
+    "length h+r*(pi-2) per tooth). style=chamfer draws the 45-degree triangular "
+    "tooth, which the user rejected on sight, so it is explicit-only "
     "(same two end points, so the net stays connected), and every new segment is "
     "checked against the whole board - other nets' clearance, the rule-derived "
     "keep-out rectangles, the board edge - before it becomes an op. board_route can "
@@ -5362,7 +5412,7 @@ _tool(
     "whose reference cannot be reached comes back as status length_not_matched with "
     "the length it did reach and, per net, which segment refused and why "
     "(blocked / does_not_fit / not_on_45_grid / copper_is_locked / "
-    "replacement_budget). Vias are counted but NEVER added to length; an arc's "
+    "replacement_budget / no_legible_radius). Vias are counted but NEVER added to length; an arc's "
     "length IS counted (through its three points, not from chords) and "
     "arcs_counted says how many, and a meander only adds copper "
     "- a net that is too long is `needs_reroute`, not shortened. Plan by default; "
@@ -5385,9 +5435,19 @@ _tool(
                         "reference_net": _str("net that also sets the reference "
                                               "length (the clock, typically)"),
                     }, **{"required": ["nets"]})}},
-         "style": _str("meander shape: chamfer = 45-degree tooth (default), arc = "
-                       "rounded meander of tangent 90-degree arcs", ["chamfer", "arc"],
-                       "chamfer"),
+         "style": _str("meander shape: arc (default) = rounded meander of tangent "
+                       "90-degree arcs; chamfer = the 45-degree triangular tooth, "
+                       "which a person rejected on sight - explicit only",
+                       ["arc", "chamfer"], "arc"),
+         "arc_r_min_mm": _num(
+             "smallest arc radius (mm) the caller will accept on the meander. "
+             "Default (omitted): r >= 1 x trace width is PREFERRED, and when the "
+             "geometry has no legal tooth at that radius the smaller arc is drawn "
+             "anyway and counted in totals.sub_legible_meanders, so a wave is not "
+             "lost to a cosmetic rule. Given explicitly: the floor is a "
+             "REQUIREMENT - a net that cannot meet it comes back with "
+             "reason=no_legible_radius naming r_floor_mm, the smallest radius the "
+             "shape allows and the sagitta that radius buys", None),
          "pitch_mm": _num("search raster for the blocking check", 0.1),
          "max_replacements": _num("segments one net may have replaced", 24),
          "respect_apply_floor": _bool(

@@ -140,9 +140,17 @@ class TestTheSerpentineLands(_Board):
                                after["LONG"]["length_mm"], delta=0.05)
         # Connectivity: the replaced chain starts and ends where the old segment
         # did, so the two original end points still carry copper.
-        segs = [s for s in TB.segments(self.reload()) if s["net"] == "SHORT"]
-        pts = set(tuple(round(v, 4) for v in s["start"]) for s in segs)
-        pts |= set(tuple(round(v, 4) for v in s["end"]) for s in segs)
+        # The file's copper is tracks AND arcs: `segments()` deliberately skips
+        # arcs ("a shape, not a segment"), and the meander's last piece IS an arc
+        # in the house style, so reading only `segments()` reported a dangling end
+        # that was not dangling at all.
+        ends = []
+        for node in self.reload().tracks:
+            if node.get("net") != "SHORT":
+                continue
+            ends.append(tuple(round(v, 4) for v in node["start"]))
+            ends.append(tuple(round(v, 4) for v in node["end"]))
+        pts = set(ends)
         self.assertIn((5.0, 8.0), pts)
         self.assertIn((13.0, 8.0), pts)
 
@@ -198,11 +206,12 @@ class TestTheRefusalsAreNamed(_Board):
         entry = res["groups"][0]["per_net"][1]
         self.assertLess(entry["after_mm"], 40.0)
         self.assertGreater(entry["after_mm"], entry["before_mm"])
-        # Which of the two honest answers it is depends on the segment: a 13 mm
-        # run runs out of room for another tooth (does_not_fit) before the
-        # replacement budget does. Both are named; neither is a silent stop.
-        self.assertIn("does_not_fit",
-                      [r["reason"] for r in entry["refusals"]])
+        # Which of the honest answers it is depends on the segment and the style:
+        # `does_not_fit` when what is left of the run is too short for another
+        # tooth, `too_shallow` when the only shapes that still fit have a cross-bar
+        # under the legibility floor. Both are named; neither is a silent stop.
+        self.assertIn([r["reason"] for r in entry["refusals"]][0],
+                      ("does_not_fit", "too_shallow", "no_legible_radius"))
 
 
 class TestNamesAndGroups(_Board):
@@ -264,6 +273,13 @@ class _Channels(_Board):
 class TestTheApplyFloor(_Channels):
     """A meander legal by the net rule can still be refused by the write gate.
 
+    Run in `style="chamfer"` on purpose: this class is about the clearance
+    ACCOUNTING, and the 0.6 mm channel these fixtures build has room for a 45-degree
+    tooth (h = amp) but not for a rounded one (amp = h + 2r, ~2x taller for the same
+    length - measured on this fixture: chamfer closes 1.5 mm, arc reaches 9.73 of
+    10.0 and names the climb). The arc side of that trade is pinned in
+    `TestArcMeander` and in `docs/202` section 3.
+
     `edit.apply_plan` will not grow the count of different-net pairs closer than
     0.2 mm, and a board's bundles are often already at 0.1 mm. The tool therefore
     COUNTS that cost instead of pretending it does not exist: the number travels
@@ -276,7 +292,7 @@ class TestTheApplyFloor(_Channels):
 
     def test_a_rule_legal_meander_reports_its_floor_cost(self):
         groups = self._pair_in_a_channel()
-        res = TB.plan(self.reload(), groups)
+        res = TB.plan(self.reload(), groups, style="chamfer")
         self.assertEqual(res["groups"][0]["status"], "matched")
         self.assertGreaterEqual(res["clearance_floor"]["new_pairs"], 1)
         self.assertEqual(res["clearance_floor"]["floor_mm"], TB.FLOOR_MM)
@@ -286,7 +302,8 @@ class TestTheApplyFloor(_Channels):
 
     def test_judging_with_the_floor_refuses_the_same_meander(self):
         groups = self._pair_in_a_channel()
-        res = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM)
+        res = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM,
+                      style="chamfer")
         self.assertEqual(res["groups"][0]["status"], "length_not_matched")
         reasons = [r["reason"] for e in res["groups"][0]["per_net"]
                    for r in e["refusals"]]
@@ -320,10 +337,11 @@ class TestTheCallerCanAskForAWritablePlan(_Channels):
 
     def test_the_flag_trades_correction_for_a_writeable_plan(self):
         groups = self._pair_in_a_channel()
-        loud = TB.plan(self.reload(), groups)
+        loud = TB.plan(self.reload(), groups, style="chamfer")
         self.assertEqual(loud["groups"][0]["status"], "matched")
         self.assertGreaterEqual(loud["clearance_floor"]["new_pairs"], 1)
-        quiet = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM)
+        quiet = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM,
+                        style="chamfer")
         self.assertEqual(quiet["clearance_floor"]["new_pairs"], 0)
         self.assertEqual(quiet["groups"][0]["status"], "length_not_matched")
         self.assertEqual(quiet["ops"], [])
@@ -333,7 +351,8 @@ class TestTheCallerCanAskForAWritablePlan(_Channels):
 
     def test_a_wave_that_is_already_clear_of_the_floor_is_still_planned(self):
         groups = self._pair_in_a_wide_channel()
-        res = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM)
+        res = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM,
+                      style="chamfer")
         self.assertEqual(res["groups"][0]["status"], "matched", res)
         self.assertEqual(res["clearance_floor"]["new_pairs"], 0)
         self.assertGreater(len(res["ops"]), 0)
@@ -342,14 +361,15 @@ class TestTheCallerCanAskForAWritablePlan(_Channels):
         groups = self._pair_in_a_channel()
         out = tools.TOOLS["board_tune_length"]["handler"](
             {"path": self.path, "groups": groups, "apply": True,
-             "respect_apply_floor": True})
+             "respect_apply_floor": True, "style": "chamfer"})
         self.assertEqual(out["value"]["clearance_floor"]["new_pairs"], 0)
         self.assertNotIn("allow_new_violations", out.get("next_step") or "")
         self.assertEqual(out["status"], "length_not_matched")
         # default still reaches the cost report, i.e. the flag is not wiring that
         # silently replaced the old path
         loud = tools.TOOLS["board_tune_length"]["handler"](
-            {"path": self.path, "groups": groups, "apply": True})
+            {"path": self.path, "groups": groups, "apply": True,
+             "style": "chamfer"})
         self.assertGreaterEqual(loud["value"]["clearance_floor"]["new_pairs"], 1)
         self.assertIn("allow_new_violations", loud.get("next_step") or "")
 
@@ -357,7 +377,8 @@ class TestTheCallerCanAskForAWritablePlan(_Channels):
         groups = self._pair_in_a_channel()
         before = os.stat(self.path).st_mtime
         out = tools.TOOLS["board_tune_length"]["handler"](
-            {"path": self.path, "groups": groups, "apply": True})
+            {"path": self.path, "groups": groups, "apply": True,
+             "style": "chamfer"})
         self.assertEqual(out["status"], "ok", out.get("message"))
         self.assertIn("allow_new_violations", out["next_step"])
         self.assertEqual(os.stat(self.path).st_mtime, before)
@@ -471,15 +492,20 @@ class TestArcMeander(_Board):
         self.assertEqual(last["style"], "arc")
         self.assertGreater(last["arcs"], 0)
 
-    def test_copper_that_needs_more_than_one_tooth_still_writes(self):
-        # A 2 mm run that has to give up 10 mm: no single tooth reaches that, so
-        # the plan reshapes the SAME origin segment more than once. Those later
-        # teeth exist only in the plan - they carry no uuid yet - and the write
-        # used to crash on them ('delete_track needs a selector'). The file's own
-        # segment uuid is the only selector that can exist, so one delete plus the
-        # whole final path must be what lands.
-        self.write(self.track("LONGR", (5.0, 21.0), (17.0, 21.0)),
-                   self.track("SHORTR", (5.0, 23.0), (7.0, 23.0)))
+    def test_copper_that_needs_more_than_one_meander_still_writes(self):
+        # 6 mm owed, and one segment can only pay what `T.max_extra` allows at its
+        # amplitude, so the correction is spread over TWO runs of the same net.
+        # Each ORIGIN segment gets exactly one delete and one final path: a piece
+        # the plan created carries no uuid yet, and a delete naming one of those
+        # used to crash ('delete_track needs a selector').
+        #
+        # (Until the arc capacity landed this fixture was one 2 mm run owing
+        # 10 mm - a 32-tooth comb at 0.25 mm pitch on a 0.25 mm trace, i.e. a solid
+        # block with 10 mm of "length" in it. That shape is what the capacity
+        # refuses now; see `docs/202` section 5.)
+        self.write(self.track("LONGR", (5.0, 21.0), (21.0, 21.0)),
+                   self.track("SHORTR", (5.0, 23.0), (11.0, 23.0)),
+                   self.track("SHORTR", (11.0, 23.0), (17.0, 23.0)))
         res = TB.plan(self.reload(), [{"name": "r", "nets": ["LONGR",
                                                           "SHORTR"],
                                       "tol_mm": 0.05}], style="arc")
@@ -488,14 +514,43 @@ class TestArcMeander(_Board):
                  if e["net"] == "SHORTR"][0]
         self.assertGreater(entry["meanders"], 1, entry)
         deletes = [o for o in res["ops"] if o["op"] == "delete_track"]
-        self.assertEqual(len(deletes), 1, deletes)
-        self.assertTrue(deletes[0].get("uuid"))
+        # One delete per ORIGIN segment, not one per meander: a second wave on a
+        # segment lands in that block's atom list (the `at` index), which is the
+        # path that used to crash with "delete_track needs a selector". So the
+        # number of deletes is <= the meander count and no uuid may repeat - a
+        # repeated delete would be deleting copper the plan itself just made, and
+        # that copper has no uuid to name.
+        self.assertTrue(all(d.get("uuid") for d in deletes), deletes)
+        self.assertEqual(len(set(d["uuid"] for d in deletes)), len(deletes))
+        self.assertLessEqual(len(deletes), entry["meanders"], deletes)
         plan = E.propose(self.path, res["ops"])
         self.assertEqual(plan["blocking"], [], plan["blocking"])
         E.apply_plan(plan["plan_id"], confirm=True, options={"engine": False})
         after = TB.measure(self.reload())
         self.assertAlmostEqual(after["SHORTR"]["length_mm"],
                                after["LONGR"]["length_mm"], delta=0.05)
+
+    def test_a_radius_below_the_floor_is_drawn_and_counted_not_refused(self):
+        # The floor asks for r >= 1 x trace width so the corner reads as round.
+        # Geometry does not always allow it: the smallest legal tooth at radius r
+        # adds h + r*(pi-2) mm with h >= ARC_H_MIN, so a 0.25 mm trace owing 0.5 mm
+        # has no 0.25 mm-radius wave at all. The answer is the smaller radius that
+        # DOES fit, reported - not a refusal of a real length fix ("docs/202"
+        # section 3 measured the alternative: 232 -> 88 -> 60 -> 0 arcs as the
+        # floor climbs, on a lane whose verdict never moved).
+        seg = {"start": (5.0, 8.0), "end": (13.0, 8.0), "length_mm": 8.0,
+               "width": 0.25, "net": "SHORT", "layer": "F.Cu", "locked": False}
+        got = TB.arc_meander(seg, 0.5, 1.0, 1)
+        self.assertIsNotNone(got.get("pieces"), got)
+        self.assertTrue(got.get("sub_legible"), got)
+        self.assertLess(got["r"], got["r_floor_mm"])
+        self.assertAlmostEqual(got["r_floor_mm"], 0.25, places=6)
+        self.assertAlmostEqual(self._length_of(got["pieces"]), 8.5, places=5)
+        # ... and an EXPLICIT floor is a requirement, so the same call refuses.
+        strict = TB.arc_meander(seg, 0.5, 1.0, 1, r_min_mm=0.25)
+        self.assertIsNone(strict.get("pieces"), strict)
+        self.assertTrue(strict.get("no_legible_radius"), strict)
+        self.assertEqual(strict["r_floor_mm"], 0.25)
 
     def test_an_unknown_style_is_refused_by_name(self):
         with self.assertRaises(TB.TuneError) as ctx:

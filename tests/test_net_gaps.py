@@ -68,7 +68,7 @@ class _Gaps(RoutabilityBase):
                 "width": width, "layer": layer, "net": net, "create_net": True}
 
     def via(self, x, y, net=NET):
-        return {"op": "add_via", "x": x, "y": y, "drill": 0.3, "diameter": 0.5,
+        return {"op": "add_via", "x": x, "y": y, "drill": 0.3, "size": 0.5,
                 "net": net, "layers": ["F.Cu", "B.Cu"]}
 
 class TestTwoPadsAreTwoPieces(_Gaps):
