@@ -66,6 +66,35 @@ def _axis_rect(poly):
     return (x0, y0, x1, y1)
 
 
+def _pad_span(a, b, poly, steps=60):
+    """The `(t0, t1)` part of segment a->b that lies inside `poly`, or None.
+
+    Only one END may be inside: this answers "how much of this stub is still the
+    pad it started on", which is the only question the edge rule asks of a
+    castellation. A segment that crosses a pad without ending in it returns
+    None on purpose - exempting it would exempt copper that is not attached to
+    that pad at all, and a false clean answer is worse than a false complaint.
+
+    Bisection instead of clipping: pads are polygons, and the corners of a
+    roundrect are the one place where its box and its copper differ, which is
+    exactly where the edge rule could be dodged by mistake.
+    """
+    def inside(t):
+        return G.point_in_polygon((a[0] + (b[0] - a[0]) * t,
+                                   a[1] + (b[1] - a[1]) * t), poly)
+
+    ia, ib = inside(0.0), inside(1.0)
+    if ia == ib:
+        return (0.0, 1.0) if ia else None
+    lo, hi = 0.0, 1.0
+    for _ in range(steps):
+        mid = 0.5 * (lo + hi)
+        if inside(mid) == ia:
+            lo = mid
+        else:
+            hi = mid
+    return (0.0, lo) if ia else (hi, 1.0)
+
 class Grid(object):
     """Cell occupancy per copper layer, plus exact geometry for acceptance."""
 
@@ -740,7 +769,8 @@ class Grid(object):
                         "actual_mm": round(d, 4),
                         "short_by_mm": round(need - d, 4)})
         out.extend(self._keepout_for_segment(tuple(a), tuple(b), layer, width))
-        out.extend(self._edge_for_segment(tuple(a), tuple(b), width))
+        out.extend(self._edge_for_segment(tuple(a), tuple(b), width,
+                                         layer=layer, net=net))
         out.sort(key=lambda w: -w["short_by_mm"])
         return out
 
@@ -761,15 +791,38 @@ class Grid(object):
                     "short_by_mm": round(need - dist, 4)}
         return None
 
-    def _edge_for_segment(self, a, b, width):
+    def _edge_for_segment(self, a, b, width, layer=None, net=None):
         """Is this track's copper inside the `edge` band along Edge.Cuts?
 
         Same rule the referee applies. It is a separate test from clearance
         because it has nothing to do with which net is next door.
+
+        The copper that belongs to a PAD is not the track's copper. A
+        castellation pad is centred on the outline by design, so a stub that
+        starts on one is measured from where it leaves the pad - otherwise the
+        rule forbids the pad the board was built around, which is exactly what
+        happened to J1 on RK3506 (`too_close_to_edge 0.35` on a stub whose
+        `from` point was the Edge.Cuts line itself).
         """
         if not self.edge or not self.board.outline:
             return []
         half = width / 2.0
+        out = []
+        for u, v in self._segments_outside_pads(a, b, layer, net):
+            gap = self._gap_to_edge(u, v, half)
+            if gap is None:
+                continue                   # nothing in the edge band here
+            hit = self._too_close_to_edge(gap, half, u)
+            if hit:
+                out.append(hit)
+        return out
+
+    def _gap_to_edge(self, a, b, half):
+        """Smallest gap from this segment's copper to Edge.Cuts, or None.
+
+        None means 'no outline near enough to be in the band', which is a
+        different answer from 0.0 and must stay different.
+        """
         ax0, ax1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
         ay0, ay1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
         gap = None
@@ -786,10 +839,81 @@ class Grid(object):
                 gap = g
                 if gap <= half:
                     break
-        if gap is None:
-            return []                      # nothing in the edge band, nothing to say
-        hit = self._too_close_to_edge(gap, half, a)
-        return [hit] if hit else []
+        return gap
+
+    def _segments_outside_pads(self, a, b, layer, net):
+        """Split a->b into the stretches whose copper is not a same-net pad's.
+
+        One shape for the caller to loop over: `[(0.0, 1.0)]` when no pad of
+        this net is involved, `[]` when the whole segment lies inside pads.
+        """
+        spans = self._pad_spans(a, b, layer, net)
+        if not spans:
+            return [(a, b)]
+        keep, cur = [], 0.0
+        for t0, t1 in spans:
+            if t0 > cur:
+                keep.append((cur, t0))
+            if t1 > cur:
+                cur = t1
+        if cur < 1.0:
+            keep.append((cur, 1.0))
+        return [((a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0),
+                 (a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1))
+                for t0, t1 in keep if t1 - t0 > 1e-12]
+
+    def _pad_spans(self, a, b, layer, net):
+        """Which parts of a->b are covered by a pad of the SAME net, as t-ranges.
+
+        Bisection on point-in-polygon rather than the pad's bounding box: a
+        roundrect corner lies inside its box, so exempting the box would hide a
+        real copper-to-edge violation that only the rounded corner reveals. 60
+        steps take the boundary to the last bit of the coordinate, and this only
+        runs for a segment that is already inside the edge band.
+        """
+        if not net or not layer:
+            return []
+        got = self._obs.get(layer)
+        if got is None:
+            return []
+        objs, boxes, buckets = got
+        bx = (min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1]))
+        cell = self._cell
+        cand = set()
+        for gx in range(int(math.floor((bx[0] - 0.1) / cell)),
+                        int(math.floor((bx[2] + 0.1) / cell)) + 1):
+            for gy in range(int(math.floor((bx[1] - 0.1) / cell)),
+                            int(math.floor((bx[3] + 0.1) / cell)) + 1):
+                idx = buckets.get((gx, gy))
+                if idx:
+                    cand.update(idx)
+        spans = []
+        for k in cand:
+            it = objs[k]
+            if it.get("kind") != "pad" or it.get("net") != net:
+                continue
+            poly = it.get("poly")
+            if not poly or len(poly) < 3:
+                continue
+            box = boxes[k]
+            if (bx[0] > box[2] or bx[2] < box[0]
+                    or bx[1] > box[3] or bx[3] < box[1]):
+                continue
+            if layer not in (it.get("layers") or []):
+                continue
+            span = _pad_span(a, b, poly)
+            if span:
+                spans.append(span)
+        if not spans:
+            return []
+        spans.sort()
+        merged = [spans[0]]
+        for t0, t1 in spans[1:]:
+            if t0 <= merged[-1][1] + 1e-12:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], t1))
+            else:
+                merged.append((t0, t1))
+        return merged
 
     def _edge_for_via(self, x, y, dia):
         if not self.edge or not self.board.outline:

@@ -1329,6 +1329,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         # back `routed` while its first track began a millimetre away from the
         # pad, touching nothing: a wrong answer, not a slow one.
         escapes = []
+        escape_failed = False
         for item in terminals:
             t = item["term"]
             i, j = t["node"]
@@ -1348,8 +1349,15 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                     # it - a "no" with a reason beats a bare "no"
                     "blockers": BLOCK.blockers(grid, net, t["at"], layer,
                                                width=width)}
+                # A failed escape used to fall through with `ok` still True, so
+                # the net came back `routed` with its first track starting 0.8 mm
+                # off the pad: copper that touches nothing is a wrong answer.
+                escape_failed = True
+                continue
             results[net]["segments"] += 1
             escapes.append("%s.%s" % (t["reference"], t["pad"]))
+        if escape_failed:
+            return False
         if escapes:
             note = ("%d pad(s) had their centre cell blocked and were joined to "
                     "the nearest free cell: %s" % (len(escapes),

@@ -467,6 +467,95 @@ class TestCopperKeepsOffTheBoardEdge(RouteBase):
                                 "copper came out %.4f mm from Edge.Cuts while the "
                                 "rule asked for 0.1 mm" % got)
 
+class TestAnEdgePadIsNotAWall(RouteBase):
+    """A pad centred ON Edge.Cuts must still be routable.
+
+    The rule this class defends, and its two edges:
+
+    * a castellation pad (an edge connector, cut in half by the outline) is a
+      process option, not a clearance violation - `ruleset.measure._castellated`
+      already says so, and the precedent it names is a shipped Adafruit Feather.
+      Its net therefore has to leave the pad, which means the pad's OWN copper
+      cannot be inside the edge band;
+    * the exemption is the pad's copper and nothing else. Copper that merely
+      runs near the edge is still refused (`TestCopperKeepsOffTheBoardEdge`),
+      and the reverse control below widens the rule past the pad's inward reach
+      and demands the same board fail - so a passing test cannot be explained by
+      the band having been switched off.
+
+    Measured before the fix: every one of the five unrouted J1 nets on RK3506
+    stopped with `search_budget`, and the first stub it wanted to emit was
+    rejected `too_close_to_edge, short_by 0.35` with `from` = (45.0, 9.0) - the
+    Edge.Cuts line itself, i.e. the pad's centre.
+    """
+
+    # 1.0 mm pad on a 60 x 40 board: half of it reaches 0.5 mm inward, so a
+    # 0.3 mm rule (0.3 + 0.125 of half-track = 0.425) is satisfiable the moment
+    # the track gets out of the pad, and a 0.6 mm rule is not.
+    PAD_MM = 1.0
+
+    def setUp(self):
+        RouteBase.setUp(self)
+        self.apply(
+            self.place("EdgePad", [("1", 0, 0, self.PAD_MM, self.PAD_MM)],
+                       ref="J1", x=0.0, y=20.0, nets={"1": "SIG"}),
+            self.place("Pad", [("1", 0, 0, 1.0, 1.0)], ref="J2", x=30.0,
+                       y=20.0, nets={"1": "SIG"}))
+
+    def test_the_net_of_an_edge_pad_leaves_the_pad(self):
+        res = self.route(nets=["SIG"], edge_clearance_mm=0.3)
+        self.assertEqual(res["failed"], [], res["failed"])
+        self.assertTrue(res["ops"], "no copper emitted")
+        starts = [(op["x1"], op["y1"]) for op in res["ops"]
+                  if op["op"] == "add_track"]
+        self.assertTrue(any(abs(x) < 0.05 for x, _y in starts),
+                        "no track starts on the edge pad: %s" % (starts,))
+
+    def test_the_copper_outside_the_pad_still_keeps_the_edge_rule(self):
+        res = self.route(nets=["SIG"], edge_clearance_mm=0.3)
+        self.assertEqual(res["failed"], [], res["failed"])
+        half_pad = self.PAD_MM / 2.0
+        worst = None
+        for op in res["ops"]:
+            if op["op"] != "add_track":
+                continue
+            a = (op["x1"], op["y1"])
+            b = (op["x2"], op["y2"])
+            if max(a[0], b[0]) <= half_pad:
+                continue        # this whole segment is the pad's copper
+            # the pad's half of the stub is the pad's copper: measure the rest
+            lo = 0.0
+            if min(a[0], b[0]) < half_pad and a[0] != b[0]:
+                lo = (half_pad - a[0]) / (b[0] - a[0])
+                lo = min(1.0, max(0.0, lo))
+            p = (a[0] + (b[0] - a[0]) * lo, a[1] + (b[1] - a[1]) * lo)
+            d = min(GEO.dist_segment_segment(p, b, ring_a, ring_b)
+                    for ring_a, ring_b in self._left_edge()) - op["width"] / 2.0
+            if worst is None or d < worst:
+                worst = d
+        self.assertIsNotNone(worst)
+        self.assertGreaterEqual(worst, 0.3 - 1e-6,
+                                "copper came out %.4f mm from Edge.Cuts while "
+                                "the rule asked for 0.3 mm" % worst)
+
+    def test_the_exemption_ends_where_the_pad_does(self):
+        # 0.6 mm is wider than the pad reaches inward, so the copper outside the
+        # pad cannot keep the rule and the net MUST fail. Without this arm the
+        # passing test above would also pass on a router that simply turned the
+        # edge band off.
+        res = self.route(nets=["SIG"], edge_clearance_mm=0.6)
+        self.assertTrue(res["failed"], res["ops"])
+
+    def _left_edge(self):
+        ring = [tuple(p) for p in self.load().outline[0]]
+        segs = []
+        for k in range(len(ring)):
+            a, b = ring[k], ring[(k + 1) % len(ring)]
+            if abs(a[0]) < 1e-9 and abs(b[0]) < 1e-9:
+                segs.append((a, b))
+        self.assertTrue(segs, "no left edge in the outline")
+        return segs
+
 class TestCreepageIsNeverInvented(RouteBase):
     """Creepage is a standard lookup, not a board-file property.
 
