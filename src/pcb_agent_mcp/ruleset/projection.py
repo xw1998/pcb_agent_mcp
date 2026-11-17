@@ -1,4 +1,4 @@
-"""Which of the 29 layout rules can reach the GENERATOR, and as what shape.
+"""Which of the 30 layout rules can reach the GENERATOR, and as what shape.
 
 The question this module answers is the one 0.1.20 could not: a rule that has a
 source and a limit is still only a *measurement of a board that already exists*.
@@ -136,6 +136,13 @@ ENTRIES = [
      "route.return_path adds a return via at every layer change while "
      "plan(return_path=True) is the default"),
     # ---- paired ----------------------------------------------------------
+    ("layout.length_tuning_corridor", "net_geometry", "not_wired",
+     "the tuner (route.tune_board) is the only code here that can place teeth, "
+     "and it judges a whole net: `plan()` refuses the net when any candidate "
+     "segment is too shallow, so 'this net has 6 mm of usable stretch' cannot "
+     "become copper. What is missing is per-segment selection, not a rectangle - "
+     "the rule is answered by the corridor WIDTH that layout reserved, and no "
+     "router can widen a corridor or move the parts that crowd it"),
     ("layout.diffpair_skew", "paired", "not_wired",
      "route.tune.finish matches lengths when the board DECLARES diff_pairs; "
      "nothing derives p/n pairs from net names, and inventing them would be a "
