@@ -8573,6 +8573,11 @@ _tool(
                                             "change is clean", None)}},
                 "allow_layer_changes": _bool("accept the forbidden layer changes "
                                              "this policy names", False),
+                "allow_plane_crossing": _bool(
+                    "accept copper laid on a reference plane. A pour is re-cut "
+                    "around new tracks, so DRC stays silent while the return path "
+                    "is cut: this is the override for a plan where cutting that "
+                    "plane IS the edit. The gate row still reports the cut", False),
             }},
     }, "required": ["path", "operations"]},
     _board_propose,
@@ -8617,6 +8622,9 @@ _tool(
                                             "change is clean", None)}},
                 "allow_layer_changes": _bool("accept the forbidden layer changes "
                                              "this policy names", False),
+                "allow_plane_crossing": _bool(
+                    "accept copper laid on a reference plane (the plan's own "
+                    "answer is stored; this only lets it write)", False),
             "step": _num("STEPPED WRITE: how many operations to write in this call. "
                          "Each call leaves a complete board file on disk, so the "
                          "change can be watched in the EDA and stopped between steps. "

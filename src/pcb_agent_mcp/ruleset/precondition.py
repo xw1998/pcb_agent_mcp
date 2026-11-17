@@ -248,7 +248,8 @@ def process_declared(process, copper_write=True):
 # ------------------------------------------------------------------ the verdict
 def assess(path=None, *, affected=(), outline=None, clearance_after=None,
            clearance_before=None, process=None, engine_on=True,
-           allow_edge_changes=False, allow_open_outline=False, copper_adds=None):
+           allow_edge_changes=False, allow_open_outline=False, copper_adds=None,
+           plane_pours=None, allow_plane_crossing=False):
     """Run every check and resolve them into one answer.
 
     Returns ``{"ok", "verdict", "blocking", "reported", "checks"}``. `ok` is True
@@ -269,6 +270,8 @@ def assess(path=None, *, affected=(), outline=None, clearance_after=None,
         mech_unchanged(affected, allow_edge_changes=allow_edge_changes),
         clearance_no_worse(clearance_after, clearance_before,
                            copper_write=copper_write),
+        plane_pour_intact(plane_pours, copper_write=copper_write,
+                          allow=allow_plane_crossing),
         process_declared(process, copper_write=copper_write),
     ]
     if allow_open_outline:
@@ -294,6 +297,63 @@ def assess(path=None, *, affected=(), outline=None, clearance_after=None,
                      "can read, not a question")}
 
 
+def plane_pour_intact(report, copper_write=True, allow=False):
+    """Does this plan land copper on a pour that is a reference plane?
+
+    `report` is `edit.planes.crossings(...)`: the pours this plan would put
+    another net's copper on, each carrying whether the pour is a plane (its
+    outline covers at least half the board). A track crossing a pour is legal
+    copper - the official filler re-cuts the pour around it - so DRC says
+    nothing and the bill is the return path: on the RK3506 SOM four segments on
+    In1.Cu took 36.96 mm2 out of a 1934 mm2 GND plane.
+
+    Only a PLANE crossing blocks; a 17% split power plane is reported with its
+    share and let through, because whether a track may cross it is a design
+    question this gate cannot answer from geometry alone.
+    """
+    if not copper_write:
+        return _row("plane_pour_intact", None,
+                    "this plan lands no copper, so no pour can be cut",
+                    severity="report")
+    if isinstance(report, dict) and report.get("error"):
+        # A measurement that did not run says nothing about the plane, and
+        # `allow_plane_crossing` is the caller saying "I know I am cutting it",
+        # not "I would rather not know": this row blocks either way.
+        return _row("plane_pour_intact", False,
+                    "the pours under this plan's copper could not be measured (%s), "
+                    "so nothing here says the reference plane survives"
+                    % report["error"],
+                    "this is a measurement failure, not a design decision: find out "
+                    "what the planned board no longer parses as, then re-plan")
+    if not isinstance(report, dict):
+        return _row("plane_pour_intact", None,
+                    "the pours under this plan's copper were not measured",
+                    severity="report")
+    hits = [h for h in report.get("crossings") or [] if h.get("plane")]
+    loose = [h for h in report.get("crossings") or [] if not h.get("plane")]
+    if not hits:
+        why = ("no copper lands on a plane pour" if not loose else
+               "copper lands on %d pour(s) that are not planes (%s)"
+               % (len(loose), ", ".join(sorted({h.get("pour_net") or "?"
+                                                 for h in loose}))))
+        return _row("plane_pour_intact", True, why)
+    first = hits[0]
+    why = ("this plan lands %s copper on %s, which is a reference plane "
+           "(%.1f mm2, %.1f%% of the board); the pour is re-cut around it, so "
+           "DRC stays silent while the return path is cut"
+           % (first.get("net") or "?", first.get("pour_net") or "?",
+              float(first.get("pour_area_mm2") or 0.0),
+              100.0 * float(first.get("share") or 0.0)))
+    if allow:
+        row = _row("plane_pour_intact", False, why,
+                   "passing allow_plane_crossing=true lets this write, and this "
+                   "row still says the plane was cut", severity="report")
+        return row
+    return _row("plane_pour_intact", False, why,
+                "route on a signal layer, or pass allow_plane_crossing=true if "
+                "cutting this plane is the subject of the edit")
+
+
 def message(result):
     """One sentence, for the error a refused apply raises."""
     bad = [c for c in result["checks"] if c["ok"] is False and c["severity"] == "block"]
@@ -302,4 +362,4 @@ def message(result):
 
 __all__ = ["assess", "message", "PreconditionError", "CLEARANCE_FLOOR_MM",
            "rules_baseline", "drc_engine", "outline_known", "mech_unchanged",
-           "clearance_no_worse", "process_declared"]
+           "clearance_no_worse", "plane_pour_intact", "process_declared"]

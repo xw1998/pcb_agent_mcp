@@ -41,10 +41,12 @@ import uuid as _uuid
 
 from .. import geometry as _geom
 from ..adapters import open_board as _open_board
+from ..adapters.kicad_pcb import parse_board_text as _parse_board_text
 from ..fidelity import engine as _engine
 from ..fidelity import kicad_doc as _kdoc
 from ..fidelity import sexpr as S
 from . import build as B
+from . import planes as _planes
 from . import checks as _checks
 from . import drc_policy as _drcp
 from ..ruleset import precondition as _precondition
@@ -291,6 +293,24 @@ def propose(path, operations, options=None):
     copper_adds = any("copper" in (r.get("affects") or ())
                       and not (r.get("op") or "").startswith("delete_")
                       for r in records)
+    # Which pours this plan would land another net's copper on. Measured on the
+    # PLANNED board - `new_text` is what would be written, so a pour added by this
+    # same plan counts and the zones are the ones the file will carry - from
+    # geometry alone; the judgement is the precondition's, not this measurement's.
+    #
+    # The input is a canonical adapter Board, not `work`: `work` is the document
+    # tree this module edits and knows nothing about pours, pads or outlines. A
+    # measurement that cannot run is NOT reported as "no crossing" - an unmeasured
+    # plane is exactly the mistake this gate exists to stop, so the failure
+    # travels to the precondition as `error` and blocks a plan that lands copper
+    # (see `plane_pour_intact`).
+    try:
+        plane_report = _planes.crossings(_parse_board_text(new_text, path=path),
+                                         operations)
+    except Exception as exc:                   # noqa: BLE001 - reported, not raised
+        plane_report = {"board_mm2": None, "planes": [], "crossings": [],
+                        "by_net": {},
+                        "error": "%s: %s" % (type(exc).__name__, exc)}
     if pre_options:
         if "copper" in touched:
             clearance_before = _checks.copper_clearance(
@@ -303,7 +323,9 @@ def propose(path, operations, options=None):
             allow_edge_changes=(pure_move or
                                 bool(options.get("allow_edge_changes"))),
             allow_open_outline=bool(options.get("allow_open_outline")),
-            copper_adds=copper_adds)
+            copper_adds=copper_adds,
+            plane_pours=plane_report,
+            allow_plane_crossing=bool(options.get("allow_plane_crossing")))
         for c in pre["checks"]:
             if c["ok"] is False and c["severity"] == "block":
                 blocking.append({"gate": "precondition." + c["check"],
@@ -344,10 +366,13 @@ def propose(path, operations, options=None):
                     "allow_edge_changes": bool(options.get("allow_edge_changes")),
                     "allow_open_outline": bool(options.get("allow_open_outline")),
                     "precheck_layer_policy": options.get("precheck_layer_policy"),
-                    "allow_layer_changes": bool(options.get("allow_layer_changes"))},
+                    "allow_layer_changes": bool(options.get("allow_layer_changes")),
+                    "allow_plane_crossing": bool(options.get("allow_plane_crossing"))},
         "preconditions_input": {
             "outline": after["outline"], "clearance_after": clearance,
-            "clearance_before": clearance_before, "copper_adds": copper_adds},
+            "clearance_before": clearance_before, "copper_adds": copper_adds,
+            "plane_pours": plane_report,
+            "allow_plane_crossing": bool(options.get("allow_plane_crossing"))},
     }
     PLANS[plan_id] = plan
     _trim_plans()
@@ -362,6 +387,10 @@ def propose(path, operations, options=None):
         "board_before": before,
         "board_after": after,
         "precheck": {"outline": after["outline"], "clearance": clearance,
+                     "plane_pours": {"board_mm2": plane_report.get("board_mm2"),
+                                     "planes": plane_report.get("planes"),
+                                     "crossings": plane_report.get("crossings"),
+                                     "error": plane_report.get("error")},
                      "layer_policy": (None if policy is None else {
                          "ok": policy.get("ok"),
                          "nets": policy.get("nets"),
@@ -768,7 +797,11 @@ def apply_plan(plan_id, confirm=False, options=None):
                                  plan["options"].get("allow_edge_changes")))),
             allow_open_outline=bool(options.get("allow_open_outline",
                                                 plan["options"].get("allow_open_outline"))),
-            copper_adds=pin.get("copper_adds"))
+            copper_adds=pin.get("copper_adds"),
+            plane_pours=pin.get("plane_pours"),
+            allow_plane_crossing=bool(options.get(
+                "allow_plane_crossing", plan["options"].get(
+                    "allow_plane_crossing"))))
         if not pre["ok"]:
             raise EditError(
                 "refusing to write: the board is not in a state where this edit is "
