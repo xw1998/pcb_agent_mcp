@@ -224,6 +224,28 @@ class TestPlanes(unittest.TestCase):
         self.assertNotIn("plane_reaches_nothing", r["flags"])
         self.assertGreaterEqual(r["plane"]["per_layer"]["In1.Cu"]["vias_inside"], 1)
 
+    def test_plane_connected_only_by_its_own_track_is_not_isolated(self):
+        """Control for the flag: no pad, no via, but a same-net track crosses it.
+
+        This is the delivery board's /+5V_IN case: a 4.1x5.8 mm rectangle sitting
+        on top of the 0.80 mm In3 bus, with no pad and no hole inside it. Counting
+        pads and vias only called that "reaches nothing", which is a false
+        negative - the pour is on the same net as the track it merges with.
+        """
+        body = ('  (zone (net 1) (net_name "+3V3") (layer "In1.Cu") (name "island")\n'
+                '    (hatch edge 0.5) (priority 0) (min_thickness 0.1)\n'
+                '    (filled_polygon (layer "In1.Cu") (pts (xy 40 5) (xy 50 5)\n'
+                '      (xy 50 15) (xy 40 15)))\n)'
+                '  (segment (start 38 10) (end 52 10) (width 0.8) '
+                '(layer "In1.Cu") (net 1))\n')
+        r = row(plan(body))
+        per = r["plane"]["per_layer"]["In1.Cu"]
+        self.assertEqual(per["pads_touching"], 0)
+        self.assertEqual(per["vias_inside"], 0)
+        self.assertGreaterEqual(per["tracks_touching"], 1)
+        self.assertNotIn("plane_reaches_nothing", r["flags"])
+        self.assertNotIn("reaches_nothing", per)
+
     def test_foreign_track_inside_the_fill_is_a_stale_pour(self):
         body = (self._plane() +
                 '  (segment (start 5 20) (end 20 20) (width 0.2) (layer "In1.Cu") (net 2))\n')
@@ -241,6 +263,20 @@ class TestPlanes(unittest.TestCase):
         self.assertTrue(in1["priority_ties"])
         self.assertEqual(in1["priority_ties"][0]["priority"], 0)
         self.assertEqual(len(in1["priority_ties"][0]["nets"]), 2)
+        # these two fills are in different parts of the layer, so the tie does
+        # not arbitrate anything and must not be reported as if it did.
+        self.assertFalse(in1["priority_ties"][0]["fills_meet"])
+        self.assertIn("do not meet", in1["priority_ties"][0]["why"])
+
+    def test_a_tie_whose_fills_meet_is_reported_as_a_real_conflict(self):
+        """Control: same priority AND the two fills overlap -> the tie matters."""
+        body = (self._plane() +
+                self._plane(net=2, name="/GND", min_thickness="0.1",
+                            pts="(xy 25 25) (xy 35 25) (xy 35 35) (xy 25 35)"))
+        out = plan(body)
+        in1 = [l for l in out["layers"] if l["layer"] == "In1.Cu"][0]
+        self.assertTrue(in1["priority_ties"][0]["fills_meet"])
+        self.assertIn("has to be lifted", in1["priority_ties"][0]["why"])
 
 class TestDefaultsAndShape(unittest.TestCase):
     def test_clearance_default_is_reported_as_such(self):
@@ -289,3 +325,96 @@ class TestDefaultsAndShape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestWhichClearanceWasUsed(unittest.TestCase):
+    """The clearance decides every "room" number, so it has to be attributed.
+
+    A planner that silently measures against a guessed 0.2 mm invented a
+    clearance violation at every fine-pitch escape on a board whose own rule is
+    0.1 mm, and the caller had no way to see which number had been used.
+    """
+
+    def test_the_boards_own_rule_is_used_when_none_is_passed(self):
+        b = board('  (segment (start 10 20) (end 30 20) (width 0.5) '
+                  '(layer "F.Cu") (net 1))\n')
+        b.rules = {"source": "x.kicad_pro",
+                   "clearance": {"min_clearance": 0.1,
+                                 "min_copper_edge_clearance": 0.3}}
+        out = rail_plan.plan(b, {"+3V3": 1.0})
+        self.assertAlmostEqual(out["assumptions"]["clearance_mm"], 0.1)
+        self.assertEqual(out["assumptions"]["clearance_source"],
+                         "board.rules.min_clearance")
+        self.assertAlmostEqual(out["assumptions"]["edge_clearance_mm"], 0.3)
+        self.assertEqual(row(out)["clearance"]["source"],
+                         "board.rules.min_clearance")
+
+    def test_a_netclass_clearance_above_the_floor_is_the_one_used(self):
+        """The project floor is a lower bound, not what DRC measures pairwise."""
+        body = ('  (segment (start 10 20) (end 30 20) (width 0.1) '
+                '(layer "F.Cu") (net 1))\n'
+                '  (segment (start 10 20.9) (end 30 20.9) (width 0.1) '
+                '(layer "F.Cu") (net 2))\n')
+        b = board(body)
+        b.rules = {"source": "x.kicad_pro",
+                   "clearance": {"min_clearance": 0.1,
+                                 "min_copper_edge_clearance": 0.3},
+                   "net_classes": {"Default": {"clearance": 0.25,
+                                               "nets": ["+3V3"]}}}
+        r = row(rail_plan.plan(b, {"+3V3": 1.0}))
+        self.assertEqual(r["clearance"]["source"], "board.rules.net_classes")
+        self.assertAlmostEqual(r["clearance"]["mm"], 0.25)
+        # 0.8 mm edge gap - 0.25 clearance = 0.55 room, so 0.1 + 2*0.55 = 1.2 mm
+        self.assertAlmostEqual(r["trace"]["widest_legal_mm"], 1.2, places=3)
+
+    def test_a_netclass_cannot_lower_the_project_floor(self):
+        b = board('  (segment (start 10 20) (end 30 20) (width 0.5) '
+                  '(layer "F.Cu") (net 1))\n')
+        b.rules = {"source": "x.kicad_pro",
+                   "clearance": {"min_clearance": 0.1,
+                                 "min_copper_edge_clearance": 0.3},
+                   "net_classes": {"Default": {"clearance": 0.05,
+                                               "nets": ["+3V3"]}}}
+        r = row(rail_plan.plan(b, {"+3V3": 1.0}))
+        self.assertAlmostEqual(r["clearance"]["mm"], 0.1)
+
+    def test_an_assumed_clearance_does_not_claim_a_drc_finding(self):
+        """Same copper, same negative room: only the SOURCE differs."""
+        body = ('  (segment (start 10 20) (end 30 20) (width 0.1) '
+                '(layer "F.Cu") (net 1))\n'
+                '  (segment (start 10 20.15) (end 30 20.15) (width 0.1) '
+                '(layer "F.Cu") (net 2))\n')
+        # no .kicad_pro in the fixture: 0.2 mm is this planner's own assumption
+        r = row(rail_plan.plan(board(body), {"+3V3": 1.0}))
+        self.assertEqual(r["verdict"], "pour_needed")
+        self.assertIn("clearance_assumed", r["flags"])
+        self.assertIn("neck_inside_assumed_clearance", r["flags"])
+        self.assertNotIn("neck_already_inside_clearance", r["flags"])
+        self.assertEqual(r["clearance"]["source"], "default")
+
+        # control: the board states the rule, so the same geometry IS a finding
+        r2 = row(plan(body))
+        self.assertIn("neck_already_inside_clearance", r2["flags"])
+        self.assertNotIn("clearance_assumed", r2["flags"])
+        self.assertNotIn("neck_inside_assumed_clearance", r2["flags"])
+
+
+class TestLegalWidthIsOneSegment(unittest.TestCase):
+    def test_the_widest_legal_comes_from_one_segment_not_two(self):
+        """A narrow segment with room plus a wide segment without: the WIDE one
+        limits the answer, and pairing one segment's width with another
+        segment's room (an earlier draft) understated it."""
+        body = ('  (segment (start 10 20) (end 30 20) (width 0.1) '
+                '(layer "F.Cu") (net 1))\n'
+                '  (segment (start 10 20.9) (end 30 20.9) (width 0.1) '
+                '(layer "F.Cu") (net 2))\n'
+                '  (segment (start 10 30) (end 30 30) (width 0.3) '
+                '(layer "F.Cu") (net 1))\n'
+                '  (segment (start 10 30.35) (end 30 30.35) (width 0.1) '
+                '(layer "F.Cu") (net 2))\n')
+        r = row(plan(body))
+        # wide segment: 0.15 edge gap - 0.1 = 0.05 room -> 0.3 + 0.1 = 0.4 mm
+        self.assertAlmostEqual(r["trace"]["widest_legal_mm"], 0.4, places=3)
+        self.assertAlmostEqual(r["trace"]["neck"]["width_mm"], 0.3, places=3)
+        self.assertAlmostEqual(r["trace"]["neck"]["legal_width_mm"], 0.4, places=3)
+        # 0.4 mm still clears the 0.3021 mm demand, so it can be widened
+        self.assertEqual(r["verdict"], "widen_traces")

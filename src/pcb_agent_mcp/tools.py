@@ -4559,9 +4559,14 @@ _tool(
     "touch copper of its own net (pads.orphan names the ones that do not). (2) "
     "WIDTH: IPC-2221 demand vs the measured trace widths, plus how much wider the "
     "narrowest segment may legally get (exact clearance to foreign copper and the "
-    "board edge - a negative room means the existing neck is already inside the "
-    "clearance, which is a DRC call, not this tool's). (3) PLANE: pads/vias inside "
-    "each filled plane, min_thickness, connect mode; a plane PROVES capacity only "
+    "board edge; that number is per segment - w + 2*room on ONE segment, the "
+    "smallest over the thin ones - and it names the clearance it used, "
+    "board rule vs netclass vs assumed 0.2 when nothing states one; a negative "
+    "room means the neck already sits inside that clearance, which is a DRC "
+    "call, not this tool's, and against an ASSUMED clearance it is reported as "
+    "an assumption instead). (3) PLANE: pads/vias/same-net tracks inside each "
+    "filled plane, min_thickness, connect mode; a fill reaches nothing only when "
+    "pads, vias AND same-net tracks are all zero. A plane PROVES capacity only "
     "when its stated min_thickness >= the demand. Below that the answer is "
     "'plane_covered_capacity_unmeasured' - not 'too thin': the copper that carries "
     "the current is the fill outline minus its voids, a shape fact this tool does "
@@ -4569,7 +4574,8 @@ _tool(
     "row says why, and a net with no current given comes back no_demand with its "
     "geometry and nothing judged, rather than with a guessed ampacity. Also "
     "reports a STALE pour (a same-layer foreign track inside a filled polygon - "
-    "the polygons predate the track) and two nets tied at the same zone priority. "
+    "the polygons predate the track) and two nets tied at the same zone priority, "
+    "with fills_meet telling whether the tie actually arbitrates anything. "
     "Actions carry the numbers a pour needs and needs_outline=true: the outline is "
     "the caller's, passed to board_add_zone. " + _NOT_WRITTEN,
     {"type": "object",
@@ -14603,8 +14609,17 @@ def _tool_search(args):
         # Whole word, with `_` counting as a boundary: `via` hits `via_resistance`
         # but not `trivial`. Plain substring matching was a false-positive source -
         # 25 of the 25 first hits for 过孔 were tools that merely mention it.
-        return re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(word),
-                         text) is not None
+        #
+        # The plural counts too, in BOTH directions: descriptions are written in
+        # the plural ("zones", "vias", "traces") while the alias table is written
+        # in the singular, and `board_zones` was ranked out of the 铺铜 results
+        # because the literal word "zone" never appears in its own name.
+        if re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(word),
+                     text) is not None:
+            return True
+        variants = (word + "s", word[:-1]) if word.endswith("s") else (word + "s",)
+        return any(v and re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(v),
+                                   text) is not None for v in variants)
 
     scored = []
     for name, spec in TOOLS.items():

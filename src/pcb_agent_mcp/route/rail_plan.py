@@ -185,6 +185,28 @@ def _round_up(x, step=0.05):
     return round(math.ceil(x / step - 1e-9) * step, 3)
 
 
+def _segment_touches_polygon(a, b, poly, half_width):
+    """Does a track body (centreline + half its width) overlap this fill?
+
+    A fill that merges with a same-net track of the same layer is electrically
+    connected to whatever that track lands on. Counting only pads and vias made
+    this planner call such a pour "reaches nothing", which is a false negative:
+    on the delivery board the /+5V_IN rectangle sits on top of the 0.80 mm In3
+    bus and touches no pad and no via at all.
+    """
+    if G.point_in_polygon(a, poly) or G.point_in_polygon(b, poly):
+        return True
+    n = len(poly)
+    for i in range(n):
+        c = poly[i]
+        d = poly[(i + 1) % n]
+        if G.segments_intersect(a, b, c, d):
+            return True
+        if G.dist_segment_segment(a, b, c, d) <= half_width + 1e-9:
+            return True
+    return False
+
+
 def plan(board, currents, nets=None, delta_t_c=10.0, copper_oz=1.0,
          standard="ipc2221", clearance_mm=None, edge_clearance_mm=None,
          window_mm=None):
@@ -322,9 +344,40 @@ def plan(board, currents, nets=None, delta_t_c=10.0, copper_oz=1.0,
         for z in zs:
             by_pri.setdefault(z["priority"], set()).add(z["net"])
         for pri, owners in sorted(by_pri.items()):
-            if len([o for o in owners if o is not None]) > 1:
-                ties.append({"priority": pri,
-                             "nets": sorted(o for o in owners if o is not None)})
+            named = sorted(o for o in owners if o is not None)
+            if len(named) > 1:
+                # A tie only arbitrates something where the fills actually meet.
+                # Two zones at the same priority that sit in different parts of
+                # the layer cannot starve each other, and reporting the tie as a
+                # problem would be a false alarm (the delivery board's In3 has
+                # /+3V3 and /+5V_IN both at 0, 0.6 mm apart, touching nowhere).
+                meet = False
+                polys_by_net = {}
+                for z in zs:
+                    if z["net"] in named and z["filled"]:
+                        polys_by_net.setdefault(z["net"], []).extend(z["polys"])
+                for i, n1 in enumerate(named):
+                    for n2 in named[i + 1:]:
+                        for p1 in polys_by_net.get(n1, []):
+                            for p2 in polys_by_net.get(n2, []):
+                                if G.dist_polygon_polygon(p1, p2) <= 1e-9:
+                                    meet = True
+                                    break
+                            if meet:
+                                break
+                        if meet:
+                            break
+                    if meet:
+                        break
+                ties.append({"priority": pri, "nets": named,
+                             "fills_meet": meet,
+                             "why": ("at the same priority the fills meet, so one "
+                                     "of them has to be lifted or one will be cut "
+                                     "back by the other"
+                                     if meet else
+                                     "at the same priority, but the fills do not "
+                                     "meet on this layer: the tie arbitrates "
+                                     "nothing here")})
         layers.append({"layer": lay,
                        "zones": [{"net": z["net"], "priority": z["priority"],
                                   "area_mm2": round(z["area_mm2"], 2),
@@ -339,7 +392,8 @@ def plan(board, currents, nets=None, delta_t_c=10.0, copper_oz=1.0,
     for net, (asked, demand) in sorted(want.items()):
         row = _one(board, net, demand, cu, edges, by_layer, tracks_of,
                    vias_of, pads_of, zone_rows, delta_t_c, copper_oz,
-                   standard, clearance_mm, edge_clearance_mm, window_mm)
+                   standard, clearance_mm, clr_src, edge_clearance_mm,
+                   window_mm)
         row["net_asked"] = asked
         rows.append(row)
 
@@ -404,11 +458,40 @@ def _poly_area(poly):
     return abs(a) / 2.0
 
 
+def _net_clearance(board, net, base_mm, base_src):
+    """The clearance KiCad actually applies to this net, and where it came from.
+
+    `design_settings.rules.min_clearance` is a project-wide FLOOR, not the number
+    DRC uses pair by pair: KiCad measures the clearance between two items against
+    their net classes, and the floor only bounds it from below. Using the floor
+    alone made "there is room to widen" optimistic on any board whose power nets
+    sit in a class with a bigger clearance, so the class value is raised over it
+    whenever the project says which class this net is in.
+    """
+    rules = getattr(board, "rules", None) or {}
+    classes = rules.get("net_classes") or {}
+    best = None
+    for spec in classes.values():
+        if net not in (spec.get("nets") or []):
+            continue
+        c = spec.get("clearance")
+        if isinstance(c, (int, float)) and not isinstance(c, bool):
+            best = float(c) if best is None else max(best, float(c))
+    if best is None:
+        return float(base_mm), base_src
+    if best <= float(base_mm):
+        # the class cannot lower the project floor, so the floor stays the rule
+        return float(base_mm), base_src
+    return best, "board.rules.net_classes"
+
+
 def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
-         zone_rows, delta_t_c, copper_oz, standard, clearance_mm,
+         zone_rows, delta_t_c, copper_oz, standard, clearance_mm, clr_src,
          edge_clearance_mm, window_mm):
     from ..oracle import _item_bbox, _dist
     from ..adapters.canonical import pad_points
+
+    clearance_mm, clr_src = _net_clearance(board, net, clearance_mm, clr_src)
 
     if demand is None:
         ext_need = int_need = None
@@ -482,29 +565,36 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
     thin_len = sum(math.hypot(s["b"][0] - s["a"][0], s["b"][1] - s["a"][1])
                    for s in thin)
 
-    room = None
-    neck = None
-    measured = False
+    room = None          # smallest room found anywhere (what the flags read)
+    legal_widen = None   # smallest LEGAL width over the thin segments
+    neck = None          # the segment that sets `legal_widen`
     if thin:
         win = window_mm or (max(s["req"] for s in thin) + ROOM_WINDOW_EXTRA_MM)
         for s in thin:
             r, near = _room_mm(board, s["a"], s["b"], s["w"],
                                _foreign_items(board, s["layer"], net, by_layer),
                                edges, clearance_mm, win)
-            if not measured or (r is not None and (room is None or r < room)):
-                measured = True
+            if r is not None and (room is None or r < room):
                 room = r
+            if r is None:
+                # nothing foreign inside the window: this segment is not the one
+                # that decides how wide the copper may get
+                continue
+            legal_s = s["w"] + 2.0 * r
+            if legal_widen is None or legal_s < legal_widen:
+                legal_widen = legal_s
                 neck = {"layer": s["layer"], "width_mm": round(s["w"], 3),
                         "required_mm": round(s["req"], 3),
-                        "room_mm": (None if r is None else round(r, 3)),
+                        "room_mm": round(r, 3),
+                        "legal_width_mm": round(legal_s, 3),
+                        "criterion": "smallest legal width (w + 2*room) over the "
+                                     "segments that are below the demand",
                         "blocked_by": (None if near is None else
                                        {"kind": near.get("kind"),
                                         "net": near.get("net"),
                                         "ref": near.get("ref")})}
-
-    legal_widen = None
-    if thin and room is not None:
-        legal_widen = round(min(s["w"] for s in thin) + 2 * room, 3)
+    if legal_widen is not None:
+        legal_widen = round(legal_widen, 3)
 
     # What a filled plane file can and cannot prove.
     #
@@ -566,6 +656,17 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
                     vias_inside += 1
                     rim.append(G.dist_point_polygon(p, poly))
                     break
+        tracks_touching = 0
+        for sg in segs:
+            if sg["layer"] != lay:
+                continue
+            for (l2, poly) in plane_polys:
+                if l2 != lay:
+                    continue
+                if _segment_touches_polygon(sg["a"], sg["b"], poly,
+                                            float(sg["w"]) / 2.0):
+                    tracks_touching += 1
+                    break
         rim.sort()
         connects = set()
         bridges = []
@@ -588,10 +689,11 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
             "pads_touching": touching,
             "pads_straddling": straddling[:4],
             "vias_inside": vias_inside,
+            "tracks_touching": tracks_touching,
             "pad_rim_min_mm": (round(rim[0], 3) if rim else None),
             "measured": ["min_thickness_mm", "connect_modes", "pads_touching",
                          "pads_inside", "pads_straddling", "vias_inside",
-                         "thermal_bridge_mm"],
+                         "tracks_touching", "thermal_bridge_mm"],
             "not_measured": ["current_corridor_width"],
             "why_unmeasured": (
                 "the file states no corridor width; the copper width that carries "
@@ -600,7 +702,7 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
                 "as unmeasured instead of estimated. pad_rim_min_mm is a pad-to-"
                 "edge distance and is not a cross-section."),
         }
-        if touching == 0 and vias_inside == 0:
+        if touching == 0 and vias_inside == 0 and tracks_touching == 0:
             plane_ok[lay]["reaches_nothing"] = True
         if not proves:
             plane_ok[lay]["why_not"] = (
@@ -645,8 +747,8 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
                     "pads_inside": v["pads_inside"],
                     "pads_touching": v["pads_touching"],
                     "pads_straddling": v["pads_straddling"],
-                    "why": ("the pour touches %d pad(s) and contains %d via(s) on "
-                            "%s, and the file proves "
+                    "why": ("the pour touches %d pad(s), contains %d via(s) and "
+                            "touches %d same-net track(s) on %s, and the file proves "
                             "nothing about the copper width that carries %.3f A: "
                             "min_thickness is %s mm against %.3f mm demanded. This "
                             "is NOT a finding that the plane is too thin - the "
@@ -654,7 +756,8 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
                             "compute. Measure it (shape/void analysis) or state "
                             "min_thickness >= the demand, which KiCad will honour "
                             "only if the plane can exist at that thickness."
-                            % (v["pads_touching"], v["vias_inside"], lay, demand,
+                            % (v["pads_touching"], v["vias_inside"],
+                               v["tracks_touching"], lay, demand,
                                v["min_thickness_mm"], v["required_mm"]))})
     elif not thin:
         verdict = "traces_ok"
@@ -682,8 +785,16 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
             # A negative room is not "no space for wider copper" in the usual
             # sense: it says the existing neck already sits inside the clearance
             # to the thing named in `neck.blocked_by`. That is a DRC's call, not
-            # this planner's, so it is reported and the caller is sent there.
-            flags.append("neck_already_inside_clearance")
+            # this planner's, so it is reported and the caller is sent there -
+            # but only when the clearance came from the board. Against a number
+            # this planner ASSUMED (no .kicad_pro), the same geometry is not a
+            # finding, it is the assumption showing through, so it says so.
+            # A number the CALLER passed is a rule they stated; only "default"
+            # means nobody stated one and the planner picked 0.2 mm itself.
+            if str(clr_src) == "default":
+                flags.append("neck_inside_assumed_clearance")
+            else:
+                flags.append("neck_already_inside_clearance")
         # Candidates are ranked inner-first: a plane belongs on an inner layer, and
         # offering F.Cu first would send the caller to pour over the signal side.
         inner = [l for l in cu[1:-1]] if len(cu) > 2 else list(cu)
@@ -726,8 +837,15 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
                        "cannot legally grow to it",
     }[verdict]
 
+    row_flags = list(flags)
+    if str(clr_src) == "default":
+        # nothing on disk states a clearance: every "room" below is measured
+        # against an assumed number and must not be read as a DRC verdict
+        row_flags.append("clearance_assumed")
+
     return {
         "net": net,
+        "clearance": {"mm": round(float(clearance_mm), 4), "source": clr_src},
         "demand_a": demand,
         "required_width_mm": need,
         "carrier": ("plane" if plane_area > 1e-9 else
@@ -751,7 +869,7 @@ def _one(board, net, demand, cu, edges, by_layer, tracks_of, vias_of, pads_of,
                   "neck": neck},
         "verdict": verdict,
         "why": why,
-        "flags": flags,
+        "flags": row_flags,
         "actions": actions,
     }
 
