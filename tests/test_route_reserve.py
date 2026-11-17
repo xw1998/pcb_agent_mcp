@@ -131,6 +131,20 @@ class TestTheRingBuysAir(ReserveBase):
                                 "ring of 1.0 mm bought %.3f mm of air" %
                                 got["gap_mm"])
         self.assertIn(got["nearest"], ("/BUS_A", "/BUS_B"))
+        # `gap_mm` says how much air was bought; `pinch` has to say by whom, and
+        # it must be a real object - a named layer, a point on the run, a
+        # non-negative edge gap - or the report is a guess dressed as a number.
+        pinch = got.get("pinch")
+        self.assertIsNotNone(pinch, got)
+        self.assertIn(pinch["kind"], ("pad", "track", "via"), pinch)
+        self.assertNotEqual(pinch["net"], "/BUS_C", pinch)
+        self.assertIn(pinch["layer"], ("F.Cu", "B.Cu"), pinch)
+        self.assertEqual(len(pinch["at"]), 2, pinch)
+        self.assertGreaterEqual(pinch["edge_mm"], 0.0, pinch)
+        if pinch["kind"] == "pad":
+            self.assertIn(".", pinch["source"], pinch)
+        else:
+            self.assertIn(pinch["source"], ("board", "this_plan"), pinch)
 
     def test_it_stays_a_price_and_never_a_wall(self):
         self.three_wire_bus()
@@ -144,6 +158,40 @@ class TestTheRingBuysAir(ReserveBase):
         for row in res["nets"]:
             self.assertEqual(row["status"], "routed", row)
 
+
+class TestPinchNamesWhatIsInTheWay(ReserveBase):
+    def test_it_names_pre_existing_board_copper_not_just_this_plan(self):
+        """The number that comes back small is only useful with a name attached,
+        and on a real board the name is usually not this plan's copper at all -
+        it is the fan-out that was already there. A blocker written before the
+        route therefore has to show up with `source == "board"`."""
+        # One reserved net with a single neighbour far below it: the only
+        # copper in the corridor is the track written before the route, so there
+        # is nothing else `pinch` could name.
+        pads = [("1", -2.0, 0.0, 0.5, 0.5), ("2", -2.0, -2.5, 0.5, 0.5)]
+        npads = [("1", 2.0, 0.0, 0.5, 0.5), ("2", 2.0, -2.5, 0.5, 0.5)]
+        self.place("pair", pads, "U1", 10.0, 20.0,
+                   {"1": "/BUS_C", "2": "/GND"})
+        self.place("pair", npads, "U2", 30.0, 20.0,
+                   {"1": "/BUS_C", "2": "/GND"})
+        plan = E.propose(self.board, [{
+            "op": "add_track", "x1": 14.0, "y1": 20.5,
+            "x2": 24.0, "y2": 20.5, "width": 0.25, "layer": "F.Cu",
+            "net": "/GND"}])
+        self.assertEqual(plan["blocking"], [], plan["blocking"])
+        E.apply_plan(plan["plan_id"], confirm=True, options={"engine": False})
+        res = self.route({"name": "bus", "nets": ["/BUS_C", "/GND"],
+                          "radius_mm": 1.2, "discount": 0.6,
+                          "reserve_nets": ["/BUS_C"], "reserve_mm": 0.5,
+                          "reserve_price": 3.0})
+        self.assertEqual(res["stats"]["nets_failed"], 0, res["failed"])
+        pinch = res["stats"]["bundle_bands"][0]["reserve"]["gap_mm"][
+            "/BUS_C"]["pinch"]
+        self.assertEqual(pinch["source"], "board", pinch)
+        self.assertEqual(pinch["kind"], "track", pinch)
+        self.assertEqual(pinch["net"], "/GND", pinch)
+        self.assertEqual(pinch["layer"], "F.Cu", pinch)
+        self.assertAlmostEqual(pinch["edge_mm"], 0.25, delta=0.06)
 
 class TestTheReservedNetClaimsSpaceFirst(ReserveBase):
     def test_it_routes_before_the_band_members_it_clears_room_from(self):

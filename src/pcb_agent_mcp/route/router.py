@@ -1805,7 +1805,99 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                 if math.hypot(x - px, y - py) < 1.0:
                     return True
             return False
+        # `gap_mm` above answers "how much room did the reservation buy" and can
+        # only see copper this run made. The number people actually need when it
+        # comes back small is "what is standing there" - and the answer is often
+        # not this plan's copper at all but the fan-out that was already on the
+        # board. `pinch` is that: the single nearest foreign edge with a name.
+        bsegs, bvias, bpads = [], [], []
+        for tr in getattr(board, "tracks", None) or ():
+            if not tr.get("net"):
+                continue
+            a = tr.get("start") or [0, 0]
+            b = tr.get("end") or [0, 0]
+            bsegs.append((tr["net"], tr.get("layer"),
+                          (a[0], a[1], b[0], b[1]),
+                          (tr.get("width") or bundle["track_mm"]) / 2.0))
+        for v in getattr(board, "vias", None) or ():
+            if not v.get("net"):
+                continue
+            bvias.append((v["net"], (v["x"], v["y"]),
+                          (v.get("diameter") or bundle["via_diameter_mm"]) / 2.0))
+        for fp in getattr(board, "footprints", None) or ():
+            for pd in fp.get("pads") or ():
+                if not pd.get("net"):
+                    continue
+                bpads.append((pd["net"], (pd["x"], pd["y"]),
+                              (pd.get("w") or 0.0, pd.get("h") or 0.0),
+                              set(pd.get("layers") or ()),
+                              "%s.%s" % (fp.get("ref"), pd.get("number"))))
+
+        def _pad_gap(x, y, qx, qy, w, h):
+            dx = max(abs(x - qx) - w / 2.0, 0.0)
+            dy = max(abs(y - qy) - h / 2.0, 0.0)
+            return math.hypot(dx, dy)
+
+        def _box(x1, y1, x2, y2):
+            return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+        def _box_gap(b, x1, y1, x2, y2):
+            """A lower bound on the real distance: two boxes that do not touch
+            are at least this far apart, and neither can be closer than its own
+            bounding box."""
+            dx = max(x1 - b[2], b[0] - x2, 0.0)
+            dy = max(y1 - b[3], b[1] - y2, 0.0)
+            return math.hypot(dx, dy)
+
+        def _pinch(n, mine, hw, nsegs, nvias, npads):
+            best = None
+            for l_here, (x1, y1, x2, y2) in mine:
+                span = math.hypot(x2 - x1, y2 - y1)
+                steps = max(1, int(span / 0.1))
+                for kk in range(steps + 1):
+                    t = kk / float(steps)
+                    x = x1 + (x2 - x1) * t
+                    y = y1 + (y2 - y1) * t
+                    if _near_pad(n, x, y):
+                        continue
+                    for (m, l), segs2 in flats.items():
+                        if m == n or l != l_here:
+                            continue
+                        for (a1, b1, a2, b2) in segs2:
+                            d = (G.dist_point_segment((x, y), (a1, b1),
+                                                      (a2, b2)) - 2.0 * hw)
+                            if best is None or d < best[0]:
+                                best = (d, "track", m, "this_plan",
+                                        (x, y), l_here)
+                    for (m, l, (a1, b1, a2, b2), ohw) in nsegs:
+                        if m == n or l != l_here:
+                            continue
+                        d = (G.dist_point_segment((x, y), (a1, b1), (a2, b2))
+                             - hw - ohw)
+                        if best is None or d < best[0]:
+                            best = (d, "track", m, "board", (x, y), l_here)
+                    for (m, (vx, vy), vr) in nvias:
+                        if m == n:
+                            continue
+                        d = math.hypot(x - vx, y - vy) - hw - vr
+                        if best is None or d < best[0]:
+                            best = (d, "via", m, "board", (x, y), l_here)
+                    for (m, (qx, qy), (w, h), lays, lbl) in npads:
+                        if m == n or l_here not in lays:
+                            continue
+                        d = _pad_gap(x, y, qx, qy, w, h) - hw
+                        if best is None or d < best[0]:
+                            best = (d, "pad", m, lbl, (x, y), l_here)
+            if best is None:
+                return None
+            d, kind, who, src, (x, y), l_here = best
+            return {"edge_mm": round(d, 4), "kind": kind, "net": who,
+                    "source": src, "at": [round(x, 3), round(y, 3)],
+                    "layer": l_here}
+
+        hw = bundle["track_mm"] / 2.0
         out = {}
+        pinch_s = 0.0
         for n in sorted(want):
             best = None
             mine = [(l, seg) for (m, l), segs in flats.items() if m == n
@@ -1832,10 +1924,45 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                             best = (d, m)
             if best is None:
                 continue
-            out[n] = {"gap_mm": round(best[0], 4), "nearest": best[1]}
+            rec = {"gap_mm": round(best[0], 4), "nearest": best[1]}
+            # Neighbour search is per net, not per sample point: an object that
+            # cannot even come within `gap + hw + ohw` of this net's own run
+            # cannot be the minimum, so it is dropped once instead of being
+            # re-tested at every sample. On the 12-net DDR lane this whole scan
+            # measures 0.026 s, so the filter is a guard against a big board,
+            # not a fix for a cost measured here.
+            corner = None
+            nb = None
+            for l_here, (x1, y1, x2, y2) in mine:
+                bb = _box(x1, y1, x2, y2)
+                nb = bb if nb is None else (min(nb[0], bb[0]),
+                                           min(nb[1], bb[1]),
+                                           max(nb[2], bb[2]),
+                                           max(nb[3], bb[3]))
+            if nb is not None:
+                reach = best[0] + 0.5
+                nsegs = [o for o in bsegs
+                         if _box_gap(_box(o[2][0], o[2][1], o[2][2], o[2][3]),
+                                     nb[0], nb[1], nb[2], nb[3]) <= reach]
+                nvias = [o for o in bvias
+                         if _box_gap((o[1][0], o[1][1], o[1][0], o[1][1]),
+                                     nb[0], nb[1], nb[2], nb[3]) <= reach]
+                npads = [o for o in bpads
+                         if _box_gap((o[1][0] - o[2][0] / 2.0,
+                                      o[1][1] - o[2][1] / 2.0,
+                                      o[1][0] + o[2][0] / 2.0,
+                                      o[1][1] + o[2][1] / 2.0),
+                                     nb[0], nb[1], nb[2], nb[3]) <= reach]
+                t_pin = time.perf_counter()
+                corner = _pinch(n, mine, hw, nsegs, nvias, npads)
+                pinch_s += time.perf_counter() - t_pin
+            if corner:
+                rec["pinch"] = corner
+            out[n] = rec
         return {"nets": sorted(want), "mm": res["mm"],
                 "price": res["price"], "ring_cells": res["painted"],
                 "pre_cells": res.get("pre", 0),
+                "pinch_s": round(pinch_s, 3),
                 "gap_mm": out}
 
     if bands:
