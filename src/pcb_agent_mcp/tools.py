@@ -8397,7 +8397,8 @@ _tool(
             "list of {op, ...params}; call board_ops for the catalogue",
             "items": {"type": "object"}},
         "options": {"type": "object", "description":
-            "allow_new_violations / allow_open_outline / engine (default true)",
+            "allow_new_violations / allow_open_outline / engine (default true) / "
+            "precheck_layer_policy",
             "properties": {
                 "allow_new_violations": _bool("accept newly introduced DRC violations"),
                 "strict_drc": _bool("let every new violation block, warnings included"),
@@ -8405,6 +8406,24 @@ _tool(
                 "engine": _bool("run the kicad-cli comparison (default true)", True),
                 "mode": _str("in_place or new_file", enum=["in_place", "new_file"]),
                 "out_path": _str("target when mode=new_file"),
+                "precheck_layer_policy": {"type": "object", "description":
+                    "refuse the edit if it gives a net a layer change the policy "
+                    "forbids: one whose two sides reference different nets, one "
+                    "with no pour on a side, or a one-layer stub (none of those is "
+                    "fixed by a hole); judged on the plan and re-judged on the "
+                    "file", "properties": {
+                        "nets": {"type": "array", "items": {"type": "string"},
+                                 "description": "net-name patterns, e.g. ['DDR']"},
+                        "depth": _num("how many copper layers away a pour counts "
+                                      "as a reference (default 3)", 3),
+                        "reach_mm": _num("how far a ground via may sit and still "
+                                         "be counted as stitching (default 2.0)",
+                                         2.0),
+                        "max_changes": _num("cap on layer changes per net; a net "
+                                            "over it is a violation even when every "
+                                            "change is clean", None)}},
+                "allow_layer_changes": _bool("accept the forbidden layer changes "
+                                             "this policy names", False),
             }},
     }, "required": ["path", "operations"]},
     _board_propose,
@@ -8431,6 +8450,24 @@ _tool(
             "engine": _bool("run the kicad-cli comparison (default true)", True),
             "mode": _str("in_place or new_file", enum=["in_place", "new_file"]),
             "out_path": _str("target when mode=new_file"),
+                "precheck_layer_policy": {"type": "object", "description":
+                    "refuse the edit if it gives a net a layer change the policy "
+                    "forbids: one whose two sides reference different nets, one "
+                    "with no pour on a side, or a one-layer stub (none of those is "
+                    "fixed by a hole); judged on the plan and re-judged on the "
+                    "file", "properties": {
+                        "nets": {"type": "array", "items": {"type": "string"},
+                                 "description": "net-name patterns, e.g. ['DDR']"},
+                        "depth": _num("how many copper layers away a pour counts "
+                                      "as a reference (default 3)", 3),
+                        "reach_mm": _num("how far a ground via may sit and still "
+                                         "be counted as stitching (default 2.0)",
+                                         2.0),
+                        "max_changes": _num("cap on layer changes per net; a net "
+                                            "over it is a violation even when every "
+                                            "change is clean", None)}},
+                "allow_layer_changes": _bool("accept the forbidden layer changes "
+                                             "this policy names", False),
             "step": _num("STEPPED WRITE: how many operations to write in this call. "
                          "Each call leaves a complete board file on disk, so the "
                          "change can be watched in the EDA and stopped between steps. "
@@ -12728,8 +12765,23 @@ _tool(
     "then re-audits.",
     {"type": "object",
      "properties": dict({
-         "action": _str("'audit' (default: read only) or 'place' (plan the holes)",
-                        enum=("audit", "place")),
+         "action": _str("'audit' (default: read only), 'layer_changes' (per-net "
+                        "layer-change policy) or 'place' (plan the holes)",
+                        enum=("audit", "layer_changes", "place")),
+         "nets": {"type": "array", "description":
+                  "layer_changes only: net-name patterns, matched case-"
+                  "insensitively against the whole name, its last /-segment and as "
+                  "a substring, so ['DDR'] covers /DDR_DQ0 and /DDR_CLKP. Omitted: "
+                  "every non-ground net", "items": {"type": "string"}},
+         "max_changes": _num("layer_changes only: a hard cap on how many layer "
+                             "changes one net may have; a net over the cap is a "
+                             "violation even when every change is clean (omitted: "
+                             "no cap)", None),
+         "include_poured": _bool("layer_changes only: judge nets the board carries "
+                                 "by pouring copper too, which is what "
+                                 "audit_reference reads. Default false: a pour's "
+                                 "vias are plane stitching, and `DDR` as a substring "
+                                 "would otherwise drag in the +1V35_DDR rail", False),
          "apply": _bool("write the plan (default false: plan only)"),
          "net": _str("the net the holes stitch (default GND)"),
          "layers": _arr("layers the hole must join (default [F.Cu, B.Cu])"),
@@ -12789,6 +12841,55 @@ def _board_return_path(args):
                  "boundaries; a via's connectivity is read from the tracks that "
                  "reach it within 0.02 mm, not from its drill span, because on a "
                  "six-layer board most through vias join two layers")
+
+    if action == "layer_changes":
+        nets = args.get("nets")
+        if isinstance(nets, str):
+            nets = [nets]
+        nets = [str(n) for n in (nets or []) if str(n).strip()] or None
+        mc = args.get("max_changes")
+        res = _rp.layer_changes(
+            board, nets=nets, depth=depth, reach_mm=reach,
+            max_changes=(None if mc is None else int(mc)), shortlist=shortlist,
+            include_poured=args.get("include_poured") is True)
+        res["policy_meaning"] = _rp._POLICY_MEANING
+        out = ok(res, "mm", model=model, basis=basis, precision=precision,
+                 assumptions={"nets": nets or "every signal net",
+                              "depth": depth, "reach_mm": reach,
+                              "max_changes": res.get("max_changes"),
+                              "poured_nets": ("included" if res.get("include_poured")
+                                              else ("excluded: %s" % ", ".join(
+                                                  res.get("excluded_as_poured") or ())
+                                                  if res.get("excluded_as_poured")
+                                                  else "excluded (none present)")),
+                              "connectivity": "from the tracks that reach each "
+                                              "via within 0.02 mm"})
+        if res.get("excluded_as_poured"):
+            out["note"] = ("%d net(s) the board carries by pouring copper are out of "
+                           "this population - their vias are plane stitching, not a "
+                           "signal abandoning its reference: %s. Pass include_poured="
+                           "true to judge them too"
+                           % (len(res["excluded_as_poured"]),
+                              ", ".join(res["excluded_as_poured"])))
+        if res.get("unmatched_patterns"):
+            out["next_step"] = ("these patterns match no net on this board: %s - "
+                                "the report below covers only the ones that do"
+                                % ", ".join(res["unmatched_patterns"]))
+        elif res["verdict"] == "violations":
+            out["next_step"] = ("%d layer change(s) on the selected nets are not "
+                                "fixable by a hole (%s); either route those nets "
+                                "without changing layer or give them a plane that "
+                                "does not change under them"
+                                % (res["violations_total"],
+                                   ", ".join("%s=%d" % (k, v) for k, v
+                                             in sorted(res["counts"].items()))))
+        elif res["verdict"] == "clean":
+            out["message"] = ("every layer change of the selected nets keeps its "
+                              "return current in the same conductor")
+        else:
+            out["message"] = ("none of the selected nets changes layer, so the "
+                              "policy has nothing to judge")
+        return out
 
     if action == "place":
         plan = _rp.plan(board, net=net, reach_mm=reach,
@@ -12895,7 +12996,11 @@ _tool(
     "- only where the same net's copper is on two layers, checked against existing "
     "copper, drills and the board edge; hole size defaults to the median of the "
     "board's own vias. Nothing is written unless apply=true, and this never routes "
-    "a track.",
+    "a track. action='layer_changes' asks the per-net question a policy can be "
+    "written on - every layer change of the nets named in `nets` (patterns) must "
+    "keep its return current in the same conductor - and reports per net the "
+    "changes, the layers it visits and the violations; `max_changes` turns 'this "
+    "bus never changes layer' into a count instead of a defect hunt.",
     {"type": "object",
      "properties": dict({
          "action": _str("'audit' (default: read only) or 'place' (plan the holes)",

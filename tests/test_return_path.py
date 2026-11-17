@@ -344,3 +344,231 @@ class TestTheToolAnswersBothReadings(unittest.TestCase):
         self.assertIn(v["status"], ("stitched", "refused", "nothing_to_stitch"))
         for skip in v["skipped"][:5]:
             self.assertTrue(skip.get("reason"), skip)
+
+
+class TestANetIsNotAllowedToChangeLayerForFree(unittest.TestCase):
+    """The policy a bus is usually given in words: "this bus does not change layer".
+
+    Written as a count or as a verdict, it has to be judged per net, because the
+    decision is made per net ("DDR never leaves the top two layers") and the
+    defect is per net ("DQ4 references two different planes"). A whole-board
+    total cannot express either: it stays the same when one net improves and
+    another gets worse.
+    """
+
+    def _shared(self):
+        """F.Cu -> In2.Cu with In1/GND under both: a legal change."""
+        return _board(["F.Cu", "In1.Cu", "In2.Cu"],
+                      zones=[_pour("/GND", "In1.Cu")],
+                      tracks=[_track("/DDR_DQ0", "F.Cu", (5.0, 10.0), (10.0, 10.0)),
+                              _track("/DDR_DQ0", "In2.Cu", (10.0, 10.0), (15.0, 10.0))],
+                      vias=[_via("/DDR_DQ0", 10.0, 10.0, ("F.Cu", "In2.Cu"))])
+
+    def _two_planes(self):
+        """In2 -> B.Cu referencing /GND above and /+1V35_DDR below."""
+        return _board(
+            ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "B.Cu"],
+            zones=[_pour("/GND", "In1.Cu"), _pour("/+1V35_DDR", "In3.Cu")],
+            tracks=[_track("/DDR_DQ1", "In2.Cu", (5.0, 10.0), (10.0, 10.0)),
+                    _track("/DDR_DQ1", "B.Cu", (10.0, 10.0), (15.0, 10.0)),
+                    _track("/USB0_DP", "F.Cu", (5.0, 20.0), (10.0, 20.0)),
+                    _track("/USB0_DP", "In2.Cu", (10.0, 20.0), (15.0, 20.0))],
+            vias=[_via("/DDR_DQ1", 10.0, 10.0, ("In2.Cu", "B.Cu")),
+                  _via("/USB0_DP", 10.0, 20.0, ("F.Cu", "In2.Cu"))])
+
+    def test_the_pattern_selects_its_nets_and_says_which_ones_matched_nothing(self):
+        res = RP.layer_changes(self._two_planes(), nets=["DDR"])
+        self.assertEqual(list(res["nets"]), ["/DDR_DQ1"], res["nets"])
+        self.assertNotIn("/USB0_DP", res["nets"])
+        self.assertEqual(res.get("unmatched_patterns"), [])
+        res2 = RP.layer_changes(self._two_planes(), nets=["DDR", "NOPE"])
+        self.assertEqual(res2["unmatched_patterns"], ["NOPE"])
+
+    def test_a_poured_rail_is_out_of_the_population_and_named(self):
+        # The board carries +1V35_DDR by pouring it. Its vias are plane
+        # stitching, and `DDR` is a substring of its name, so without this the
+        # rail's holes would be reported as a DDR bus defect.
+        b = _board(
+            ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "B.Cu"],
+            zones=[_pour("/GND", "In1.Cu"), _pour("/+1V35_DDR", "In3.Cu")],
+            tracks=[_track("/DDR_DQ1", "In2.Cu", (5.0, 10.0), (10.0, 10.0)),
+                    _track("/DDR_DQ1", "B.Cu", (10.0, 10.0), (15.0, 10.0)),
+                    _track("/+1V35_DDR", "In3.Cu", (5.0, 30.0), (10.0, 30.0)),
+                    _track("/+1V35_DDR", "B.Cu", (10.0, 30.0), (15.0, 30.0))],
+            vias=[_via("/DDR_DQ1", 10.0, 10.0, ("In2.Cu", "B.Cu")),
+                  _via("/+1V35_DDR", 10.0, 30.0, ("In3.Cu", "B.Cu"))])
+        res = RP.layer_changes(b, nets=["DDR"])
+        self.assertEqual(list(res["nets"]), ["/DDR_DQ1"], res["nets"])
+        self.assertEqual(res["excluded_as_poured"], ["/+1V35_DDR"])
+        self.assertFalse(res["include_poured"])
+        # asking for it explicitly gets the whole-board reading back
+        wide = RP.layer_changes(b, nets=["DDR"], include_poured=True)
+        self.assertIn("/+1V35_DDR", wide["nets"])
+        self.assertEqual(wide["excluded_as_poured"], [])
+
+    def test_a_pattern_matches_a_hierarchical_name_by_its_parts(self):
+        self.assertTrue(RP._net_matches("/DDR_DQ0", "DDR"))
+        self.assertTrue(RP._net_matches("/DDR_DQ0", "DQ0"))
+        self.assertTrue(RP._net_matches("/PWR/DDR_VREF", "DDR"))
+        self.assertFalse(RP._net_matches("/USB0_DP", "DDR"))
+        self.assertFalse(RP._net_matches("/DDR_DQ0", " "))
+        self.assertFalse(RP._net_matches(None, "DDR"))
+
+    def test_a_change_between_two_plane_nets_is_a_violation(self):
+        res = RP.layer_changes(self._two_planes(), nets=["DDR"])
+        self.assertEqual(res["verdict"], "violations", res)
+        self.assertEqual(res["violations_total"], 1)
+        v = res["violations"][0]
+        self.assertEqual(v["verdict"], "reference_changes_net")
+        self.assertFalse(v["fixable_by_via"])
+        self.assertEqual(res["nets"]["/DDR_DQ1"]["verdict"], "violations")
+
+    def test_a_legal_change_is_clean_and_owes_no_hole(self):
+        res = RP.layer_changes(self._shared(), nets=["DDR"])
+        self.assertEqual(res["verdict"], "clean", res)
+        self.assertEqual(res["violations_total"], 0)
+        self.assertEqual(res["owed_vias"], 0)
+        self.assertEqual(res["nets"]["/DDR_DQ0"]["layers"], ["F.Cu", "In2.Cu"])
+
+    def test_max_changes_turns_a_clean_bus_into_a_violation_by_count(self):
+        # Every change here is legal; the rule being tested is "this net changes
+        # layer at most N times", which no defect count can express.
+        res = RP.layer_changes(self._shared(), nets=["DDR"], max_changes=0)
+        self.assertEqual(res["verdict"], "violations")
+        self.assertEqual(res["violations"][0]["verdict"], "too_many_layer_changes")
+        self.assertEqual(res["violations"][0]["detail"]["vias"], 1)
+        self.assertEqual(res["counts"].get("shared_reference"), 1)
+
+    def test_a_stitchable_change_is_reported_as_owed_not_as_a_violation(self):
+        b = _board(
+            ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "B.Cu"],
+            zones=[_pour("/GND", "In1.Cu"), _pour("/GND", "In3.Cu")],
+            tracks=[_track("/DDR_DQ2", "In2.Cu", (5.0, 10.0), (10.0, 10.0)),
+                    _track("/DDR_DQ2", "B.Cu", (10.0, 10.0), (15.0, 10.0))],
+            vias=[_via("/DDR_DQ2", 10.0, 10.0, ("In2.Cu", "B.Cu"))])
+        res = RP.layer_changes(b, nets=["DDR"], depth=1)
+        self.assertEqual(res["verdict"], "clean", res)
+        self.assertEqual(res["owed_vias"], 1)
+        self.assertEqual(res["counts"].get("stitch_needed"), 1)
+
+    def test_a_net_with_no_via_is_no_layer_change_not_a_pass(self):
+        res = RP.layer_changes(self._shared(), nets=["USB0"])
+        self.assertEqual(res["verdict"], "no_layer_change")
+        self.assertEqual(res["nets"], {})
+
+class TestTheGateJudgesTheEditNotTheBoard(unittest.TestCase):
+    """A board that already carries a defect must stay editable.
+
+    Refusing every future edit until an old defect is repaired is how a rule gets
+    switched off, so the comparison is "violations that exist after and not
+    before", never a total.
+    """
+
+    def _board(self, broken):
+        tracks = [_track("/DDR_DQ0", "F.Cu", (5.0, 10.0), (10.0, 10.0)),
+                  _track("/DDR_DQ0", "In2.Cu", (10.0, 10.0), (15.0, 10.0))]
+        vias = [_via("/DDR_DQ0", 10.0, 10.0, ("F.Cu", "In2.Cu"))]
+        if broken:
+            tracks += [_track("/DDR_DQ1", "In2.Cu", (5.0, 20.0), (10.0, 20.0)),
+                       _track("/DDR_DQ1", "B.Cu", (10.0, 20.0), (15.0, 20.0))]
+            vias.append(_via("/DDR_DQ1", 10.0, 20.0, ("In2.Cu", "B.Cu")))
+        return _board(
+            ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "B.Cu"],
+            zones=[_pour("/GND", "In1.Cu"), _pour("/+1V35_DDR", "In3.Cu")],
+            tracks=tracks, vias=vias)
+
+    def test_a_new_violation_blocks(self):
+        res = RP.policy_gate(self._board(False), self._board(True), nets=["DDR"])
+        self.assertFalse(res["ok"], res)
+        self.assertEqual(len(res["new"]), 1)
+        self.assertEqual(res["new"][0]["verdict"], "reference_changes_net")
+        self.assertIn("/DDR_DQ1", res["message"])
+
+    def test_an_old_violation_alone_does_not_block_even_while_it_remains(self):
+        res = RP.policy_gate(self._board(True), self._board(True), nets=["DDR"])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["new"], [])
+        # and it is still reported, so a pass does not imply a clean board
+        self.assertEqual(res["after"]["violations"], 1)
+
+    def test_fixing_a_violation_is_not_blocked_by_the_policy(self):
+        res = RP.policy_gate(self._board(True), self._board(False), nets=["DDR"])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["before"]["violations"], 1)
+        self.assertEqual(res["after"]["violations"], 0)
+
+class TestThePolicyOnTheRealBoardAndOnTheWritePath(unittest.TestCase):
+    """The two things a person actually touches: the tool and `board_apply`."""
+
+    def _path(self):
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "examples", "rk3506_som", "rk3506_som.kicad_pcb")
+
+    def test_the_layer_changes_action_reports_per_net(self):
+        from pcb_agent_mcp import tools
+        out = tools.call_tool("board_return_path",
+                              {"path": self._path(), "action": "layer_changes",
+                               "nets": ["DDR"], "shortlist": 5})
+        self.assertEqual(out["status"], "ok", out)
+        v = out["value"]
+        self.assertTrue(v["writes_nothing"])
+        self.assertTrue(v["nets"])
+        for name in v["nets"]:
+            self.assertTrue(name.startswith("/DDR"), name)
+            rec = v["nets"][name]
+            self.assertEqual(sum(rec["counts"].values()), rec["vias"])
+        # `DDR` as a substring also selects the +1V35_DDR rail; the rail is
+        # poured, so it is named as excluded instead of judged as a bus defect
+        self.assertIn("/+1V35_DDR", v["excluded_as_poured"])
+        self.assertNotIn("/+1V35_DDR", v["nets"])
+        self.assertTrue(v["excluded_as_poured"])
+        self.assertTrue(out.get("note"), out)
+        # every violation is either a real defect or the count cap, and none of
+        # them claims a hole would fix it
+        for viol in v["violations"]:
+            self.assertIn(viol["verdict"], ("reference_changes_net",
+                                            "no_reference", "dangling_escape",
+                                            "too_many_layer_changes"))
+            self.assertFalse(viol["fixable_by_via"])
+
+    def test_a_via_that_changes_layer_is_refused_and_the_file_is_untouched(self):
+        import shutil
+        import tempfile
+        from pcb_agent_mcp import edit as E
+        tmp = tempfile.mkdtemp(prefix="pcbpolicy-")
+        home = os.environ.get("PCB_AGENT_HOME")
+        os.environ["PCB_AGENT_HOME"] = os.path.join(tmp, "home")
+        try:
+            path = os.path.join(tmp, "board.kicad_pcb")
+            shutil.copy(self._path(), path)
+            with open(path, "rb") as fh:
+                before = fh.read()
+            opts = {"engine": False, "preconditions": False,
+                    "allow_new_violations": True,
+                    "precheck_layer_policy": {"nets": ["DDR"]}}
+            ops = [{"op": "add_via", "x": 12.0, "y": 30.0, "size": 0.6,
+                    "drill": 0.3, "net": "/DDR_DQ0"}]
+            prop = E.propose(path, ops, opts)
+            # propose already knows: the cheap place to change one's mind
+            self.assertEqual(prop["precheck"]["layer_policy"]["ok"], False)
+            self.assertTrue([b for b in prop["blocking"]
+                             if b.get("gate") == "layer_policy"], prop["blocking"])
+            with self.assertRaises(E.EditError) as ctx:
+                E.apply_plan(prop["plan_id"], confirm=True, options=opts)
+            self.assertEqual(ctx.exception.reason_code, "GATE_BLOCKED")
+            self.assertIn("layer change the policy forbids", str(ctx.exception))
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), before, "the refuse must roll back")
+            # the same plan with the override writes, and the gate still REPORTS
+            # the violation it accepted - an override is not a clean bill
+            opts2 = dict(opts, allow_layer_changes=True)
+            prop2 = E.propose(path, ops, opts2)
+            out = E.apply_plan(prop2["plan_id"], confirm=True, options=opts2)
+            self.assertEqual(out["status"], "ok", out)
+            self.assertEqual(out["gates"]["layer_policy"]["ok"], False)
+        finally:
+            if home is None:
+                os.environ.pop("PCB_AGENT_HOME", None)
+            else:
+                os.environ["PCB_AGENT_HOME"] = home
+            shutil.rmtree(tmp, ignore_errors=True)

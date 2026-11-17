@@ -310,6 +310,22 @@ def propose(path, operations, options=None):
                                  "message": c["why"],
                                  "how_to_clear": c.get("how_to_clear")})
 
+    # The layer-change policy, asked on the PLAN as well as on the file. Propose
+    # is where a caller can still change its mind cheaply; apply re-asks because
+    # the rule set and the stackup are read from disk, not remembered.
+    pol_spec = options.get("precheck_layer_policy")
+    policy = None
+    if pol_spec:
+        policy = _layer_policy_gate(raw, None, pol_spec, options,
+                                    after_text=new_text)
+        if policy.get("ok") is False and not options.get("allow_layer_changes"):
+            blocking.append({"gate": "layer_policy",
+                             "message": policy.get("message") or
+                             "this plan adds a forbidden layer change",
+                             "how_to_clear": "route those nets without changing "
+                                             "layer, or pass "
+                                             "allow_layer_changes=true"})
+
     plan_id = "plan-" + _uuid.uuid4().hex[:12]
     plan = {
         "plan_id": plan_id, "path": os.path.abspath(path),
@@ -326,7 +342,9 @@ def propose(path, operations, options=None):
                     "process": options.get("process"),
                     "preconditions": pre_options,
                     "allow_edge_changes": bool(options.get("allow_edge_changes")),
-                    "allow_open_outline": bool(options.get("allow_open_outline"))},
+                    "allow_open_outline": bool(options.get("allow_open_outline")),
+                    "precheck_layer_policy": options.get("precheck_layer_policy"),
+                    "allow_layer_changes": bool(options.get("allow_layer_changes"))},
         "preconditions_input": {
             "outline": after["outline"], "clearance_after": clearance,
             "clearance_before": clearance_before, "copper_adds": copper_adds},
@@ -344,6 +362,12 @@ def propose(path, operations, options=None):
         "board_before": before,
         "board_after": after,
         "precheck": {"outline": after["outline"], "clearance": clearance,
+                     "layer_policy": (None if policy is None else {
+                         "ok": policy.get("ok"),
+                         "nets": policy.get("nets"),
+                         "new": policy.get("new"),
+                         "after": policy.get("after"),
+                         "message": policy.get("message")}),
                      "outside": outside},
         "self_check": {"token_identity": self_check.get("token_identity"),
                        "note": "the edited tree survives a serialise/parse round trip "
@@ -620,6 +644,70 @@ def _drc_diff(before, after, limit=10, strict=False):
             "resolved_total": len(gone),
             "before_total": len(a), "after_total": len(b)}
 
+def _layer_policy_gate(before_bytes, after_path, spec, options, after_text=None):
+    """Did this edit add a layer change the policy forbids?
+
+    Opt-in on purpose: the policy names a net population ("DDR"), and a
+    population is a design statement this module cannot derive. With no spec the
+    gate does not exist and the caller's behaviour is exactly what it was.
+
+    The comparison is board-to-board through `route.return_path`, i.e. the same
+    judge `board_return_path` reports with. A gate that re-implemented the
+    question could pass copper its own audit calls defective.
+    """
+    from ..adapters import open_board as _ob
+    from ..adapters.kicad_pcb import parse_board_text
+    from ..route import return_path as _rp
+    nets = spec.get("nets")
+    if isinstance(nets, str):
+        nets = [nets]
+    if not nets:
+        return {"ok": None, "reason_code": "NOT_MEASURED",
+                "reason": "precheck_layer_policy.nets is empty, so no population "
+                          "was named and nothing was judged"}
+    depth = int(spec.get("depth") if spec.get("depth") is not None else 3)
+    reach = float(spec.get("reach_mm") if spec.get("reach_mm") is not None
+                  else _rp.GROUND_REACH_MM)
+    max_changes = spec.get("max_changes")
+    max_changes = None if max_changes is None else int(max_changes)
+    # The caller may hand over the bytes (propose) or the checkpoint's path
+    # (apply); a checkpoint stores its body as a FILE, and reading the path as if
+    # it were the copper made this gate answer NOT_MEASURED on every apply - a
+    # gate that never judges is worse than no gate, because it reads as one.
+    raw = before_bytes
+    if isinstance(raw, str):
+        try:
+            with open(raw, "rb") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            return {"ok": None, "reason_code": "NOT_MEASURED",
+                    "reason": "the checkpoint body is not readable (%s), so the "
+                              "before-state of this edit cannot be parsed" % exc}
+    if not isinstance(raw, (bytes, bytearray)):
+        return {"ok": None, "reason_code": "NOT_MEASURED",
+                "reason": "no before-state was handed to the policy gate"}
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:                                  # noqa: BLE001
+        text = ""
+    if "(kicad_pcb" not in text[:4000]:
+        return {"ok": None, "reason_code": "NOT_MEASURED",
+                "reason": "the checkpoint is not a KiCad board, so the zone and "
+                          "stackup facts this gate reads are not available"}
+    try:
+        before = parse_board_text(text)
+        after = (parse_board_text(after_text) if after_text is not None
+                 else _ob(after_path, project=options.get("project")))
+        res = _rp.policy_gate(before, after, nets=nets, depth=depth,
+                              reach_mm=reach, max_changes=max_changes)
+    except Exception as exc:                           # noqa: BLE001
+        return {"ok": None, "reason_code": "NOT_MEASURED",
+                "reason": "%s: %s - an unmeasured gate is not a pass, but it is "
+                          "not a block either, and it says which" %
+                          (type(exc).__name__, exc)}
+    res["nets"] = nets
+    return res
+
 def apply_plan(plan_id, confirm=False, options=None):
     """Write the plan. This is the only function in this package that writes."""
     options = options or {}
@@ -788,6 +876,12 @@ def apply_plan(plan_id, confirm=False, options=None):
                                "ok": None}
             gates["drc"] = {"comparable": False, "reason": "NOT_REQUESTED"}
 
+        spec = options.get("precheck_layer_policy") or \
+            plan["options"].get("precheck_layer_policy")
+        if spec:
+            gates["layer_policy"] = _layer_policy_gate(
+                checkpoint["body"], target, spec, options)
+
         # ---------------- decisions
         blocking = []
         if not gates["bytes_written"]["ok"]:
@@ -836,6 +930,14 @@ def apply_plan(plan_id, confirm=False, options=None):
                                ", ".join(sorted({v["type"] for v in drc["new_blocking"]})),
                                "; ".join(where),
                                (" ..." if drc["new_blocking_total"] > 5 else "")))
+        pol = gates.get("layer_policy") or {}
+        if pol.get("ok") is False and not options.get("allow_layer_changes"):
+            blocking.append(pol.get("message") or (
+                "this edit adds %d forbidden layer change(s) on net(s) %s; pass "
+                "allow_layer_changes=true to accept them, or route those nets "
+                "without changing layer"
+                % (sum(n["count"] for n in pol.get("new") or []),
+                   ", ".join(sorted({n["net"] for n in pol.get("new") or []})))))
         plan_outline = _checks.outline_report(re_doc)
         if "outline" in plan["affected"] and not plan_outline["closed"] and \
                 not options.get("allow_open_outline"):

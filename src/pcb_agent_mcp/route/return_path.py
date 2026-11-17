@@ -743,6 +743,40 @@ def plan(board, net=None, reach_mm=GROUND_REACH_MM, dia_mm=None, drill_mm=None,
                      ("nothing_to_stitch" if not out["skipped"] else "refused"))
     return out
 
+def _judge_via(board, order, pours, gc, v, depth=3, reach_mm=GROUND_REACH_MM):
+    """One layer change, judged once. Every caller reads the same verdict.
+
+    `audit_reference` and `layer_changes` answer different questions about the
+    same object, so they must not each carry their own copy of this logic: two
+    copies drift, and then the report that says "no via can fix this" and the
+    gate that says "this is fine" are both green.
+    """
+    x, y = float(v["x"]), float(v["y"])
+    joined = _via_layers(board, v)
+    if len(joined) < 2:
+        return "dangling_escape", {"layers_joined": joined,
+                                   "via_span": [v.get("from"), v.get("to")]}
+    refs = [_reference_of(order, pours, l, x, y, depth) for l in joined]
+    if any(r is None for r in refs):
+        return "no_reference", {
+            "layers_joined": joined, "references": refs,
+            "layers_without_pour": [l for l, r in zip(joined, refs) if r is None]}
+    if len(set((r["layer"], r["net"]) for r in refs)) == 1:
+        return "shared_reference", {"layers_joined": joined, "reference": refs[0]}
+    if len(set(r["net"] for r in refs)) == 1:
+        detail = {"layers_joined": joined, "reference": refs[0],
+                  "reference_after": refs[-1], "nearest_ground_via_mm": None}
+        near = _nearest_ground_via(gc, x, y) if gc else None
+        if near is not None:
+            detail["nearest_ground_via_mm"] = round(near[0], 4)
+            if near[0] <= reach_mm:
+                return "stitched", detail
+        return "stitch_needed", detail
+    return "reference_changes_net", {
+        "layers_joined": joined, "reference": refs[0], "reference_after": refs[-1],
+        "note": "the two planes carry %r and %r"
+                % (refs[0]["net"], refs[-1]["net"])}
+
 _REF_MEANING = {
     "shared_reference": "both layers see the same plane, so the return current "
                         "never leaves it and no hole is owed",
@@ -794,43 +828,9 @@ def audit_reference(board, net=None, depth=3, reach_mm=GROUND_REACH_MM, shortlis
         if pours is None:
             pours = _pour_at(board, x, y)
             cache[key] = pours
-        joined = _via_layers(board, v)
         rec = out["by_net"].setdefault(one, {"vias": 0, "counts": {}})
         rec["vias"] += 1
-        if len(joined) < 2:
-            verdict = "dangling_escape"
-            detail = {"layers_joined": joined,
-                      "via_span": [v.get("from"), v.get("to")]}
-        else:
-            refs = [_reference_of(order, pours, l, x, y, depth) for l in joined]
-            if any(r is None for r in refs):
-                verdict = "no_reference"
-                detail = {"layers_joined": joined,
-                          "references": refs,
-                          "layers_without_pour": [l for l, r in zip(joined, refs)
-                                                  if r is None]}
-            elif len(set((r["layer"], r["net"]) for r in refs)) == 1:
-                verdict = "shared_reference"
-                detail = {"layers_joined": joined,
-                          "reference": refs[0]}
-            elif len(set(r["net"] for r in refs)) == 1:
-                verdict = "stitch_needed"
-                detail = {"layers_joined": joined,
-                          "reference": refs[0],
-                          "reference_after": refs[-1],
-                          "nearest_ground_via_mm": None}
-                near = _nearest_ground_via(gc, x, y)
-                if near is not None:
-                    detail["nearest_ground_via_mm"] = round(near[0], 4)
-                    if near[0] <= reach_mm:
-                        verdict = "stitched"
-            else:
-                verdict = "reference_changes_net"
-                detail = {"layers_joined": joined,
-                          "reference": refs[0],
-                          "reference_after": refs[-1],
-                          "note": "the two planes carry %r and %r"
-                                  % (refs[0]["net"], refs[-1]["net"])}
+        verdict, detail = _judge_via(board, order, pours, gc, v, depth, reach_mm)
         out["counts"][verdict] = out["counts"].get(verdict, 0) + 1
         rec["counts"][verdict] = rec["counts"].get(verdict, 0) + 1
         rec.setdefault("first", {})
@@ -847,4 +847,209 @@ def audit_reference(board, net=None, depth=3, reach_mm=GROUND_REACH_MM, shortlis
     out["meaning"] = _REF_MEANING
     out["defect_cases"] = bad[:int(shortlist)]
     out["defect_cases_truncated"] = max(0, len(bad) - int(shortlist))
+    return out
+
+
+# Verdicts that a rule asking for "no gratuitous layer changes" must block. A
+# `stitch_needed` change is legal and owes one hole, so it is reported
+# (`owed_vias`) but not counted as a violation - conflating the two would make
+# the policy forbid a thing a single hole fixes.
+_POLICY_BLOCKING = ("reference_changes_net", "no_reference", "dangling_escape")
+
+_POLICY_MEANING = {
+    "no_layer_change": "none of the selected nets changes layer at all, so the "
+                       "policy has nothing to judge",
+    "clean": "every layer change of every selected net keeps its return current in "
+             "the same conductor (shared plane) or already has its hole (stitched)",
+    "violations": "at least one layer change of a selected net either references a "
+                  "different net on its two sides, has no pour on one side, or is a "
+                  "one-layer stub - none of those is fixed by adding a hole",
+}
+
+def _net_matches(name, pattern):
+    """Does this net name fall under this pattern?
+
+    Matching is deliberately blunt and stated: the pattern is compared
+    case-insensitively against the whole name, its last `/`-segment, and as a
+    substring of the whole name. So `DDR` covers `/DDR_DQ0`, `/DDR_DQS0P` and
+    `/DDR_CLKP` on a KiCad board where every net carries its sheet path, while
+    `/DDR_DQ0` also answers to `DQ0`. A pattern that matches nothing is reported
+    as unmatched instead of silently selecting the whole board.
+    """
+    if not isinstance(name, str) or not isinstance(pattern, str):
+        return False
+    pat = pattern.strip().upper().lstrip("/")
+    if not pat:
+        return False
+    up = name.strip().upper()
+    return pat == up.lstrip("/") or pat == up.split("/")[-1] or pat in up
+
+def _poured_nets(board):
+    """Nets the board itself carries by pouring copper.
+
+    Not a name heuristic: a rail that has a filled pour IS the rail the board
+    distributes current on, whatever it is called. Its vias are plane stitching,
+    not a signal abandoning its reference, so they are read by a different
+    question and are out of this population by default.
+    """
+    got = set()
+    for z in (getattr(board, "zones", None) or ()):
+        if z.get("is_keepout") or not (z.get("filled_polygons") or ()):
+            continue
+        if z.get("net"):
+            got.add(z["net"])
+    return got
+
+def layer_changes(board, nets=None, depth=3, reach_mm=GROUND_REACH_MM,
+                  max_changes=None, shortlist=20, include_poured=False):
+    """Every layer change of the selected nets, and whether the policy allows it.
+
+    The question `audit_reference` answers for the whole board, asked per net and
+    with a verdict a gate can act on. `nets` is a list of patterns (see
+    `_net_matches`); with no list every signal net is judged.
+
+    Nets the board carries by POURING copper (`_poured_nets`) are out of the
+    population unless `include_poured` is set, and the ones that were dropped are
+    named in `excluded_as_poured`. Two reasons, both measured on the RV3506
+    board: a plane net's via is plane stitching - the current is already in a
+    conductor, so "does it keep a reference" is not the question; and pattern
+    matching is a substring match, so `DDR` would otherwise drag in the
+    `+1V35_DDR` rail and report a power plane's vias as a DDR bus defect. Pass
+    `include_poured=True` to get the older whole-board reading back, which is
+    the population `audit_reference` uses.
+
+    `max_changes`, when given, is a hard cap per net: a net that changes layer
+    more often than that is a violation of its own (`too_many_layer_changes`)
+    even when every individual change is clean. That is the rule as it is
+    usually written - "this bus does not change layer" - which counting defects
+    cannot express.
+    """
+    order = _stack_order(board)
+    gnd = None
+    cands = sorted(set(n for n in _board_net_names(board) if _looks_ground(n)))
+    if len(cands) == 1:
+        gnd = cands[0]
+    gc = _ground_copper(board, gnd) if gnd else None
+    cache = {}
+    pats = [str(p) for p in (nets or []) if str(p).strip()]
+    matched_pats = set()
+    poured = set() if include_poured else _poured_nets(board)
+    excluded = set()
+    out = {"net_patterns": pats, "max_changes": max_changes, "depth": depth,
+           "reach_mm": reach_mm, "counts": {}, "nets": {}, "violations": [],
+           "violations_total": 0, "owed_vias": 0, "ground_net": gnd,
+           "include_poured": bool(include_poured),
+           "meaning": _POLICY_MEANING, "writes_nothing": True}
+    for v in (getattr(board, "vias", None) or ()):
+        one = v.get("net")
+        if not one or v.get("x") is None or one == gnd:
+            continue
+        if one in poured:
+            if not pats or any(_net_matches(one, p) for p in pats):
+                excluded.add(one)
+            continue
+        if pats:
+            hit = [p for p in pats if _net_matches(one, p)]
+            if not hit:
+                continue
+            matched_pats.update(hit)
+        elif _looks_ground(one):
+            continue
+        x, y = float(v["x"]), float(v["y"])
+        key = (round(x, 3), round(y, 3))
+        pours = cache.get(key)
+        if pours is None:
+            pours = _pour_at(board, x, y)
+            cache[key] = pours
+        verdict, detail = _judge_via(board, order, pours, gc, v, depth, reach_mm)
+        rec = out["nets"].setdefault(one, {
+            "vias": 0, "layers": [], "counts": {}, "violations": [], "owed": 0})
+        rec["vias"] += 1
+        for lay in detail.get("layers_joined") or ():
+            if lay not in rec["layers"]:
+                rec["layers"].append(lay)
+        rec["counts"][verdict] = rec["counts"].get(verdict, 0) + 1
+        out["counts"][verdict] = out["counts"].get(verdict, 0) + 1
+        if verdict == "stitch_needed":
+            rec["owed"] += 1
+            out["owed_vias"] += 1
+        if verdict in _POLICY_BLOCKING:
+            item = {"net": one, "at": [round(x, 4), round(y, 4)],
+                    "verdict": verdict, "detail": detail, "fixable_by_via": False}
+            rec["violations"].append(item)
+            out["violations"].append(item)
+    if pats:
+        out["unmatched_patterns"] = [p for p in pats if p not in matched_pats]
+    out["excluded_as_poured"] = sorted(excluded)
+    for one, rec in out["nets"].items():
+        if max_changes is not None and rec["vias"] > int(max_changes):
+            item = {"net": one, "at": None,
+                    "verdict": "too_many_layer_changes",
+                    "detail": {"vias": rec["vias"],
+                               "max_changes": int(max_changes),
+                               "layers": rec["layers"]},
+                    "fixable_by_via": False}
+            rec["violations"].append(item)
+            out["violations"].append(item)
+    for one, rec in out["nets"].items():
+        rec["layers"] = _in_stack_order(rec["layers"], order)
+        rec["verdict"] = ("violations" if rec["violations"] else "clean")
+    out["violations_total"] = len(out["violations"])
+    if not out["nets"]:
+        out["verdict"] = "no_layer_change"
+    elif out["violations"]:
+        out["verdict"] = "violations"
+    else:
+        out["verdict"] = "clean"
+    out["violations"] = out["violations"][:int(shortlist)]
+    out["violations_truncated"] = max(0, out["violations_total"]
+                                      - int(shortlist))
+    return out
+
+def policy_gate(before, after, nets=None, depth=3, reach_mm=GROUND_REACH_MM,
+                max_changes=None, include_poured=False):
+    """Did this edit make a selected net change layer somewhere it may not?
+
+    Compares the two boards the way a gate has to: by the violations that exist
+    in `after` and not in `before`, not by totals. A board that already carries
+    a defect must stay editable - refusing every future edit until the old
+    defect is repaired is how a rule gets switched off.
+    """
+    b = layer_changes(before, nets=nets, depth=depth, reach_mm=reach_mm,
+                     max_changes=max_changes, shortlist=10000,
+                     include_poured=include_poured)
+    a = layer_changes(after, nets=nets, depth=depth, reach_mm=reach_mm,
+                     max_changes=max_changes, shortlist=10000,
+                     include_poured=include_poured)
+
+    def bag(res):
+        got = {}
+        for v in res["violations"]:
+            key = (v["net"], v["verdict"])
+            got[key] = got.get(key, 0) + 1
+        return got
+
+    cb, ca = bag(b), bag(a)
+    new = []
+    for key, n in ca.items():
+        extra = n - cb.get(key, 0)
+        if extra > 0:
+            new.append({"net": key[0], "verdict": key[1], "count": extra})
+    out = {"ok": not new, "new": new,
+           "before": {"verdict": b["verdict"], "violations": b["violations_total"],
+                      "counts": b["counts"]},
+           "after": {"verdict": a["verdict"], "violations": a["violations_total"],
+                     "counts": a["counts"]},
+           "net_patterns": list(nets or []), "max_changes": max_changes,
+           "excluded_as_poured": a["excluded_as_poured"],
+           "examples": a["violations"][:8]}
+    if new:
+        out["message"] = (
+            "this edit gives net(s) %s a layer change the policy forbids: %s. A "
+            "change that references a different net on its two sides (or has no "
+            "pour on one side) cannot be repaired by adding a hole - the stackup "
+            "or the routing has to change"
+            % (", ".join(sorted({n["net"] for n in new})),
+               "; ".join("%s x%d (%s)" % (n["net"], n["count"], n["verdict"])
+                         for n in new)))
     return out
