@@ -5242,11 +5242,19 @@ def _tune_length(board, args):
         grow = args.get("keepout_grow_mm")
         keep, skipped = PR.keepout_rects(
             board, None if grow is None else float(grow))
+        # `respect_apply_floor` judges every candidate against the same 0.2 mm
+        # floor `edit.apply_plan` uses, so the ops that come back do not grow the
+        # count of sub-floor pairs and can be written with the gates left alone.
+        # Off by default: on a board whose bundles are already at 0.1 mm it refuses
+        # waves the net rule would allow, and the caller has to decide whether it
+        # wants that correction or that restraint.
+        floor_mm = TB.FLOOR_MM if args.get("respect_apply_floor") is True else 0.0
         res = TB.plan(board, groups, _rrules.resolve(board), keepout_rects=keep,
                       pitch_mm=float(args.get("pitch_mm") or 0.1),
                       max_replacements=int(args.get("max_replacements") or 24),
                       allow_locked=args.get("allow_locked") is True,
                       style=str(args.get("style") or "chamfer"),
+                      floor_mm=floor_mm,
                       with_headroom=args.get("headroom") is True)
     except ValueError as exc:
         return err(str(exc), "ARG_INVALID")
@@ -5382,6 +5390,13 @@ _tool(
                        "chamfer"),
          "pitch_mm": _num("search raster for the blocking check", 0.1),
          "max_replacements": _num("segments one net may have replaced", 24),
+         "respect_apply_floor": _bool(
+             "plan only meanders that stay clear of the apply-time 0.2 mm floor, so "
+             "the returned ops never grow the count of sub-floor pairs and write "
+             "without allow_new_violations (or a lowered precheck_clearance_mm). "
+             "Default false: on a board whose bundles already sit at 0.1 mm this "
+             "refuses waves the net rule allows - the correction gets smaller and "
+             "clearance_floor.new_pairs comes back 0", False),
          "keepout_grow_mm": _num("rule rectangles grow past the pad hull by this", 0.1),
          "precheck_clearance_mm": _num(
              "the gap apply_plan refuses to shrink below (default 0.2 mm). Bundles "

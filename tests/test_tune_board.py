@@ -239,14 +239,8 @@ class TestTheToolAnswers(_Board):
         self.assertEqual(ctx.exception.reason_code, "TUNE_NO_COPPER")
 
 
-class TestTheApplyFloor(_Board):
-    """A meander legal by the net rule can still be refused by the write gate.
-
-    `edit.apply_plan` will not grow the count of different-net pairs closer than
-    0.2 mm, and a board's bundles are often already at 0.1 mm. The tool therefore
-    COUNTS that cost instead of pretending it does not exist: the number travels
-    in `clearance_floor`, and the write needs the caller to say so.
-    """
+class _Channels(_Board):
+    """Fixtures shared by the two halves of the apply-floor question."""
 
     def _pair_in_a_channel(self):
         # The apply floor (0.2 mm) and this board's own net rule (0.1 mm) have to
@@ -265,6 +259,16 @@ class TestTheApplyFloor(_Board):
                    self.track("N1", (5.0, 7.4), (13.0, 7.4)),
                    self.track("N2", (5.0, 8.6), (13.0, 8.6)))
         return [{"name": "pair", "nets": ["LONG", "SHORT"], "tol_mm": 0.05}]
+
+
+class TestTheApplyFloor(_Channels):
+    """A meander legal by the net rule can still be refused by the write gate.
+
+    `edit.apply_plan` will not grow the count of different-net pairs closer than
+    0.2 mm, and a board's bundles are often already at 0.1 mm. The tool therefore
+    COUNTS that cost instead of pretending it does not exist: the number travels
+    in `clearance_floor`, and the write needs the caller to say so.
+    """
 
     def test_the_floor_number_is_the_one_the_gate_uses(self):
         from pcb_agent_mcp.ruleset import precondition
@@ -288,6 +292,66 @@ class TestTheApplyFloor(_Board):
                    for r in e["refusals"]]
         self.assertIn("clearance", reasons)
         self.assertEqual(res["clearance_floor"]["new_pairs"], 0)
+
+class TestTheCallerCanAskForAWritablePlan(_Channels):
+    """`respect_apply_floor` is the third answer to "the floor costs me length".
+
+    Default (off) is unchanged: plan by the net rule, COUNT the sub-floor pairs in
+    `clearance_floor`, and let the write need `allow_new_violations` or a lowered
+    `precheck_clearance_mm`. With it on, every candidate is judged against the
+    same 0.2 mm the write gate uses, so the ops come back writable as they are -
+    and, on a channel that is already at 0.1 mm, the correction is smaller. The
+    reverse control matters as much: a wave that is already clear of the floor
+    must NOT be refused by the flag, or "writable" would just mean "no plan".
+    """
+
+    def _pair_in_a_wide_channel(self):
+        # Same pair, neighbours moved out to 1.0 mm: a 0.5 mm tooth now has ~0.4 mm
+        # of edge room either side, which is what the 0.2 mm floor asks for.
+        raw = open(self.path, "rb").read()
+        open(self.path, "wb").write(raw.replace(b"(clearance 0.2)",
+                                                b"(clearance 0.1)"))
+        self.board = self.reload()
+        self.write(self.track("LONG", (5.0, 5.0), (15.0, 5.0)),
+                   self.track("SHORT", (5.0, 8.0), (13.5, 8.0)),
+                   self.track("N1", (5.0, 7.0), (13.0, 7.0)),
+                   self.track("N2", (5.0, 9.0), (13.0, 9.0)))
+        return [{"name": "pair", "nets": ["LONG", "SHORT"], "tol_mm": 0.05}]
+
+    def test_the_flag_trades_correction_for_a_writeable_plan(self):
+        groups = self._pair_in_a_channel()
+        loud = TB.plan(self.reload(), groups)
+        self.assertEqual(loud["groups"][0]["status"], "matched")
+        self.assertGreaterEqual(loud["clearance_floor"]["new_pairs"], 1)
+        quiet = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM)
+        self.assertEqual(quiet["clearance_floor"]["new_pairs"], 0)
+        self.assertEqual(quiet["groups"][0]["status"], "length_not_matched")
+        self.assertEqual(quiet["ops"], [])
+        # the sentence must not keep claiming the floor is only counted
+        self.assertIn("0.20 mm floor", quiet["assumptions"]["clearance"])
+        self.assertIn("COUNTED", loud["assumptions"]["clearance"])
+
+    def test_a_wave_that_is_already_clear_of_the_floor_is_still_planned(self):
+        groups = self._pair_in_a_wide_channel()
+        res = TB.plan(self.reload(), groups, floor_mm=TB.FLOOR_MM)
+        self.assertEqual(res["groups"][0]["status"], "matched", res)
+        self.assertEqual(res["clearance_floor"]["new_pairs"], 0)
+        self.assertGreater(len(res["ops"]), 0)
+
+    def test_the_tool_reaches_the_flag_and_stops_asking_for_allow_new_violations(self):
+        groups = self._pair_in_a_channel()
+        out = tools.TOOLS["board_tune_length"]["handler"](
+            {"path": self.path, "groups": groups, "apply": True,
+             "respect_apply_floor": True})
+        self.assertEqual(out["value"]["clearance_floor"]["new_pairs"], 0)
+        self.assertNotIn("allow_new_violations", out.get("next_step") or "")
+        self.assertEqual(out["status"], "length_not_matched")
+        # default still reaches the cost report, i.e. the flag is not wiring that
+        # silently replaced the old path
+        loud = tools.TOOLS["board_tune_length"]["handler"](
+            {"path": self.path, "groups": groups, "apply": True})
+        self.assertGreaterEqual(loud["value"]["clearance_floor"]["new_pairs"], 1)
+        self.assertIn("allow_new_violations", loud.get("next_step") or "")
 
     def test_the_tool_will_not_write_when_the_floor_cost_is_unacknowledged(self):
         groups = self._pair_in_a_channel()

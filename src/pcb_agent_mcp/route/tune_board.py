@@ -1003,9 +1003,13 @@ def plan(board, groups=None, bundle=None, keepout_rects=None, pitch_mm=0.1,
                                  "(or target_mm); a too-long net is `needs_reroute`",
             "angles": "only segments on the 0/45/90/135 grid are meandered, so "
                       "every new segment is on that grid too",
-            "clearance": "candidates are judged against each pair's own net rule; "
-                         "the apply-time 0.2 mm floor is COUNTED, not enforced, "
-                         "because this board's bundles are already at 0.1 mm",
+            "clearance": ("candidates are judged against each pair's own net rule "
+                          "AND the apply-time %.2f mm floor, so nothing this plan "
+                          "adds lands closer than the write gate allows"
+                          % floor_mm if floor_mm else
+                          "candidates are judged against each pair's own net rule; "
+                          "the apply-time 0.2 mm floor is COUNTED, not enforced, "
+                          "because this board's bundles are already at 0.1 mm"),
         },
     }
 
