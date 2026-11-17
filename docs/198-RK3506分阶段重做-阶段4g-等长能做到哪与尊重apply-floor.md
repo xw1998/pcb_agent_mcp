@@ -8,6 +8,7 @@
 2. **残余不匹配点名的全是出线栅栏**：`/DDR_DQ3` 的拒绝是 `clearance needed 0.105 actual 0.0`、对手是 `/DDR_DQ1` 的 via `@(21.000,22.311)`；`/DDR_DQS0N` 对手是 `/DDR_DQ3` 在 `(20.15,22.95)` 的 track；`/DDR_DQS0P` 对手是 `/DDR_DQS0N` 在 `(19.9,22.3)` 的 track。y≈22.3–23.3 就是 `196 §2` 算出来的那道 0.5621 mm 球距的栅栏——**代码层的读数与几何层的上界对上了**，不是算法不行。
 3. **0.2 mm floor 是一笔明码交换**（本轮新增开关的那一半）：默认档（`floor_mm=0`，只按各网自己的 DRC 净距判）把 skew 从 6.468 压到 4.800 mm，代价是**新增 35 对 <0.2 mm 的异网对**（最紧 0.1085 mm，位于 `(21.0,14.45)`，两对都是 `/DDR_DQ5`）；开 `respect_apply_floor` 后 **new_pairs = 0、ops 从 244 降到 114**，代价是 skew 只到 **5.930**——也就是说，**这 1.130 mm 的改良是完全由那 35 对贴到 0.10–0.11 mm 的铜买来的**（占默认档总改良 1.668 mm 的 68%）。
 4. **`style=arc` 在这块板上更差，且有一处能力缺口**：405 op、new_pairs **259**、skew 只到 5.018；`/DDR_DQ2` 那 0.141 mm 的缺口它根本补不上（`does_not_fit`）——圆弧蛇形的齿数是 `range(2, 65, 2)`，最少 2 颗，**表达不出小于一颗齿的增量**。这解释了为什么 `197` 的连续段读数再宽，也不能简单换成 arc 就解决。
+5. **把整块板给一条网、邻居不争，7 条仍然吞不下自己欠的长度**（§7 `headroom`）：组判 `blocked_by_geometry`，binding net `/DDR_DM0` 差 **4.800 mm**——与默认档最后一颗齿之后的残余**同值**。所以这 4.800 mm 不是搜索不够，是 `/DDR_DM0` 的几何上限；调路由参数再多次也不会变，只能回布局。
 
 ## §2 怎么读的
 
@@ -79,7 +80,7 @@ schema 新增 `respect_apply_floor`（`_bool`，默认 `False`），描述里写
 ## §5 未做项
 
 1. **没有写盘**：244/114 两组 op 都只到 plan 为止，没有 `board_propose` + `board_apply`，也没有 `board_drc` 复测。写下去要不要接受那 35 对，是产品判断，不是本轮的读数。
-2. **`headroom` 没跑**：12 网一次 `with_headroom=True` 是每条网一整趟 plan（约 10 s/条），能回答「`/DDR_CLKP` 缺 6.468 mm 靠自己那条铜到底能不能补上」。但 §3 的默认档已经给了它的上界（21 颗齿之后仍差 4.8 mm），所以这一项是**确认**不是**发现**。
+2. **`headroom` 已经跑了**（见 §7）：把整块板子给一条网、邻居不争，12 条网里 **7 条仍然吞不下自己欠的长度** ⇒ 该组的 `verdict=blocked_by_geometry`（binding net = `/DDR_DM0`，差 4.800 mm）。这条是**终局**，不是待调参数。
 3. **0.2 mm 余量仍是交换**（`188 §4`）：本轮第一次把它量化成「35 对 ↔ 1.130 mm」，但没有把它变成判据——要不要为了 skew 接受 0.1085 mm 的异网对，是用户的设计决定。
 4. **`rules/` 里的优先级表仍未动**（`197 §4` 的两条布局规则还在文档里）。
 5. 盲/埋孔仍未评估；`boot_sw` 等阶段 4 的历史欠账未动。
@@ -94,6 +95,37 @@ MSYS2_ARG_CONV_EXCL='*' env -u PYTHONPATH -u PYTHONHOME \
   python D:/tmp/_tune2.py D:/tmp/_rsv2_contract_p2_pinch3.json chamfer 0.2
 MSYS2_ARG_CONV_EXCL='*' env -u PYTHONPATH -u PYTHONHOME \
   python D:/tmp/_tune2.py D:/tmp/_rsv2_contract_p2_pinch3.json arc 0
+# §7 headroom（219 s，整块板给一条网）
+MSYS2_ARG_CONV_EXCL='*' env -u PYTHONPATH -u PYTHONHOME \
+  python D:/tmp/_hr.py D:/tmp/_rsv2_contract_p2_pinch3.json 0
 # 测试
 env -u PYTHONPATH -u PYTHONHOME python -m pytest tests/test_tune_board.py -q
 ```
+
+## §7 `headroom`：11 条欠长的网里 7 条**单独也吞不下**
+
+`plan(with_headroom=True)` 对每条网在**干净板子上单独**跑一整趟（`headroom()`，`HEADROOM_EXTRA_MM = 0.2`：只求「刚过缺口」就停）。口径要注意：这里的「单」是**整块板都给它、邻居不争**，所以 `shortfall` 是几何终局，`reachable` 只是「自己的铜够用」，不是「和邻居一起也能放」。
+
+| 网 | 欠 (mm) | 单独能吞 (mm) | 差 (mm) | 卡在哪 | status |
+|---|---|---|---|---|---|
+| `/DDR_CLKP` | 6.468 | 5.066 | **1.402** | `does_not_fit` | shortfall |
+| `/DDR_DQ0` | 2.054 | 2.254 | 0 | — | reachable |
+| `/DDR_DQ1` | 5.930 | 3.848 | **2.082** | `does_not_fit` | shortfall |
+| `/DDR_DQ2` | 0.141 | 0.341 | 0 | — | reachable |
+| `/DDR_DQ3` | 4.394 | 0.780 | **3.614** | `clearance` | shortfall |
+| `/DDR_DQ4` | 0 | 0 | 0 | — | already_within_tol |
+| `/DDR_DQ5` | 5.138 | 3.315 | **1.824** | `does_not_fit` | shortfall |
+| `/DDR_DQ6` | 1.794 | 1.994 | 0 | — | reachable |
+| `/DDR_DQ7` | 1.321 | 1.521 | 0 | — | reachable |
+| `/DDR_DM0` | 5.018 | 0.219 | **4.800** | `clearance` | shortfall |
+| `/DDR_DQS0N` | 2.760 | **0.000** | **2.760** | `clearance` | shortfall |
+| `/DDR_DQS0P` | 3.186 | 0.291 | **2.895** | `clearance` | shortfall |
+
+四条读法：
+
+1. **组的 `verdict` 是 `blocked_by_geometry`，binding net 是 `/DDR_DM0`（差 4.800 mm）**：只要有成员单独也吞不下，组就不是「可调」；`198 §3` 默认档最后仍差 4.800 mm，与这个 binding 数字**同值**——残余不是搜索不够，是 `/DDR_DM0` 的几何上限。
+2. **两种 `blocks` 指向同一件事**：`does_not_fit`（`/DDR_CLKP`、`/DDR_DQ1`、`/DDR_DQ5`）是「没有一段够长放下齿」，`clearance`（`/DDR_DQ3`、`/DDR_DM0`、`/DDR_DQS0N`、`/DDR_DQS0P`）是「把整块板给它也躲不开别人的铜」。前者是铜太碎、后者是走廊太窄，**都不是路由能改的**。
+3. **`/DDR_DQS0N` 的 `reachable_add_mm = 0.000` 最刺眼**：一条 15.05 mm 的网，一颗齿都放不下——它整条贴在 `/DDR_DQ3` 旁边（`197 §3b` 的连续段读数：`/DDR_DQS0N` 连续 0），这是同一条事实的两种量法互相印证。
+4. **4 条 `reachable` 的余量都只有 ≈0.2 mm**（DO0 2.254−2.054、DQ2 0.341−0.141、DQ6 1.994−1.794、DQ7 1.521−1.321 全等于 0.2）：那是探针的 `HEADROOM_EXTRA_MM`，**不是富余**，只说明「自己的铜刚好够它自己欠的那一点」。
+
+这条读数的用途是判词级的：`board_tune_length(headroom=true)` 回来的 `blocked_by_geometry` 只要出现，就**不该再靠调路由参数重开这条 lane**，而应回到布局（`197 §4` 的两条规则：走廊按齿宽预留；齿只能落在量到的连续段里）。
