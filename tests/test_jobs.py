@@ -204,6 +204,33 @@ class DRCAsAJob(JobsBase):
         tools.call_tool("board_job", {"action": "wait", "id": r["value"]["job"],
                                       "timeout_s": 15})
 
+    def test_a_named_project_is_what_the_verdict_is_read_against(self):
+        """Same bytes, two verdicts - the project is the difference.
+
+        Without a project KiCad falls back to its own rule minimums, so the answer
+        has to say so (`rule_source`). With one, the answer must say `project`.
+        The reverse control is the next test: a path that is not there is refused
+        rather than quietly replaced by the defaults.
+        """
+        bare = tools.call_tool("board_drc", {"path": self.board})
+        self.assertEqual(bare["status"], "ok", bare)
+        self.assertEqual(bare["rule_source"], "kicad_defaults")
+        pro = os.path.join(self.dir, "b.kicad_pro")
+        with open(pro, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        told = tools.call_tool("board_drc", {"path": self.board, "project": pro})
+        self.assertEqual(told["status"], "ok", told)
+        self.assertEqual(told["rule_source"], "project")
+        self.assertIsNone(told["rule_source_note"])
+
+    def test_a_project_that_is_not_there_is_refused_not_silently_swapped(self):
+        missing = os.path.join(self.dir, "nope.kicad_pro")
+        r = tools.call_tool("board_drc", {"path": self.board, "project": missing})
+        self.assertEqual(r["status"], "error", r)
+        self.assertEqual(r["reason_code"], "FILE_NOT_FOUND")
+        self.assertIn("silently", r["message"])
+        self.assertEqual(self.calls, [])
+
     def test_the_job_tool_is_registered_and_documented(self):
         caps = tools.call_tool("calc_capabilities", {})
         self.assertIn("board_job", caps["available"])

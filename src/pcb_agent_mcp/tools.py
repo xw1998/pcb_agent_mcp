@@ -7826,6 +7826,12 @@ _tool(
          "timeout_s": _num("budget handed to the DRC subprocess (default 900 s)"),
          "background": _bool("run it as a job and answer with its id instead of "
                              "blocking", False),
+         "project": _str("absolute path to the .kicad_pro the verdict must be read "
+                         "against - KiCad takes the design-rule minimums AND the "
+                         "rule severities from it, and silently uses its own "
+                         "defaults when there is none, so the same board can be "
+                         "0 error with its project and 515 without; a path that "
+                         "does not exist is refused rather than ignored"),
      },
      "required": ["path"]},
     lambda a: _guarded(lambda: _board_drc(a)),
@@ -7884,11 +7890,27 @@ def _board_drc(args):
     severity = args.get("severity") or "all"
     timeout_s = float(args.get("timeout_s") or _engine.DRC_TIMEOUT_S)
 
+    # The verdict depends on the DESIGN RULES, and those live in the project
+    # file. Without one KiCad silently falls back to its own minimums and the same
+    # bytes come back with a different verdict - measured on the STM32F412 core
+    # board: 665 violations / 515 error with no .kicad_pro beside it, 150 / 0 error
+    # with it. So a project the caller NAMES but that is not there is an error, not
+    # a quiet fallback: answering "kicad_defaults" while the caller believes its own
+    # rules were used is the wrong-answer-shaped silence this package refuses.
+    project = args.get("project") or None
+    if project is not None:
+        project = os.path.abspath(str(project))
+        if not os.path.isfile(project):
+            return err("project file does not exist: %r (KiCad would silently fall "
+                       "back to its built-in rule minimums and return a different "
+                       "verdict on the same bytes)" % project, "FILE_NOT_FOUND")
+
     refill = args.get("refill_zones")
     refill = True if refill is None else bool(refill)
 
     def _do_drc():
-        out = _engine.drc(path, severity=severity, timeout=timeout_s, refill=refill)
+        out = _engine.drc(path, severity=severity, timeout=timeout_s,
+                          project=project, refill=refill)
         if out.get("status") != "ok":
             return out
         from .edit import drc_policy as _policy
