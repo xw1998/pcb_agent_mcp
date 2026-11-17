@@ -61,11 +61,19 @@ used to be spread across the twelve files.
                  magnetic: the refusal names the body instead of a distance that
                  would send the reader to draw a bus that cannot help.
 
+    262 -> 263   0.1.44: board_return_path - the question the router never asked
+                 about its own copper: "does this layer change keep its return
+                 current in the same conductor". Two readings on purpose
+                 (proximity vs reference plane), because they disagree for a
+                 reason worth reading, and one classification no existing tool
+                 could produce: reference_changes_net - a defect no via fixes.
+                 New question, not a flag.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 262
+EXPECTED_TOOL_COUNT = 263
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

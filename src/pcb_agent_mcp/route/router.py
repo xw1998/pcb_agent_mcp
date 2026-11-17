@@ -115,6 +115,106 @@ def _split_layers(board, copper, explicit=None):
     return routing, planes
 
 
+def _layer_pours(board, copper):
+    """layer -> [(net, area_mm2)], biggest pour first, keepouts excluded.
+
+    Counted from the zones themselves rather than from `_split_layers`, because
+    that function answers a different question: it asks "is this layer a power
+    PLANE, so do not route signal on it", and it only looks at nets whose names
+    look like power. A plane that carries `+1V35_DDR` is still the only return
+    path its neighbouring signal layers have, and a layer carrying two nets is a
+    SPLIT plane whose return path depends on where you are - both facts are
+    invisible in a single net name, so they are read here per zone.
+    """
+    got = {}
+    for z in (getattr(board, "zones", None) or ()):
+        if z.get("is_keepout") or not z.get("net"):
+            continue
+        rings = [p for p in (z.get("filled_polygons") or ()) if p and len(p) >= 3]
+        if not rings:
+            rings = [r for r in [z.get("outline") or []] if len(r) >= 3]
+        if not rings:
+            continue
+        area = sum(abs(G.polygon_area(r)) for r in rings)
+        for layer in (z.get("layers") or ([z.get("layer")] if z.get("layer") else [])):
+            if layer not in copper:
+                continue
+            got.setdefault(layer, []).append((z["net"], round(area, 2)))
+    for layer in got:
+        got[layer].sort(key=lambda t: (-t[1], t[0]))
+        # one entry per net, areas summed (a net may be poured in several zones)
+        merged = {}
+        for net, area in got[layer]:
+            merged[net] = round(merged.get(net, 0.0) + area, 2)
+        got[layer] = sorted(merged.items(), key=lambda t: (-t[1], t[0]))
+    return got
+
+def _stackup_reference(board, copper, ops):
+    """Where the return current goes home, layer by layer.
+
+    A signal layer is only usable if the copper next to it is a plane that
+    carries a pour: the return current flows in the nearest conductor, so a
+    layer with no plane above or below it has no return path at all - and the
+    search will route on it anyway, because nothing asks this question.
+
+    Layer granularity, not point granularity (`route.return_path.audit_reference`
+    asks the per-via version). Two things are reported side by side on purpose:
+    `reference_layers` (nearest layer WITH A POUR, any net - that is the physics)
+    and `is_plane` (whether the router demoted that layer to a plane, which is a
+    routing decision about power nets). They can disagree, and the disagreement
+    is the reading: a `+1V35_DDR` pour is a real return path that the router does
+    not call a plane, and a SPLIT plane is a return path that only exists where
+    you happen to be.
+    """
+    try:
+        _routing, planes = _split_layers(board, copper)
+    except RouteError:
+        planes = {}
+    pours = _layer_pours(board, copper)
+    idx = {l: i for i, l in enumerate(copper)}
+    mm = {}
+    # Copper ALREADY on the board counts: a board routed in an earlier call has
+    # tracks the ops list knows nothing about, and reporting 0 mm on a layer
+    # full of copper would read as "nothing is routed here, so nothing to fix".
+    for t in (getattr(board, "tracks", None) or ()):
+        a, b = t.get("start"), t.get("end")
+        if t.get("layer") in idx and a and b:
+            mm[t["layer"]] = mm.get(t["layer"], 0.0) + math.hypot(
+                b[0] - a[0], b[1] - a[1])
+    for op in ops or ():
+        if op.get("op") == "add_track" and op.get("layer") in idx:
+            mm[op["layer"]] = mm.get(op["layer"], 0.0) + math.hypot(
+                op["x2"] - op["x1"], op["y2"] - op["y1"])
+    out = {}
+    for L in copper:
+        if L in planes and (planes[L].get("area_mm2") or 0) > 0:
+            continue                      # a plane is not a routing layer
+        i = idx[L]
+        nb = []
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(copper):
+                n = copper[j]
+                npours = pours.get(n) or []
+                nb.append({"layer": n,
+                           "is_plane": n in planes,
+                           "pour_net": (planes.get(n) or {}).get("net"),
+                           "pour_nets": [p[0] for p in npours],
+                           "pour_split": len(npours) > 1})
+        refs = [b for b in nb if b["pour_nets"]]
+        out[L] = {"neighbours": nb,
+                  "reference_layers": [b["layer"] for b in refs],
+                  "reference_nets": {b["layer"]: b["pour_nets"] for b in refs},
+                  "has_reference": bool(refs),
+                  "copper_mm": round(mm.get(L, 0.0), 3)}
+    out["layers_without_reference"] = sorted(l for l, v in out.items()
+                                             if isinstance(v, dict)
+                                             and not v["has_reference"])
+    out["layers_without_reference_and_copper"] = sorted(
+        l for l, v in out.items()
+        if isinstance(v, dict) and not v["has_reference"] and v["copper_mm"] > 0.0)
+    out["pour_layers"] = sorted(pours, key=lambda l: idx.get(l, 0))
+    return out
+
 def _apply_terminal_override(terms, override, grid, routing):
     """Swap a pad-centre terminal for the escape-via centres the caller placed.
 
@@ -1991,6 +2091,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
         "diff_pairs": tune_report["diff_pairs"],
         "length_groups": tune_report["length_groups"],
         "return_path": tune_report.get("return_path"),
+        "stackup_reference": _stackup_reference(board, copper, em.ops),
         "congestion": congestion,
         "pour": _pour_report(board, em.ops, copper),
         "nets": out_nets,

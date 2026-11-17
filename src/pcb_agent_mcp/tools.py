@@ -12752,6 +12752,176 @@ _tool(
     lambda a: _guarded(lambda: _board_stitch_vias(a)),
 )
 
+# ------------------------------------------------ return paths on a stackup
+def _board_return_path(args):
+    """Which layer changes need a return via, and which ones no via can save.
+
+    The board-level question the emitter pass answers only for the copper it has
+    just routed. Two readings are returned side by side because they disagree for
+    a reason worth reading: `proximity` asks "is there a ground via within reach",
+    `reference` asks "do the two sides of this layer change see the same plane".
+    A via can be 8 mm from the nearest ground hole and owe nothing (shared plane,
+    return current never leaves it) and another can have a ground hole 0.4 mm away
+    and still have no return path (that hole joins the wrong plane).
+    """
+    from . import edit as _edit
+    from .route import return_path as _rp
+
+    board, e = _load_board(args)
+    if e:
+        return e
+    action = args.get("action") or "audit"
+    net = args.get("net") or None
+    reach = float(args.get("reach_mm") or _rp.GROUND_REACH_MM)
+    depth = int(args.get("depth") if args.get("depth") is not None else 3)
+    shortlist = int(args.get("shortlist") or 20)
+
+    model = ("a layer change owes a return path only if the return current has to "
+             "leave its conductor: a signal that goes between two layers that both "
+             "see the SAME plane owes nothing, one whose two sides reference "
+             "DIFFERENT nets cannot be fixed by any via, and one that crosses "
+             "between two planes of the same net owes one hole between them")
+    basis = ("IPC-2221 / high-speed practice: the return current flows in the "
+             "nearest plane, so a reference change is what creates loop area; the "
+             "0.25 mm hole-to-hole figure and the clearance are fabrication rules "
+             "and are read from the board, not assumed")
+    precision = ("exact for the stored polygons and segments except at 1e-9 mm "
+                 "boundaries; a via's connectivity is read from the tracks that "
+                 "reach it within 0.02 mm, not from its drill span, because on a "
+                 "six-layer board most through vias join two layers")
+
+    if action == "place":
+        plan = _rp.plan(board, net=net, reach_mm=reach,
+                        dia_mm=(float(args["dia_mm"]) if args.get("dia_mm") is not None else None),
+                        drill_mm=(float(args["drill_mm"]) if args.get("drill_mm") is not None else None),
+                        clearance_mm=float(args.get("clearance_mm") or 0.25),
+                        edge_mm=float(args.get("edge_mm") or 0.5),
+                        max_ops=int(args.get("max_ops") or 400))
+        plan["writes_nothing"] = True
+        out = ok(plan, "mm", model=model, basis=basis, precision=precision,
+                 assumptions={"net": plan.get("ground_net"), "reach_mm": reach,
+                              "dia_mm": plan.get("dia_mm"),
+                              "drill_mm": plan.get("drill_mm"),
+                              "clearance_mm": float(args.get("clearance_mm") or 0.25),
+                              "hole_size_from": "the median of the board's own "
+                                                "signal vias unless dia_mm/drill_mm "
+                                                "are given"})
+        if plan.get("status") != "stitched":
+            out["next_step"] = ("nothing can be placed: every refusal is named in "
+                                "skipped[].reason (ground_not_on_two_layers means "
+                                "the ground is not on two layers there, so the hole "
+                                "would be a stub)")
+            return out
+        if args.get("apply") is not True:
+            out["next_step"] = ("pass apply=true to write these %d hole(s) through "
+                                "board_propose + board_apply, then re-read with "
+                                "board_drc(refill_zones=true)" % len(plan["ops"]))
+            return out
+        prop = _edit.propose(args["path"], plan["ops"], {"engine": True})
+        try:
+            applied = _edit.apply_plan(
+                prop["plan_id"], confirm=True,
+                options={"engine": True,
+                         "allow_new_violations": bool(
+                             args.get("allow_new_violations")),
+                         "strict_drc": bool(args.get("strict_drc"))})
+        except _edit.EditError as exc:
+            return _edit_error(exc)
+        plan["plan_id"] = prop["plan_id"]
+        plan["applied"] = applied
+        plan["writes_nothing"] = False
+        return ok(plan, "mm", model=model, basis=basis, precision=precision,
+                  assumptions={"net": plan.get("ground_net"),
+                               "reach_mm": reach})
+
+    value = {"proximity": _rp.audit(board, net=net, reach_mm=reach,
+                                    shortlist=shortlist),
+             "reference": _rp.audit_reference(board, net=net, depth=depth,
+                                              reach_mm=reach,
+                                              shortlist=shortlist),
+             "writes_nothing": True}
+    ref = value["reference"]
+    prox = value["proximity"]
+    if ref.get("verdict") == "refused" or prox.get("verdict") == "refused":
+        out = ok(value, "mm", model=model, basis=basis, precision=precision)
+        out["next_step"] = ("pass net= naming the plane this board calls ground: "
+                            "no net name on it looks like one, or several do")
+        return out
+    out = ok(value, "mm", model=model, basis=basis, precision=precision,
+             assumptions={"net": ref.get("net"), "depth": depth,
+                          "reach_mm": reach,
+                          "connectivity": "from the tracks that reach each via "
+                                          "within 0.02 mm"})
+    counts = ref.get("counts") or {}
+    bad = counts.get("reference_changes_net", 0)
+    none = counts.get("no_reference", 0)
+    if bad or none:
+        bits = []
+        if bad:
+            bits.append("%d layer change(s) reference DIFFERENT nets" % bad)
+        if none:
+            bits.append("%d have no pour within depth layers on one side" % none)
+        out["next_step"] = ("%s: no via fixes those, the stackup or the routing "
+                            "has to change - see reference.defect_cases"
+                            % "; ".join(bits))
+    elif counts.get("stitch_needed"):
+        out["next_step"] = ("%d layer change(s) cross between two planes of the "
+                            "same net and have no hole between them: action='place' "
+                            "plans those holes"
+                            % counts["stitch_needed"])
+    else:
+        out["message"] = ("every layer change keeps its return current in the same "
+                          "conductor (%d shared plane(s), no reference change)"
+                          % counts.get("shared_reference", 0))
+    return out
+
+_tool(
+    "board_return_path",
+    "Answer the two questions every layer change asks, on the board as it is "
+    "stored: does the return current have somewhere to go, and is a via owed. "
+    "action='audit' (default) reads the whole board and reports two readings that "
+    "deliberately disagree - 'proximity' (is there a ground VIA within reach_mm of "
+    "each signal via) and 'reference' (does each layer change keep the same plane). "
+    "The reference reading classifies every signal via as shared_reference (both "
+    "layers see the same plane: nothing is owed, whatever the distance to the "
+    "nearest ground hole), stitch_needed (the plane changes layer but keeps its "
+    "net: one hole between them closes the loop), stitched (that hole is already "
+    "there), reference_changes_net (the two sides reference DIFFERENT nets: no via "
+    "can carry that return current, it is a stackup/routing defect and the report "
+    "says so), no_reference (no pour within depth layers on one side) or "
+    "dangling_escape (the via joins one layer only, so it is a stub). Net names are "
+    "matched by their last path segment, so /GND and /PWR/GND are ground while AGND "
+    "is not. action='place' plans ground vias beside the signal vias that need them "
+    "- only where the same net's copper is on two layers, checked against existing "
+    "copper, drills and the board edge; hole size defaults to the median of the "
+    "board's own vias. Nothing is written unless apply=true, and this never routes "
+    "a track.",
+    {"type": "object",
+     "properties": dict({
+         "action": _str("'audit' (default: read only) or 'place' (plan the holes)",
+                        enum=("audit", "place")),
+         "apply": _bool("write the plan (default false: plan only)"),
+         "net": _str("the plane net (default: the one net whose name is a ground; "
+                     "pass it when the board calls the plane something else)"),
+         "reach_mm": _num("how far a ground via may sit from the signal via it "
+                          "serves (default 2.0)", 2.0),
+         "depth": _num("how many copper layers away a pour still counts as a "
+                       "reference (default 3)", 3),
+         "shortlist": _num("how many cases to list in full (default 20)", 20),
+         "dia_mm": _num("via pad diameter for placed holes (default: median of "
+                        "this board's signal vias)", None),
+         "drill_mm": _num("via drill for placed holes (default: median of this "
+                          "board's signal vias)", None),
+         "clearance_mm": _num("copper spacing to other nets (default 0.25)", 0.25),
+         "edge_mm": _num("minimum distance from the board edge (default 0.5)", 0.5),
+         "max_ops": _num("cap on holes planned (default 400)", 400),
+         "allow_new_violations": _bool("accept newly introduced DRC violations"),
+         "strict_drc": _bool("let every new violation block, warnings included"),
+     }, **_COMMON),
+     "required": ["path"]},
+    lambda a: _guarded(lambda: _board_return_path(a)),
+)
+
 # ------------------------------------------------------------ silk labels
 def _board_pin_labels(args):
     """Write one silkscreen name per pin of a through-hole header.
