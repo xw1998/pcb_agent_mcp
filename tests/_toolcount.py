@@ -43,11 +43,18 @@ used to be spread across the twelve files.
                  gate, not a score with tuned weights; it refuses to rank fewer
                  than two boards and never uses corpus numbers as thresholds.
 
+    260 -> 261   0.1.42: board_decap_sites - "where does the bypass capacitor
+                 go, and what makes that site legal", answered per rail or
+                 serially per board. A new question (placement planning against
+                 FILLED copper), not a flag on board_place_gate: that gate reports
+                 a distance, this one returns a legal site with both legs of the
+                 loop closed, or a refusal with the number that refused it.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 260
+EXPECTED_TOOL_COUNT = 261
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than

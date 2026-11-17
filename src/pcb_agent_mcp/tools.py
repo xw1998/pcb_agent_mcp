@@ -20,6 +20,7 @@ from . import lceda_live as _live
 from . import fidelity as _fidelity
 from . import oracle as _oracle
 from . import place_gate as _place_gate
+from . import decap_sites as _decap
 from . import shape_gate as _shape_gate
 from . import snapshot as _snapshot
 from . import aesthetics as _aesthetics
@@ -4701,6 +4702,90 @@ _tool(
         b, edge_keepout_mm=a.get("edge_keepout_mm"),
         soft_mm=a.get("soft_mm"), hard_mm=a.get("hard_mm"),
         top=a.get("top", 20)), derived=True),
+)
+
+def _decap_sites(b, a):
+    kw = {"nets": [str(n) for n in a["nets"]] if a.get("nets") else None,
+          "targets": a.get("targets") or None,
+          "sides": a.get("sides") or None}
+    for key in ("clearance_mm", "body_gap_mm", "stub_mm", "reach_mm",
+                "side_reach_mm", "max_track_mm"):
+        if a.get(key) is not None:
+            kw[key] = a[key]
+    if str(a.get("mode") or "fill") == "plan":
+        value = _decap.plan(b, top=int(a.get("top") or 3), **kw)
+    else:
+        value = _decap.fill(b, **kw)
+    placed = [n for n, r in (value.get("rails") or {}).items() if r.get("chosen")]
+    bare = [n for n, r in (value.get("rails") or {}).items() if not r.get("chosen")]
+    return ok(
+        value=value,
+        unit="mm",
+        model="0402 courtyard + pad lands, a %.2f mm dogbone via outside the pad "
+              "on both legs (rail and ground), 0/45/90/135 runs, then official "
+              "zone fills as the copper the rail can actually reach"
+              % _decap._STUB_MM,
+        basis="the board's own courtyards, pads, tracks, vias and FILLED zone "
+              "polygons; a rail whose flood is drawn but not poured has no copper "
+              "here, because an outline is not a pour",
+        precision="clearance and distance are exact against rectangles, circles "
+                  "and segments; a site is legal or it is not, and every refusal "
+                  "carries the number that refused it. Both legs of the loop are "
+                  "required - a site with a rail run and no ground via is not a "
+                  "placement",
+        assumptions={"clearance_mm": kw.get("clearance_mm", _decap._CLEARANCE_MM),
+                     "stub_mm": kw.get("stub_mm", _decap._STUB_MM),
+                     "reach_mm": kw.get("reach_mm", _decap._REACH_MM),
+                     "max_track_mm": kw.get("max_track_mm", _decap._MAX_TRACK_MM),
+                     "placed": placed, "no_site": bare},
+    )
+
+
+_tool(
+    "board_decap_sites",
+    "Where the bypass capacitors go, and the numbers that make each site legal. "
+    "mode=fill (default) places one part per rail SERIALLY: tightest rail first, "
+    "and every part already placed becomes an obstacle for the next, because eight "
+    "independent answers to the same question is not a layout. mode=plan answers "
+    "per rail as if the board were empty, which is the right question when you are "
+    "checking one rail. Each site carries both legs of the loop: the rail run (a "
+    "%.2f mm via outside the pad into the flood, or a short track to same-layer "
+    "copper) and the ground via into the In1 flood, also outside the pad - a via "
+    "drilled in a land is a process defect, which is why the stub exists at all. "
+    "Runs use 0/45/90/135 only, acute corners are never produced, and a site that "
+    "cannot close both legs comes back as `refused` with the reason instead of a "
+    "placement that would add two unconnected pads. `decoupling_far` in "
+    "board_place_gate measures a rail pad to the nearest pad of the same net "
+    "ANYWHERE on the board; this tool measures to the pads of the TARGET part - "
+    "they disagree on purpose, and this one is the loop. Reads the FILLED zone "
+    "polygons: a zone whose outline is drawn but not poured is not copper. This "
+    "tool places nothing and routes nothing - it reports what is legal, and the "
+    "caller decides. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "mode": _str("fill = serial placement per rail (default); plan = per rail "
+                      "with the board otherwise empty", ["fill", "plan"], "fill"),
+         "nets": _arr("rail nets to plan for (default: every rail the board has)"),
+         "targets": {"type": "object",
+                     "description": "per net, which part's pins the cap is FOR, as "
+                                    "{net: reference}. Default is the part with the "
+                                    "most pads on the rail, which is right for a load "
+                                    "and wrong for a rail that leaves a BGA for memory",
+                     "additionalProperties": {"type": "string"}},
+         "sides": _arr("restrict sites to these sides of the target courtyard: "
+                       "left, right, top, bottom"),
+         "top": _num("plan mode: how many ranked sites to return per rail", 3),
+         "clearance_mm": _num("copper-to-copper minimum (default 0.15)", 0.15),
+         "body_gap_mm": _num("cap body to foreign courtyard gap (default 0.0)", 0.0),
+         "stub_mm": _num("pad centre to via centre; must keep the drill out of the "
+                         "land (default 0.65 for a 0402)", 0.65),
+         "reach_mm": _num("how far the search looks for the rail's copper", 6.0),
+         "side_reach_mm": _num("how far out from a courtyard edge sites are tried", 3.0),
+         "max_track_mm": _num("longest same-layer run that still counts as a "
+                              "connection (default 1.5)", 1.5),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_decap_sites, derived=True),
 )
 
 _tool(

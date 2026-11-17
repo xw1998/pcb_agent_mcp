@@ -115,6 +115,37 @@ def _bbox_of(box):
             float(box["x_max"]), float(box["y_max"]))
 
 
+def _contour_boxes(fp):
+    """Courtyard contours as rectangles, one box per contour.
+
+    A ring is not a rectangle. The stamp-hole frame is drawn as four strips; its
+    convex hull is the whole board, which makes every part inside it "overlap the
+    module" - the reason this gate used to exempt J1 by AREA and, by exempting it,
+    stopped seeing that a capacitor was standing on the castellations.
+    """
+    out = []
+    for poly in ((fp.get("courtyard") or {}).get("contours") or []):
+        if len(poly) < 3:
+            continue
+        xs = [float(p[0]) for p in poly]
+        ys = [float(p[1]) for p in poly]
+        out.append((min(xs), min(ys), max(xs), max(ys)))
+    return out
+
+def _contour_area(fp):
+    """Area the courtyard actually covers. Bounding boxes lie about frames."""
+    tot = 0.0
+    for poly in ((fp.get("courtyard") or {}).get("contours") or []):
+        if len(poly) < 3:
+            continue
+        s = 0.0
+        for i in range(len(poly)):
+            x1, y1 = float(poly[i][0]), float(poly[i][1])
+            x2, y2 = float(poly[(i + 1) % len(poly)][0]), float(poly[(i + 1) % len(poly)][1])
+            s += x1 * y2 - x2 * y1
+        tot += abs(s) / 2.0
+    return tot
+
 def _fp_box(fp):
     cy = fp.get("courtyard") or {}
     box = _bbox_of(cy.get("bbox")) or _bbox_of(fp.get("bbox"))
@@ -316,12 +347,19 @@ def gate(board, edge_keepout_mm=None, soft_mm=None, hard_mm=None, top=20):
 
     boxes = {}
     modules = set()
+    solid = set()
     for fp in fps:
         ref = fp.get("ref")
         box = _fp_box(fp)
         boxes[ref] = box
         if _box_area(box) / board_area >= MODULE_AREA_FRAC:
+            # Its courtyard edge IS the board edge, so an edge distance is not a
+            # measurement. Two different questions, two different answers.
             modules.add(ref)
+        if _contour_area(fp) / board_area >= MODULE_AREA_FRAC:
+            # A courtyard that really covers the board cannot collide with
+            # anything. A frame covers 9% of it and very much can.
+            solid.add(ref)
 
     # -- 1 hole_in_pad ------------------------------------------------------
     # The test is "the drill wall removes pad copper", not "the drill centre is
@@ -358,32 +396,36 @@ def gate(board, edge_keepout_mm=None, soft_mm=None, hard_mm=None, top=20):
 
     # -- 2 courtyard_overlap ------------------------------------------------
     overlaps = []
-    refs = [r for r in boxes if r not in modules]
+    refs = [r for r in boxes if r not in solid]
+    by_ref = {}
+    for fp in fps:
+        by_ref[fp.get("ref")] = fp
     for i in range(len(refs)):
         for j in range(i + 1, len(refs)):
             ra, rb = refs[i], refs[j]
             a, b = boxes[ra], boxes[rb]
             if _box_overlap(a, b) <= 0.0:
                 continue
-            fa = next(f for f in fps if f.get("ref") == ra)
-            fb = next(f for f in fps if f.get("ref") == rb)
-            pa = []
-            pb = []
-            for poly in ((fa.get("courtyard") or {}).get("contours") or []):
-                pa.extend(poly)
-            for poly in ((fb.get("courtyard") or {}).get("contours") or []):
-                pb.extend(poly)
-            if pa and pb:
-                if not _convex_overlap(_hull(pa), _hull(pb)):
+            fa, fb = by_ref[ra], by_ref[rb]
+            ca, cb = _contour_boxes(fa), _contour_boxes(fb)
+            if ca and cb:
+                best = 0.0
+                for x in ca:
+                    for y in cb:
+                        if _convex_overlap(_hull([(x[0], x[1]), (x[2], x[1]),
+                                                  (x[2], x[3]), (x[0], x[3])]),
+                                           _hull([(y[0], y[1]), (y[2], y[1]),
+                                                  (y[2], y[3]), (y[0], y[3])])):
+                            best = max(best, min(_box_overlap(x, y),
+                                                 _box_area(x), _box_area(y)))
+                if best <= 0.0:
                     continue
                 how = "courtyard contour"
             else:
+                best = min(_box_overlap(a, b), _box_area(a), _box_area(b))
                 how = "courtyard bbox (no closed contour to test)"
-            overlaps.append({
-                "a": ra, "b": rb, "how": how,
-                "overlap_mm2": round(min(_box_overlap(a, b),
-                                         _box_area(a), _box_area(b)), 3),
-            })
+            overlaps.append({"a": ra, "b": rb, "how": how,
+                             "overlap_mm2": round(best, 3)})
     overlaps.sort(key=lambda r: -r["overlap_mm2"])
 
     # -- 3 edge_keepout -----------------------------------------------------
