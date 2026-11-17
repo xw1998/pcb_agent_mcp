@@ -4522,6 +4522,80 @@ _tool(
         top=a.get("top")), derived=True),
 )
 
+def _board_rail_plan(b, args):
+    from .route import rail_plan as RP
+    cur = args.get("currents") or {}
+    try:
+        out = RP.plan(b, cur, nets=args.get("nets"),
+                      delta_t_c=args.get("delta_t_c", 10.0),
+                      copper_oz=args.get("copper_oz", 1.0),
+                      standard=args.get("standard") or "ipc2221",
+                      clearance_mm=args.get("clearance_mm"),
+                      edge_clearance_mm=args.get("edge_clearance_mm"),
+                      window_mm=args.get("window_mm"))
+    except RP.PlanError as exc:
+        return err(str(exc), "BAD_INPUT",
+                   hint="currents maps net name -> amps; nets lists nets to "
+                        "inspect without a current. Neither set means nothing to "
+                        "report, so one of them is required")
+    value = dict(out)
+    model = value.pop("model")
+    precision = value.pop("precision")
+    assumptions = value.pop("assumptions")
+    top = int(args.get("top") or 0)
+    if top and len(value["rows"]) > top:
+        value["rows_truncated_from"] = len(value["rows"])
+        value["rows"] = value["rows"][:top]
+    return ok(value, "mm", model,
+              "IPC-2221 (or IPC-2152) ampacity against the copper this file "
+              "actually carries; coverage, plane state and zone priorities read "
+              "from the parsed board, not from a picture of it",
+              precision, assumptions)
+
+_tool(
+    "board_rail_plan",
+    "Per POWER RAIL: what copper it needs, what it has, and what to do - in the "
+    "order that decides what 'done' means. (1) COVERAGE: does every pad of the net "
+    "touch copper of its own net (pads.orphan names the ones that do not). (2) "
+    "WIDTH: IPC-2221 demand vs the measured trace widths, plus how much wider the "
+    "narrowest segment may legally get (exact clearance to foreign copper and the "
+    "board edge - a negative room means the existing neck is already inside the "
+    "clearance, which is a DRC call, not this tool's). (3) PLANE: pads/vias inside "
+    "each filled plane, min_thickness, connect mode; a plane PROVES capacity only "
+    "when its stated min_thickness >= the demand. Below that the answer is "
+    "'plane_covered_capacity_unmeasured' - not 'too thin': the copper that carries "
+    "the current is the fill outline minus its voids, a shape fact this tool does "
+    "not compute, and mm2 area is measured but never judged. (4) FAILURE: every "
+    "row says why, and a net with no current given comes back no_demand with its "
+    "geometry and nothing judged, rather than with a guessed ampacity. Also "
+    "reports a STALE pour (a same-layer foreign track inside a filled polygon - "
+    "the polygons predate the track) and two nets tied at the same zone priority. "
+    "Actions carry the numbers a pour needs and needs_outline=true: the outline is "
+    "the caller's, passed to board_add_zone. " + _NOT_WRITTEN,
+    {"type": "object",
+     "properties": dict({
+         "currents": {"type": "object",
+                      "additionalProperties": {"type": "number"},
+                      "description": "net name -> amps it must carry; the sheet "
+                                     "path is optional ('/+3V3' or '+3V3')"},
+         "nets": {"type": "array", "items": {"type": "string"},
+                  "description": "nets to report; a net listed here with no "
+                                 "current comes back no_demand (geometry only)"},
+         "delta_t_c": _num("allowed temperature rise (default 10)", 10),
+         "copper_oz": _num("copper weight (default 1)", 1),
+         "standard": _str("IPC chart to fit: ipc2221 (default) or ipc2152",
+                          ["ipc2221", "ipc2152"], "ipc2221"),
+         "clearance_mm": _num("copper-to-copper clearance for the 'room to "
+                              "widen' search (default: the board's rule)"),
+         "edge_clearance_mm": _num("board-edge clearance (default: the board's rule)"),
+         "window_mm": _num("how far the room search looks beyond the demanded "
+                           "width (default demand + 1.0)"),
+         "top": _num("how many rows to return (0 = all)"),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_board_rail_plan, derived=True),
+)
+
 _tool(
     "board_length_budget",
     "Can these nets still be brought to one length, and what would it cost? Uses "

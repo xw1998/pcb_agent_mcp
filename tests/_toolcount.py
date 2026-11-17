@@ -81,11 +81,27 @@ used to be spread across the twelve files.
                  `available` list: it reads a board, so it is not a pure
                  calculator, and that count stays 222.
 
+    264 -> 265   (no version bump - docs/203 is a stage note): board_rail_plan -
+                 the four questions a power rail needs answered in the order that
+                 decides what "done" means: coverage (which pads touch copper of
+                 their own net), width (IPC demand vs measured traces AND how much
+                 wider the narrowest may legally get), plane (pads/vias inside each
+                 fill, min_thickness, connect mode - and a plane PROVES capacity
+                 only when min_thickness >= the demand; otherwise the answer is
+                 "unmeasured", because the corridor width is a shape fact this
+                 tool does not invent), and failure (why, per row). It also names
+                 a stale pour (a same-layer foreign track inside a fill) and two
+                 nets tied at the same zone priority. board_power_copper could
+                 only say WHICH carrier was failing; this says what to do about it
+                 and refuses to guess a current: a net listed with no current
+                 comes back no_demand with geometry and nothing judged. Also not
+                 in the `available` list, for the same reason as board_power_copper.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 264
+EXPECTED_TOOL_COUNT = 265
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than
