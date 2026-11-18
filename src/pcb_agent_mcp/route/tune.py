@@ -22,6 +22,15 @@ gap and reports it. A constant-gap coupled walk (one net's path offset from the
 other's, corners mitered) is a different algorithm and is not implemented - the
 description says so and the report carries `coupled: False` rather than leaving a
 reader to assume otherwise.
+
+The SHAPE of a meander is a choice, not a constant. `style="arc"` draws the same
+added length as a ROUNDED wave (straight run along the axis, 90-degree arc, climb,
+arc back - tangent continuous, closed-form `h + r*(pi - 2)` per tooth), which is
+the shape this package's own planner (`route.tune_board`) defaults to and the only
+one the user has accepted; `style="chamfer"` keeps the 45-degree tooth this module
+has always emitted, and stays the default so a caller who says nothing gets the
+copper it got yesterday. Both styles go through the SAME geometry: an "arc" wave
+is a call into `route.tune_board.arc_meander`, not a second implementation.
 """
 
 import math
@@ -53,7 +62,18 @@ BOUND_SLACK_MM = 2.0
 
 
 def _tracks(ops, net):
+    """STRAIGHT segments of one net, i.e. the segments a meander may replace.
+
+    Straight only on purpose: an arc is copper (it is length, see `net_length`)
+    but it is never a meander HOST - a tooth fanned off a curve has no axis to
+    fan from, and "re-shape the equalising wave" is not a thing this module does.
+    """
     return [o for o in ops if o.get("op") == "add_track" and o.get("net") == net]
+
+def _arcs(ops, net):
+    """Arc ops of one net, in the order they were written."""
+    return [o for o in ops
+            if o.get("op") == "add_track_arc" and o.get("net") == net]
 
 
 def _seg_length(op):
@@ -63,11 +83,23 @@ def _seg_length(op):
 def net_length(ops, net, width=None):
     """Copper length of one net, the way a length-tuning engineer measures it.
 
-    Tracks only. A via is not length: its contribution depends on the stackup and
-    the drill, and adding a made-up stub length would make two different numbers
-    (track length and electrical length) look like one.
+    Tracks AND arcs. A via is not length: its contribution depends on the stackup
+    and the drill, and adding a made-up stub length would make two different
+    numbers (track length and electrical length) look like one. An arc IS length,
+    measured through its three points (`edit.ops.arc_length_mm`) rather than from
+    a chord polyline - the same number `route.tune_board` reports, so a rounded
+    meander written by either module adds the same millimetres to this figure.
+    Counting arcs only when they exist keeps the all-straight case at exactly the
+    arithmetic it had before.
     """
-    return sum(_seg_length(o) for o in _tracks(ops, net))
+    total = sum(_seg_length(o) for o in _tracks(ops, net))
+    arcs = _arcs(ops, net)
+    if arcs:
+        from ..edit import ops as OPS
+        total += sum(OPS.arc_length_mm((o["x1"], o["y1"]),
+                                       (o["mx"], o["my"]),
+                                       (o["x2"], o["y2"])) for o in arcs)
+    return total
 
 
 def _gap_between(ops_a, ops_b):
@@ -176,39 +208,118 @@ def max_extra(length, amplitude):
     return max(0.0, unit * (length - 0.5) / 2.0)
 
 
-def _emit_meander(em, op, pts):
-    """Replace one finished segment with this polyline, or leave it alone.
+#: How the meander `match_group` writes is shaped. "chamfer" is the 45-degree
+#: tooth this module has always emitted; "arc" is the rounded wave, produced by
+#: `route.tune_board.arc_meander` - one geometry, two callers, so the router's
+#: post-pass and the offline planner cannot drift into two different "arc
+#: meanders". The default is "chamfer" on purpose: a caller who says nothing gets
+#: byte-for-byte the copper it got before this option existed.
+MEANDER_STYLES = ("chamfer", "arc")
+MEANDER_STYLE_DEFAULT = "chamfer"
 
-    Every new segment goes through the exact check first. A meander that would
-    come within clearance of a neighbour is not written at all: the group then
-    reports the length it actually achieved, which is the honest answer and also
-    the one a person needs in order to move the track somewhere else.
+def _wave(a, b, extra_mm, amplitude, side=1, style=MEANDER_STYLE_DEFAULT,
+          width=None):
+    """Pieces of a meander that adds `extra_mm` to the run from `a` to `b`.
+
+    Returns `(pieces, info)`. `pieces` is a list of `("line", p, q)` /
+    `("arc", s, m, e)` - the same list shape `route.tune_board.plan` emits, so a
+    reader can put the two answers side by side. `info` says what the report
+    needs about the shape (`teeth`, `arcs`, `radius_mm`, `sub_legible`).
+
+    `(None, refusal)` when this segment cannot hold the wave, and the refusal
+    names WHY: `no_segment_long_enough` (the run is shorter than the wave needs),
+    `too_shallow` (only cross-bars narrower than a trace fit - a different fix
+    from "no room") and `no_legible_radius`. A caller that cannot tell those
+    apart re-runs the tool with the same inputs.
+
+    `style="chamfer"` reproduces `_serpentine` exactly and emits no arc, so the
+    default path is unchanged down to the coordinates; `style="arc"` hands the
+    same arithmetic to `route.tune_board.arc_meander` (imported here, not at
+    module scope, because `tune_board` already imports this module).
     """
+    if style not in MEANDER_STYLES:
+        raise ValueError("style must be one of %s, got %r"
+                         % (", ".join(MEANDER_STYLES), style))
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    if style == "chamfer":
+        pts = _serpentine(a, b, extra_mm, amplitude, side)
+        if pts is None:
+            return None, {"reason": "no_segment_long_enough",
+                          "longest_segment_mm": round(length, 4)}
+        return ([("line", pts[k], pts[k + 1]) for k in range(len(pts) - 1)],
+                {"teeth": (len(pts) - 2) // 2, "arcs": 0, "radius_mm": None,
+                 "sub_legible": False})
+    from . import tune_board as TB
+    got = TB.arc_meander({"start": (float(a[0]), float(a[1])),
+                          "end": (float(b[0]), float(b[1])),
+                          "length_mm": length,
+                          "width": float(width or 0.0)},
+                         extra_mm, amplitude, side=side)
+    if got is None:
+        return None, {"reason": "no_segment_long_enough",
+                      "longest_segment_mm": round(length, 4)}
+    if got.get("pieces") is None:
+        why = {"reason": ("too_shallow" if got.get("too_shallow")
+                           else "no_legible_radius")}
+        why.update((k, v) for k, v in got.items() if k != "pieces")
+        return None, why
+    info = {"teeth": got["teeth"],
+            "arcs": sum(1 for p in got["pieces"] if p[0] == "arc"),
+            "radius_mm": round(float(got["r"]), 4),
+            "sub_legible": bool(got.get("sub_legible"))}
+    if got.get("sub_legible"):
+        info["radius_floor_mm"] = got.get("r_floor_mm")
+    return got["pieces"], info
+
+def _emit_meander(em, op, pieces):
+    """Replace one finished segment with this path, or leave it alone.
+
+    Every new piece goes through the exact check first; arcs are checked chord by
+    chord with the probe widened by the sagitta the chord can hide - the SAME
+    probe `route.tune_board.plan` judges arcs with, so "it passed here" and "it
+    passed there" are one test and not two. A meander that would come within
+    clearance of a neighbour is not written at all: the group then reports the
+    length it actually achieved, which is the honest answer and also the one a
+    person needs in order to move the track somewhere else.
+    """
+    from . import tune_board as TB
     net, layer, width = op["net"], op["layer"], op["width"]
-    for k in range(len(pts) - 1):
-        a, b = pts[k], pts[k + 1]
-        bad = em.grid.seg_blockers(a, b, layer, net, width)
+    probes = list(TB._pieces_probe(pieces, width))
+    for a, b, w in probes:
+        bad = em.grid.seg_blockers(a, b, layer, net, w)
         if bad:
             return False, {"reason": "blocked",
                            "at": [round(a[0], 3), round(a[1], 3)],
                            "detail": bad[0]}
-    for k in range(len(pts) - 1):
-        a, b = pts[k], pts[k + 1]
-        em.grid.add_track(net, layer, a, b, width)
+    for a, b, w in probes:
+        em.grid.add_track(net, layer, a, b, w)
     new_ops = []
-    for k in range(len(pts) - 1):
-        a, b = pts[k], pts[k + 1]
-        new_ops.append({"op": "add_track", "x1": round(a[0], 6),
-                        "y1": round(a[1], 6), "x2": round(b[0], 6),
-                        "y2": round(b[1], 6), "width": width, "layer": layer,
-                        "net": net})
+    added = 0.0
+    for piece in pieces:
+        if piece[0] == "line":
+            a, b = piece[1], piece[2]
+            added += math.hypot(b[0] - a[0], b[1] - a[1])
+            new_ops.append({"op": "add_track", "x1": round(a[0], 6),
+                            "y1": round(a[1], 6), "x2": round(b[0], 6),
+                            "y2": round(b[1], 6), "width": width,
+                            "layer": layer, "net": net})
+        else:
+            from ..edit import ops as OPS
+            a, m, b = piece[1], piece[2], piece[3]
+            added += OPS.arc_length_mm(a, m, b)
+            new_ops.append({"op": "add_track_arc", "x1": round(a[0], 6),
+                            "y1": round(a[1], 6), "mx": round(m[0], 6),
+                            "my": round(m[1], 6), "x2": round(b[0], 6),
+                            "y2": round(b[1], 6), "width": width,
+                            "layer": layer, "net": net})
     idx = em.ops.index(op)
     em.ops[idx:idx + 1] = new_ops
-    em.length[net] = em.length.get(net, 0.0) - _seg_length(op) \
-        + sum(math.hypot(o["x2"] - o["x1"], o["y2"] - o["y1"]) for o in new_ops)
+    em.length[net] = em.length.get(net, 0.0) - _seg_length(op) + added
     return True, {"replaced": [[round(op["x1"], 3), round(op["y1"], 3)],
                                [round(op["x2"], 3), round(op["y2"], 3)]],
-                  "segments": len(new_ops)}
+                  "segments": len(new_ops),
+                  "arcs": sum(1 for o in new_ops
+                              if o["op"] == "add_track_arc")}
 
 
 def _candidate_order(em, net, cands, air_mm=2.0):
@@ -280,6 +391,13 @@ def match_group(em, bundle, group, results, ops_of=None):
     name = group.get("name") or "+".join(nets)
     max_skew = group.get("max_skew_mm")
     amplitude = group.get("amplitude_mm")
+    # The shape is the caller's, per group: a group that asks for "arc" gets the
+    # rounded wave, and one that says nothing gets the tooth this module has
+    # always drawn - so "style not mentioned" cannot change a single coordinate.
+    style = group.get("style") or MEANDER_STYLE_DEFAULT
+    if style not in MEANDER_STYLES:
+        raise ValueError("%s: style must be one of %s, got %r"
+                         % (name, ", ".join(MEANDER_STYLES), style))
     before = dict((n, round(net_length(em.ops, n), 4)) for n in nets)
     routed = dict((n, bool(_tracks(em.ops, n))) for n in nets)
     target = group.get("target_mm")
@@ -288,7 +406,7 @@ def match_group(em, bundle, group, results, ops_of=None):
     target = float(target)
     out = {"name": name, "nets": nets, "target_mm": round(target, 4),
            "max_skew_mm": max_skew, "before": before, "after": before,
-           "routed": routed,
+           "routed": routed, "style": style,
            "status": "reported", "detail": {}}
     missing = [n for n in nets if not routed[n]]
     if missing:
@@ -340,27 +458,41 @@ def match_group(em, bundle, group, results, ops_of=None):
                     continue
                 want = min(remaining, room)
                 for side in (1, -1):
-                    pts = _serpentine(a, b, want, this_amp, side)
-                    if pts is None:
-                        why = {"reason": "no_segment_long_enough",
-                               "needed_mm": round(need, 4),
-                               "amplitude_mm": round(this_amp, 4),
-                               "longest_segment_mm": round(seg_len, 4)}
+                    pieces, meta = _wave(a, b, want, this_amp, side, style,
+                                         width)
+                    if pieces is None:
+                        # The refusal carries its own reason and the numbers that
+                        # led to it; the group's need is added next to them so a
+                        # reader can see how far short this host is.
+                        why = dict(meta)
+                        why.setdefault("needed_mm", round(need, 4))
+                        why.setdefault("amplitude_mm", round(this_amp, 4))
+                        why.setdefault("longest_segment_mm", round(seg_len, 4))
                         continue
-                    ok, info = _emit_meander(em, op, pts)
+                    ok, info = _emit_meander(em, op, pieces)
                     if not ok:
                         why = dict(info)
                         why["amplitude_mm"] = round(this_amp, 4)
                         continue
                     added = net_length(em.ops, net) - before[net] - sum(
                         p["added_mm"] for p in parts)
-                    parts.append({"replaced": info["replaced"],
-                                  "segments": info["segments"],
-                                  "amplitude_mm": round(this_amp, 4),
-                                  "narrowed": abs(this_amp - amp) > 1e-9,
-                                  "teeth": (len(pts) - 2) // 2,
-                                  "side": side,
-                                  "added_mm": round(added, 4)})
+                    part = {"replaced": info["replaced"],
+                            "segments": info["segments"],
+                            "amplitude_mm": round(this_amp, 4),
+                            "narrowed": abs(this_amp - amp) > 1e-9,
+                            "style": style,
+                            "teeth": meta["teeth"],
+                            "side": side,
+                            "added_mm": round(added, 4)}
+                    if style == "arc":
+                        # Only named when it exists: an all-straight report stays
+                        # byte-identical, an arc one says how round it came out.
+                        part["arcs"] = info["arcs"]
+                        part["radius_mm"] = meta["radius_mm"]
+                        part["sub_legible"] = meta["sub_legible"]
+                        if meta.get("radius_floor_mm") is not None:
+                            part["radius_floor_mm"] = meta["radius_floor_mm"]
+                    parts.append(part)
                     remaining -= added
                     placed = True
                     break
@@ -373,8 +505,11 @@ def match_group(em, bundle, group, results, ops_of=None):
             got = {"added_mm": round(net_length(em.ops, net) - before[net], 4),
                    "amplitude_mm": round(parts[0]["amplitude_mm"], 4),
                    "amplitude_ladder_mm": [round(x, 4) for x in ladder],
+                   "style": style,
                    "meanders": parts,
                    "hosts_considered": tried[:8]}
+            if style == "arc":
+                got["arcs"] = sum(int(p.get("arcs") or 0) for p in parts)
         if got is None:
             out["detail"].setdefault(net, {})["why"] = why or {
                 "reason": "no_segment_long_enough",

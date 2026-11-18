@@ -30,6 +30,7 @@ from pcb_agent_mcp import edit as E
 from pcb_agent_mcp import geometry as GEO
 from pcb_agent_mcp import tools
 from pcb_agent_mcp.calc import impedance as Z
+from pcb_agent_mcp.edit import ops as OPS
 from pcb_agent_mcp.edit import plan as P
 from pcb_agent_mcp.route import grid as GRID
 from pcb_agent_mcp.route import intent as INTENT
@@ -37,6 +38,7 @@ from pcb_agent_mcp.route import rules as R
 from pcb_agent_mcp.route import router
 from pcb_agent_mcp.route import topology as TOPO
 from pcb_agent_mcp.route import tune as TUNE
+from pcb_agent_mcp.route import tune_board as TB
 
 SPEC = {"width_mm": 60, "height_mm": 40, "copper_layers": 2, "engine": False,
         "title": "route"}
@@ -952,6 +954,136 @@ class TestLengthMatchingChangesTheCopper(RouteBase):
         self.assertEqual(out["value"]["nets_routed"], 2)
         grp = out["length_groups"][0]
         self.assertEqual(grp["status"], "matched")
+
+class TestTheMeanderShapeIsTheOneAskedFor(RouteBase):
+    """`style` is per group, and the shape nobody asked for is the old one.
+
+    `route.tune_board` has drawn a rounded wave since the user rejected the
+    triangle; the ROUTER's own post-pass could only draw the 45-degree tooth,
+    which is exactly what came out of a routed DDR lane and got refused on sight.
+    So `style="arc"` reaches the router too. Four claims, each falsifiable alone:
+    the arcs are really written (a real 3-point arc, ~90 degrees, with a radius),
+    the length this module reports counts them, saying nothing changes nothing,
+    and a shape this code cannot draw is refused by name instead of quietly
+    becoming a tooth.
+    """
+
+    def setUp(self):
+        RouteBase.setUp(self)
+        self.apply(self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J1", x=10.0,
+                              y=8.0, nets={"1": "L1"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J2", x=40.0,
+                              y=8.0, nets={"1": "L1"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J3", x=10.0,
+                              y=20.0, nets={"1": "L2"}),
+                   self.place("Pad", [("1", 0, 0, 0.5, 0.5)], ref="J4", x=44.0,
+                              y=20.0, nets={"1": "L2"}))
+
+    def _arcs(self, ops, net=None):
+        return [o for o in ops if o["op"] == "add_track_arc"
+                and (net is None or o["net"] == net)]
+
+    def _copper(self, ops, net):
+        """Straight + arc length of one net, measured from the ops themselves."""
+        total = 0.0
+        for o in ops:
+            if o["net"] != net:
+                continue
+            if o["op"] == "add_track":
+                total += math.hypot(o["x2"] - o["x1"], o["y2"] - o["y1"])
+            elif o["op"] == "add_track_arc":
+                total += OPS.arc_length_mm((o["x1"], o["y1"]),
+                                          (o["mx"], o["my"]),
+                                          (o["x2"], o["y2"]))
+        return total
+
+    def test_arc_style_writes_arcs_and_still_matches(self):
+        res = self.route(nets=["L1", "L2"], layers=["F.Cu"],
+                         length_groups=[{"name": "clk", "nets": ["L1", "L2"],
+                                         "max_skew_mm": 0.5, "style": "arc"}])
+        grp = res["length_groups"][0]
+        self.assertEqual(grp["style"], "arc", grp)
+        self.assertEqual(grp["status"], "matched", grp)
+        arcs = self._arcs(res["ops"])
+        self.assertTrue(arcs, "style=arc wrote no arc at all")
+        # A real arc, not a chamfer wearing the op name: a radius exists and the
+        # sweep is a quarter turn - which is what the rounded wave is made of.
+        for a in arcs[:8]:
+            geom = TB._arc_geom((a["x1"], a["y1"]), (a["mx"], a["my"]),
+                                     (a["x2"], a["y2"]))
+            self.assertIsNotNone(geom, a)
+            _c, r, _a0, sweep = geom
+            self.assertGreater(r, 0.0, a)
+            self.assertAlmostEqual(abs(sweep), 90.0, delta=0.5)
+        # A rounded wave introduces no new ANGLE: every straight piece is on the
+        # segment's own axis or across it, so the lane still reads as 0/45/90/135
+        # copper - the rule that got the chamfer rejected in the first place was
+        # about right angles, not about curves.
+        short = min(grp["before"], key=lambda n: grp["before"][n])
+        for o in res["ops"]:
+            if o["op"] != "add_track" or o["net"] != short:
+                continue
+            ang = math.degrees(math.atan2(o["y2"] - o["y1"],
+                                          o["x2"] - o["x1"])) % 45.0
+            self.assertTrue(min(ang, 45.0 - ang) < 1e-6, o)
+        # The reported length is the copper: measured here on the ops, both nets
+        # land inside the budget, and the short one was really lengthened.
+        got = dict((n, self._copper(res["ops"], n)) for n in ("L1", "L2"))
+        self.assertLessEqual(abs(got["L1"] - got["L2"]), 0.5 + 1e-6, got)
+        short = min(grp["before"], key=lambda n: grp["before"][n])
+        self.assertGreater(got[short], grp["before"][short] + 0.5, got)
+        self.assertAlmostEqual(got[short], grp["after"][short], delta=2e-3)
+
+    def test_saying_nothing_still_writes_only_straight_copper(self):
+        res = self.route(nets=["L1", "L2"], layers=["F.Cu"],
+                         length_groups=[{"name": "clk", "nets": ["L1", "L2"],
+                                         "max_skew_mm": 0.5}])
+        grp = res["length_groups"][0]
+        self.assertEqual(grp["style"], "chamfer", grp)
+        self.assertEqual(grp["status"], "matched", grp)
+        self.assertEqual(self._arcs(res["ops"]), [],
+                         "the default shape grew an arc nobody asked for")
+        short = min(grp["before"], key=lambda n: grp["before"][n])
+        self.assertIn(short, grp["detail"], grp["detail"])
+        self.assertNotIn("arcs", grp["detail"][short])
+
+    def test_a_shape_this_router_cannot_draw_is_refused(self):
+        out = self.call(nets="L1,L2", layers="F.Cu",
+                        length_groups=[{"nets": ["L1", "L2"],
+                                        "max_skew_mm": 0.5,
+                                        "style": "triangle"}])
+        self.assertEqual(out["status"], "error", out)
+        self.assertEqual(out["reason_code"], "ARG_INVALID", out)
+        self.assertIn("triangle", out["message"])
+
+    def test_the_two_styles_share_their_arithmetic(self):
+        a, b, extra, amp = (0.0, 0.0), (10.0, 0.0), 2.0, 1.0
+        pts = TUNE._serpentine(a, b, extra, amp, 1)
+        pieces, meta = TUNE._wave(a, b, extra, amp, 1, "chamfer")
+        self.assertEqual(meta["arcs"], 0)
+        self.assertEqual(len(pieces), len(pts) - 1)
+        for k, piece in enumerate(pieces):
+            self.assertEqual(piece[0], "line")
+            self.assertEqual(piece[1], pts[k])
+            self.assertEqual(piece[2], pts[k + 1])
+        cham = sum(math.hypot(p[2][0] - p[1][0], p[2][1] - p[1][1])
+                   for p in pieces) - 10.0
+        self.assertAlmostEqual(cham, extra, delta=1e-9)
+        # The arc wave buys the SAME length, and the pieces say how it is made.
+        apieces, ameta = TUNE._wave(a, b, extra, amp, 1, "arc", 0.1)
+        arcs = [p for p in apieces if p[0] == "arc"]
+        self.assertTrue(arcs)
+        self.assertEqual(ameta["arcs"], len(arcs))
+        self.assertGreater(ameta["radius_mm"], 0.0)
+        total = 0.0
+        for p in apieces:
+            if p[0] == "line":
+                total += math.hypot(p[2][0] - p[1][0], p[2][1] - p[1][1])
+            else:
+                total += OPS.arc_length_mm(p[1], p[2], p[3])
+        self.assertAlmostEqual(total - 10.0, extra, delta=1e-5)
+        with self.assertRaises(ValueError):
+            TUNE._wave(a, b, extra, amp, 1, "circle")
 
 class TestDiffPairsEnterTheSearch(RouteBase):
     """A declared pair is a distance rule and a width, not a drawing.

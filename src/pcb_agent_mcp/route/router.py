@@ -557,6 +557,20 @@ class _Emitter(object):
             self.grid.add_track(op["net"], op["layer"],
                                 (op["x1"], op["y1"]), (op["x2"], op["y2"]),
                                 op["width"])
+        elif op["op"] == "add_track_arc":
+            # A rounded meander's arc is copper the map has to know about before
+            # the next candidate is judged - otherwise a rebuild would hand the
+            # search a board with a hole where the wave is. The map holds line
+            # segments only, so the arc goes in chord by chord with the probe
+            # widened by the sagitta the chord can hide: the same probe
+            # `route.tune_board` plans arcs with, not a second approximation.
+            from . import tune_board as TB
+            for a, b, w in TB._pieces_probe([("arc",
+                                              (op["x1"], op["y1"]),
+                                              (op["mx"], op["my"]),
+                                              (op["x2"], op["y2"]))],
+                                            op["width"]):
+                self.grid.add_track(op["net"], op["layer"], a, b, w)
         else:
             self.grid.add_via(op["net"], op["x"], op["y"],
                               op.get("size") or self.grid.via_dia)
@@ -856,6 +870,24 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     if max_nets:
         keep = sorted(by_net, key=lambda n: -len(by_net[n]))[:int(max_nets)]
         by_net = dict((k, by_net[k]) for k in keep)
+
+    # ------------------------------------------------------------------ style
+    # A group's meander SHAPE is validated here, before any routing work: a
+    # misspelled style must cost one refusal, not twenty minutes of search
+    # followed by a raise in the post-pass. `None` means "whatever the module
+    # defaults to" (the tooth), so a group that never mentions style takes the
+    # path it always took.
+    for grp in (length_groups or []):
+        if isinstance(grp, dict):
+            st = grp.get("style")
+            if st is not None and st not in tune.MEANDER_STYLES:
+                raise RouteError(
+                    "length group %r asked for style %r; this router draws %s"
+                    % (grp.get("name") or grp.get("nets") or "?", st,
+                       " / ".join(tune.MEANDER_STYLES)),
+                    "ARG_INVALID",
+                    hint="'chamfer' is the 45-degree tooth (the default), 'arc' "
+                         "is the rounded wave")
 
     # ------------------------------------------------------------------ fixed
     # What "fixed" means here, and what it does not.

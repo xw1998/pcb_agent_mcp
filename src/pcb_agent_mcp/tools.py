@@ -3478,12 +3478,16 @@ _tool(
                                  "refusal, not a coin flip)"),
          "length_groups": {"type": "array", "description":
                            "nets that must come out the same length: [{name, nets, "
-                           "target_mm?, max_skew_mm?, amplitude_mm?}]. After "
-                           "routing, the shorter nets get a 45-degree serpentine "
+                           "target_mm?, max_skew_mm?, amplitude_mm?, style?}]. "
+                           "After routing, the shorter nets get a serpentine "
                            "inserted in their longest straight segment, and every "
-                           "new segment goes back through the exact check. If the "
-                           "target cannot be reached the answer carries the length "
-                           "it actually achieved and status length_not_matched.",
+                           "new piece goes back through the exact check. "
+                           "style 'arc' draws the rounded wave (straight run, "
+                           "90-degree arc, climb, arc back - tangent continuous, "
+                           "no kink) instead of the default 45-degree tooth. If "
+                           "the target cannot be reached the answer carries the "
+                           "length it actually achieved and status "
+                           "length_not_matched.",
                            "items": {"type": "object", "properties": dict({
                                "name": _str("label for the report"),
                                "nets": {"type": "array",
@@ -3494,6 +3498,11 @@ _tool(
                                "amplitude_mm": _num("meander amplitude (default "
                                                     "3*sqrt(2)*width so the legs of "
                                                     "a tooth keep 3w apart)"),
+                               "style": _str("'arc' (rounded wave, the shape "
+                                             "this package draws elsewhere) or "
+                                             "'chamfer' (45-degree tooth, the "
+                                             "default); anything else is "
+                                             "refused by name, not guessed"),
                            }, **{"required": ["nets"]})}},
          "impedance_targets": {"type": "array", "description":
                                "single-ended impedance requirements: [{net|p+n, "
@@ -5952,6 +5961,13 @@ def _board_route(args):
                  else "plan only"),
     })
     segs = [o for o in res["ops"] if o["op"] == "add_track"]
+    # An equal-length group with style="arc" writes ARCS, and an arc is copper:
+    # leaving it out of `track_length_mm` would report a board shorter than the
+    # one about to be written. Counted through the three points, `arcs` says how
+    # many. With the default (tooth) style there are none and every number below
+    # is byte-identical to what it was before arcs could be emitted at all.
+    arcs = [o for o in res["ops"] if o["op"] == "add_track_arc"]
+    from .edit import ops as _OPS
     from .route import rules as _rrules
     rules_in_effect = _rrules.per_net_summary(stats["rule_bundle"])
     out = ok(
@@ -5960,9 +5976,15 @@ def _board_route(args):
                "nets_fixed": stats.get("nets_fixed", 0), "ops": len(res["ops"]),
                "vias": sum(1 for o in res["ops"] if o["op"] == "add_via"),
                "segments": len(segs),
+               "arcs": len(arcs),
                "track_length_mm": round(sum(math.hypot(o["x2"] - o["x1"],
                                                        o["y2"] - o["y1"])
-                                            for o in segs), 3)},
+                                            for o in segs)
+                                        + sum(_OPS.arc_length_mm(
+                                            (o["x1"], o["y1"]),
+                                            (o["mx"], o["my"]),
+                                            (o["x2"], o["y2"]))
+                                            for o in arcs), 3)},
         unit="nets/ops",
         model="grid_maze_router",
         basis="A* on a %.3f mm raster per copper layer, with every emitted segment "
