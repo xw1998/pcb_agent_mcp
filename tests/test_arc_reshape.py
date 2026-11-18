@@ -283,5 +283,65 @@ class RealBoardTest(unittest.TestCase):
                              "a tip-line endpoint must meet nothing, got %r" % (pt,))
 
 
+# ---- two precisions: keys at 1 um, geometry at the file's own -----------------
+
+STAIR = [(20.153553, 13.553553), (20.153553, 13.914178),
+         (20.514178, 13.914178), (20.514178, 14.274802),
+         (20.874802, 14.274802), (20.874802, 14.635427),
+         (21.235427, 14.635427)]
+
+class GeometryPrecisionTest(unittest.TestCase):
+    """The chain's LENGTH must be the copper's, not the key grid's.
+
+    `/DDR_DQ0` on rk3506_som carries a six-leg 45-degree staircase whose ends sit
+    on 1 um coordinates. Measuring it on the 1 um grid the junction test uses
+    read 2.162000 mm where the file's own copper is 2.163748 mm: a 1.748e-03 mm
+    hole in a check whose tolerance is 1e-4, and the net then looked as if the
+    REWRITE had changed its length when only the measurement had.
+    """
+
+    def _board(self, pts):
+        return FakeBoard([leg(i, pts[i], pts[i + 1]) for i in range(len(pts) - 1)])
+
+    def test_chain_length_uses_the_file_coordinates(self):
+        m = ar().Model(self._board(STAIR))
+        chs = ar().chains(m)
+        self.assertEqual(len(chs), 1, chs)
+        ch = chs[0]
+        exact = sum(math.hypot(STAIR[i + 1][0] - STAIR[i][0],
+                               STAIR[i + 1][1] - STAIR[i][1])
+                    for i in range(len(STAIR) - 1))
+        self.assertAlmostEqual(ch["length_mm"], exact, places=6)
+        self.assertAlmostEqual(ch["chord_mm"],
+                               math.hypot(STAIR[-1][0] - STAIR[0][0],
+                                          STAIR[-1][1] - STAIR[0][1]), places=6)
+        self.assertAlmostEqual(ch["amp_mm"], 0.255, places=3)
+
+    def test_the_1um_grid_would_have_read_a_different_length(self):
+        """反向对照：把顶点先取整到 1 um，长度就变了——这正是修之前那 1.7e-3 的来源。"""
+        rounded = [(round(x, 3), round(y, 3)) for x, y in STAIR]
+        exact = sum(math.hypot(STAIR[i + 1][0] - STAIR[i][0],
+                               STAIR[i + 1][1] - STAIR[i][1])
+                    for i in range(len(STAIR) - 1))
+        on_grid = sum(math.hypot(rounded[i + 1][0] - rounded[i][0],
+                                 rounded[i + 1][1] - rounded[i][1])
+                      for i in range(len(rounded) - 1))
+        self.assertGreater(abs(on_grid - exact), 1e-4,
+                           "a 1 um grid must move this length by more than the "
+                           "1e-4 tolerance or this test proves nothing")
+        m = ar().Model(self._board(STAIR))
+        ch = ar().chains(m)[0]
+        anew = abs(ch["length_mm"] - exact)
+        agrid = abs(ch["length_mm"] - on_grid)
+        self.assertLess(anew, 1e-6, "the chain length must be the file's")
+        self.assertGreater(agrid, 1e-4, "and it must NOT read as the grid's")
+
+    def test_the_chord_ends_are_file_points_not_grid_points(self):
+        m = ar().Model(self._board(STAIR))
+        ch = ar().chains(m)[0]
+        for pt in (ch["start"], ch["end"]):
+            self.assertTrue(any(abs(pt[0] - p[0]) < 1e-9 and abs(pt[1] - p[1]) < 1e-9
+                                for p in STAIR), pt)
+
 if __name__ == "__main__":
     unittest.main()

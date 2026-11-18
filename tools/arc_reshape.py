@@ -92,7 +92,21 @@ def _hdg(a, b):
 
 
 class Model(object):
-    """The board's straight copper, indexed for chain walking."""
+    """The board's straight copper, indexed for chain walking.
+
+    Two precisions on purpose. A POINT KEY is the coordinate rounded to 1 um: it
+    answers "do these two legs meet?" and nothing else. The geometry - the leg's
+    own ends, its length, its heading, the chain's chord - keeps the file's own
+    precision.
+
+    Rounding the geometry to the key's grid is not harmless: a 1 um shift on one
+    end of a 0.36 mm leg moves that leg's length by up to 1 um, so the chain's
+    "before" length stops being the copper's length. Measured on rk3506_som, the
+    six-leg 45-degree staircase on `/DDR_DQ0` read 2.162000 mm from rounded ends
+    and 2.163748 mm from the file - a 1.748e-03 mm hole in a check whose whole
+    tolerance is 1e-4, and the net then looked like the REWRITE had changed its
+    length when only the measurement had.
+    """
 
     def __init__(self, board):
         self.board = board
@@ -102,20 +116,22 @@ class Model(object):
             if t.get("_arc"):
                 self.arcs += 1
                 continue
-            s, e = _k(t["start"]), _k(t["end"])
+            s = (float(t["start"][0]), float(t["start"][1]))
+            e = (float(t["end"][0]), float(t["end"][1]))
             L = math.hypot(e[0] - s[0], e[1] - s[1])
             if L <= 1e-9:
                 continue
             self.segs.append({"net": t["net"], "layer": t["layer"],
-                              "w": float(t["width"]), "s": s, "e": e, "L": L,
+                              "w": float(t["width"]), "s": s, "e": e,
+                              "ks": _k(s), "ke": _k(e), "L": L,
                               "h": _hdg(s, e), "uuid": t["uuid"],
                               "locked": bool(t.get("locked"))})
         self.at = {}
         for i, g in enumerate(self.segs):
             key = (g["net"], g["layer"], round(g["w"], 3))
             d = self.at.setdefault(key, {})
-            d.setdefault(g["s"], []).append(i)
-            d.setdefault(g["e"], []).append(i)
+            d.setdefault(g["ks"], []).append(i)
+            d.setdefault(g["ke"], []).append(i)
         # Every object whose copper touches a point, so "does this chain end land
         # on copper that STAYS behind" can be asked before anything is deleted.
         # An arc counts at its two endpoints only: KiCad connects an arc there, not
@@ -147,8 +163,8 @@ class Model(object):
 
     def deg(self, i):
         g = self.segs[i]
-        return (len(self.at[self.key(g)].get(g["s"], [])) - 1
-                + len(self.at[self.key(g)].get(g["e"], [])) - 1)
+        return (len(self.at[self.key(g)].get(g["ks"], [])) - 1
+                + len(self.at[self.key(g)].get(g["ke"], [])) - 1)
 
 
 def _is_90(d):
@@ -164,12 +180,12 @@ def chains(model):
         if i in used or model.segs[i]["L"] > SHORT_MM:
             continue
 
-        def walk(start, from_pt, mine):
-            cur, pt = start, from_pt
+        def walk(start, from_key, mine):
+            cur, pt = start, from_key
             got = []
             while True:
                 g = model.segs[cur]
-                nxt = g["e"] if pt == g["s"] else g["s"]
+                nxt = g["ke"] if pt == g["ks"] else g["ks"]
                 step = None
                 for j in model.at[model.key(g)].get(nxt, []):
                     if j == cur or j in used or j in mine:
@@ -186,8 +202,8 @@ def chains(model):
                 cur, pt = step, nxt
 
         g = model.segs[i]
-        a_side = walk(i, g["e"], [i])
-        b_side = walk(i, g["s"], [i])
+        a_side = walk(i, g["ke"], [i])
+        b_side = walk(i, g["ks"], [i])
         if len(a_side[0]) + len(b_side[0]) + 1 < 3:
             continue
         order = list(reversed(b_side[0])) + [i] + a_side[0]
@@ -207,8 +223,8 @@ def chains(model):
         def _free_end(i):
             g = gs[i]
             nb = gs[i + 1] if i == 0 else gs[i - 1]
-            shared = (_k(nb["s"]), _k(nb["e"]))
-            return g["e"] if _k(g["s"]) in shared else g["s"]
+            shared = (nb["ks"], nb["ke"])
+            return g["e"] if g["ks"] in shared else g["s"]
 
         mine = [g["uuid"] for g in gs]
         a, b = _free_end(0), _free_end(len(gs) - 1)
