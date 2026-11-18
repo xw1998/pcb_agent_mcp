@@ -307,9 +307,13 @@ def plane_pour_intact(report, copper_write=True, allow=False):
     nothing and the bill is the return path: on the RK3506 SOM four segments on
     In1.Cu took 36.96 mm2 out of a 1934 mm2 GND plane.
 
-    Only a PLANE crossing blocks; a 17% split power plane is reported with its
-    share and let through, because whether a track may cross it is a design
-    question this gate cannot answer from geometry alone.
+    Only copper that runs ALONG a plane blocks. Three things are not that and are
+    reported instead: a via, whose barrel passes every layer of its span and gets
+    an antipad (every board has thousands; a hole is not a split), a pour under
+    half the board (this board's 17% In3 split), where "may a track cross it" is
+    a design question geometry cannot answer, and any pour on an OUTER layer,
+    because that is ground fill - every design cuts it and the filler re-fills
+    it, so cutting one is not a return path being cut.
     """
     if not copper_write:
         return _row("plane_pour_intact", None,
@@ -332,11 +336,30 @@ def plane_pour_intact(report, copper_write=True, allow=False):
     hits = [h for h in report.get("crossings") or [] if h.get("plane")]
     loose = [h for h in report.get("crossings") or [] if not h.get("plane")]
     if not hits:
-        why = ("no copper lands on a plane pour" if not loose else
-               "copper lands on %d pour(s) that are not planes (%s)"
-               % (len(loose), ", ".join(sorted({h.get("pour_net") or "?"
-                                                 for h in loose}))))
-        return _row("plane_pour_intact", True, why)
+        if not loose:
+            return _row("plane_pour_intact", True,
+                        "no copper lands on a plane pour")
+        vias = [h for h in loose if h.get("via")]
+        outer = [h for h in loose if not h.get("via") and not h.get("reference")]
+        small = [h for h in loose if not h.get("via") and h.get("reference")]
+        parts = []
+        if vias:
+            parts.append("%d via(s) whose barrel passes through it - an antipad is "
+                         "not a cut (%s)"
+                         % (len(vias), ", ".join(sorted(
+                             {h.get("pour_net") or "?" for h in vias}))))
+        if small:
+            parts.append("%d pour(s) under half the board (%s)"
+                         % (len(small), ", ".join(sorted(
+                             {h.get("pour_net") or "?" for h in small}))))
+        if outer:
+            parts.append("%d outer-layer pour(s), which are ground fill and not "
+                         "reference planes (%s)"
+                         % (len(outer), ", ".join(sorted(
+                             {h.get("pour_net") or "?" for h in outer}))))
+        return _row("plane_pour_intact", True,
+                    "copper lands on %d pour(s) that are not reference planes: %s"
+                    % (len(loose), "; ".join(parts)))
     first = hits[0]
     why = ("this plan lands %s copper on %s, which is a reference plane "
            "(%.1f mm2, %.1f%% of the board); the pour is re-cut around it, so "

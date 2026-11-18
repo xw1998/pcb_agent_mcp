@@ -77,13 +77,49 @@ def _copper_layers(board):
     return names or ["F.Cu", "B.Cu"]
 
 
+def _inner_layer(layer, copper):
+    """True when this copper layer has copper on both sides of it."""
+    try:
+        i = copper.index(layer)
+    except ValueError:
+        return False
+    return 0 < i < len(copper) - 1
+
+
+def _walk_layers(routing, new_layers=None):
+    """Which layers the search may STEP on, i.e. where new copper may land.
+
+    The grid keeps the plane layers in it for physics (a via still has to clear
+    copper it may not use), so "every grid layer" is not a safe default. It is
+    the routing layers, and the plane layers only when the caller names them.
+    """
+    return list(new_layers) if new_layers is not None else list(routing)
+
+
 def _split_layers(board, copper, explicit=None):
     """Routing layers vs plane layers, and WHY each plane is a plane.
 
-    A layer counts as a plane only when a non-keepout zone with a power-looking
-    net covers it. Guessing "the inner layers are planes" would drop a signal
-    layer on a 4-layer board that routes on all four, so the pour has to be in the
-    file for the layer to be demoted.
+    A layer counts as a plane only when BOTH hold: a non-keepout zone with a
+    power-looking net covers it, and the layer is an INNER layer. Guessing "the
+    inner layers are planes" would drop a signal layer on a 4-layer board that
+    routes on all four, so the pour has to be in the file for the layer to be
+    demoted.
+
+    The inner-layer half of that is not a detail. An outer pour is ground fill:
+    every design cuts it, the official filler re-fills it around the new copper,
+    and it is a reference plane for nothing (a signal on the other outer layer
+    returns on the inner plane between them). Calling an outer pour a plane made
+    two boards unusable rather than safer:
+
+    * ``examples/sky_star`` (2 layers, GND on B.Cu and +3V3/+5V on F.Cu) came
+      back as "every copper layer is a plane" - the router refused the whole
+      board;
+    * ``tests/data/sample.kicad_pcb`` (GND pour over all of B.Cu) was routed as a
+      single-layer board: B.Cu was not a terminal layer, so a net whose pads only
+      reach B.Cu had nowhere to start.
+
+    A two-layer board simply has no reference plane, and that is the honest
+    answer, not a reason to stop routing.
     """
     if explicit:
         routing = [l for l in explicit if l in copper]
@@ -105,6 +141,8 @@ def _split_layers(board, copper, explicit=None):
         for layer in (z.get("layers") or []):
             if layer not in copper:
                 continue
+            if not _inner_layer(layer, copper):
+                continue        # outer pour = ground fill, cut freely
             got = planes.setdefault(layer, {"net": z.get("net"), "area_mm2": 0.0})
             got["area_mm2"] = round(got["area_mm2"] + area, 2)
     routing = [l for l in copper if l not in planes]
@@ -659,8 +697,15 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
     a via still has to clear the copper on F.Cu it is not allowed to use. A
     terminal left with no layer in the set is reported per pad rather than
     quietly dropped, because "no terminal" is a layout fact and silent failure
-    is a wrong answer. `None` (default) is the historical behaviour: any
-    collected layer is also a new-copper layer.
+    is a wrong answer. `None` (the default) no longer means "any collected
+    layer": it means the ROUTING layers, which is the same set without the
+    plane layers. A plane layer has no new copper placed on it unless the
+    caller names it here, because the write gate refuses another net's copper
+    on a plane pour anyway (`ruleset.precondition.plane_pour_intact`) and a
+    plan that cannot be written is not a plan. The measurement behind that
+    default: on the RK3506 SOM the old default "routed" DDR_A8/DDR_A11 with 9
+    of 19 segments on In1.Cu, the only GND pour, and taking the same two nets
+    off the plane returns 0 ops.
 
     `bundle_bands` is how a bus gets a geometry instead of a pile of
     independently shortest paths. Each entry is
@@ -783,6 +828,22 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
             t["layers"] = keep_l
             kept.append(t)
         terms = kept
+
+    # Where may the search STEP? New copper may only land on a routing layer. A
+    # plane layer is a pour by definition and the write gate refuses another
+    # net's copper on it (`ruleset.precondition.plane_pour_intact`), so walking
+    # there only manufactures plans that cannot be written.
+    #
+    # `walk_layers=None` used to mean "every layer in the grid", and the grid
+    # deliberately keeps the planes in it (a via still has to clear the copper it
+    # may not use). So the default defaulted to cutting the plane, and that is
+    # not a theory: on the RK3506 SOM it is exactly how DDR_A8/DDR_A11 "routed"
+    # - 9 of 19 segments on In1.Cu, the board's only GND pour - while limiting
+    # the same two nets to the signal layers returns 0 ops (A11 search_budget,
+    # A8 no_path). Two nets connected is not worth a 36.1 mm2 hole in the return
+    # path, so the search is not allowed to step on a plane unless the caller
+    # names the layers with `new_copper_layers`.
+    walk = _walk_layers(routing, new_layers)
 
     plane_nets = {}
     for layer, spec in planes.items():
@@ -1418,7 +1479,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                          via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
                                if allow_vias else None),
                          diag=ast_diag, guide=guide_now[0],
-                         guide_outside=guide_now[1], walk_layers=new_layers,
+                         guide_outside=guide_now[1], walk_layers=walk,
                          reserve=rsv_now[0], reserve_price=rsv_now[1])
             if path is None:
                 src = goals
@@ -1432,7 +1493,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                              via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
                                if allow_vias else None),
                              diag=ast_diag, guide=guide_now[0],
-                             guide_outside=guide_now[1], walk_layers=new_layers,
+                             guide_outside=guide_now[1], walk_layers=walk,
                              reserve=rsv_now[0], reserve_price=rsv_now[1])
             if path is None:
                 t = (terminals[b]["term"] if b < len(terminals) else
@@ -1677,7 +1738,7 @@ def plan(board, pitch_mm=0.1, layers=None, nets=None, clearance_mm=None,
                          allow_vias=allow_vias,
                          via_check=(_via_gate(grid, net, exact=(via_gate == "exact"))
                                if allow_vias else None),
-                         soft=SOFT_BLOCK, walk_layers=new_layers)
+                         soft=SOFT_BLOCK, walk_layers=walk)
             if path is None:
                 continue
             for p in path:
