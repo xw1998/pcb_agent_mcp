@@ -27,6 +27,13 @@ a rounded meander:
     end, their length equals the chain's length to 1e-6, and no piece comes
     within clearance of foreign copper on its own layer (arcs are probed chord by
     chord with the sagitta added, the same way tune_board does it);
+  * the radius ladder reaches below one trace width, because a NARROW tooth
+    (small radius, tall bar) buys the same length out of a smaller amplitude -
+    the only shape that fits a corridor barely wider than the copper itself.
+    Nothing is ever drawn from that tail without saying so: a radius under one
+    width comes back flagged, and a wave whose crest run ends up closer than
+    `SELF_GAP` to its OWN base run is refused, because same-net copper never
+    triggers a DRC rule and a solid bar still measures the right length;
   * the write goes through the MCP's own `board_propose` + `board_apply`, so the
     four gates (bytes == plan, re-parse, per-op postcondition, KiCad DRC diff)
     judge it, not this script.
@@ -71,9 +78,31 @@ AMP_SLACK = float(os.environ.get("ARS_AMP", "0.002"))
 
 #: Radius ladder for the wave: small radii first, because the corridor being
 #: re-cut is an existing meander's, not a fresh segment's.
-R_LADDER = (0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.04, 0.03)
+#:
+#: It goes below one trace width on purpose. A NARROW tooth (small radius, tall
+#: bar) reaches the same length in a smaller amplitude, so it is the only shape
+#: that can live in a corridor barely wider than the trace itself - the four
+#: chains this tool used to refuse without an explanation. The tail was added
+#: after measuring them (docs/211): 0.025 is what /DDR_DQ13 needs, 0.020 what
+#: /DDR_A1 needs, and 0.015/0.012/0.010 are there so "narrow" has somewhere to
+#: go before the answer becomes "no shape at all". A radius under one width is
+#: reported by `arc_meander` as `sub_legible` with the number it used - it is
+#: drawn and named, never silently accepted.
+R_LADDER = (0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.04, 0.03,
+            0.025, 0.020, 0.015, 0.012, 0.010)
 
 H_MIN = TB.ARC_H_MIN          # geometric floor; a shallower bar is not a bar
+
+#: Gap a wave must keep between its OWN two parallel runs (the crest at `amp`
+#: and the base at 0). Below it the two runs stop reading as one wave and start
+#: reading as a filled slab: same net, so no DRC rule fires, and the length still
+#: measures right, which is exactly why this needs a number and not an eye.
+#:
+#: 0.05 is the tightest wave ALREADY on rk3506_som, not a fresh opinion: the
+#: closest pair there is /DDR_A4 B.Cu (amp 0.156, w 0.10 -> 0.0556) and /DDR_BA1
+#: (0.0603). The four chains this refuses sit at 0.0017 / 0.0226 / 0.0271 /
+#: 0.0163 - two to thirty times tighter than anything the board already carries.
+SELF_GAP = float(os.environ.get("ARS_SELFGAP", "0.05"))
 
 #: How far the re-measured length may drift from the chain's length. The pieces
 #: are written with points rounded to 1e-6 mm, and an arc's LENGTH is re-derived
@@ -390,12 +419,36 @@ def plan_chain(ch, copper):
     got = TB.arc_meander(seg, ch["extra_mm"], ch["amp_mm"] + AMP_SLACK,
                          side=ch["side"], r_ladder=R_LADDER, h_min=H_MIN)
     if got is None:
-        return None, {"reason": "does_not_fit",
-                      "amp_max_mm": round(ch["amp_mm"], 4)}
+        # Say how much amplitude the SAME length would need, so "the corridor is
+        # too shallow" arrives with the number that makes it true instead of on
+        # its own. The probe is free (one more search) and it is the difference
+        # between a refusal a reader can act on and one they have to re-derive.
+        detail = {"reason": "does_not_fit",
+                  "amp_max_mm": round(ch["amp_mm"], 4)}
+        wide = TB.arc_meander(seg, ch["extra_mm"], 1e6, side=ch["side"],
+                              r_ladder=R_LADDER, h_min=H_MIN)
+        if wide is not None and wide.get("pieces") is not None:
+            detail["amp_needed_mm"] = round(wide["amp"], 4)
+            detail["amp_short_mm"] = round(wide["amp"] - ch["amp_mm"], 4)
+        return None, detail
     if got.get("pieces") is None:
         return None, {"reason": got.get("reason") or "too_shallow",
                       "detail": {k: v for k, v in got.items() if k != "pieces"}}
     pieces = got["pieces"]
+    # 0. the wave has to still LOOK like a wave: its crest run and its base run
+    # are the same net, so nothing else in this file - and nothing in KiCad -
+    # would ever complain about them merging into a solid bar.
+    self_gap = got["amp"] - ch["w"]
+    if self_gap < SELF_GAP - 1e-9:
+        return None, {"reason": "tooth_fills_its_own_corridor",
+                      "amp_mm": round(got["amp"], 4),
+                      "width_mm": round(ch["w"], 3),
+                      "self_gap_mm": round(self_gap, 4),
+                      "need_mm": SELF_GAP,
+                      "corridor_mm": round(ch["amp_mm"], 4),
+                      "r_mm": got["r"], "teeth": got["teeth"],
+                      # this fit only exists NARROWER than one trace width
+                      "narrow_tooth": bool(got.get("sub_legible"))}
     # 1. the pieces join end to end, from the chain's first point to its last
     for k in range(len(pieces) - 1):
         if abs(pieces[k][-1][0] - pieces[k + 1][1][0]) > 1e-6 or \
@@ -466,8 +519,11 @@ def main(argv=None):
         plan, why = plan_chain(ch, copper)
         if plan is None:
             refused.append((ch, why))
-            print("  REFUSED %-14s %-7s extra %5.2f  %s"
-                  % (ch["net"], ch["layer"], ch["extra_mm"], why["reason"]), flush=True)
+            nums = " ".join("%s=%s" % (k, v) for k, v in sorted(why.items())
+                            if k != "reason" and not isinstance(v, (dict, list)))
+            print("  REFUSED %-14s %-7s extra %5.2f  %s  %s"
+                  % (ch["net"], ch["layer"], ch["extra_mm"], why["reason"], nums),
+                  flush=True)
         else:
             sh = plan["shape"]
             jobs.append((ch, plan))

@@ -229,6 +229,48 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(why["reason"], "copper_is_locked")
 
 
+OLD_LADDER = (0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.04, 0.03)
+
+class NarrowToothTest(unittest.TestCase):
+    """「用弧形窄齿宽」能不能把窄走廊塞进去——能，但塞进去的那个齿是扁的。
+
+    窄齿（小半径、高竖条）用更小的振幅换同样的长度，所以在只有一根线宽的走廊
+    里也几何可解。可解的代价是齿顶与齿根只剩几十微米——同网，任何 DRC 都不会
+    响，长度也照样对，所以这条只能靠一个数字拦住。两条用例是同一构造的一对：
+    窄走廊必须拒，走廊放宽后同一条链必须过（否则判据是「恒拒」）。
+    """
+
+    def _plan(self, offset, height):
+        board = FakeBoard(tooth_on_rail(offset=offset, n_teeth=2, rail=5.0,
+                                        height=height)
+                          + [leg(90, (5, 0), (5, -1)),
+                             leg(91, (5, height), (5, height + 1))])
+        ch = ar().chains(ar().Model(board))[0]
+        return ar().plan_chain(ch, ar().Copper(board))
+
+    def test_a_narrow_corridor_needs_a_tooth_narrower_than_the_trace(self):
+        plan, why = self._plan(-0.13, 0.52)
+        self.assertIsNone(plan)
+        self.assertEqual(why["reason"], "tooth_fills_its_own_corridor", why)
+        # the fit EXISTS - that is what the narrow ladder bought - and it is
+        # narrower than one trace width, i.e. below the legibility floor
+        self.assertTrue(why["narrow_tooth"])
+        self.assertLess(why["r_mm"], why["width_mm"])
+        self.assertLess(why["r_mm"], min(OLD_LADDER))
+        # ...and it is unusable because the crest run sits on the base run
+        self.assertLess(why["self_gap_mm"], why["need_mm"])
+        self.assertAlmostEqual(why["self_gap_mm"], why["amp_mm"] - why["width_mm"],
+                               places=4)
+
+    def test_the_same_chain_plans_once_the_corridor_is_wide_enough(self):
+        """反向对照：同一条链、走廊放宽到 0.30，窄齿不再需要，判据不许再触发。"""
+        plan, why = self._plan(-0.30, 1.20)
+        self.assertIsNone(why, why)
+        self.assertGreaterEqual(plan["shape"]["amp"] - 0.1,
+                                ar().SELF_GAP - 1e-9)
+        self.assertGreaterEqual(plan["shape"]["r"], min(OLD_LADDER),
+                                "a wide corridor must not need the narrow tail")
+
 class RealBoardTest(unittest.TestCase):
     """这次修的真现场：32 条 dangling 就是在这一条链上长出来的。"""
 
@@ -266,6 +308,25 @@ class RealBoardTest(unittest.TestCase):
         nets = {c["net"] for c in self.chains}
         self.assertIn("/DDR_DQ0", nets)
         self.assertIn("/DDR_A0", nets)
+
+    def test_the_four_tight_chains_are_refused_with_numbers(self):
+        """4 条窄走廊的链：窄齿能塞进去，但塞进去的齿顶压在自己的齿根上。
+
+        它们的走廊只有 0.102-0.128，而一条「两段平行铜」的波形至少要
+        width + SELF_GAP = 0.15，所以这不是半径没选对，是这个形状在这种
+        走廊里根本没有合法解。
+        """
+        names = {"/DDR_DQ15", "/DDR_DQ9", "/DDR_A1", "/DDR_DQ13"}
+        got = {c["net"]: c for c in self.chains if c["net"] in names}
+        self.assertEqual(set(got), names)
+        cu = ar().Copper(self.board)
+        for net, ch in got.items():
+            plan, why = ar().plan_chain(ch, cu)
+            self.assertIsNone(plan, net)
+            self.assertEqual(why["reason"], "tooth_fills_its_own_corridor",
+                             (net, why))
+            self.assertLess(why["self_gap_mm"], why["need_mm"], net)
+            self.assertLess(ch["amp_mm"] - ch["w"], ar().SELF_GAP, net)
 
     def test_a_bad_chain_would_have_been_caught(self):
         """反向对照：把弦挪到齿尖线上，长度照样对，但两端立刻不接铜。
