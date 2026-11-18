@@ -448,7 +448,7 @@ def measure(board, net, layer=None, demand_mm=None, sample_mm=SAMPLE_MM,
                                    ("status", "code", "reason", "message")}})
             return row
         v = out.get("value") or {}
-        row["filled"] = (v.get("filled") or {}).get("fill_area_mm2")
+        row["filled_area_mm2"] = (v.get("filled") or {}).get("fill_area_mm2")
         poured = _open(work)
         polys = zone_polygons(poured, net, layer)
         cor = corridor(poured, net, layer, sample_mm=sample_mm, polys=polys)
