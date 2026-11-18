@@ -4602,6 +4602,95 @@ _tool(
     _board_tool(_board_rail_plan, derived=True),
 )
 
+def _board_rail_pour(b, args):
+    from .route import rail_pour as RP
+    from .route import rail_plan as RPL
+    cur = args.get("currents") or {}
+    nets = [str(n) for n in (args.get("nets") or [])]
+    demands = {}
+    if cur:
+        plan = RPL.plan(b, cur, delta_t_c=args.get("delta_t_c", 10.0),
+                        copper_oz=args.get("copper_oz", 1.0),
+                        standard=args.get("standard") or "ipc2221")
+        for row in plan["rows"]:
+            demands[row["net"]] = row["required_width_mm"]["internal"]
+    if not nets:
+        nets = sorted(cur)
+    if not nets:
+        return err("no rail named", "BAD_INPUT",
+                   hint="pass `nets` (rail names) and/or `currents` (net -> amps); "
+                        "a pour measured against no net answers nothing")
+    rows = []
+    for net in nets:
+        rows.append(RP.measure(b, net, layer=args.get("layer"),
+                               demand_mm=demands.get(net),
+                               clearance_mm=args.get("clearance_mm"),
+                               min_thickness_mm=args.get("min_thickness_mm")))
+    top = int(args.get("top") or 0)
+    value = {"rows": rows}
+    if top and len(rows) > top:
+        value["rows_truncated_from"] = len(rows)
+        value["rows"] = rows[:top]
+    return ok(value, "mm",
+              "the copper KiCad's ZONE_FILLER poured for each rail on its own "
+              "layer, measured along that rail's own tracks",
+              "one whole-board plane poured per rail on a TEMP COPY of this file, "
+              "at the clearance and min_thickness this board's own zones state; "
+              "width is the perpendicular cross-section (track width + how far "
+              "the fill reaches past each track edge), and its minimum over the "
+              "rail is the bottleneck - not a bound on the average",
+              "0.05 mm sampling along the tracks; widths rounded to 0.0001 mm; "
+              "the pour itself is binary (filled or not) per polygon",
+              {"temps": "the pour happens on a copy; the file you named is not "
+                         "written", "cost": "the filler runs once per rail "
+                                     "(~10-20 s each on the RK3506 SOM)"})
+
+_tool(
+    "board_rail_pour",
+    "Does pouring this rail actually widen it where it is narrow? board_rail_plan "
+    "ends an unbalanced rail with pour_needed + needs_outline because it will not "
+    "invent a shape; this answers the follow-up by pouring the BOARD OUTLINE over "
+    "the rail's own layer with KiCad's own ZONE_FILLER (on a temp copy - the file "
+    "you named is not written) and measuring what came out. Three facts per rail: "
+    "COVERAGE (how much of the rail's own length ends up outside the pour - a rail "
+    "chopped by every crossing signal is not one conductor), WIDTH across the rail "
+    "(perpendicular cross-section = track width + how far the fill reaches past "
+    "each track edge; the MINIMUM over the rail is the bottleneck and `at` names "
+    "it, while p50/p90 say what the pour does elsewhere), and FRAGMENTATION (how "
+    "many pieces the filler produced and how big they are). The verdicts are "
+    "asymmetric on purpose: width_proven means the bottleneck already carries the "
+    "demand, width_unproven means this measurement cannot certify it - never that "
+    "the pour is too narrow. A rail whose bottle neck reads its own track width is "
+    "the ordinary answer: the pour obeys the same clearance the neck does, so it "
+    "cannot come closer than the neighbours already allow. Requires `nets` and/or "
+    "`currents`; a net with no current comes back width_unproven with the geometry "
+    "and no judgement. Slow by nature: the filler runs once per rail.",
+    {"type": "object",
+     "properties": dict({
+         "nets": {"type": "array", "items": {"type": "string"},
+                  "description": "rail names to pour and measure; omit to use "
+                                 "the keys of `currents`"},
+         "currents": {"type": "object",
+                      "additionalProperties": {"type": "number"},
+                      "description": "net name -> amps; the demand each row is "
+                                     "judged against comes from the SAME IPC "
+                                     "model board_rail_plan uses"},
+         "layer": _str("pour on this layer instead of the inner layer the rail "
+                       "already runs on most"),
+         "clearance_mm": _num("clearance for the pour (default: this board's "
+                              "own clearance rule)"),
+         "min_thickness_mm": _num("zone min_thickness (default: the thinnest "
+                                  "on this board's own zones)"),
+         "delta_t_c": _num("allowed temperature rise (default 10)", 10),
+         "copper_oz": _num("copper weight (default 1)", 1),
+         "standard": _str("IPC chart to fit: ipc2221 (default) or ipc2152",
+                          ["ipc2221", "ipc2152"], "ipc2221"),
+         "top": _num("how many rails to pour (0 = all)"),
+     }, **_COMMON),
+     "required": ["path"]},
+    _board_tool(_board_rail_pour, derived=True),
+)
+
 _tool(
     "board_length_budget",
     "Can these nets still be brought to one length, and what would it cost? Uses "

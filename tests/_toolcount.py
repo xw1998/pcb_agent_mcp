@@ -97,11 +97,23 @@ used to be spread across the twelve files.
                  comes back no_demand with geometry and nothing judged. Also not
                  in the `available` list, for the same reason as board_power_copper.
 
+    265 -> 266   (no version bump - docs/207 is a stage note): board_rail_pour -
+                 the question board_rail_plan could only refuse: "if a pour were
+                 drawn, would the copper that comes out be usable". Pours the board
+                 outline over the rail's own layer with KiCad's own ZONE_FILLER on
+                 a temp copy and measures coverage along the rail, the
+                 perpendicular WIDTH across it (minimum = bottleneck, p50/p90 =
+                 everywhere else) and the filler's fragmentation. New question,
+                 and it is the first tool whose verdict is asymmetric by design
+                 (width_proven certifies, width_unproven never denies). Not in the
+                 `available` list: it shells out to the filler, so it is not a pure
+                 calculator and that count stays 222.
+
 Nothing here is a routing or placement tool: board_route and board_fanout are
 gone (TOOL_RETIRED) and stay gone, so they are not in the count below.
 """
 
-EXPECTED_TOOL_COUNT = 265
+EXPECTED_TOOL_COUNT = 266
 
 # calc_capabilities answers for the subset of tools that are pure calculators:
 # they take numbers and return numbers, so "available" is a shorter list than
