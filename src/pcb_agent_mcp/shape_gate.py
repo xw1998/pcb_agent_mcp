@@ -19,9 +19,15 @@ The order is by "how unrecoverable is this in copper":
 2. `off_45_heading` - a segment that is neither H, V nor 45. Nothing in this
    house is drawn at 30 degrees, and one such segment is a straight violation
    rather than a style opinion.
-3. `duplicate_copper` - two tracks with the same net, layer and both endpoints.
-   Pure waste, and it silently doubles every length and detour number the other
-   audits report (`/FSPI_CLK` on the SOM board carried exactly this pair).
+3. `duplicate_copper` - the same piece of copper drawn twice, in either of the
+   two shapes it takes: two tracks with the same net, layer and both endpoints,
+   or two tracks of the same net and layer leaving one point in the SAME
+   direction towards different points (one is a prefix of the other, a partial
+   overlap). Pure waste, and it silently doubles every length and detour number
+   the other audits report (`/FSPI_CLK` on the SOM board carried the first pair).
+   The second shape used to be reported by `angle_audit` as a 0 degree
+   `acute_corner`, which is impossible geometry and sends the fixer at an angle
+   that does not exist instead of at the redundant copper to trim.
 4. `redundant_loop` - a signal net that closes a ring against itself. Two paths
    between the same pair of pins is copper drawn twice, and it inflates every
    length the other rules read. `duplicate_copper` cannot see it (the endpoints
@@ -57,7 +63,8 @@ RULES = (
     {"priority": 2, "id": "off_45_heading", "blocking": True,
      "rule": "every segment heading is 0/45/90 degrees"},
     {"priority": 3, "id": "duplicate_copper", "blocking": True,
-     "rule": "no two tracks share net, layer and both endpoints"},
+     "rule": "no copper drawn twice: not the same net+layer+endpoints, and not "
+             "two traces leaving one point in the same direction"},
     {"priority": 4, "id": "redundant_loop", "blocking": True,
      "rule": "no signal net closes a ring against itself (a rail may be a grid)"},
     {"priority": 5, "id": "dead_end", "blocking": True,
@@ -572,7 +579,7 @@ def gate(board, strict=False, angle_tol_deg=1.0,
         return ang
     av = (ang.get("value") if isinstance(ang, dict) else None) or {}
 
-    acute_list, square_list = [], []
+    acute_list, square_list, overlap_list = [], [], []
     other_pct_max = 0.0
     other_segs = []
     for lay, c in (av.get("corners") or {}).items():
@@ -580,6 +587,8 @@ def gate(board, strict=False, angle_tol_deg=1.0,
             acute_list.append(dict(row, layer=lay))
         for row in (c.get("right_angle_list") or []):
             square_list.append(dict(row, layer=lay))
+        for row in (c.get("overlap_list") or []):
+            overlap_list.append(dict(row, layer=lay))
     for lay, st in (av.get("per_layer") or {}).items():
         other_pct_max = max(other_pct_max, float(st.get("other_pct") or 0.0))
         for row in (st.get("other_segments") or []):
@@ -588,6 +597,8 @@ def gate(board, strict=False, angle_tol_deg=1.0,
                       for c in (av.get("corners") or {}).values())
     square_total = sum(int(c.get("corner_90") or 0)
                        for c in (av.get("corners") or {}).values())
+    overlap_total = sum(int(c.get("overlap") or 0)
+                        for c in (av.get("corners") or {}).values())
     other_total = sum(int(s.get("other") or 0)
                       for s in (av.get("per_layer") or {}).values())
     arc_tracks = sum(int(s.get("arc_tracks") or 0)
@@ -633,9 +644,22 @@ def gate(board, strict=False, angle_tol_deg=1.0,
     _rule(RULES[1], other_total, other_total > 0,
           "%d segment(s) are neither H, V nor 45 (worst layer %.2f%%)"
           % (other_total, other_pct_max), other_segs)
-    _rule(RULES[2], len(dups), bool(dups),
-          "%d duplicated track(s): same net, layer and both endpoints" % len(dups),
-          dups)
+    # `overlap_total` is the other half of "this copper is drawn twice": two
+    # segments of the same net and layer leaving one vertex in the same direction
+    # towards different points, i.e. one is a prefix of the other. Physically
+    # that is one trace laid on top of another, and the 0 degree interior angle
+    # it produces is not a corner at all. It lands here rather than in
+    # `acute_corner` because the fix is to TRIM the copper, not to redraw an
+    # angle. Measured: the 52 via-in-pad relocations on `_dg_h.kicad_pcb`
+    # produced 6 of these and every one was reported as a 0 deg acute corner.
+    _rule(RULES[2], len(dups) + overlap_total,
+          bool(dups) or overlap_total > 0,
+          "%d duplicated track pair(s) (same net, layer and both endpoints) + "
+          "%d overlapping copper vertex(-ices) (same net and layer leaving one "
+          "point in the same direction towards different points - one trace laid "
+          "on another; trim it, a 0 deg corner does not exist)"
+          % (len(dups), overlap_total),
+          dups + [dict(r, kind="overlap") for r in overlap_list])
     # A rail is allowed to be a grid. Feeding one ball row from two stitched
     # rails is how power is shared without widening a trace, and `/ +1V8_ANA` on
     # the SOM board does exactly that between y=31.246 and y=31.521. A signal has

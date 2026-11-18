@@ -66,6 +66,29 @@ TOUCH = 0.02
 STEP = 0.05
 D_MIN = 0.10
 
+#: How far off a contact's own axis a repair may aim and still be treated as
+#: "along that axis". This is the tolerance the gate itself uses when it folds a
+#: heading onto 0/45/90/135, so a joint this far off straight is still reported
+#: as collinear, not as a new heading.
+#:
+#: It is deliberately NOT tightened. Two attempts measured why: at 0.05 deg the
+#: SOM board refused 8 holes that a 1 deg acceptance solves, because a contact
+#: 0.5 deg off a lattice ray is fine in copper. What is NOT fine is the segment
+#: that comes out of the slide - when the length left over is short, a 1 deg
+#: aiming error is amplified into a 6.3 deg heading (`/FSPI_D1`: 0.19 mm at
+#: 96.3 deg) or a 1.4 deg one (`/FB_U7`). So the aiming stays loose and the
+#: DRAWN segment is checked against the grid before the site is accepted.
+COL_EPS = 1.0
+
+#: How far a site may be pulled sideways so that it sits exactly ON the line of a
+#: track this move continues. A slid track end draws one straight segment from
+#: the track's fixed end to the new site, so 0.02 mm of sideways drift is enough
+#: to turn it into a 1.4 or 1.7 degree heading (`/FB_U7` R8.1, `/FSPI_D1` U3.2),
+#: and the angle gate reports any heading more than a degree off 0/45/90/135.
+#: Snapping keeps the copper on the line it continues; the shift is a fraction of
+#: the hole body and the site is re-checked against clearance after the snap.
+SNAP_MAX = 0.10
+
 #: Side of the square bucket the clearance queries walk. The site search asks a
 #: clearance question tens of thousands of times per board, and a straight scan
 #: over 5k items makes that minutes instead of seconds.
@@ -172,6 +195,13 @@ class Model(object):
                 "net": z["net"],
                 "layers": [str(s) for s in (z.get("layers") or [])],
                 "poly": [(float(a), float(b)) for a, b in z["outline"]]})
+
+        #: (net, layer) -> tracks. The coverage question "is this stitch already
+        #: copper" asks over one net on one layer, and walking 4k tracks to build
+        #: that list per candidate made the planner take minutes on the SOM board.
+        self.by_net_layer = {}
+        for t in self.tracks:
+            self.by_net_layer.setdefault((t["net"], t["layer"]), []).append(t)
 
         self.edges = []
         for chain in (board.outline or []):
@@ -334,6 +364,253 @@ def _pad_covers(model, net, layer, x, y):
             return True
     return False
 
+def _in_own_copper(model, net, layer, x, y, inset=0.0):
+    """True if `(x,y)` is inside same-net copper on `layer` with `inset` slack.
+
+    `inset` is the half-width of the copper that would be drawn there: asking
+    for `inset = w/2` means "a `w`-wide trace laid at this point adds nothing",
+    which is exactly the question a stitch has to answer before it is drawn.
+    """
+    nb = model.near(x, y)
+    for i in nb["track"]:
+        t = model.tracks[i]
+        if t["layer"] != layer or t["net"] != net:
+            continue
+        d = _seg_point_distance(x, y, t["x1"], t["y1"], t["x2"], t["y2"])
+        if d <= t["w"] / 2.0 - inset + 1e-6:
+            return True
+    for i in nb["pad"]:
+        p = model.pads[i]
+        if p["net"] == net and _on(p["layers"], layer) and \
+                _point_in_polygon(x, y, p["poly"]):
+            return True
+    # zones are not in the 1 mm bucket table (they are few), so they are walked
+    for z in model.zones:
+        if z["net"] == net and layer in z["layers"] and \
+                _point_in_polygon(x, y, z["poly"]):
+            return True
+    return False
+
+def _covered_by_own(model, net, layer, ax, ay, bx, by, width):
+    """Is the whole segment already same-net copper of at least `width`?
+
+    A stitch that runs along copper that is already there is a second trace on
+    top of the first. That is what `shape_gate` now reports as an overlapping
+    copper pair, and the answer here is to NOT draw it: the layers it would have
+    carried are still carried, because `held()` counts the copper that is
+    already present. Measured on `_dg_h.kicad_pcb`: `/+3V3`, `/+5V_IN` and
+    `/+1V35_DDR` each got a stitch laid exactly on an existing trace and each
+    came back as a 0 degree corner.
+
+    Tracks are handled exactly (project every collinear same-net track onto the
+    segment and ask whether the intervals cover it end to end), because this
+    runs inside the site search and a per-sample walk over `near()` made the
+    planner take minutes. Pads and zones are sampled at a handful of points; a
+    stitch that is entirely inside a pad or a pour needs no copper either.
+    """
+    L = math.hypot(bx - ax, by - ay)
+    if L < 1e-9:
+        return True
+    ux, uy = (bx - ax) / L, (by - ay) / L
+    need = width / 2.0 - 1e-6
+
+    idx = getattr(model, "by_net_layer", None)
+    if idx is None:
+        pool = [t for t in model.tracks
+                if t["layer"] == layer and t["net"] == net]
+    else:
+        pool = idx.get((net, layer), ())
+    spans = []
+    for t in pool:
+        if t["w"] / 2.0 < need:
+            continue
+        tx, ty = t["x2"] - t["x1"], t["y2"] - t["y1"]
+        tl = math.hypot(tx, ty)
+        if tl < 1e-9:
+            continue
+        if abs((tx / tl) * uy - (ty / tl) * ux) > 1e-4:
+            continue
+        if _seg_point_distance(ax, ay, t["x1"], t["y1"],
+                               t["x2"], t["y2"]) > t["w"] / 2.0 - need:
+            continue
+        s1 = (t["x1"] - ax) * ux + (t["y1"] - ay) * uy
+        s2 = (t["x2"] - ax) * ux + (t["y2"] - ay) * uy
+        spans.append((min(s1, s2), max(s1, s2)))
+    if spans:
+        spans.sort()
+        reach = 0.0
+        for lo, hi in spans:
+            if lo > reach + 1e-6:
+                break
+            if hi > reach:
+                reach = hi
+            if reach >= L - 1e-6:
+                return True
+
+    for k in (0.0, 0.25, 0.5, 0.75, 1.0):
+        if not _in_own_copper(model, net, layer,
+                              ax + (bx - ax) * k, ay + (by - ay) * k, need):
+            return False
+    return True
+
+VROUND = 3
+
+
+def _ray_angle(u, v):
+    """The corner number `angle_audit` reports: the angle between two rays.
+
+    The gate folds a pair of outgoing directions to `0..180` and calls anything
+    under 90 an acute corner, 90 a square one and 135 a chamfer. Reproducing
+    that number here is the whole point of this helper - a second, "reasonable"
+    angle convention would refuse sites the gate accepts and accept sites it
+    refuses, which is the same mistake in two directions.
+    """
+    d = max(-1.0, min(1.0, u[0] * v[0] + u[1] * v[1]))
+    return math.degrees(math.acos(d))
+
+
+def _shape_local(model, net, drawn, slid, tol_deg=1.0):
+    """Would the copper this candidate draws leave a corner the gate refuses?
+
+    `drawn` is copper to be written, `(layer, width, a, b)` per piece. `slid`
+    is an existing track whose near end moves onto the new site,
+    `(layer, at, far, old)`: the piece it leaves behind is `at`..`far`, so it
+    contributes a leaving direction at the NEW site and takes one away at `at`
+    (writing it in `drawn` as well would be the duplicate the gate refuses).
+    `old` is where that end sat before the slide, so the track's own copper can
+    be recognised at its old place and dropped: a stale ray there would pair
+    with the stitch that continues it and read as 0 degrees.
+
+    The audit is the gate's own, run on the vertices this move touches: at each
+    such vertex every pair of outgoing rays on that layer has to keep an angle
+    of at least 90. Two rays in the SAME direction are the overlap the gate
+    calls duplicate copper and come out of the same arithmetic as 0 degrees.
+
+    Priority, and the reason this runs before a site is accepted: an acute
+    corner is rule 1 and blocks the board outright, while one more hole left in
+    its pad is rule 1 of `place_gate` - so a site that buys a hole with an acid
+    trap is refused rather than reported. Measured on `_dg_i.kicad_pcb`: 45
+    holes moved, 17 left behind, and the board still read `shape_fail` on two
+    45 degree corners at `/+3V3` 11.8,11.12 and 11.8,13.92 - both made by a
+    stitch that started at an existing track end where a 45 degree branch
+    already left the same point.
+    """
+    if not drawn and not slid:
+        return None
+    layers = [p[0] for p in drawn] + [s[0] for s in slid]
+    seen_layer = []
+    for L in layers:
+        if L not in seen_layer:
+            seen_layer.append(L)
+    idx = getattr(model, "by_net_layer", None)
+
+    def pool(L):
+        if idx is None:
+            return [t for t in model.tracks
+                    if t["layer"] == L and t["net"] == net]
+        return idx.get((net, L), ())
+
+    # the tracks being slid are not at `at` any more, so they must not be read
+    # as copper that still leaves from there
+    gone = set()
+    for s in slid:
+        L, at, far = s[0], s[1], s[2]
+        old = s[3] if len(s) > 3 else s[1]
+        for a, b in ((at, far), (old, far)):
+            gone.add((L, round(a[0], VROUND), round(a[1], VROUND),
+                      round(b[0], VROUND), round(b[1], VROUND)))
+            gone.add((L, round(b[0], VROUND), round(b[1], VROUND),
+                      round(a[0], VROUND), round(a[1], VROUND)))
+
+    rays = {}
+
+    def add(L, px, py, qx, qy):
+        d = math.hypot(qx - px, qy - py)
+        if d < 1e-9:
+            return
+        rays.setdefault((L, round(px, VROUND), round(py, VROUND)), []).append(
+            ((qx - px) / d, (qy - py) / d))
+
+    for L in seen_layer:
+        for t in pool(L):
+            k1 = (L, round(t["x1"], VROUND), round(t["y1"], VROUND),
+                  round(t["x2"], VROUND), round(t["y2"], VROUND))
+            if k1 in gone:
+                continue
+            add(L, t["x1"], t["y1"], t["x2"], t["y2"])
+            add(L, t["x2"], t["y2"], t["x1"], t["y1"])
+
+    touch = set()
+    for L, _w, a, b in drawn:
+        add(L, a[0], a[1], b[0], b[1])
+        touch.add((L, round(a[0], VROUND), round(a[1], VROUND)))
+        touch.add((L, round(b[0], VROUND), round(b[1], VROUND)))
+    for s in slid:
+        L, at, far = s[0], s[1], s[2]
+        add(L, at[0], at[1], far[0], far[1])
+        touch.add((L, round(at[0], VROUND), round(at[1], VROUND)))
+
+    for k in touch:
+        lst = rays.get(k, ())
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                a = _ray_angle(lst[i], lst[j])
+                if a < 90.0 - tol_deg:
+                    return ("this site would leave a %.1f deg corner at "
+                            "%.3f,%.3f on %s" % (a, k[1], k[2], k[0]))
+    return None
+
+
+def _off_grid(ax, ay, bx, by, tol_deg=1.0):
+    """Is this segment off the 0/45/90/135 headings by more than `tol_deg`?
+
+    The tolerance is the gate's own: `angle_audit(angle_tol_deg=1.0)` folds a
+    heading onto 0/45/90/135 within a degree, so a segment inside that degree is
+    reported as on-grid and rebuilding it is not a violation. Refusing what the
+    gate would accept is the same class of mistake as accepting what it rejects.
+    """
+    h = math.degrees(math.atan2(by - ay, bx - ax)) % 180.0
+    a = h % 45.0
+    return min(a, 45.0 - a) > tol_deg
+
+def _snap_to_axis(contacts, pinned, u, x, y):
+    """Pull a site onto the line of a track this move carries on.
+
+    Three ways of leaving a hole all draw a segment that is supposed to be the
+    SAME line as an existing track: sliding a track end along its own axis (in
+    either direction), and carrying on from a track's far end. In all three the
+    site has to sit exactly on that track's line, otherwise the segment comes
+    out a degree or two off the grid - which is not a routing style question but
+    the difference between `45deg` and `other` in the angle gate.
+
+    Only axes this ray is already heading along are snapped (the angle tests
+    below are the same ones the caller uses), and only when the pull is shorter
+    than `SNAP_MAX`; a bigger pull would be a different site, not the same one.
+    """
+    lines = []
+    for c in contacts:
+        a = _ang(c["u"], u)
+        if a < COL_EPS or a > 180.0 - COL_EPS:
+            lines.append((c["end"], c["u"]))
+    for (ex, ey, _lay, _dd, _w, far) in pinned:
+        fl = math.hypot(far[0] - ex, far[1] - ey)
+        dl = math.hypot(x - ex, y - ey)
+        if fl < 1e-9 or dl < 1e-9:
+            continue
+        du = ((far[0] - ex) / fl, (far[1] - ey) / fl)
+        if (x - ex) / dl * du[0] + (y - ey) / dl * du[1] > 0.9995:
+            lines.append(((ex, ey), du))
+    best = None
+    for (px, py), (dx, dy) in lines:
+        t = (x - px) * dx + (y - py) * dy
+        nx, ny = px + t * dx, py + t * dy
+        s = math.hypot(nx - x, ny - y)
+        if s <= SNAP_MAX and (best is None or s < best[0]):
+            best = (s, nx, ny)
+    if best is not None:
+        return best[1], best[2], best[1] - x, best[2] - y
+    return x, y, 0.0, 0.0
+
 
 def contacts_of(model, via):
     """Same-net track ends sitting on the hole, with the heading they leave by."""
@@ -450,6 +727,20 @@ def _dogleg_at(model, via, pad, r, contacts, pad_layers):
                     if len(model.held(ex, ey, via, carry)) < 2:
                         d2 = round(d2 + STEP, 4)
                         continue
+                    # the dogleg is the one path that writes two pieces per
+                    # layer straight out of the hole, so it is the one that
+                    # lays a leg on an existing trace: measured on
+                    # `_dg_i.kicad_pcb`, `/+0V9_CPU` L1.2's first leg ran 0.8 mm
+                    # down exactly where the pad's own 0.4 mm In4 trace already
+                    # ran, and the gate read it as 0 degrees plus a ring.
+                    shed = _shape_local(model, via["net"],
+                                        [(L, widths[L], V, (bx, by))
+                                         for L in need] +
+                                        [(L, widths[L], (bx, by), (ex, ey))
+                                         for L in need], [])
+                    if shed:
+                        d2 = round(d2 + STEP, 4)
+                        continue
                     stitch = [(L, widths[L], [V, (bx, by), (ex, ey)])
                               for L in need]
                     cand = {"x": round(ex, 4), "y": round(ey, 4),
@@ -527,15 +818,44 @@ def _plan_at(model, via, pad, r):
     best = None
     alts = []
     killed = []
+    _dbg = bool(os.environ.get("OPD_DEBUG"))
+    def _why(tag, msg):
+        if _dbg:
+            print("      [%s d=%.2f u=%.0f] %s" % (
+                tag, d, math.degrees(math.atan2(u[1], u[0])) % 360, msg))
     for u, why in dirs:
         seen = None
         got_site = False
         d = D_MIN
         while d <= D_MAX + 1e-9:
             x, y = V[0] + d * u[0], V[1] + d * u[1]
+            # a move that carries a track on along its own line has to land ON
+            # that line, or the piece it draws comes out a degree or two off the
+            # grid; the clearance checks below then run at the snapped point
+            x, y, sx, sy = _snap_to_axis(contacts, pinned, u, x, y)
+            if sx or sy:
+                # a stitch that starts at the hole centre would be left a degree
+                # off the ray by the snap, so it starts at the same sideways
+                # offset instead. That start has to stay inside copper the hole
+                # already has (the pad on its layers, the barrel on the rest), so
+                # a snap is dropped rather than turned into a disconnected piece.
+                if math.hypot(sx, sy) > max(0.0, r - 0.03) or \
+                        not _point_in_polygon(V[0] + sx, V[1] + sy, pad["poly"]):
+                    x, y, sx, sy = x - sx, y - sy, 0.0, 0.0
+            S = (V[0] + sx, V[1] + sy)
             why_bad = model.point_ok(x, y, via, layers)
+            if why_bad and (sx or sy):
+                # the snap exists only to keep the drawn copper on the grid; when
+                # it pushes the site into clearance trouble, keep the point the
+                # search asked for and let the grid gate judge the segment that
+                # comes out of it (measured: `/FB_U7` R7.2 sat 9 um too close to
+                # its own pad edge only after the snap)
+                x, y, sx, sy = x - sx, y - sy, 0.0, 0.0
+                S = (V[0], V[1])
+                why_bad = model.point_ok(x, y, via, layers)
             if why_bad:
                 seen = why_bad   # keep the reason at the furthest site tried
+                _why("clear", why_bad)
                 d = round(d + STEP, 4)
                 continue
             # a pinned end either stays under the new copper, or is picked up
@@ -555,6 +875,10 @@ def _plan_at(model, via, pad, r):
                 fl = math.hypot(far[0] - ex, far[1] - ey)
                 fu = ((far[0] - ex) / fl, (far[1] - ey) / fl) if fl > 0 else (0.0, 0.0)
                 dot = ux * fu[0] + uy * fu[1]
+                # "nearly its own axis" is enough to aim, because the segment
+                # the slide produces is checked against the grid before the site
+                # is accepted; a sideways drift of this size is exactly what made
+                # the 96.3 deg stub on `/FSPI_D1` and it is now caught there.
                 if dot > 0.9995:
                     pin_ext.append({"layer": play, "w": pw,
                                     "a": [ex, ey], "b": [far[0], far[1]]})
@@ -578,24 +902,31 @@ def _plan_at(model, via, pad, r):
                 pin_st.append((play, pw2, [(ex, ey), (x, y)]))
             if pin_bad:
                 seen = pin_bad
+                _why("pin", pin_bad)
                 d = round(d + STEP, 4)
                 continue
 
             extend, stitch, bad = [], [], None
             for c in contacts:
                 a = _ang(c["u"], u)
-                if a > 179.0:
+                if a > 180.0 - COL_EPS:
                     # sliding the endpoint back along the track's own axis keeps
                     # it one straight segment: no corner, and no length limit
                     extend.append(c)
-                elif a < 1.0 and c["len"] >= d - 1e-9:
+                elif a < COL_EPS and c["len"] >= d - 1e-9:
                     extend.append(c)
-                elif a < 1.0:
+                elif a < COL_EPS:
                     # the track is shorter than the move, so its endpoint
-                    # cannot be slid: carry the same heading on with a stitch
-                    # that starts exactly where that track ends. Collinear, so
-                    # it adds no corner and no length limit applies.
-                    cc = dict(c, frm=c["end"])
+                    # cannot be slid: carry the same heading on with a stitch.
+                    # It has to start at the track's FAR end, not at the hole:
+                    # starting at the hole lays the new copper on top of the
+                    # old track (measured on `/+3V3` In2 11.4,13.92, where the
+                    # existing 11.4->11.8 piece got a second copy on it and the
+                    # pair read as a 0 degree corner).
+                    far = c["far"]
+                    if math.hypot(far[0] - x, far[1] - y) <= 1e-6:
+                        continue        # the track already reaches the new site
+                    cc = dict(c, frm=far)
                     stitch.append(cc)
                 elif a < 90.0 - 1.0:
                     bad = "stitch would make a %.1f deg corner with the %s " \
@@ -606,23 +937,39 @@ def _plan_at(model, via, pad, r):
                     break
             if bad:
                 seen = bad
+                _why("corner", bad)
                 break
 
             # the pad itself: the old site is inside its copper, so one stitch on
             # a pad layer carries it out; a pad layer that already has a contact
             # going this way is extended instead and needs nothing
+            pad_width = 0.20 if _powerish(via["net"]) else 0.12
             pad_done = any(L in pad_layers for L in
                            [c["layer"] for c in extend] +
                            [c["layer"] for c in stitch])
-            extra_pad = [L for L in pad_layers
-                         if L not in [c["layer"] for c in extend] +
-                         [c["layer"] for c in stitch]]
+            extra_pad = []
+            # a pad layer whose copper already reaches the new site needs no
+            # stitch at all - and it still COUNTS as carried, otherwise skipping
+            # the stitch would talk the planner out of a site that is fine.
+            # Measured: `/+5V_IN` U6.4 sat 0.30 mm under its own F.Cu trace and
+            # got a 0.5 mm stitch laid on that trace (a 0 degree corner); with
+            # the stitch skipped but not counted, the same hole was refused.
+            pad_carried = False
+            for L in pad_layers:
+                if L in [c["layer"] for c in extend] + \
+                        [c["layer"] for c in stitch]:
+                    continue
+                if _covered_by_own(model, via["net"], L,
+                                   S[0], S[1], x, y, pad_width):
+                    pad_carried = True
+                    continue
+                extra_pad.append(L)
 
             plan_stitch = []
             okc = True
             for c in stitch:
                 width = max(c["w"], 0.12)
-                sx0, sy0 = c.get("frm", V)
+                sx0, sy0 = c.get("frm", S)
                 why_s = model.stitch_ok(sx0, sy0, x, y, c["layer"],
                                         via["net"], width)
                 if why_s:
@@ -630,26 +977,25 @@ def _plan_at(model, via, pad, r):
                     seen = "stitch %s/%.0fdeg: %s" % (c["layer"], math.degrees(
                         math.atan2(u[1], u[0])) % 360, why_s)
                     break
-                sx1, sy1 = c.get("frm", V)
+                sx1, sy1 = c.get("frm", S)
                 plan_stitch.append((c["layer"], width,
                                     [(sx1, sy1), (x, y)]))
             if not okc:
                 d = round(d + STEP, 4)
                 continue
-            pad_width = 0.20 if _powerish(via["net"]) else 0.12
             for L in extra_pad:
-                why_s = model.stitch_ok(V[0], V[1], x, y, L, via["net"], pad_width)
+                why_s = model.stitch_ok(S[0], S[1], x, y, L, via["net"], pad_width)
                 if why_s:
                     okc = False
                     seen = "pad stitch %s/%.0fdeg: %s" % (L, math.degrees(
                         math.atan2(u[1], u[0])) % 360, why_s)
                     break
                 plan_stitch.append((L, pad_width,
-                                    [(V[0], V[1]), (x, y)]))
+                                    [S, (x, y)]))
             if not okc:
                 d = round(d + STEP, 4)
                 continue
-            if not pad_done and not extra_pad:
+            if not pad_done and not extra_pad and not pad_carried:
                 d = round(d + STEP, 4)
                 continue
 
@@ -668,6 +1014,52 @@ def _plan_at(model, via, pad, r):
                         math.atan2(u[1], u[0])) % 360, why_s)
                     break
             if not okc:
+                d = round(d + STEP, 4)
+                continue
+
+            # Last gate before the site is accepted: every piece of copper this
+            # candidate would draw has to be on the 0/45/90/135 grid. The site
+            # search works on ray directions, but a stitch that continues a
+            # contact starts at that contact's far end, and a slid track end
+            # recently sat up to 1.8 degrees off its own axis - so the direction
+            # of the ACTUAL segment is what gets checked, not the ray.
+            off = None
+            for L, _w, pts in plan_stitch:
+                for i in range(len(pts) - 1):
+                    if _off_grid(pts[i][0], pts[i][1],
+                                 pts[i + 1][0], pts[i + 1][1]):
+                        off = "planned %s stitch %.1f,%.1f -> %.1f,%.1f is off " \
+                              "the 45 grid" % ((L,) + tuple(pts[i]) + tuple(pts[i + 1]))
+                        break
+                if off:
+                    break
+            if off is None:
+                for c in extend:
+                    bx_, by_ = (c["far"] if "far" in c
+                                else (c["b"][0], c["b"][1]))
+                    if _off_grid(x, y, bx_, by_):
+                        off = "sliding the %s track end to the new site leaves " \
+                              "a segment off the 45 grid" % c["layer"]
+                        break
+            if off:
+                seen = off
+                _why("grid", off)
+                d = round(d + STEP, 4)
+                continue
+
+            drawn = []
+            for L, w, pts in plan_stitch:
+                for i in range(len(pts) - 1):
+                    drawn.append((L, w, pts[i], pts[i + 1]))
+            slid = [(c["layer"], (x, y),
+                     tuple(c["far"]) if "far" in c
+                     else (c["b"][0], c["b"][1]),
+                     tuple(c["end"]) if "end" in c
+                     else (c["a"][0], c["a"][1])) for c in extend]
+            shed = _shape_local(model, via["net"], drawn, slid)
+            if shed:
+                seen = shed
+                _why("shape", shed)
                 d = round(d + STEP, 4)
                 continue
 
@@ -743,6 +1135,7 @@ def main(argv=None):
             # alternatives before giving up
             tried = []
             picked = None
+            clash = None
             for _key, c in [(None, cand)] + list(alts):
                 if (c["x"], c["y"]) in tried:
                     continue
@@ -756,11 +1149,23 @@ def main(argv=None):
                 if hit is None:
                     picked = c
                     break
+                if clash is None:
+                    clash = (c, hit)
             if picked is None:
                 cand = None
+                # the refusal has to carry the arithmetic, not just the fact:
+                # how far from the accepted site this hole's only option sits,
+                # and how far two holes of these drills have to sit apart. That
+                # is the difference between "no room" and "one more millimetre
+                # of board and it works".
+                c, (v2, c2) = clash
+                gap = (v["drill"] + v2["drill"]) / 2.0 + H2H
                 why = "every legal site lands on top of another hole's new " \
-                      "site (first clash: %s at %.3f,%.3f)" % (
-                          hit[0]["net"], hit[1]["x"], hit[1]["y"])
+                      "site (first clash: %s at %.3f,%.3f; best site is " \
+                      "%.3f mm away, two %.2f/%.2f mm holes need %.3f)" % (
+                          v2["net"], c2["x"], c2["y"],
+                          math.hypot(c["x"] - c2["x"], c["y"] - c2["y"]),
+                          v["drill"], v2["drill"], gap)
             else:
                 cand = picked
         if cand is None:

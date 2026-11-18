@@ -6531,7 +6531,7 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20,
                     (_seg_ray(p, q), (round(q[0], 3), round(q[1], 3)), s))
         bend = {"corner_135": 0, "corner_90": 0, "corner_acute": 0,
                 "collinear": 0, "coincident": 0, "right_angle_list": [],
-                "acute_list": []}
+                "acute_list": [], "overlap": 0, "overlap_list": []}
         # de-duplicate a pair of segments meeting at both ends (a 2-seg loop)
         seen_pairs = set()
         for (key, net), lst in rays.items():
@@ -6564,6 +6564,29 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20,
                             bend["right_angle_list"].append(
                                 {"net": net, "x": round(key[0], 2), "y": round(key[1], 2),
                                  "w": lst[i][2]["w"]})
+                    elif corner <= tol:
+                        # Two segments leave the same vertex in the SAME
+                        # direction but end at different points: one of them is a
+                        # prefix of the other, so this is one piece of copper
+                        # drawn twice, not a corner. The interior angle is 0 deg
+                        # and a 0 deg corner cannot exist in copper (the two rays
+                        # are the same ray); the fix is to trim the copper, not to
+                        # redraw an angle. Measured reason this branch exists -
+                        # the 52 via-in-pad relocations left 6 of these on
+                        # `_dg_h.kicad_pcb` and every one was reported as an
+                        # `acute_corner` with `corner_deg: 0.0`. The
+                        # `coincident` branch above catches the special case
+                        # where both segments end at the same point; this one
+                        # catches the partial-overlap length mismatch.
+                        bend["overlap"] += 1
+                        if len(bend["overlap_list"]) < int(top_other):
+                            w_i = float(lst[i][2].get("w") or 0.0)
+                            w_j = float(lst[j][2].get("w") or 0.0)
+                            bend["overlap_list"].append(
+                                {"net": net, "x": round(key[0], 2),
+                                 "y": round(key[1], 2),
+                                 "corner_deg": round(corner, 3),
+                                 "w": round(w_i, 3), "w_other": round(w_j, 3)})
                     elif corner < 90.0 + tol:
                         bend["corner_acute"] += 1
                         if len(bend["acute_list"]) < int(top_other):
@@ -6614,6 +6637,8 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20,
             problems.append("right_angle_corner@%s" % lay)
         if c["corner_acute"]:
             problems.append("acute_corner@%s" % lay)
+        if c.get("overlap"):
+            problems.append("overlapping_copper@%s" % lay)
     verdict = "angles_clean" if not problems else "angles_" + "+".join(problems)
 
     return ok(
@@ -6630,7 +6655,11 @@ def angle_audit(board, layer=None, angle_tol_deg=1.0, top_other=20,
                 "turn, 90 is a square corner, <90 is an acid trap. tees are "
                 "branches (an endpoint inside another segment of the same net): a "
                 "90 tee is the normal way to branch off a trunk and is NOT a "
-                "routing defect, so it is reported apart from corners"),
+                "routing defect, so it is reported apart from corners. overlap "
+                "counts vertices where two segments leave in the SAME direction "
+                "towards different points - that is one piece of copper drawn "
+                "twice (trim it), not a 0 degree corner, and it is NOT counted "
+                "as acute"),
         },
         unit="deg",
         model="atan2 heading per segment folded into [0,180); corner = 180 - "
