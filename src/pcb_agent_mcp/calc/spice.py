@@ -4815,7 +4815,8 @@ ENGINE_NOTE = (
 BUNDLED_NOTE = (
     "vendor/ngspice/ holds an unmodified ngspice-47 Windows build (GPL-2.0, see "
     "vendor/ngspice/NOTICE.md) as a SEPARATE PROGRAM: it is spawned as a subprocess "
-    "and never linked, so this module stays MIT and stays import-free. It is reached "
+    "and never linked, so no third-party code enters this module: it stays import-free "
+    "and covered by this repository's own licence. It is reached "
     "by engine='ngspice' only after PCB_AGENT_NGSPICE, PATH and an installed copy "
     "have all come up empty"
 )

@@ -7,7 +7,7 @@ deck **including XSPICE `A` cards**, vendored so that
 Licence and provenance: **[NOTICE.md](NOTICE.md)**. This directory is a **mixed**
 licence third-party program (mostly Modified BSD, XSPICE code models public
 domain, `table.cm` GPLv2+, some LGPL components), the rest of the repository is
-MIT, and they are separate programs.
+PolyForm Noncommercial 1.0.0 (non-commercial), and they are separate programs.
 
 ## Layout
 

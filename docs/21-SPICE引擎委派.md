@@ -9,7 +9,7 @@
 
 | 候选 | 体量 / 依赖 | 结论 |
 |---|---|---|
-| ngspice | 约 50 万行 C，需 flex/bison/autotools 编译，产物是平台二进制 | 无法以源码形式"内置"，也不该把预编译二进制塞进 MIT 仓库 |
+| ngspice | 约 50 万行 C，需 flex/bison/autotools 编译，产物是平台二进制 | 无法以源码形式"内置"，也不该把预编译二进制塞进本仓库 |
 | ahkab / PySpice / lcapy | 需要 numpy（+ scipy）；PySpice 还要绑定 libngspice 动态库 | 一装就打破"仅 stdlib" |
 | Xyce / LTspice | 同 ngspice，且授权/平台受限 | 同上 |
 

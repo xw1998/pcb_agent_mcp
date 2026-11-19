@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcb-agent-mcp"
-version = "0.1.42"
+version = "0.1.43"
 description = "PCB design MCP server for AI agents: current, impedance, creepage, thermal and magnetics calculators plus gated KiCad / LCEDA-Pro editing, DRC and JLCPCB fabrication gates"
 readme = "README.md"
 requires-python = ">=3.9"

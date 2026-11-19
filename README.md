@@ -6,10 +6,11 @@
 > 全部在你自己机器上跑（唯一的出网是可选的立创在线取件查询，关掉就走本地 SQLite），零运行时依赖，Python ≥ 3.9。
 
 > **这是 source-available（源码可见），不是 OSI 认证的开源软件。**
+> **`0.1.43` 是本项目第一次对外发布。** 仓库历史里那份 MIT `LICENSE` 是内部草稿期的遗留文本，**从未对外提供过任何副本，因而不构成对外授权**；MIT 不适用于本仓库的任何版本（见文末「License」）。
 > 代码按 [PolyForm Noncommercial 1.0.0](LICENSE) 授权、**禁止任何商业用途**；文档按 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh)；随包的第三方组件各有原许可（见 [THIRD-PARTY.md](THIRD-PARTY.md)）。
 > 商业授权请开 [Issue](https://gitee.com/xw19981010/pcb_agent_mcp/issues) 或邮件 <1490588966@qq.com>；细则见文末「License」。
 
-当前版本 **`0.1.42`**：**注册 266 个工具**（`tools/list` 默认只暴露 50 个入口，全量需 `PCB_AGENT_TOOLSET=all`）、**零 runtime 依赖**、Python ≥ 3.9。已实现十一层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步，以及一层**从 20 块真实好板子量出习惯、但绝不自己动手改板**的经验累积（[docs/94](docs/94-经验累积模块与语料.md)）。
+当前版本 **`0.1.43`**：**注册 266 个工具**（`tools/list` 默认只暴露 50 个入口，全量需 `PCB_AGENT_TOOLSET=all`）、**零 runtime 依赖**、Python ≥ 3.9。已实现十一层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步，以及一层**从 20 块真实好板子量出习惯、但绝不自己动手改板**的经验累积（[docs/94](docs/94-经验累积模块与语料.md)）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
@@ -19,7 +20,7 @@ KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对
 ```bash
 git clone https://gitee.com/xw19981010/pcb_agent_mcp.git
 cd pcb_agent_mcp
-python run_server.py --version    # pcb-agent-mcp 0.1.42
+python run_server.py --version    # pcb-agent-mcp 0.1.43
 python run_server.py              # 起 stdio MCP 服务（日志只写 stderr，stdout 归协议）
 ```
 
@@ -190,7 +191,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # pcb-agent-mcp 0.1.42
+python run_server.py --version          # pcb-agent-mcp 0.1.43
 python run_server.py --selftest         # 协议级自检，366/366 passed（约 2 分钟）
 python -m unittest discover -s tests    # 4919 个用例 / 192 个模块（口径以这一条为准）
 ```
@@ -490,7 +491,7 @@ kicad-cli 导出包必然误报）、包里的 `.txt` 说明与 `.GDD` 图纸不
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # pcb-agent-mcp 0.1.42
+python run_server.py --version       # pcb-agent-mcp 0.1.43
 python run_server.py --selftest      # 协议级自检，366/366 passed（约 2 分钟；含板与原理图写路径端到端、
                                      #   天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、安规五问、
                                      #   滤波器三问、随包引擎三问等——逐条以运行时输出为准）
@@ -1341,8 +1342,13 @@ Rockchip / RK3506 属于瑞芯微。本项目与上述任何一方**没有隶属
 **商业授权**：开 [Issue](https://gitee.com/xw19981010/pcb_agent_mcp/issues) 或邮件
 <1490588966@qq.com>，说明用途与规模。
 
-**历史版本**：`0.1.42` 及以前发出的副本是按 MIT 许可的，那份授权**不可撤回**——已经拿到 MIT
-副本的人仍可依 MIT 使用那份副本。本版起新发出的副本按上面的非商业条款授权；本仓库历史提交里
-的 `LICENSE` 也保持原样，可自行查阅。
+**MIT 不适用于本仓库的任何版本。** 本仓库在 `0.1.43` 之前**从未对外发布**：没有面向公众的仓库、
+没有任何形式发给外部的副本（源码、wheel、源码包都没有）。因此仓库历史里那份 MIT `LICENSE` 只是
+内部草稿期的遗留文本，**不构成对任何人的授权**——「拿到 MIT 副本的人可以继续用」这句话在真正
+发过副本的项目上成立，在这里不成立，因为没有人拿到过副本。
+
+- `0.1.43` 是**第一次对外发布**，从这一版起只有上面那张表里的非商业条款；
+- 历史提交里的旧 `LICENSE` 文本仍可查阅（不改写 git 历史），但它只是内部遗留，**不描述任何对外授权**，
+  也不是任何人的许可依据。
 
 Copyright (c) 2026 xw19981010

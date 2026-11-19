@@ -2,17 +2,30 @@
 
 ## [Unreleased]
 
-### 许可变更：MIT → PolyForm Noncommercial 1.0.0（禁止商用）
+## [0.1.43] - 2026-11-19
+
+### 首次对外发布，许可为 PolyForm Noncommercial 1.0.0（禁止商用）；MIT 不适用于任何版本
 
 - **代码**改为 [PolyForm Noncommercial 1.0.0](LICENSE)（SPDX `PolyForm-Noncommercial-1.0.0`），
   **禁止任何商业用途**；**文档**改为 CC BY-NC-SA 4.0。这不是 OSI 认可的开源许可，
   README 顶部已按 source-available 表述，不再自称"开源"。
-- **历史副本不受影响**：`0.1.42` 及以前发出的副本仍是 MIT，那份授权不可撤回。
+- **`0.1.43` 是第一次对外发布**，MIT **从未生效**：此前没有公开仓库、没有发给任何人的副本
+  （源码 / wheel / sdist 都没有），仓库里那份 MIT `LICENSE` 只是内部草稿期的遗留文本，
+  **不构成对任何人的授权**，也就不存在「历史副本仍可按 MIT 使用」这件事。版本号从 `0.1.42` 升到
+  `0.1.43`，是为了让「第一次对外发布」有一个能引用的版本号。
+  相应的，README 的「License」一节直接写「MIT 不适用于本仓库的任何版本」，不写「已收回／不可撤回」
+  ——后者在真正发过副本的项目上成立，在这里不成立。
+- **清掉当前树里所有「本仓库是 MIT」的陈述**（第三方上游自身的 MIT 声明与 CHANGELOG 历史条目一律不动）：
+  `calc/spice.py` 的 `BUNDLED_NOTE`（"this module stays MIT"）、`vendor/ngspice/README.md`
+  （"the rest of the repository is MIT"）、`docs/21`（"塞进 MIT 仓库"）、`docs/43`（"MIT 代码一行都不用改"）、
+  `docs/README.md` 的 91 与 43 两条索引措辞，全部改成「本仓库 / 本仓库自己的许可」。
 - 新增 [THIRD-PARTY.md](THIRD-PARTY.md)：随包 ngspice 的混搭许可逐项说明、立创能力库的 MIT
   上游声明与改造边界、随包数据表与示例工程的性质、商标使用声明。
 - `vendor/ngspice/NOTICE.md` 三处「本仓库是 MIT」改成「本仓库自己的许可」；
   README / docs/21 / docs/43 / docs/91 里的同款措辞一并改。第三方上游自身的 MIT 描述保留不动。
-- 版本号不变（许可与文档变更不升版本）。
+- 补留在 `src/`、`vendor/`、`docs/` 里的五处漏改（见上一条），本轮逐个改到，`grep -rn "\bMIT\b"`
+  现在只剩第三方上游声明与历史条目。Gitee 仓库页的许可证识别为 `None`（PolyForm 不在识别表里），
+  页面上不再显示 MIT；仓库元数据（`pyproject` 的 `license` / `classifiers`）也已是非商业口径。
 
 ### 文档
 
