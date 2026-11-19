@@ -19,6 +19,15 @@
   `calc/spice.py` 的 `BUNDLED_NOTE`（"this module stays MIT"）、`vendor/ngspice/README.md`
   （"the rest of the repository is MIT"）、`docs/21`（"塞进 MIT 仓库"）、`docs/43`（"MIT 代码一行都不用改"）、
   `docs/README.md` 的 91 与 43 两条索引措辞，全部改成「本仓库 / 本仓库自己的许可」。
+- **Git 历史一并重写**（同一发布点，两次 `git filter-branch --index-filter` + 强推 master 与 33 个标签）：
+  先把历史里 331 个提交中的 MIT `LICENSE` blob（`8dc7943`，1087 B）逐个换成现在的 PolyForm 文本
+  （`b51078`，5581 B），再把 196 个历史 `pyproject.toml` 里的
+  `"License :: OSI Approved :: MIT License"` 分类器行删掉（只删这一行，其余逐字节不变）。
+  重写后 `git rev-list --all --objects -- LICENSE` 只剩一个 blob，全库已无任何可达对象含
+  `OSI Approved :: MIT`；旧对象经 `reflog expire` + `gc --prune=now` 清理，`git cat-file -e 8dc7943`
+  已返回不存在。HEAD 的 tree 仍是 `b6cbebd`（内容零变化，只换提交哈希）。
+  两个备份 bundle（重写前全量）在 `D:\tmp\git_backup\`，`git bundle verify` 均通过。
+  远端 Gitee 服务端何时 GC 不可控：旧提交已不可达，但服务端可能短期仍留有对象副本。
 - 新增 [THIRD-PARTY.md](THIRD-PARTY.md)：随包 ngspice 的混搭许可逐项说明、立创能力库的 MIT
   上游声明与改造边界、随包数据表与示例工程的性质、商标使用声明。
 - `vendor/ngspice/NOTICE.md` 三处「本仓库是 MIT」改成「本仓库自己的许可」；
