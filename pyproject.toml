@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pcb-agent-mcp"
 version = "0.1.42"
-description = "AI-native PCB design MCP server - Calc layer: current, impedance, lambda/20 and safety spacing with a strict evidence envelope"
+description = "PCB design MCP server for AI agents: current, impedance, creepage, thermal and magnetics calculators plus gated KiCad / LCEDA-Pro editing, DRC and JLCPCB fabrication gates"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
@@ -13,7 +13,7 @@ license = { file = "LICENSE" }
 authors = [
     { name = "xw19981010", email = "1490588966@qq.com" },
 ]
-keywords = ["mcp", "pcb", "eda", "kicad", "easyeda", "lcsc", "ipc-2221", "impedance", "creepage"]
+keywords = ["mcp", "model-context-protocol", "ai-agent", "pcb", "eda", "kicad", "easyeda", "lceda", "lcsc", "jlcpcb", "drc", "ipc-2221", "impedance", "creepage", "thermal", "schematic", "gerber"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: Other/Proprietary License",

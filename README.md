@@ -1,6 +1,9 @@
 # pcb-agent-mcp
 
-让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
+**给硬件工程师和 PCB 设计者用的 MCP 服务器**：把「电路计算 + KiCad / 立创 EDA Pro 实操」接到 Claude、Cursor、Cherry Studio、Cline 等任何支持 **Model Context Protocol (MCP)** 的 AI 客户端上，让它在画板、选器件、跑 DRC、算载流与阻抗、对嘉立创（JLCPCB）工艺门禁时，给出来的是**量出来的数字**和**带闸门的写操作**，而不是背下来的经验。
+
+> 检索关键词：PCB / EDA / MCP / Model Context Protocol / AI Agent / KiCad / 立创EDA / 嘉立创 / JLCPCB / 打样 / DRC / 阻抗 / 叠层 / 载流 / 温升 / 爬电距离 / IPC-2221 / 磁芯选型 / 环路与热 / 原理图 / Gerber。
+> 全部在你自己机器上跑（唯一的出网是可选的立创在线取件查询，关掉就走本地 SQLite），零运行时依赖，Python ≥ 3.9。
 
 > **这是 source-available（源码可见），不是 OSI 认证的开源软件。**
 > 代码按 [PolyForm Noncommercial 1.0.0](LICENSE) 授权、**禁止任何商业用途**；文档按 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh)；随包的第三方组件各有原许可（见 [THIRD-PARTY.md](THIRD-PARTY.md)）。
