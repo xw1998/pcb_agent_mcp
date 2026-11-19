@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### 许可变更：MIT → PolyForm Noncommercial 1.0.0（禁止商用）
+
+- **代码**改为 [PolyForm Noncommercial 1.0.0](LICENSE)（SPDX `PolyForm-Noncommercial-1.0.0`），
+  **禁止任何商业用途**；**文档**改为 CC BY-NC-SA 4.0。这不是 OSI 认可的开源许可，
+  README 顶部已按 source-available 表述，不再自称"开源"。
+- **历史副本不受影响**：`0.1.42` 及以前发出的副本仍是 MIT，那份授权不可撤回。
+- 新增 [THIRD-PARTY.md](THIRD-PARTY.md)：随包 ngspice 的混搭许可逐项说明、立创能力库的 MIT
+  上游声明与改造边界、随包数据表与示例工程的性质、商标使用声明。
+- `vendor/ngspice/NOTICE.md` 三处「本仓库是 MIT」改成「本仓库自己的许可」；
+  README / docs/21 / docs/43 / docs/91 里的同款措辞一并改。第三方上游自身的 MIT 描述保留不动。
+- 版本号不变（许可与文档变更不升版本）。
+
+### 文档
+
+- README 首部重排：source-available 声明、版本与工具数（0.1.42 / 266 个工具 / 默认 50 个入口）、
+  「三十秒上手」、纯文本目录；清掉 0.0.95 时代的历史累积注释与过时计数
+  （246→266 个工具、199→266 个 schema、3631→4911 个用例、docs 00~93→00~211 共 212 篇、
+  `tools/list` 预算改实测 50 个 / 24 808 B、全量 7 页每页 22–25 KB）。
+- `docs/README.md` 的「一百零三篇」改「两百一十二篇」，顶部加许可说明。
+
+### 修复
+
+- `--selftest` 的 5 条失败：断言里写死 `len(tools.TOOLS) == 256`（工具早已 266）。
+  计数提成 `_EXPECTED_TOOL_COUNT` 常量，5 处断言引用它，三处 prose 由 `%d` 代入 —— 以后加工具只改一处。
+
 ## [0.1.42] - 2026-11-16
 
 上一版结尾登记的七条欠账，这一版逐条做掉，或**写明为什么不做**（不做的那条给了辖区分界，不是「没排期」）。

@@ -26,7 +26,7 @@
 > `vendor/ngspice/`（14 MB）是官方 `ngspice-47` 的**未改动**子集，随包但**仍然不是一个 runtime 依赖**：
 > `dependencies = []` 照旧成立（删掉那个目录不影响任何 import），它只被 `engine="ngspice"`
 > 在「本机一个都没装」时兜底，而且只作为**独立进程**运行（不 link、不 include）。
-> 表里「不该把预编译二进制塞进 MIT 仓库」这条判断也被改写：塞进去的不是 MIT 代码，
+> 表里「不该把预编译二进制塞进开源仓库」这条判断也被改写：塞进去的不是本仓库自己的代码，
 > 是一份**混搭许可**的三方程序（Modified BSD 为主 + XSPICE 公有领域 + `table.cm` GPLv2+ + 若干 LGPL），
 > 逐项写在 `vendor/ngspice/NOTICE.md`，所以「独立程序」这个形态是许可共存的前提，不是偷懒。
 > 查找顺序因此多了一档（在 `PATH` 之后、目录扫描之前），`engine="auto"` **刻意仍然不看它**。

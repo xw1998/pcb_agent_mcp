@@ -1,7 +1,7 @@
 # NOTICE — bundled ngspice binary
 
 This directory ships a **third-party program**, not code written for this
-project. Nothing here is covered by this repository's MIT licence.
+project. Nothing here is covered by this repository's own licence.
 
 | item | value |
 | --- | --- |
@@ -35,7 +35,7 @@ GPLv2+ code model (`table`) and (L)GPL components inside the binary.** All of
 them permit redistribution of an unmodified binary provided the notices and the
 licence text travel with it and the corresponding source is available — which is
 why `COPYING` is kept here verbatim and why the source location is named above
-rather than claimed under this repository's MIT terms.
+rather than claimed under this repository's own terms.
 
 If you rebuild or patch any of these files, the upstream obligations change from
 "point at the source" to "publish your source", and the GPLv2+ part
@@ -53,8 +53,9 @@ an ordinary subprocess, with a per-run temporary working directory.**
 
 ## How the two licences coexist
 
-This repository's own code is MIT. The bundled program is BSD/LGPL/GPL, and the
-two are **separate programs**: the MIT code never links against ngspice, only
+This repository's own code is under its own (noncommercial) licence. The bundled
+program is BSD/LGPL/GPL, and the two are **separate programs**: the repository's
+own code never links against ngspice, only
 `subprocess.run`s it, and to the OS this is the same relationship as "my shell
 script calls `grep`". Nothing in `src/` includes a header from the bundle, links
 an object from it, or vendors a line of its source.

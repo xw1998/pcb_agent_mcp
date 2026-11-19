@@ -124,7 +124,7 @@
 2. **逐项 try/catch + 最后报一次 skip 计数**：KiCad 是为了「单个无法解析的件不该沉掉整块板」（`m_skippedCount` 收尾报一次 warning）。我们的口径是 fail-closed；若将来做导入，正确形态是**条数上限 + 全量清单落盘**，不是静默跳过。
 3. **让 session 里的 `polygon` 接管铺铜**：KiCad 导入时直接**忽略**会话里的 polygon（板上已有 zone）。我们的 `refill_pours` 委派 `ZONE_FILLER` 与它同侧——**外部结果不接管铺铜**。这条我们已经在做，写在这里是为了以后别改坏。
 4. **把 388 个关键字当成能力清单**：词表很大，但两个成熟实现共同实现的只是 `width` / `clearance` / `use_via` 这一小块。`length` / `max_delay` / `parallel` / `shield` / `crosstalk_model` 这些**在词表里，但没人写也没人读**。「规范上有」≠「生态在用」。
-5. **GPL 代码**：KiCad 与 FreeRouting 都是 GPL-3.0（FreeRouting 的 SPDX 已核为 `GPL-3.0`），本仓库是 MIT。**一行都不能抄**，只能借协议与机制。这是我们这条线最大的约束，比「难不难」更硬。
+5. **GPL 代码**：KiCad 与 FreeRouting 都是 GPL-3.0（FreeRouting 的 SPDX 已核为 `GPL-3.0`），本仓库是非商业许可。**一行都不能抄**，只能借协议与机制。这是我们这条线最大的约束，比「难不难」更硬。
 
 ## 91.6 一个反面事实：DSN 传的是「几何与宽度」，不是「电气意图」
 

@@ -33,3 +33,9 @@ _scratch/
 /examples/sky_star/_gaps.py
 /examples/sky_star/_near.py
 /examples/sky_star/_probe_edge.py
+
+# 本地临时产物（脚本落盘的读数码表/工作副本/试跑板）。文件保留在本机，只是不入库。
+/_*
+/--apply*
+/--apply/*
+/.selftest_home/

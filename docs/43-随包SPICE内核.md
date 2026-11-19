@@ -142,7 +142,7 @@ if os.path.isdir(<exe>/../lib/ngspice) and not os.path.isfile(init):
 对应源码可得——这就是 `COPYING` 原样留在 `vendor/ngspice/` 的原因，也是 `NOTICE.md` 写清版本、
 来源 URL、sha256 与「未做任何修改」的原因。
 
-MIT 与它们能共存，是因为**它们是两个程序**：本仓库的代码从不 include 它的头文件、不链接它的
+本仓库的非商业许可与它们能共存，是因为**它们是两个程序**：本仓库的代码从不 include 它的头文件、不链接它的
 目标文件、不 vendored 它的源码，只用 `subprocess.run` 起一个进程——与「shell 脚本调用 `grep`」
 是同一层关系。若将来改了这个二进制，义务就从「指向上游源码」变成「公布你的源码」，且 `table.cm`
 那部分还要额外满足 GPLv2+。

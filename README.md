@@ -2,10 +2,57 @@
 
 让 AI 在 **立创 EDA Pro** 与 **KiCad** 里真正"算得出来再动手"的 MCP 服务。
 
-当前版本 `0.0.95` 已实现十一层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步，以及一层**从 20 块真实好板子量出习惯、但绝不自己动手改板**的经验累积（[docs/94](docs/94-经验累积模块与语料.md)）。
+> **这是 source-available（源码可见），不是 OSI 认证的开源软件。**
+> 代码按 [PolyForm Noncommercial 1.0.0](LICENSE) 授权、**禁止任何商业用途**；文档按 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh)；随包的第三方组件各有原许可（见 [THIRD-PARTY.md](THIRD-PARTY.md)）。
+> 商业授权请开 [Issue](https://gitee.com/xw19981010/pcb_agent_mcp/issues) 或邮件 <1490588966@qq.com>；细则见文末「License」。
+
+当前版本 **`0.1.42`**：**注册 266 个工具**（`tools/list` 默认只暴露 50 个入口，全量需 `PCB_AGENT_TOOLSET=all`）、**零 runtime 依赖**、Python ≥ 3.9。已实现十一层：只读的算/保真/适配/度量/仿真，一条**带闸门的写路径**（提案 → 落盘，两种格式；还能**分步落盘**，让人在 EDA 窗口里看着它一步步长出来并随时喊停），一个**会说不通在哪**的布线器，一套**外包给立创/板厂自己的裁判**的制造输出与原理图同步，以及一层**从 20 块真实好板子量出习惯、但绝不自己动手改板**的经验累积（[docs/94](docs/94-经验累积模块与语料.md)）。
 立创侧的每条口径都以 **194 个真实 `.epro` 归档**为证据（[docs/13](docs/13-立创实测-真实存储与记录格式.md)）；
 KiCad 侧的几何与规则对着厂商自己核过：13 块真实板的 DRC 对账（厂商报的 56 条全命中）、
 412 个焊盘与 `pcbnew` 逐点对账 0 不一致（[docs/15](docs/15-对账-推导对着厂商判决.md)）。
+
+## 三十秒上手
+
+```bash
+git clone https://gitee.com/xw19981010/pcb_agent_mcp.git
+cd pcb_agent_mcp
+python run_server.py --version    # pcb-agent-mcp 0.1.42
+python run_server.py              # 起 stdio MCP 服务（日志只写 stderr，stdout 归协议）
+```
+
+MCP 客户端（stdio）配置 —— 把路径换成你自己的绝对路径：
+
+```json
+{
+  "mcpServers": {
+    "pcb-agent": {
+      "command": "python",
+      "args": ["D:/path/to/pcb_agent_mcp/run_server.py"]
+    }
+  }
+}
+```
+
+连上之后先调 **`calc_capabilities`**：它逐条列出「能算什么 / 拒算什么、为什么」，比任何文档都准，
+也是本项目唯一不会过期的能力清单。完整自检与全量测试见[「用法」](#用法)。
+
+## 本文目录
+
+- 一页速查：做完了什么 / 还差什么
+- 为什么不是"又一个图元 MCP"
+- 三条诚实规则（代码里强制，不是口号）
+- 为什么要内置计算：两个真实反例
+- 信封契约
+- 工具（266 个，默认入口 50 个）
+- JLCPCB 制板门禁
+- 用法
+- 路线图
+- 已知未实现 / 已打折扣的地方（诚实清单）
+- 项目结构
+- 第三方组件与商标
+- 免责声明
+- 贡献
+- License
 
 > **只想判断「现在能不能用」？** 直接看下面隔一节的
 > **「一页速查：做完了什么 / 还差什么」**——三十秒扫完；本表是逐层机制。
@@ -94,14 +141,14 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 | 不做的事 | 现在给什么替代 | 为什么不做 |
 |---|---|---|
 | 全波电磁（方向图 / 互耦 / SAR / iris / 色散） | `fullwave_solver` 是个**接缝**：装了什么、版本、要你给它什么；`verified_here` 恒 `false` | 用闭式冒充全波，正是本项目最想消灭的假答案 |
-| 自己写一个完整 SPICE | `0.0.37` 起**随包**官方 ngspice-47（独立进程，不 link） | 抄开源比重写诚实，MIT 与混搭许可也能共存 |
+| 自己写一个完整 SPICE | `0.0.37` 起**随包**官方 ngspice-47（独立进程，不 link） | 抄开源比重写诚实；本仓库的非商业许可与它那套混搭许可也能共存（独立进程，不 link） |
 | 内置板厂工艺能力表 | 只给 15 条规则目录 + 体检，限值必须来自你的能力文档 | 猜一个线宽等于替板厂签字 |
 | 安规默认值 | IEC 60664-1 有表；其余族 `SAFETY_TABLE_MISSING` | 标准付费、公开转述互相矛盾 |
 | 热学 `h` / `Rth` / Steinberg 允许挠度 / 焊点 `ε_f` 的默认值 | 参数必填，缺就 `ARG_REQUIRED` | 那是「引线类」的数，不是你这颗器件的数 |
 | 元件库几何 | 在线检索只给**元数据**；离线 `lceda-std.elib` 给封装 | 没有几何就画不出焊盘，编不出来 |
 | 立创的 DRC 判决 | 明确拒绝给判决（立创无命令行），不近似 | 拿自己的几何冒充「厂商判过」是第二种假答案 |
 | 3-D 热 / 器件自热 / 交流损耗进 SPICE | 全部写进 `not_computed` | 需要场解与频率相关模型，超出子集 |
-| 接 Specctra DSN/SES 交换（收外部布线器的候选） | 判决写在 [docs/91](docs/91-Specctra评估-DSN与SES交换格式.md)：**不接**，只借五条机制（其中「锁定的铜不回流」= A1 已在 `0.0.90` 实施，「合并=替换未锁定」= A2 仍**记账未实施**） | 三条：① **判据错位**——我们的价值是精确几何 + 外部裁判，收外部候选要付整套 IO 保真责任，换来的只是「多一个候选」；② **零依赖红线**——FreeRouting 是 Java 程序、KiCad 布线器在 PCB editor 里，都不能当 runtime 依赖；③ **GPL-3.0**——两个参考实现都是，本仓库 MIT，一行都不能抄 |
+| 接 Specctra DSN/SES 交换（收外部布线器的候选） | 判决写在 [docs/91](docs/91-Specctra评估-DSN与SES交换格式.md)：**不接**，只借五条机制（其中「锁定的铜不回流」= A1 已在 `0.0.90` 实施，「合并=替换未锁定」= A2 仍**记账未实施**） | 三条：① **判据错位**——我们的价值是精确几何 + 外部裁判，收外部候选要付整套 IO 保真责任，换来的只是「多一个候选」；② **零依赖红线**——FreeRouting 是 Java 程序、KiCad 布线器在 PCB editor 里，都不能当 runtime 依赖；③ **GPL-3.0**——两个参考实现都是，本仓库是非商业许可（同样与 GPL-3.0 不兼容），一行都不能抄 |
 | 最后一公里撕铜（FreeRouting `LastMileBlockerRipup`） | `board_route` 的 `_negotiate()` 已是更强形态（带历史价格、按 wish 走廊、整轮重布线、`max_rips` 可调）；判决与常量（`MAX_ITEMS = 24`、走廊 `margin = max(span/4, 1)`）记在 [docs/92](docs/92-FreeRouting算法借鉴-悬空铜与最后一公里.md) | 增量只在「不带价格、只在最后几条时触发、item 级上限」这三条，做成参数即可，不值得新增一个阶段；先让悬空铜跑过真板再评估 |
 
 #### B2 ｜现在拒绝，**门是开着的**（前置条件写在那里）
@@ -140,26 +187,13 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ### 自己核这三条
 
 ```bash
-python run_server.py --version          # 0.0.95
-python run_server.py --selftest         # 329/329（本机 326/329：随包 ngspice 缺 spinit，见下）
-python -m unittest discover -s tests    # 3631 个用例（0.0.95 实测 22 分 08 秒、skipped=5；请读下面的历史累计，
-                                        #   它们是我当时记的数，实测口径以这一条为准）
-                                        #   （`tests/test_pulse_latent.py`）⇒ 3464；本轮再新增 29 例
-                                        #   （`tests/test_taper_latent.py`）⇒ 3464 + 29 = 3493；
-                                        #   秒数不作性能结论——本机负载没有记录；skipped 仍是那 5 条；
-                                        #   3464/3493 例的实测秒数等下一次全量回归回填；本轮再新增 24 例
-                                        #   （`tests/test_experience.py`）⇒ 3493 + 24 = 3517；0.0.94 再新增 5 例
-                                        #   （`tests/test_ledger.py` 的 `TestWhoRanIt`）⇒ 3522；0.0.95 再新增 13 例
-                                        #   （`test_ops_edit.py::ZoneParams` 7 + `test_engine_drc_project.py` 6）
-                                        #   ⇒ 3535 是当时记的数；0.0.95 补齐第一版没跑完的全量，实测收集 **3609**：
-                                        #   **3596 passed / 8 failed / 5 skipped**；0.0.95 本轮再新增 22 例
-                                        #   （`tests/test_pro_rules.py`）⇒ 3631 收集。那 8 条要看清口径——
-                                        #   全在 `tests/test_spice_bundled.py`：本机随包 ngspice 找不到 `spinit`，
-                                        #   所以 `gain`/`limit`/`mult` 这些 A 卡报 MIF-ERROR。把工作区 stash 回 0.0.94
-                                        #   后**逐条同样失败**，与本次改动无关；`--selftest` 的 3 条失败是同一件事
-                                        #   （326/329），不是新回归）
+python run_server.py --version          # pcb-agent-mcp 0.1.42
+python run_server.py --selftest         # 协议级自检，366/366 passed（约 2 分钟）
+python -m unittest discover -s tests    # 4911 个用例 / 191 个模块（口径以这一条为准）
 ```
 
+上面三条是**实测口径**：数字来自本机这一次运行。旧版本里那串「历史累计」注释已删掉——
+累积注释本身就会漂移，而 `--version` / `--selftest` / `discover` 的当场输出不会。
 外加一个**机器可读**的同一份清单：`calc_capabilities`——它逐条列出「能算什么 / 拒算什么、为什么」。
 本文这一节会过期，那个工具的答案不会。
 
@@ -233,7 +267,7 @@ KiCad 的叠层 εr/tanδ/铜厚也在）—— **不是没存，是没人算。
 
 约定：信封必写 `status`（ok/error），业务字段**禁止**叫 `status`，避免一键两义。
 
-## 工具（246 个）
+## 工具（266 个，默认入口 50 个）
 
 下面逐行列的是**读路径、写路径与计算**的主力工具。`0.0.10` 之后陆续加的那些（`board_route` / `pdn_*` / `board_electrothermal` / `filter_*` / `magnetics_inductor` / `magnetics_select_core` / `magnetics_data` / `stackup_*` / `rf_chain` / `design_rules` / `layout_review` / `schematic_review` / `part_*` / `board_routability` / `board_width_ladder` / `board_via_ladder` / `board_zones` / `board_fill_zones` / `board_progress` / `lceda_pro_*` / `board_intent` / `lceda_pcb_write` / `lceda_write_snippet` / `lceda_step_record` / `lceda_step_replay` / `board_job` / `board_fab_package` / `board_export` / `board_bom` / `board_netlist` / `board_graphics` / `schematic_pcb_diff` / `schematic_pcb_sync` / `board_blockers` / `board_fanout` / `board_run_ledger` / `fullwave_solver` / `filter_mc_yield` / `magnetics_dcm` / `magnetics_core_loss` / `magnetics_dcr` / `magnetics_winding_ac` / `magnetics_fringing_loss` / `magnetics_material_core_loss` / `magnetics_dc_bias` /
 `filter_coupling_matrix` / `fusing_current` / `fusing_current_taper` / `current_density_field` / `cavity_plane_q` / `roughness_huray` / `plane_radiation_q` / `plane_open_end` / `ac_sheet_resistance` / `ac_round_conductor` / `ac_self_heating` / `experience_recall` / `experience_check` / `experience_candidate` / `experience_promote` / `experience_outcome` / `experience_export` / `experience_import`）没有逐行进表 —— 权威清单请调 **`calc_capabilities`**（它同时列出「拒算什么、为什么」），逐条口径见 [docs/20](docs/20-平面谐振与电热耦合.md)~[docs/27](docs/27-自动布线器.md)。
@@ -453,11 +487,11 @@ kicad-cli 导出包必然误报）、包里的 `.txt` 说明与 `.GDD` 图纸不
 零外部依赖，Python ≥ 3.9。
 
 ```bash
-python run_server.py --version       # 0.0.95
-python run_server.py --selftest      # 协议级自检，329/329（含板与原理图写路径端到端、天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、板级应力二问、平面模态二问、滤波器三问、安规五问、馈线差分对三问、子电路展开三问、行为源四问、无损线二问、有损线与 URC 二问、噪声二问、多页二问、受控源与互感二问、开关三问、JFET 三问、随包引擎三问、多端口 code model 三问、偏置线性化扫频二问、非矩形板轮廓三问、写 snippet 与后台作业四问、铜面导热三问、辐射与热过孔三问、桶壁剖面与界面层三问、两线串扰三问、重复脉冲降额三问、平面阻抗曲线三问、平面电容反谐振三问、表面粗糙度三问、波导腔全模谱与填充五问、铜加强筋与点质量五问、SPICE 1/f 与温度扫描五问、磁芯选型四问、阻焊丝印与成品孔三问、熔断沿长度三问、开边辐射 Q 与 Huray 五问、电流场三问、铺铜并入网络三问、负载阶跃四问、趋肤四问、粉末磁环三问、DC 偏置四问、DC 偏置接进选型四问、环型 MLT 与铜损六问、粉末磁化曲线七问、厂商损耗锚点审计四问、掩膜定义焊盘二问、随机振动模态叠加四问、热焊盘花三问、熔断潜热三问、脉冲串三电流四问、沿长度潜热三问、悬空铜三问、经验累积三问、铺铜填充参数一问）
-python -m unittest discover -s tests # 3631 个用例（0.0.95 实测 22 分 08 秒 = 1328.02 s、skipped=5；3618 passed / 8 failed，那 8 条是随包 ngspice 缺 spinit，kicad-cli / pcbnew 与二维场解用例占大头；
-                                     #   秒数随机器负载浮动，不作性能结论；同一次全量里 3609 收集里的 3522 例
-                                     #   已一并跑过，不再有待回填的旧数字）
+python run_server.py --version       # pcb-agent-mcp 0.1.42
+python run_server.py --selftest      # 协议级自检，366/366 passed（约 2 分钟；含板与原理图写路径端到端、
+                                     #   天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、安规五问、
+                                     #   滤波器三问、随包引擎三问等——逐条以运行时输出为准）
+python -m unittest discover -s tests # 4911 个用例 / 191 个模块（秒数随机器负载浮动，不作性能结论）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -468,7 +502,7 @@ MCP 客户端配置（stdio）：
   "mcpServers": {
     "pcb-agent": {
       "command": "python",
-      "args": ["D:/工作/git_project/pcb_agent_mcp/run_server.py"]
+      "args": ["D:/path/to/pcb_agent_mcp/run_server.py"]
     }
   }
 }
@@ -477,7 +511,7 @@ MCP 客户端配置（stdio）：
 协议实现是 stdlib 手写的 JSON-RPC 2.0 换行分隔流（`2025-06-18`，向后兼容 `2025-03-26` / `2024-11-05`），
 `dependencies = []`（`0.0.37` 起 `vendor/ngspice/` 是一个随包的**外部程序**，不是一个 Python 依赖，删掉它不影响任何 import，见下文「最小内核随包」）。日志只写 stderr —— stdout 承载协议。
 
-`tools/list` 默认只列 46 个入口工具（约 54 KB）：全量 199 个工具是约 317 KB（≈10 万 token），
+`tools/list` 默认只列 **50 个入口工具**（一页，实测 **24 808 B**）：全量 **266 个工具**分 7 页、每页 22–25 KB（合计约 166 KB ≈ 5 万 token），
 聊天客户端每轮都把它放进上下文，会撑爆窗口并让对话中断或卡死。不在列表里的工具用
 `tool_search`（按任务搜，返回完整参数 schema）+ `tool_call`（按名调用）取用，能力一个不少。
 需要旧的全量列表时设 `PCB_AGENT_TOOLSET=all`；也可以用前缀自选，例如
@@ -744,7 +778,7 @@ MCP 客户端配置（stdio）：
   `ngspice-47` Windows 构建的**未改动**子集（`bin/ngspice_con.exe` + 三个硬依赖 DLL +
   `lib/ngspice/*.cm` + `share/ngspice/scripts/spinit` + `COPYING`），只被 `engine="ngspice"`
   在「本机一个都没装」时兜底，`engine="auto"` **刻意不看它**（仓库长出 14 MB 不该改变既有
-  安装的答案）。它是**独立进程**（只 `subprocess.run`，不 link 不 include），所以 MIT 与上游的
+  安装的答案）。它是**独立进程**（只 `subprocess.run`，不 link 不 include），所以本仓库的非商业许可与上游的
   混搭许可（Modified BSD / XSPICE 公有领域 / `table.cm` GPLv2+ / LGPL 组件）能共存——
   `vendor/ngspice/NOTICE.md` 逐项写明，`tests/test_spice_bundled.py` 里有断言盯着这份声明。
   与"零依赖"的关系是**改写而不是打脸**：`dependencies = []` 仍然成立（Python 包没有任何
@@ -1098,7 +1132,7 @@ pcb_agent_mcp/
 ├── pyproject.toml                # 零 runtime 依赖；entry point: pcb-agent-mcp
 ├── src/pcb_agent_mcp/
 │   ├── server.py                 # stdlib JSON-RPC 2.0 stdio 协议层 + --selftest
-│   ├── tools.py                  # 199 个 tool 的 schema 与 handler 注册
+│   ├── tools.py                  # 266 个 tool 的 schema 与 handler 注册
 │   ├── edit/                     # 写路径：propose -> apply（两种格式）
 │   │   ├── ops.py                # 37 个 KiCad op（板框/开槽/挖空/机械/文字/走线/过孔/keepout/zone/via-in-pad/泪滴）
 │   │   ├── build.py              # S 表达式构造器（层号按文件版本写）
@@ -1174,14 +1208,31 @@ pcb_agent_mcp/
 │   ├── powder_curve_fits.json    # 125 行 DC 磁化 B(H) + 54 行 Δµ/µ(T) + 49 行印刷稳定性表 + 5 行偏置变体，每行带印刷页与 URL（0.0.80 起）
 │   ├── material_loss_anchors.json # 9 个牌号 / 17 个厂商印刷 PV 点 / 3 个来源，每点带 printed_page、printed_as 与 qualifier（`≤` / `~` / `Max.` / 裸数字四分类，0.0.81 起）
 │   └── creepage_tables.json      # 电气间隙/爬电距离阶梯（schematic_review 的隔离间距用）
-├── tests/                        # 3631 个用例（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+├── tests/                        # 4911 个用例 / 191 个模块（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
-├── docs/                         # 设计文档 00~93，建议按编号顺序读（索引见 docs/README.md）
+├── docs/                         # 设计文档 00~211 共 212 篇，建议按编号顺序读（索引见 docs/README.md）
 ├── CHANGELOG.md
-└── LICENSE
+├── THIRD-PARTY.md                # 第三方组件与商标清单（随包 ngspice、移植的能力库…）
+└── LICENSE                       # PolyForm Noncommercial 1.0.0（禁止商用；文档 CC BY-NC-SA 4.0）
 ```
+
+## 第三方组件与商标
+
+本仓库不是从零重写一切；凡是用到别人东西的地方，都在 [THIRD-PARTY.md](THIRD-PARTY.md) 里逐项写清
+「是什么、谁的、什么许可、我改了什么」。要点：
+
+| 对象 | 在哪 | 许可 | 与本仓库的关系 |
+|---|---|---|---|
+| ngspice-47（官方 Windows 构建的未改动子集） | `vendor/ngspice/`（14 MB） | **混搭**：Modified BSD 为主 + XSPICE 公有领域 + `table.cm` GPLv2+ + (L)GPL 组件 | **独立进程**（只 `subprocess.run`，不 link、不 include）；`COPYING` 原样随包；删掉只影响 `engine="ngspice"` 兜底 |
+| 立创 EDA 能力与规范数值 | `src/pcb_agent_mcp/jlc/data/*.json` | 上游 MIT（[jackwang988/jlceda-pcb-ai-workflow](https://github.com/jackwang988/jlceda-pcb-ai-workflow)） | 移植并改造；MIT 声明保留，见 THIRD-PARTY.md |
+| 厂商数据表里的数字 | `src/pcb_agent_mcp/*.json` | 不适用（事实数据，非代码） | 每行带来源 URL / 印刷页码，不是标准原文的重发 |
+| 示例工程 | `examples/` | 本仓库许可 | 自建符号与封装，不是厂商库原件 |
+
+**商标**：KiCad 属于 KiCad E.D.A. 开发者团队；立创 EDA / 嘉立创（JLCPCB）属于其各自权利人；
+Rockchip / RK3506 属于瑞芯微。本项目与上述任何一方**没有隶属、赞助或背书关系**，名字只用来
+说明「这个工具读写什么格式、对着谁的数字核过」。本仓库不含任何厂商的私有库、模板或二进制。
 
 ## 免责声明
 
@@ -1212,7 +1263,7 @@ pcb_agent_mcp/
   响应，不是有限元接触分析。
 - 爬电/间隙**故意不给默认值**。安规间距须按适用标准与电压等级查表，本项目只做查表与一致性检查；
   涉及市电、医疗、车载等场景请由有资质的工程师评审。
-- MIT 许可证，作者不对任何设计后果承担责任。
+- 代码按 [PolyForm Noncommercial 1.0.0](LICENSE) 授权（**禁止任何商业用途**），文档按 CC BY-NC-SA 4.0；作者不对任何设计后果承担责任。
 
 ## 贡献
 
@@ -1227,4 +1278,20 @@ pcb_agent_mcp/
 
 ## License
 
-[MIT](LICENSE) © 2026 xw19981010
+**这是 source-available，不是 OSI 认证的开源软件。** 二者不是措辞差别：OSI 开源许可不允许
+限制使用领域，而这份许可明确禁止商业用途。
+
+| 对象 | 许可 | 你可以 | 你不可以 |
+|---|---|---|---|
+| 源代码（`src/`、`run_server.py`、`tools/`、`tests/`、`skills/`…） | [PolyForm Noncommercial 1.0.0](LICENSE) | 个人使用、学习、研究、实验、教学、非营利/慈善/政府机构内部使用；修改；非商业分发（须带 `Required Notice` 与原许可全文） | **任何商业用途**（含内部商业流程、付费服务、商业产品集成）；再许可为其他许可 |
+| 文档（`docs/` 与各 Markdown 正文） | [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh) | 署名、非商业地转载/改编、相同方式共享 | 商业使用；去掉署名；改用其他许可分发改编件 |
+| 第三方组件 | 各自原许可（[THIRD-PARTY.md](THIRD-PARTY.md)） | 按原许可 | 按原许可 |
+
+**商业授权**：开 [Issue](https://gitee.com/xw19981010/pcb_agent_mcp/issues) 或邮件
+<1490588966@qq.com>，说明用途与规模。
+
+**历史版本**：`0.1.42` 及以前发出的副本是按 MIT 许可的，那份授权**不可撤回**——已经拿到 MIT
+副本的人仍可依 MIT 使用那份副本。本版起新发出的副本按上面的非商业条款授权；本仓库历史提交里
+的 `LICENSE` 也保持原样，可自行查阅。
+
+Copyright (c) 2026 xw19981010
