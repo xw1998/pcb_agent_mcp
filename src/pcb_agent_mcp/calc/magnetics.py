@@ -51,6 +51,7 @@ What it does, in four entry points:
                     a named reason for every part that is rejected;
   magnetic_data     read that table back, with the URL behind every row.
 """
+from .. import datafiles as _datafiles
 import json
 import math
 import os
@@ -1601,11 +1602,9 @@ def fringing_loss(freq_hz, gap_mm, leg_width_mm, leg_depth_mm, layers,
 # every answer below says WHICH field is missing rather than filling it in.
 # --------------------------------------------------------------------------
 
-DATA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))),
-    "data", "magnetic_materials.json",
-)
+# Resolved through one helper so a wheel, an editable install and a git
+# clone all find the same table (see pcb_agent_mcp/datafiles.py).
+DATA_PATH = _datafiles.resolve("magnetic_materials.json")
 
 # The two temperatures the vendor tables actually publish a Bsat at. A value in
 # between is not interpolated: the curve between them is not linear and nothing
@@ -1690,7 +1689,7 @@ def _bsat_at(material, temperature_c):
 #     permeability instead.
 # --------------------------------------------------------------------------
 
-POWDER_PATH = os.path.join(os.path.dirname(DATA_PATH), "powder_cores.json")
+POWDER_PATH = _datafiles.resolve("powder_cores.json")
 
 # The nine column headings the toroid pages print, mapped onto the material names
 # data/magnetic_materials.json already uses plus the variant label its loss_fit
@@ -2029,8 +2028,7 @@ def _magnetic_data_powder(kind, material=None, permeability=None, limit=None,
 # rounded corners and the rectangle over-fills it. Both are reported, neither is
 # used to replace a printed value that exists.
 
-TOROID_MLT_PATH = os.path.join(os.path.dirname(DATA_PATH),
-                               "toroid_mlt_reference.json")
+TOROID_MLT_PATH = _datafiles.resolve("toroid_mlt_reference.json")
 TOROID_MLT_SCHEMA = "toroid-mlt-reference"
 TOROID_MLT_MODES = ("off", "estimate")
 TOROID_MLT_SOURCE = ("Amidon / Profi-Electronic data-sheet pages for the T-type "
@@ -3760,7 +3758,7 @@ def _dc_biased_design(al_nh, inductance_h, i_peak_a, i_dc_a, b_limit_t,
 #     walked into saturation is visible rather than hidden inside a percentage.
 # --------------------------------------------------------------------------
 
-DC_BIAS_PATH = os.path.join(os.path.dirname(DATA_PATH), "dc_bias_fit.json")
+DC_BIAS_PATH = _datafiles.resolve("dc_bias_fit.json")
 
 DC_BIAS_SCHEMA = "dc-bias-fit"
 
@@ -4144,7 +4142,7 @@ def _magnetic_data_dc_bias(material=None, permeability=None, limit=None, path=No
 #     is falling while H rises.
 # --------------------------------------------------------------------------
 
-CURVE_PATH = os.path.join(os.path.dirname(DATA_PATH), "powder_curve_fits.json")
+CURVE_PATH = _datafiles.resolve("powder_curve_fits.json")
 
 CURVE_SCHEMA = "powder-curve-fits"
 
@@ -4739,8 +4737,7 @@ def magnetics_powder_curve(material, permeability, h_oe=None, temperature_c=None
 # apart from misses.
 # --------------------------------------------------------------------------
 
-LOSS_ANCHOR_PATH = os.path.join(os.path.dirname(DATA_PATH),
-                                "material_loss_anchors.json")
+LOSS_ANCHOR_PATH = _datafiles.resolve("material_loss_anchors.json")
 
 LOSS_ANCHOR_SCHEMA = "material-loss-anchors"
 

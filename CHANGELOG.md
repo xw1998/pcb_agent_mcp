@@ -21,11 +21,50 @@
   （246→266 个工具、199→266 个 schema、3631→4911 个用例、docs 00~93→00~211 共 212 篇、
   `tools/list` 预算改实测 50 个 / 24 808 B、全量 7 页每页 22–25 KB）。
 - `docs/README.md` 的「一百零三篇」改「两百一十二篇」，顶部加许可说明。
+- README 新增「随包的数据表与经验语料：随项目一起发出去」：十一张表在 git clone / wheel /
+  `PCB_AGENT_DATA` 三种布局下的落点、缺表时的具名拒绝、以及经验种子（只读、随包）与本机学习
+  （`$PCB_AGENT_HOME/experience.json`、永不覆盖种子、shadow 当场报告）的分工。
+- README 的「用法」补齐折叠三档实测表（`core` 50/24 847 B/1 页、`board_` 87/72 091 B/3 页、
+  `all` 266/170 677 B/7 页……），并写明 `tools/list` 全量口径改 170 677 B；
+  48 KB 上限那段改成当轮实测（`calc_capabilities` 70 586 B、`board_ops` 48 821 B、
+  `board_view` pads 一页 16 804 B）。
+
+### 工具重复审计与上下文占用（发送前检查）
+
+- **功能重复：0 组。** 266 个工具逐对比过三件事 —— handler 是否同一个（0 组）、
+  description 是否逐字相同（0 组）、名字相似度 ≥ 0.78 的 59 组逐对读描述判归属。
+  另有 9 组**参数签名（properties + required）完全相同**，逐个读下来全是参数形状巧合：
+  `creepage_required` / `clearance_required` / `spacing_required` 是 IEC 60664-1 的三个不同输出，
+  `board_summary` / `board_topology` / `board_reservations` / `board_zones` 读的是四件不同的事，
+  `pcb_rule_catalog` / `board_ops` / `pattern_status` / `calc_capabilities` 等 8 个只吃零参数的「目录类」工具
+  回答的是各自的目录。名字相近而答案不同的典型对照也核过：`diff_impedance`（闭式）vs
+  `diff_impedance_field`（场解）、`board_zones`（读文件里已铺的）vs `board_fill_zones`（调 KiCad 的
+  ZONE_FILLER 去铺）、`fusing_current`（等温、删除散热）vs `fusing_current_taper`（轴向分段、带导热）。
+  所有描述两两 Jaccard 最高 < 0.55，没有一对在讲同一件事。**结论：没有可合并的工具，也没有需要退役的。**
 
 ### 修复
 
 - `--selftest` 的 5 条失败：断言里写死 `len(tools.TOOLS) == 256`（工具早已 266）。
   计数提成 `_EXPECTED_TOOL_COUNT` 常量，5 处断言引用它，三处 prose 由 `%d` 代入 —— 以后加工具只改一处。
+- **随包的十一张表装 wheel 会全丢**：`pyproject.toml` 只声明了 `pcb_agent_mcp.jlc` 的 package-data，
+  根目录 `data/` 既没有 package-data 也没有 `MANIFEST.in`，`pip install` 出来的 wheel 里一张表都没有，
+  而七个模块是按「仓库根 / data」硬算路径的。新增 `src/pcb_agent_mcp/datafiles.py`
+  按 `<PCB_AGENT_DATA>` → 仓库 `data/` → 包内 `data/` → `<prefix>/share/pcb_agent_mcp/data/` 顺序寻址，
+  六个 calc 模块与 `experience.py` 全部改走它；`pyproject.toml` 增加
+  `[tool.setuptools.data-files]`，构建实测 11 个 JSON 全部进 wheel，装好后落在
+  `<prefix>/share/pcb_agent_mcp/data/`。
+- **经验种子缺失时静默回空库**：`experience._read_seed()` 吞掉 `OSError/ValueError` 返回 `[]`，
+  于是 `experience_status` 读成「随包的库是空的」，而不是「文件不在这台机器上」。
+  两种都是答案，只有一种是真的。现在缺文件时 `library()` / `status()` 增加
+  `seed_found: false` 与 `seed_note`（写明路径与异常），`status.message` 直接说「种子**没找到**，
+  这里的数只有本地条目」；**文件存在时输出逐字节不变**（新键只在缺失路径上出现）。
+- `calc_capabilities` 增加 `shipped_data`：当场报「找到几张 / 缺哪张 / 找过哪几个目录」，
+  让「这台机器上这套能力是不是全的」变成读数。
+- `tools.py` 折叠层的注释还在写 `~190 tools / ~315 KB / 46 tools / 23 976 B`，
+  与实测（266 / 170 677 B / 50 / 24 847 B）不符，按实测改写。
+- 新增 `tests/test_datafiles.py`（8 例）：表清单必须与 `data/` 目录逐项相等、checkout 里 11 张全找得到、
+  wheel 的 share 目录会被搜到、`PCB_AGENT_DATA` 压过 checkout、找不到时 `require()` 抛
+  `MissingTable` 且消息列全搜索路径、健康种子不多出任何键、缺种子必须报出来。
 
 ## [0.1.42] - 2026-11-16
 

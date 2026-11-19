@@ -11,6 +11,7 @@ Two standards disagree and the difference is large, so the caller MUST choose:
 Never return a number without telling which standard produced it, and never let
 one standard answer a question asked about the other.
 """
+from .. import datafiles as _datafiles
 import json
 import math
 import os
@@ -80,11 +81,9 @@ BA_INTERNAL = (
 )
 THICKNESS_MIL_PER_OZ = 1.378   # nominal: 1 oz/ft^2 finished ~= 35.0 um
 
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))),
-    "data", "ipc2152_tables.json",
-)
+# Resolved through one helper so a wheel, an editable install and a git
+# clone all find the same table (see pcb_agent_mcp/datafiles.py).
+MODEL_PATH = _datafiles.resolve("ipc2152_tables.json")
 _model_status = None
 
 

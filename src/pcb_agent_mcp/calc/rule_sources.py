@@ -19,15 +19,14 @@ returning an empty dictionary that would read as "nothing is cited".
 Nothing here is a route, and nothing here fills a number.
 """
 
+from .. import datafiles as _datafiles
 import io
 import json
 import os
 
-DATA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))),
-    "data", "layout-rule-sources.json",
-)
+# Resolved through one helper so a wheel, an editable install and a git
+# clone all find the same table (see pcb_agent_mcp/datafiles.py).
+DATA_PATH = _datafiles.resolve("layout-rule-sources.json")
 
 # Agreement labels that say something about the strength of the claim. A source
 # that only says "45 degrees OR an arc" is weaker than three independent vendors

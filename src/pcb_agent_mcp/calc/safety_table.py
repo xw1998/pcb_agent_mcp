@@ -15,15 +15,14 @@ What they CANNOT check: whether a source transcribed the standard correctly. Two
 blogs copying each other pass rule one and fail nothing. That is why the shipped file
 keeps `verified: false` and carries its candidate rows as *evidence*, not as answers.
 """
+from .. import datafiles as _datafiles
 import bisect
 import json
 import os
 
-DATA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))),
-    "data", "creepage_tables.json",
-)
+# Resolved through one helper so a wheel, an editable install and a git
+# clone all find the same table (see pcb_agent_mcp/datafiles.py).
+DATA_PATH = _datafiles.resolve("creepage_tables.json")
 
 MATERIAL_ORDER = {"I": 0, "II": 1, "IIIA": 2, "IIIB": 3}
 POLLUTION_ORDER = {"PD1": 1, "PD2": 2, "PD3": 3, "PD4": 4}

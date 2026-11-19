@@ -37,16 +37,16 @@ import math as _math
 import os
 import time
 
+from . import datafiles as _datafiles
+
 FILENAME = "experience.json"
 # The seed ships with the repository, not with the module: `data/` is the one
 # directory every table in this package lives in (creepage_tables.json,
-# ipc2152_tables.json, ...), so resolve it from the repository root rather than
-# from inside the package.
-SEED = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__)))),
-    "data", "experience_seed.json",
-)
+# ipc2152_tables.json, ...). `datafiles.resolve` finds it in a git clone, an
+# editable install and a wheel alike, and a path it could not find is still a
+# *path* here - `_read_seed` reports the miss instead of pretending the library
+# is empty.
+SEED = _datafiles.resolve("experience_seed.json")
 SCHEMA = 1
 KINDS = ("hard", "soft")
 STATUSES = ("candidate", "active", "retired")
@@ -102,20 +102,36 @@ def path():
 
 
 # ------------------------------------------------------------------ storage
-def _read_seed():
+def _read_seed(diag=None):
+    """Seed entries, and - when the file is not there - the reason, in `diag`.
+
+    A missing seed used to return `[]`, which made `experience_status` read as
+    "the shipped library is empty" when the truth was "the file is not on this
+    machine". Those are different answers and only one of them is true, so the
+    miss now travels back with the entries. The entry list is unchanged: a
+    caller that passes no `diag` sees exactly what it saw before.
+    """
     try:
         with open(SEED, encoding="utf-8") as fh:
             blob = json.load(fh)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        if isinstance(diag, dict):
+            diag["seed_found"] = False
+            diag["seed_note"] = ("the seed file that ships with the package was "
+                                 "not readable at %s (%s: %s); the entries "
+                                 "below are local ones only"
+                                 % (SEED, type(exc).__name__, exc))
         return []
-    out = []
+    if isinstance(diag, dict):
+        diag["seed_found"] = True
+    entries = []
     for entry in blob.get("entries") or []:
         if not isinstance(entry, dict):
             continue
         item = dict(entry)
         item["origin"] = "seed"
-        out.append(item)
-    return out
+        entries.append(item)
+    return entries
 
 
 def _read_blob():
@@ -181,17 +197,24 @@ def library():
     name (that is how a shipped rule gets retired locally), and the shadowing is
     reported rather than hidden."""
     by_id = {}
-    for entry in _read_seed():
+    diag = {}
+    for entry in _read_seed(diag):
         by_id[entry["id"]] = entry
     shadowed = []
     for entry in _read_local():
         if entry["id"] in by_id:
             shadowed.append(entry["id"])
         by_id[entry["id"]] = entry
-    return {"entries": [by_id[k] for k in sorted(by_id)],
-            "counts": _counts(by_id.values()),
-            "seed": SEED, "store": path(), "enabled": enabled(),
-            "shadowed_seed_ids": sorted(shadowed)}
+    out = {"entries": [by_id[k] for k in sorted(by_id)],
+           "counts": _counts(by_id.values()),
+           "seed": SEED, "store": path(), "enabled": enabled(),
+           "shadowed_seed_ids": sorted(shadowed)}
+    # Only the miss changes the shape of the answer: a healthy install returns
+    # the same keys it always did, so nothing downstream has to learn a new one.
+    if diag.get("seed_found") is False:
+        out["seed_found"] = False
+        out["seed_note"] = diag["seed_note"]
+    return out
 
 
 def _counts(entries):
@@ -937,14 +960,23 @@ def status():
     else:
         parts.append("no board has ever been measured against the library by this "
                      "machine (the numbers in the seed come from its own survey)")
-    if not entries:
+    if lib.get("seed_found") is False:
+        # Otherwise `total: 0` reads as "the shipped library is empty", which is a
+        # different claim from "the file is not on this machine".
+        parts.append("the shipped seed was NOT found at %s, so every number here "
+                     "is local-only" % lib["seed"])
+    elif not entries:
         parts.append("nothing has ever been written down")
-    return {"store": path(), "seed": lib["seed"], "enabled": enabled(),
-            "total": len(entries), "by_origin": by_origin,
-            "by_status": by_status, "by_kind": by_kind,
-            "candidates_waiting": waiting,
-            "observations": {"total": len(observations),
-                             "by_metric": observed_by_metric},
-            "store_written_at": written_at,
-            "shadowed_seed_ids": lib["shadowed_seed_ids"],
-            "message": "; ".join(parts)}
+    out = {"store": path(), "seed": lib["seed"], "enabled": enabled(),
+           "total": len(entries), "by_origin": by_origin,
+           "by_status": by_status, "by_kind": by_kind,
+           "candidates_waiting": waiting,
+           "observations": {"total": len(observations),
+                            "by_metric": observed_by_metric},
+           "store_written_at": written_at,
+           "shadowed_seed_ids": lib["shadowed_seed_ids"],
+           "message": "; ".join(parts)}
+    if lib.get("seed_found") is False:
+        out["seed_found"] = False
+        out["seed_note"] = lib["seed_note"]
+    return out

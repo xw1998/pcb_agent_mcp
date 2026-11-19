@@ -12,6 +12,7 @@ altitude and coating. Two states are possible:
   the only way to answer, because a guessed safety distance is worse than no
   answer.
 """
+from .. import datafiles as _datafiles
 import json
 import os
 import re
@@ -26,11 +27,9 @@ _IEC60664_RE = re.compile(r"^iec[\s_-]*60664(?!\d)")
 def _is_iec60664(safety_standard):
     return bool(_IEC60664_RE.match(str(safety_standard or "").strip().lower()))
 
-DATA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))),
-    "data", "creepage_tables.json",
-)
+# Resolved through one helper so a wheel, an editable install and a git
+# clone all find the same table (see pcb_agent_mcp/datafiles.py).
+DATA_PATH = _datafiles.resolve("creepage_tables.json")
 
 STANDARD_HINT = (
     "Creepage distance is not a number anyone should recall from memory. "

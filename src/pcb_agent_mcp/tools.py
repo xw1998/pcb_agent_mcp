@@ -11,6 +11,7 @@ import re
 import time
 
 from . import jsonsafe as _jsonsafe
+from . import datafiles as _datafiles
 from . import geometry as G
 
 from . import desktop as _desktop
@@ -6712,6 +6713,12 @@ def _capabilities(_args):
     return {
         "status": "ok",
         "server": "pcb-agent-mcp",
+        # The tables this build reads are files on THIS machine, and a wheel, an
+        # editable install and a git clone put them in different directories. So
+        # "can this server answer" has a file-level answer too, and it belongs in
+        # the tool that says call me first: a missing table is a capability that
+        # is off, not an empty answer waiting to be misread.
+        "shipped_data": _datafiles.report(),
         "layers": {
             "calc": "stateless engineering calculation (no board needed)",
             "fidelity": "the board CONVERTED, not summarised: the whole document is "
@@ -14562,12 +14569,14 @@ _tool(
 
 # ------------------------------------------------------------ tool profile
 #
-# The registry holds ~190 tools, which is ~315 KB of JSON (roughly 100 k tokens)
-# in a single tools/list reply. A chat client puts that in front of the model
-# before the first user message, so the context window fills up and the dialog
-# stalls or breaks outright. The default profile advertises the entry point of
-# every layer plus discovery; tool_search / tool_call reach the rest without
-# paying for their schemas up front.
+# The registry holds 266 tools, which is ~167 KB of JSON (measured at 0.1.42:
+# 170 677 B over 7 pages, roughly 50 k tokens) if a client asks for all of them
+# at once. A chat client puts tools/list in front of the model before the first
+# user message, so that cost is paid before any work starts. The default profile
+# advertises the entry point of every layer plus discovery - 50 tools, one page,
+# 24 847 B measured - and tool_search / tool_call reach the rest without paying
+# for their schemas up front. Counts here drift with every release; `--selftest`
+# measures the live ones and is the source of truth, not this comment.
 #
 # PCB_AGENT_TOOLSET:
 #   core (default)  the entry points below + the discovery tools
@@ -14606,9 +14615,10 @@ CORE_TOOLS = (
     # parts
     "part_search", "part_get",
     # JLCPCB fabrication gates are NOT here on purpose: the core page is packed to
-    # the 25 KiB tools/list budget (46 tools / 23 976 B before this release), so any
-    # addition pushes a tool off the single page. They stay in the registry, are
-    # listed by calc_capabilities, and tool_search / tool_call reach them.
+    # the 25 KiB tools/list budget (50 tools / 24 847 B measured at 0.1.42, ~750 B
+    # of headroom), so any addition pushes a tool off the single page. They stay in
+    # the registry, are listed by calc_capabilities, and tool_search / tool_call
+    # reach them.
     # board_netlist / board_sim are in the same position (0.0.142): they are the
     # whole-board deck and solve, they are listed in calc_capabilities, and the
     # page has no room for them.

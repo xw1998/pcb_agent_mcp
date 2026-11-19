@@ -25,17 +25,16 @@ the source is not a constant: PD2 with material group IIIa/IIIb above 160 V
 follows ``creepage = V / 100`` up to 50 kV (iec60664.cpp line 1057).  Without
 that segment the port would silently truncate a 50 kV ladder at 160 V.
 """
+from .. import datafiles as _datafiles
 import bisect
 import json
 import os
 
 from .result import ok, err
 
-DATA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))),
-    "data", "iec60664_tables.json",
-)
+# Resolved through one helper so a wheel, an editable install and a git
+# clone all find the same table (see pcb_agent_mcp/datafiles.py).
+DATA_PATH = _datafiles.resolve("iec60664_tables.json")
 
 MODEL = "iec60664_1_2020_table_lookup"
 

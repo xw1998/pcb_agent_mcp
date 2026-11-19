@@ -189,7 +189,7 @@ KiCad 侧这套闸门在自造示例板上真拦下过三次错（丝印压板�
 ```bash
 python run_server.py --version          # pcb-agent-mcp 0.1.42
 python run_server.py --selftest         # 协议级自检，366/366 passed（约 2 分钟）
-python -m unittest discover -s tests    # 4911 个用例 / 191 个模块（口径以这一条为准）
+python -m unittest discover -s tests    # 4919 个用例 / 192 个模块（口径以这一条为准）
 ```
 
 上面三条是**实测口径**：数字来自本机这一次运行。旧版本里那串「历史累计」注释已删掉——
@@ -491,7 +491,7 @@ python run_server.py --version       # pcb-agent-mcp 0.1.42
 python run_server.py --selftest      # 协议级自检，366/366 passed（约 2 分钟；含板与原理图写路径端到端、
                                      #   天线四问、仿真七问、DFM 三问、振动九问、腔体与电热七问、安规五问、
                                      #   滤波器三问、随包引擎三问等——逐条以运行时输出为准）
-python -m unittest discover -s tests # 4911 个用例 / 191 个模块（秒数随机器负载浮动，不作性能结论）
+python -m unittest discover -s tests # 4919 个用例 / 192 个模块（秒数随机器负载浮动，不作性能结论）
 python run_server.py                 # 起 stdio MCP 服务
 ```
 
@@ -511,11 +511,29 @@ MCP 客户端配置（stdio）：
 协议实现是 stdlib 手写的 JSON-RPC 2.0 换行分隔流（`2025-06-18`，向后兼容 `2025-03-26` / `2024-11-05`），
 `dependencies = []`（`0.0.37` 起 `vendor/ngspice/` 是一个随包的**外部程序**，不是一个 Python 依赖，删掉它不影响任何 import，见下文「最小内核随包」）。日志只写 stderr —— stdout 承载协议。
 
-`tools/list` 默认只列 **50 个入口工具**（一页，实测 **24 808 B**）：全量 **266 个工具**分 7 页、每页 22–25 KB（合计约 166 KB ≈ 5 万 token），
-聊天客户端每轮都把它放进上下文，会撑爆窗口并让对话中断或卡死。不在列表里的工具用
+`tools/list` 默认只列 **50 个入口工具**（一页，实测 **24 847 B**）：全量 **266 个工具**分 7 页、每页 22–25 KB（合计 **170 677 B**
+≈ 167 KB ≈ 5 万 token），聊天客户端每轮都把它放进上下文，会撑爆窗口并让对话中断或卡死。不在列表里的工具用
 `tool_search`（按任务搜，返回完整参数 schema）+ `tool_call`（按名调用）取用，能力一个不少。
 需要旧的全量列表时设 `PCB_AGENT_TOOLSET=all`；也可以用前缀自选，例如
 `PCB_AGENT_TOOLSET=board_,magnetics_`（`core` 可与前缀混写）。
+
+实测三档（`0.1.42`，同一台机器、默认 25 KiB 单页预算，字节数是整条 JSON-RPC 回复）：
+
+| 档位 | 工具数 | 页数 | 字节 |
+| --- | --- | --- | --- |
+| 默认 `core` | 50 | 1 | 24 847 |
+| `board_` | 87 | 3 | 72 091 |
+| `lceda_` | 19 | 1 | 19 209 |
+| `magnetics_` | 14 | 1 | 21 475 |
+| `jlc_` | 14 | 1 | 13 104 |
+| `schematic_` | 13 | 1 | 10 366 |
+| `experience_` | 11 | 1 | 11 570 |
+| `all` | 266 | 7 | 170 677 |
+
+`core` 已经顶到 25 KiB 预算（约 750 B 余量），所以 JLCPCB 制板门禁、`board_netlist`、`board_sim`
+刻意不在里面：它们留在注册表里，由 `calc_capabilities` 列出，`tool_search` / `tool_call` 能取到。
+纯中文查询也搜得到：`tool_search` 有一张中文任务名词到英文关键字的别名表（阻抗 / 过孔 / 铺铜 / 散热 / 爬电……），
+表里没有的词会明确告诉你「这次什么都没搜」而不是安静地回零条。
 
 单个工具的回复也有上限，因为一次几十万 token 的结果同样会把会话撑死：
 
@@ -523,7 +541,33 @@ MCP 客户端配置（stdio）：
 - `board_view` 的 `kind=all` 只回每类计数，读记录要指名 kind，并用 `limit` / `offset` / `max_bytes` 分页（`max_bytes` 默认 16 KB，实测一页约 50 个焊盘）；原始 S 表达式只在 `include_raw=true` 时附带；
 - 任何工具的单次回复超过 `PCB_AGENT_MAX_RESULT_KB`（默认 **48 KB**）时，回复会被**截断而不是丢弃**：留住 `status`、所有标量、每个长列表的头部（按字节预算）与每个长串前 2000 字符，加 `truncated` / `bytes_full` / `cap_bytes` / `truncated_fields`，并把完整 JSON 落到 `%TEMP%\pcb_agent_mcp_results\` 后以 `saved_to` 指出；设成 `0` 关闭该上限。
 
-  为什么是 48 KB 而不是管道那套 1 MiB / 16 MiB：这两个数字回答的是「搬得动吗」，不是「读进来还有没有地方推理」。实测本仓库最大的诚实答案是 `board_ops` **33 340 B**（41 条写操作），最小的一次倾泻是 `calc_capabilities` **68 089 B**，再往上是 `board_view` pads 109 190 B 与 `lceda_pro_run` 的整对象几百 KB；48 KB 夹在中间。0.0.104 之前这里只有 `RESULT_TOO_LARGE`（整包丢弃），调用方付了查询的代价却只拿回一句「太大了」。见 `docs/103`。
+### 随包的数据表与经验语料：随项目一起发出去
+
+十一张表跟着仓库走，**不在 wheel 的包里、也不在任何一份手抄本里**，因为 `docs/` 是照那个路径写的，
+而一张能在编辑器里打开、能对着书页逐行核的表才是可核的表：
+
+```
+data/creepage_tables.json      data/iec60664_tables.json    data/ipc2152_tables.json
+data/magnetic_materials.json   data/powder_cores.json       data/powder_curve_fits.json
+data/toroid_mlt_reference.json data/material_loss_anchors.json  data/dc_bias_fit.json
+data/layout-rule-sources.json  data/experience_seed.json    （共 11 个，约 330 KB）
+```
+
+- **git clone / `pip install -e .`**：表就在 `<repo>/data/`，`docs/` 里写的路径就是它。
+- **`pip install` 装 wheel**：表被装到 `<prefix>/share/pcb_agent_mcp/data/`（`pyproject.toml` 的
+  `[tool.setuptools.data-files]` 声明，构建时实测 11 个文件全部进了 wheel）。`pcb_agent_mcp/datafiles.py`
+  按 `<PCB_AGENT_DATA>` → 仓库 `data/` → 包内 `data/` → `<prefix>/share/pcb_agent_mcp/data/` 的顺序找，
+  先找到的文件胜出，所以装法不会让它读错表。
+- **`PCB_AGENT_DATA`** 指向别的目录时优先用它，用来临时换成你核过的表。
+- **表不在机器上**：`calc_capabilities` 的 `shipped_data` 当场报「找到几张 / 缺哪张 / 找过哪几个目录」；
+  需要表的工具会**具名拒绝**（`SAFETY_TABLE_MISSING` 等），不会把「没有文件」当成「表里没这个数」。
+- **经验语料**：种子 `data/experience_seed.json`（7 条 active，量自 20 块真实板）是**只读**的，
+  随包发出；本机学到的东西写在 `$PCB_AGENT_HOME/experience.json`（默认 `~/.pcb_agent_mcp/`），
+  永远不覆盖种子（同 id 的本地条目会 shadow 种子并**当场报告** shadow 了哪几条）。
+  种子文件读不到时 `experience_status` 会写明「种子**没找到**，这里的数只有本地条目」——
+  以前这种情况会静默回一个空库，读起来像「随包的东西是空的」，那是两件事。
+
+  为什么是 48 KB 而不是管道那套 1 MiB / 16 MiB：这两个数字回答的是「搬得动吗」，不是「读进来还有没有地方推理」。一条普通的板级读回答远在下面（`board_view` 的 pads 一页实测 **16 804 B**），而「目录 / 自述」类的诚实答案在线上面：`calc_capabilities` 完整自述 **70 586 B**、`board_ops` 的写操作目录 **48 821 B**，`lceda_pro_run` 的整对象则是几百 KB；48 KB 夹在中间。0.0.104 之前这里只有 `RESULT_TOO_LARGE`（整包丢弃），调用方付了查询的代价却只拿回一句「太大了」。见 `docs/103`。
 
 传输层同批修掉两处会让对话中断的缺陷（见 `docs/96`）：JSON-RPC **批量请求**（数组）
 按数组回答、坏元素只坏自己，此前它抛在 handler 之外、直接打死进程（复现原文
@@ -1207,12 +1251,16 @@ pcb_agent_mcp/
 │   ├── toroid_mlt_reference.json # 13 行印刷 MLT（环型实测比值带的来历），每行带 URL（0.0.79 起）
 │   ├── powder_curve_fits.json    # 125 行 DC 磁化 B(H) + 54 行 Δµ/µ(T) + 49 行印刷稳定性表 + 5 行偏置变体，每行带印刷页与 URL（0.0.80 起）
 │   ├── material_loss_anchors.json # 9 个牌号 / 17 个厂商印刷 PV 点 / 3 个来源，每点带 printed_page、printed_as 与 qualifier（`≤` / `~` / `Max.` / 裸数字四分类，0.0.81 起）
+│   ├── layout-rule-sources.json  # 布局规则引证账本：每条规则一条来源、逐条 quote + 页码 + scope（quantitative / principle_only）
+│   ├── experience_seed.json      # 经验种子（7 条 active，量自 20 块真实 LCEDA-Pro 板；只读，本机学习写 $PCB_AGENT_HOME）
 │   └── creepage_tables.json      # 电气间隙/爬电距离阶梯（schematic_review 的隔离间距用）
-├── tests/                        # 4911 个用例 / 191 个模块（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
+# ↑ 这十一张表随仓库一起发布；wheel 装到 <prefix>/share/pcb_agent_mcp/data/，寻址逻辑见
+#   src/pcb_agent_mcp/datafiles.py，缺表由 calc_capabilities 的 shipped_data 当场报出。
+├── tests/                        # 4919 个用例 / 192 个模块（含"解析前后 sha256 不变"、"闸门有牙"、真实归档形状，
 │                                 #  以及拿 pcbnew / kicad-cli 当裁判的对账用例）
 │   └── data/sample.kicad_pcb     # 合成样本（不是真实工程，但已通过 KiCad 校验）
 ├── vendor/ngspice/               # 0.0.37 随包引擎：官方 ngspice-47 未改动子集（14 MB，独立进程）
-├── docs/                         # 设计文档 00~211 共 212 篇，建议按编号顺序读（索引见 docs/README.md）
+├── docs/                         # 设计文档 00~212 共 213 篇，建议按编号顺序读（索引见 docs/README.md）
 ├── CHANGELOG.md
 ├── THIRD-PARTY.md                # 第三方组件与商标清单（随包 ngspice、移植的能力库…）
 └── LICENSE                       # PolyForm Noncommercial 1.0.0（禁止商用；文档 CC BY-NC-SA 4.0）

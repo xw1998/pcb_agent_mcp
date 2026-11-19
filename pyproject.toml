@@ -39,3 +39,13 @@ where = ["src"]
 # gates have no numbers to compare against.
 [tool.setuptools.package-data]
 "pcb_agent_mcp.jlc" = ["data/*.json", "data/rule-presets/*.json"]
+
+# The rest of the tables - safety, IPC charts, the powder-core catalog, the rule
+# ledger and the experience seed - live in the repository-root `data/` directory,
+# outside the package, because `docs/` names them by that path and because a table
+# you can open in an editor is a table you can check against the page it came from.
+# A wheel installs them under <prefix>/share/pcb_agent_mcp/data/; pcb_agent_mcp.
+# datafiles looks there as well as in a source checkout. Without this block a
+# `pip install` would ship every tool with its table missing.
+[tool.setuptools.data-files]
+"share/pcb_agent_mcp/data" = ["data/*.json"]
